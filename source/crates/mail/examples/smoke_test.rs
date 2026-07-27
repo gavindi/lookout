@@ -23,8 +23,7 @@ impl CredentialProvider for GoaCredentialProvider {
         self.client.ensure_credentials(&self.account).await.map_err(|e| e.to_string())?;
         match &self.account.auth {
             AuthMethod::OAuth2 => {
-                let (token, _expires_in) =
-                    self.client.get_access_token(&self.account).await.map_err(|e| e.to_string())?;
+                let (token, _expires_in) = self.client.get_access_token(&self.account).await.map_err(|e| e.to_string())?;
                 Ok(Credential::OAuth2AccessToken(token))
             }
             AuthMethod::Password { .. } => {
@@ -38,8 +37,7 @@ impl CredentialProvider for GoaCredentialProvider {
         self.client.ensure_credentials(&self.account).await.map_err(|e| e.to_string())?;
         match &self.account.auth {
             AuthMethod::OAuth2 => {
-                let (token, _expires_in) =
-                    self.client.get_access_token(&self.account).await.map_err(|e| e.to_string())?;
+                let (token, _expires_in) = self.client.get_access_token(&self.account).await.map_err(|e| e.to_string())?;
                 Ok(Credential::OAuth2AccessToken(token))
             }
             AuthMethod::Password { .. } => {

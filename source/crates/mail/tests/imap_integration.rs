@@ -70,8 +70,18 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         account_id: AccountId("test-account".to_string()),
         display_name: "Test Account".to_string(),
         email: "testuser@localhost".to_string(),
-        imap: EndpointConfig { host: host.clone(), port: imaps_port, use_tls: true, username: "testuser".to_string() },
-        smtp: EndpointConfig { host, port: smtps_port, use_tls: true, username: "testuser".to_string() },
+        imap: EndpointConfig {
+            host: host.clone(),
+            port: imaps_port,
+            use_tls: true,
+            username: "testuser".to_string(),
+        },
+        smtp: EndpointConfig {
+            host,
+            port: smtps_port,
+            use_tls: true,
+            username: "testuser".to_string(),
+        },
     };
 
     let (cmd_tx, cmd_rx) = async_channel::unbounded();

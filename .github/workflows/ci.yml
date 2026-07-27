@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+defaults:
+  run:
+    working-directory: source
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4/libadwaita/WebKitGTK dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libglib2.0-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4/libadwaita/WebKitGTK dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libglib2.0-dev \
+            pkg-config \
+            dbus-daemon
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+      - name: Unit tests (whole workspace)
+        run: cargo test --workspace --all-features
+      - name: Fake-GOA D-Bus test (isolated session bus)
+        run: dbus-run-session -- cargo test -p lookout-goa --test fake_goa
+
+  greenmail:
+    runs-on: ubuntu-24.04
+    # Docker is preinstalled on GitHub-hosted ubuntu runners - the first
+    # environment able to actually execute this test (written against a
+    # local environment with no Docker available, and never run there).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+      - name: GreenMail integration test
+        run: cargo test -p lookout-mail --features test-utils --test imap_integration -- --ignored
+        continue-on-error: true
+
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4/libadwaita/WebKitGTK dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libglib2.0-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+      - run: cargo build --workspace --all-features

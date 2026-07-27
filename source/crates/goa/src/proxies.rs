@@ -21,11 +21,7 @@ pub trait ObjectManager {
     fn get_managed_objects(&self) -> zbus::Result<ManagedObjects>;
 
     #[zbus(signal)]
-    fn interfaces_added(
-        &self,
-        object_path: OwnedObjectPath,
-        interfaces: HashMap<String, HashMap<String, OwnedValue>>,
-    ) -> zbus::Result<()>;
+    fn interfaces_added(&self, object_path: OwnedObjectPath, interfaces: HashMap<String, HashMap<String, OwnedValue>>) -> zbus::Result<()>;
 
     #[zbus(signal)]
     fn interfaces_removed(&self, object_path: OwnedObjectPath, interfaces: Vec<String>) -> zbus::Result<()>;

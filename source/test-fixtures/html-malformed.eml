@@ -1,0 +1,14 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: Malformed HTML
+Date: Tue, 28 Jul 2026 09:20:00 +0000
+Message-ID: <html-malformed-fixture@lookout.test>
+Content-Type: text/html; charset=utf-8
+
+<html><body>
+<p>Unclosed paragraph
+<div><b>Bold never closed
+<table><tr><td>Cell without closing table tags
+<img src="cid:doesnotexist">
+5 < 10 and 10 > 5 stray angle brackets
+</body>

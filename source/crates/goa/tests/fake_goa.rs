@@ -127,15 +127,20 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
         .await
         .expect("couldn't connect to the session bus - run this test under `dbus-run-session --`");
 
+    connection.object_server().at("/org/gnome/OnlineAccounts", FakeObjectManager { objects }).await.unwrap();
     connection
         .object_server()
-        .at("/org/gnome/OnlineAccounts", FakeObjectManager { objects })
+        .at("/org/gnome/OnlineAccounts/Accounts/oauth_account", FakeAccount)
         .await
         .unwrap();
-    connection.object_server().at("/org/gnome/OnlineAccounts/Accounts/oauth_account", FakeAccount).await.unwrap();
     connection
         .object_server()
-        .at("/org/gnome/OnlineAccounts/Accounts/oauth_account", FakeOAuth2Based { token: "fake-access-token".to_string() })
+        .at(
+            "/org/gnome/OnlineAccounts/Accounts/oauth_account",
+            FakeOAuth2Based {
+                token: "fake-access-token".to_string(),
+            },
+        )
         .await
         .unwrap();
     connection.object_server().at("/org/gnome/OnlineAccounts/Accounts/pw_account", FakeAccount).await.unwrap();
@@ -145,13 +150,10 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
         .await
         .unwrap();
 
-    connection
-        .request_name("org.gnome.OnlineAccounts")
-        .await
-        .expect(
-            "couldn't claim the org.gnome.OnlineAccounts bus name - a real GOA daemon (or another instance of \
+    connection.request_name("org.gnome.OnlineAccounts").await.expect(
+        "couldn't claim the org.gnome.OnlineAccounts bus name - a real GOA daemon (or another instance of \
              this test) is likely already running on this bus. Run under `dbus-run-session --` for an isolated bus.",
-        );
+    );
 
     let client = GoaClient::connect().await.unwrap();
     let mut accounts = client.list_mail_accounts().await.unwrap();

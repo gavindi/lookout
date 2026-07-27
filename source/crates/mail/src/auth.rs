@@ -14,7 +14,11 @@ pub struct XOAuth2Authenticator {
 
 impl XOAuth2Authenticator {
     pub fn new(user: impl Into<String>, access_token: impl Into<String>) -> Self {
-        XOAuth2Authenticator { user: user.into(), access_token: access_token.into(), sent_response: false }
+        XOAuth2Authenticator {
+            user: user.into(),
+            access_token: access_token.into(),
+            sent_response: false,
+        }
     }
 }
 

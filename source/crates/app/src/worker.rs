@@ -17,10 +17,7 @@ impl Worker {
         let thread = std::thread::Builder::new()
             .name("lookout-worker".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build tokio runtime");
+                let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("failed to build tokio runtime");
                 tx.send(rt.handle().clone()).expect("UI thread dropped worker startup channel");
                 rt.block_on(std::future::pending::<()>());
             })

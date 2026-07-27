@@ -1,0 +1,11 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: HTML with external image
+Date: Tue, 28 Jul 2026 09:15:00 +0000
+Message-ID: <html-external-image-fixture@lookout.test>
+Content-Type: text/html; charset=utf-8
+
+<html><body>
+  <p>Remote image below (should NOT auto-load once external-image blocking ships):</p>
+  <img src="https://example.com/tracker.png" width="1" height="1">
+</body></html>

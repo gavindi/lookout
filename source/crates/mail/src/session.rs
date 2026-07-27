@@ -43,7 +43,10 @@ pub enum AccountCommand {
     /// (fetching a body from a different mailbox would require a SELECT,
     /// which would drop out of IDLE on that other folder - out of scope for
     /// Phase 1, where only the open folder's messages are readable).
-    FetchBody { mailbox: MailboxId, uid: Uid },
+    FetchBody {
+        mailbox: MailboxId,
+        uid: Uid,
+    },
     /// Force a folder-list + current-mailbox resync outside of IDLE's own cadence.
     Refresh,
     /// Send a composed message over SMTP, then `APPEND` it to the account's
@@ -256,31 +259,26 @@ async fn connect_and_run(
                     if let Some(path) = mailbox_id.0.strip_prefix(&format!("{}:", account_id.0)) {
                         current_mailbox_name = path.to_string();
                         current_mailbox_id = mailbox_id;
-                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache)
-                            .await?;
+                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                     }
                 }
                 AccountCommand::FetchBody { mailbox, uid } => {
                     if mailbox != current_mailbox_id {
-                        tracing::warn!(
-                            "FetchBody requested for a mailbox other than the currently selected one; ignoring"
-                        );
+                        tracing::warn!("FetchBody requested for a mailbox other than the currently selected one; ignoring");
                         continue;
                     }
                     if let Some(body) = fetch_body(&mut session, uid).await? {
                         let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
                     }
                 }
-                AccountCommand::SendMessage(msg) => {
-                    match send_message(config, credentials, &mut session, &folders, msg).await {
-                        Ok(()) => {
-                            let _ = events.send(AccountEvent::SendCompleted).await;
-                        }
-                        Err(e) => {
-                            let _ = events.send(AccountEvent::Error(format!("Couldn't send message: {e}"))).await;
-                        }
+                AccountCommand::SendMessage(msg) => match send_message(config, credentials, &mut session, &folders, msg).await {
+                    Ok(()) => {
+                        let _ = events.send(AccountEvent::SendCompleted).await;
                     }
-                }
+                    Err(e) => {
+                        let _ = events.send(AccountEvent::Error(format!("Couldn't send message: {e}"))).await;
+                    }
+                },
                 // Already connected - nothing to reconnect. This variant
                 // only does something useful while backed off between
                 // connection attempts, see `run_account_session`.
@@ -294,13 +292,7 @@ async fn connect_and_run(
 /// account's Sent mailbox (if one was identified in `folders`) so it shows
 /// up in the Sent view - IMAP has no server-side "file to Sent on submit"
 /// the way JMAP's EmailSubmission does.
-async fn send_message(
-    config: &AccountConfig,
-    credentials: &dyn CredentialProvider,
-    session: &mut Session<ImapStream>,
-    folders: &[Mailbox],
-    msg: ComposedMessage,
-) -> Result<()> {
+async fn send_message(config: &AccountConfig, credentials: &dyn CredentialProvider, session: &mut Session<ImapStream>, folders: &[Mailbox], msg: ComposedMessage) -> Result<()> {
     let (raw, _message_id, recipients) = build_raw_message(&msg);
 
     let smtp_credential = credentials.smtp_credential().await.map_err(Error::LoginFailed)?;
@@ -385,8 +377,7 @@ async fn sync_mailbox(
     let fetch_from = uid_next.saturating_sub(INITIAL_FETCH_LIMIT).max(1);
     let uid_range = format!("{fetch_from}:*");
 
-    let fetches: Vec<_> =
-        session.uid_fetch(&uid_range, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)").await?.try_collect().await?;
+    let fetches: Vec<_> = session.uid_fetch(&uid_range, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)").await?.try_collect().await?;
 
     let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)).collect();
 
@@ -403,7 +394,12 @@ async fn sync_mailbox(
             tracing::warn!("failed to cache messages for {mailbox_id}: {e}");
         }
     }
-    let _ = events.send(AccountEvent::MessagesUpdated { mailbox: mailbox_id.clone(), messages }).await;
+    let _ = events
+        .send(AccountEvent::MessagesUpdated {
+            mailbox: mailbox_id.clone(),
+            messages,
+        })
+        .await;
     Ok(())
 }
 

@@ -4,11 +4,11 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use webkit::prelude::*;
 use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId};
 use lookout_goa::GoaClient;
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
 use lookout_mail::{AccountConfig, EndpointConfig};
+use webkit::prelude::*;
 
 use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_credentials::GoaCredentialProvider;
@@ -93,7 +93,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     folder_factory.connect_bind(|_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(row) = list_item.item().and_downcast::<gtk::TreeListRow>() else { return };
-        let Some(expander) = list_item.child().and_downcast::<gtk::TreeExpander>() else { return };
+        let Some(expander) = list_item.child().and_downcast::<gtk::TreeExpander>() else {
+            return;
+        };
         expander.set_list_row(Some(&row));
         let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
         let tree_item = boxed.borrow::<TreeItem>();
@@ -105,8 +107,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
             TreeItem::Folder(node) => {
                 let unread = node.mailbox.unread;
-                let text =
-                    if unread > 0 { format!("{}  ({unread})", node.mailbox.name) } else { node.mailbox.name.clone() };
+                let text = if unread > 0 {
+                    format!("{}  ({unread})", node.mailbox.name)
+                } else {
+                    node.mailbox.name.clone()
+                };
                 label.set_label(&text);
                 label.set_css_classes(&[]);
             }
@@ -122,13 +127,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let message_selection = gtk::SingleSelection::new(Some(message_store.clone()));
     let message_factory = gtk::SignalListItemFactory::new();
     message_factory.connect_setup(|_, list_item| {
-        let box_ = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).margin_top(6).margin_bottom(6).margin_start(10).margin_end(10).build();
+        let box_ = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(10)
+            .margin_end(10)
+            .build();
         let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
         let sender = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let date = gtk::Label::builder().xalign(1.0).css_classes(["dim-label", "caption"]).build();
         top_row.append(&sender);
         top_row.append(&date);
-        let subject = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).css_classes(["dim-label"]).build();
+        let subject = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label"])
+            .build();
         box_.append(&top_row);
         box_.append(&subject);
         list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&box_));
@@ -154,6 +170,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let message_card = card_section(&message_scroller);
     let compose_button = gtk::Button::from_icon_name("mail-message-new-symbolic");
     compose_button.set_tooltip_text(Some("New Message"));
+
+    // Dev-only: load a raw .eml fixture straight into the reading pane,
+    // bypassing IMAP entirely - for manually exercising render_body()
+    // against test-fixtures/. Compiled out of release builds.
+    #[cfg(debug_assertions)]
+    let open_eml_button = gtk::Button::from_icon_name("document-open-symbolic");
+    #[cfg(debug_assertions)]
+    open_eml_button.set_tooltip_text(Some("Open .eml (debug)"));
 
     // --- Reading pane: WebKit for HTML, GtkTextView for plain text ---
     let webkit_settings = webkit::Settings::new();
@@ -185,7 +209,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         false
     });
 
-    let text_view = gtk::TextView::builder().editable(false).cursor_visible(false).wrap_mode(gtk::WrapMode::WordChar).left_margin(12).right_margin(12).top_margin(12).bottom_margin(12).build();
+    let text_view = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .left_margin(12)
+        .right_margin(12)
+        .top_margin(12)
+        .bottom_margin(12)
+        .build();
     let text_scroller = gtk::ScrolledWindow::builder().child(&text_view).build();
 
     let reading_stack = gtk::Stack::new();
@@ -246,6 +278,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let window_header = adw::HeaderBar::new();
     window_header.set_title_widget(Some(&adw::WindowTitle::new("Lookout", "")));
     window_header.pack_end(&compose_button);
+    #[cfg(debug_assertions)]
+    window_header.pack_end(&open_eml_button);
     let outer_toolbar_view = adw::ToolbarView::new();
     outer_toolbar_view.add_top_bar(&window_header);
     outer_toolbar_view.set_content(Some(&root_stack));
@@ -260,7 +294,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .content(&toast_overlay)
         .build();
 
-    let state = Rc::new(RefCell::new(UiState { accounts: HashMap::new(), current_account: None, current_mailbox: None }));
+    let state = Rc::new(RefCell::new(UiState {
+        accounts: HashMap::new(),
+        current_account: None,
+        current_mailbox: None,
+    }));
 
     // --- Compose button -> new-message window, "From" = the account owning
     // the currently-open mailbox (falling back to any connected account if
@@ -276,6 +314,33 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let from_email = handle.email.clone();
             drop(st);
             crate::compose::open_compose_window(&window, from_email, cmd_tx, None, None, None);
+        });
+    }
+
+    // --- Debug: open a raw .eml fixture straight into the reading pane ---
+    #[cfg(debug_assertions)]
+    {
+        let window = window.clone();
+        let reading_stack = reading_stack.clone();
+        open_eml_button.connect_clicked(move |_| {
+            let window = window.clone();
+            let reading_stack = reading_stack.clone();
+            glib::spawn_future_local(async move {
+                let filter = gtk::FileFilter::new();
+                filter.add_suffix("eml");
+                filter.set_name(Some("Email messages (*.eml)"));
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+
+                let dialog = gtk::FileDialog::builder().title("Open .eml (debug)").filters(&filters).build();
+
+                let Ok(file) = dialog.open_future(Some(&window)).await else { return };
+                let Some(path) = file.path() else { return };
+                let Ok(raw) = std::fs::read(&path) else { return };
+                if let Some(body) = lookout_mail::body::parse_body(lookout_core::Uid(0), &raw) {
+                    render_body(&reading_stack, body);
+                }
+            });
         });
     }
 
@@ -321,7 +386,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let reading_stack = reading_stack.clone();
         message_selection.connect_selected_item_notify(move |sel| {
-            let Some(boxed) = sel.selected_item().and_downcast::<glib::BoxedAnyObject>() else { return };
+            let Some(boxed) = sel.selected_item().and_downcast::<glib::BoxedAnyObject>() else {
+                return;
+            };
             let summary = boxed.borrow::<EmailSummary>();
             let uid = summary.uid;
             let mailbox = summary.mailbox.clone();
@@ -425,8 +492,7 @@ fn connect_account(
             username: account.smtp.username.clone(),
         },
     };
-    let credentials: Rc<dyn lookout_mail::session::CredentialProvider> =
-        Rc::new(GoaCredentialProvider::new(goa_client, account));
+    let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = Rc::new(GoaCredentialProvider::new(goa_client, account));
     // `run_account_session` requires `Arc<dyn CredentialProvider>` (it may
     // run reconnect attempts on the worker thread's own async tasks), so
     // wrap in a thread-safe handle even though only ever driven from one
@@ -447,14 +513,18 @@ fn connect_account(
             self.0.smtp_credential().await
         }
     }
-    let credentials: std::sync::Arc<dyn lookout_mail::session::CredentialProvider> =
-        std::sync::Arc::new(SendWrapper(credentials));
+    let credentials: std::sync::Arc<dyn lookout_mail::session::CredentialProvider> = std::sync::Arc::new(SendWrapper(credentials));
 
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::unbounded();
     state.borrow_mut().accounts.insert(
         account_id.clone(),
-        AccountHandle { cmd_tx, email: config.email.clone(), display_name, folders: Vec::new() },
+        AccountHandle {
+            cmd_tx,
+            email: config.email.clone(),
+            display_name,
+            folders: Vec::new(),
+        },
     );
 
     worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
@@ -513,7 +583,12 @@ fn connect_account(
 }
 
 fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String {
-    state.borrow().accounts.get(account_id).map(|h| h.display_name.clone()).unwrap_or_else(|| account_id.0.clone())
+    state
+        .borrow()
+        .accounts
+        .get(account_id)
+        .map(|h| h.display_name.clone())
+        .unwrap_or_else(|| account_id.0.clone())
 }
 
 /// Rebuilds the folder sidebar's `Gtk.TreeListModel` from every connected
@@ -525,7 +600,11 @@ fn rebuild_folder_tree(state: &UiState, folder_selection: &gtk::SingleSelection)
         .accounts
         .iter()
         .map(|(id, handle)| {
-            let label = if handle.display_name.is_empty() { handle.email.clone() } else { handle.display_name.clone() };
+            let label = if handle.display_name.is_empty() {
+                handle.email.clone()
+            } else {
+                handle.display_name.clone()
+            };
             (id.clone(), label, handle.folders.clone())
         })
         .collect();

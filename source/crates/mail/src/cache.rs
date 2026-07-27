@@ -35,7 +35,11 @@ fn cache_dir() -> std::path::PathBuf {
 /// `/org/gnome/OnlineAccounts/Accounts/account_1234`); sanitize into a bare
 /// filename.
 fn sanitize_filename(account_id: &AccountId) -> String {
-    account_id.0.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    account_id
+        .0
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
 }
 
 impl Cache {

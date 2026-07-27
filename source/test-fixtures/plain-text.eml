@@ -1,0 +1,13 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: Plain text fixture
+Date: Tue, 28 Jul 2026 09:00:00 +0000
+Message-ID: <plain-text-fixture@lookout.test>
+Content-Type: text/plain; charset=utf-8
+
+Hello Bob,
+
+This is a plain-text-only message with no HTML alternative.
+It should render in the Gtk.TextView fallback pane.
+
+- Alice

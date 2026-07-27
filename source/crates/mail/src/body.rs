@@ -12,10 +12,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
     let text_body = message.body_text(0).map(|c| c.into_owned());
     let html_body = message.body_html(0).map(|c| c.into_owned());
 
-    let headers = message
-        .headers_raw()
-        .map(|(name, value)| (name.to_string(), value.trim().to_string()))
-        .collect();
+    let headers = message.headers_raw().map(|(name, value)| (name.to_string(), value.trim().to_string())).collect();
 
     let parts = message
         .attachments()
@@ -39,5 +36,65 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         })
         .collect();
 
-    Some(EmailBody { uid, text_body, html_body, parts, headers, auth_results: None })
+    Some(EmailBody {
+        uid,
+        text_body,
+        html_body,
+        parts,
+        headers,
+        auth_results: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/").to_string() + name;
+        std::fs::read(&path).unwrap_or_else(|e| panic!("reading fixture {path}: {e}"))
+    }
+
+    #[test]
+    fn plain_text_fixture_has_text_body() {
+        let body = parse_body(Uid(0), &fixture("plain-text.eml")).expect("parses");
+        assert!(body.text_body.is_some());
+        // Note: mail_parser's body_html(0) synthesizes an HTML rendering of
+        // the plain-text body as a convenience fallback (wraps it in
+        // <html><body>...<br/> tags), so html_body is Some here too - a
+        // genuinely plain-text-only message doesn't actually leave
+        // html_body unset. render_body() in the app crate prefers
+        // html_body when present, so this fixture in practice renders via
+        // the WebKit view, not the Gtk.TextView fallback path.
+    }
+
+    #[test]
+    fn html_inline_css_fixture_parses_html() {
+        let body = parse_body(Uid(0), &fixture("html-inline-css.eml")).expect("parses");
+        let html = body.html_body.expect("has html body");
+        assert!(html.contains("highlight"));
+    }
+
+    #[test]
+    fn html_cid_image_fixture_parses_without_panicking() {
+        let body = parse_body(Uid(0), &fixture("html-cid-image.eml")).expect("parses");
+        assert!(body.html_body.expect("has html body").contains("cid:logo123"));
+        // Documents current behavior for the still-open "inline cid: image
+        // resolution" TODO item, rather than asserting a specific outcome:
+        // mail_parser's `attachments()` may or may not surface a
+        // multipart/related inline part as a `BodyPart` with `cid` set.
+        let _ = body.parts.iter().find(|p| p.cid.as_deref() == Some("logo123"));
+    }
+
+    #[test]
+    fn html_external_image_fixture_parses_html() {
+        let body = parse_body(Uid(0), &fixture("html-external-image.eml")).expect("parses");
+        assert!(body.html_body.expect("has html body").contains("example.com/tracker.png"));
+    }
+
+    #[test]
+    fn malformed_html_fixture_does_not_panic() {
+        let body = parse_body(Uid(0), &fixture("html-malformed.eml")).expect("parses");
+        assert!(body.html_body.is_some());
+    }
 }

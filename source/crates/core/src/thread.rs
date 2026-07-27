@@ -88,10 +88,7 @@ pub fn normalize_subject(subject: &str) -> String {
     let mut s = subject.trim();
     loop {
         let lower = s.to_ascii_lowercase();
-        let prefix_len = ["re:", "fwd:", "fw:"]
-            .iter()
-            .find(|p| lower.starts_with(**p))
-            .map(|p| p.len());
+        let prefix_len = ["re:", "fwd:", "fw:"].iter().find(|p| lower.starts_with(**p)).map(|p| p.len());
         match prefix_len {
             Some(len) => s = s[len..].trim(),
             None => break,
@@ -145,9 +142,7 @@ pub fn compute_thread_keys(messages: &[EmailSummary]) -> HashMap<Uid, ThreadKey>
             .iter()
             .find(|(id, has_parent, _)| referenced.contains(id) && !has_parent)
             .map(|(id, _, _)| id.clone());
-        let key = true_root.unwrap_or_else(|| {
-            members.iter().min_by_key(|(_, _, date)| *date).unwrap().0.clone()
-        });
+        let key = true_root.unwrap_or_else(|| members.iter().min_by_key(|(_, _, date)| *date).unwrap().0.clone());
         canonical.insert(root.clone(), key);
     }
 
@@ -175,9 +170,10 @@ pub fn group_into_threads(mut messages: Vec<EmailSummary>) -> Vec<ThreadGroup> {
 
     let mut by_key: HashMap<ThreadKey, Vec<EmailSummary>> = HashMap::new();
     for msg in messages {
-        let key = keys.get(&msg.uid).cloned().unwrap_or_else(|| {
-            ThreadKey(format!("subject:{}", normalize_subject(msg.subject.as_deref().unwrap_or(""))))
-        });
+        let key = keys
+            .get(&msg.uid)
+            .cloned()
+            .unwrap_or_else(|| ThreadKey(format!("subject:{}", normalize_subject(msg.subject.as_deref().unwrap_or("")))));
         by_key.entry(key).or_default().push(msg);
     }
 
@@ -187,16 +183,20 @@ pub fn group_into_threads(mut messages: Vec<EmailSummary>) -> Vec<ThreadGroup> {
             let has_unread = emails.iter().any(|e| e.is_unread());
             let has_starred = emails.iter().any(|e| e.is_starred());
             let has_attachment = emails.iter().any(|e| e.has_attachment);
-            let has_answered = emails
-                .iter()
-                .any(|e| e.flags.contains(&crate::email::SystemFlagBit::Answered));
-            let mut participants: Vec<String> = emails
-                .iter()
-                .flat_map(|e| e.from.iter().map(|a| a.display_label().to_string()))
-                .collect();
+            let has_answered = emails.iter().any(|e| e.flags.contains(&crate::email::SystemFlagBit::Answered));
+            let mut participants: Vec<String> = emails.iter().flat_map(|e| e.from.iter().map(|a| a.display_label().to_string())).collect();
             participants.dedup();
             let latest = emails.len() - 1;
-            ThreadGroup { key, emails, latest, participants, has_unread, has_starred, has_attachment, has_answered }
+            ThreadGroup {
+                key,
+                emails,
+                latest,
+                participants,
+                has_unread,
+                has_starred,
+                has_attachment,
+                has_answered,
+            }
         })
         .collect();
 

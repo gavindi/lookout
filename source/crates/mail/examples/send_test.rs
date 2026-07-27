@@ -35,9 +35,7 @@ impl GoaCredentialProvider {
                 let (token, _) = self.client.get_access_token(&self.account).await.map_err(|e| e.to_string())?;
                 Ok(Credential::OAuth2AccessToken(token))
             }
-            AuthMethod::Password { .. } => {
-                Ok(Credential::Password(self.client.get_imap_password(&self.account).await.map_err(|e| e.to_string())?))
-            }
+            AuthMethod::Password { .. } => Ok(Credential::Password(self.client.get_imap_password(&self.account).await.map_err(|e| e.to_string())?)),
         }
     }
 }

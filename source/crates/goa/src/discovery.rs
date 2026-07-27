@@ -4,7 +4,7 @@ use lookout_core::AccountId;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
-use crate::proxies::{AccountProxy, ManagedObjects, ObjectManagerProxy, OAuth2BasedProxy, PasswordBasedProxy};
+use crate::proxies::{AccountProxy, ManagedObjects, OAuth2BasedProxy, ObjectManagerProxy, PasswordBasedProxy};
 use crate::{Error, Result};
 
 const IFACE_ACCOUNT: &str = "org.gnome.OnlineAccounts.Account";
@@ -21,7 +21,10 @@ pub enum AuthMethod {
     /// slot ids to use for each protocol (commonly `"imap-password"` /
     /// `"smtp-password"`, falling back to a generic `"password"` id for
     /// providers that don't split them).
-    Password { imap_password_id: String, smtp_password_id: String },
+    Password {
+        imap_password_id: String,
+        smtp_password_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -78,11 +81,7 @@ impl GoaClient {
         Ok(accounts)
     }
 
-    fn parse_mail_account(
-        &self,
-        path: &OwnedObjectPath,
-        ifaces: &HashMap<String, HashMap<String, OwnedValue>>,
-    ) -> Result<Option<GoaMailAccount>> {
+    fn parse_mail_account(&self, path: &OwnedObjectPath, ifaces: &HashMap<String, HashMap<String, OwnedValue>>) -> Result<Option<GoaMailAccount>> {
         let Some(account_props) = ifaces.get(IFACE_ACCOUNT) else {
             return Ok(None);
         };
@@ -111,16 +110,14 @@ impl GoaClient {
         let imap = EndpointConfig {
             host: imap_host,
             port: imap_port,
-            use_tls: get_bool(mail_props, "ImapUseSsl").unwrap_or(false)
-                || get_bool(mail_props, "ImapUseTls").unwrap_or(false),
+            use_tls: get_bool(mail_props, "ImapUseSsl").unwrap_or(false) || get_bool(mail_props, "ImapUseTls").unwrap_or(false),
             accept_ssl_errors: get_bool(mail_props, "ImapAcceptSslErrors").unwrap_or(false),
             username: get_string(mail_props, "ImapUserName").unwrap_or_default(),
         };
         let smtp = EndpointConfig {
             host: smtp_host,
             port: smtp_port,
-            use_tls: get_bool(mail_props, "SmtpUseSsl").unwrap_or(false)
-                || get_bool(mail_props, "SmtpUseTls").unwrap_or(false),
+            use_tls: get_bool(mail_props, "SmtpUseSsl").unwrap_or(false) || get_bool(mail_props, "SmtpUseTls").unwrap_or(false),
             accept_ssl_errors: get_bool(mail_props, "SmtpAcceptSslErrors").unwrap_or(false),
             username: get_string(mail_props, "SmtpUserName").unwrap_or_default(),
         };

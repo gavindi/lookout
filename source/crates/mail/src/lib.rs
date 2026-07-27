@@ -10,7 +10,7 @@
 //! any GNOME/D-Bus session present.
 
 mod auth;
-mod body;
+pub mod body;
 mod cache;
 mod config;
 mod connection;

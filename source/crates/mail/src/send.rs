@@ -1,5 +1,5 @@
-use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::address::Envelope;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Address as SmtpAddress, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use mail_builder::headers::address::Address as BuilderAddress;
 use mail_builder::MessageBuilder;

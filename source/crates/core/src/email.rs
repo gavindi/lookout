@@ -13,7 +13,10 @@ pub struct EmailAddress {
 
 impl EmailAddress {
     pub fn new(address: impl Into<String>) -> Self {
-        EmailAddress { name: None, address: address.into() }
+        EmailAddress {
+            name: None,
+            address: address.into(),
+        }
     }
 
     /// A display label suitable for list rows: the display name if present,
@@ -164,13 +167,22 @@ mod tests {
 
     #[test]
     fn display_label_prefers_name_over_bare_address() {
-        let addr = EmailAddress { name: Some("Ada Lovelace".into()), address: "ada@example.com".into() };
+        let addr = EmailAddress {
+            name: Some("Ada Lovelace".into()),
+            address: "ada@example.com".into(),
+        };
         assert_eq!(addr.display_label(), "Ada Lovelace");
 
-        let addr = EmailAddress { name: None, address: "ada@example.com".into() };
+        let addr = EmailAddress {
+            name: None,
+            address: "ada@example.com".into(),
+        };
         assert_eq!(addr.display_label(), "ada@example.com");
 
-        let addr = EmailAddress { name: Some("  ".into()), address: "ada@example.com".into() };
+        let addr = EmailAddress {
+            name: Some("  ".into()),
+            address: "ada@example.com".into(),
+        };
         assert_eq!(addr.display_label(), "ada@example.com");
     }
 

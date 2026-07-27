@@ -40,7 +40,14 @@ pub fn open_compose_window(
     }
     let body_scroller = gtk::ScrolledWindow::builder().child(&body_view).vexpand(true).build();
 
-    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
     content.append(&fields_group);
     content.append(&body_scroller);
 

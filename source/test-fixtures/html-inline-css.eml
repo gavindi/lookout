@@ -1,0 +1,14 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: HTML with inline CSS
+Date: Tue, 28 Jul 2026 09:05:00 +0000
+Message-ID: <html-inline-css-fixture@lookout.test>
+Content-Type: text/html; charset=utf-8
+
+<html><head><style>
+  body { font-family: sans-serif; color: #222; }
+  .highlight { background: #ffec99; padding: 2px 4px; }
+</style></head>
+<body>
+  <p>Hello <span class="highlight">Bob</span>, this uses inline CSS.</p>
+</body></html>
