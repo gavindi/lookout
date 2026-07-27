@@ -1,0 +1,12 @@
+[package]
+name = "lookout-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]

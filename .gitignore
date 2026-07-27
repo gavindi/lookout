@@ -1,0 +1,11 @@
+# Referecne Material
+webmail/
+
+# Build Directories
+source/target/
+target/
+
+#Temporary Files
+*.lock
+*.tmp
+

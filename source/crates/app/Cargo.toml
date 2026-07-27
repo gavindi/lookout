@@ -1,0 +1,23 @@
+[package]
+name = "lookout-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lookout"
+path = "src/main.rs"
+
+[dependencies]
+lookout-core.workspace = true
+lookout-goa.workspace = true
+lookout-mail.workspace = true
+async-channel.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+webkit = { package = "webkit6", version = "0.6" }

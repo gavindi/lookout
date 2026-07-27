@@ -1,0 +1,31 @@
+[package]
+name = "lookout-mail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lookout-core.workspace = true
+async-channel.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tracing.workspace = true
+
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+futures = "0.3"
+base64 = "0.22"
+
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+
+mail-parser = "0.11"
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+anyhow = "1"
+lookout-goa.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true

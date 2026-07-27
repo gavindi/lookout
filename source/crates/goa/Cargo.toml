@@ -1,0 +1,15 @@
+[package]
+name = "lookout-goa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lookout-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+anyhow = "1"
+tokio.workspace = true
