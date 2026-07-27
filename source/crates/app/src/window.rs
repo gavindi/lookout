@@ -1,26 +1,43 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 use webkit::prelude::*;
-use lookout_core::{AccountId, EmailSummary, MailboxId};
+use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId};
 use lookout_goa::GoaClient;
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
 use lookout_mail::{AccountConfig, EndpointConfig};
 
-use crate::folder_tree::{build_tree_model, FolderNode};
+use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::worker::Worker;
+
+/// Per-account state the UI needs once an `AccountSession` actor is running:
+/// how to send it commands, its identity (for compose "From" and toast
+/// labeling), and the last folder list it reported (kept here so the
+/// multi-account folder tree can be rebuilt in full from all accounts'
+/// latest snapshots whenever any one of them changes).
+struct AccountHandle {
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    email: String,
+    display_name: String,
+    folders: Vec<Mailbox>,
+}
 
 /// Mutable UI-thread state the various signal handlers close over. Plain
 /// `Rc<RefCell<_>>` is fine here - GTK is single-threaded, so there's no
 /// need for `Arc<Mutex<_>>` on this side of the worker-thread boundary.
 struct UiState {
-    cmd_tx: Option<async_channel::Sender<AccountCommand>>,
+    accounts: HashMap<AccountId, AccountHandle>,
+    /// Which account owns the currently-open mailbox - drives command
+    /// routing (FetchBody, compose "From") and which account's
+    /// `MessagesUpdated` events are allowed to update the message list (a
+    /// background IDLE resync on some *other* account must not clobber
+    /// whatever the user is currently looking at).
+    current_account: Option<AccountId>,
     current_mailbox: Option<MailboxId>,
-    account_id: Option<AccountId>,
-    from_email: Option<String>,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -64,7 +81,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     });
     status_page.set_child(Some(&open_settings_button));
 
-    // --- Folder sidebar ---
+    // --- Folder sidebar: one expanded-by-default group per account ---
     let folder_selection = gtk::SingleSelection::new(None::<gio::ListModel>);
     let folder_factory = gtk::SignalListItemFactory::new();
     folder_factory.connect_setup(|_, list_item| {
@@ -79,12 +96,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let Some(expander) = list_item.child().and_downcast::<gtk::TreeExpander>() else { return };
         expander.set_list_row(Some(&row));
         let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
-        let node = boxed.borrow::<Rc<FolderNode>>();
-        if let Some(label) = expander.child().and_downcast::<gtk::Label>() {
-            let unread = node.mailbox.unread;
-            let text =
-                if unread > 0 { format!("{}  ({unread})", node.mailbox.name) } else { node.mailbox.name.clone() };
-            label.set_label(&text);
+        let tree_item = boxed.borrow::<TreeItem>();
+        let Some(label) = expander.child().and_downcast::<gtk::Label>() else { return };
+        match &*tree_item {
+            TreeItem::Account(account) => {
+                label.set_label(&account.label);
+                label.set_css_classes(&["heading"]);
+            }
+            TreeItem::Folder(node) => {
+                let unread = node.mailbox.unread;
+                let text =
+                    if unread > 0 { format!("{}  ({unread})", node.mailbox.name) } else { node.mailbox.name.clone() };
+                label.set_label(&text);
+                label.set_css_classes(&[]);
+            }
         }
     });
 
@@ -169,6 +194,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let reading_empty = adw::StatusPage::builder().icon_name("mail-message-new-symbolic").title("No Message Selected").build();
     reading_stack.add_named(&reading_empty, Some("empty"));
     reading_stack.set_visible_child_name("empty");
+    // Floor so the reading pane never gets squeezed down to something
+    // unusably short if the window itself is resized very short - since
+    // both Paneds here are horizontal, every pane always spans the full
+    // window height, so this is really a minimum-window-height constraint
+    // expressed on the pane that most needs it. Set directly on the Stack
+    // (not on `text_scroller`'s child) because `Gtk.ScrolledWindow`
+    // deliberately absorbs its child's size request instead of propagating
+    // it - setting it here, on the Stack itself, is what actually reaches
+    // the window's own size negotiation.
+    reading_stack.set_size_request(-1, 300);
 
     let reading_card = card_section(&reading_stack);
 
@@ -225,21 +260,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .content(&toast_overlay)
         .build();
 
-    let state = Rc::new(RefCell::new(UiState { cmd_tx: None, current_mailbox: None, account_id: None, from_email: None }));
+    let state = Rc::new(RefCell::new(UiState { accounts: HashMap::new(), current_account: None, current_mailbox: None }));
 
-    // --- Compose button -> new-message window ---
+    // --- Compose button -> new-message window, "From" = the account owning
+    // the currently-open mailbox (falling back to any connected account if
+    // nothing's been selected yet) ---
     {
         let state = state.clone();
         let window = window.clone();
         compose_button.connect_clicked(move |_| {
             let st = state.borrow();
-            let (Some(cmd_tx), Some(from_email)) = (st.cmd_tx.clone(), st.from_email.clone()) else { return };
+            let account_id = st.current_account.clone().or_else(|| st.accounts.keys().next().cloned());
+            let Some(handle) = account_id.and_then(|id| st.accounts.get(&id)) else { return };
+            let cmd_tx = handle.cmd_tx.clone();
+            let from_email = handle.email.clone();
             drop(st);
             crate::compose::open_compose_window(&window, from_email, cmd_tx, None, None, None);
         });
     }
 
-    // --- Network connectivity -> nudge a backed-off session to retry now ---
+    // --- Network connectivity -> nudge every backed-off account to retry now ---
     {
         let state = state.clone();
         let monitor = gio::NetworkMonitor::default();
@@ -247,29 +287,36 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if !available {
                 return;
             }
-            let st = state.borrow();
-            if let Some(tx) = &st.cmd_tx {
-                let _ = tx.send_blocking(AccountCommand::Reconnect);
+            for handle in state.borrow().accounts.values() {
+                let _ = handle.cmd_tx.send_blocking(AccountCommand::Reconnect);
             }
         });
     }
 
-    // --- Folder selection -> AccountCommand::SyncMailbox ---
+    // --- Folder selection -> AccountCommand::SyncMailbox on that folder's
+    // own account (selecting an account-group row itself is a no-op - it
+    // just expands/collapses) ---
     {
         let state = state.clone();
         folder_selection.connect_selected_item_notify(move |sel| {
             let Some(row) = sel.selected_item().and_downcast::<gtk::TreeListRow>() else { return };
             let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
-            let node = boxed.borrow::<Rc<FolderNode>>();
+            let tree_item = boxed.borrow::<TreeItem>();
+            let TreeItem::Folder(node) = &*tree_item else { return };
             let mailbox_id = node.mailbox.id.clone();
-            let st = state.borrow();
-            if let Some(tx) = &st.cmd_tx {
-                let _ = tx.send_blocking(AccountCommand::SyncMailbox(mailbox_id));
+            let account_id = node.mailbox.account_id.clone();
+            drop(tree_item);
+
+            let mut st = state.borrow_mut();
+            st.current_account = Some(account_id.clone());
+            st.current_mailbox = Some(mailbox_id.clone());
+            if let Some(handle) = st.accounts.get(&account_id) {
+                let _ = handle.cmd_tx.send_blocking(AccountCommand::SyncMailbox(mailbox_id));
             }
         });
     }
 
-    // --- Message selection -> AccountCommand::FetchBody ---
+    // --- Message selection -> AccountCommand::FetchBody on the current account ---
     {
         let state = state.clone();
         let reading_stack = reading_stack.clone();
@@ -279,10 +326,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let uid = summary.uid;
             let mailbox = summary.mailbox.clone();
             drop(summary);
+
             let st = state.borrow();
-            if let Some(tx) = &st.cmd_tx {
-                let _ = tx.send_blocking(AccountCommand::FetchBody { mailbox, uid });
+            if let Some(handle) = st.current_account.as_ref().and_then(|id| st.accounts.get(id)) {
+                let _ = handle.cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox, uid });
             }
+            drop(st);
             reading_stack.set_visible_child_name("empty");
         });
     }
@@ -315,10 +364,25 @@ fn spawn_account_discovery(
     glib::spawn_future_local(async move {
         let Ok(result) = goa_rx.recv().await else { return };
         match result {
-            Ok((client, mut accounts)) if !accounts.is_empty() => {
-                let account = accounts.remove(0);
+            Ok((client, accounts)) if !accounts.is_empty() => {
                 root_stack.set_visible_child_name("mail");
-                connect_account(worker, state, folder_selection, message_store, reading_stack, toast_overlay, client, account);
+                // One AccountSession actor per connected account, all
+                // running concurrently on the worker thread. `GoaClient` is
+                // a cheap Arc-backed handle (see its doc comment), so
+                // cloning it per account reuses the one D-Bus connection
+                // rather than opening a redundant one each time.
+                for account in accounts {
+                    connect_account(
+                        worker.clone(),
+                        state.clone(),
+                        folder_selection.clone(),
+                        message_store.clone(),
+                        reading_stack.clone(),
+                        toast_overlay.clone(),
+                        client.clone(),
+                        account,
+                    );
+                }
             }
             Ok(_) => {
                 root_stack.set_visible_child_name("empty");
@@ -343,6 +407,7 @@ fn connect_account(
     account: lookout_goa::GoaMailAccount,
 ) {
     let account_id = AccountId(account.account_id.0.clone());
+    let display_name = account.display_name.clone();
     let config = AccountConfig {
         account_id: account_id.clone(),
         display_name: account.display_name.clone(),
@@ -387,9 +452,10 @@ fn connect_account(
 
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::unbounded();
-    state.borrow_mut().cmd_tx = Some(cmd_tx);
-    state.borrow_mut().account_id = Some(account_id);
-    state.borrow_mut().from_email = Some(config.email.clone());
+    state.borrow_mut().accounts.insert(
+        account_id.clone(),
+        AccountHandle { cmd_tx, email: config.email.clone(), display_name, folders: Vec::new() },
+    );
 
     worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
 
@@ -397,22 +463,39 @@ fn connect_account(
         while let Ok(event) = evt_rx.recv().await {
             match event {
                 AccountEvent::ConnectionStateChanged(ConnectionState::Error { message, .. }) => {
-                    toast_overlay.add_toast(adw::Toast::new(&message));
+                    toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", account_label(&state, &account_id))));
                 }
                 AccountEvent::ConnectionStateChanged(_) => {}
                 AccountEvent::FoldersUpdated(folders) => {
-                    let Some(account_id) = state.borrow().account_id.clone() else { continue };
-                    let model = build_tree_model(folders, &account_id);
-                    folder_selection.set_model(Some(&model));
+                    if let Some(handle) = state.borrow_mut().accounts.get_mut(&account_id) {
+                        handle.folders = folders;
+                    }
+                    rebuild_folder_tree(&state.borrow(), &folder_selection);
                 }
                 AccountEvent::MessagesUpdated { mailbox, messages } => {
-                    state.borrow_mut().current_mailbox = Some(mailbox);
-                    message_store.remove_all();
-                    // Newest first for the reading list.
-                    let mut messages = messages;
-                    messages.sort_by_key(|m| std::cmp::Reverse(m.date));
-                    for m in messages {
-                        message_store.append(&glib::BoxedAnyObject::new(m));
+                    let should_display = {
+                        let mut st = state.borrow_mut();
+                        // Nothing selected yet (fresh startup): adopt
+                        // whichever account's initial inbox sync lands
+                        // first as the default view, rather than leaving
+                        // the message list empty until the user clicks a
+                        // folder. Whichever connected account happens to
+                        // finish its first sync first wins this race -
+                        // an acceptable, benign nondeterminism for Phase 1.
+                        if st.current_mailbox.is_none() {
+                            st.current_account = Some(account_id.clone());
+                            st.current_mailbox = Some(mailbox.clone());
+                        }
+                        st.current_mailbox.as_ref() == Some(&mailbox)
+                    };
+                    if should_display {
+                        message_store.remove_all();
+                        // Newest first for the reading list.
+                        let mut messages = messages;
+                        messages.sort_by_key(|m| std::cmp::Reverse(m.date));
+                        for m in messages {
+                            message_store.append(&glib::BoxedAnyObject::new(m));
+                        }
                     }
                 }
                 AccountEvent::BodyFetched { body, .. } => {
@@ -422,11 +505,34 @@ fn connect_account(
                     toast_overlay.add_toast(adw::Toast::new("Message sent"));
                 }
                 AccountEvent::Error(message) => {
-                    toast_overlay.add_toast(adw::Toast::new(&message));
+                    toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", account_label(&state, &account_id))));
                 }
             }
         }
     });
+}
+
+fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String {
+    state.borrow().accounts.get(account_id).map(|h| h.display_name.clone()).unwrap_or_else(|| account_id.0.clone())
+}
+
+/// Rebuilds the folder sidebar's `Gtk.TreeListModel` from every connected
+/// account's latest folder snapshot. Accounts are sorted by email for a
+/// stable order across rebuilds (`HashMap` iteration order isn't stable,
+/// and accounts visibly reshuffling on every resync would be jarring).
+fn rebuild_folder_tree(state: &UiState, folder_selection: &gtk::SingleSelection) {
+    let mut accounts: Vec<(AccountId, String, Vec<Mailbox>)> = state
+        .accounts
+        .iter()
+        .map(|(id, handle)| {
+            let label = if handle.display_name.is_empty() { handle.email.clone() } else { handle.display_name.clone() };
+            (id.clone(), label, handle.folders.clone())
+        })
+        .collect();
+    accounts.sort_by_key(|a| a.1.to_lowercase());
+
+    let model = build_multi_account_tree_model(accounts);
+    folder_selection.set_model(Some(&model));
 }
 
 /// Wraps `content` directly in a `.card`-styled box - libadwaita's real,

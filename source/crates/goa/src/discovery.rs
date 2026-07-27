@@ -49,6 +49,10 @@ pub struct GoaMailAccount {
 
 /// Thin wrapper over a session-bus [`Connection`] providing GOA account
 /// discovery and on-demand credential fetches. Holds no secrets itself.
+/// `Clone` is cheap - `zbus::Connection` is itself an `Arc`-backed handle -
+/// so one `GoaClient` can be shared across multiple accounts' credential
+/// providers instead of opening a redundant D-Bus connection per account.
+#[derive(Clone)]
 pub struct GoaClient {
     connection: Connection,
 }

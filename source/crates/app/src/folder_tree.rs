@@ -15,6 +15,20 @@ pub struct FolderNode {
     pub children: Vec<Rc<FolderNode>>,
 }
 
+/// A root-level row identifying one connected GOA account, above that
+/// account's own folder tree.
+pub struct AccountNode {
+    pub account_id: AccountId,
+    pub label: String,
+}
+
+/// What a `Gtk.TreeListRow`'s `glib::BoxedAnyObject` actually holds - either
+/// the account-grouping row itself, or one of that account's mailboxes.
+pub enum TreeItem {
+    Account(AccountNode),
+    Folder(Rc<FolderNode>),
+}
+
 /// Reconstructs a folder hierarchy from the flat mailbox list IMAP's `LIST`
 /// returns, by splitting each mailbox's full path (recovered from its
 /// `MailboxId`) on its hierarchy delimiter. A folder whose parent path isn't
@@ -67,26 +81,49 @@ fn sort_paths(paths: &mut [String], by_path: &HashMap<String, Mailbox>) {
     });
 }
 
-/// Builds the `Gtk.TreeListModel` for the folder sidebar from a flat mailbox
-/// list. Each row's item is a `glib::BoxedAnyObject` wrapping an
-/// `Rc<FolderNode>`.
-pub fn build_tree_model(mailboxes: Vec<Mailbox>, account_id: &AccountId) -> gtk::TreeListModel {
-    let roots = build_folder_roots(mailboxes, account_id);
+/// Builds the `Gtk.TreeListModel` for the folder sidebar from every
+/// connected account's flat mailbox list: one top-level, expanded-by-default
+/// `TreeItem::Account` row per account (Thunderbird-style grouping), each
+/// expanding to that account's own folder tree. Each row's item is a
+/// `glib::BoxedAnyObject` wrapping a `TreeItem`.
+pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mailbox>)>) -> gtk::TreeListModel {
+    let mut folder_roots_by_account: HashMap<AccountId, Vec<Rc<FolderNode>>> = HashMap::new();
     let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
-    for node in roots {
-        root_store.append(&glib::BoxedAnyObject::new(node));
+    for (account_id, label, mailboxes) in accounts {
+        let roots = build_folder_roots(mailboxes, &account_id);
+        root_store.append(&glib::BoxedAnyObject::new(TreeItem::Account(AccountNode {
+            account_id: account_id.clone(),
+            label,
+        })));
+        folder_roots_by_account.insert(account_id, roots);
     }
 
-    gtk::TreeListModel::new(root_store, false, false, |item| {
+    let model = gtk::TreeListModel::new(root_store, false, false, move |item| {
         let boxed = item.downcast_ref::<glib::BoxedAnyObject>()?;
-        let node = boxed.borrow::<Rc<FolderNode>>();
-        if node.children.is_empty() {
+        let tree_item = boxed.borrow::<TreeItem>();
+        let children = match &*tree_item {
+            TreeItem::Account(acc) => folder_roots_by_account.get(&acc.account_id)?.clone(),
+            TreeItem::Folder(node) => node.children.clone(),
+        };
+        if children.is_empty() {
             return None;
         }
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
-        for child in &node.children {
-            store.append(&glib::BoxedAnyObject::new(child.clone()));
+        for child in children {
+            store.append(&glib::BoxedAnyObject::new(TreeItem::Folder(child)));
         }
         Some(store.upcast::<gio::ListModel>())
-    })
+    });
+
+    // Expand every account row by default so folders are immediately
+    // visible without an extra click - matches the single-account
+    // behavior this replaces. Only the top level: subfolders still start
+    // collapsed.
+    for i in 0..model.n_items() {
+        if let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() {
+            row.set_expanded(true);
+        }
+    }
+
+    model
 }
