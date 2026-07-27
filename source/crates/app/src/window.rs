@@ -129,16 +129,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let webkit_settings = webkit::Settings::new();
     webkit_settings.set_enable_javascript(false);
     webkit_settings.set_enable_developer_extras(false);
-    let web_view = webkit::WebView::builder().settings(&webkit_settings).build();
-    // Block all navigation out of the sandboxed viewer (loading a message
-    // body is the only intended use); external links should open in the
-    // system browser instead of navigating in-place - full "open
-    // externally" handling is a Phase 2 refinement, for now navigation is
-    // simply vetoed.
+    let web_view = webkit::WebView::builder().settings(&webkit_settings).hexpand(true).vexpand(true).build();
+    // Block navigation *away* from the loaded message body (e.g. clicking a
+    // link) - but NOT the initial programmatic `load_html()` call itself,
+    // which also fires a NavigationAction decision. Distinguish the two via
+    // `is_user_gesture()`: a real click is a user gesture, `load_html()` is
+    // not. Getting this wrong (blocking unconditionally) silently vetoes
+    // every load, which is exactly the "reading pane always blank" bug this
+    // fixes - the WebView was never rendering anything because its own
+    // initial content load was being cancelled before it started. External
+    // links should ideally open in the system browser instead of just being
+    // dropped - full "open externally" handling is a Phase 2 refinement.
     web_view.connect_decide_policy(|_view, decision, decision_type| {
         if decision_type == webkit::PolicyDecisionType::NavigationAction {
-            decision.ignore();
-            return true;
+            let is_user_gesture = decision
+                .downcast_ref::<webkit::NavigationPolicyDecision>()
+                .and_then(|d| d.navigation_action())
+                .map(|action| action.is_user_gesture())
+                .unwrap_or(false);
+            if is_user_gesture {
+                decision.ignore();
+                return true;
+            }
         }
         false
     });

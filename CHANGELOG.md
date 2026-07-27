@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 (2026-07-28)
+
+### Fixed
+
+- **Mail**: the HTML reading pane always rendered blank white, regardless of content. The `decide-policy` handler installed to block link-clicks from navigating the viewer was blocking *every* `NavigationAction` decision, including the WebView's own initial `load_html()` load - so no message body ever actually rendered, silently. Now distinguished via `NavigationAction::is_user_gesture()`: real clicks are still blocked, the programmatic initial load isn't. Confirmed fixed against a real HTML email (a Google Calendar invite, full styling and all).
+
 ## 0.2.0 (2026-07-28)
 
 ### Added
