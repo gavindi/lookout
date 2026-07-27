@@ -1,5 +1,6 @@
 //! GTK4/libadwaita application entry point.
 
+mod compose;
 mod folder_tree;
 mod goa_credentials;
 mod window;

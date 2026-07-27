@@ -11,11 +11,14 @@
 
 mod auth;
 mod body;
+mod cache;
 mod config;
 mod connection;
 mod envelope;
 mod error;
+pub mod send;
 pub mod session;
 
 pub use config::{AccountConfig, Credential, EndpointConfig};
 pub use error::{Error, Result};
+pub use send::ComposedMessage;

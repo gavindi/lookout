@@ -33,6 +33,21 @@ impl CredentialProvider for GoaCredentialProvider {
             }
         }
     }
+
+    async fn smtp_credential(&self) -> Result<Credential, String> {
+        self.client.ensure_credentials(&self.account).await.map_err(|e| e.to_string())?;
+        match &self.account.auth {
+            AuthMethod::OAuth2 => {
+                let (token, _expires_in) =
+                    self.client.get_access_token(&self.account).await.map_err(|e| e.to_string())?;
+                Ok(Credential::OAuth2AccessToken(token))
+            }
+            AuthMethod::Password { .. } => {
+                let password = self.client.get_smtp_password(&self.account).await.map_err(|e| e.to_string())?;
+                Ok(Credential::Password(password))
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -130,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         got_body = true;
                     }
+                    AccountEvent::SendCompleted => println!("send completed"),
                     AccountEvent::Error(e) => println!("ERROR: {e}"),
                 }
                 if got_folders && got_messages && got_body {

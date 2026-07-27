@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Lookout
+GenericName=Mail Client
+Comment=Read and send mail through accounts configured in GNOME Online Accounts
+Exec=lookout
+Icon=io.github.gavindi.Lookout
+Terminal=false
+Categories=GNOME;GTK;Network;Email;
+Keywords=Mail;Email;IMAP;SMTP;
+StartupNotify=true

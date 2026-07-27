@@ -20,6 +20,7 @@ struct UiState {
     cmd_tx: Option<async_channel::Sender<AccountCommand>>,
     current_mailbox: Option<MailboxId>,
     account_id: Option<AccountId>,
+    from_email: Option<String>,
 }
 
 pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::ApplicationWindow {
@@ -115,9 +116,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .title("Messages")
         .child(&adw::ToolbarView::builder().top_bar_style(adw::ToolbarStyle::Flat).content(&message_scroller).build())
         .build();
+    let compose_button = gtk::Button::from_icon_name("mail-message-new-symbolic");
+    compose_button.set_tooltip_text(Some("New Message"));
     {
+        let header = adw::HeaderBar::new();
+        header.pack_end(&compose_button);
         let toolbar_view = message_page.child().and_downcast::<adw::ToolbarView>().unwrap();
-        toolbar_view.add_top_bar(&adw::HeaderBar::new());
+        toolbar_view.add_top_bar(&header);
     }
 
     // --- Reading pane: WebKit for HTML, GtkTextView for plain text ---
@@ -179,7 +184,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .content(&toast_overlay)
         .build();
 
-    let state = Rc::new(RefCell::new(UiState { cmd_tx: None, current_mailbox: None, account_id: None }));
+    let state = Rc::new(RefCell::new(UiState { cmd_tx: None, current_mailbox: None, account_id: None, from_email: None }));
+
+    // --- Compose button -> new-message window ---
+    {
+        let state = state.clone();
+        let window = window.clone();
+        compose_button.connect_clicked(move |_| {
+            let st = state.borrow();
+            let (Some(cmd_tx), Some(from_email)) = (st.cmd_tx.clone(), st.from_email.clone()) else { return };
+            drop(st);
+            crate::compose::open_compose_window(&window, from_email, cmd_tx, None, None, None);
+        });
+    }
+
+    // --- Network connectivity -> nudge a backed-off session to retry now ---
+    {
+        let state = state.clone();
+        let monitor = gio::NetworkMonitor::default();
+        monitor.connect_network_changed(move |_monitor, available| {
+            if !available {
+                return;
+            }
+            let st = state.borrow();
+            if let Some(tx) = &st.cmd_tx {
+                let _ = tx.send_blocking(AccountCommand::Reconnect);
+            }
+        });
+    }
 
     // --- Folder selection -> AccountCommand::SyncMailbox ---
     {
@@ -304,6 +336,10 @@ fn connect_account(
         async fn imap_credential(&self) -> Result<lookout_mail::Credential, String> {
             self.0.imap_credential().await
         }
+
+        async fn smtp_credential(&self) -> Result<lookout_mail::Credential, String> {
+            self.0.smtp_credential().await
+        }
     }
     let credentials: std::sync::Arc<dyn lookout_mail::session::CredentialProvider> =
         std::sync::Arc::new(SendWrapper(credentials));
@@ -312,6 +348,7 @@ fn connect_account(
     let (evt_tx, evt_rx) = async_channel::unbounded();
     state.borrow_mut().cmd_tx = Some(cmd_tx);
     state.borrow_mut().account_id = Some(account_id);
+    state.borrow_mut().from_email = Some(config.email.clone());
 
     worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
 
@@ -339,6 +376,9 @@ fn connect_account(
                 }
                 AccountEvent::BodyFetched { body, .. } => {
                     render_body(&reading_stack, body);
+                }
+                AccountEvent::SendCompleted => {
+                    toast_overlay.add_toast(adw::Toast::new("Message sent"));
                 }
                 AccountEvent::Error(message) => {
                     toast_overlay.add_toast(adw::Toast::new(&message));

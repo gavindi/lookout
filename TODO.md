@@ -5,29 +5,39 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 ## Phase 1 — Mail MVP
 
 - [x] Cargo workspace scaffolding (`lookout-core`, `lookout-goa`, `lookout-mail`, `lookout-app`)
-- [ ] `.desktop` file, GResource bundle
+- [x] `.desktop` file (`data/io.github.gavindi.Lookout.desktop`, passes `desktop-file-validate`), AppStream metainfo (passes `appstreamcli validate` bar the placeholder homepage URL), placeholder app icon
+  - [ ] GResource bundle - nothing to bundle yet since the UI is built programmatically with no `.ui` XML templates (a deliberate Phase 1 choice, see the plan)
 - [x] `AdwApplication` shell with empty-state page ("No mail accounts configured") that spawns `gnome-control-center online-accounts`
 - [x] `lookout-goa`: zbus proxies for `ObjectManager`/`Account`/`Mail`/`PasswordBased`/`OAuth2Based`; `list_mail_accounts()`
 - [x] Wire account discovery into startup → folder tree for the default account
 - [x] `lookout-mail`: `AccountSession` actor — `LOGIN`/`AUTHENTICATE XOAUTH2`, `LIST (SPECIAL-USE)`, `SELECT`, bounded envelope fetch, IDLE loop with instant command interruption
-- [ ] SQLite cache schema (`mailboxes`, `messages`) + flat-file `.eml`/attachment cache under `$XDG_CACHE_HOME`
+- [x] SQLite cache for mailboxes/messages (`$XDG_CACHE_HOME/lookout/mail/`), used for fast first paint before the live IMAP fetch completes
+  - [ ] Flat-file `.eml`/attachment cache (bodies are still fetched fresh each time, not cached)
 - [x] Folder tree UI wired to live data (`Gtk.TreeListModel`)
 - [x] Message list UI wired to live data (flat, `thread_key` computed but not yet grouped in UI)
 - [x] Message viewer: body fetch → `mail-parser` → sandboxed WebView with `Gtk.TextView` fallback
   - [ ] Switch from whole-message fetch to `BODYSTRUCTURE`-driven partial fetch
   - [ ] Inline `cid:` image resolution via a custom WebKit URI scheme handler
-- [ ] Compose window: new/reply/reply-all/forward, plain-entry recipients, contenteditable WebView body (or plain-text if descoped), `mail-builder` MIME, `lettre` SMTP send (XOAUTH2), `APPEND` to Sent, autosave drafts
-- [x] Connection lifecycle: state machine, backoff reconnect, IDLE re-issue before RFC 2177 timeout
-  - [ ] `Gio.NetworkMonitor`-driven reconnect (react to network-down/up instead of blind backoff)
+- [x] Compose window: plain-text body, `mail-builder` MIME, `lettre` SMTP send (XOAUTH2/password), `APPEND` to Sent - validated live end-to-end against Gmail
+  - [ ] reply/reply-all/forward entry points (currently new-message only)
+  - [ ] Rich-text/contenteditable WebView body (currently plain-text only, per the plan's own descope fallback)
+  - [ ] Recipient chip widget with autocomplete (currently comma-separated text)
+  - [ ] Autosave drafts
+  - [ ] Multiple sending identities (currently always sends as the account's own address)
+- [x] Connection lifecycle: state machine, backoff reconnect, IDLE re-issue before RFC 2177 timeout, `Gio.NetworkMonitor`-driven reconnect (cuts the backoff wait short once connectivity is back)
 - [x] `Adw.ToastOverlay` for connection/send errors
-- [ ] Packaging skeleton: `.desktop`, GResource, Flatpak manifest spike (verify GOA D-Bus reachability from the sandbox)
+- [x] Flatpak manifest spike (`flatpak/io.github.gavindi.Lookout.json`) - GOA permission (`--talk-name=org.gnome.OnlineAccounts`) confirmed against Geary's real, shipping manifest, not guessed; see `flatpak/README.md` for exactly what's still needed before this actually builds:
+  - [ ] Generate `cargo-sources.json` via Flathub's `flatpak-cargo-generator.py` (~150 transitive deps)
+  - [ ] Install `flatpak-builder` + `org.gnome.Sdk//49` + the rust-stable SDK extension and do a real build+run (none of that is available in this environment)
+  - [ ] Fix "Open Online Accounts Settings" for sandboxed runs - it currently shells out to `gnome-control-center` via `std::process::Command`, which doesn't work inside a Flatpak sandbox; needs `org.gnome.ControlCenter` D-Bus activation instead
 
 ### Testing/verification (Phase 1)
 
-- [x] Unit tests: JWZ threading, mailbox-role heuristics, header/address parsing
+- [x] Unit tests: JWZ threading, mailbox-role heuristics, header/address parsing, SQLite cache round-trip
 - [x] Manual smoke test against real GOA accounts (OAuth2 + read-only IMAP flow validated live against Gmail)
-- [ ] Protocol integration tests: GreenMail (`testcontainers`) covering LOGIN/LIST/FETCH/APPEND/IDLE and SMTP send-and-verify
-- [ ] Fake-GOA D-Bus test service (zbus server-side `#[interface]`) for CI coverage of the GOA layer without a live session
+- [x] Manual send test: self-addressed email sent via SMTP and confirmed present in Sent via `APPEND` (live against Gmail)
+- [x] Fake-GOA D-Bus test service (`crates/goa/tests/fake_goa.rs`, zbus server-side `#[interface]`) - **run and passing** under `dbus-run-session -- cargo test -p lookout-goa --test fake_goa`; real D-Bus-wire coverage of discovery + credential fetch (OAuth2 and password paths, plus the two real-world "unusable Mail interface" cases seen live: `ImapSupported=false` and no Mail interface at all)
+- [x] Protocol integration test: GreenMail (`crates/mail/tests/imap_integration.rs`, `testcontainers`) covering LOGIN/LIST/APPEND/SMTP send via the real `run_account_session` actor, gated behind a `test-utils` Cargo feature (self-referencing dev-dependency, never reachable from production builds) that adds an insecure-TLS test connector for GreenMail's self-signed cert. **Written carefully (GOA/port/env-var details cross-checked against GreenMail's own source and Docker docs) but never executed** - no Docker available in the environment that wrote it. `#[ignore]`d so `cargo test` skips it by default; run with `cargo test -p lookout-mail --features test-utils --test imap_integration -- --ignored` once Docker is available, and treat that first run as the real validation.
 - [ ] `test-fixtures/` sample `.eml` set (plain text, HTML+inline CSS, HTML+`cid:`, HTML+external images, malformed HTML) + dev-only "open .eml" debug action
 - [ ] CI: `cargo fmt --check`, `cargo clippy -D warnings`, unit tests, fake-goa tests, GreenMail integration tests, build-only job against GTK4/libadwaita/webkitgtk-6.0 dev packages
 - [ ] Manual milestone smoke test covering compose+send and reconnect-after-sleep on both an OAuth2 and a password-based account

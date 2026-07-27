@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.gavindi.Lookout</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Lookout</name>
+  <summary>A native mail client for GNOME</summary>
+  <description>
+    <p>
+      Lookout is a native GNOME/libadwaita mail client. It connects to your
+      mail accounts through GNOME Online Accounts, so there is no separate
+      sign-in - add an account in Settings and Lookout picks it up
+      automatically.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.gavindi.Lookout.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+  <developer id="io.github.gavindi">
+    <name>Gavin Graham</name>
+  </developer>
+  <!-- Placeholder until a real repository exists at this address. -->
+  <url type="homepage">https://github.com/gavindi/lookout</url>
+  <releases>
+    <release version="0.1.0" date="2026-07-27">
+      <description>
+        <p>Initial release: browse folders, read mail, and send plain-text messages through an account configured in GNOME Online Accounts.</p>
+      </description>
+    </release>
+  </releases>
+</component>

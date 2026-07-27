@@ -1,0 +1,103 @@
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+use lettre::address::Envelope;
+use lettre::{Address as SmtpAddress, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+use mail_builder::headers::address::Address as BuilderAddress;
+use mail_builder::MessageBuilder;
+
+use crate::config::{Credential, EndpointConfig};
+use crate::error::{Error, Result};
+
+/// A message the user has composed, ready to be built into a raw RFC 5322
+/// document and sent. Deliberately simple for Phase 1: a single `From`
+/// address (the account's own address - no sending-identity selection yet),
+/// plain-text body only (rich HTML compose is a Phase 2 item per the plan).
+#[derive(Debug)]
+pub struct ComposedMessage {
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub text_body: String,
+    /// RFC 5322 `In-Reply-To`, when replying to a message.
+    pub in_reply_to: Option<String>,
+    /// RFC 5322 `References`, when replying to a message.
+    pub references: Vec<String>,
+}
+
+/// Builds the raw RFC 5322 message bytes for `msg`, generating a fresh
+/// `Message-ID`. Returns the bytes plus the generated Message-ID (the caller
+/// may want it for thread-tracking) and the flat recipient list (to/cc/bcc
+/// combined) needed for the SMTP envelope, since MIME headers alone aren't
+/// necessarily what the envelope's `RCPT TO` list should be (bcc must be in
+/// the envelope but never in a header).
+pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>) {
+    let message_id = format!("{}@lookout.local", uuid::Uuid::new_v4());
+
+    let mut builder = MessageBuilder::new()
+        .message_id(message_id.clone())
+        .from(BuilderAddress::new_address(None::<String>, msg.from.clone()))
+        .subject(msg.subject.clone())
+        .text_body(msg.text_body.clone());
+
+    if !msg.to.is_empty() {
+        builder = builder.to(BuilderAddress::new_list(
+            msg.to.iter().map(|a| BuilderAddress::new_address(None::<String>, a.clone())).collect(),
+        ));
+    }
+    if !msg.cc.is_empty() {
+        builder = builder.cc(BuilderAddress::new_list(
+            msg.cc.iter().map(|a| BuilderAddress::new_address(None::<String>, a.clone())).collect(),
+        ));
+    }
+    // Bcc is deliberately not added as a header (that would leak it to
+    // every recipient) - it only affects the SMTP envelope's RCPT TO list,
+    // built separately below.
+    if let Some(irt) = &msg.in_reply_to {
+        builder = builder.in_reply_to(irt.clone());
+    }
+    if !msg.references.is_empty() {
+        builder = builder.references(msg.references.clone());
+    }
+
+    let raw = builder.write_to_vec().expect("writing to an in-memory Vec cannot fail");
+    let mut recipients = msg.to.clone();
+    recipients.extend(msg.cc.iter().cloned());
+    recipients.extend(msg.bcc.iter().cloned());
+    (raw, message_id, recipients)
+}
+
+/// Submits `raw` over SMTP. `port == 465` is treated as implicit TLS
+/// (SMTPS); anything else uses STARTTLS, which covers the common 587/25
+/// configurations - GOA's `SmtpUseSsl`/`SmtpUseTls` flags don't map cleanly
+/// enough onto lettre's implicit-vs-STARTTLS split to trust directly (Gmail
+/// reports both as true), so the port is the more reliable signal here.
+pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: &str, recipients: &[String], raw: &[u8]) -> Result<()> {
+    crate::connection::ensure_crypto_provider_installed();
+    let builder = if endpoint.port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(&endpoint.host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&endpoint.host)
+    }
+    .map_err(|e| Error::LoginFailed(e.to_string()))?
+    .port(endpoint.port);
+
+    let builder = match credential {
+        Credential::OAuth2AccessToken(token) => builder
+            .credentials(Credentials::new(endpoint.username.clone(), token))
+            .authentication(vec![Mechanism::Xoauth2]),
+        Credential::Password(password) => builder.credentials(Credentials::new(endpoint.username.clone(), password)),
+    };
+
+    let transport = builder.build();
+
+    let from_addr: SmtpAddress = from.parse().map_err(|_| Error::LoginFailed(format!("invalid From address: {from}")))?;
+    let to_addrs: Vec<SmtpAddress> = recipients
+        .iter()
+        .map(|r| r.parse::<SmtpAddress>().map_err(|_| Error::LoginFailed(format!("invalid recipient address: {r}"))))
+        .collect::<Result<_>>()?;
+    let envelope = Envelope::new(Some(from_addr), to_addrs).map_err(|e| Error::LoginFailed(e.to_string()))?;
+
+    transport.send_raw(&envelope, raw).await.map_err(|e| Error::LoginFailed(e.to_string()))?;
+    Ok(())
+}

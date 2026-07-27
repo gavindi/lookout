@@ -8,6 +8,8 @@ pub enum Error {
     Tls(#[from] tokio_rustls::rustls::Error),
     #[error("cache error: {0}")]
     Cache(#[from] rusqlite::Error),
+    #[error("cache (de)serialization error: {0}")]
+    CacheSerde(#[from] serde_json::Error),
     #[error("no usable root certificates found")]
     NoRootCertificates,
     #[error("invalid server hostname: {0}")]

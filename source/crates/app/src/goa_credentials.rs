@@ -13,11 +13,8 @@ impl GoaCredentialProvider {
     pub fn new(client: GoaClient, account: GoaMailAccount) -> Self {
         GoaCredentialProvider { client, account }
     }
-}
 
-#[async_trait::async_trait]
-impl CredentialProvider for GoaCredentialProvider {
-    async fn imap_credential(&self) -> Result<Credential, String> {
+    async fn credential(&self, password: impl std::future::Future<Output = lookout_goa::Result<String>>) -> Result<Credential, String> {
         self.client.ensure_credentials(&self.account).await.map_err(|e| e.to_string())?;
         match &self.account.auth {
             AuthMethod::OAuth2 => {
@@ -25,10 +22,18 @@ impl CredentialProvider for GoaCredentialProvider {
                     self.client.get_access_token(&self.account).await.map_err(|e| e.to_string())?;
                 Ok(Credential::OAuth2AccessToken(token))
             }
-            AuthMethod::Password { .. } => {
-                let password = self.client.get_imap_password(&self.account).await.map_err(|e| e.to_string())?;
-                Ok(Credential::Password(password))
-            }
+            AuthMethod::Password { .. } => Ok(Credential::Password(password.await.map_err(|e| e.to_string())?)),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialProvider for GoaCredentialProvider {
+    async fn imap_credential(&self) -> Result<Credential, String> {
+        self.credential(self.client.get_imap_password(&self.account)).await
+    }
+
+    async fn smtp_credential(&self) -> Result<Credential, String> {
+        self.credential(self.client.get_smtp_password(&self.account)).await
     }
 }

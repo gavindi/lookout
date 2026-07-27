@@ -1,0 +1,51 @@
+{
+    "app-id": "io.github.gavindi.Lookout",
+    "runtime": "org.gnome.Platform",
+    "runtime-version": "49",
+    "sdk": "org.gnome.Sdk",
+    "sdk-extensions": [
+        "org.freedesktop.Sdk.Extension.rust-stable"
+    ],
+    "command": "lookout",
+    "finish-args": [
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--share=ipc",
+        "--device=dri",
+        "--share=network",
+
+        "--talk-name=org.gnome.OnlineAccounts",
+
+        "--talk-name=org.gnome.ControlCenter"
+    ],
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "env": {
+            "CARGO_HOME": "/run/build/lookout/cargo"
+        }
+    },
+    "modules": [
+        {
+            "name": "lookout",
+            "buildsystem": "simple",
+            "build-commands": [
+                "cargo --offline build --release",
+                "install -Dm755 target/release/lookout /app/bin/lookout",
+                "install -Dm644 data/io.github.gavindi.Lookout.desktop /app/share/applications/io.github.gavindi.Lookout.desktop",
+                "install -Dm644 data/io.github.gavindi.Lookout.metainfo.xml /app/share/metainfo/io.github.gavindi.Lookout.metainfo.xml",
+                "install -Dm644 data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg /app/share/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "..",
+                    "dest": "."
+                },
+                {
+                    "type": "file",
+                    "path": "cargo-sources.json"
+                }
+            ]
+        }
+    ]
+}

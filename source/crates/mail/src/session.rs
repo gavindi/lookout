@@ -11,6 +11,7 @@ use crate::config::{AccountConfig, Credential};
 use crate::connection::{connect_tls, ImapStream};
 use crate::envelope::summary_from_fetch;
 use crate::error::{Error, Result};
+use crate::send::{build_raw_message, send_smtp, ComposedMessage};
 
 /// How many of the most recent messages to fetch on initial folder sync.
 /// Cheap (envelope-only) so this can be generous; full CONDSTORE/QRESYNC
@@ -45,6 +46,16 @@ pub enum AccountCommand {
     FetchBody { mailbox: MailboxId, uid: Uid },
     /// Force a folder-list + current-mailbox resync outside of IDLE's own cadence.
     Refresh,
+    /// Send a composed message over SMTP, then `APPEND` it to the account's
+    /// Sent mailbox (two explicit steps - IMAP has no JMAP-style implicit
+    /// filing on submit). If no Sent mailbox can be identified, the message
+    /// is still sent; only the archival copy is skipped (logged as a warning).
+    SendMessage(ComposedMessage),
+    /// A hint that it's worth retrying the connection now rather than
+    /// waiting out the current backoff delay - e.g. the app crate's
+    /// `Gio.NetworkMonitor` reporting connectivity just came back. A no-op
+    /// if the session is already connected (nothing to reconnect).
+    Reconnect,
     Shutdown,
 }
 
@@ -54,16 +65,18 @@ pub enum AccountEvent {
     FoldersUpdated(Vec<Mailbox>),
     MessagesUpdated { mailbox: MailboxId, messages: Vec<EmailSummary> },
     BodyFetched { mailbox: MailboxId, uid: Uid, body: EmailBody },
+    SendCompleted,
     Error(String),
 }
 
-/// Fetches a fresh credential immediately before each (re)connect attempt.
-/// `lookout-mail` never caches credentials itself; the app crate implements
-/// this trait against `lookout-goa`, keeping this crate free of D-Bus
-/// concerns and independently testable (see the `imap_integration` test).
+/// Fetches a fresh credential immediately before each (re)connect attempt or
+/// SMTP send. `lookout-mail` never caches credentials itself; the app crate
+/// implements this trait against `lookout-goa`, keeping this crate free of
+/// D-Bus concerns and independently testable (see the `imap_integration` test).
 #[async_trait::async_trait]
 pub trait CredentialProvider: Send + Sync {
     async fn imap_credential(&self) -> std::result::Result<Credential, String>;
+    async fn smtp_credential(&self) -> std::result::Result<Credential, String>;
 }
 
 /// Runs one account's IMAP connection lifecycle on the calling task (spawn
@@ -76,12 +89,38 @@ pub async fn run_account_session(
     commands: async_channel::Receiver<AccountCommand>,
     events: async_channel::Sender<AccountEvent>,
 ) {
+    let cache = match crate::cache::Cache::open(&config.account_id) {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            tracing::warn!("couldn't open local cache, continuing without it: {e}");
+            None
+        }
+    };
+
+    // Fast first paint: emit whatever's cached from the previous session
+    // before the network connection even starts. This is immediately
+    // superseded by live data once the connection succeeds - the cache is
+    // never treated as authoritative (see `Cache`'s doc comment).
+    if let Some(cache) = &cache {
+        if let Ok(folders) = cache.load_mailboxes(&config.account_id) {
+            if !folders.is_empty() {
+                let _ = events.send(AccountEvent::FoldersUpdated(folders)).await;
+            }
+        }
+        let inbox_id = MailboxId::new(&config.account_id, "INBOX");
+        if let Ok(messages) = cache.load_messages(&inbox_id) {
+            if !messages.is_empty() {
+                let _ = events.send(AccountEvent::MessagesUpdated { mailbox: inbox_id, messages }).await;
+            }
+        }
+    }
+
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     loop {
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
-        match connect_and_run(&config, credentials.as_ref(), &commands, &events).await {
+        match connect_and_run(&config, credentials.as_ref(), &commands, &events, cache.as_ref()).await {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
                 return;
@@ -98,7 +137,21 @@ pub async fn run_account_session(
             }
         }
 
-        tokio::time::sleep(backoff).await;
+        // Wait out the backoff delay, but cut it short if a command arrives
+        // in the meantime (in particular `Reconnect`, sent by the app crate
+        // when `Gio.NetworkMonitor` reports connectivity is back - no point
+        // waiting out a multi-second delay once the network is actually
+        // usable again). `Shutdown` received while disconnected exits
+        // immediately rather than looping back into another connect attempt.
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            cmd = commands.recv() => {
+                if matches!(cmd, Ok(AccountCommand::Shutdown)) {
+                    let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                    return;
+                }
+            }
+        }
         backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
     }
 }
@@ -112,16 +165,22 @@ async fn connect_and_run(
     credentials: &dyn CredentialProvider,
     commands: &async_channel::Receiver<AccountCommand>,
     events: &async_channel::Sender<AccountEvent>,
+    cache: Option<&crate::cache::Cache>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
     let mut session = login(config, credential).await?;
 
     let account_id = config.account_id.clone();
-    let folders = list_mailboxes(&mut session, &account_id).await?;
+    let mut folders = list_mailboxes(&mut session, &account_id).await?;
+    if let Some(cache) = cache {
+        if let Err(e) = cache.replace_mailboxes(&account_id, &folders) {
+            tracing::warn!("failed to cache mailbox list: {e}");
+        }
+    }
     let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
 
     let inbox_id = MailboxId::new(&account_id, "INBOX");
-    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events).await?;
+    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache).await?;
 
     let mut current_mailbox_name = "INBOX".to_string();
     let mut current_mailbox_id = inbox_id;
@@ -167,7 +226,7 @@ async fn connect_and_run(
             // CONDSTORE delta - see INITIAL_FETCH_LIMIT's doc comment.
             Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
             Wake::Idle(Ok(_)) => {
-                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events).await?;
+                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
             }
             Wake::Idle(Err(e)) => return Err(Error::Imap(e)),
             Wake::Command(cmd) => woke_on_command = Some(cmd),
@@ -183,16 +242,21 @@ async fn connect_and_run(
                     return Ok(ShutdownReason::Requested);
                 }
                 AccountCommand::Refresh => {
-                    let folders = list_mailboxes(&mut session, &account_id).await?;
-                    let _ = events.send(AccountEvent::FoldersUpdated(folders)).await;
-                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events).await?;
+                    folders = list_mailboxes(&mut session, &account_id).await?;
+                    if let Some(cache) = cache {
+                        if let Err(e) = cache.replace_mailboxes(&account_id, &folders) {
+                            tracing::warn!("failed to cache mailbox list: {e}");
+                        }
+                    }
+                    let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
+                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                 }
                 AccountCommand::SyncMailbox(mailbox_id) => {
                     // MailboxId is "<account_id>:<folder path>"; recover the folder path.
                     if let Some(path) = mailbox_id.0.strip_prefix(&format!("{}:", account_id.0)) {
                         current_mailbox_name = path.to_string();
                         current_mailbox_id = mailbox_id;
-                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events)
+                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache)
                             .await?;
                     }
                 }
@@ -207,9 +271,52 @@ async fn connect_and_run(
                         let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
                     }
                 }
+                AccountCommand::SendMessage(msg) => {
+                    match send_message(config, credentials, &mut session, &folders, msg).await {
+                        Ok(()) => {
+                            let _ = events.send(AccountEvent::SendCompleted).await;
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't send message: {e}"))).await;
+                        }
+                    }
+                }
+                // Already connected - nothing to reconnect. This variant
+                // only does something useful while backed off between
+                // connection attempts, see `run_account_session`.
+                AccountCommand::Reconnect => {}
             }
         }
     }
+}
+
+/// Sends `msg` over SMTP, then best-effort `APPEND`s the raw message to the
+/// account's Sent mailbox (if one was identified in `folders`) so it shows
+/// up in the Sent view - IMAP has no server-side "file to Sent on submit"
+/// the way JMAP's EmailSubmission does.
+async fn send_message(
+    config: &AccountConfig,
+    credentials: &dyn CredentialProvider,
+    session: &mut Session<ImapStream>,
+    folders: &[Mailbox],
+    msg: ComposedMessage,
+) -> Result<()> {
+    let (raw, _message_id, recipients) = build_raw_message(&msg);
+
+    let smtp_credential = credentials.smtp_credential().await.map_err(Error::LoginFailed)?;
+    send_smtp(&config.smtp, smtp_credential, &msg.from, &recipients, &raw).await?;
+
+    let Some(sent) = folders.iter().find(|m| matches!(m.role, lookout_core::MailboxRole::Sent)) else {
+        tracing::warn!("no Sent mailbox found; message was sent but not archived");
+        return Ok(());
+    };
+    let Some(path) = sent.id.0.strip_prefix(&format!("{}:", config.account_id.0)) else {
+        return Ok(());
+    };
+    if let Err(e) = session.append(path, Some("\\Seen"), None, raw.as_slice()).await {
+        tracing::warn!("message was sent but APPEND to Sent failed: {e}");
+    }
+    Ok(())
 }
 
 async fn login(config: &AccountConfig, credential: Credential) -> Result<Session<ImapStream>> {
@@ -270,9 +377,11 @@ async fn sync_mailbox(
     folder_path: &str,
     mailbox_id: &MailboxId,
     events: &async_channel::Sender<AccountEvent>,
+    cache: Option<&crate::cache::Cache>,
 ) -> Result<()> {
     let mailbox_meta = session.select(folder_path).await?;
     let uid_next = mailbox_meta.uid_next.unwrap_or(1);
+    let uidvalidity = UidValidity(mailbox_meta.uid_validity.unwrap_or(0));
     let fetch_from = uid_next.saturating_sub(INITIAL_FETCH_LIMIT).max(1);
     let uid_range = format!("{fetch_from}:*");
 
@@ -289,6 +398,11 @@ async fn sync_mailbox(
     }
 
     tracing::debug!(account = %account_id, mailbox = %folder_path, count = messages.len(), "synced mailbox");
+    if let Some(cache) = cache {
+        if let Err(e) = cache.replace_messages(mailbox_id, uidvalidity, &messages) {
+            tracing::warn!("failed to cache messages for {mailbox_id}: {e}");
+        }
+    }
     let _ = events.send(AccountEvent::MessagesUpdated { mailbox: mailbox_id.clone(), messages }).await;
     Ok(())
 }

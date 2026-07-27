@@ -21,11 +21,27 @@ tokio-rustls = "0.26"
 rustls-native-certs = "0.8"
 
 mail-parser = "0.11"
+mail-builder = "0.4"
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+uuid.workspace = true
 
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true
+
+[features]
+# Only for lookout-mail's own integration tests (see tests/imap_integration.rs):
+# exposes an insecure TLS connector that accepts any server certificate, so
+# tests can talk to an ephemeral local GreenMail container's self-signed
+# cert. Enabled below via a self-referencing dev-dependency, which Cargo
+# only applies when building this crate's own test/example/bench targets -
+# a normal consumer (e.g. lookout-app) depending on lookout-mail never
+# enables this feature and never links this code path.
+test-utils = []
 
 [dev-dependencies]
 anyhow = "1"
 lookout-goa.workspace = true
+lookout-mail = { path = ".", features = ["test-utils"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing-subscriber.workspace = true
+testcontainers = "0.27"
