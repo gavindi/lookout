@@ -47,9 +47,8 @@ struct UiState {
 /// only its painted background/border is removed.
 ///
 /// Also gives the folder card (`.folder-pane`, see `card_section`'s caller)
-/// a 50%-alpha background instead of libadwaita's normal opaque `.card`
-/// fill - `alpha(@card_bg_color, 0.5)` keeps it tied to the current
-/// light/dark theme's own card color rather than a hardcoded value.
+/// a 50%-alpha black background instead of libadwaita's normal opaque
+/// `.card` fill, so the window background image shows through it.
 fn install_paned_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
@@ -61,7 +60,7 @@ fn install_paned_css() {
             min-height: 12px;
         }
         .folder-pane {
-            background-color: alpha(@card_bg_color, 0.5);
+            background-color: rgba(0, 0, 0, 0.5);
         }
         .folder-pane listview,
         .folder-pane scrolledwindow {
@@ -75,6 +74,16 @@ fn install_paned_css() {
 
 pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::ApplicationWindow {
     install_paned_css();
+
+    let bg_bytes = include_bytes!("../../../Assets/backgrounds/backgropund1.jpg");
+    let bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes))
+        .expect("bundled background image should decode");
+    let background = gtk::Picture::for_paintable(&bg_texture);
+    background.set_content_fit(gtk::ContentFit::Cover);
+    background.set_can_shrink(true);
+    background.set_hexpand(true);
+    background.set_vexpand(true);
+    background.set_opacity(0.25);
 
     let toast_overlay = adw::ToastOverlay::new();
 
@@ -298,13 +307,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     outer_toolbar_view.set_content(Some(&root_stack));
 
     toast_overlay.set_child(Some(&outer_toolbar_view));
+    toast_overlay.set_hexpand(true);
+    toast_overlay.set_vexpand(true);
+
+    let window_overlay = gtk::Overlay::new();
+    window_overlay.set_child(Some(&background));
+    window_overlay.add_overlay(&toast_overlay);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Lookout")
         .default_width(1600)
         .default_height(900)
-        .content(&toast_overlay)
+        .content(&window_overlay)
         .build();
 
     let state = Rc::new(RefCell::new(UiState {

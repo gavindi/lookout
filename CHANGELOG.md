@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 (2026-07-28)
+
+### Added
+
+- **UI**: the main window now renders a background image (`Assets/backgrounds/backgropund1.jpg`) behind the mail panes, embedded into the binary at compile time and drawn at reduced opacity so it doesn't compete with the foreground UI.
+
+### Changed
+
+- **UI**: the folder pane's translucent background is now a hardcoded black at 50% alpha instead of tracking the current theme's card color, so it reads consistently against the new background image in both light and dark mode.
+
 ## 0.2.3 (2026-07-28)
 
 ### Added
