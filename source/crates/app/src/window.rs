@@ -45,6 +45,11 @@ struct UiState {
 /// so a painted handle on top of that just looks like a stray line. The
 /// handle keeps a comfortable draggable hit-area (`min-width`/`min-height`);
 /// only its painted background/border is removed.
+///
+/// Also gives the folder card (`.folder-pane`, see `card_section`'s caller)
+/// a 50%-alpha background instead of libadwaita's normal opaque `.card`
+/// fill - `alpha(@card_bg_color, 0.5)` keeps it tied to the current
+/// light/dark theme's own card color rather than a hardcoded value.
 fn install_paned_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
@@ -54,6 +59,13 @@ fn install_paned_css() {
             box-shadow: none;
             min-width: 12px;
             min-height: 12px;
+        }
+        .folder-pane {
+            background-color: alpha(@card_bg_color, 0.5);
+        }
+        .folder-pane listview,
+        .folder-pane scrolledwindow {
+            background-color: transparent;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -121,6 +133,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let folder_list_view = gtk::ListView::new(Some(folder_selection.clone()), Some(folder_factory));
     let folder_scroller = gtk::ScrolledWindow::builder().child(&folder_list_view).vexpand(true).build();
     let folder_card = card_section(&folder_scroller);
+    folder_card.add_css_class("folder-pane");
 
     // --- Message list ---
     let message_store = gio::ListStore::new::<glib::BoxedAnyObject>();
