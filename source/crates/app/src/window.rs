@@ -23,7 +23,30 @@ struct UiState {
     from_email: Option<String>,
 }
 
+/// Strips `Gtk.Paned`'s default visible grey separator line - the card
+/// margins already provide a visual gap between panes (see `card_section`),
+/// so a painted handle on top of that just looks like a stray line. The
+/// handle keeps a comfortable draggable hit-area (`min-width`/`min-height`);
+/// only its painted background/border is removed.
+fn install_paned_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(
+        "paned > separator {
+            background: none;
+            border: none;
+            box-shadow: none;
+            min-width: 12px;
+            min-height: 12px;
+        }",
+    );
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+}
+
 pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::ApplicationWindow {
+    install_paned_css();
+
     let toast_overlay = adw::ToastOverlay::new();
 
     let status_page = adw::StatusPage::builder()
@@ -67,16 +90,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let folder_list_view = gtk::ListView::new(Some(folder_selection.clone()), Some(folder_factory));
     let folder_scroller = gtk::ScrolledWindow::builder().child(&folder_list_view).vexpand(true).build();
-    let folder_page = adw::NavigationPage::builder()
-        .title("Folders")
-        .child(&adw::ToolbarView::builder().top_bar_style(adw::ToolbarStyle::Flat).content(&folder_scroller).build())
-        .build();
-    // Placeholder header bar so the folder page has its own titlebar even
-    // before AdwNavigationSplitView wraps it.
-    {
-        let toolbar_view = folder_page.child().and_downcast::<adw::ToolbarView>().unwrap();
-        toolbar_view.add_top_bar(&adw::HeaderBar::new());
-    }
+    let folder_card = card_section(&folder_scroller);
 
     // --- Message list ---
     let message_store = gio::ListStore::new::<glib::BoxedAnyObject>();
@@ -112,18 +126,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     });
     let message_list_view = gtk::ListView::new(Some(message_selection.clone()), Some(message_factory));
     let message_scroller = gtk::ScrolledWindow::builder().child(&message_list_view).vexpand(true).build();
-    let message_page = adw::NavigationPage::builder()
-        .title("Messages")
-        .child(&adw::ToolbarView::builder().top_bar_style(adw::ToolbarStyle::Flat).content(&message_scroller).build())
-        .build();
+    let message_card = card_section(&message_scroller);
     let compose_button = gtk::Button::from_icon_name("mail-message-new-symbolic");
     compose_button.set_tooltip_text(Some("New Message"));
-    {
-        let header = adw::HeaderBar::new();
-        header.pack_end(&compose_button);
-        let toolbar_view = message_page.child().and_downcast::<adw::ToolbarView>().unwrap();
-        toolbar_view.add_top_bar(&header);
-    }
 
     // --- Reading pane: WebKit for HTML, GtkTextView for plain text ---
     let webkit_settings = webkit::Settings::new();
@@ -165,34 +170,58 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     reading_stack.add_named(&reading_empty, Some("empty"));
     reading_stack.set_visible_child_name("empty");
 
-    let reading_page = adw::NavigationPage::builder()
-        .title("Message")
-        .child(&adw::ToolbarView::builder().top_bar_style(adw::ToolbarStyle::Flat).content(&reading_stack).build())
-        .build();
-    {
-        let toolbar_view = reading_page.child().and_downcast::<adw::ToolbarView>().unwrap();
-        toolbar_view.add_top_bar(&adw::HeaderBar::new());
-    }
+    let reading_card = card_section(&reading_stack);
 
-    // --- Nested split views: folders | (messages | reading) ---
-    let inner_split = adw::NavigationSplitView::builder().sidebar(&message_page).content(&reading_page).build();
-    let inner_split_page = adw::NavigationPage::builder().title("Mail").child(&inner_split).build();
-    let outer_split = adw::NavigationSplitView::builder().sidebar(&folder_page).content(&inner_split_page).build();
+    // --- Resizable panes: folders | (messages | reading), each its own
+    // rounded card. `resize_start_child(false)` keeps the sidebar-like
+    // panes from silently growing when the window resizes; the reading
+    // pane absorbs the extra space.
+    let messages_reading_paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(&message_card)
+        .end_child(&reading_card)
+        .resize_start_child(false)
+        .resize_end_child(true)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(320)
+        .build();
+    let main_paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(&folder_card)
+        .end_child(&messages_reading_paned)
+        .resize_start_child(false)
+        .resize_end_child(true)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(220)
+        .build();
 
     let status_page_as_widget: gtk::Widget = status_page.clone().upcast();
-    let outer_split_as_widget: gtk::Widget = outer_split.clone().upcast();
+    let main_paned_as_widget: gtk::Widget = main_paned.clone().upcast();
     let root_stack = gtk::Stack::new();
     root_stack.add_named(&status_page_as_widget, Some("empty"));
-    root_stack.add_named(&outer_split_as_widget, Some("mail"));
+    root_stack.add_named(&main_paned_as_widget, Some("mail"));
     root_stack.set_visible_child_name("empty");
 
-    toast_overlay.set_child(Some(&root_stack));
+    // The one real title bar for the window - owns the actual
+    // minimize/maximize/close buttons. The per-card header bars inside
+    // `root_stack` are explicitly told not to show these (see
+    // `card_section`), so there's exactly one set, not four.
+    let window_header = adw::HeaderBar::new();
+    window_header.set_title_widget(Some(&adw::WindowTitle::new("Lookout", "")));
+    window_header.pack_end(&compose_button);
+    let outer_toolbar_view = adw::ToolbarView::new();
+    outer_toolbar_view.add_top_bar(&window_header);
+    outer_toolbar_view.set_content(Some(&root_stack));
+
+    toast_overlay.set_child(Some(&outer_toolbar_view));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Lookout")
-        .default_width(1100)
-        .default_height(720)
+        .default_width(1600)
+        .default_height(900)
         .content(&toast_overlay)
         .build();
 
@@ -398,6 +427,26 @@ fn connect_account(
             }
         }
     });
+}
+
+/// Wraps `content` directly in a `.card`-styled box - libadwaita's real,
+/// built-in style class for a rounded-corner, softly-shaded panel. No
+/// per-section header bar: `Gtk.Paned` (see `build_window`) provides the
+/// resize handle and visual gap between cards, and the small margin here is
+/// what makes each card's rounded corners actually visible against the
+/// window background instead of touching the divider/edges.
+fn card_section(content: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["card"])
+        .overflow(gtk::Overflow::Hidden)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    card.append(content);
+    card
 }
 
 fn render_body(reading_stack: &gtk::Stack, body: lookout_core::EmailBody) {
