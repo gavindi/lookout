@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.7 (2026-07-29)
+
+### Changed
+
+- **UI**: the window background image now renders at full opacity - removed the `set_opacity(0.5)` call on the `gtk::Picture`, which had been carried over from earlier tuning.
+- **UI**: the view-switcher rail now has a 6px left margin, matching the gap `card_section`'s default margin already puts between the rail and the folder pane, so the spacing reads as even on both sides of the rail.
+
 ## 0.3.6 (2026-07-29)
 
 ### Changed

@@ -98,7 +98,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     background.set_can_shrink(true);
     background.set_hexpand(true);
     background.set_vexpand(true);
-    background.set_opacity(0.25);
 
     let toast_overlay = adw::ToastOverlay::new();
 
@@ -379,6 +378,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .orientation(gtk::Orientation::Vertical)
         .width_request(56)
         .margin_top(6)
+        .margin_start(6)
         .spacing(6)
         .build();
     nav_rail.append(&mail_view_button);
