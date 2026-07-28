@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 (2026-07-28)
+
+### Changed
+
+- **UI**: swapped the embedded window background image from `backgropund1.jpg` to `background2.png` (`Assets/backgrounds/`), still compiled into the binary via `include_bytes!` and drawn the same way (reduced opacity, behind the mail panes).
+
 ## 0.3.2 (2026-07-28)
 
 ### Changed

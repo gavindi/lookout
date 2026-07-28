@@ -90,7 +90,7 @@ fn install_paned_css() {
 pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::ApplicationWindow {
     install_paned_css();
 
-    let bg_bytes = include_bytes!("../../../Assets/backgrounds/backgropund1.jpg");
+    let bg_bytes = include_bytes!("../../../Assets/backgrounds/background2.png");
     let bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes))
         .expect("bundled background image should decode");
     let background = gtk::Picture::for_paintable(&bg_texture);
@@ -122,7 +122,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let folder_factory = gtk::SignalListItemFactory::new();
     folder_factory.connect_setup(|_, list_item| {
         let expander = gtk::TreeExpander::new();
-        let label = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
         expander.set_child(Some(&label));
         list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&expander));
     });
