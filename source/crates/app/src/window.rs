@@ -90,6 +90,26 @@ fn install_paned_css() {
 pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::ApplicationWindow {
     install_paned_css();
 
+    let quit_action = gio::SimpleAction::new("quit", None);
+    quit_action.connect_activate({
+        let app = app.clone();
+        move |_, _| app.quit()
+    });
+    app.add_action(&quit_action);
+
+    let about_action = gio::SimpleAction::new("about", None);
+    about_action.connect_activate(|_, _| {
+        adw::AboutDialog::builder()
+            .application_name("Lookout")
+            .version(env!("CARGO_PKG_VERSION"))
+            .developer_name("Gavin Graham")
+            .license_type(gtk::License::Gpl30)
+            .comments("A native GNOME mail client for GNOME Online Accounts.")
+            .build()
+            .present(gtk::Window::NONE);
+    });
+    app.add_action(&about_action);
+
     let bg_bytes = include_bytes!("../../../Assets/backgrounds/background2.png");
     let bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes))
         .expect("bundled background image should decode");
@@ -355,9 +375,61 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `card_section`), so there's exactly one set, not four.
     let window_header = adw::HeaderBar::new();
     window_header.set_title_widget(Some(&adw::WindowTitle::new("Lookout", "")));
-    window_header.pack_end(&compose_button);
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
+
+    // --- Menu bar row (File/Home/View/Help). Only File (Quit) and Help
+    // (About) have real actions behind them, so only those two are
+    // `MenuButton`s with a real popover; Home/View have no ribbon-tab
+    // content to show yet, so they're honestly disabled instead of opening
+    // an empty popover.
+    let file_menu = gio::Menu::new();
+    file_menu.append(Some("Quit"), Some("app.quit"));
+    let help_menu = gio::Menu::new();
+    help_menu.append(Some("About Lookout"), Some("app.about"));
+
+    let file_button = gtk::MenuButton::builder().label("File").css_classes(["flat"]).menu_model(&file_menu).build();
+    let home_button = gtk::Button::builder().label("Home").css_classes(["flat"]).sensitive(false).build();
+    let view_button = gtk::Button::builder().label("View").css_classes(["flat"]).sensitive(false).build();
+    let help_button = gtk::MenuButton::builder().label("Help").css_classes(["flat"]).menu_model(&help_menu).build();
+
+    let menu_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).css_classes(["toolbar"]).build();
+    menu_bar.append(&file_button);
+    menu_bar.append(&home_button);
+    menu_bar.append(&view_button);
+    menu_bar.append(&help_button);
+
+    // --- Command toolbar row. `compose_button` is the only button here
+    // backed by real functionality; the rest mirror Outlook's row visually
+    // but are disabled since Lookout doesn't implement delete/archive/
+    // report/flag/snooze yet.
+    let delete_button = gtk::Button::from_icon_name("user-trash-symbolic");
+    delete_button.set_tooltip_text(Some("Delete"));
+    delete_button.set_sensitive(false);
+    let archive_button = gtk::Button::from_icon_name("mail-archive-symbolic");
+    archive_button.set_tooltip_text(Some("Archive"));
+    archive_button.set_sensitive(false);
+    let report_button = gtk::Button::from_icon_name("mail-mark-junk-symbolic");
+    report_button.set_tooltip_text(Some("Report"));
+    report_button.set_sensitive(false);
+    let flag_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
+    flag_button.set_tooltip_text(Some("Flag/Unflag"));
+    flag_button.set_sensitive(false);
+    let snooze_button = gtk::Button::from_icon_name("appointment-soon-symbolic");
+    snooze_button.set_tooltip_text(Some("Snooze"));
+    snooze_button.set_sensitive(false);
+    let more_button = gtk::Button::from_icon_name("view-more-symbolic");
+    more_button.set_tooltip_text(Some("More"));
+    more_button.set_sensitive(false);
+
+    let command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
+    command_toolbar.append(&compose_button);
+    command_toolbar.append(&delete_button);
+    command_toolbar.append(&archive_button);
+    command_toolbar.append(&report_button);
+    command_toolbar.append(&flag_button);
+    command_toolbar.append(&snooze_button);
+    command_toolbar.append(&more_button);
     // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
     // no background) strip along the window's left edge so the background
     // image shows straight through it. Only one view exists today (Mail);
@@ -389,6 +461,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let outer_toolbar_view = adw::ToolbarView::new();
     outer_toolbar_view.add_top_bar(&window_header);
+    outer_toolbar_view.add_top_bar(&menu_bar);
+    outer_toolbar_view.add_top_bar(&command_toolbar);
     outer_toolbar_view.set_content(Some(&content_row));
 
     toast_overlay.set_child(Some(&outer_toolbar_view));

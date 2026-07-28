@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 (2026-07-29)
+
+### Added
+
+- **UI**: an Outlook-style menu bar (File / Home / View / Help) and command toolbar (New mail, Delete, Archive, Report, Flag/Unflag, Snooze, More) now span the full window width above the nav rail and mail panes, stacked below the title bar via `AdwToolbarView::add_top_bar`. File → Quit and Help → About are wired to real `gio::SimpleAction`s (`app.quit`, `app.about`, the latter presenting a real `AdwAboutDialog`); everything else without a backing implementation yet (Home, View, Delete, Archive, Report, Flag/Unflag, Snooze, More) is a real but disabled button rather than a dead click. `compose_button` ("New mail") moved out of the header bar into this new toolbar.
+
 ## 0.3.7 (2026-07-29)
 
 ### Changed
