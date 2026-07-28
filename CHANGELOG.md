@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 (2026-07-28)
+
+### Changed
+
+- **UI**: the reading pane's empty state ("No Message Selected") no longer shows an icon or title - it's now a bare placeholder that goes fully transparent (zero alpha, via a new `.reading-pane-transparent` CSS class toggled off the reading stack's `visible-child-name`) so the window background image shows straight through with no card tint. The pane reverts to its normal opaque card as soon as a message is displayed.
+
 ## 0.3.0 (2026-07-28)
 
 ### Added

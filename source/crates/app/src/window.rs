@@ -65,6 +65,9 @@ fn install_paned_css() {
         .folder-pane listview,
         .folder-pane scrolledwindow {
             background-color: transparent;
+        }
+        .reading-pane-transparent {
+            background-color: transparent;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -245,7 +248,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let reading_stack = gtk::Stack::new();
     reading_stack.add_named(&web_view, Some("html"));
     reading_stack.add_named(&text_scroller, Some("text"));
-    let reading_empty = adw::StatusPage::builder().icon_name("mail-message-new-symbolic").title("No Message Selected").build();
+    let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
     reading_stack.set_visible_child_name("empty");
     // Floor so the reading pane never gets squeezed down to something
@@ -260,6 +263,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     reading_stack.set_size_request(-1, 300);
 
     let reading_card = card_section(&reading_stack);
+
+    // Keep the reading pane's card fully transparent while it's showing the
+    // "no message selected" placeholder, so the window background image
+    // shows straight through with no card tint - matching `.folder-pane`'s
+    // translucency, but taken all the way to zero alpha since there's no
+    // content to read against here. Driven off the stack's own signal
+    // (rather than each `set_visible_child_name` call site) so every path
+    // that flips back to "empty" - initial state above, `render_body`'s
+    // fallback, and the reset on account disconnect - is covered for free.
+    let update_reading_card_transparency = {
+        let reading_card = reading_card.clone();
+        move |stack: &gtk::Stack| {
+            if stack.visible_child_name().as_deref() == Some("empty") {
+                reading_card.add_css_class("reading-pane-transparent");
+            } else {
+                reading_card.remove_css_class("reading-pane-transparent");
+            }
+        }
+    };
+    update_reading_card_transparency(&reading_stack);
+    reading_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
+        update_reading_card_transparency(stack);
+    });
 
     // --- Resizable panes: folders | (messages | reading), each its own
     // rounded card. `resize_start_child(false)` keeps the sidebar-like
