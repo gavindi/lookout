@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId};
+use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, MailboxRole};
 use lookout_goa::GoaClient;
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
 use lookout_mail::{AccountConfig, EndpointConfig};
@@ -122,13 +122,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let folder_factory = gtk::SignalListItemFactory::new();
     folder_factory.connect_setup(|_, list_item| {
         let expander = gtk::TreeExpander::new();
+        let icon = gtk::Image::builder().icon_size(gtk::IconSize::Normal).build();
         let label = gtk::Label::builder()
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .margin_top(6)
             .margin_bottom(6)
             .build();
-        expander.set_child(Some(&label));
+        let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+        row_box.append(&icon);
+        row_box.append(&label);
+        expander.set_child(Some(&row_box));
         list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&expander));
     });
     folder_factory.connect_bind(|_, list_item| {
@@ -140,9 +144,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         expander.set_list_row(Some(&row));
         let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
         let tree_item = boxed.borrow::<TreeItem>();
-        let Some(label) = expander.child().and_downcast::<gtk::Label>() else { return };
+        let Some(row_box) = expander.child().and_downcast::<gtk::Box>() else { return };
+        let Some(icon) = row_box.first_child().and_downcast::<gtk::Image>() else { return };
+        let Some(label) = row_box.last_child().and_downcast::<gtk::Label>() else { return };
         match &*tree_item {
             TreeItem::Account(account) => {
+                icon.set_visible(false);
                 label.set_label(&account.label);
                 label.set_css_classes(&["heading"]);
             }
@@ -153,6 +160,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 } else {
                     node.mailbox.name.clone()
                 };
+                icon.set_visible(true);
+                icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
                 label.set_label(&text);
                 label.set_css_classes(&[]);
             }
@@ -350,9 +359,37 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window_header.pack_end(&compose_button);
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
+    // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
+    // no background) strip along the window's left edge so the background
+    // image shows straight through it. Only one view exists today (Mail);
+    // more buttons can be appended here later and joined into the same
+    // toggle group for mutual-exclusive selection.
+    let mail_icon_bytes = include_bytes!("../../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg");
+    let mail_icon_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(mail_icon_bytes))
+        .expect("bundled app icon should decode");
+    let mail_icon_image = gtk::Image::from_paintable(Some(&mail_icon_texture));
+    mail_icon_image.set_pixel_size(28);
+    let mail_view_button = gtk::ToggleButton::builder()
+        .child(&mail_icon_image)
+        .css_classes(["flat"])
+        .tooltip_text("Mail")
+        .active(true)
+        .build();
+    let nav_rail = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(56)
+        .margin_top(6)
+        .spacing(6)
+        .build();
+    nav_rail.append(&mail_view_button);
+
+    let content_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
+    content_row.append(&nav_rail);
+    content_row.append(&root_stack);
+
     let outer_toolbar_view = adw::ToolbarView::new();
     outer_toolbar_view.add_top_bar(&window_header);
-    outer_toolbar_view.set_content(Some(&root_stack));
+    outer_toolbar_view.set_content(Some(&content_row));
 
     toast_overlay.set_child(Some(&outer_toolbar_view));
     toast_overlay.set_hexpand(true);
@@ -708,6 +745,23 @@ fn card_section(content: &impl IsA<gtk::Widget>) -> gtk::Box {
         .build();
     card.append(content);
     card
+}
+
+/// Maps a mailbox's special-use role to a folder-row icon name, mirroring the
+/// role->icon mapping in the reference webmail app's `getIconForMailbox()`
+/// (webmail/components/layout/sidebar.tsx). These specific names come from
+/// this machine's Yaru icon theme, not the base Adwaita theme - fine for now
+/// since there's no working Flatpak build yet, just a manifest spike.
+fn folder_icon_name(role: MailboxRole) -> &'static str {
+    match role {
+        MailboxRole::Inbox => "mail-inbox-symbolic",
+        MailboxRole::Sent => "mail-sent-symbolic",
+        MailboxRole::Drafts => "mail-drafts-symbolic",
+        MailboxRole::Trash => "user-trash-symbolic",
+        MailboxRole::Junk => "mail-spam-symbolic",
+        MailboxRole::Archive => "mail-archive-symbolic",
+        MailboxRole::Custom => "folder-symbolic",
+    }
 }
 
 fn render_body(reading_stack: &gtk::Stack, body: lookout_core::EmailBody) {
