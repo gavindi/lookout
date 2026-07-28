@@ -68,6 +68,18 @@ fn install_paned_css() {
         }
         .reading-pane-transparent {
             background-color: transparent;
+        }
+        .card-flush-end {
+            border-top-right-radius: 0;
+            border-bottom-right-radius: 0;
+        }
+        .card-flush-start {
+            border-top-left-radius: 0;
+            border-bottom-left-radius: 0;
+        }
+        .seamless-paned > separator {
+            min-width: 6px;
+            min-height: 6px;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -146,6 +158,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let folder_scroller = gtk::ScrolledWindow::builder().child(&folder_list_view).vexpand(true).build();
     let folder_card = card_section(&folder_scroller);
     folder_card.add_css_class("folder-pane");
+    folder_card.add_css_class("card-flush-end");
+    folder_card.set_margin_end(0);
 
     // --- Message list ---
     let message_store = gio::ListStore::new::<glib::BoxedAnyObject>();
@@ -193,6 +207,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let message_list_view = gtk::ListView::new(Some(message_selection.clone()), Some(message_factory));
     let message_scroller = gtk::ScrolledWindow::builder().child(&message_list_view).vexpand(true).build();
     let message_card = card_section(&message_scroller);
+    message_card.add_css_class("card-flush-start");
+    message_card.set_margin_start(0);
     let compose_button = gtk::Button::from_icon_name("mail-message-new-symbolic");
     compose_button.set_tooltip_text(Some("New Message"));
 
@@ -311,6 +327,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .shrink_end_child(false)
         .position(220)
         .build();
+    main_paned.add_css_class("seamless-paned");
 
     let status_page_as_widget: gtk::Widget = status_page.clone().upcast();
     let main_paned_as_widget: gtk::Widget = main_paned.clone().upcast();

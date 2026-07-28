@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 (2026-07-28)
+
+### Changed
+
+- **UI**: the folder pane and message-list pane now sit flush against each other - no gap, no rounded corners on the touching edge (new `.card-flush-end`/`.card-flush-start` CSS classes), and the `Gtk.Paned` handle between them shrinks from 12px to 6px with no painted background (scoped via a new `.seamless-paned` class so the message/reading split keeps its usual handle). Hovering the boundary still shows a resize cursor and drags as before; only the visual gap and handle went away.
+
 ## 0.3.1 (2026-07-28)
 
 ### Changed
