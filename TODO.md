@@ -8,6 +8,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [x] `.desktop` file (`data/io.github.gavindi.Lookout.desktop`, passes `desktop-file-validate`), AppStream metainfo (passes `appstreamcli validate` bar the placeholder homepage URL), placeholder app icon
   - [ ] GResource bundle - nothing to bundle yet since the UI is built programmatically with no `.ui` XML templates (a deliberate Phase 1 choice, see the plan)
 - [x] `AdwApplication` shell with empty-state page ("No mail accounts configured") that spawns `gnome-control-center online-accounts`
+- [x] Window chrome polish: background image behind the mail panes, translucent folder pane (and empty-state reading pane) so it shows through, per-`MailboxRole` folder icons in the tree, a view-switcher rail on the window's left edge (Mail only so far - scaffold for Phase 3/4's Calendar/Contacts views), and an Outlook-style menu bar + command toolbar stacked below the title bar. File→Quit and Help→About are wired to real `gio::SimpleAction`s; Home/View and the toolbar's Delete/Archive/Report/Flag/Snooze/More buttons are visible-but-disabled placeholders pending the features below
 - [x] `lookout-goa`: zbus proxies for `ObjectManager`/`Account`/`Mail`/`PasswordBased`/`OAuth2Based`; `list_mail_accounts()`
 - [x] Wire account discovery into startup → folder tree for the default account
 - [x] `lookout-mail`: `AccountSession` actor — `LOGIN`/`AUTHENTICATE XOAUTH2`, `LIST (SPECIAL-USE)`, `SELECT`, bounded envelope fetch, IDLE loop with instant command interruption
@@ -44,6 +45,10 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 
 ## Phase 2 — Mail advanced (roadmap)
 
+- [ ] Message delete (`\Deleted` flag + `EXPUNGE`, or move-to-Trash) - backs the toolbar's Delete button
+- [ ] Move-to-folder actions: Archive and Report-as-junk (mark junk + move to the account's Junk mailbox) - backs the toolbar's Archive/Report buttons
+- [ ] Client-side snooze (hide a message and resurface it later - no IMAP-native equivalent, same approach as Gmail/Outlook desktop) - backs the toolbar's Snooze button
+- [ ] Ribbon-style Home/View tab content once there's something to put in them - the menu bar's Home/View buttons are disabled placeholders until then
 - [ ] Full-text search: SQLite FTS5 over cache + IMAP `SEARCH` fallback
 - [ ] Internal drag-drop (move/tag) + external drag-out (`.eml`/`.zip`)
 - [ ] Collapsible thread UI (reuse the folder tree's `TreeListModel` trick)

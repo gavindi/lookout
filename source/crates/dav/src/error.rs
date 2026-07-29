@@ -1,0 +1,19 @@
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("XML error: {0}")]
+    Xml(#[from] quick_xml::Error),
+    #[error("iCalendar parse error: {0}")]
+    Ical(String),
+    #[error("recurrence rule error: {0}")]
+    Recurrence(String),
+    #[error("login failed: {0}")]
+    LoginFailed(String),
+    #[error("account does not use this authentication method")]
+    WrongAuthMethod,
+    #[error("CalDAV discovery failed: {0}")]
+    Discovery(String),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

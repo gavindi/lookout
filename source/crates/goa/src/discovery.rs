@@ -9,6 +9,7 @@ use crate::{Error, Result};
 
 const IFACE_ACCOUNT: &str = "org.gnome.OnlineAccounts.Account";
 const IFACE_MAIL: &str = "org.gnome.OnlineAccounts.Mail";
+const IFACE_CALENDAR: &str = "org.gnome.OnlineAccounts.Calendar";
 const IFACE_OAUTH2: &str = "org.gnome.OnlineAccounts.OAuth2Based";
 const IFACE_PASSWORD: &str = "org.gnome.OnlineAccounts.PasswordBased";
 
@@ -48,6 +49,33 @@ pub struct GoaMailAccount {
     pub imap: EndpointConfig,
     pub smtp: EndpointConfig,
     pub auth: AuthMethod,
+}
+
+/// How to obtain live credentials for a [`GoaCalendarAccount`]. A separate
+/// type from [`AuthMethod`] rather than a reuse - Mail's variant is
+/// IMAP/SMTP-shaped (two password ids), which doesn't fit Calendar's single
+/// CalDAV endpoint.
+#[derive(Debug, Clone)]
+pub enum CalendarAuthMethod {
+    OAuth2,
+    /// `password_id` is the `PasswordBased.GetPassword` slot id to use
+    /// (commonly `"calendar-password"`, per GOA's one-slot-per-service-
+    /// interface convention - distinct from `imap-password`/`smtp-password`
+    /// even on an account that also has Mail enabled).
+    Password { password_id: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct GoaCalendarAccount {
+    pub account_id: AccountId,
+    pub object_path: OwnedObjectPath,
+    pub display_name: String,
+    /// `Calendar.Uri` - the CalDAV base URL GOA has configured for this
+    /// account (may be a principal URL, a calendar-home-set URL, or a bare
+    /// server root, depending on provider - discovery must not assume which).
+    pub uri: String,
+    pub accept_ssl_errors: bool,
+    pub auth: CalendarAuthMethod,
 }
 
 /// Thin wrapper over a session-bus [`Connection`] providing GOA account
@@ -151,32 +179,109 @@ impl GoaClient {
     /// `gnome-control-center online-accounts` rather than attempting our own
     /// reauth flow.
     pub async fn ensure_credentials(&self, account: &GoaMailAccount) -> Result<()> {
-        let proxy = AccountProxy::builder(&self.connection).path(account.object_path.as_ref())?.build().await?;
-        proxy.ensure_credentials().await?;
-        Ok(())
+        self.ensure_credentials_for(&account.object_path).await
     }
 
     pub async fn get_access_token(&self, account: &GoaMailAccount) -> Result<(String, i32)> {
-        let proxy = OAuth2BasedProxy::builder(&self.connection).path(account.object_path.as_ref())?.build().await?;
-        Ok(proxy.get_access_token().await?)
+        self.get_access_token_for(&account.object_path).await
     }
 
     pub async fn get_imap_password(&self, account: &GoaMailAccount) -> Result<String> {
         let AuthMethod::Password { imap_password_id, .. } = &account.auth else {
             return Err(Error::WrongAuthMethod);
         };
-        self.get_password(account, imap_password_id).await
+        self.get_password_for(&account.object_path, imap_password_id).await
     }
 
     pub async fn get_smtp_password(&self, account: &GoaMailAccount) -> Result<String> {
         let AuthMethod::Password { smtp_password_id, .. } = &account.auth else {
             return Err(Error::WrongAuthMethod);
         };
-        self.get_password(account, smtp_password_id).await
+        self.get_password_for(&account.object_path, smtp_password_id).await
     }
 
-    async fn get_password(&self, account: &GoaMailAccount, id: &str) -> Result<String> {
-        let proxy = PasswordBasedProxy::builder(&self.connection).path(account.object_path.as_ref())?.build().await?;
+    /// Lists every GOA account with a usable `Calendar` interface - a fully
+    /// separate set from [`list_mail_accounts`](Self::list_mail_accounts)'s
+    /// results (a Calendar-only account has no `Mail` interface at all, and a
+    /// Mail account may equally have no `Calendar` interface).
+    pub async fn list_calendar_accounts(&self) -> Result<Vec<GoaCalendarAccount>> {
+        let manager = ObjectManagerProxy::new(&self.connection).await?;
+        let objects: ManagedObjects = manager.get_managed_objects().await?;
+
+        let mut accounts = Vec::new();
+        for (path, ifaces) in &objects {
+            if let Some(account) = self.parse_calendar_account(path, ifaces)? {
+                accounts.push(account);
+            }
+        }
+        Ok(accounts)
+    }
+
+    fn parse_calendar_account(&self, path: &OwnedObjectPath, ifaces: &HashMap<String, HashMap<String, OwnedValue>>) -> Result<Option<GoaCalendarAccount>> {
+        let Some(account_props) = ifaces.get(IFACE_ACCOUNT) else {
+            return Ok(None);
+        };
+        let Some(cal_props) = ifaces.get(IFACE_CALENDAR) else {
+            return Ok(None);
+        };
+
+        // NB: unlike Mail's `MailDisabled`, there's no confirmed
+        // `CalendarDisabled` boolean on the real GOA `Account` interface -
+        // presence of the `Calendar` interface itself is treated as
+        // authoritative for now. Revisit if a live account turns up one.
+        let display_name = get_string(account_props, "PresentationIdentity").unwrap_or_default();
+        let uri = get_string(cal_props, "Uri").unwrap_or_default();
+        if uri.is_empty() {
+            return Ok(None);
+        }
+        let accept_ssl_errors = get_bool(cal_props, "AcceptSslErrors").unwrap_or(false);
+
+        let auth = if ifaces.contains_key(IFACE_OAUTH2) {
+            CalendarAuthMethod::OAuth2
+        } else if ifaces.contains_key(IFACE_PASSWORD) {
+            CalendarAuthMethod::Password { password_id: "calendar-password".to_string() }
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(GoaCalendarAccount {
+            account_id: AccountId(path.to_string()),
+            object_path: path.clone(),
+            display_name,
+            uri,
+            accept_ssl_errors,
+            auth,
+        }))
+    }
+
+    pub async fn ensure_credentials_calendar(&self, account: &GoaCalendarAccount) -> Result<()> {
+        self.ensure_credentials_for(&account.object_path).await
+    }
+
+    pub async fn get_access_token_calendar(&self, account: &GoaCalendarAccount) -> Result<(String, i32)> {
+        self.get_access_token_for(&account.object_path).await
+    }
+
+    pub async fn get_calendar_password(&self, account: &GoaCalendarAccount) -> Result<String> {
+        let CalendarAuthMethod::Password { password_id } = &account.auth else {
+            return Err(Error::WrongAuthMethod);
+        };
+        self.get_password_for(&account.object_path, password_id).await
+    }
+
+    async fn ensure_credentials_for(&self, object_path: &OwnedObjectPath) -> Result<()> {
+        let proxy = AccountProxy::builder(&self.connection).path(object_path.as_ref())?.build().await?;
+        proxy.ensure_credentials().await?;
+        Ok(())
+    }
+
+    async fn get_access_token_for(&self, object_path: &OwnedObjectPath) -> Result<(String, i32)> {
+        let proxy = OAuth2BasedProxy::builder(&self.connection).path(object_path.as_ref())?.build().await?;
+        Ok(proxy.get_access_token().await?)
+    }
+
+    async fn get_password_for(&self, object_path: &OwnedObjectPath, id: &str) -> Result<String> {
+        let proxy = PasswordBasedProxy::builder(&self.connection).path(object_path.as_ref())?.build().await?;
         Ok(proxy.get_password(id).await?)
     }
 }

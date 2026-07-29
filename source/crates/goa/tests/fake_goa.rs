@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use lookout_goa::{AuthMethod, GoaClient};
+use lookout_goa::{AuthMethod, CalendarAuthMethod, GoaClient};
 use zbus::interface;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -87,16 +87,27 @@ fn mail_account_props(email: &str, imap_supported: bool) -> HashMap<String, Hash
     ifaces
 }
 
+/// Adds a `Calendar` interface's properties onto an already-built `ifaces`
+/// map, in place - so a fixture can carry Mail, Calendar, both, or neither.
+fn add_calendar_iface(ifaces: &mut HashMap<String, HashMap<String, OwnedValue>>, uri: &str, accept_ssl_errors: bool) {
+    let mut calendar = HashMap::new();
+    calendar.insert("Uri".to_string(), prop(uri.to_string()));
+    calendar.insert("AcceptSslErrors".to_string(), prop(accept_ssl_errors));
+    ifaces.insert("org.gnome.OnlineAccounts.Calendar".to_string(), calendar);
+}
+
 #[tokio::test]
 async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     let mut objects = HashMap::new();
 
     let mut oauth_ifaces = mail_account_props("oauth@example.com", true);
     oauth_ifaces.insert("org.gnome.OnlineAccounts.OAuth2Based".to_string(), HashMap::new());
+    add_calendar_iface(&mut oauth_ifaces, "https://caldav.example.com/dav/oauth@example.com/", false);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/oauth_account").unwrap(), oauth_ifaces);
 
     let mut pw_ifaces = mail_account_props("password@example.com", true);
     pw_ifaces.insert("org.gnome.OnlineAccounts.PasswordBased".to_string(), HashMap::new());
+    add_calendar_iface(&mut pw_ifaces, "https://caldav.example.com/dav/password@example.com/", true);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/pw_account").unwrap(), pw_ifaces);
 
     // An account whose Mail interface is present but unusable (mirrors the
@@ -119,6 +130,7 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
         m
     });
     no_mail_ifaces.insert("org.gnome.OnlineAccounts.PasswordBased".to_string(), HashMap::new());
+    add_calendar_iface(&mut no_mail_ifaces, "https://cloud.example.com/remote.php/dav/", false);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/no_mail_account").unwrap(), no_mail_ifaces);
 
     let connection = zbus::connection::Builder::session()
@@ -149,6 +161,15 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
         .at("/org/gnome/OnlineAccounts/Accounts/pw_account", FakePasswordBased { password: "fake-pw".to_string() })
         .await
         .unwrap();
+    connection.object_server().at("/org/gnome/OnlineAccounts/Accounts/no_mail_account", FakeAccount).await.unwrap();
+    connection
+        .object_server()
+        .at(
+            "/org/gnome/OnlineAccounts/Accounts/no_mail_account",
+            FakePasswordBased { password: "fake-nc-pw".to_string() },
+        )
+        .await
+        .unwrap();
 
     connection.request_name("org.gnome.OnlineAccounts").await.expect(
         "couldn't claim the org.gnome.OnlineAccounts bus name - a real GOA daemon (or another instance of \
@@ -172,4 +193,31 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
 
     let password = client.get_imap_password(&accounts[1]).await.unwrap();
     assert_eq!(password, "fake-pw-imap-password");
+
+    // Calendar accounts are a fully separate set: `unsupported_account` (no
+    // Calendar interface at all) must be excluded, while `no_mail_account`
+    // (no Mail interface, but a real Calendar one - mirrors the live
+    // Nextcloud account this fixture is modeled on) must now appear here
+    // even though it's absent from `list_mail_accounts()` above.
+    let mut cal_accounts = client.list_calendar_accounts().await.unwrap();
+    cal_accounts.sort_by(|a, b| a.uri.cmp(&b.uri));
+
+    assert_eq!(cal_accounts.len(), 3, "expected exactly the three usable-calendar accounts, got: {cal_accounts:?}");
+    assert_eq!(cal_accounts[0].uri, "https://caldav.example.com/dav/oauth@example.com/");
+    assert!(matches!(cal_accounts[0].auth, CalendarAuthMethod::OAuth2));
+    assert_eq!(cal_accounts[1].uri, "https://caldav.example.com/dav/password@example.com/");
+    assert!(matches!(cal_accounts[1].auth, CalendarAuthMethod::Password { .. }));
+    assert_eq!(cal_accounts[2].uri, "https://cloud.example.com/remote.php/dav/");
+    assert!(matches!(cal_accounts[2].auth, CalendarAuthMethod::Password { .. }));
+
+    client.ensure_credentials_calendar(&cal_accounts[0]).await.unwrap();
+    let (cal_token, cal_expires_in) = client.get_access_token_calendar(&cal_accounts[0]).await.unwrap();
+    assert_eq!(cal_token, "fake-access-token");
+    assert_eq!(cal_expires_in, 3600);
+
+    let cal_password = client.get_calendar_password(&cal_accounts[1]).await.unwrap();
+    assert_eq!(cal_password, "fake-pw-calendar-password");
+
+    let nextcloud_password = client.get_calendar_password(&cal_accounts[2]).await.unwrap();
+    assert_eq!(nextcloud_password, "fake-nc-pw-calendar-password");
 }

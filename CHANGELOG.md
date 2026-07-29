@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 (2026-07-30)
+
+### Added
+
+- **Calendar**: Phase 3 basics - a new `lookout-dav` crate is a CalDAV client mirroring `lookout-mail`'s architecture: RFC 4791 discovery (principal → calendar-home-set → calendar list), a `calendar-query` REPORT event fetch over `reqwest`, iCalendar parsing (`icalendar` crate, with `TZID`→UTC resolution via `chrono-tz`), and window-bounded RRULE expansion (`rrule` crate). A `CalendarSession` actor mirrors `AccountSession`'s backoff/command-loop shape, polling every 5 minutes in place of IMAP IDLE (CalDAV has no long-poll equivalent).
+- **Calendar**: `lookout-goa` now discovers GOA `Calendar`-interface accounts (`list_calendar_accounts`) alongside Mail, as a fully independent account set - a Calendar-only account (no Mail interface) is now correctly picked up, confirmed via an extended fake-GOA D-Bus test.
+- **Calendar**: `lookout-core` gains `CalendarId`/`EventUid` ids and `CalendarInfo`/`CalendarEvent`/`EventOccurrence` types, following the existing `Mailbox`/`MailboxId` conventions.
+- **UI**: the nav rail's Mail button is now grouped with a new Calendar button, switching to a read-only month-grid view (`calendar_view.rs`) with prev/next/Today navigation. Backed by `spawn_calendar_discovery`/`connect_calendar_account`, mirroring the existing Mail account-discovery wiring, unioning every connected calendar account's events for the displayed month.
+- **Testing**: 20 new `lookout-dav` unit/integration tests, including a full `wiremock`-backed discover→list-calendars→fetch-events flow against a mocked CalDAV server.
+
+### Known limitations (tracked for follow-up in `TODO.md`)
+
+- Read-only month view only - no week/day/agenda views, event create/edit/drag, iMIP invitation banners, `.ics` import/webcal, VTODO tasks, birthdays, or notifications yet.
+- The GOA `calendar-password` credential-slot id and whether Google's `Calendar.Uri` needs special-casing beyond the generic discovery flow are both unverified against a real live account.
+
+### Fixed
+
+- **Calendar**: a `RefCell` double-borrow panic in `calendar_view::build()` that crashed the app on startup - the initial `set_month` call was passed a still-borrowed value from the same `RefCell` it then tried to `borrow_mut()`.
+
 ## 0.4.0 (2026-07-29)
 
 ### Added

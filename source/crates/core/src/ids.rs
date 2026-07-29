@@ -35,3 +35,33 @@ impl MailboxId {
         MailboxId(format!("{}:{}", account_id.0, folder_path))
     }
 }
+
+/// Account-scoped identifier for a CalDAV calendar collection, synthesized
+/// from the account id and the collection's href since CalDAV has no opaque
+/// calendar id of its own (mirrors `MailboxId`'s synthesis for IMAP folders).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct CalendarId(pub String);
+
+impl fmt::Display for CalendarId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl CalendarId {
+    pub fn new(account_id: &AccountId, calendar_href: &str) -> Self {
+        CalendarId(format!("{}:{}", account_id.0, calendar_href))
+    }
+}
+
+/// An iCalendar `UID` (RFC 5545 §3.8.4.7). Only unique within a given
+/// `CalendarId` - the same UID string could coincidentally appear in a
+/// different calendar/account.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct EventUid(pub String);
+
+impl fmt::Display for EventUid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}

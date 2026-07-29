@@ -1,7 +1,9 @@
 //! GTK4/libadwaita application entry point.
 
+mod calendar_view;
 mod compose;
 mod folder_tree;
+mod goa_calendar_credentials;
 mod goa_credentials;
 mod window;
 mod worker;
