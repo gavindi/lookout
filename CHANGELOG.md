@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 (2026-07-30)
+
+### Added
+
+- **Calendar**: reworked the calendar view to match an Outlook-style month layout. The main grid is now Sunday-first with day numbers top-left in a flat hairline grid (new `.calendar-day-cell`/`.calendar-today-cell` CSS classes) instead of libadwaita's rounded `.card` panels; today gets a bordered highlight. A new resizable sidebar (mirroring the Mail folder pane's split) holds a mini month-picker (`MiniCalendar`, clicking a day jumps the main grid to that month) and a live "My calendars" checklist - unchecking a calendar actually filters its events out of the grid, via new `refresh_calendar_checklist`/`refresh_displayed_calendar_view` helpers. A Calendar-specific command toolbar (New event, Day/Work week/Week/Month/Split-view segmented control, Filter/Share/Print - all disabled placeholders except the working Month view) now swaps in for the Mail toolbar via a new `view_toolbar_stack` when the nav rail's Calendar button is active.
+
 ## 0.5.0 (2026-07-30)
 
 ### Added

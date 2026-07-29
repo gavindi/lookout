@@ -1,10 +1,10 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, CalendarInfo, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole};
+use lookout_core::{AccountId, CalendarId, CalendarInfo, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole};
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};
@@ -63,6 +63,11 @@ struct CalendarAccountHandle {
 struct CalendarUiState {
     accounts: HashMap<AccountId, CalendarAccountHandle>,
     displayed_month: chrono::NaiveDate,
+    /// Which calendars (by id) are currently shown - unioned in
+    /// `refresh_displayed_calendar_view`, toggled from the sidebar's "My
+    /// calendars" checklist. Newly-discovered calendars default to checked
+    /// (shown) - see `refresh_calendar_checklist`.
+    checked_calendar_ids: HashSet<CalendarId>,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -400,8 +405,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .description("Add an account with Calendar enabled in GNOME Online Accounts to see events here.")
         .build();
     let month_grid = Rc::new(calendar_view::build());
+    let calendar_sidebar = calendar_view::build_sidebar();
+    let calendar_sidebar_card = card_section(&calendar_sidebar.root);
+    calendar_sidebar_card.add_css_class("folder-pane");
+    let calendar_paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(&calendar_sidebar_card)
+        .end_child(&month_grid.root)
+        .resize_start_child(false)
+        .resize_end_child(true)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(260)
+        .build();
+    calendar_paned.add_css_class("seamless-paned");
     root_stack.add_named(&calendar_status_page, Some("calendar-empty"));
-    root_stack.add_named(&month_grid.root, Some("calendar"));
+    root_stack.add_named(&calendar_paned, Some("calendar"));
 
     // The one real title bar for the window - owns the actual
     // minimize/maximize/close buttons. The per-card header bars inside
@@ -464,6 +483,50 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&flag_button);
     command_toolbar.append(&snooze_button);
     command_toolbar.append(&more_button);
+
+    // --- Calendar's own command toolbar row, swapped in for the Mail one
+    // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
+    // active. "Month" is the only view that actually exists, so it's the
+    // only sensitive item in the Day/Work week/Week/Month/Split view
+    // segmented control; everything else here mirrors the Mail toolbar's
+    // disabled-placeholder convention.
+    let new_event_button = gtk::Button::from_icon_name("appointment-new-symbolic");
+    new_event_button.set_tooltip_text(Some("New Event"));
+    new_event_button.set_sensitive(false);
+
+    let day_view_button = gtk::ToggleButton::builder().label("Day").sensitive(false).build();
+    let work_week_view_button = gtk::ToggleButton::builder().label("Work week").sensitive(false).build();
+    let week_view_button = gtk::ToggleButton::builder().label("Week").sensitive(false).build();
+    let month_view_button = gtk::ToggleButton::builder().label("Month").active(true).build();
+    let split_view_button = gtk::ToggleButton::builder().label("Split view").sensitive(false).build();
+    let view_switch_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).css_classes(["linked"]).build();
+    view_switch_box.append(&day_view_button);
+    view_switch_box.append(&work_week_view_button);
+    view_switch_box.append(&week_view_button);
+    view_switch_box.append(&month_view_button);
+    view_switch_box.append(&split_view_button);
+
+    let filter_button = gtk::Button::from_icon_name("edit-find-symbolic");
+    filter_button.set_tooltip_text(Some("Filter"));
+    filter_button.set_sensitive(false);
+    let share_button = gtk::Button::from_icon_name("send-to-symbolic");
+    share_button.set_tooltip_text(Some("Share"));
+    share_button.set_sensitive(false);
+    let print_button = gtk::Button::from_icon_name("printer-symbolic");
+    print_button.set_tooltip_text(Some("Print"));
+    print_button.set_sensitive(false);
+
+    let calendar_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
+    calendar_command_toolbar.append(&new_event_button);
+    calendar_command_toolbar.append(&view_switch_box);
+    calendar_command_toolbar.append(&filter_button);
+    calendar_command_toolbar.append(&share_button);
+    calendar_command_toolbar.append(&print_button);
+
+    let view_toolbar_stack = gtk::Stack::new();
+    view_toolbar_stack.add_named(&command_toolbar, Some("mail"));
+    view_toolbar_stack.add_named(&calendar_command_toolbar, Some("calendar"));
+
     // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
     // no background) strip along the window's left edge so the background
     // image shows straight through it. Two views today (Mail/Calendar),
@@ -511,18 +574,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let root_stack = root_stack.clone();
         let current_mail_page = current_mail_page.clone();
+        let view_toolbar_stack = view_toolbar_stack.clone();
         mail_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 root_stack.set_visible_child_name(current_mail_page.get());
+                view_toolbar_stack.set_visible_child_name("mail");
             }
         });
     }
     {
         let root_stack = root_stack.clone();
         let current_calendar_page = current_calendar_page.clone();
+        let view_toolbar_stack = view_toolbar_stack.clone();
         calendar_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 root_stack.set_visible_child_name(current_calendar_page.get());
+                view_toolbar_stack.set_visible_child_name("calendar");
             }
         });
     }
@@ -530,7 +597,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let outer_toolbar_view = adw::ToolbarView::new();
     outer_toolbar_view.add_top_bar(&window_header);
     outer_toolbar_view.add_top_bar(&menu_bar);
-    outer_toolbar_view.add_top_bar(&command_toolbar);
+    outer_toolbar_view.add_top_bar(&view_toolbar_stack);
     outer_toolbar_view.set_content(Some(&content_row));
 
     toast_overlay.set_child(Some(&outer_toolbar_view));
@@ -557,6 +624,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
         accounts: HashMap::new(),
         displayed_month: current_month_start(),
+        checked_calendar_ids: HashSet::new(),
     }));
 
     // --- Compose button -> new-message window, "From" = the account owning
@@ -668,29 +736,43 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let calendar_state = calendar_state.clone();
         let month_grid = month_grid.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
         let prev_button = month_grid.prev_button.clone();
         prev_button.connect_clicked(move |_| {
             let current = calendar_state.borrow().displayed_month;
             let new_month = current.checked_sub_months(chrono::Months::new(1)).unwrap_or(current);
-            show_month(&calendar_state, &month_grid, new_month);
+            show_month(&calendar_state, &month_grid, &mini_calendar, new_month);
         });
     }
     {
         let calendar_state = calendar_state.clone();
         let month_grid = month_grid.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
         let next_button = month_grid.next_button.clone();
         next_button.connect_clicked(move |_| {
             let current = calendar_state.borrow().displayed_month;
             let new_month = current.checked_add_months(chrono::Months::new(1)).unwrap_or(current);
-            show_month(&calendar_state, &month_grid, new_month);
+            show_month(&calendar_state, &month_grid, &mini_calendar, new_month);
         });
     }
     {
         let calendar_state = calendar_state.clone();
         let month_grid = month_grid.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
         let today_button = month_grid.today_button.clone();
         today_button.connect_clicked(move |_| {
-            show_month(&calendar_state, &month_grid, current_month_start());
+            show_month(&calendar_state, &month_grid, &mini_calendar, current_month_start());
+        });
+    }
+    // --- Sidebar mini-calendar -> jump the main grid to whatever month the
+    // clicked date belongs to (same `show_month` helper the main grid's own
+    // prev/next/Today buttons use).
+    {
+        let calendar_state = calendar_state.clone();
+        let month_grid = month_grid.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
+        calendar_view::connect_day_selected(&calendar_sidebar.mini_calendar, move |date| {
+            show_month(&calendar_state, &month_grid, &mini_calendar, date);
         });
     }
 
@@ -711,6 +793,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         root_stack,
         toast_overlay,
         month_grid,
+        calendar_sidebar.calendar_list_box,
         current_calendar_page,
         calendar_view_button,
     );
@@ -718,12 +801,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window
 }
 
-/// Updates `calendar_state.displayed_month`, redraws the grid's date labels
-/// immediately (`calendar_view::set_month` clears every cell's events, so
-/// this shows an empty grid for the new month until the resync below lands),
-/// and asks every connected calendar account to resync it.
-fn show_month(calendar_state: &Rc<RefCell<CalendarUiState>>, month_grid: &MonthGrid, new_month: chrono::NaiveDate) {
+/// Updates `calendar_state.displayed_month`, redraws the main grid's date
+/// labels immediately (`calendar_view::set_month` clears every cell's
+/// events, so this shows an empty grid for the new month until the resync
+/// below lands) and keeps the sidebar's mini-calendar showing the same
+/// month, then asks every connected calendar account to resync it.
+fn show_month(calendar_state: &Rc<RefCell<CalendarUiState>>, month_grid: &MonthGrid, mini_calendar: &calendar_view::MiniCalendar, new_month: chrono::NaiveDate) {
     calendar_view::set_month(month_grid, new_month);
+    calendar_view::set_mini_month(mini_calendar, new_month);
     let mut st = calendar_state.borrow_mut();
     st.displayed_month = new_month;
     for handle in st.accounts.values() {
@@ -930,6 +1015,7 @@ fn spawn_calendar_discovery(
     root_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
     month_grid: Rc<MonthGrid>,
+    calendar_list_box: gtk::Box,
     current_calendar_page: Rc<Cell<&'static str>>,
     calendar_view_button: gtk::ToggleButton,
 ) {
@@ -956,7 +1042,7 @@ fn spawn_calendar_discovery(
             Ok((client, accounts)) if !accounts.is_empty() => {
                 show_page("calendar");
                 for account in accounts {
-                    connect_calendar_account(worker.clone(), calendar_state.clone(), month_grid.clone(), toast_overlay.clone(), client.clone(), account);
+                    connect_calendar_account(worker.clone(), calendar_state.clone(), month_grid.clone(), calendar_list_box.clone(), toast_overlay.clone(), client.clone(), account);
                 }
             }
             Ok(_) => {
@@ -970,7 +1056,60 @@ fn spawn_calendar_discovery(
     });
 }
 
-fn connect_calendar_account(worker: Rc<Worker>, calendar_state: Rc<RefCell<CalendarUiState>>, month_grid: Rc<MonthGrid>, toast_overlay: adw::ToastOverlay, goa_client: GoaClient, account: GoaCalendarAccount) {
+/// Recomputes which calendars actually exist across every connected account,
+/// defaults any newly-seen id to checked (shown), and re-renders the
+/// sidebar's "My calendars" checklist against that - the checklist's own
+/// `on_toggle` closure flips membership in `checked_calendar_ids` and calls
+/// `refresh_displayed_calendar_view` to redraw the grid accordingly.
+fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_list_box: &gtk::Box, month_grid: &Rc<MonthGrid>) {
+    let all_calendars: Vec<CalendarInfo> = calendar_state.borrow().accounts.values().flat_map(|h| h.calendars.iter().cloned()).collect();
+    {
+        let mut st = calendar_state.borrow_mut();
+        for cal in &all_calendars {
+            if !st.checked_calendar_ids.contains(&cal.id) {
+                st.checked_calendar_ids.insert(cal.id.clone());
+            }
+        }
+    }
+    let checked = calendar_state.borrow().checked_calendar_ids.clone();
+    let on_toggle = {
+        let calendar_state = calendar_state.clone();
+        let month_grid = month_grid.clone();
+        move |id: CalendarId, is_checked: bool| {
+            {
+                let mut st = calendar_state.borrow_mut();
+                if is_checked {
+                    st.checked_calendar_ids.insert(id);
+                } else {
+                    st.checked_calendar_ids.remove(&id);
+                }
+            }
+            refresh_displayed_calendar_view(&calendar_state, &month_grid);
+        }
+    };
+    calendar_view::rebuild_calendar_checklist(calendar_list_box, &all_calendars, &checked, on_toggle);
+}
+
+/// Unions every connected calendar account's latest occurrences for
+/// whatever month is currently displayed - filtered to only the calendars
+/// currently checked in the sidebar - and redraws the grid. Same
+/// "only apply if it matches what's on screen" + "merge all accounts'
+/// latest snapshot" approach as Mail's `MessagesUpdated`/`rebuild_folder_tree`.
+fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>, month_grid: &MonthGrid) {
+    let st = calendar_state.borrow();
+    let month = st.displayed_month;
+    let merged: Vec<EventOccurrence> = st
+        .accounts
+        .values()
+        .filter(|h| h.last_synced_month == Some(month))
+        .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned())
+        .collect();
+    drop(st);
+    calendar_view::set_occurrences(month_grid, &merged);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_calendar_account(worker: Rc<Worker>, calendar_state: Rc<RefCell<CalendarUiState>>, month_grid: Rc<MonthGrid>, calendar_list_box: gtk::Box, toast_overlay: adw::ToastOverlay, goa_client: GoaClient, account: GoaCalendarAccount) {
     let account_id = account.account_id.clone();
     let display_name = account.display_name.clone();
     let config = CalendarAccountConfig {
@@ -1022,29 +1161,14 @@ fn connect_calendar_account(worker: Rc<Worker>, calendar_state: Rc<RefCell<Calen
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
                         handle.calendars = calendars;
                     }
+                    refresh_calendar_checklist(&calendar_state, &calendar_list_box, &month_grid);
                 }
                 CalendarSessionEvent::OccurrencesUpdated { month, occurrences } => {
-                    let displayed_month = {
-                        let mut st = calendar_state.borrow_mut();
-                        if let Some(handle) = st.accounts.get_mut(&account_id) {
-                            handle.last_occurrences = occurrences;
-                            handle.last_synced_month = Some(month);
-                        }
-                        st.displayed_month
-                    };
-                    if displayed_month == month {
-                        // Union every connected account's latest snapshot
-                        // for the displayed month - same approach as
-                        // `rebuild_folder_tree`'s all-accounts merge.
-                        let st = calendar_state.borrow();
-                        let merged: Vec<EventOccurrence> = st
-                            .accounts
-                            .values()
-                            .filter(|h| h.last_synced_month == Some(month))
-                            .flat_map(|h| h.last_occurrences.iter().cloned())
-                            .collect();
-                        calendar_view::set_occurrences(&month_grid, &merged);
+                    if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                        handle.last_occurrences = occurrences;
+                        handle.last_synced_month = Some(month);
                     }
+                    refresh_displayed_calendar_view(&calendar_state, &month_grid);
                 }
                 CalendarSessionEvent::Error(message) => {
                     toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
