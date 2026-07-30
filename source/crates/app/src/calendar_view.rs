@@ -46,6 +46,10 @@ fn install_calendar_css() {
         }
         .calendar-today-cell {
             border: 2px solid @accent_bg_color;
+        }
+        .calendar-main-background {
+            background-color: #2e2e32;
+            border-radius: 12px;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -94,7 +98,18 @@ pub fn build() -> MonthGrid {
         }
     }
 
-    let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    let root_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["calendar-main-background"])
+        .overflow(gtk::Overflow::Hidden)
+        // Matches `card_section()`'s own 6px margin (used by the sidebar to
+        // its left), so both panels sit the same distance from the paned
+        // divider/window edges.
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
     root_box.append(&header_row);
     root_box.append(&grid);
 

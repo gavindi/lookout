@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.2 (2026-07-30)
+
+### Changed
+
+- **UI**: the main (large) calendar grid now has a dark grey (`#2e2e32`) rounded-corner background (new `.calendar-main-background` class) instead of showing the window background image through it, with margins matching the sidebar's `card_section` gap so both panels sit evenly off the paned divider/window edges.
+- **UI**: the nav rail now spans the window's full height *below the title bar* rather than only beside the mail/calendar content - `window_header` stays the one real title bar spanning the full window width at the very top; the menu bar, command toolbar, and content now live in a new `inner_content_box` to the rail's right instead of stacking above it as `AdwToolbarView` top bars.
+- **UI**: the menu bar and icon command toolbar are now visually grouped - a shared black `.window-toolbars-background` behind both rows, with the icon toolbar additionally boxed into its own `#2e2e32` dark grey, rounded-corner (`.window-icon-toolbar-background`), 6px-margined subgroup distinct from the menu bar above it.
+
 ## 0.5.1 (2026-07-30)
 
 ### Added

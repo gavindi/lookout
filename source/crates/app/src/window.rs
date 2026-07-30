@@ -110,6 +110,13 @@ fn install_paned_css() {
         .seamless-paned > separator {
             min-width: 6px;
             min-height: 6px;
+        }
+        .window-toolbars-background {
+            background-color: black;
+        }
+        .window-icon-toolbar-background {
+            background-color: #2e2e32;
+            border-radius: 8px;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -549,19 +556,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     calendar_view_button.set_group(Some(&mail_view_button));
 
+    // `vexpand(true)` so the rail stretches the window's full height (it
+    // sits beside `outer_toolbar_view` - header bar, menu bar, and command
+    // toolbar included - rather than below those top bars).
     let nav_rail = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .width_request(56)
         .margin_top(6)
         .margin_start(6)
         .spacing(6)
+        .vexpand(true)
         .build();
     nav_rail.append(&mail_view_button);
     nav_rail.append(&calendar_view_button);
-
-    let content_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
-    content_row.append(&nav_rail);
-    content_row.append(&root_stack);
 
     // Which sub-page each view should show when its nav-rail button becomes
     // active - kept up to date by the discovery/event handlers below (which
@@ -594,11 +601,43 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // The nav rail runs the full height *below the title bar* - it sits
+    // beside the menu bar/command toolbar/mail-or-calendar content, but not
+    // beside `window_header` itself, which stays the one real title bar
+    // spanning the full window width at the very top.
+    root_stack.set_hexpand(true);
+    root_stack.set_vexpand(true);
+
+    // The icon command toolbar (Mail's/Calendar's) gets its own dark grey
+    // subgroup, distinct from the menu bar's black background.
+    let icon_toolbar_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["window-icon-toolbar-background"])
+        .overflow(gtk::Overflow::Hidden)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    icon_toolbar_box.append(&view_toolbar_stack);
+
+    // Menu bar + icon toolbar grouped onto their own shared black
+    // background, rather than each row painting (or not painting) its own.
+    let toolbars_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["window-toolbars-background"]).build();
+    toolbars_box.append(&menu_bar);
+    toolbars_box.append(&icon_toolbar_box);
+
+    let inner_content_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).vexpand(true).build();
+    inner_content_box.append(&toolbars_box);
+    inner_content_box.append(&root_stack);
+
+    let window_body = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
+    window_body.append(&nav_rail);
+    window_body.append(&inner_content_box);
+
     let outer_toolbar_view = adw::ToolbarView::new();
     outer_toolbar_view.add_top_bar(&window_header);
-    outer_toolbar_view.add_top_bar(&menu_bar);
-    outer_toolbar_view.add_top_bar(&view_toolbar_stack);
-    outer_toolbar_view.set_content(Some(&content_row));
+    outer_toolbar_view.set_content(Some(&window_body));
 
     toast_overlay.set_child(Some(&outer_toolbar_view));
     toast_overlay.set_hexpand(true);
