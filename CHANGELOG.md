@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1 (2026-07-30)
+
+### Added
+
+- **Mail**: Reply, Reply All, and Forward toolbar buttons now open the compose window pre-filled from the currently selected/open message - `Re: `/`Fwd: ` subject (not doubled up if already present), quoted original body ("On {date}, {sender} wrote:" with `> `-prefixed lines for Reply/Reply-All; a "Forwarded message" header block with the original body verbatim for Forward), and correct `In-Reply-To`/`References` threading headers for Reply/Reply-All (Forward starts a new, unthreaded conversation). Reply-All also carries over the original's other To/Cc recipients, excluding the replying account's own address.
+- **Mail**: the compose window gained a Cc field (previously To/Subject/body only), needed for Reply-All to actually carry Cc recipients through to the sent message.
+
+### Fixed
+
+- **Mail**: fixed a would-be double-bracketing bug in the new reply-threading code before it ever shipped - `mail-builder`'s outgoing `Message-Id`/`References`/`In-Reply-To` headers add their own `<>` wrapping, so raw header values pulled from an original message (which already have brackets) are now stripped of them first.
+
 ## 0.6.0 (2026-07-30)
 
 ### Added

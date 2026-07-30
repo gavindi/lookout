@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, CalendarId, CalendarInfo, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, Uid};
+use lookout_core::{AccountId, CalendarId, CalendarInfo, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, Uid};
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};
@@ -42,6 +42,12 @@ struct UiState {
     /// whatever the user is currently looking at).
     current_account: Option<AccountId>,
     current_mailbox: Option<MailboxId>,
+    /// The most recently fetched message body, kept alongside its
+    /// mailbox/uid so Reply/Reply-All/Forward can find it again without a
+    /// second fetch - see `selected_message_reply_context`. `None` until the
+    /// first `BodyFetched` event lands, or if it's for a message other than
+    /// what's currently selected.
+    current_body: Option<(MailboxId, Uid, EmailBody)>,
 }
 
 /// Per-calendar-account state, kept separate from `UiState`/`AccountHandle`
@@ -459,11 +465,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     menu_bar.append(&view_button);
     menu_bar.append(&help_button);
 
-    // --- Command toolbar row. `compose_button`, `delete_button`,
+    // --- Command toolbar row. `compose_button`, `reply_button`,
+    // `reply_all_button`, `forward_button`, `delete_button`,
     // `archive_button`, `report_button`, and `snooze_button` are backed by
     // real functionality; `flag_button`/`more_button` mirror Outlook's row
     // visually but are disabled since Lookout doesn't implement
     // flag/unflag or the "More" menu yet.
+    let reply_button = gtk::Button::from_icon_name("mail-reply-sender-symbolic");
+    reply_button.set_tooltip_text(Some("Reply"));
+    let reply_all_button = gtk::Button::from_icon_name("mail-reply-all-symbolic");
+    reply_all_button.set_tooltip_text(Some("Reply All"));
+    let forward_button = gtk::Button::from_icon_name("mail-forward-symbolic");
+    forward_button.set_tooltip_text(Some("Forward"));
     let delete_button = gtk::Button::from_icon_name("user-trash-symbolic");
     delete_button.set_tooltip_text(Some("Delete"));
     let archive_button = gtk::Button::from_icon_name("mail-archive-symbolic");
@@ -481,6 +494,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     command_toolbar.append(&compose_button);
+    command_toolbar.append(&reply_button);
+    command_toolbar.append(&reply_all_button);
+    command_toolbar.append(&forward_button);
     command_toolbar.append(&delete_button);
     command_toolbar.append(&archive_button);
     command_toolbar.append(&report_button);
@@ -694,6 +710,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         accounts: HashMap::new(),
         current_account: None,
         current_mailbox: None,
+        current_body: None,
     }));
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
         accounts: HashMap::new(),
@@ -719,7 +736,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let cmd_tx = handle.cmd_tx.clone();
             let from_email = handle.email.clone();
             drop(st);
-            crate::compose::open_compose_window(&window, from_email, cmd_tx, None, None, None);
+            crate::compose::open_compose_window(&window, from_email, cmd_tx, crate::compose::ComposePrefill::default());
+        });
+    }
+
+    // --- Reply/Reply-All/Forward -> opens the compose window pre-filled
+    // from whatever message is currently selected and has a body loaded.
+    // Silent no-op if nothing's selected or the body hasn't arrived yet
+    // (same convention as the Delete/Archive/Report/Snooze buttons below).
+    for (button, mode) in [(&reply_button, crate::compose::ReplyMode::Reply), (&reply_all_button, crate::compose::ReplyMode::ReplyAll)] {
+        let message_selection = message_selection.clone();
+        let state = state.clone();
+        let window = window.clone();
+        button.connect_clicked(move |_| {
+            if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_selection, &state) {
+                let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
+                crate::compose::open_compose_window(&window, from_email, cmd_tx, prefill);
+            }
+        });
+    }
+    {
+        let message_selection = message_selection.clone();
+        let state = state.clone();
+        let window = window.clone();
+        forward_button.connect_clicked(move |_| {
+            if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_selection, &state) {
+                let prefill = crate::compose::build_forward_prefill(&summary, &body);
+                crate::compose::open_compose_window(&window, from_email, cmd_tx, prefill);
+            }
         });
     }
 
@@ -1122,7 +1166,8 @@ fn connect_account(
                         }
                     }
                 }
-                AccountEvent::BodyFetched { body, .. } => {
+                AccountEvent::BodyFetched { mailbox, uid, body } => {
+                    state.borrow_mut().current_body = Some((mailbox, uid, body.clone()));
                     render_body(&reading_stack, body);
                 }
                 AccountEvent::SendCompleted => {
@@ -1402,6 +1447,25 @@ fn selected_message_command_target(message_selection: &gtk::SingleSelection, sta
     let st = state.borrow();
     let cmd_tx = st.current_account.as_ref().and_then(|id| st.accounts.get(id)).map(|handle| handle.cmd_tx.clone())?;
     Some((mailbox, uid, cmd_tx))
+}
+
+/// Resolves the currently-selected message plus its already-fetched body,
+/// for the Reply/Reply-All/Forward button handlers. Returns `None` if
+/// nothing is selected, its account has disconnected, or the cached
+/// `current_body` doesn't match the selection (its body hasn't arrived yet,
+/// or is stale from a previous selection) - the calling handler is then a
+/// silent no-op, same convention as `selected_message_command_target`.
+fn selected_message_reply_context(message_selection: &gtk::SingleSelection, state: &Rc<RefCell<UiState>>) -> Option<(EmailSummary, EmailBody, String, async_channel::Sender<AccountCommand>)> {
+    let boxed = message_selection.selected_item().and_downcast::<glib::BoxedAnyObject>()?;
+    let summary = boxed.borrow::<EmailSummary>().clone();
+
+    let st = state.borrow();
+    let (body_mailbox, body_uid, body) = st.current_body.as_ref()?;
+    if *body_mailbox != summary.mailbox || *body_uid != summary.uid {
+        return None;
+    }
+    let handle = st.current_account.as_ref().and_then(|id| st.accounts.get(id))?;
+    Some((summary, body.clone(), handle.email.clone(), handle.cmd_tx.clone()))
 }
 
 fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String {
