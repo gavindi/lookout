@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3 (2026-07-30)
+
+### Added
+
+- **UI**: the reading pane now has its own header above the message body (new `message_header` module) - subject line, a colored initials avatar, sender name/email, a "To:" recipient line, the message date, and a second set of Reply/Reply-All/Forward buttons (duplicating the top command toolbar's by design). Populated the instant a message is selected from its `EmailSummary` rather than waiting on the async body fetch, and hidden automatically (via the reading pane's existing stack-page signal) whenever the empty placeholder or the in-place composer is showing instead.
+
 ## 0.6.2 (2026-07-30)
 
 ### Changed

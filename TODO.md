@@ -48,7 +48,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [x] Message delete - move-to-Trash via IMAP MOVE (RFC 6851) where supported, else COPY + STORE `\Deleted` + EXPUNGE - backs the toolbar's Delete button
 - [x] Move-to-folder actions: Archive and Report-as-junk (move to the account's Archive/Junk mailbox via the same MOVE/COPY+EXPUNGE path) - backs the toolbar's Archive/Report buttons
 - [x] Client-side snooze (hide a message and resurface it later - no IMAP-native equivalent, same approach as Gmail/Outlook desktop; tracked in a local SQLite `snoozed` table, re-checked on next sync rather than a dedicated timer) - backs the toolbar's Snooze button
-- [ ] Ribbon-style Home/View tab content once there's something to put in them - the menu bar's Home/View buttons are disabled placeholders until then
+- [ ] Ribbon-style Home/View tab content - the *content* a Home tab would hold (New mail, Delete, Archive, Report, Reply, Reply All, Forward, Snooze) already exists, but as an always-visible command toolbar row rather than behind an actual Home-tab switch; the menu bar's `home_button`/`view_button` themselves are still `.sensitive(false)` placeholders with no click handler, and the View tab has no content anywhere yet
 - [ ] Full-text search: SQLite FTS5 over cache + IMAP `SEARCH` fallback
 - [ ] Internal drag-drop (move/tag) + external drag-out (`.eml`/`.zip`)
 - [ ] Collapsible thread UI (reuse the folder tree's `TreeListModel` trick)

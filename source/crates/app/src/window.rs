@@ -123,7 +123,25 @@ fn install_paned_css() {
         .window-icon-toolbar-background {
             background-color: #2e2e32;
             border-radius: 8px;
-        }",
+        }
+        .message-header-subject {
+            font-weight: bold;
+            font-size: 1.2em;
+        }
+        .message-header-meta {
+            opacity: 0.7;
+        }
+        .avatar-circle {
+            border-radius: 9999px;
+            color: white;
+            font-weight: bold;
+        }
+        .avatar-color-0 { background-color: #e57373; }
+        .avatar-color-1 { background-color: #64b5f6; }
+        .avatar-color-2 { background-color: #81c784; }
+        .avatar-color-3 { background-color: #ffb74d; }
+        .avatar-color-4 { background-color: #ba68c8; }
+        .avatar-color-5 { background-color: #4db6ac; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -354,7 +372,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the window's own size negotiation.
     reading_stack.set_size_request(-1, 300);
 
-    let reading_card = card_section(&reading_stack);
+    // --- Reading-pane header: subject/sender/avatar/To/date, plus a second
+    // set of Reply/Reply-All/Forward buttons duplicating the top command
+    // toolbar's (see below) - visible only while an actual message is shown,
+    // not for the empty placeholder or the in-place composer.
+    let message_header = crate::message_header::build();
+    message_header.widget.set_visible(false);
+
+    let reading_pane_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    reading_pane_box.append(&message_header.widget);
+    reading_pane_box.append(&reading_stack);
+
+    let reading_card = card_section(&reading_pane_box);
 
     // Keep the reading pane's card fully transparent while it's showing the
     // "no message selected" placeholder, so the window background image
@@ -377,6 +406,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     update_reading_card_transparency(&reading_stack);
     reading_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
         update_reading_card_transparency(stack);
+    });
+
+    let update_message_header_visibility = {
+        let message_header_widget = message_header.widget.clone();
+        move |stack: &gtk::Stack| {
+            let show = matches!(stack.visible_child_name().as_deref(), Some("html") | Some("text"));
+            message_header_widget.set_visible(show);
+        }
+    };
+    update_message_header_visibility(&reading_stack);
+    reading_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
+        update_message_header_visibility(stack);
     });
 
     // --- Resizable panes: folders | (messages | reading), each its own
@@ -744,7 +785,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // pre-filled from whatever message is currently selected and has a body
     // loaded. Silent no-op if nothing's selected or the body hasn't arrived
     // yet (same convention as the Delete/Archive/Report/Snooze buttons below).
-    for (button, mode, title) in [(&reply_button, crate::compose::ReplyMode::Reply, "Reply"), (&reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All")] {
+    // Wired twice - once for the top command toolbar's buttons, once for the
+    // reading-pane header's own copies - by design, see the plan this
+    // shipped under.
+    for (button, mode, title) in [
+        (&reply_button, crate::compose::ReplyMode::Reply, "Reply"),
+        (&message_header.reply_button, crate::compose::ReplyMode::Reply, "Reply"),
+        (&reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
+        (&message_header.reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
+    ] {
         let message_selection = message_selection.clone();
         let state = state.clone();
         let reading_stack = reading_stack.clone();
@@ -755,11 +804,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
-    {
+    for button in [&forward_button, &message_header.forward_button] {
         let message_selection = message_selection.clone();
         let state = state.clone();
         let reading_stack = reading_stack.clone();
-        forward_button.connect_clicked(move |_| {
+        button.connect_clicked(move |_| {
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_selection, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 show_composer_in_reading_pane(&reading_stack, "Forward", from_email, cmd_tx, prefill);
@@ -835,6 +884,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let reading_stack = reading_stack.clone();
+        let message_header = message_header.clone();
         message_selection.connect_selected_item_notify(move |sel| {
             let Some(boxed) = sel.selected_item().and_downcast::<glib::BoxedAnyObject>() else {
                 return;
@@ -842,6 +892,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let summary = boxed.borrow::<EmailSummary>();
             let uid = summary.uid;
             let mailbox = summary.mailbox.clone();
+            message_header.update(&summary);
             drop(summary);
 
             let st = state.borrow();
