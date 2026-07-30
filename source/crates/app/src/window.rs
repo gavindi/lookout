@@ -723,12 +723,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(chrono::Utc::now().date_naive()));
     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
 
-    // --- Compose button -> new-message window, "From" = the account owning
-    // the currently-open mailbox (falling back to any connected account if
-    // nothing's been selected yet) ---
+    // --- Compose button -> new-message composer in the reading pane,
+    // "From" = the account owning the currently-open mailbox (falling back
+    // to any connected account if nothing's been selected yet) ---
     {
         let state = state.clone();
-        let window = window.clone();
+        let reading_stack = reading_stack.clone();
         compose_button.connect_clicked(move |_| {
             let st = state.borrow();
             let account_id = st.current_account.clone().or_else(|| st.accounts.keys().next().cloned());
@@ -736,33 +736,33 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let cmd_tx = handle.cmd_tx.clone();
             let from_email = handle.email.clone();
             drop(st);
-            crate::compose::open_compose_window(&window, from_email, cmd_tx, crate::compose::ComposePrefill::default());
+            show_composer_in_reading_pane(&reading_stack, "New Message", from_email, cmd_tx, crate::compose::ComposePrefill::default());
         });
     }
 
-    // --- Reply/Reply-All/Forward -> opens the compose window pre-filled
-    // from whatever message is currently selected and has a body loaded.
-    // Silent no-op if nothing's selected or the body hasn't arrived yet
-    // (same convention as the Delete/Archive/Report/Snooze buttons below).
-    for (button, mode) in [(&reply_button, crate::compose::ReplyMode::Reply), (&reply_all_button, crate::compose::ReplyMode::ReplyAll)] {
+    // --- Reply/Reply-All/Forward -> opens the composer in the reading pane
+    // pre-filled from whatever message is currently selected and has a body
+    // loaded. Silent no-op if nothing's selected or the body hasn't arrived
+    // yet (same convention as the Delete/Archive/Report/Snooze buttons below).
+    for (button, mode, title) in [(&reply_button, crate::compose::ReplyMode::Reply, "Reply"), (&reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All")] {
         let message_selection = message_selection.clone();
         let state = state.clone();
-        let window = window.clone();
+        let reading_stack = reading_stack.clone();
         button.connect_clicked(move |_| {
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_selection, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
-                crate::compose::open_compose_window(&window, from_email, cmd_tx, prefill);
+                show_composer_in_reading_pane(&reading_stack, title, from_email, cmd_tx, prefill);
             }
         });
     }
     {
         let message_selection = message_selection.clone();
         let state = state.clone();
-        let window = window.clone();
+        let reading_stack = reading_stack.clone();
         forward_button.connect_clicked(move |_| {
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_selection, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
-                crate::compose::open_compose_window(&window, from_email, cmd_tx, prefill);
+                show_composer_in_reading_pane(&reading_stack, "Forward", from_email, cmd_tx, prefill);
             }
         });
     }
@@ -849,6 +849,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let _ = handle.cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox, uid });
             }
             drop(st);
+            // Also silently abandons an in-progress composer in the reading
+            // pane, if one's open - no "discard draft?" prompt, consistent
+            // with this app's existing no-confirmation-dialog convention.
             reading_stack.set_visible_child_name("empty");
         });
     }
@@ -1555,4 +1558,28 @@ fn render_body(reading_stack: &gtk::Stack, body: lookout_core::EmailBody) {
         }
     }
     reading_stack.set_visible_child_name("empty");
+}
+
+/// Swaps a compose widget into the reading pane's `"compose"` stack page,
+/// replacing whatever was showing there (a message, or the empty
+/// placeholder). Removes any leftover `"compose"` page first so repeated
+/// clicks don't accumulate stale pages, and restores whatever page was
+/// visible beforehand once `on_done` fires (Cancel or Send) - so Reply's
+/// Cancel lands back on the same message, and New Message's Cancel lands
+/// back on the empty placeholder.
+fn show_composer_in_reading_pane(reading_stack: &gtk::Stack, title: &str, from_email: String, cmd_tx: async_channel::Sender<AccountCommand>, prefill: crate::compose::ComposePrefill) {
+    if let Some(existing) = reading_stack.child_by_name("compose") {
+        reading_stack.remove(&existing);
+    }
+    let previous_page = reading_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_else(|| "empty".to_string());
+    let reading_stack_for_close = reading_stack.clone();
+    let on_done: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
+            reading_stack_for_close.remove(&existing);
+        }
+        reading_stack_for_close.set_visible_child_name(&previous_page);
+    });
+    let composer = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done);
+    reading_stack.add_named(&composer, Some("compose"));
+    reading_stack.set_visible_child_name("compose");
 }

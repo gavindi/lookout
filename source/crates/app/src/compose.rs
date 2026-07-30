@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use adw::prelude::*;
 use lookout_core::{EmailBody, EmailSummary};
 use lookout_mail::session::AccountCommand;
@@ -140,12 +142,16 @@ pub fn build_forward_prefill(summary: &EmailSummary, body: &EmailBody) -> Compos
     }
 }
 
-/// Opens a plain-text compose window. Rich-text/contenteditable compose was
-/// the plan's own flagged highest-risk Phase 1 item; this ships the
-/// documented fallback (plain `Gtk.TextView` body, comma-separated
-/// recipients) so sending mail works end-to-end now, with a richer composer
-/// as Phase 2 work.
-pub fn open_compose_window(parent: &adw::ApplicationWindow, from_email: String, cmd_tx: async_channel::Sender<AccountCommand>, prefill: ComposePrefill) {
+/// Builds a plain-text composer widget, meant to be embedded as a page in
+/// the reading pane's `gtk::Stack` (see `window.rs`'s
+/// `show_composer_in_reading_pane`) rather than presented as its own window.
+/// `on_done` is called once Cancel or Send is clicked, so the caller can
+/// tear the page down and restore whatever the reading pane showed before.
+/// Rich-text/contenteditable compose was the plan's own flagged
+/// highest-risk Phase 1 item; this ships the documented fallback (plain
+/// `Gtk.TextView` body, comma-separated recipients) so sending mail works
+/// end-to-end now, with a richer composer as Phase 2 work.
+pub fn build_compose_view(title: &str, from_email: String, cmd_tx: async_channel::Sender<AccountCommand>, prefill: ComposePrefill, on_done: Rc<dyn Fn()>) -> gtk::Box {
     let to_row = adw::EntryRow::builder().title("To").build();
     if let Some(to) = &prefill.to {
         to_row.set_text(to);
@@ -176,6 +182,15 @@ pub fn open_compose_window(parent: &adw::ApplicationWindow, from_email: String, 
     }
     let body_scroller = gtk::ScrolledWindow::builder().child(&body_view).vexpand(true).build();
 
+    let cancel_button = gtk::Button::builder().label("Cancel").build();
+    let send_button = gtk::Button::builder().label("Send").css_classes(["suggested-action"]).build();
+    let title_label = gtk::Label::builder().label(title).hexpand(true).build();
+
+    let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
+    top_row.append(&cancel_button);
+    top_row.append(&title_label);
+    top_row.append(&send_button);
+
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -184,36 +199,15 @@ pub fn open_compose_window(parent: &adw::ApplicationWindow, from_email: String, 
         .margin_start(12)
         .margin_end(12)
         .build();
+    content.append(&top_row);
     content.append(&fields_group);
     content.append(&body_scroller);
 
-    let cancel_button = gtk::Button::builder().label("Cancel").build();
-    let send_button = gtk::Button::builder().label("Send").css_classes(["suggested-action"]).build();
-
-    let header = adw::HeaderBar::builder().show_end_title_buttons(false).show_start_title_buttons(false).build();
-    header.pack_start(&cancel_button);
-    header.pack_end(&send_button);
-    header.set_title_widget(Some(&gtk::Label::new(Some("New Message"))));
-
-    let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&content));
-
-    let window = adw::Window::builder()
-        .transient_for(parent)
-        .modal(false)
-        .default_width(640)
-        .default_height(480)
-        .title("New Message")
-        .content(&toolbar_view)
-        .build();
-
     {
-        let window = window.clone();
-        cancel_button.connect_clicked(move |_| window.close());
+        let on_done = on_done.clone();
+        cancel_button.connect_clicked(move |_| on_done());
     }
     {
-        let window = window.clone();
         let in_reply_to = prefill.in_reply_to;
         let references = prefill.references;
         send_button.connect_clicked(move |_| {
@@ -235,11 +229,11 @@ pub fn open_compose_window(parent: &adw::ApplicationWindow, from_email: String, 
                 references: references.clone(),
             };
             let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(msg));
-            window.close();
+            on_done();
         });
     }
 
-    window.present();
+    content
 }
 
 #[cfg(test)]

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2 (2026-07-30)
+
+### Changed
+
+- **UI**: New Message, Reply, Reply All, and Forward now open the composer in place of the reading pane's content instead of as a separate modal window - a new `"compose"` page in the reading pane's existing `gtk::Stack`, matching how it already flips between the HTML/plain-text/empty views. Cancel or Send returns to whatever was showing before (the same message for Reply/Forward, the empty placeholder for New Message). Selecting a different message while composing silently abandons it, consistent with the app's existing no-confirmation-dialog convention.
+
 ## 0.6.1 (2026-07-30)
 
 ### Added
