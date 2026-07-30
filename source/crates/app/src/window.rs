@@ -570,6 +570,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     nav_rail.append(&mail_view_button);
     nav_rail.append(&calendar_view_button);
 
+    // --- Mail-screen calendar overview pane: a mini month-picker + a list
+    // of the clicked day's events, docked to the far right of the window,
+    // spanning the same full height as `nav_rail` (it's a sibling in
+    // `window_body`, not nested inside `root_stack`). Mail-only - the
+    // Calendar view already has its own full sidebar with a mini-calendar.
+    let mail_calendar_overview = calendar_view::build_mini();
+    let mail_overview_day_list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(8).build();
+    // Matches `build_sidebar()`'s own width_request - without an explicit
+    // cap here, the mini-calendar's day-button grid requests its natural
+    // (much wider) size instead of a compact peek-pane width.
+    let mail_overview_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).width_request(240).build();
+    mail_overview_box.append(&mail_calendar_overview.root);
+    mail_overview_box.append(&mail_overview_day_list);
+
+    let mail_calendar_overview_card = card_section(&mail_overview_box);
+    mail_calendar_overview_card.add_css_class("folder-pane");
+    mail_calendar_overview_card.set_vexpand(true);
+
     // Which sub-page each view should show when its nav-rail button becomes
     // active - kept up to date by the discovery/event handlers below (which
     // only actually flip `root_stack`'s visible child if their own button is
@@ -582,10 +600,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let root_stack = root_stack.clone();
         let current_mail_page = current_mail_page.clone();
         let view_toolbar_stack = view_toolbar_stack.clone();
+        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         mail_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 root_stack.set_visible_child_name(current_mail_page.get());
                 view_toolbar_stack.set_visible_child_name("mail");
+                mail_calendar_overview_card.set_visible(true);
             }
         });
     }
@@ -593,10 +613,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let root_stack = root_stack.clone();
         let current_calendar_page = current_calendar_page.clone();
         let view_toolbar_stack = view_toolbar_stack.clone();
+        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         calendar_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 root_stack.set_visible_child_name(current_calendar_page.get());
                 view_toolbar_stack.set_visible_child_name("calendar");
+                mail_calendar_overview_card.set_visible(false);
             }
         });
     }
@@ -631,9 +653,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     inner_content_box.append(&toolbars_box);
     inner_content_box.append(&root_stack);
 
+    // Resizable split between the main content and the overview pane -
+    // `nav_rail` stays a fixed-width sibling outside the split (it isn't
+    // meant to be resizable), but the overview pane's width is user-
+    // draggable like every other pane split in this app.
+    let content_and_overview_paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(&inner_content_box)
+        .end_child(&mail_calendar_overview_card)
+        .resize_start_child(true)
+        .resize_end_child(false)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(1340)
+        .build();
+    content_and_overview_paned.add_css_class("seamless-paned");
+
     let window_body = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
     window_body.append(&nav_rail);
-    window_body.append(&inner_content_box);
+    window_body.append(&content_and_overview_paned);
 
     let outer_toolbar_view = adw::ToolbarView::new();
     outer_toolbar_view.add_top_bar(&window_header);
@@ -665,6 +703,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         displayed_month: current_month_start(),
         checked_calendar_ids: HashSet::new(),
     }));
+    // Which single day the Mail-screen overview pane's event list is
+    // currently showing - separate from `calendar_state.displayed_month`
+    // (that's the main Calendar view's own concern).
+    let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(chrono::Utc::now().date_naive()));
+    refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
 
     // --- Compose button -> new-message window, "From" = the account owning
     // the currently-open mailbox (falling back to any connected account if
@@ -814,6 +857,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             show_month(&calendar_state, &month_grid, &mini_calendar, date);
         });
     }
+    // --- Mail-screen overview mini-calendar -> re-show that day's events
+    // (from whatever's already cached) and ask every connected calendar
+    // account to resync that month in the background, without touching the
+    // main Calendar view's own `displayed_month`.
+    {
+        let calendar_state = calendar_state.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        calendar_view::connect_day_selected(&mail_calendar_overview, move |date| {
+            mail_overview_day.set(date);
+            refresh_mail_overview_day_list(&calendar_state, date, &mail_overview_day_list);
+            let month = first_of_month(date);
+            for handle in calendar_state.borrow().accounts.values() {
+                let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
+            }
+        });
+    }
 
     spawn_account_discovery(
         worker.clone(),
@@ -833,6 +893,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         toast_overlay,
         month_grid,
         calendar_sidebar.calendar_list_box,
+        mail_overview_day,
+        mail_overview_day_list,
         current_calendar_page,
         calendar_view_button,
     );
@@ -856,9 +918,12 @@ fn show_month(calendar_state: &Rc<RefCell<CalendarUiState>>, month_grid: &MonthG
 }
 
 fn current_month_start() -> chrono::NaiveDate {
+    first_of_month(chrono::Utc::now().date_naive())
+}
+
+fn first_of_month(date: chrono::NaiveDate) -> chrono::NaiveDate {
     use chrono::Datelike;
-    let today = chrono::Utc::now().date_naive();
-    today.with_day(1).unwrap_or(today)
+    date.with_day(1).unwrap_or(date)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1055,6 +1120,8 @@ fn spawn_calendar_discovery(
     toast_overlay: adw::ToastOverlay,
     month_grid: Rc<MonthGrid>,
     calendar_list_box: gtk::Box,
+    mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
+    mail_overview_day_list: gtk::Box,
     current_calendar_page: Rc<Cell<&'static str>>,
     calendar_view_button: gtk::ToggleButton,
 ) {
@@ -1081,7 +1148,17 @@ fn spawn_calendar_discovery(
             Ok((client, accounts)) if !accounts.is_empty() => {
                 show_page("calendar");
                 for account in accounts {
-                    connect_calendar_account(worker.clone(), calendar_state.clone(), month_grid.clone(), calendar_list_box.clone(), toast_overlay.clone(), client.clone(), account);
+                    connect_calendar_account(
+                        worker.clone(),
+                        calendar_state.clone(),
+                        month_grid.clone(),
+                        calendar_list_box.clone(),
+                        mail_overview_day.clone(),
+                        mail_overview_day_list.clone(),
+                        toast_overlay.clone(),
+                        client.clone(),
+                        account,
+                    );
                 }
             }
             Ok(_) => {
@@ -1147,8 +1224,56 @@ fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>
     calendar_view::set_occurrences(month_grid, &merged);
 }
 
+/// Fills the Mail-screen overview pane's event list with every checked
+/// calendar's occurrences (from whatever's currently cached - no new fetch
+/// here) whose local date matches `day`, sorted by start time. Shows a
+/// "No events" placeholder when there are none. Unlike
+/// `refresh_displayed_calendar_view`, this filters by exact day rather than
+/// by the main Calendar view's own displayed month - the overview pane can
+/// be showing a day from a different month entirely.
+fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>, day: chrono::NaiveDate, day_list_box: &gtk::Box) {
+    while let Some(child) = day_list_box.first_child() {
+        day_list_box.remove(&child);
+    }
+
+    let st = calendar_state.borrow();
+    let mut occurrences: Vec<&EventOccurrence> = st
+        .accounts
+        .values()
+        .flat_map(|h| h.last_occurrences.iter())
+        .filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id))
+        .filter(|occ| occ.start.with_timezone(&chrono::Local).date_naive() == day)
+        .collect();
+    occurrences.sort_by_key(|occ| occ.start);
+
+    if occurrences.is_empty() {
+        let placeholder = gtk::Label::builder().label("No events").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+        day_list_box.append(&placeholder);
+    } else {
+        for occ in occurrences {
+            let text = if occ.all_day {
+                occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
+            } else {
+                format!("{} {}", occ.start.with_timezone(&chrono::Local).format("%H:%M"), occ.summary.as_deref().unwrap_or("(untitled)"))
+            };
+            let label = gtk::Label::builder().label(&text).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).css_classes(["caption"]).build();
+            day_list_box.append(&label);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn connect_calendar_account(worker: Rc<Worker>, calendar_state: Rc<RefCell<CalendarUiState>>, month_grid: Rc<MonthGrid>, calendar_list_box: gtk::Box, toast_overlay: adw::ToastOverlay, goa_client: GoaClient, account: GoaCalendarAccount) {
+fn connect_calendar_account(
+    worker: Rc<Worker>,
+    calendar_state: Rc<RefCell<CalendarUiState>>,
+    month_grid: Rc<MonthGrid>,
+    calendar_list_box: gtk::Box,
+    mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
+    mail_overview_day_list: gtk::Box,
+    toast_overlay: adw::ToastOverlay,
+    goa_client: GoaClient,
+    account: GoaCalendarAccount,
+) {
     let account_id = account.account_id.clone();
     let display_name = account.display_name.clone();
     let config = CalendarAccountConfig {
@@ -1208,6 +1333,7 @@ fn connect_calendar_account(worker: Rc<Worker>, calendar_state: Rc<RefCell<Calen
                         handle.last_synced_month = Some(month);
                     }
                     refresh_displayed_calendar_view(&calendar_state, &month_grid);
+                    refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
                 }
                 CalendarSessionEvent::Error(message) => {
                     toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));

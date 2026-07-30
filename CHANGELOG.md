@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.3 (2026-07-30)
+
+### Added
+
+- **UI**: the Mail screen now has a calendar overview pane docked to the far right of the window, spanning the same full height as the nav rail (a sibling in `window_body`, not nested inside `root_stack`) - a mini month-picker plus a day-agenda list below it. Clicking a date shows that day's events (filtered to checked calendars) and triggers a background `CalendarCommand::SyncMonth` for that month without disturbing the main Calendar view's own displayed month. Today's events populate automatically shortly after a calendar account connects, via each account's existing auto-sync-current-month behavior. Hidden while the Calendar view is active, since that view already has its own sidebar mini-calendar. Resizable via a new `content_and_overview_paned` split, matching every other pane boundary in the app.
+
+### Fixed
+
+- **UI**: the overview pane's mini-calendar was rendering roughly 2x wider than intended and had no resize handle - it was appended directly into a plain `gtk::Box` with nothing constraining its natural width (unlike the Calendar view's own sidebar, which caps width via `build_sidebar()`'s `width_request`). Added a matching `width_request(240)` and moved the pane into the new resizable `content_and_overview_paned` split.
+
 ## 0.5.2 (2026-07-30)
 
 ### Changed
