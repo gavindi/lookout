@@ -8,7 +8,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [x] `.desktop` file (`data/io.github.gavindi.Lookout.desktop`, passes `desktop-file-validate`), AppStream metainfo (passes `appstreamcli validate` bar the placeholder homepage URL), placeholder app icon
   - [ ] GResource bundle - nothing to bundle yet since the UI is built programmatically with no `.ui` XML templates (a deliberate Phase 1 choice, see the plan)
 - [x] `AdwApplication` shell with empty-state page ("No mail accounts configured") that spawns `gnome-control-center online-accounts`
-- [x] Window chrome polish: background image behind the mail panes, translucent folder pane (and empty-state reading pane) so it shows through, per-`MailboxRole` folder icons in the tree, a view-switcher rail on the window's left edge (Mail only so far - scaffold for Phase 3/4's Calendar/Contacts views), and an Outlook-style menu bar + command toolbar stacked below the title bar. File→Quit and Help→About are wired to real `gio::SimpleAction`s; Home/View and the toolbar's Delete/Archive/Report/Flag/Snooze/More buttons are visible-but-disabled placeholders pending the features below
+- [x] Window chrome polish: background image behind the mail panes, translucent folder pane (and empty-state reading pane) so it shows through, per-`MailboxRole` folder icons in the tree, a view-switcher rail on the window's left edge (Mail only so far - scaffold for Phase 3/4's Calendar/Contacts views), and an Outlook-style menu bar + command toolbar stacked below the title bar. File→Quit and Help→About are wired to real `gio::SimpleAction`s; Delete/Archive/Report/Snooze and Reply/Reply All/Forward are now live (see Phase 2 and below); Home/View and the toolbar's Flag/More buttons remain visible-but-disabled placeholders
 - [x] `lookout-goa`: zbus proxies for `ObjectManager`/`Account`/`Mail`/`PasswordBased`/`OAuth2Based`; `list_mail_accounts()`
 - [x] Wire account discovery into startup → folder tree for the default account
 - [x] `lookout-mail`: `AccountSession` actor — `LOGIN`/`AUTHENTICATE XOAUTH2`, `LIST (SPECIAL-USE)`, `SELECT`, bounded envelope fetch, IDLE loop with instant command interruption
@@ -20,7 +20,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
   - [ ] Switch from whole-message fetch to `BODYSTRUCTURE`-driven partial fetch
   - [ ] Inline `cid:` image resolution via a custom WebKit URI scheme handler
 - [x] Compose window: plain-text body, `mail-builder` MIME, `lettre` SMTP send (XOAUTH2/password), `APPEND` to Sent - validated live end-to-end against Gmail
-  - [ ] reply/reply-all/forward entry points (currently new-message only)
+  - [x] reply/reply-all/forward entry points - pre-filled subject/quoted body/`In-Reply-To`/`References` threading, Reply-All carries over To/Cc minus the account's own address. New/Reply/Reply-All/Forward all open in place of the reading pane's content (a `"compose"` page in its `gtk::Stack`) rather than a separate modal window
   - [ ] Rich-text/contenteditable WebView body (currently plain-text only, per the plan's own descope fallback)
   - [ ] Recipient chip widget with autocomplete (currently comma-separated text)
   - [ ] Autosave drafts
@@ -45,9 +45,9 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 
 ## Phase 2 — Mail advanced (roadmap)
 
-- [ ] Message delete (`\Deleted` flag + `EXPUNGE`, or move-to-Trash) - backs the toolbar's Delete button
-- [ ] Move-to-folder actions: Archive and Report-as-junk (mark junk + move to the account's Junk mailbox) - backs the toolbar's Archive/Report buttons
-- [ ] Client-side snooze (hide a message and resurface it later - no IMAP-native equivalent, same approach as Gmail/Outlook desktop) - backs the toolbar's Snooze button
+- [x] Message delete - move-to-Trash via IMAP MOVE (RFC 6851) where supported, else COPY + STORE `\Deleted` + EXPUNGE - backs the toolbar's Delete button
+- [x] Move-to-folder actions: Archive and Report-as-junk (move to the account's Archive/Junk mailbox via the same MOVE/COPY+EXPUNGE path) - backs the toolbar's Archive/Report buttons
+- [x] Client-side snooze (hide a message and resurface it later - no IMAP-native equivalent, same approach as Gmail/Outlook desktop; tracked in a local SQLite `snoozed` table, re-checked on next sync rather than a dedicated timer) - backs the toolbar's Snooze button
 - [ ] Ribbon-style Home/View tab content once there's something to put in them - the menu bar's Home/View buttons are disabled placeholders until then
 - [ ] Full-text search: SQLite FTS5 over cache + IMAP `SEARCH` fallback
 - [ ] Internal drag-drop (move/tag) + external drag-out (`.eml`/`.zip`)
@@ -65,17 +65,19 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 
 ## Phase 3 — Calendar (roadmap)
 
-- [ ] `lookout-dav`: thin CalDAV/WebDAV layer over `reqwest`
-- [ ] iCalendar modeling + recurrence expansion (`icalendar` + `rrule`, spike to confirm maturity)
-- [ ] GOA `Calendar` interface for endpoint + credentials
-- [ ] Custom-drawn month/week/day/agenda views
+- [x] `lookout-dav`: thin CalDAV/WebDAV layer over `reqwest` - RFC 4791 discovery (principal → calendar-home-set → calendar list) + `calendar-query` REPORT event fetch, mirroring `lookout-mail`'s actor architecture (`CalendarSession`, polling every 5 minutes in place of IMAP IDLE)
+- [x] iCalendar modeling + recurrence expansion (`icalendar` + `rrule`) - `TZID`→UTC resolution via `chrono-tz`, window-bounded RRULE expansion
+- [x] GOA `Calendar` interface for endpoint + credentials - discovery (`list_calendar_accounts`) confirmed live; the `calendar-password` credential-slot id and Google `Calendar.Uri` special-casing are implemented but still unverified against a real live account
+- [x] Custom-drawn month view (Outlook-style, Sunday-first grid, mini-calendar sidebar + "My calendars" checklist filter)
+  - [ ] Week/Day/Agenda views and the Split-view layout (the command toolbar's view-switcher only has Month wired up; the other segmented-control options are disabled placeholders)
 - [ ] Drag-reschedule; recurring edit scopes (this / this-and-following / all)
 - [ ] iMIP invitation banners in the mail viewer
 - [ ] `.ics` import / webcal subscription
-- [ ] Mini-calendar sidebar widget
+- [x] Mini-calendar sidebar widget - both the Calendar view's own sidebar and a second copy docked to the Mail screen's far right (with a day-agenda list underneath, filtered to checked calendars)
 - [ ] VTODO tasks
 - [ ] Birthday calendar synthesized from Contacts
 - [ ] `Gio.Notification` event alerts
+- [ ] Event create/edit (the "New Event" toolbar button is still a disabled placeholder - the calendar view is read-only today)
 
 ## Phase 4 — Contacts (roadmap)
 
