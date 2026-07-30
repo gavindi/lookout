@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::sync::Mutex;
 
-use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, UidValidity};
+use chrono::{DateTime, Utc};
+use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, Uid, UidValidity};
 use rusqlite::Connection;
 
 use crate::error::Result;
@@ -65,6 +67,12 @@ impl Cache {
                 PRIMARY KEY (mailbox_id, uid)
             );
             CREATE INDEX IF NOT EXISTS messages_by_mailbox ON messages (mailbox_id);
+            CREATE TABLE IF NOT EXISTS snoozed (
+                mailbox_id TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                snoozed_until INTEGER NOT NULL,
+                PRIMARY KEY (mailbox_id, uid)
+            );
             ",
         )?;
         Ok(Cache { conn: Mutex::new(conn) })
@@ -132,6 +140,35 @@ impl Cache {
         }
         Ok(messages)
     }
+
+    /// Records that `uid` (in `mailbox_id`) should be hidden from
+    /// `MessagesUpdated` until `until` - purely client-side state, IMAP has
+    /// no native snooze concept. `INSERT OR REPLACE` so re-snoozing an
+    /// already-snoozed message just updates its wake time.
+    pub fn snooze_message(&self, mailbox_id: &MailboxId, uid: Uid, until: DateTime<Utc>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO snoozed (mailbox_id, uid, snoozed_until) VALUES (?1, ?2, ?3)",
+            rusqlite::params![mailbox_id.0, uid.0, until.timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Returns every uid in `mailbox_id` still snoozed as of `now`, having
+    /// first opportunistically deleted rows whose snooze time has already
+    /// passed (cheap cleanup piggybacked on the read every caller already
+    /// does before building `MessagesUpdated`).
+    pub fn active_snoozed_uids(&self, mailbox_id: &MailboxId, now: DateTime<Utc>) -> Result<HashSet<Uid>> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM snoozed WHERE snoozed_until <= ?1", rusqlite::params![now.timestamp()])?;
+        let mut stmt = conn.prepare("SELECT uid FROM snoozed WHERE mailbox_id = ?1")?;
+        let rows = stmt.query_map([&mailbox_id.0], |row| row.get::<_, u32>(0))?;
+        let mut uids = HashSet::new();
+        for row in rows {
+            uids.insert(Uid(row?));
+        }
+        Ok(uids)
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +217,28 @@ mod tests {
         // Replacing again should wholesale-replace, not accumulate.
         cache.replace_mailboxes(&account_id, &mailboxes[..1]).unwrap();
         assert_eq!(cache.load_mailboxes(&account_id).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn round_trips_snooze_state_and_excludes_expired_entries() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let now = Utc::now();
+
+        cache.snooze_message(&mailbox_id, Uid(1), now + chrono::Duration::hours(1)).unwrap();
+        cache.snooze_message(&mailbox_id, Uid(2), now - chrono::Duration::hours(1)).unwrap();
+
+        let active = cache.active_snoozed_uids(&mailbox_id, now).unwrap();
+        assert_eq!(active, HashSet::from([Uid(1)]));
+
+        // Re-snoozing an already-snoozed message updates its wake time
+        // rather than erroring or duplicating the row.
+        cache.snooze_message(&mailbox_id, Uid(1), now - chrono::Duration::hours(1)).unwrap();
+        assert!(cache.active_snoozed_uids(&mailbox_id, now).unwrap().is_empty());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

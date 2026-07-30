@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, CalendarId, CalendarInfo, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole};
+use lookout_core::{AccountId, CalendarId, CalendarInfo, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, Uid};
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};
@@ -459,25 +459,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     menu_bar.append(&view_button);
     menu_bar.append(&help_button);
 
-    // --- Command toolbar row. `compose_button` is the only button here
-    // backed by real functionality; the rest mirror Outlook's row visually
-    // but are disabled since Lookout doesn't implement delete/archive/
-    // report/flag/snooze yet.
+    // --- Command toolbar row. `compose_button`, `delete_button`,
+    // `archive_button`, `report_button`, and `snooze_button` are backed by
+    // real functionality; `flag_button`/`more_button` mirror Outlook's row
+    // visually but are disabled since Lookout doesn't implement
+    // flag/unflag or the "More" menu yet.
     let delete_button = gtk::Button::from_icon_name("user-trash-symbolic");
     delete_button.set_tooltip_text(Some("Delete"));
-    delete_button.set_sensitive(false);
     let archive_button = gtk::Button::from_icon_name("mail-archive-symbolic");
     archive_button.set_tooltip_text(Some("Archive"));
-    archive_button.set_sensitive(false);
     let report_button = gtk::Button::from_icon_name("mail-mark-junk-symbolic");
     report_button.set_tooltip_text(Some("Report"));
-    report_button.set_sensitive(false);
     let flag_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
     flag_button.set_tooltip_text(Some("Flag/Unflag"));
     flag_button.set_sensitive(false);
     let snooze_button = gtk::Button::from_icon_name("appointment-soon-symbolic");
     snooze_button.set_tooltip_text(Some("Snooze"));
-    snooze_button.set_sensitive(false);
     let more_button = gtk::Button::from_icon_name("view-more-symbolic");
     more_button.set_tooltip_text(Some("More"));
     more_button.set_sensitive(false);
@@ -812,6 +809,36 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // --- Delete/Archive/Report -> AccountCommand::MoveMessage against the
+    // account's Trash/Archive/Junk mailbox; Snooze -> AccountCommand::
+    // SnoozeMessage with a single fixed "tomorrow 9:00 AM local time"
+    // default. All four are silent no-ops with nothing selected.
+    for (button, role) in [(&delete_button, MailboxRole::Trash), (&archive_button, MailboxRole::Archive), (&report_button, MailboxRole::Junk)] {
+        let message_selection = message_selection.clone();
+        let state = state.clone();
+        button.connect_clicked(move |_| {
+            if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_selection, &state) {
+                let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage { mailbox, uid, role });
+            }
+        });
+    }
+    {
+        let message_selection = message_selection.clone();
+        let state = state.clone();
+        snooze_button.connect_clicked(move |_| {
+            if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_selection, &state) {
+                let tomorrow_9am = chrono::Local::now()
+                    .date_naive()
+                    .succ_opt()
+                    .and_then(|d| d.and_hms_opt(9, 0, 0))
+                    .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(chrono::Utc::now);
+                let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessage { mailbox, uid, until: tomorrow_9am });
+            }
+        });
+    }
+
     // --- Month grid navigation: prev/next/Today update the grid locally
     // (immediate redraw of the date labels) and ask every connected
     // calendar account to resync the newly-displayed month.
@@ -1101,6 +1128,18 @@ fn connect_account(
                 AccountEvent::SendCompleted => {
                     toast_overlay.add_toast(adw::Toast::new("Message sent"));
                 }
+                AccountEvent::MessageMoved { role } => {
+                    let label = match role {
+                        MailboxRole::Trash => "Deleted",
+                        MailboxRole::Archive => "Archived",
+                        MailboxRole::Junk => "Reported as junk",
+                        _ => "Moved",
+                    };
+                    toast_overlay.add_toast(adw::Toast::new(label));
+                }
+                AccountEvent::MessageSnoozed => {
+                    toast_overlay.add_toast(adw::Toast::new("Snoozed until tomorrow 9:00 AM"));
+                }
                 AccountEvent::Error(message) => {
                     toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", account_label(&state, &account_id))));
                 }
@@ -1345,6 +1384,24 @@ fn connect_calendar_account(
 
 fn calendar_account_label(state: &Rc<RefCell<CalendarUiState>>, account_id: &AccountId) -> String {
     state.borrow().accounts.get(account_id).map(|h| h.display_name.clone()).unwrap_or_else(|| account_id.0.clone())
+}
+
+/// Resolves the currently-selected message in `message_selection` to its
+/// mailbox/uid and its owning account's command channel, for the
+/// Delete/Archive/Report/Snooze button handlers - mirrors the lookup already
+/// done inline by the `FetchBody`-on-selection handler above. Returns `None`
+/// if nothing is selected or its account has since disconnected, in which
+/// case the calling handler is a silent no-op.
+fn selected_message_command_target(message_selection: &gtk::SingleSelection, state: &Rc<RefCell<UiState>>) -> Option<(MailboxId, Uid, async_channel::Sender<AccountCommand>)> {
+    let boxed = message_selection.selected_item().and_downcast::<glib::BoxedAnyObject>()?;
+    let summary = boxed.borrow::<EmailSummary>();
+    let uid = summary.uid;
+    let mailbox = summary.mailbox.clone();
+    drop(summary);
+
+    let st = state.borrow();
+    let cmd_tx = st.current_account.as_ref().and_then(|id| st.accounts.get(id)).map(|handle| handle.cmd_tx.clone())?;
+    Some((mailbox, uid, cmd_tx))
 }
 
 fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String {

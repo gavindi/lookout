@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_imap::Session;
 use futures::TryStreamExt;
 use lookout_core::mailbox::role_from_special_use;
-use lookout_core::{AccountId, EmailBody, EmailSummary, Mailbox, MailboxId, Uid, UidValidity};
+use lookout_core::{AccountId, EmailBody, EmailSummary, Mailbox, MailboxId, MailboxRole, Uid, UidValidity};
 
 use crate::auth::XOAuth2Authenticator;
 use crate::body::parse_body;
@@ -59,6 +59,19 @@ pub enum AccountCommand {
     /// `Gio.NetworkMonitor` reporting connectivity just came back. A no-op
     /// if the session is already connected (nothing to reconnect).
     Reconnect,
+    /// Moves a message from its current mailbox into the account's mailbox
+    /// with the given special-use role (Trash for Delete, Archive for
+    /// Archive, Junk for Report-as-junk) - via IMAP MOVE (RFC 6851) if the
+    /// server advertises it, else COPY + STORE `\Deleted` + EXPUNGE. If no
+    /// mailbox with that role exists, this fails with an `Error` event
+    /// rather than silently permanent-deleting - there's no
+    /// confirmation-dialog UI in this app yet, so no destructive fallback
+    /// without one.
+    MoveMessage { mailbox: MailboxId, uid: Uid, role: MailboxRole },
+    /// Client-side only - IMAP has no native snooze. Records `until` in the
+    /// local cache and hides the message from `MessagesUpdated` until that
+    /// time passes.
+    SnoozeMessage { mailbox: MailboxId, uid: Uid, until: chrono::DateTime<chrono::Utc> },
     Shutdown,
 }
 
@@ -69,6 +82,8 @@ pub enum AccountEvent {
     MessagesUpdated { mailbox: MailboxId, messages: Vec<EmailSummary> },
     BodyFetched { mailbox: MailboxId, uid: Uid, body: EmailBody },
     SendCompleted,
+    MessageMoved { role: MailboxRole },
+    MessageSnoozed,
     Error(String),
 }
 
@@ -283,9 +298,68 @@ async fn connect_and_run(
                 // only does something useful while backed off between
                 // connection attempts, see `run_account_session`.
                 AccountCommand::Reconnect => {}
+                AccountCommand::MoveMessage { mailbox, uid, role } => {
+                    if mailbox != current_mailbox_id {
+                        tracing::warn!("MoveMessage requested for a mailbox other than the currently selected one; ignoring");
+                        continue;
+                    }
+                    match move_message_to_role(&mut session, &folders, &account_id, uid, role).await {
+                        Ok(()) => {
+                            let _ = events.send(AccountEvent::MessageMoved { role }).await;
+                            folders = list_mailboxes(&mut session, &account_id).await?;
+                            if let Some(cache) = cache {
+                                if let Err(e) = cache.replace_mailboxes(&account_id, &folders) {
+                                    tracing::warn!("failed to cache mailbox list: {e}");
+                                }
+                            }
+                            let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
+                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't move message: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::SnoozeMessage { mailbox, uid, until } => {
+                    if mailbox != current_mailbox_id {
+                        tracing::warn!("SnoozeMessage requested for a mailbox other than the currently selected one; ignoring");
+                        continue;
+                    }
+                    if let Some(cache) = cache {
+                        if let Err(e) = cache.snooze_message(&mailbox, uid, until) {
+                            tracing::warn!("failed to record snooze: {e}");
+                        }
+                    }
+                    let _ = events.send(AccountEvent::MessageSnoozed).await;
+                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                }
             }
         }
     }
+}
+
+/// Moves `uid` from the currently selected mailbox into the account's
+/// mailbox with special-use role `role`, via IMAP MOVE (RFC 6851) if the
+/// server advertises it, else COPY + STORE `\Deleted` + EXPUNGE.
+async fn move_message_to_role(session: &mut Session<ImapStream>, folders: &[Mailbox], account_id: &AccountId, uid: Uid, role: MailboxRole) -> Result<()> {
+    let Some(target) = folders.iter().find(|m| m.role == role) else {
+        return Err(Error::NoSuchFolder(role));
+    };
+    let Some(path) = target.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
+        return Ok(());
+    };
+    let caps = session.capabilities().await?;
+    if caps.has_str("MOVE") {
+        session.uid_mv(uid.0.to_string(), path).await?;
+    } else {
+        session.uid_copy(uid.0.to_string(), path).await?;
+        let _: Vec<_> = session.uid_store(uid.0.to_string(), "+FLAGS (\\Deleted)").await?.try_collect().await?;
+        // NB: expunges every \Deleted-flagged message in the currently
+        // selected mailbox, not just this one - a documented, accepted
+        // simplification since nothing else in this crate ever sets \Deleted.
+        let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    }
+    Ok(())
 }
 
 /// Sends `msg` over SMTP, then best-effort `APPEND`s the raw message to the
@@ -394,6 +468,15 @@ async fn sync_mailbox(
             tracing::warn!("failed to cache messages for {mailbox_id}: {e}");
         }
     }
+
+    // Snoozed messages are still fetched/cached normally above - only what's
+    // emitted to the UI is filtered, so a snooze is purely a display concern.
+    if let Some(cache) = cache {
+        if let Ok(snoozed) = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()) {
+            messages.retain(|m| !snoozed.contains(&m.uid));
+        }
+    }
+
     let _ = events
         .send(AccountEvent::MessagesUpdated {
             mailbox: mailbox_id.clone(),

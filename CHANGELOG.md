@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 (2026-07-30)
+
+### Added
+
+- **Mail**: Delete, Archive, and Report-as-junk toolbar buttons are now live - each moves the selected message into the account's Trash/Archive/Junk mailbox via IMAP MOVE (RFC 6851) where the server supports it, falling back to COPY + STORE `\Deleted` + EXPUNGE otherwise. If an account has no mailbox for that role, the move fails with a toast rather than silently permanent-deleting.
+- **Mail**: Snooze is now live - hides the selected message from the list until tomorrow at 9:00 AM local time. Purely client-side (IMAP has no native snooze concept): tracked in a new `snoozed` table in the local per-account SQLite cache, filtered out of what's shown to the UI while still being fetched/cached normally. Snooze expiry is only re-checked on the next sync (IDLE-triggered or explicit), not on a dedicated timer.
+- All four actions surface an `AdwToast` on completion ("Deleted"/"Archived"/"Reported as junk"/"Snoozed until tomorrow 9:00 AM") and trigger an immediate folder + message-list resync, matching the existing toast-only feedback convention.
+
 ## 0.5.3 (2026-07-30)
 
 ### Added

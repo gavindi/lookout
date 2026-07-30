@@ -130,7 +130,10 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
                         got_send = true;
                     }
                     AccountEvent::Error(e) => panic!("account session reported an error: {e}"),
-                    AccountEvent::ConnectionStateChanged(_) | AccountEvent::BodyFetched { .. } => {}
+                    AccountEvent::ConnectionStateChanged(_)
+                    | AccountEvent::BodyFetched { .. }
+                    | AccountEvent::MessageMoved { .. }
+                    | AccountEvent::MessageSnoozed => {}
                 }
                 if got_folders && got_messages && got_send {
                     break;

@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                         got_body = true;
                     }
                     AccountEvent::SendCompleted => println!("send completed"),
+                    AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed => {}
                     AccountEvent::Error(e) => println!("ERROR: {e}"),
                 }
                 if got_folders && got_messages && got_body {

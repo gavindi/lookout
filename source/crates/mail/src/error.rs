@@ -16,6 +16,8 @@ pub enum Error {
     InvalidServerName(String),
     #[error("login failed: {0}")]
     LoginFailed(String),
+    #[error("no {0:?} folder found")]
+    NoSuchFolder(lookout_core::MailboxRole),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
