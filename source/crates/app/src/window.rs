@@ -258,9 +258,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Message list ---
     let message_store = gio::ListStore::new::<glib::BoxedAnyObject>();
     let message_selection = gtk::SingleSelection::new(Some(message_store.clone()));
+    let state = Rc::new(RefCell::new(UiState {
+        accounts: HashMap::new(),
+        current_account: None,
+        current_mailbox: None,
+        current_body: None,
+    }));
+    let reading_stack = gtk::Stack::new();
+    let state_clone = state.clone();
+    let reading_stack_clone = reading_stack.clone();
     let message_factory = gtk::SignalListItemFactory::new();
-    message_factory.connect_setup(|_, list_item| {
-        let box_ = gtk::Box::builder()
+    message_factory.connect_setup(move |_, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        // Main vertical box for sender, date, subject
+        let vbox = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
             .margin_top(6)
@@ -268,36 +279,225 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .margin_start(10)
             .margin_end(10)
             .build();
-        let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-        let sender = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
-        let date = gtk::Label::builder().xalign(1.0).css_classes(["dim-label", "caption"]).build();
-        top_row.append(&sender);
-        top_row.append(&date);
-        let subject = gtk::Label::builder()
+        // Top row: sender and date
+        let hbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+        let sender_label = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        let date_label = gtk::Label::builder()
+            .xalign(1.0)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        hbox.append(&sender_label);
+        hbox.append(&date_label);
+        // Subject label
+        let subject_label = gtk::Label::builder()
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label"])
             .build();
-        box_.append(&top_row);
-        box_.append(&subject);
-        list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&box_));
+        vbox.append(&hbox);
+        vbox.append(&subject_label);
+        // Action box (initially hidden)
+        let action_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Center)
+            .margin_end(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        let archive_btn = gtk::Button::from_icon_name("mail-archive-symbolic");
+        archive_btn.set_tooltip_text(Some("Archive"));
+        let delete_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+        delete_btn.set_tooltip_text(Some("Delete"));
+        let reply_btn = gtk::Button::from_icon_name("mail-reply-sender-symbolic");
+        reply_btn.set_tooltip_text(Some("Reply"));
+        action_box.append(&archive_btn);
+        action_box.append(&delete_btn);
+        action_box.append(&reply_btn);
+        // Initially hide actions
+        action_box.set_visible(false);
+        // Overlay to overlay actions on top of content
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&vbox));
+        overlay.add_overlay(&action_box);
+        unsafe {
+            list_item.set_data("action-box", action_box.clone());
+            list_item.set_data("archive-button", archive_btn.clone());
+            list_item.set_data("delete-button", delete_btn.clone());
+            list_item.set_data("reply-button", reply_btn.clone());
+        }
+        list_item.set_child(Some(&overlay));
     });
-    message_factory.connect_bind(|_, list_item| {
+    message_factory.connect_bind(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else { return };
-        let summary = boxed.borrow::<EmailSummary>();
-        let Some(box_) = list_item.child().and_downcast::<gtk::Box>() else { return };
-        let Some(top_row) = box_.first_child().and_downcast::<gtk::Box>() else { return };
-        let sender = top_row.first_child().and_downcast::<gtk::Label>().unwrap();
-        let date_label = top_row.last_child().and_downcast::<gtk::Label>().unwrap();
-        let subject = box_.last_child().and_downcast::<gtk::Label>().unwrap();
-
-        let from = summary.from.first().map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
-        sender.set_label(&from);
-        sender.set_css_classes(if summary.is_unread() { &["heading"] } else { &[] });
+        let summary = boxed.borrow::<EmailSummary>().clone();
+        let overlay = list_item
+            .child()
+            .and_downcast::<gtk::Overlay>()
+            .expect("overlay");
+        let action_box = unsafe {
+            list_item
+                .data::<gtk::Box>("action-box")
+                .expect("action box")
+                .as_ref()
+                .clone()
+        };
+        let vbox = overlay
+            .child()
+            .and_downcast::<gtk::Box>()
+            .expect("vbox");
+        let hbox = vbox
+            .first_child()
+            .and_downcast::<gtk::Box>()
+            .expect("hbox");
+        let sender_label = hbox
+            .first_child()
+            .and_downcast::<gtk::Label>()
+            .expect("sender label");
+        let date_label = hbox
+            .last_child()
+            .and_downcast::<gtk::Label>()
+            .expect("date label");
+        let subject_label = vbox
+            .last_child()
+            .and_downcast::<gtk::Label>()
+            .expect("subject label");
+        let from = summary
+            .from
+            .first()
+            .map(|a| a.display_label().to_string())
+            .unwrap_or_else(|| "(unknown)".into());
+        sender_label.set_label(&from);
+        sender_label.set_css_classes(if summary.is_unread() {
+            &["heading"]
+        } else {
+            &[]
+        });
         date_label.set_label(&summary.date.format("%Y-%m-%d %H:%M").to_string());
-        subject.set_label(summary.subject.as_deref().unwrap_or("(no subject)"));
+        subject_label.set_label(summary.subject.as_deref().unwrap_or("(no subject)"));
+        let action_box_for_hover = action_box.clone();
+        let hover_controller = gtk::EventControllerMotion::new();
+        hover_controller.connect_enter(move |_, _, _| {
+            action_box_for_hover.set_visible(true);
+        });
+        let action_box_for_leave = action_box.clone();
+        hover_controller.connect_leave(move |_| {
+            action_box_for_leave.set_visible(false);
+        });
+        overlay.add_controller(hover_controller);
+        // Button click handlers
+        let state_clone = state_clone.clone();
+        let reading_stack_clone = reading_stack_clone.clone();
+        let mailbox_for_archive = summary.mailbox.clone();
+        let uid_for_archive = summary.uid;
+        let mailbox_for_delete = summary.mailbox.clone();
+        let uid_for_delete = summary.uid;
+        let mailbox_for_reply = summary.mailbox.clone();
+        let uid_for_reply = summary.uid;
+        let summary_for_reply = summary.clone();
+        // Archive button: first child of action_box
+        {
+            let archive_btn = unsafe {
+                list_item
+                    .data::<gtk::Button>("archive-button")
+                    .expect("archive button")
+                    .as_ref()
+                    .clone()
+            };
+            let state_for_archive = state_clone.clone();
+            archive_btn.connect_clicked(move |_| {
+                let Some(account_id) = mailbox_account_id(&mailbox_for_archive) else {
+                    return;
+                };
+                let state = state_for_archive.borrow();
+                if let Some(handle) = state.accounts.get(&account_id) {
+                    let _ = handle.cmd_tx.send_blocking(AccountCommand::MoveMessage {
+                        mailbox: mailbox_for_archive.clone(),
+                        uid: uid_for_archive,
+                        role: MailboxRole::Archive,
+                    });
+                }
+            });
+        }
+        // Delete button: second child of action_box
+        {
+            let delete_btn = unsafe {
+                list_item
+                    .data::<gtk::Button>("delete-button")
+                    .expect("delete button")
+                    .as_ref()
+                    .clone()
+            };
+            let state_for_delete = state_clone.clone();
+            delete_btn.connect_clicked(move |_| {
+                let Some(account_id) = mailbox_account_id(&mailbox_for_delete) else {
+                    return;
+                };
+                let state = state_for_delete.borrow();
+                if let Some(handle) = state.accounts.get(&account_id) {
+                    let _ = handle.cmd_tx.send_blocking(AccountCommand::MoveMessage {
+                        mailbox: mailbox_for_delete.clone(),
+                        uid: uid_for_delete,
+                        role: MailboxRole::Trash,
+                    });
+                }
+            });
+        }
+        // Reply button: third child of action_box
+        {
+            let reply_btn = unsafe {
+                list_item
+                    .data::<gtk::Button>("reply-button")
+                    .expect("reply button")
+                    .as_ref()
+                    .clone()
+            };
+            let state_for_reply = state_clone.clone();
+            let reading_stack_for_reply = reading_stack_clone.clone();
+            reply_btn.connect_clicked(move |_| {
+                let state = state_for_reply.borrow();
+                // Check if we have the body for this message
+                if let Some((body_mailbox, body_uid, body)) = state.current_body.as_ref() {
+                    if *body_mailbox == mailbox_for_reply && *body_uid == uid_for_reply {
+                        // We have the body, can reply
+                        let Some(account_id) = mailbox_account_id(&mailbox_for_reply) else {
+                            return;
+                        };
+                        if let Some(handle) = state.accounts.get(&account_id) {
+                            let from_email = handle.email.clone();
+                            let prefill = crate::compose::build_reply_prefill(
+                                &summary_for_reply,
+                                body,
+                                &from_email,
+                                crate::compose::ReplyMode::Reply,
+                            );
+                            // Show composer in reading pane
+                            let on_done = Rc::new(|| {});
+                            let composer = crate::compose::build_compose_view(
+                                "Reply",
+                                from_email,
+                                handle.cmd_tx.clone(),
+                                prefill,
+                                on_done,
+                            );
+                            reading_stack_for_reply.add_named(&composer, Some("compose"));
+                            reading_stack_for_reply.set_visible_child_name("compose");
+                        }
+                    }
+                }
+            });
+        }
     });
+    message_factory.connect_unbind(move |_, _| {});
     let message_list_view = gtk::ListView::new(Some(message_selection.clone()), Some(message_factory));
     let message_scroller = gtk::ScrolledWindow::builder().child(&message_list_view).vexpand(true).build();
     let message_card = card_section(&message_scroller);
@@ -315,6 +515,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     open_eml_button.set_tooltip_text(Some("Open .eml (debug)"));
 
     // --- Reading pane: WebKit for HTML, GtkTextView for plain text ---
+    let _reading_stack = reading_stack.clone();
     let webkit_settings = webkit::Settings::new();
     webkit_settings.set_enable_javascript(false);
     webkit_settings.set_enable_developer_extras(false);
@@ -747,12 +948,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .content(&window_overlay)
         .build();
 
-    let state = Rc::new(RefCell::new(UiState {
-        accounts: HashMap::new(),
-        current_account: None,
-        current_mailbox: None,
-        current_body: None,
-    }));
+    let state = state.clone();
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
         accounts: HashMap::new(),
         displayed_month: current_month_start(),
@@ -1483,6 +1679,10 @@ fn connect_calendar_account(
 
 fn calendar_account_label(state: &Rc<RefCell<CalendarUiState>>, account_id: &AccountId) -> String {
     state.borrow().accounts.get(account_id).map(|h| h.display_name.clone()).unwrap_or_else(|| account_id.0.clone())
+}
+
+fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
+    mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
 }
 
 /// Resolves the currently-selected message in `message_selection` to its

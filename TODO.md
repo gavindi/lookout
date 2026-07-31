@@ -41,7 +41,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [x] Protocol integration test: GreenMail (`crates/mail/tests/imap_integration.rs`, `testcontainers`) covering LOGIN/LIST/APPEND/SMTP send via the real `run_account_session` actor, gated behind a `test-utils` Cargo feature (self-referencing dev-dependency, never reachable from production builds) that adds an insecure-TLS test connector for GreenMail's self-signed cert. **Written carefully (GOA/port/env-var details cross-checked against GreenMail's own source and Docker docs) but never executed** - no Docker available in the environment that wrote it. `#[ignore]`d so `cargo test` skips it by default; run with `cargo test -p lookout-mail --features test-utils --test imap_integration -- --ignored` once Docker is available, and treat that first run as the real validation.
 - [x] `test-fixtures/` sample `.eml` set (plain text, HTML+inline CSS, HTML+`cid:`, HTML+external images, malformed HTML) + dev-only "open .eml" debug action
 - [x] CI: `cargo fmt --check`, `cargo clippy -D warnings`, unit tests, fake-goa tests, GreenMail integration tests, build-only job against GTK4/libadwaita/webkitgtk-6.0 dev packages
-- [ ] Manual milestone smoke test covering compose+send and reconnect-after-sleep on both an OAuth2 and a password-based account
+- [x] Manual milestone smoke test covering compose+send and reconnect-after-sleep on both an OAuth2 and a password-based account
 
 ## Phase 2 — Mail advanced (roadmap)
 
@@ -56,7 +56,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [ ] Recipient-chip/autocomplete composer widget
 - [ ] Unified mailbox + cross-account views; full multi-account switcher
 - [ ] Batch actions + `Gtk.MultiSelection`
-- [ ] Hover quick-actions
+- [x] Hover quick-actions
 - [ ] Physical-keycode global keyboard shortcuts
 - [ ] Print support
 - [ ] List-Unsubscribe banner

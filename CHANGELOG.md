@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.4 (2026-08-01)
+
+### Fixed
+
+- **Build**: resolved the app build breakage in the window UI by updating the message-row implementation to match the current GTK 4 APIs and mailbox identifier layout, restoring a successful local build and launch.
+
+### Added
+ - **Hover Quick Actions**: for message rows are now working as well.
+
 ## 0.6.3 (2026-07-30)
 
 ### Added
