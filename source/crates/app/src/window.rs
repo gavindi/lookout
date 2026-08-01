@@ -382,7 +382,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         } else {
             &[]
         });
-        date_label.set_label(&summary.date.format("%Y-%m-%d %H:%M").to_string());
+        let now = chrono::Utc::now();
+        let recent = now.signed_duration_since(summary.date) < chrono::Duration::hours(24);
+        let date = glib::DateTime::from_unix_local(summary.date.timestamp())
+            .ok()
+            .and_then(|dt| dt.format(if recent { "%X" } else { "%x" }).ok())
+            .unwrap_or_default();
+        date_label.set_label(&date);
         subject_label.set_label(summary.subject.as_deref().unwrap_or("(no subject)"));
         let action_box_for_hover = action_box.clone();
         let hover_controller = gtk::EventControllerMotion::new();
@@ -1506,6 +1512,12 @@ fn spawn_calendar_discovery(
     });
 }
 
+fn ensure_checked_calendars(checked: &mut HashSet<CalendarId>, calendars: &[CalendarInfo]) {
+    for calendar in calendars {
+        checked.insert(calendar.id.clone());
+    }
+}
+
 /// Recomputes which calendars actually exist across every connected account,
 /// defaults any newly-seen id to checked (shown), and re-renders the
 /// sidebar's "My calendars" checklist against that - the checklist's own
@@ -1515,11 +1527,7 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
     let all_calendars: Vec<CalendarInfo> = calendar_state.borrow().accounts.values().flat_map(|h| h.calendars.iter().cloned()).collect();
     {
         let mut st = calendar_state.borrow_mut();
-        for cal in &all_calendars {
-            if !st.checked_calendar_ids.contains(&cal.id) {
-                st.checked_calendar_ids.insert(cal.id.clone());
-            }
-        }
+        ensure_checked_calendars(&mut st.checked_calendar_ids, &all_calendars);
     }
     let checked = calendar_state.borrow().checked_calendar_ids.clone();
     let on_toggle = {
@@ -1538,6 +1546,7 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
         }
     };
     calendar_view::rebuild_calendar_checklist(calendar_list_box, &all_calendars, &checked, on_toggle);
+    refresh_displayed_calendar_view(calendar_state, month_grid);
 }
 
 /// Unions every connected calendar account's latest occurrences for
@@ -1657,9 +1666,14 @@ fn connect_calendar_account(
                 CalendarSessionEvent::ConnectionStateChanged(_) => {}
                 CalendarSessionEvent::CalendarsUpdated(calendars) => {
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
-                        handle.calendars = calendars;
+                        handle.calendars = calendars.clone();
                     }
                     refresh_calendar_checklist(&calendar_state, &calendar_list_box, &month_grid);
+                    if let Some(handle) = calendar_state.borrow().accounts.get(&account_id) {
+                        if !handle.calendars.is_empty() {
+                            let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(calendar_state.borrow().displayed_month));
+                        }
+                    }
                 }
                 CalendarSessionEvent::OccurrencesUpdated { month, occurrences } => {
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.5 (2026-08-02)
+
+### Changed
+
+- **UI**: the message list now shows each message's date only, formatted according to the system's regional settings (GLib's locale-aware `%x`). Emails received within the last 24 hours instead show the time (`%X`) rather than the date, so fresh messages are easier to spot at a glance.
+
 ## 0.6.4 (2026-08-01)
 
 ### Fixed
@@ -8,6 +14,7 @@
 
 ### Added
  - **Hover Quick Actions**: for message rows are now working as well.
+ - **Calendar Sidebar**: the "My calendars" list now repopulates from GOA-discovered CalDAV collections as accounts connect, and newly discovered calendars are shown by default in the month view.
 
 ## 0.6.3 (2026-07-30)
 
