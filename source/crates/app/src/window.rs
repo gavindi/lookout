@@ -141,7 +141,25 @@ fn install_paned_css() {
         .avatar-color-2 { background-color: #81c784; }
         .avatar-color-3 { background-color: #ffb74d; }
         .avatar-color-4 { background-color: #ba68c8; }
-        .avatar-color-5 { background-color: #4db6ac; }",
+        .avatar-color-5 { background-color: #4db6ac; }
+        .hover-quick-actions {
+            background-color: @theme_bg_color;
+            border-radius: 8px;
+            padding: 2px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+        }
+        button.hover-quick-action {
+            background-color: @theme_bg_color;
+            border-radius: 6px;
+            padding: 1px;
+            min-width: 22px;
+            min-height: 22px;
+            box-shadow: none;
+        }
+        button.hover-quick-action:hover {
+            background-color: @theme_selected_bg_color;
+            color: @theme_selected_fg_color;
+        }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -306,18 +324,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // Action box (initially hidden)
         let action_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
+            .spacing(0)
             .halign(gtk::Align::End)
             .valign(gtk::Align::Center)
             .margin_end(8)
             .margin_top(4)
             .margin_bottom(4)
             .build();
+        action_box.add_css_class("hover-quick-actions");
         let archive_btn = gtk::Button::from_icon_name("mail-archive-symbolic");
+        archive_btn.add_css_class("hover-quick-action");
         archive_btn.set_tooltip_text(Some("Archive"));
         let delete_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+        delete_btn.add_css_class("hover-quick-action");
         delete_btn.set_tooltip_text(Some("Delete"));
         let reply_btn = gtk::Button::from_icon_name("mail-reply-sender-symbolic");
+        reply_btn.add_css_class("hover-quick-action");
         reply_btn.set_tooltip_text(Some("Reply"));
         action_box.append(&archive_btn);
         action_box.append(&delete_btn);

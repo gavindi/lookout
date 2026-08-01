@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.6 (2026-08-02)
+
+### Changed
+
+- **UI**: the message-row hover quick actions (Archive/Delete/Reply) are now densely packed (zero spacing between buttons) and sit on a solid, opaque pill background (new `.hover-quick-actions`/`.hover-quick-action` CSS classes) overlaid on top of the message line, so they no longer blend transparently into the row content.
+- **Build**: `build.sh` now builds everything in the repo - the Rust Cargo workspace and the Next.js webmail frontend - and reports the resulting binary path (`target/debug/lookout` or `target/release/lookout`) at the end of the build.
+
 ## 0.6.5 (2026-08-02)
 
 ### Changed

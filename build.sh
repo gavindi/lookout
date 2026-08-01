@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Builds the Lookout Cargo workspace (crates live under source/).
+# Builds everything in the Lookout repo:
+#   1. The Rust Cargo workspace (crates live under source/).
+#   2. The webmail frontend (Next.js app under webmail/).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$SCRIPT_DIR/source"
+WEBMAIL_DIR="$SCRIPT_DIR/webmail"
 
 RELEASE=false
 for arg in "$@"; do
@@ -42,8 +45,23 @@ cd "$WORKSPACE_DIR"
 
 if [ "$RELEASE" = true ]; then
     cargo build --workspace --release
-    echo "Built: $WORKSPACE_DIR/target/release/lookout"
+    BINARY_PATH="$WORKSPACE_DIR/target/release/lookout"
 else
     cargo build --workspace
-    echo "Built: $WORKSPACE_DIR/target/debug/lookout"
+    BINARY_PATH="$WORKSPACE_DIR/target/debug/lookout"
 fi
+
+# --- Webmail (Next.js) frontend ---
+if [ -f "$WEBMAIL_DIR/package.json" ]; then
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "error: npm not found. Install Node.js and re-run." >&2
+        exit 1
+    fi
+    cd "$WEBMAIL_DIR"
+    echo "Building webmail frontend..."
+    npm install
+    npm run build
+fi
+
+echo
+echo "Built binary: $BINARY_PATH"
