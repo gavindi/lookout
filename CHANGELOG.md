@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.7 (2026-08-03)
+
+### Added
+
+- **UI**: a new Config view on the left nav rail (third toggle button, `preferences-system-symbolic`, grouped with Mail/Calendar) showing a settings screen (`config_view.rs`): a live account overview - one row per connected Mail account (display name, email, IMAP/SMTP `host:port` from the account's stored connection config) and per Calendar account (display name, CalDAV base URL) - plus disabled placeholder sections mirroring the Phase 5 settings taxonomy (General/Appearance/Layout/Mail/Privacy/Apps/Advanced). Rows repopulate on every switch to the view and again whenever account discovery lands. An "Add account…" row (and matching command-toolbar button) opens GNOME Online Accounts settings, same invocation as the empty-state page's button.
+- **UI**: the Config nav-rail button is anchored to the bottom of the rail (below a `vexpand(true)` spacer), matching the Mail/Calendar buttons at the top - a standard app-shell "settings at the bottom" placement.
+
 ## 0.6.6 (2026-08-02)
 
 ### Changed

@@ -2,6 +2,7 @@
 
 mod calendar_view;
 mod compose;
+mod config_view;
 mod folder_tree;
 mod goa_calendar_credentials;
 mod goa_credentials;

@@ -1,0 +1,130 @@
+//! Config view: a read-only overview of the Mail/Calendar accounts Lookout
+//! is connected to, plus disabled placeholder sections mirroring the Phase 5
+//! settings taxonomy (General/Appearance/Layout/Mail/Privacy/Apps/Advanced).
+//! Data-in/widget-out like `calendar_view.rs` and `folder_tree.rs`: the
+//! caller (window.rs) owns the session state and feeds plain display structs
+//! into `refresh`.
+
+use std::cell::RefCell;
+
+use adw::prelude::*;
+
+/// Plain display data for one mail account, decoupled from window.rs's
+/// private `AccountHandle` so this module has no dependency on the session
+/// types.
+pub struct MailAccountInfo {
+    pub display_name: String,
+    pub email: String,
+    /// Preformatted `host:port`.
+    pub imap: String,
+    /// Preformatted `host:port`.
+    pub smtp: String,
+}
+
+/// Plain display data for one calendar account.
+pub struct CalendarAccountInfo {
+    pub display_name: String,
+    /// The account's CalDAV base URL.
+    pub uri: String,
+}
+
+/// The config screen's widget tree. `root` goes into the main `root_stack`;
+/// the account groups are kept here so `refresh` can repopulate them in
+/// place without rebuilding the whole page.
+pub struct ConfigView {
+    pub root: gtk::Widget,
+    /// "Add account…" entry row, exposed so the caller can wire its
+    /// `activated` signal to the same GOA-settings invocation the empty-state
+    /// page uses.
+    pub add_account_row: adw::ActionRow,
+    mail_group: adw::PreferencesGroup,
+    calendar_group: adw::PreferencesGroup,
+    mail_rows: RefCell<Vec<adw::ActionRow>>,
+    calendar_rows: RefCell<Vec<adw::ActionRow>>,
+}
+
+/// Phase 5 roadmap's settings taxonomy, each rendered as a disabled
+/// placeholder group until that work lands - same honest-disabled convention
+/// as the menu bar's Home/View ribbon tabs.
+const PLACEHOLDER_SECTIONS: [&str; 7] = ["General", "Appearance", "Layout", "Mail", "Privacy", "Apps", "Advanced"];
+
+pub fn build() -> ConfigView {
+    let page = adw::PreferencesPage::new();
+    page.set_vexpand(true);
+
+    let accounts_group = adw::PreferencesGroup::builder().title("Accounts").build();
+    let add_account_row = adw::ActionRow::builder()
+        .title("Add account…")
+        .subtitle("Open GNOME Online Accounts settings")
+        .activatable(true)
+        .build();
+    accounts_group.add(&add_account_row);
+    page.add(&accounts_group);
+
+    let mail_group = adw::PreferencesGroup::builder().title("Mail accounts").build();
+    page.add(&mail_group);
+
+    let calendar_group = adw::PreferencesGroup::builder().title("Calendar accounts").build();
+    page.add(&calendar_group);
+
+    for section in PLACEHOLDER_SECTIONS {
+        let group = adw::PreferencesGroup::builder().title(section).build();
+        let row = adw::ActionRow::builder().title("Not implemented yet").build();
+        row.set_sensitive(false);
+        group.add(&row);
+        page.add(&group);
+    }
+
+    ConfigView {
+        root: page.upcast(),
+        add_account_row,
+        mail_group,
+        calendar_group,
+        mail_rows: RefCell::new(Vec::new()),
+        calendar_rows: RefCell::new(Vec::new()),
+    }
+}
+
+/// Rebuilds the two account groups from the caller's latest state. Clears any
+/// rows added by a previous refresh first, and shows a dim placeholder row per
+/// group while it has no accounts.
+pub fn refresh(view: &ConfigView, mail: &[MailAccountInfo], calendar: &[CalendarAccountInfo]) {
+    for row in view.mail_rows.borrow_mut().drain(..) {
+        view.mail_group.remove(&row);
+    }
+    for row in view.calendar_rows.borrow_mut().drain(..) {
+        view.calendar_group.remove(&row);
+    }
+
+    if mail.is_empty() {
+        push_row(&view.mail_group, &view.mail_rows, empty_row("No mail accounts connected"));
+    } else {
+        for info in mail {
+            let subtitle = format!("{} · IMAP {} · SMTP {}", info.email, info.imap, info.smtp);
+            push_row(&view.mail_group, &view.mail_rows, account_row(&info.display_name, &subtitle));
+        }
+    }
+
+    if calendar.is_empty() {
+        push_row(&view.calendar_group, &view.calendar_rows, empty_row("No calendar accounts connected"));
+    } else {
+        for info in calendar {
+            push_row(&view.calendar_group, &view.calendar_rows, account_row(&info.display_name, &info.uri));
+        }
+    }
+}
+
+fn account_row(title: &str, subtitle: &str) -> adw::ActionRow {
+    adw::ActionRow::builder().title(title).subtitle(subtitle).build()
+}
+
+fn empty_row(title: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(title).build();
+    row.set_sensitive(false);
+    row
+}
+
+fn push_row(group: &adw::PreferencesGroup, rows: &RefCell<Vec<adw::ActionRow>>, row: adw::ActionRow) {
+    group.add(&row);
+    rows.borrow_mut().push(row);
+}

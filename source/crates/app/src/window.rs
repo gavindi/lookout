@@ -27,6 +27,13 @@ struct AccountHandle {
     cmd_tx: async_channel::Sender<AccountCommand>,
     email: String,
     display_name: String,
+    /// Connection parameters, kept for the Config view's account overview
+    /// (the Config view shows how each account is configured, not just that
+    /// it exists).
+    imap_host: String,
+    imap_port: u16,
+    smtp_host: String,
+    smtp_port: u16,
     folders: Vec<Mailbox>,
 }
 
@@ -56,6 +63,9 @@ struct UiState {
 struct CalendarAccountHandle {
     cmd_tx: async_channel::Sender<CalendarCommand>,
     display_name: String,
+    /// The account's CalDAV base URL, kept for the Config view's account
+    /// overview.
+    uri: String,
     calendars: Vec<CalendarInfo>,
     /// Latest occurrences for whatever month this account last synced,
     /// keyed by month so a stale resync from one account can't clobber
@@ -863,7 +873,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Matches `build_sidebar()`'s own width_request - without an explicit
     // cap here, the mini-calendar's day-button grid requests its natural
     // (much wider) size instead of a compact peek-pane width.
-    let mail_overview_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).width_request(240).build();
+    let mail_overview_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).width_request(140).build();
     mail_overview_box.append(&mail_calendar_overview.root);
     mail_overview_box.append(&mail_overview_day_list);
 
@@ -987,6 +997,97 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // (that's the main Calendar view's own concern).
     let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(chrono::Utc::now().date_naive()));
     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+
+    // --- Config view: the third nav-rail view, a read-only overview of the
+    // connected Mail/Calendar accounts (endpoints included, so it shows how
+    // each account is configured) plus the Phase 5 placeholder sections, and
+    // an "Add account" entry that opens GOA settings - same invocation as the
+    // empty-state page's button. The account groups are repopulated by
+    // `refresh_config` on every activation and again whenever either
+    // discovery lands (`spawn_*_discovery` below).
+    let config_view = Rc::new(crate::config_view::build());
+    let config_card = card_section(&config_view.root);
+    config_card.add_css_class("folder-pane");
+    root_stack.add_named(&config_card, Some("config"));
+
+    {
+        let add_account_row = config_view.add_account_row.clone();
+        add_account_row.connect_activated(|_| {
+            let _ = std::process::Command::new("gnome-control-center").arg("online-accounts").spawn();
+        });
+    }
+
+    // --- Config's own command-toolbar row, swapped in via `view_toolbar_stack`
+    // like Mail's and Calendar's when the Config nav-rail button is active.
+    let config_add_account_button = gtk::Button::from_icon_name("contact-new-symbolic");
+    config_add_account_button.set_tooltip_text(Some("Add account"));
+    config_add_account_button.connect_clicked(|_| {
+        let _ = std::process::Command::new("gnome-control-center").arg("online-accounts").spawn();
+    });
+    let config_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
+    config_command_toolbar.append(&config_add_account_button);
+    view_toolbar_stack.add_named(&config_command_toolbar, Some("config"));
+
+    let config_view_button = gtk::ToggleButton::builder()
+        .icon_name("preferences-system-symbolic")
+        .css_classes(["flat"])
+        .tooltip_text("Config")
+        .build();
+    config_view_button.set_group(Some(&calendar_view_button));
+    // Anchored to the bottom of the rail: Mail/Calendar stay at the top, a
+    // `vexpand(true)` spacer fills the middle, Config sits below it.
+    let nav_rail_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    nav_rail_spacer.set_vexpand(true);
+    nav_rail.append(&nav_rail_spacer);
+    nav_rail.append(&config_view_button);
+
+    let refresh_config: Rc<dyn Fn()> = Rc::new({
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let config_view = config_view.clone();
+        move || {
+            let mut mail: Vec<crate::config_view::MailAccountInfo> = state
+                .borrow()
+                .accounts
+                .values()
+                .map(|h| crate::config_view::MailAccountInfo {
+                    display_name: h.display_name.clone(),
+                    email: h.email.clone(),
+                    imap: format!("{}:{}", h.imap_host, h.imap_port),
+                    smtp: format!("{}:{}", h.smtp_host, h.smtp_port),
+                })
+                .collect();
+            mail.sort_by_key(|a| a.email.to_lowercase());
+            let mut calendar: Vec<crate::config_view::CalendarAccountInfo> = calendar_state
+                .borrow()
+                .accounts
+                .values()
+                .map(|h| crate::config_view::CalendarAccountInfo {
+                    display_name: h.display_name.clone(),
+                    uri: h.uri.clone(),
+                })
+                .collect();
+            calendar.sort_by_key(|a| a.display_name.to_lowercase());
+            crate::config_view::refresh(&config_view, &mail, &calendar);
+        }
+    });
+    // Populate the placeholder rows now (both groups are empty at startup).
+    refresh_config();
+
+    {
+        let root_stack = root_stack.clone();
+        let view_toolbar_stack = view_toolbar_stack.clone();
+        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let refresh_config = refresh_config.clone();
+        config_view_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                root_stack.set_visible_child_name("config");
+                view_toolbar_stack.set_visible_child_name("config");
+                mail_calendar_overview_card.set_visible(false);
+                refresh_config();
+            }
+        });
+    }
 
     // --- Compose button -> new-message composer in the reading pane,
     // "From" = the account owning the currently-open mailbox (falling back
@@ -1234,6 +1335,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         reading_stack,
         current_mail_page,
         mail_view_button,
+        refresh_config.clone(),
     );
     spawn_calendar_discovery(
         worker,
@@ -1246,6 +1348,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mail_overview_day_list,
         current_calendar_page,
         calendar_view_button,
+        refresh_config,
     );
 
     window
@@ -1286,6 +1389,7 @@ fn spawn_account_discovery(
     reading_stack: gtk::Stack,
     current_mail_page: Rc<Cell<&'static str>>,
     mail_view_button: gtk::ToggleButton,
+    refresh_config: Rc<dyn Fn()>,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -1326,6 +1430,7 @@ fn spawn_account_discovery(
                         account,
                     );
                 }
+                refresh_config();
             }
             Ok(_) => {
                 show_page("empty");
@@ -1399,6 +1504,10 @@ fn connect_account(
             cmd_tx,
             email: config.email.clone(),
             display_name,
+            imap_host: config.imap.host.clone(),
+            imap_port: config.imap.port,
+            smtp_host: config.smtp.host.clone(),
+            smtp_port: config.smtp.port,
             folders: Vec::new(),
         },
     );
@@ -1486,6 +1595,7 @@ fn spawn_calendar_discovery(
     mail_overview_day_list: gtk::Box,
     current_calendar_page: Rc<Cell<&'static str>>,
     calendar_view_button: gtk::ToggleButton,
+    refresh_config: Rc<dyn Fn()>,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -1522,6 +1632,7 @@ fn spawn_calendar_discovery(
                         account,
                     );
                 }
+                refresh_config();
             }
             Ok(_) => {
                 show_page("calendar-empty");
@@ -1671,6 +1782,7 @@ fn connect_calendar_account(
         CalendarAccountHandle {
             cmd_tx,
             display_name,
+            uri: config.base_url.clone(),
             calendars: Vec::new(),
             last_occurrences: Vec::new(),
             last_synced_month: None,
