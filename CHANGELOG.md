@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.12 (2026-08-03)
+
+### Changed
+
+- **Calendar**: the "My calendars" checklist's per-calendar checkboxes are now custom multi-select radio rows that finally render each calendar's assigned colour. The stock GTK/libadwaita `CheckButton` paints its `.check` indicator through an internal widget whose fill is drawn in a way that ignores display-level CSS overrides (`background-color`, `background-image` and `-gtk-icon-source` at `STYLE_PROVIDER_PRIORITY_APPLICATION` all left it stuck on the theme's accent colour), so the colour could never win. Each row is now a flat `ToggleButton` carrying a hand-drawn 16px radio indicator (a `DrawingArea` painted with Cairo): checked calendars show a solid disc in the calendar's colour with a white inner dot, unchecked ones a hollow ring in that colour - the same colour the calendar's event chips use. Row backgrounds are fully translucent in every state (base/hover/active/checked), so the sidebar background shows straight through the lines. Behaviour is unchanged - multiple calendars stay selectable, toggling still filters the grids, and newly discovered calendars still default to checked.
+
 ## 0.6.11 (2026-08-03)
 
 ### Added

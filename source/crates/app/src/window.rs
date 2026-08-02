@@ -12,6 +12,7 @@ use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
 use lookout_mail::{AccountConfig, EndpointConfig};
 use webkit::prelude::*;
 
+use crate::calendar_colors;
 use crate::calendar_view::{self, CalendarMain};
 use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
@@ -88,6 +89,11 @@ struct CalendarUiState {
     /// calendars" checklist. Newly-discovered calendars default to checked
     /// (shown) - see `refresh_calendar_checklist`.
     checked_calendar_ids: HashSet<CalendarId>,
+    /// Each calendar's assigned colour, persisted between sessions (see
+    /// `calendar_colors`). Kept alongside `checked_calendar_ids` so the
+    /// checklist can colour its checkboxes; new calendars are assigned here in
+    /// `refresh_calendar_checklist`.
+    calendar_colors: calendar_colors::CalendarColorMap,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -944,6 +950,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         accounts: HashMap::new(),
         displayed_month: current_month_start(),
         checked_calendar_ids: HashSet::new(),
+        calendar_colors: calendar_colors::load(),
     }));
     // Which single day the Mail-screen overview pane's event list is
     // currently showing - separate from `calendar_state.displayed_month`
@@ -1662,8 +1669,10 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
     {
         let mut st = calendar_state.borrow_mut();
         ensure_checked_calendars(&mut st.checked_calendar_ids, &all_calendars);
+        calendar_colors::assign_missing(&mut st.calendar_colors, &all_calendars);
     }
     let checked = calendar_state.borrow().checked_calendar_ids.clone();
+    let colors = calendar_state.borrow().calendar_colors.clone();
     let on_toggle = {
         let calendar_state = calendar_state.clone();
         let calendar_main = calendar_main.clone();
@@ -1679,7 +1688,8 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
             refresh_displayed_calendar_view(&calendar_state, &calendar_main);
         }
     };
-    calendar_view::rebuild_calendar_checklist(calendar_list_box, &groups, &checked, on_toggle);
+    calendar_view::rebuild_calendar_checklist(calendar_list_box, &groups, &checked, &colors, &calendar_main.check_colors, on_toggle);
+    calendar_view::set_calendar_colors(calendar_main, &colors);
     refresh_displayed_calendar_view(calendar_state, calendar_main);
 }
 

@@ -1,5 +1,6 @@
 //! GTK4/libadwaita application entry point.
 
+mod calendar_colors;
 mod calendar_view;
 mod compose;
 mod config_view;

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -6,6 +6,8 @@ use chrono::{Datelike, NaiveDate, Timelike};
 use gtk::prelude::*;
 use lookout_core::{CalendarId, CalendarInfo, EventOccurrence};
 use lookout_dav::session::ConnectionState as CalendarConnectionState;
+
+use crate::calendar_colors;
 
 /// Sunday-first week (matches Outlook's/the US default convention, per the
 /// reference screenshot this view is matched against) rather than
@@ -24,6 +26,11 @@ const WORK_WEEK_DAYS: [chrono::Weekday; 5] = [chrono::Weekday::Mon, chrono::Week
 const MAX_VISIBLE_EVENTS_PER_DAY: usize = 3;
 const MAX_VISIBLE_EVENTS_PER_HOUR: usize = 3;
 const HOURS_PER_DAY: usize = 24;
+/// The inclusive local-hour range rendered with a lighter "business hours"
+/// background in the Day/Week/Work week grids (8am-5pm); everything else is
+/// the darker off-hours background.
+const BUSINESS_HOURS_START: usize = 8;
+const BUSINESS_HOURS_END: usize = 17;
 /// Width of the hour-gutter column in the Day/Week grids, wide enough for
 /// "00:00" without pushing the event columns off-balance.
 const HOUR_GUTTER_WIDTH: i32 = 56;
@@ -50,10 +57,26 @@ fn install_calendar_css() {
         }
         .calendar-hour-cell {
             border-bottom: 1px solid alpha(currentColor, 0.06);
+            background-color: #26262a;
+        }
+        .calendar-hour-cell-business {
+            background-color: #3d3d44;
         }
         .calendar-main-background {
             background-color: #2e2e32;
             border-radius: 12px;
+        }
+        .calendar-toggle {
+            padding: 2px 4px;
+            border-radius: 6px;
+            background: transparent;
+            box-shadow: none;
+        }
+        .calendar-toggle:hover,
+        .calendar-toggle:active,
+        .calendar-toggle:checked {
+            background: transparent;
+            box-shadow: none;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -153,7 +176,7 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
 /// "+N more" label for the rest (no popover - kept simple for this pass).
 /// Occurrences for dates outside the grid's currently-displayed 6-week span
 /// are silently ignored.
-pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence]) {
+pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>) {
     let grid_start = first_grid_day(*mg.anchor_month.borrow());
 
     for cell in &mg.day_cells {
@@ -170,7 +193,7 @@ pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence]) {
         let date = grid_start + chrono::Duration::days(i as i64);
         let Some(day_occurrences) = by_date.get(&date) else { continue };
         for occ in &day_occurrences[..day_occurrences.len().min(MAX_VISIBLE_EVENTS_PER_DAY)] {
-            cell.events_box.append(&event_label(occ));
+            cell.events_box.append(&event_label(occ, colors));
         }
         if day_occurrences.len() > MAX_VISIBLE_EVENTS_PER_DAY {
             cell.events_box.append(&more_label(day_occurrences.len() - MAX_VISIBLE_EVENTS_PER_DAY));
@@ -226,6 +249,9 @@ fn build_week_grid(weekdays: &[chrono::Weekday]) -> WeekGrid {
                 .hexpand(true)
                 .spacing(1)
                 .build();
+            if (BUSINESS_HOURS_START..=BUSINESS_HOURS_END).contains(&h) {
+                cell.add_css_class("calendar-hour-cell-business");
+            }
             grid.attach(&cell, col, h as i32 + 2, 1, 1);
             hours.push(cell);
         }
@@ -242,7 +268,7 @@ fn build_week_grid(weekdays: &[chrono::Weekday]) -> WeekGrid {
     grid.attach(&all_day_gutter, 0, 1, 1, 1);
     for h in 0..HOURS_PER_DAY {
         let hour_label = gtk::Label::builder()
-            .label(format!("{h:02}:00"))
+            .label(hour_gutter_text(h))
             .css_classes(["dim-label", "caption"])
             .halign(gtk::Align::End)
             .width_request(HOUR_GUTTER_WIDTH)
@@ -290,7 +316,7 @@ pub fn set_week(w: &WeekGrid, anchor: NaiveDate) {
 /// columns: all-day events into the "All day" row, timed events into the hour
 /// cell matching their local start hour (capped per hour with a "+N more").
 /// Occurrences outside the displayed week are ignored.
-pub fn set_week_occurrences(w: &WeekGrid, occurrences: &[EventOccurrence]) {
+pub fn set_week_occurrences(w: &WeekGrid, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>) {
     let anchor = *w.anchor.borrow();
     let start = week_start(anchor, w.weekdays[0]);
     let end = start + chrono::Duration::days(w.columns.len() as i64);
@@ -308,11 +334,11 @@ pub fn set_week_occurrences(w: &WeekGrid, occurrences: &[EventOccurrence]) {
         let Some(list) = by_date.get(&date) else { continue };
         for occ in list {
             if occ.all_day {
-                append_event(&col.all_day, occ, MAX_VISIBLE_EVENTS_PER_HOUR);
+                append_event(&col.all_day, occ, MAX_VISIBLE_EVENTS_PER_HOUR, colors);
             } else {
                 let hour = occ.start.with_timezone(&chrono::Local).hour() as usize;
                 if hour < col.hours.len() {
-                    append_event(&col.hours[hour], occ, MAX_VISIBLE_EVENTS_PER_HOUR);
+                    append_event(&col.hours[hour], occ, MAX_VISIBLE_EVENTS_PER_HOUR, colors);
                 }
             }
         }
@@ -353,7 +379,7 @@ fn build_day_view() -> DayView {
     let mut hours = Vec::with_capacity(HOURS_PER_DAY);
     for h in 0..HOURS_PER_DAY {
         let hour_label = gtk::Label::builder()
-            .label(format!("{h:02}:00"))
+            .label(hour_gutter_text(h))
             .css_classes(["dim-label", "caption"])
             .halign(gtk::Align::End)
             .width_request(HOUR_GUTTER_WIDTH)
@@ -365,6 +391,9 @@ fn build_day_view() -> DayView {
             .hexpand(true)
             .spacing(1)
             .build();
+        if (BUSINESS_HOURS_START..=BUSINESS_HOURS_END).contains(&h) {
+            cell.add_css_class("calendar-hour-cell-business");
+        }
         grid.attach(&hour_label, 0, h as i32 + 1, 1, 1);
         grid.attach(&cell, 1, h as i32 + 1, 1, 1);
         hours.push(cell);
@@ -394,7 +423,7 @@ pub fn set_day(d: &DayView, day: NaiveDate) {
 /// Fills the day view with every occurrence whose local date matches the
 /// displayed day: all-day events on top, timed events in their local start
 /// hour's cell (capped per hour).
-pub fn set_day_occurrences(d: &DayView, occurrences: &[EventOccurrence]) {
+pub fn set_day_occurrences(d: &DayView, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>) {
     let day = *d.anchor.borrow();
     for occ in occurrences {
         let date = occ.start.with_timezone(&chrono::Local).date_naive();
@@ -402,11 +431,11 @@ pub fn set_day_occurrences(d: &DayView, occurrences: &[EventOccurrence]) {
             continue;
         }
         if occ.all_day {
-            append_event(&d.all_day, occ, MAX_VISIBLE_EVENTS_PER_HOUR);
+            append_event(&d.all_day, occ, MAX_VISIBLE_EVENTS_PER_HOUR, colors);
         } else {
             let hour = occ.start.with_timezone(&chrono::Local).hour() as usize;
             if hour < d.hours.len() {
-                append_event(&d.hours[hour], occ, MAX_VISIBLE_EVENTS_PER_HOUR);
+                append_event(&d.hours[hour], occ, MAX_VISIBLE_EVENTS_PER_HOUR, colors);
             }
         }
     }
@@ -444,9 +473,9 @@ fn build_agenda_view() -> AgendaView {
 }
 
 /// Rebuilds the agenda's rows for `anchor` (its own month forward). One row
-/// per occurrence: a date column plus "HH:MM – HH:MM summary" (or "All day
+/// per occurrence: a date column plus "5:00pm – 6:00pm summary" (or "All day
 /// summary") in the summary column.
-pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurrence]) {
+pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>) {
     *a.anchor.borrow_mut() = anchor;
     clear_children(&a.events_box);
 
@@ -479,8 +508,8 @@ pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurre
         let text = if occ.all_day {
             occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
         } else {
-            let start = occ.start.with_timezone(&chrono::Local).format("%H:%M");
-            let end = occ.end.with_timezone(&chrono::Local).format("%H:%M");
+            let start = format_event_time(&occ.start.with_timezone(&chrono::Local));
+            let end = format_event_time(&occ.end.with_timezone(&chrono::Local));
             format!("{start} – {end}  {}", occ.summary.as_deref().unwrap_or("(untitled)"))
         };
         let summary_label = gtk::Label::builder()
@@ -490,6 +519,7 @@ pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurre
             .css_classes(["caption"])
             .hexpand(true)
             .build();
+        apply_event_color(&summary_label, &occ.calendar_id, colors);
 
         row.append(&date_label);
         row.append(&summary_label);
@@ -550,6 +580,18 @@ pub struct CalendarMain {
     split: SplitView,
     anchor: Rc<RefCell<NaiveDate>>,
     occurrences: Rc<RefCell<Vec<EventOccurrence>>>,
+    /// The current `CalendarId` -> colour map, mirrored from the sidebar's
+    /// checklist so event chips can be tinted to their calendar's colour.
+    /// Updated by [`set_calendar_colors`] (from the persisted
+    /// `calendar_colors` map) whenever the checklist rebuilds.
+    colors: Rc<RefCell<HashMap<CalendarId, String>>>,
+    /// Display-level CSS provider whose rules this module rewrites whenever the
+    /// "My calendars" checklist is rebuilt, writing the `.calendar-event-<hex>`
+    /// chip rules that tint each calendar's event labels. Owned here purely as
+    /// a lifetime home for the provider - the rules affect the whole display,
+    /// and the window.rs caller rebuilds them via
+    /// [`rebuild_calendar_checklist`].
+    pub check_colors: gtk::CssProvider,
 }
 
 pub fn build_main() -> CalendarMain {
@@ -606,6 +648,13 @@ pub fn build_main() -> CalendarMain {
     root_box.append(&stack);
 
     let anchor = Rc::new(RefCell::new(chrono::Utc::now().date_naive()));
+    // Empty until `rebuild_calendar_checklist` writes the per-calendar
+    // checkbox rules; registered up-front so the provider is live for the
+    // whole lifetime of the main panel.
+    let check_colors = gtk::CssProvider::new();
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &check_colors, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
     let calendar_main = CalendarMain {
         root: root_box.upcast(),
         header_label,
@@ -621,6 +670,8 @@ pub fn build_main() -> CalendarMain {
         split,
         anchor: anchor.clone(),
         occurrences: Rc::new(RefCell::new(Vec::new())),
+        colors: Rc::new(RefCell::new(HashMap::new())),
+        check_colors,
     };
     // Extracted into a local first (rather than inlined into the call
     // below) so the `Ref` temporary from `.borrow()` is dropped before
@@ -672,6 +723,15 @@ pub fn set_occurrences(c: &CalendarMain, occurrences: &[EventOccurrence]) {
     refresh(c);
 }
 
+/// Updates the `CalendarId` -> colour map used to tint event chips. The
+/// corresponding `.calendar-event-*` CSS rules are written into
+/// `check_colors` by [`rebuild_calendar_checklist`], so this only stores the
+/// lookup table - callers are expected to re-render (they normally do, as
+/// part of the same checklist refresh).
+pub fn set_calendar_colors(c: &CalendarMain, colors: &HashMap<CalendarId, String>) {
+    *c.colors.borrow_mut() = colors.clone();
+}
+
 /// Moves the anchor by `by` steps in the active view's natural unit: a day
 /// for Day/Agenda, a week for Week/Work week, a month for Month/Split.
 pub fn step(c: &CalendarMain, by: i64) {
@@ -694,22 +754,23 @@ pub fn go_today(c: &CalendarMain) {
 fn refresh(c: &CalendarMain) {
     let anchor = *c.anchor.borrow();
     let occurrences = c.occurrences.borrow();
+    let colors = c.colors.borrow();
 
     set_month(&c.month, anchor);
-    set_month_occurrences(&c.month, &occurrences);
+    set_month_occurrences(&c.month, &occurrences, &colors);
     set_month(&c.split.month, anchor);
-    set_month_occurrences(&c.split.month, &occurrences);
+    set_month_occurrences(&c.split.month, &occurrences, &colors);
 
     set_week(&c.workweek, anchor);
-    set_week_occurrences(&c.workweek, &occurrences);
+    set_week_occurrences(&c.workweek, &occurrences, &colors);
     set_week(&c.week, anchor);
-    set_week_occurrences(&c.week, &occurrences);
+    set_week_occurrences(&c.week, &occurrences, &colors);
 
     set_day(&c.day, anchor);
-    set_day_occurrences(&c.day, &occurrences);
+    set_day_occurrences(&c.day, &occurrences, &colors);
 
-    set_agenda(&c.agenda, anchor, &occurrences);
-    set_agenda(&c.split.agenda, anchor, &occurrences);
+    set_agenda(&c.agenda, anchor, &occurrences, &colors);
+    set_agenda(&c.split.agenda, anchor, &occurrences, &colors);
 
     c.header_label.set_label(&header_text(c));
 }
@@ -743,7 +804,7 @@ fn week_start(anchor: NaiveDate, first: chrono::Weekday) -> NaiveDate {
 
 /// Appends `occ` to `events_box`, showing at most `cap` event labels and then
 /// a single "+N more" dim label that keeps counting up.
-fn append_event(events_box: &gtk::Box, occ: &EventOccurrence, cap: usize) {
+fn append_event(events_box: &gtk::Box, occ: &EventOccurrence, cap: usize, colors: &HashMap<CalendarId, String>) {
     if child_count(events_box) >= cap {
         let mut last = events_box.first_child();
         while let Some(sibling) = last.as_ref().and_then(|w| w.next_sibling()) {
@@ -766,7 +827,7 @@ fn append_event(events_box: &gtk::Box, occ: &EventOccurrence, cap: usize) {
         events_box.append(&more_label(1));
         return;
     }
-    events_box.append(&event_label(occ));
+    events_box.append(&event_label(occ, colors));
 }
 
 fn child_count(container: &gtk::Box) -> usize {
@@ -779,21 +840,64 @@ fn child_count(container: &gtk::Box) -> usize {
     count
 }
 
-/// A single event's compact label: "HH:MM Summary", or just "Summary" for an
-/// all-day event.
-fn event_label(occ: &EventOccurrence) -> gtk::Label {
+/// A single event's compact label: "5:00pm Summary", or just "Summary" for an
+/// all-day event. The label carries the `.calendar-event-<hex>` class matching
+/// its calendar's colour so it renders as a coloured chip.
+fn event_label(occ: &EventOccurrence, colors: &HashMap<CalendarId, String>) -> gtk::Label {
     let text = if occ.all_day {
         occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
     } else {
-        let time = occ.start.with_timezone(&chrono::Local).format("%H:%M");
+        let time = format_event_time(&occ.start.with_timezone(&chrono::Local));
         format!("{time} {}", occ.summary.as_deref().unwrap_or("(untitled)"))
     };
-    gtk::Label::builder()
+    let label = gtk::Label::builder()
         .label(&text)
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["caption"])
-        .build()
+        .build();
+    apply_event_color(&label, &occ.calendar_id, colors);
+    label
+}
+
+/// Adds the `.calendar-event-<hex>` class to `label` for `calendar_id`'s
+/// colour, or does nothing if the colour is unknown. The class's CSS rule is
+/// generated alongside the checkbox rules in [`rebuild_calendar_checklist`].
+fn apply_event_color(label: &gtk::Label, calendar_id: &CalendarId, colors: &HashMap<CalendarId, String>) {
+    if let Some(color) = colors.get(calendar_id) {
+        label.add_css_class(&format!("calendar-event-{}", color.trim_start_matches('#')));
+    }
+}
+
+/// Compact 12-hour hour-gutter label for the Day/Week/Work week grids:
+/// `5am`, `12pm`, `11pm` (midnight and noon read as `12am`/`12pm`).
+fn hour_gutter_text(h: usize) -> String {
+    let h = (h as u32) % 24;
+    format!("{}{}", hour_12(h), meridiem(h))
+}
+
+/// Local time as a compact 12-hour timestamp with minutes: `9:30am`,
+/// `5:00pm`.
+fn format_event_time(local: &chrono::DateTime<chrono::Local>) -> String {
+    format!("{}:{:02}{}", hour_12(local.hour()), local.minute(), meridiem(local.hour()))
+}
+
+/// The 12-hour-clock face for a 0-23 hour (12 for both midnight and noon).
+fn hour_12(h: u32) -> u32 {
+    let h = h % 12;
+    if h == 0 {
+        12
+    } else {
+        h
+    }
+}
+
+fn meridiem(h: u32) -> &'static str {
+    if h < 12 {
+        "am"
+    } else {
+        "pm"
+    }
 }
 
 fn more_label(count: usize) -> gtk::Label {
@@ -963,14 +1067,29 @@ pub fn calendar_account_status_text(connection_state: &CalendarConnectionState, 
 
 /// Clears `container` and re-renders the "My calendars" checklist from the
 /// given per-account groups: one account header (dim caption-heading) per
-/// group, its calendars as checkbuttons (label = display name, active =
-/// currently checked), or a dim status line when the account has none yet.
-/// Each checkbutton's `connect_toggled` fires `on_toggle`. A plain
-/// rebuildable-list function rather than a stateful struct, matching this
-/// file's existing data-in/widget-state-out convention - callers own the
-/// actual checked/unchecked state and just ask for a fresh render of it.
-pub fn rebuild_calendar_checklist(container: &gtk::Box, groups: &[CalendarAccountGroup], checked: &HashSet<CalendarId>, on_toggle: impl Fn(CalendarId, bool) + 'static + Clone) {
+/// group, its calendars as custom coloured toggle rows (name + hand-drawn
+/// radio indicator in the calendar's colour, active = currently checked), or
+/// a dim status line when the account has none yet. Each row's `toggled`
+/// handler fires `on_toggle`. A plain rebuildable-list function rather than a
+/// stateful struct, matching this file's existing data-in/widget-state-out
+/// convention - callers own the actual checked/unchecked state and just ask
+/// for a fresh render of it.
+///
+/// Every calendar's row is tinted with its assigned colour from `colors` (the
+/// colour normally lives in `calendar_colors::load`, but this function only
+/// needs the map - the caller resolves/persists assignments). The same pass
+/// writes the matching `.calendar-event-<hex>` chip rules into `check_colors`,
+/// a display-level provider owned by the caller.
+pub fn rebuild_calendar_checklist(
+    container: &gtk::Box,
+    groups: &[CalendarAccountGroup],
+    checked: &HashSet<CalendarId>,
+    colors: &HashMap<CalendarId, String>,
+    check_colors: &gtk::CssProvider,
+    on_toggle: impl Fn(CalendarId, bool) + 'static + Clone,
+) {
     clear_children(container);
+    let mut css = String::new();
     if groups.is_empty() {
         let placeholder = gtk::Label::builder()
             .label("No calendars connected")
@@ -978,7 +1097,6 @@ pub fn rebuild_calendar_checklist(container: &gtk::Box, groups: &[CalendarAccoun
             .xalign(0.0)
             .build();
         container.append(&placeholder);
-        return;
     }
     for group in groups {
         let header = gtk::Label::builder()
@@ -995,13 +1113,94 @@ pub fn rebuild_calendar_checklist(container: &gtk::Box, groups: &[CalendarAccoun
             continue;
         }
         for calendar in &group.calendars {
-            let check = gtk::CheckButton::builder().label(&calendar.display_name).active(checked.contains(&calendar.id)).build();
+            let color = colors.get(&calendar.id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
+            css.push_str(&calendar_color_css(color));
             let id = calendar.id.clone();
             let on_toggle = on_toggle.clone();
-            check.connect_toggled(move |btn| on_toggle(id.clone(), btn.is_active()));
-            container.append(&check);
+            let toggle = calendar_toggle_row(&calendar.display_name, color, checked.contains(&calendar.id), move |is_checked| {
+                on_toggle(id.clone(), is_checked)
+            });
+            container.append(&toggle);
         }
     }
+    check_colors.load_from_string(&css);
+}
+
+/// One row in the "My calendars" checklist: a flat `ToggleButton` carrying the
+/// calendar's name plus a hand-drawn 16px radio indicator (a `DrawingArea`)
+/// painted in the calendar's colour - checked = solid disc with a white inner
+/// dot, unchecked = a hollow ring. The indicator is drawn rather than themed
+/// because a stock GTK checkbox paints its `.check` node through an internal
+/// path that ignores display-level overrides, whereas the `DrawingArea` gives
+/// the colour full control. `active` seeds the button's state; `on_toggle`
+/// fires with the new state whenever it changes.
+fn calendar_toggle_row(name: &str, color: &str, active: bool, on_toggle: impl Fn(bool) + 'static) -> gtk::ToggleButton {
+    let button = gtk::ToggleButton::new();
+    button.add_css_class("flat");
+    button.add_css_class("calendar-toggle");
+    button.set_active(active);
+
+    let checked = Rc::new(Cell::new(active));
+    let indicator = gtk::DrawingArea::builder().width_request(16).height_request(16).build();
+    {
+        let checked = checked.clone();
+        let color = color.to_string();
+        indicator.set_draw_func(move |_, cr, width, height| draw_calendar_indicator(cr, width, height, &color, checked.get()));
+    }
+    let label = gtk::Label::builder().label(name).xalign(0.0).hexpand(true).build();
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    content.append(&indicator);
+    content.append(&label);
+    button.set_child(Some(&content));
+
+    {
+        let checked = checked.clone();
+        let indicator = indicator.clone();
+        button.connect_toggled(move |btn| {
+            checked.set(btn.is_active());
+            indicator.queue_draw();
+            on_toggle(btn.is_active());
+        });
+    }
+
+    button
+}
+
+/// Paints one calendar's radio indicator into `cr`: a solid disc in `color`
+/// with a white inner dot when `checked`, otherwise a hollow ring. `color` is
+/// a `#rgb`/`#rrggbb`/`#rrggbbaa` hex value; anything unparseable falls back
+/// to a neutral grey.
+fn draw_calendar_indicator(cr: &gtk::cairo::Context, width: i32, height: i32, color: &str, checked: bool) {
+    let rgba = gtk::gdk::RGBA::parse(color).unwrap_or_else(|_| gtk::gdk::RGBA::new(0.6, 0.6, 0.6, 1.0));
+    let (r, g, b) = (rgba.red(), rgba.green(), rgba.blue());
+    let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let radius = w.min(h) / 2.0 - 1.0;
+    if checked {
+        cr.set_source_rgba(r as f64, g as f64, b as f64, 1.0);
+        cr.arc(cx, cy, radius, 0.0, std::f64::consts::TAU);
+        let _ = cr.fill();
+        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        cr.arc(cx, cy, radius * 0.32, 0.0, std::f64::consts::TAU);
+        let _ = cr.fill();
+    } else {
+        cr.set_source_rgba(r as f64, g as f64, b as f64, 0.8);
+        cr.set_line_width(1.5);
+        cr.arc(cx, cy, radius - 0.75, 0.0, std::f64::consts::TAU);
+        let _ = cr.stroke();
+    }
+}
+
+/// The CSS rule for one calendar's colour: the `.calendar-event-<hex>` chip
+/// rule that [`event_label`] applies to occurrences of each calendar. The
+/// checklist's own indicator is hand-drawn (see [`calendar_toggle_row`]) and
+/// needs no CSS.
+fn calendar_color_css(color: &str) -> String {
+    let fg = calendar_colors::readable_foreground(color);
+    format!(
+        ".calendar-event-{} {{ background-color: {color}; color: {fg}; border-radius: 4px; padding: 1px 4px; }}\n",
+        color.trim_start_matches('#')
+    )
 }
 
 /// The calendar view's left sidebar: a mini month-picker, a disabled "Add
@@ -1122,6 +1321,146 @@ mod tests {
         assert_eq!(last_of_month(feb), NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());
         let august = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
         assert_eq!(last_of_month(august), NaiveDate::from_ymd_opt(2026, 8, 31).unwrap());
+    }
+
+    #[test]
+    fn hour_gutter_labels_are_compact_12_hour() {
+        assert_eq!(hour_gutter_text(0), "12am");
+        assert_eq!(hour_gutter_text(5), "5am");
+        assert_eq!(hour_gutter_text(8), "8am");
+        assert_eq!(hour_gutter_text(12), "12pm");
+        assert_eq!(hour_gutter_text(13), "1pm");
+        assert_eq!(hour_gutter_text(17), "5pm");
+        assert_eq!(hour_gutter_text(23), "11pm");
+    }
+
+    #[test]
+    fn event_times_are_compact_12_hour_with_minutes() {
+        use chrono::TimeZone;
+        let at = |hour: u32, minute: u32| {
+            let naive = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap().and_hms_opt(hour, minute, 0).unwrap();
+            chrono::Local.from_local_datetime(&naive).single().unwrap()
+        };
+        assert_eq!(format_event_time(&at(9, 30)), "9:30am");
+        assert_eq!(format_event_time(&at(17, 0)), "5:00pm");
+        assert_eq!(format_event_time(&at(0, 5)), "12:05am");
+        assert_eq!(format_event_time(&at(12, 15)), "12:15pm");
+    }
+
+    #[test]
+    fn calendar_color_css_parses_as_valid_gtk_css() {
+        // `load_from_string` swallows parse errors (logging them to GLib), so
+        // assert on `to_str()` instead: a provider that failed to parse the
+        // rules round-trips to an empty string. Skipped when the test host has
+        // no display to initialise GTK against.
+        if gtk::init().is_err() {
+            return;
+        }
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(&calendar_color_css("#3584e4"));
+        let round_tripped = provider.to_str();
+        assert!(!round_tripped.is_empty(), "calendar colour CSS did not parse");
+        assert!(round_tripped.contains("calendar-event-3584e4"));
+
+        let multi = format!("{}{}", calendar_color_css("#e5a50a"), calendar_color_css("#56b9c4"));
+        provider.load_from_string(&multi);
+        let round_tripped = provider.to_str();
+        assert!(!round_tripped.is_empty(), "multi-colour CSS did not parse");
+        assert!(round_tripped.contains("calendar-event-e5a50a"));
+        assert!(round_tripped.contains("calendar-event-56b9c4"));
+    }
+
+    #[test]
+    fn calendar_toggle_row_fires_callback_with_new_state() {
+        // The custom checklist rows are plain ToggleButtons with a drawn
+        // indicator; verify they seed the given checked state and fire
+        // `on_toggle` with the new state as they flip. Skipped when the test
+        // host has no display to initialise GTK against.
+        if gtk::init().is_err() {
+            return;
+        }
+        let calls: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let toggle = calendar_toggle_row("Work", "#3584e4", false, {
+            let calls = calls.clone();
+            move |is_checked| calls.borrow_mut().push(is_checked)
+        });
+        assert!(!toggle.is_active(), "row seeded unchecked");
+        assert!(toggle.child().is_some(), "row carries content (indicator + label)");
+
+        toggle.set_active(true);
+        assert!(toggle.is_active(), "first toggle checks the row");
+        toggle.set_active(false);
+        assert!(!toggle.is_active(), "second toggle unchecks the row");
+        assert_eq!(calls.borrow().as_slice(), &[true, false][..]);
+
+        let seeded = calendar_toggle_row("Private", "#e5a50a", true, |_| {});
+        assert!(seeded.is_active(), "row seeded checked");
+    }
+
+    #[test]
+    fn application_priority_css_beats_theme_on_toggle_button() {
+        // The checklist's custom toggle rows rely on display-level CSS at
+        // STYLE_PROVIDER_PRIORITY_APPLICATION (their `flat`/`calendar-toggle`
+        // classes), so verify that a provider at that priority is consulted
+        // for a real widget's style context (reachability) and that its rules
+        // beat the active libadwaita/Yaru theme (precedence). Uses the
+        // deprecated GtkStyleContext lookup because gtk4-rs 0.11 does not wrap
+        // gtk_widget_css_lookup_color; skipped when the test host has no
+        // display to initialise GTK against.
+        if gtk::init().is_err() {
+            return;
+        }
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(
+            "@define-color probe #3584e4;\n\
+             .calendar-toggle { color: #123456; }\n\
+             .calendar-toggle:checked { color: #89abcd; }",
+        );
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
+        let window = gtk::Window::builder().default_width(40).default_height(40).build();
+        let toggle = gtk::ToggleButton::new();
+        toggle.add_css_class("calendar-toggle");
+        toggle.set_active(true);
+        window.set_child(Some(&toggle));
+        window.present();
+        for _ in 0..10 {
+            while gtk::glib::MainContext::default().iteration(false) {}
+        }
+        use gtk::glib::prelude::Cast;
+        use gtk::glib::translate::ToGlibPtr;
+        let widget = toggle.upcast_ref::<gtk::Widget>();
+        let context = unsafe { gtk::ffi::gtk_widget_get_style_context(widget.to_glib_none().0) };
+        assert!(!context.is_null(), "no style context for the toggle button");
+
+        let mut probe = gtk::gdk::ffi::GdkRGBA {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 0.0,
+        };
+        let resolved = unsafe { gtk::ffi::gtk_style_context_lookup_color(context, b"probe\0".as_ptr().cast(), &mut probe) };
+        assert!(resolved != 0, "display-level @define-color did not resolve on the widget's style context");
+        assert!((probe.red - ((0x35_u32 as f64) / 255.0) as f32).abs() < 0.01, "probe red = {}", probe.red);
+
+        let mut color = gtk::gdk::ffi::GdkRGBA {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 0.0,
+        };
+        unsafe {
+            gtk::ffi::gtk_style_context_get_color(context, &mut color);
+        }
+        let (r, g, b) = (color.red, color.green, color.blue);
+        assert!(
+            (r - ((0x89_u32 as f64) / 255.0) as f32).abs() < 0.01 && (g - ((0xab_u32 as f64) / 255.0) as f32).abs() < 0.01 && (b - ((0xcd_u32 as f64) / 255.0) as f32).abs() < 0.01,
+            "computed color = #{:02x}{:02x}{:02x}, expected the checked rule #89abcd (APPLICATION priority lost to the theme?)",
+            (r * 255.0) as u8,
+            (g * 255.0) as u8,
+            (b * 255.0) as u8
+        );
     }
 
     #[test]
