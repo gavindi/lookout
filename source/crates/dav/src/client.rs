@@ -164,8 +164,12 @@ mod tests {
   <D:response>
     <D:href>/principals/alice/</D:href>
     <D:propstat>
-      <D:prop><C:calendar-home-set><D:href>/calendars/alice/home/</D:href></C:calendar-home-set></D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
+      <D:prop>
+        <C:calendar-home-set>
+          <D:href>/calendars/alice/home/</D:href>
+        </C:calendar-home-set>
+      </D:prop>
     </D:propstat>
   </D:response>
 </D:multistatus>"#,
@@ -183,18 +187,25 @@ mod tests {
   <D:response>
     <D:href>/calendars/alice/home/</D:href>
     <D:propstat>
-      <D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
+      <D:prop>
+        <D:resourcetype>
+          <D:collection/>
+        </D:resourcetype>
+      </D:prop>
     </D:propstat>
   </D:response>
   <D:response>
     <D:href>/calendars/alice/home/personal/</D:href>
     <D:propstat>
+      <D:status>HTTP/1.1 200 OK</D:status>
       <D:prop>
         <D:displayname>Personal</D:displayname>
-        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+        <D:resourcetype>
+          <D:collection/>
+          <C:calendar/>
+        </D:resourcetype>
       </D:prop>
-      <D:status>HTTP/1.1 200 OK</D:status>
     </D:propstat>
   </D:response>
 </D:multistatus>"#,

@@ -119,10 +119,16 @@ impl ParseState {
         if let Some(pd) = self.prop_depth {
             if depth == pd + 1 {
                 if let (Some(key), Some(resp)) = (self.prop_key.take(), self.current.as_mut()) {
-                    let value = if !self.prop_child_names.is_empty() && self.prop_text.is_empty() {
+                    // Whitespace between child elements (pretty-printed XML,
+                    // e.g. Google's `calendar-home-set` href or a multi-line
+                    // `resourcetype`) leaks into `prop_text` - treat
+                    // whitespace-only text as "no text", and trim the final
+                    // value, so formatting never contaminates the result.
+                    let has_text = !self.prop_text.trim().is_empty();
+                    let value = if !self.prop_child_names.is_empty() && !has_text {
                         self.prop_child_names.join(",")
                     } else {
-                        self.prop_text.clone()
+                        self.prop_text.trim().to_string()
                     };
                     resp.props.insert(key, value);
                 }
@@ -340,6 +346,76 @@ mod tests {
         let ical = responses[0].prop(CALDAV, "calendar-data").unwrap();
         assert!(ical.contains("UID:evt-1@example.com"));
         assert!(ical.contains("SUMMARY:Team sync"));
+    }
+
+    // Real servers pretty-print their multistatus XML - Google in particular
+    // puts the calendar-home-set's `<D:href>` and each resourcetype marker on
+    // their own indented line. Formatting whitespace must not leak into the
+    // extracted property values (this previously appended "\n    " to the
+    // home-set href and replaced resourcetype's "collection,calendar" with
+    // whitespace, yielding an empty calendar list for Google accounts).
+    const GOOGLE_STYLE_HOME_MULTISTATUS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:caldav="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+ <D:response xmlns:carddav="urn:ietf:params:xml:ns:carddav" xmlns:cm="http://cal.me.com/_namespace/" xmlns:md="urn:mobileme:davservices">
+  <D:href>/caldav/v2/gavindi@gmail.com/user</D:href>
+  <D:propstat>
+   <D:status>HTTP/1.1 200 OK</D:status>
+   <D:prop>
+    <caldav:calendar-home-set>
+     <D:href>/caldav/v2/gavindi%40gmail.com/</D:href>
+    </caldav:calendar-home-set>
+   </D:prop>
+  </D:propstat>
+ </D:response>
+</D:multistatus>"#;
+
+    const GOOGLE_STYLE_LIST_MULTISTATUS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:caldav="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">
+ <D:response xmlns:carddav="urn:ietf:params:xml:ns:carddav" xmlns:cm="http://cal.me.com/_namespace/" xmlns:md="urn:mobileme:davservices">
+  <D:href>/caldav/v2/gavindi%40gmail.com/events/</D:href>
+  <D:propstat>
+   <D:status>HTTP/1.1 200 OK</D:status>
+   <D:prop>
+    <D:displayname>gavindi@gmail.com</D:displayname>
+    <ical:calendar-color>#9FE1E7FF</ical:calendar-color>
+    <D:resourcetype>
+     <D:collection/>
+     <caldav:calendar/>
+    </D:resourcetype>
+   </D:prop>
+  </D:propstat>
+ </D:response>
+ <D:response xmlns:carddav="urn:ietf:params:xml:ns:carddav" xmlns:cm="http://cal.me.com/_namespace/" xmlns:md="urn:mobileme:davservices">
+  <D:href>/caldav/v2/gavindi%40gmail.com/user</D:href>
+  <D:propstat>
+   <D:status>HTTP/1.1 404 Not Found</D:status>
+   <D:prop>
+    <D:current-user-principal/>
+   </D:prop>
+  </D:propstat>
+ </D:response>
+</D:multistatus>"#;
+
+    #[test]
+    fn pretty_printed_multistatus_does_not_leak_whitespace_into_prop_values() {
+        let home = parse_multistatus(GOOGLE_STYLE_HOME_MULTISTATUS).unwrap();
+        assert_eq!(home.len(), 1);
+        assert_eq!(home[0].prop(CALDAV, "calendar-home-set"), Some("/caldav/v2/gavindi%40gmail.com/"));
+
+        let list = parse_multistatus(GOOGLE_STYLE_LIST_MULTISTATUS).unwrap();
+        assert_eq!(list.len(), 2);
+        let calendar = &list[0];
+        assert_eq!(calendar.href, "/caldav/v2/gavindi%40gmail.com/events/");
+        assert_eq!(calendar.prop(DAV, "displayname"), Some("gavindi@gmail.com"));
+        assert_eq!(calendar.prop(APPLE_ICAL, "calendar-color"), Some("#9FE1E7FF"));
+        // The resourcetype must survive as "collection,calendar", not a
+        // whitespace blob, or the calendar-collection filter loses everything.
+        assert_eq!(calendar.prop(DAV, "resourcetype"), Some("collection,calendar"));
+        assert!(calendar.prop(DAV, "resourcetype").unwrap().contains("calendar"));
+        // A 404 propstat's prop must still surface (Google 404s
+        // current-user-principal; the empty value is what drives the
+        // resolve-to-base_url fallback in discover_calendar_home).
+        assert_eq!(list[1].prop(DAV, "current-user-principal"), Some(""));
     }
 
     #[test]

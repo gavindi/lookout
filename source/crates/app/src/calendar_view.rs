@@ -431,6 +431,12 @@ pub fn build_sidebar() -> CalendarSidebar {
 
     let my_calendars_label = gtk::Label::builder().label("My calendars").css_classes(["heading"]).xalign(0.0).margin_top(12).build();
     let calendar_list_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+    let calendar_list_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .child(&calendar_list_box)
+        .build();
 
     let root_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -444,7 +450,7 @@ pub fn build_sidebar() -> CalendarSidebar {
     root_box.append(&mini_calendar.root);
     root_box.append(&add_calendar_button);
     root_box.append(&my_calendars_label);
-    root_box.append(&calendar_list_box);
+    root_box.append(&calendar_list_scroller);
 
     CalendarSidebar {
         root: root_box.upcast(),

@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **Calendar**: Google (and most other CalDAV servers) pretty-print their `multistatus` XML - properties and their `<href>` values sit on their own indented lines. The WebDAV response parser was accumulating that formatting whitespace into property text, which corrupted the `calendar-home-set` href (trailing `\n    ` made the calendar-list PROPFIND hit a non-existent URL) and replaced `resourcetype`'s `collection,calendar` markers with a whitespace blob (so every calendar failed the calendar-type filter). Net result: connected Google accounts silently reported zero calendars and the "My calendars" checklist stayed empty - the exact behavior Evolution sidesteps via its own e-d-s parsing. Fixed by trimming final property values and treating whitespace-only text as absent for container properties; regression-tested with a Google-style pretty-printed response.
+
+
+## 0.6.9 (2026-08-03)
+
+### Fixed
+
 - **Calendar**: the sidebar's "My calendars" checklist no longer stays blank while accounts are connected but haven't reported their calendars yet. It now renders one entry per connected calendar account (a dim account header), each with its discovered calendars as checkboxes - or, until they arrive, an inline status line: "Connecting…" while the CalDAV session is establishing, "No calendars found" if the account comes up with zero collections, or the session's error message when discovery fails. A "No calendars connected" placeholder shows when there are no calendar accounts at all, so the section always reflects reality instead of silently disappearing.
 
 ## 0.6.8 (2026-08-03)
