@@ -12,7 +12,7 @@ use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
 use lookout_mail::{AccountConfig, EndpointConfig};
 use webkit::prelude::*;
 
-use crate::calendar_view::{self, MonthGrid};
+use crate::calendar_view::{self, CalendarMain};
 use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
@@ -204,8 +204,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     app.add_action(&about_action);
 
     let bg_bytes = include_bytes!("../../../Assets/backgrounds/background2.png");
-    let bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes))
-        .expect("bundled background image should decode");
+    let bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes)).expect("bundled background image should decode");
     let background = gtk::Picture::for_paintable(&bg_texture);
     background.set_content_fit(gtk::ContentFit::Cover);
     background.set_can_shrink(true);
@@ -312,19 +311,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .margin_end(10)
             .build();
         // Top row: sender and date
-        let hbox = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .build();
-        let sender_label = gtk::Label::builder()
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
-        let date_label = gtk::Label::builder()
-            .xalign(1.0)
-            .css_classes(["dim-label", "caption"])
-            .build();
+        let hbox = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+        let sender_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let date_label = gtk::Label::builder().xalign(1.0).css_classes(["dim-label", "caption"]).build();
         hbox.append(&sender_label);
         hbox.append(&date_label);
         // Subject label
@@ -376,48 +365,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else { return };
         let summary = boxed.borrow::<EmailSummary>().clone();
-        let overlay = list_item
-            .child()
-            .and_downcast::<gtk::Overlay>()
-            .expect("overlay");
-        let action_box = unsafe {
-            list_item
-                .data::<gtk::Box>("action-box")
-                .expect("action box")
-                .as_ref()
-                .clone()
-        };
-        let vbox = overlay
-            .child()
-            .and_downcast::<gtk::Box>()
-            .expect("vbox");
-        let hbox = vbox
-            .first_child()
-            .and_downcast::<gtk::Box>()
-            .expect("hbox");
-        let sender_label = hbox
-            .first_child()
-            .and_downcast::<gtk::Label>()
-            .expect("sender label");
-        let date_label = hbox
-            .last_child()
-            .and_downcast::<gtk::Label>()
-            .expect("date label");
-        let subject_label = vbox
-            .last_child()
-            .and_downcast::<gtk::Label>()
-            .expect("subject label");
-        let from = summary
-            .from
-            .first()
-            .map(|a| a.display_label().to_string())
-            .unwrap_or_else(|| "(unknown)".into());
+        let overlay = list_item.child().and_downcast::<gtk::Overlay>().expect("overlay");
+        let action_box = unsafe { list_item.data::<gtk::Box>("action-box").expect("action box").as_ref().clone() };
+        let vbox = overlay.child().and_downcast::<gtk::Box>().expect("vbox");
+        let hbox = vbox.first_child().and_downcast::<gtk::Box>().expect("hbox");
+        let sender_label = hbox.first_child().and_downcast::<gtk::Label>().expect("sender label");
+        let date_label = hbox.last_child().and_downcast::<gtk::Label>().expect("date label");
+        let subject_label = vbox.last_child().and_downcast::<gtk::Label>().expect("subject label");
+        let from = summary.from.first().map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
         sender_label.set_label(&from);
-        sender_label.set_css_classes(if summary.is_unread() {
-            &["heading"]
-        } else {
-            &[]
-        });
+        sender_label.set_css_classes(if summary.is_unread() { &["heading"] } else { &[] });
         let now = chrono::Utc::now();
         let recent = now.signed_duration_since(summary.date) < chrono::Duration::hours(24);
         let date = glib::DateTime::from_unix_local(summary.date.timestamp())
@@ -448,13 +405,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let summary_for_reply = summary.clone();
         // Archive button: first child of action_box
         {
-            let archive_btn = unsafe {
-                list_item
-                    .data::<gtk::Button>("archive-button")
-                    .expect("archive button")
-                    .as_ref()
-                    .clone()
-            };
+            let archive_btn = unsafe { list_item.data::<gtk::Button>("archive-button").expect("archive button").as_ref().clone() };
             let state_for_archive = state_clone.clone();
             archive_btn.connect_clicked(move |_| {
                 let Some(account_id) = mailbox_account_id(&mailbox_for_archive) else {
@@ -472,13 +423,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
         // Delete button: second child of action_box
         {
-            let delete_btn = unsafe {
-                list_item
-                    .data::<gtk::Button>("delete-button")
-                    .expect("delete button")
-                    .as_ref()
-                    .clone()
-            };
+            let delete_btn = unsafe { list_item.data::<gtk::Button>("delete-button").expect("delete button").as_ref().clone() };
             let state_for_delete = state_clone.clone();
             delete_btn.connect_clicked(move |_| {
                 let Some(account_id) = mailbox_account_id(&mailbox_for_delete) else {
@@ -496,13 +441,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
         // Reply button: third child of action_box
         {
-            let reply_btn = unsafe {
-                list_item
-                    .data::<gtk::Button>("reply-button")
-                    .expect("reply button")
-                    .as_ref()
-                    .clone()
-            };
+            let reply_btn = unsafe { list_item.data::<gtk::Button>("reply-button").expect("reply button").as_ref().clone() };
             let state_for_reply = state_clone.clone();
             let reading_stack_for_reply = reading_stack_clone.clone();
             reply_btn.connect_clicked(move |_| {
@@ -516,21 +455,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         };
                         if let Some(handle) = state.accounts.get(&account_id) {
                             let from_email = handle.email.clone();
-                            let prefill = crate::compose::build_reply_prefill(
-                                &summary_for_reply,
-                                body,
-                                &from_email,
-                                crate::compose::ReplyMode::Reply,
-                            );
+                            let prefill = crate::compose::build_reply_prefill(&summary_for_reply, body, &from_email, crate::compose::ReplyMode::Reply);
                             // Show composer in reading pane
                             let on_done = Rc::new(|| {});
-                            let composer = crate::compose::build_compose_view(
-                                "Reply",
-                                from_email,
-                                handle.cmd_tx.clone(),
-                                prefill,
-                                on_done,
-                            );
+                            let composer = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done);
                             reading_stack_for_reply.add_named(&composer, Some("compose"));
                             reading_stack_for_reply.set_visible_child_name("compose");
                         }
@@ -701,14 +629,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .title("No Calendar Accounts")
         .description("Add an account with Calendar enabled in GNOME Online Accounts to see events here.")
         .build();
-    let month_grid = Rc::new(calendar_view::build());
+    let calendar_main = Rc::new(calendar_view::build_main());
     let calendar_sidebar = calendar_view::build_sidebar();
     let calendar_sidebar_card = card_section(&calendar_sidebar.root);
     calendar_sidebar_card.add_css_class("folder-pane");
     let calendar_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .start_child(&calendar_sidebar_card)
-        .end_child(&month_grid.root)
+        .end_child(&calendar_main.root)
         .resize_start_child(false)
         .resize_end_child(true)
         .shrink_start_child(false)
@@ -790,25 +718,44 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Calendar's own command toolbar row, swapped in for the Mail one
     // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
-    // active. "Month" is the only view that actually exists, so it's the
-    // only sensitive item in the Day/Work week/Week/Month/Split view
-    // segmented control; everything else here mirrors the Mail toolbar's
-    // disabled-placeholder convention.
+    // active. All five segmented options (Day/Work week/Week/Month/Split)
+    // switch the main panel's stack; the rest of the toolbar mirrors the
+    // Mail toolbar's disabled-placeholder convention.
     let new_event_button = gtk::Button::from_icon_name("appointment-new-symbolic");
     new_event_button.set_tooltip_text(Some("New Event"));
     new_event_button.set_sensitive(false);
 
-    let day_view_button = gtk::ToggleButton::builder().label("Day").sensitive(false).build();
-    let work_week_view_button = gtk::ToggleButton::builder().label("Work week").sensitive(false).build();
-    let week_view_button = gtk::ToggleButton::builder().label("Week").sensitive(false).build();
+    let day_view_button = gtk::ToggleButton::builder().label("Day").build();
+    let work_week_view_button = gtk::ToggleButton::builder().label("Work week").build();
+    let week_view_button = gtk::ToggleButton::builder().label("Week").build();
     let month_view_button = gtk::ToggleButton::builder().label("Month").active(true).build();
-    let split_view_button = gtk::ToggleButton::builder().label("Split view").sensitive(false).build();
+    let split_view_button = gtk::ToggleButton::builder().label("Split view").build();
+    // One mutual-exclusion group so exactly one view is active at a time
+    // (same `set_group` trick as the nav rail's Mail/Calendar buttons).
+    split_view_button.set_group(Some(&month_view_button));
+    week_view_button.set_group(Some(&split_view_button));
+    work_week_view_button.set_group(Some(&week_view_button));
+    day_view_button.set_group(Some(&work_week_view_button));
     let view_switch_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).css_classes(["linked"]).build();
     view_switch_box.append(&day_view_button);
     view_switch_box.append(&work_week_view_button);
     view_switch_box.append(&week_view_button);
     view_switch_box.append(&month_view_button);
     view_switch_box.append(&split_view_button);
+    for (button, view) in [
+        (&day_view_button, "day"),
+        (&work_week_view_button, "workweek"),
+        (&week_view_button, "week"),
+        (&month_view_button, "month"),
+        (&split_view_button, "split"),
+    ] {
+        let calendar_main = calendar_main.clone();
+        button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                calendar_view::set_view(&calendar_main, view);
+            }
+        });
+    }
 
     let filter_button = gtk::Button::from_icon_name("edit-find-symbolic");
     filter_button.set_tooltip_text(Some("Filter"));
@@ -836,8 +783,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // image shows straight through it. Two views today (Mail/Calendar),
     // joined into one toggle group for mutual-exclusive selection.
     let mail_icon_bytes = include_bytes!("../../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg");
-    let mail_icon_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(mail_icon_bytes))
-        .expect("bundled app icon should decode");
+    let mail_icon_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(mail_icon_bytes)).expect("bundled app icon should decode");
     let mail_icon_image = gtk::Image::from_paintable(Some(&mail_icon_texture));
     mail_icon_image.set_pixel_size(28);
     let mail_view_button = gtk::ToggleButton::builder()
@@ -942,7 +888,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // Menu bar + icon toolbar grouped onto their own shared black
     // background, rather than each row painting (or not painting) its own.
-    let toolbars_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["window-toolbars-background"]).build();
+    let toolbars_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["window-toolbars-background"])
+        .build();
     toolbars_box.append(&menu_bar);
     toolbars_box.append(&icon_toolbar_box);
 
@@ -1100,7 +1049,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let calendar_state = calendar_state.clone();
-        let month_grid = month_grid.clone();
+        let calendar_main = calendar_main.clone();
         let mail_overview_day = mail_overview_day.clone();
         let mail_overview_day_list = mail_overview_day_list.clone();
         let toast_overlay = toast_overlay.clone();
@@ -1115,7 +1064,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 handle.last_synced_month = None;
                 let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
             }
-            refresh_displayed_calendar_view(&calendar_state, &month_grid);
+            refresh_displayed_calendar_view(&calendar_state, &calendar_main);
             refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
             for handle in state.borrow().accounts.values() {
                 let _ = handle.cmd_tx.send_blocking(AccountCommand::Refresh);
@@ -1270,7 +1219,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // account's Trash/Archive/Junk mailbox; Snooze -> AccountCommand::
     // SnoozeMessage with a single fixed "tomorrow 9:00 AM local time"
     // default. All four are silent no-ops with nothing selected.
-    for (button, role) in [(&delete_button, MailboxRole::Trash), (&archive_button, MailboxRole::Archive), (&report_button, MailboxRole::Junk)] {
+    for (button, role) in [
+        (&delete_button, MailboxRole::Trash),
+        (&archive_button, MailboxRole::Archive),
+        (&report_button, MailboxRole::Junk),
+    ] {
         let message_selection = message_selection.clone();
         let state = state.clone();
         button.connect_clicked(move |_| {
@@ -1291,54 +1244,58 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or_else(chrono::Utc::now);
-                let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessage { mailbox, uid, until: tomorrow_9am });
+                let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessage {
+                    mailbox,
+                    uid,
+                    until: tomorrow_9am,
+                });
             }
         });
     }
 
-    // --- Month grid navigation: prev/next/Today update the grid locally
-    // (immediate redraw of the date labels) and ask every connected
-    // calendar account to resync the newly-displayed month.
+    // --- Main calendar navigation: prev/next/Today move the anchor by the
+    // active view's natural unit (day/week/month - see `calendar_view::step`)
+    // and redraw every view immediately, then ask every connected calendar
+    // account to resync the newly-displayed month.
     {
         let calendar_state = calendar_state.clone();
-        let month_grid = month_grid.clone();
+        let calendar_main = calendar_main.clone();
         let mini_calendar = calendar_sidebar.mini_calendar.clone();
-        let prev_button = month_grid.prev_button.clone();
+        let prev_button = calendar_main.prev_button.clone();
         prev_button.connect_clicked(move |_| {
-            let current = calendar_state.borrow().displayed_month;
-            let new_month = current.checked_sub_months(chrono::Months::new(1)).unwrap_or(current);
-            show_month(&calendar_state, &month_grid, &mini_calendar, new_month);
+            calendar_view::step(&calendar_main, -1);
+            show_anchor(&calendar_state, &calendar_main, &mini_calendar);
         });
     }
     {
         let calendar_state = calendar_state.clone();
-        let month_grid = month_grid.clone();
+        let calendar_main = calendar_main.clone();
         let mini_calendar = calendar_sidebar.mini_calendar.clone();
-        let next_button = month_grid.next_button.clone();
+        let next_button = calendar_main.next_button.clone();
         next_button.connect_clicked(move |_| {
-            let current = calendar_state.borrow().displayed_month;
-            let new_month = current.checked_add_months(chrono::Months::new(1)).unwrap_or(current);
-            show_month(&calendar_state, &month_grid, &mini_calendar, new_month);
+            calendar_view::step(&calendar_main, 1);
+            show_anchor(&calendar_state, &calendar_main, &mini_calendar);
         });
     }
     {
         let calendar_state = calendar_state.clone();
-        let month_grid = month_grid.clone();
+        let calendar_main = calendar_main.clone();
         let mini_calendar = calendar_sidebar.mini_calendar.clone();
-        let today_button = month_grid.today_button.clone();
+        let today_button = calendar_main.today_button.clone();
         today_button.connect_clicked(move |_| {
-            show_month(&calendar_state, &month_grid, &mini_calendar, current_month_start());
+            calendar_view::go_today(&calendar_main);
+            show_anchor(&calendar_state, &calendar_main, &mini_calendar);
         });
     }
-    // --- Sidebar mini-calendar -> jump the main grid to whatever month the
-    // clicked date belongs to (same `show_month` helper the main grid's own
-    // prev/next/Today buttons use).
+    // --- Sidebar mini-calendar -> re-anchor the main panel to the clicked
+    // date (whatever view is active) and resync that date's month.
     {
         let calendar_state = calendar_state.clone();
-        let month_grid = month_grid.clone();
+        let calendar_main = calendar_main.clone();
         let mini_calendar = calendar_sidebar.mini_calendar.clone();
         calendar_view::connect_day_selected(&calendar_sidebar.mini_calendar, move |date| {
-            show_month(&calendar_state, &month_grid, &mini_calendar, date);
+            calendar_view::set_anchor(&calendar_main, date);
+            show_anchor(&calendar_state, &calendar_main, &mini_calendar);
         });
     }
     // --- Mail-screen overview mini-calendar -> re-show that day's events
@@ -1376,7 +1333,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         calendar_state,
         root_stack,
         toast_overlay,
-        month_grid,
+        calendar_main,
         calendar_sidebar.calendar_list_box,
         mail_overview_day,
         mail_overview_day_list,
@@ -1388,18 +1345,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window
 }
 
-/// Updates `calendar_state.displayed_month`, redraws the main grid's date
-/// labels immediately (`calendar_view::set_month` clears every cell's
-/// events, so this shows an empty grid for the new month until the resync
-/// below lands) and keeps the sidebar's mini-calendar showing the same
-/// month, then asks every connected calendar account to resync it.
-fn show_month(calendar_state: &Rc<RefCell<CalendarUiState>>, month_grid: &MonthGrid, mini_calendar: &calendar_view::MiniCalendar, new_month: chrono::NaiveDate) {
-    calendar_view::set_month(month_grid, new_month);
-    calendar_view::set_mini_month(mini_calendar, new_month);
+/// Re-anchors the main calendar panel's already-redrawn views, keeps the
+/// sidebar's mini-calendar showing the anchor's month, records the displayed
+/// month, and asks every connected calendar account to resync it.
+fn show_anchor(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &CalendarMain, mini_calendar: &calendar_view::MiniCalendar) {
+    let day = calendar_view::anchor(calendar_main);
+    calendar_view::set_mini_month(mini_calendar, day);
+    let month = first_of_month(day);
     let mut st = calendar_state.borrow_mut();
-    st.displayed_month = new_month;
+    st.displayed_month = month;
     for handle in st.accounts.values() {
-        let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(new_month));
+        let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
     }
 }
 
@@ -1623,7 +1579,7 @@ fn spawn_calendar_discovery(
     calendar_state: Rc<RefCell<CalendarUiState>>,
     root_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
-    month_grid: Rc<MonthGrid>,
+    calendar_main: Rc<CalendarMain>,
     calendar_list_box: gtk::Box,
     mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
     mail_overview_day_list: gtk::Box,
@@ -1657,7 +1613,7 @@ fn spawn_calendar_discovery(
                     connect_calendar_account(
                         worker.clone(),
                         calendar_state.clone(),
-                        month_grid.clone(),
+                        calendar_main.clone(),
                         calendar_list_box.clone(),
                         mail_overview_day.clone(),
                         mail_overview_day_list.clone(),
@@ -1690,7 +1646,7 @@ fn ensure_checked_calendars(checked: &mut HashSet<CalendarId>, calendars: &[Cale
 /// sidebar's "My calendars" checklist against that - the checklist's own
 /// `on_toggle` closure flips membership in `checked_calendar_ids` and calls
 /// `refresh_displayed_calendar_view` to redraw the grid accordingly.
-fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_list_box: &gtk::Box, month_grid: &Rc<MonthGrid>) {
+fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_list_box: &gtk::Box, calendar_main: &Rc<CalendarMain>) {
     let mut groups: Vec<calendar_view::CalendarAccountGroup> = calendar_state
         .borrow()
         .accounts
@@ -1710,7 +1666,7 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
     let checked = calendar_state.borrow().checked_calendar_ids.clone();
     let on_toggle = {
         let calendar_state = calendar_state.clone();
-        let month_grid = month_grid.clone();
+        let calendar_main = calendar_main.clone();
         move |id: CalendarId, is_checked: bool| {
             {
                 let mut st = calendar_state.borrow_mut();
@@ -1720,19 +1676,21 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
                     st.checked_calendar_ids.remove(&id);
                 }
             }
-            refresh_displayed_calendar_view(&calendar_state, &month_grid);
+            refresh_displayed_calendar_view(&calendar_state, &calendar_main);
         }
     };
     calendar_view::rebuild_calendar_checklist(calendar_list_box, &groups, &checked, on_toggle);
-    refresh_displayed_calendar_view(calendar_state, month_grid);
+    refresh_displayed_calendar_view(calendar_state, calendar_main);
 }
 
 /// Unions every connected calendar account's latest occurrences for
 /// whatever month is currently displayed - filtered to only the calendars
-/// currently checked in the sidebar - and redraws the grid. Same
-/// "only apply if it matches what's on screen" + "merge all accounts'
-/// latest snapshot" approach as Mail's `MessagesUpdated`/`rebuild_folder_tree`.
-fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>, month_grid: &MonthGrid) {
+/// currently checked in the sidebar - and redraws the whole main panel (every
+/// view in the stack gets the merged set; each derives its own window from
+/// the anchor). Same "only apply if it matches what's on screen" + "merge all
+/// accounts' latest snapshot" approach as Mail's
+/// `MessagesUpdated`/`rebuild_folder_tree`.
+fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &CalendarMain) {
     let st = calendar_state.borrow();
     let month = st.displayed_month;
     let merged: Vec<EventOccurrence> = st
@@ -1742,7 +1700,7 @@ fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>
         .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned())
         .collect();
     drop(st);
-    calendar_view::set_occurrences(month_grid, &merged);
+    calendar_view::set_occurrences(calendar_main, &merged);
 }
 
 /// Fills the Mail-screen overview pane's event list with every checked
@@ -1775,9 +1733,18 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
             let text = if occ.all_day {
                 occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
             } else {
-                format!("{} {}", occ.start.with_timezone(&chrono::Local).format("%H:%M"), occ.summary.as_deref().unwrap_or("(untitled)"))
+                format!(
+                    "{} {}",
+                    occ.start.with_timezone(&chrono::Local).format("%H:%M"),
+                    occ.summary.as_deref().unwrap_or("(untitled)")
+                )
             };
-            let label = gtk::Label::builder().label(&text).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).css_classes(["caption"]).build();
+            let label = gtk::Label::builder()
+                .label(&text)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["caption"])
+                .build();
             day_list_box.append(&label);
         }
     }
@@ -1787,7 +1754,7 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
 fn connect_calendar_account(
     worker: Rc<Worker>,
     calendar_state: Rc<RefCell<CalendarUiState>>,
-    month_grid: Rc<MonthGrid>,
+    calendar_main: Rc<CalendarMain>,
     calendar_list_box: gtk::Box,
     mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
     mail_overview_day_list: gtk::Box,
@@ -1847,13 +1814,13 @@ fn connect_calendar_account(
                     if let CalConnectionState::Error { message, .. } = &state {
                         toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
                     }
-                    refresh_calendar_checklist(&calendar_state, &calendar_list_box, &month_grid);
+                    refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
                 }
                 CalendarSessionEvent::CalendarsUpdated(calendars) => {
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
                         handle.calendars = calendars.clone();
                     }
-                    refresh_calendar_checklist(&calendar_state, &calendar_list_box, &month_grid);
+                    refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
                     if let Some(handle) = calendar_state.borrow().accounts.get(&account_id) {
                         if !handle.calendars.is_empty() {
                             let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(calendar_state.borrow().displayed_month));
@@ -1865,7 +1832,7 @@ fn connect_calendar_account(
                         handle.last_occurrences = occurrences;
                         handle.last_synced_month = Some(month);
                     }
-                    refresh_displayed_calendar_view(&calendar_state, &month_grid);
+                    refresh_displayed_calendar_view(&calendar_state, &calendar_main);
                     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
                 }
                 CalendarSessionEvent::Error(message) => {
@@ -1877,7 +1844,12 @@ fn connect_calendar_account(
 }
 
 fn calendar_account_label(state: &Rc<RefCell<CalendarUiState>>, account_id: &AccountId) -> String {
-    state.borrow().accounts.get(account_id).map(|h| h.display_name.clone()).unwrap_or_else(|| account_id.0.clone())
+    state
+        .borrow()
+        .accounts
+        .get(account_id)
+        .map(|h| h.display_name.clone())
+        .unwrap_or_else(|| account_id.0.clone())
 }
 
 fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
@@ -1908,7 +1880,10 @@ fn selected_message_command_target(message_selection: &gtk::SingleSelection, sta
 /// `current_body` doesn't match the selection (its body hasn't arrived yet,
 /// or is stale from a previous selection) - the calling handler is then a
 /// silent no-op, same convention as `selected_message_command_target`.
-fn selected_message_reply_context(message_selection: &gtk::SingleSelection, state: &Rc<RefCell<UiState>>) -> Option<(EmailSummary, EmailBody, String, async_channel::Sender<AccountCommand>)> {
+fn selected_message_reply_context(
+    message_selection: &gtk::SingleSelection,
+    state: &Rc<RefCell<UiState>>,
+) -> Option<(EmailSummary, EmailBody, String, async_channel::Sender<AccountCommand>)> {
     let boxed = message_selection.selected_item().and_downcast::<glib::BoxedAnyObject>()?;
     let summary = boxed.borrow::<EmailSummary>().clone();
 
@@ -2017,7 +1992,13 @@ fn render_body(reading_stack: &gtk::Stack, body: lookout_core::EmailBody) {
 /// visible beforehand once `on_done` fires (Cancel or Send) - so Reply's
 /// Cancel lands back on the same message, and New Message's Cancel lands
 /// back on the empty placeholder.
-fn show_composer_in_reading_pane(reading_stack: &gtk::Stack, title: &str, from_email: String, cmd_tx: async_channel::Sender<AccountCommand>, prefill: crate::compose::ComposePrefill) {
+fn show_composer_in_reading_pane(
+    reading_stack: &gtk::Stack,
+    title: &str,
+    from_email: String,
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    prefill: crate::compose::ComposePrefill,
+) {
     if let Some(existing) = reading_stack.child_by_name("compose") {
         reading_stack.remove(&existing);
     }

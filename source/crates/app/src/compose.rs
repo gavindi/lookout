@@ -99,7 +99,12 @@ pub fn build_reply_prefill(summary: &EmailSummary, body: &EmailBody, own_email: 
     let subject = summary.subject.as_deref().map(|s| with_prefix_once(s, "Re: ")).unwrap_or_else(|| "Re: ".to_string());
 
     let quoted = body.text_body.as_deref().unwrap_or("");
-    let reply_body = format!("\n\nOn {}, {} wrote:\n{}", summary.date.format("%a, %b %d, %Y at %I:%M %p"), sender_label(summary), quote_lines(quoted));
+    let reply_body = format!(
+        "\n\nOn {}, {} wrote:\n{}",
+        summary.date.format("%a, %b %d, %Y at %I:%M %p"),
+        sender_label(summary),
+        quote_lines(quoted)
+    );
 
     let (in_reply_to, references) = reply_threading(body);
 
@@ -186,7 +191,14 @@ pub fn build_compose_view(title: &str, from_email: String, cmd_tx: async_channel
     let send_button = gtk::Button::builder().label("Send").css_classes(["suggested-action"]).build();
     let title_label = gtk::Label::builder().label(title).hexpand(true).build();
 
-    let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
+    let top_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
     top_row.append(&cancel_button);
     top_row.append(&title_label);
     top_row.append(&send_button);
@@ -253,9 +265,24 @@ mod tests {
             references: Vec::new(),
             thread_key: ThreadKey(String::new()),
             subject: Some("Hello there".to_string()),
-            from: vec![EmailAddress { name: Some("Ada Lovelace".to_string()), address: "ada@example.com".to_string() }],
-            to: vec![EmailAddress { name: None, address: "me@example.com".to_string() }, EmailAddress { name: None, address: "other@example.com".to_string() }],
-            cc: vec![EmailAddress { name: None, address: "cc-person@example.com".to_string() }],
+            from: vec![EmailAddress {
+                name: Some("Ada Lovelace".to_string()),
+                address: "ada@example.com".to_string(),
+            }],
+            to: vec![
+                EmailAddress {
+                    name: None,
+                    address: "me@example.com".to_string(),
+                },
+                EmailAddress {
+                    name: None,
+                    address: "other@example.com".to_string(),
+                },
+            ],
+            cc: vec![EmailAddress {
+                name: None,
+                address: "cc-person@example.com".to_string(),
+            }],
             date: Utc.with_ymd_and_hms(2026, 7, 30, 12, 0, 0).unwrap(),
             flags: BTreeSet::new(),
             keywords: BTreeSet::new(),
@@ -300,7 +327,10 @@ mod tests {
         let body = sample_body(headers, Some("hi"));
         let (in_reply_to, references) = reply_threading(&body);
         assert_eq!(in_reply_to, Some("orig@example.com".to_string()));
-        assert_eq!(references, vec!["older@example.com".to_string(), "older2@example.com".to_string(), "orig@example.com".to_string()]);
+        assert_eq!(
+            references,
+            vec!["older@example.com".to_string(), "older2@example.com".to_string(), "orig@example.com".to_string()]
+        );
     }
 
     #[test]

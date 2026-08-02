@@ -62,7 +62,9 @@ pub enum CalendarAuthMethod {
     /// (commonly `"calendar-password"`, per GOA's one-slot-per-service-
     /// interface convention - distinct from `imap-password`/`smtp-password`
     /// even on an account that also has Mail enabled).
-    Password { password_id: String },
+    Password {
+        password_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -239,7 +241,9 @@ impl GoaClient {
         let auth = if ifaces.contains_key(IFACE_OAUTH2) {
             CalendarAuthMethod::OAuth2
         } else if ifaces.contains_key(IFACE_PASSWORD) {
-            CalendarAuthMethod::Password { password_id: "calendar-password".to_string() }
+            CalendarAuthMethod::Password {
+                password_id: "calendar-password".to_string(),
+            }
         } else {
             return Ok(None);
         };

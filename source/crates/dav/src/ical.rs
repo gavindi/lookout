@@ -93,7 +93,15 @@ fn to_utc(dpt: &DatePerhapsTime) -> Option<(DateTime<Utc>, bool)> {
 fn parse_ical_duration(raw: &str) -> Duration {
     match iso8601::duration(raw) {
         Ok(iso8601::Duration::Weeks(w)) => Duration::weeks(w as i64),
-        Ok(iso8601::Duration::YMDHMS { year, month, day, hour, minute, second, millisecond }) => {
+        Ok(iso8601::Duration::YMDHMS {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            millisecond,
+        }) => {
             Duration::days(i64::from(year) * 365 + i64::from(month) * 30 + i64::from(day))
                 + Duration::hours(i64::from(hour))
                 + Duration::minutes(i64::from(minute))

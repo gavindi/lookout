@@ -67,11 +67,19 @@ pub enum AccountCommand {
     /// rather than silently permanent-deleting - there's no
     /// confirmation-dialog UI in this app yet, so no destructive fallback
     /// without one.
-    MoveMessage { mailbox: MailboxId, uid: Uid, role: MailboxRole },
+    MoveMessage {
+        mailbox: MailboxId,
+        uid: Uid,
+        role: MailboxRole,
+    },
     /// Client-side only - IMAP has no native snooze. Records `until` in the
     /// local cache and hides the message from `MessagesUpdated` until that
     /// time passes.
-    SnoozeMessage { mailbox: MailboxId, uid: Uid, until: chrono::DateTime<chrono::Utc> },
+    SnoozeMessage {
+        mailbox: MailboxId,
+        uid: Uid,
+        until: chrono::DateTime<chrono::Utc>,
+    },
     Shutdown,
 }
 

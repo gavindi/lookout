@@ -69,7 +69,8 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [x] iCalendar modeling + recurrence expansion (`icalendar` + `rrule`) - `TZID`→UTC resolution via `chrono-tz`, window-bounded RRULE expansion
 - [x] GOA `Calendar` interface for endpoint + credentials - discovery (`list_calendar_accounts`) confirmed live; the `calendar-password` credential-slot id and Google `Calendar.Uri` special-casing are implemented but still unverified against a real live account
 - [x] Custom-drawn month view (Outlook-style, Sunday-first grid, mini-calendar sidebar + "My calendars" checklist filter)
-  - [ ] Week/Day/Agenda views and the Split-view layout (the command toolbar's view-switcher only has Month wired up; the other segmented-control options are disabled placeholders)
+  - [x] Week/Day/Agenda views and the Split-view layout (the command toolbar's view-switcher is fully live: Day, Work week, Week, Month and Split are mutually-exclusive segmented options backed by a shared-anchor view stack. Day/Week/Work week are read-only time grids - all-day row plus per-hour cells against an hour-ruler gutter; Month is the original Sunday-first grid; Split pairs the month grid with a chronological agenda list for the anchor's month. Today/prev/next navigate in the active view's natural unit)
+- [ ] Time-grid polish: scrollable hour timeline, positioned (not bucket-per-hour) event chips, multi-day event spans, agenda grouping by day
 - [ ] Drag-reschedule; recurring edit scopes (this / this-and-following / all)
 - [ ] iMIP invitation banners in the mail viewer
 - [ ] `.ics` import / webcal subscription

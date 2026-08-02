@@ -27,7 +27,13 @@ pub struct MessageHeader {
 pub fn build() -> MessageHeader {
     let subject_label = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["message-header-subject"]).build();
 
-    let avatar_label = gtk::Label::builder().css_classes(["avatar-circle"]).width_request(40).height_request(40).halign(gtk::Align::Center).valign(gtk::Align::Center).build();
+    let avatar_label = gtk::Label::builder()
+        .css_classes(["avatar-circle"])
+        .width_request(40)
+        .height_request(40)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
 
     let sender_name_label = gtk::Label::builder().xalign(0.0).css_classes(["heading"]).build();
     let sender_email_label = gtk::Label::builder().xalign(0.0).css_classes(["message-header-meta"]).build();
@@ -107,7 +113,8 @@ impl MessageHeader {
         let to = summary.to.iter().map(|a| a.display_label()).collect::<Vec<_>>().join(", ");
         self.to_label.set_label(&format!("To: {to}"));
 
-        self.date_label.set_label(&summary.date.with_timezone(&chrono::Local).format("%a %d/%m/%Y %I:%M %p").to_string());
+        self.date_label
+            .set_label(&summary.date.with_timezone(&chrono::Local).format("%a %d/%m/%Y %I:%M %p").to_string());
     }
 }
 

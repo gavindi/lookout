@@ -161,12 +161,18 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
         .at("/org/gnome/OnlineAccounts/Accounts/pw_account", FakePasswordBased { password: "fake-pw".to_string() })
         .await
         .unwrap();
-    connection.object_server().at("/org/gnome/OnlineAccounts/Accounts/no_mail_account", FakeAccount).await.unwrap();
+    connection
+        .object_server()
+        .at("/org/gnome/OnlineAccounts/Accounts/no_mail_account", FakeAccount)
+        .await
+        .unwrap();
     connection
         .object_server()
         .at(
             "/org/gnome/OnlineAccounts/Accounts/no_mail_account",
-            FakePasswordBased { password: "fake-nc-pw".to_string() },
+            FakePasswordBased {
+                password: "fake-nc-pw".to_string(),
+            },
         )
         .await
         .unwrap();

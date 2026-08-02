@@ -1,11 +1,16 @@
 # Changelog
 
+## 0.6.11 (2026-08-03)
+
+### Added
+
+- **Calendar**: the command toolbar's view-switcher is now fully live instead of a Month-only placeholder. Day, Work week, Week, Month and Split view are real, mutually-exclusive segmented options wired to the main panel's new view stack (anchored to a single shared date so every view agrees on what's displayed, and the header's Today/prev/next navigate in the active view's natural unit - days for Day, weeks for Week/Work week, months for Month/Split). Day and Week/Work week are read-only time grids (all-day row plus one cell per hour against an hour-ruler gutter); Month is the existing Sunday-first grid; Split pairs the month grid with a day-agenda list. An agenda-style list view (chronological, from the anchor date to its month's end) is also available as the Split view's right-hand pane, mirroring the Mail-screen overview pane's day list. All views remain read-only - event creation is still a separate roadmap item.
+
 ## 0.6.10 (2026-08-03)
 
 ### Fixed
 
 - **Calendar**: Google (and most other CalDAV servers) pretty-print their `multistatus` XML - properties and their `<href>` values sit on their own indented lines. The WebDAV response parser was accumulating that formatting whitespace into property text, which corrupted the `calendar-home-set` href (trailing `\n    ` made the calendar-list PROPFIND hit a non-existent URL) and replaced `resourcetype`'s `collection,calendar` markers with a whitespace blob (so every calendar failed the calendar-type filter). Net result: connected Google accounts silently reported zero calendars and the "My calendars" checklist stayed empty - the exact behavior Evolution sidesteps via its own e-d-s parsing. Fixed by trimming final property values and treating whitespace-only text as absent for container properties; regression-tested with a Google-style pretty-printed response.
-
 
 ## 0.6.9 (2026-08-03)
 

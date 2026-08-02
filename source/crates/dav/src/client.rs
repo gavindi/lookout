@@ -109,7 +109,12 @@ impl DavClient {
 
     async fn send_xml_request(&self, method: &str, url: reqwest::Url, depth: u8, credential: &Credential, body: String) -> Result<Vec<DavResponse>> {
         let method = Method::from_bytes(method.as_bytes()).expect("method name is a valid HTTP token");
-        let mut req = self.http.request(method, url).header("Depth", depth.to_string()).header("Content-Type", "application/xml; charset=utf-8").body(body);
+        let mut req = self
+            .http
+            .request(method, url)
+            .header("Depth", depth.to_string())
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(body);
         req = match credential {
             // CalDAV's actual auth mechanism is plain HTTP headers, not the
             // SASL-inside-IMAP `AUTHENTICATE XOAUTH2` Mail uses - nothing to
@@ -138,9 +143,8 @@ mod tests {
 
         Mock::given(method("PROPFIND"))
             .and(path("/dav/"))
-            .respond_with(
-                ResponseTemplate::new(207).insert_header("Content-Type", "application/xml").set_body_string(
-                    r#"<?xml version="1.0" encoding="utf-8"?>
+            .respond_with(ResponseTemplate::new(207).insert_header("Content-Type", "application/xml").set_body_string(
+                r#"<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:">
   <D:response>
     <D:href>/dav/</D:href>
@@ -150,16 +154,14 @@ mod tests {
     </D:propstat>
   </D:response>
 </D:multistatus>"#,
-                ),
-            )
+            ))
             .mount(&server)
             .await;
 
         Mock::given(method("PROPFIND"))
             .and(path("/principals/alice/"))
-            .respond_with(
-                ResponseTemplate::new(207).insert_header("Content-Type", "application/xml").set_body_string(
-                    r#"<?xml version="1.0" encoding="utf-8"?>
+            .respond_with(ResponseTemplate::new(207).insert_header("Content-Type", "application/xml").set_body_string(
+                r#"<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
     <D:href>/principals/alice/</D:href>
@@ -173,16 +175,14 @@ mod tests {
     </D:propstat>
   </D:response>
 </D:multistatus>"#,
-                ),
-            )
+            ))
             .mount(&server)
             .await;
 
         Mock::given(method("PROPFIND"))
             .and(path("/calendars/alice/home/"))
-            .respond_with(
-                ResponseTemplate::new(207).insert_header("Content-Type", "application/xml").set_body_string(
-                    r#"<?xml version="1.0" encoding="utf-8"?>
+            .respond_with(ResponseTemplate::new(207).insert_header("Content-Type", "application/xml").set_body_string(
+                r#"<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
     <D:href>/calendars/alice/home/</D:href>
@@ -209,8 +209,7 @@ mod tests {
     </D:propstat>
   </D:response>
 </D:multistatus>"#,
-                ),
-            )
+            ))
             .mount(&server)
             .await;
 
