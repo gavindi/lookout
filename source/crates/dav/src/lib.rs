@@ -4,6 +4,7 @@
 //! [`session::CalendarCredentialProvider`] trait, keeping this crate free of
 //! D-Bus concerns.
 
+pub mod cache;
 mod client;
 mod config;
 mod error;
@@ -12,5 +13,6 @@ mod recurrence;
 pub mod session;
 mod xml;
 
+pub use cache::clear_all_caches;
 pub use config::{CalendarAccountConfig, Credential};
 pub use error::{Error, Result};

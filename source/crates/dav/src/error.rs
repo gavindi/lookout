@@ -4,6 +4,12 @@ pub enum Error {
     Http(#[from] reqwest::Error),
     #[error("XML error: {0}")]
     Xml(#[from] quick_xml::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("cache error: {0}")]
+    Cache(#[from] rusqlite::Error),
+    #[error("cache (de)serialization error: {0}")]
+    CacheSerde(#[from] serde_json::Error),
     #[error("iCalendar parse error: {0}")]
     Ical(String),
     #[error("recurrence rule error: {0}")]

@@ -77,6 +77,19 @@ fn install_calendar_css() {
         .calendar-toggle:checked {
             background: transparent;
             box-shadow: none;
+        }
+        .mini-calendar-event-day,
+        .mini-calendar-today {
+            font-weight: bold;
+        }
+        .mini-calendar-today {
+            color: @accent_bg_color;
+        }
+        .calendar-account-header {
+            font-weight: bold;
+        }
+        .calendar-toggle-label {
+            font-weight: normal;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -923,11 +936,18 @@ pub struct MiniCalendar {
     header_label: gtk::Label,
     day_buttons: Vec<gtk::Button>,
     anchor_month: Rc<RefCell<NaiveDate>>,
+    /// The local dates (within the currently-displayed month) that have at
+    /// least one occurrence from a checked calendar - their day buttons get
+    /// bold numerals (`.mini-calendar-event-day`). Kept so the mini grid's own
+    /// prev/next paging re-applies the markers without needing the caller;
+    /// updated by [`set_mini_month`]/[`set_mini_event_days`].
+    event_days: Rc<RefCell<HashSet<NaiveDate>>>,
     on_day_selected: DaySelectedCallbacks,
 }
 
 pub fn build_mini() -> MiniCalendar {
     let anchor_month = Rc::new(RefCell::new(first_of_month(chrono::Utc::now().date_naive())));
+    let event_days = Rc::new(RefCell::new(HashSet::new()));
     let on_day_selected: DaySelectedCallbacks = Rc::new(RefCell::new(Vec::new()));
 
     let header_label = gtk::Label::builder().css_classes(["heading"]).hexpand(true).xalign(0.0).build();
@@ -975,6 +995,7 @@ pub fn build_mini() -> MiniCalendar {
         header_label,
         day_buttons,
         anchor_month,
+        event_days,
         on_day_selected,
     };
 
@@ -982,33 +1003,56 @@ pub fn build_mini() -> MiniCalendar {
         let mini_month = mini.anchor_month.clone();
         let mini_header = mini.header_label.clone();
         let mini_buttons = mini.day_buttons.clone();
+        let mini_days = mini.event_days.clone();
         prev_button.connect_clicked(move |_| {
             let current = *mini_month.borrow();
+            let event_days = mini_days.borrow();
             let new_month = current.checked_sub_months(chrono::Months::new(1)).unwrap_or(current);
-            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month);
+            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days);
         });
     }
     {
         let mini_month = mini.anchor_month.clone();
         let mini_header = mini.header_label.clone();
         let mini_buttons = mini.day_buttons.clone();
+        let mini_days = mini.event_days.clone();
         next_button.connect_clicked(move |_| {
             let current = *mini_month.borrow();
+            let event_days = mini_days.borrow();
             let new_month = current.checked_add_months(chrono::Months::new(1)).unwrap_or(current);
-            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month);
+            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days);
         });
     }
 
     let initial_month = *mini.anchor_month.borrow();
-    relabel_mini(&mini.anchor_month, &mini.header_label, &mini.day_buttons, initial_month);
+    let initial_days = mini.event_days.borrow().clone();
+    relabel_mini(&mini.anchor_month, &mini.header_label, &mini.day_buttons, initial_month, &initial_days);
     mini
 }
 
-pub fn set_mini_month(mc: &MiniCalendar, month: NaiveDate) {
-    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month);
+/// Re-points the mini grid at `month`'s month and records which local dates
+/// within it have events (`event_days`) so their day buttons render bold.
+pub fn set_mini_month(mc: &MiniCalendar, month: NaiveDate, event_days: &HashSet<NaiveDate>) {
+    *mc.event_days.borrow_mut() = event_days.clone();
+    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days);
 }
 
-fn relabel_mini(anchor_month: &Rc<RefCell<NaiveDate>>, header_label: &gtk::Label, day_buttons: &[gtk::Button], month: NaiveDate) {
+/// Updates which dates in the currently-displayed month have events, without
+/// moving the month - used when a `SyncMonth` fetch lands for the month the
+/// mini grid is already showing.
+pub fn set_mini_event_days(mc: &MiniCalendar, event_days: &HashSet<NaiveDate>) {
+    *mc.event_days.borrow_mut() = event_days.clone();
+    let month = *mc.anchor_month.borrow();
+    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days);
+}
+
+/// The first-of-month date the mini grid is currently showing (see
+/// [`set_mini_month`]).
+pub fn mini_month(mc: &MiniCalendar) -> NaiveDate {
+    *mc.anchor_month.borrow()
+}
+
+fn relabel_mini(anchor_month: &Rc<RefCell<NaiveDate>>, header_label: &gtk::Label, day_buttons: &[gtk::Button], month: NaiveDate, event_days: &HashSet<NaiveDate>) {
     let month = first_of_month(month);
     *anchor_month.borrow_mut() = month;
     header_label.set_label(&month.format("%B %Y").to_string());
@@ -1019,12 +1063,16 @@ fn relabel_mini(anchor_month: &Rc<RefCell<NaiveDate>>, header_label: &gtk::Label
         let date = grid_start + chrono::Duration::days(i as i64);
         button.set_label(&date.day().to_string());
         button.remove_css_class("dim-label");
-        button.remove_css_class("suggested-action");
+        button.remove_css_class("mini-calendar-event-day");
+        button.remove_css_class("mini-calendar-today");
         if date.month() != month.month() {
             button.add_css_class("dim-label");
         }
+        if event_days.contains(&date) {
+            button.add_css_class("mini-calendar-event-day");
+        }
         if date == today {
-            button.add_css_class("suggested-action");
+            button.add_css_class("mini-calendar-today");
         }
     }
 }
@@ -1066,7 +1114,8 @@ pub fn calendar_account_status_text(connection_state: &CalendarConnectionState, 
 }
 
 /// Clears `container` and re-renders the "My calendars" checklist from the
-/// given per-account groups: one account header (dim caption-heading) per
+/// given per-account groups: one account header (dim caption, deliberately not
+/// the bold `caption-heading`) per
 /// group, its calendars as custom coloured toggle rows (name + hand-drawn
 /// radio indicator in the calendar's colour, active = currently checked), or
 /// a dim status line when the account has none yet. Each row's `toggled`
@@ -1099,11 +1148,7 @@ pub fn rebuild_calendar_checklist(
         container.append(&placeholder);
     }
     for group in groups {
-        let header = gtk::Label::builder()
-            .label(&group.display_name)
-            .css_classes(["dim-label", "caption-heading"])
-            .xalign(0.0)
-            .build();
+        let header = gtk::Label::builder().label(&group.display_name).css_classes(["dim-label", "caption", "calendar-account-header"]).xalign(0.0).build();
         container.append(&header);
         if group.calendars.is_empty() {
             if let Some(status) = &group.status {
@@ -1147,7 +1192,7 @@ fn calendar_toggle_row(name: &str, color: &str, active: bool, on_toggle: impl Fn
         let color = color.to_string();
         indicator.set_draw_func(move |_, cr, width, height| draw_calendar_indicator(cr, width, height, &color, checked.get()));
     }
-    let label = gtk::Label::builder().label(name).xalign(0.0).hexpand(true).build();
+    let label = gtk::Label::builder().label(name).xalign(0.0).hexpand(true).css_classes(["calendar-toggle-label"]).build();
     let content = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
     content.append(&indicator);
     content.append(&label);
@@ -1346,6 +1391,8 @@ mod tests {
         assert_eq!(format_event_time(&at(0, 5)), "12:05am");
         assert_eq!(format_event_time(&at(12, 15)), "12:15pm");
     }
+
+    #[test]
 
     #[test]
     fn calendar_color_css_parses_as_valid_gtk_css() {

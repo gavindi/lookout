@@ -1061,9 +1061,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mail_overview_day_list = mail_overview_day_list.clone();
         let toast_overlay = toast_overlay.clone();
         config_view.clear_cache_row.connect_activated(move |_| {
-            match lookout_mail::clear_all_caches() {
-                Ok(()) => toast_overlay.add_toast(adw::Toast::new("Cleared email and calendar caches")),
-                Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't clear caches: {e}"))),
+            match (lookout_mail::clear_all_caches(), lookout_dav::clear_all_caches()) {
+                (Ok(()), Ok(())) => toast_overlay.add_toast(adw::Toast::new("Cleared email and calendar caches")),
+                (Err(e), _) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't clear caches: {e}"))),
+                (_, Err(e)) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't clear caches: {e}"))),
             }
             let month = calendar_state.borrow().displayed_month;
             for handle in calendar_state.borrow_mut().accounts.values_mut() {
@@ -1342,6 +1343,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         toast_overlay,
         calendar_main,
         calendar_sidebar.calendar_list_box,
+        calendar_sidebar.mini_calendar,
         mail_overview_day,
         mail_overview_day_list,
         current_calendar_page,
@@ -1353,17 +1355,38 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 }
 
 /// Re-anchors the main calendar panel's already-redrawn views, keeps the
-/// sidebar's mini-calendar showing the anchor's month, records the displayed
-/// month, and asks every connected calendar account to resync it.
+/// sidebar's mini-calendar showing the anchor's month (with event-day
+/// markers), records the displayed month, and asks every connected calendar
+/// account to resync it.
 fn show_anchor(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &CalendarMain, mini_calendar: &calendar_view::MiniCalendar) {
     let day = calendar_view::anchor(calendar_main);
-    calendar_view::set_mini_month(mini_calendar, day);
     let month = first_of_month(day);
+    let event_days = calendar_event_days(calendar_state, month);
+    calendar_view::set_mini_month(mini_calendar, day, &event_days);
     let mut st = calendar_state.borrow_mut();
     st.displayed_month = month;
     for handle in st.accounts.values() {
         let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
     }
+}
+
+/// The local dates within `month` that have at least one occurrence from a
+/// currently-checked calendar, unioned across every account that has synced
+/// that month - drives the mini-calendar's bold event-day numerals.
+fn calendar_event_days(calendar_state: &Rc<RefCell<CalendarUiState>>, month: chrono::NaiveDate) -> HashSet<chrono::NaiveDate> {
+    let st = calendar_state.borrow();
+    let mut days = HashSet::new();
+    for handle in st.accounts.values() {
+        if handle.last_synced_month != Some(month) {
+            continue;
+        }
+        for occ in &handle.last_occurrences {
+            if st.checked_calendar_ids.contains(&occ.calendar_id) {
+                days.insert(occ.start.with_timezone(&chrono::Local).date_naive());
+            }
+        }
+    }
+    days
 }
 
 fn current_month_start() -> chrono::NaiveDate {
@@ -1588,6 +1611,7 @@ fn spawn_calendar_discovery(
     toast_overlay: adw::ToastOverlay,
     calendar_main: Rc<CalendarMain>,
     calendar_list_box: gtk::Box,
+    mini_calendar: calendar_view::MiniCalendar,
     mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
     mail_overview_day_list: gtk::Box,
     current_calendar_page: Rc<Cell<&'static str>>,
@@ -1622,6 +1646,7 @@ fn spawn_calendar_discovery(
                         calendar_state.clone(),
                         calendar_main.clone(),
                         calendar_list_box.clone(),
+                        mini_calendar.clone(),
                         mail_overview_day.clone(),
                         mail_overview_day_list.clone(),
                         toast_overlay.clone(),
@@ -1766,6 +1791,7 @@ fn connect_calendar_account(
     calendar_state: Rc<RefCell<CalendarUiState>>,
     calendar_main: Rc<CalendarMain>,
     calendar_list_box: gtk::Box,
+    mini_calendar: calendar_view::MiniCalendar,
     mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
     mail_overview_day_list: gtk::Box,
     toast_overlay: adw::ToastOverlay,
@@ -1844,6 +1870,14 @@ fn connect_calendar_account(
                     }
                     refresh_displayed_calendar_view(&calendar_state, &calendar_main);
                     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+                    // The sidebar mini-calendar's bold event-day numerals track
+                    // the currently-displayed month - refresh them when a fetch
+                    // for that month lands (navigating to an uncached month
+                    // marks its days bold the moment the sync completes).
+                    if calendar_view::mini_month(&mini_calendar) == month {
+                        let event_days = calendar_event_days(&calendar_state, month);
+                        calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+                    }
                 }
                 CalendarSessionEvent::Error(message) => {
                     toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));

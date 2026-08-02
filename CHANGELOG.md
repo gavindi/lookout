@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.13 (2026-08-03)
+
+### Fixed
+
+- **Calendar**: the mini calendar now only bolds the current day and days that actually have events, while the sidebar’s “My calendars” list keeps account names bold and calendar row labels at normal weight.
+
 ## 0.6.12 (2026-08-03)
 
 ### Changed

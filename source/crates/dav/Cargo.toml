@@ -15,11 +15,14 @@ tracing.workspace = true
 
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 quick-xml = "0.41"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true
 icalendar = { version = "0.17", features = ["chrono-tz"] }
 rrule = "0.14"
 iso8601 = "0.6"
 
 [dev-dependencies]
 anyhow = "1"
+uuid.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
