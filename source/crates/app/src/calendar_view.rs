@@ -5,6 +5,7 @@ use std::rc::Rc;
 use chrono::{Datelike, NaiveDate};
 use gtk::prelude::*;
 use lookout_core::{CalendarId, CalendarInfo, EventOccurrence};
+use lookout_dav::session::ConnectionState as CalendarConnectionState;
 
 /// Sunday-first week (matches Outlook's/the US default convention, per the
 /// reference screenshot this view is matched against) rather than
@@ -335,20 +336,80 @@ pub fn connect_day_selected(mc: &MiniCalendar, f: impl Fn(NaiveDate) + 'static) 
     mc.on_day_selected.borrow_mut().push(Rc::new(f));
 }
 
-/// Clears `container` and appends one `gtk::CheckButton` per calendar
-/// (label = display name, active = currently checked), wiring each one's
-/// `connect_toggled` to `on_toggle`. A plain rebuildable-list function
-/// rather than a stateful struct, matching this file's existing
-/// data-in/widget-state-out convention - callers own the actual
-/// checked/unchecked state and just ask for a fresh render of it.
-pub fn rebuild_calendar_checklist(container: &gtk::Box, calendars: &[CalendarInfo], checked: &HashSet<CalendarId>, on_toggle: impl Fn(CalendarId, bool) + 'static + Clone) {
+/// One calendar account in the sidebar's "My calendars" checklist: a header
+/// row showing the account's display name, its discovered calendars as the
+/// checkable rows below it, and an optional status line rendered while the
+/// account hasn't delivered any calendars yet (so a connected-but-silent
+/// account is never just blank).
+pub struct CalendarAccountGroup {
+    pub display_name: String,
+    pub calendars: Vec<CalendarInfo>,
+    /// Short status line for the sidebar, or `None` once the account has
+    /// calendars to list (see [`calendar_account_status_text`]).
+    pub status: Option<String>,
+}
+
+/// Renders a calendar account's latest session state as a short sidebar
+/// status line, shown under the account header until it has calendars to
+/// list. `None` once calendars exist - the checkboxes speak for themselves.
+pub fn calendar_account_status_text(connection_state: &CalendarConnectionState, has_calendars: bool) -> Option<String> {
+    if has_calendars {
+        return None;
+    }
+    let text = match connection_state {
+        CalendarConnectionState::Connecting => "Connecting…".to_string(),
+        CalendarConnectionState::Disconnected => "Disconnected".to_string(),
+        CalendarConnectionState::Idle | CalendarConnectionState::Busy => "No calendars found".to_string(),
+        CalendarConnectionState::Error { message, .. } => message.clone(),
+    };
+    Some(text)
+}
+
+/// Clears `container` and re-renders the "My calendars" checklist from the
+/// given per-account groups: one account header (dim caption-heading) per
+/// group, its calendars as checkbuttons (label = display name, active =
+/// currently checked), or a dim status line when the account has none yet.
+/// Each checkbutton's `connect_toggled` fires `on_toggle`. A plain
+/// rebuildable-list function rather than a stateful struct, matching this
+/// file's existing data-in/widget-state-out convention - callers own the
+/// actual checked/unchecked state and just ask for a fresh render of it.
+pub fn rebuild_calendar_checklist(container: &gtk::Box, groups: &[CalendarAccountGroup], checked: &HashSet<CalendarId>, on_toggle: impl Fn(CalendarId, bool) + 'static + Clone) {
     clear_children(container);
-    for calendar in calendars {
-        let check = gtk::CheckButton::builder().label(&calendar.display_name).active(checked.contains(&calendar.id)).build();
-        let id = calendar.id.clone();
-        let on_toggle = on_toggle.clone();
-        check.connect_toggled(move |btn| on_toggle(id.clone(), btn.is_active()));
-        container.append(&check);
+    if groups.is_empty() {
+        let placeholder = gtk::Label::builder()
+            .label("No calendars connected")
+            .css_classes(["dim-label", "caption"])
+            .xalign(0.0)
+            .build();
+        container.append(&placeholder);
+        return;
+    }
+    for group in groups {
+        let header = gtk::Label::builder()
+            .label(&group.display_name)
+            .css_classes(["dim-label", "caption-heading"])
+            .xalign(0.0)
+            .build();
+        container.append(&header);
+        if group.calendars.is_empty() {
+            if let Some(status) = &group.status {
+                let label = gtk::Label::builder()
+                    .label(status)
+                    .css_classes(["dim-label", "caption"])
+                    .xalign(0.0)
+                    .wrap(true)
+                    .build();
+                container.append(&label);
+            }
+            continue;
+        }
+        for calendar in &group.calendars {
+            let check = gtk::CheckButton::builder().label(&calendar.display_name).active(checked.contains(&calendar.id)).build();
+            let id = calendar.id.clone();
+            let on_toggle = on_toggle.clone();
+            check.connect_toggled(move |btn| on_toggle(id.clone(), btn.is_active()));
+            container.append(&check);
+        }
     }
 }
 
@@ -426,5 +487,46 @@ mod tests {
         // 2026-11-01 is itself a Sunday.
         let month = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
         assert_eq!(first_grid_day(month), month);
+    }
+
+    #[test]
+    fn account_status_is_none_once_calendars_exist() {
+        for state in [
+            CalendarConnectionState::Disconnected,
+            CalendarConnectionState::Connecting,
+            CalendarConnectionState::Idle,
+            CalendarConnectionState::Busy,
+            CalendarConnectionState::Error { message: "boom".to_string(), retryable: true },
+        ] {
+            assert_eq!(calendar_account_status_text(&state, true), None);
+        }
+    }
+
+    #[test]
+    fn account_status_maps_connecting_and_disconnected() {
+        assert_eq!(
+            calendar_account_status_text(&CalendarConnectionState::Connecting, false).as_deref(),
+            Some("Connecting…")
+        );
+        assert_eq!(
+            calendar_account_status_text(&CalendarConnectionState::Disconnected, false).as_deref(),
+            Some("Disconnected")
+        );
+    }
+
+    #[test]
+    fn account_status_says_no_calendars_when_idle_or_busy_with_none() {
+        for state in [CalendarConnectionState::Idle, CalendarConnectionState::Busy] {
+            assert_eq!(
+                calendar_account_status_text(&state, false).as_deref(),
+                Some("No calendars found")
+            );
+        }
+    }
+
+    #[test]
+    fn account_status_surfaces_the_session_error() {
+        let state = CalendarConnectionState::Error { message: "login failed".to_string(), retryable: true };
+        assert_eq!(calendar_account_status_text(&state, false).as_deref(), Some("login failed"));
     }
 }

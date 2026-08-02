@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.9 (2026-08-03)
+
+### Fixed
+
+- **Calendar**: the sidebar's "My calendars" checklist no longer stays blank while accounts are connected but haven't reported their calendars yet. It now renders one entry per connected calendar account (a dim account header), each with its discovered calendars as checkboxes - or, until they arrive, an inline status line: "Connecting…" while the CalDAV session is establishing, "No calendars found" if the account comes up with zero collections, or the session's error message when discovery fails. A "No calendars connected" placeholder shows when there are no calendar accounts at all, so the section always reflects reality instead of silently disappearing.
+
 ## 0.6.8 (2026-08-03)
 
 ### Added

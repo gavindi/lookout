@@ -67,6 +67,10 @@ struct CalendarAccountHandle {
     /// overview.
     uri: String,
     calendars: Vec<CalendarInfo>,
+    /// Latest reported session state, rendered in the sidebar's "My
+    /// calendars" checklist while the account hasn't delivered any
+    /// calendars yet (see `refresh_calendar_checklist`).
+    connection_state: CalConnectionState,
     /// Latest occurrences for whatever month this account last synced,
     /// keyed by month so a stale resync from one account can't clobber
     /// another account's occurrences for the currently-displayed month -
@@ -1687,7 +1691,18 @@ fn ensure_checked_calendars(checked: &mut HashSet<CalendarId>, calendars: &[Cale
 /// `on_toggle` closure flips membership in `checked_calendar_ids` and calls
 /// `refresh_displayed_calendar_view` to redraw the grid accordingly.
 fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_list_box: &gtk::Box, month_grid: &Rc<MonthGrid>) {
-    let all_calendars: Vec<CalendarInfo> = calendar_state.borrow().accounts.values().flat_map(|h| h.calendars.iter().cloned()).collect();
+    let mut groups: Vec<calendar_view::CalendarAccountGroup> = calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .map(|h| calendar_view::CalendarAccountGroup {
+            display_name: h.display_name.clone(),
+            calendars: h.calendars.clone(),
+            status: calendar_view::calendar_account_status_text(&h.connection_state, !h.calendars.is_empty()),
+        })
+        .collect();
+    groups.sort_by_key(|g| g.display_name.to_lowercase());
+    let all_calendars: Vec<CalendarInfo> = groups.iter().flat_map(|g| g.calendars.iter().cloned()).collect();
     {
         let mut st = calendar_state.borrow_mut();
         ensure_checked_calendars(&mut st.checked_calendar_ids, &all_calendars);
@@ -1708,7 +1723,7 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
             refresh_displayed_calendar_view(&calendar_state, &month_grid);
         }
     };
-    calendar_view::rebuild_calendar_checklist(calendar_list_box, &all_calendars, &checked, on_toggle);
+    calendar_view::rebuild_calendar_checklist(calendar_list_box, &groups, &checked, on_toggle);
     refresh_displayed_calendar_view(calendar_state, month_grid);
 }
 
@@ -1814,6 +1829,7 @@ fn connect_calendar_account(
             display_name,
             uri: config.base_url.clone(),
             calendars: Vec::new(),
+            connection_state: CalConnectionState::Connecting,
             last_occurrences: Vec::new(),
             last_synced_month: None,
         },
@@ -1824,10 +1840,15 @@ fn connect_calendar_account(
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
             match event {
-                CalendarSessionEvent::ConnectionStateChanged(CalConnectionState::Error { message, .. }) => {
-                    toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
+                CalendarSessionEvent::ConnectionStateChanged(state) => {
+                    if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                        handle.connection_state = state.clone();
+                    }
+                    if let CalConnectionState::Error { message, .. } = &state {
+                        toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
+                    }
+                    refresh_calendar_checklist(&calendar_state, &calendar_list_box, &month_grid);
                 }
-                CalendarSessionEvent::ConnectionStateChanged(_) => {}
                 CalendarSessionEvent::CalendarsUpdated(calendars) => {
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
                         handle.calendars = calendars.clone();
