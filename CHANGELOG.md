@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.8 (2026-08-03)
+
+### Added
+
+- **UI**: the Config view's "Advanced" section is now live (rather than a disabled placeholder) with a "Clear all caches" action that deletes the on-disk mail SQLite caches (`$XDG_CACHE_HOME/lookout/mail/`), drops the in-memory calendar occurrences, and asks every connected Mail/Calendar account to resync so the caches rebuild from the servers immediately instead of on next launch.
+
 ## 0.6.7 (2026-08-03)
 
 ### Added

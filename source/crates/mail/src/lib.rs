@@ -19,6 +19,7 @@ mod error;
 pub mod send;
 pub mod session;
 
+pub use cache::clear_all_caches;
 pub use config::{AccountConfig, Credential, EndpointConfig};
 pub use error::{Error, Result};
 pub use send::ComposedMessage;

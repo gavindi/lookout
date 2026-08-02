@@ -1089,6 +1089,36 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // --- "Clear all caches" (Config → Advanced): deletes the on-disk mail
+    // cache, drops the in-memory calendar occurrences, and asks every
+    // connected account to resync so the caches rebuild from the servers
+    // right away rather than on next launch ---
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let month_grid = month_grid.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        let toast_overlay = toast_overlay.clone();
+        config_view.clear_cache_row.connect_activated(move |_| {
+            match lookout_mail::clear_all_caches() {
+                Ok(()) => toast_overlay.add_toast(adw::Toast::new("Cleared email and calendar caches")),
+                Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't clear caches: {e}"))),
+            }
+            let month = calendar_state.borrow().displayed_month;
+            for handle in calendar_state.borrow_mut().accounts.values_mut() {
+                handle.last_occurrences.clear();
+                handle.last_synced_month = None;
+                let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
+            }
+            refresh_displayed_calendar_view(&calendar_state, &month_grid);
+            refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+            for handle in state.borrow().accounts.values() {
+                let _ = handle.cmd_tx.send_blocking(AccountCommand::Refresh);
+            }
+        });
+    }
+
     // --- Compose button -> new-message composer in the reading pane,
     // "From" = the account owning the currently-open mailbox (falling back
     // to any connected account if nothing's been selected yet) ---

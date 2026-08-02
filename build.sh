@@ -51,17 +51,5 @@ else
     BINARY_PATH="$WORKSPACE_DIR/target/debug/lookout"
 fi
 
-# --- Webmail (Next.js) frontend ---
-if [ -f "$WEBMAIL_DIR/package.json" ]; then
-    if ! command -v npm >/dev/null 2>&1; then
-        echo "error: npm not found. Install Node.js and re-run." >&2
-        exit 1
-    fi
-    cd "$WEBMAIL_DIR"
-    echo "Building webmail frontend..."
-    npm install
-    npm run build
-fi
-
 echo
 echo "Built binary: $BINARY_PATH"

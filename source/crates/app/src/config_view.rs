@@ -1,9 +1,9 @@
 //! Config view: a read-only overview of the Mail/Calendar accounts Lookout
 //! is connected to, plus disabled placeholder sections mirroring the Phase 5
-//! settings taxonomy (General/Appearance/Layout/Mail/Privacy/Apps/Advanced).
-//! Data-in/widget-out like `calendar_view.rs` and `folder_tree.rs`: the
-//! caller (window.rs) owns the session state and feeds plain display structs
-//! into `refresh`.
+//! settings taxonomy (General/Appearance/Layout/Mail/Privacy/Apps) and a
+//! live Advanced section with a cache-clear action. Data-in/widget-out like
+//! `calendar_view.rs` and `folder_tree.rs`: the caller (window.rs) owns the
+//! session state and feeds plain display structs into `refresh`.
 
 use std::cell::RefCell;
 
@@ -37,6 +37,10 @@ pub struct ConfigView {
     /// `activated` signal to the same GOA-settings invocation the empty-state
     /// page uses.
     pub add_account_row: adw::ActionRow,
+    /// "Clear all caches…" row, exposed so the caller can wire its
+    /// `activated` signal to the actual cache-clearing (the mail cache lives
+    /// in the `lookout-mail` crate, out of this module's reach).
+    pub clear_cache_row: adw::ActionRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     mail_rows: RefCell<Vec<adw::ActionRow>>,
@@ -45,8 +49,9 @@ pub struct ConfigView {
 
 /// Phase 5 roadmap's settings taxonomy, each rendered as a disabled
 /// placeholder group until that work lands - same honest-disabled convention
-/// as the menu bar's Home/View ribbon tabs.
-const PLACEHOLDER_SECTIONS: [&str; 7] = ["General", "Appearance", "Layout", "Mail", "Privacy", "Apps", "Advanced"];
+/// as the menu bar's Home/View ribbon tabs. "Advanced" is deliberately absent:
+/// it's a real, enabled group below (see `build`).
+const PLACEHOLDER_SECTIONS: [&str; 6] = ["General", "Appearance", "Layout", "Mail", "Privacy", "Apps"];
 
 pub fn build() -> ConfigView {
     let page = adw::PreferencesPage::new();
@@ -75,9 +80,19 @@ pub fn build() -> ConfigView {
         page.add(&group);
     }
 
+    let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
+    let clear_cache_row = adw::ActionRow::builder()
+        .title("Clear all caches")
+        .subtitle("Delete locally-stored email and calendar data")
+        .activatable(true)
+        .build();
+    advanced_group.add(&clear_cache_row);
+    page.add(&advanced_group);
+
     ConfigView {
         root: page.upcast(),
         add_account_row,
+        clear_cache_row,
         mail_group,
         calendar_group,
         mail_rows: RefCell::new(Vec::new()),

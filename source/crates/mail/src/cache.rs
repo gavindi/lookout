@@ -33,6 +33,20 @@ fn cache_dir() -> std::path::PathBuf {
     base.join("lookout").join("mail")
 }
 
+/// Removes every cached per-account SQLite database under
+/// `$XDG_CACHE_HOME/lookout/mail/` so the next session starts fresh from the
+/// server. Safe to call while account sessions are live: each session keeps
+/// its own already-open connection (POSIX unlink doesn't disturb an open fd),
+/// and the cache is only a fast-first-paint hint anyway - so only the on-disk
+/// files are dropped, and the in-memory/live data keeps working as-is.
+pub fn clear_all_caches() -> Result<()> {
+    let dir = cache_dir();
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
 /// GOA account ids are D-Bus object paths (e.g.
 /// `/org/gnome/OnlineAccounts/Accounts/account_1234`); sanitize into a bare
 /// filename.
