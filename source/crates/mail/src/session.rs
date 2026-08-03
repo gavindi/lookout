@@ -6,7 +6,7 @@ use lookout_core::mailbox::role_from_special_use;
 use lookout_core::{AccountId, EmailBody, EmailSummary, Mailbox, MailboxId, MailboxRole, Uid, UidValidity};
 
 use crate::auth::XOAuth2Authenticator;
-use crate::body::parse_body;
+use crate::body::{parse_body, preview_from_raw};
 use crate::config::{AccountConfig, Credential};
 use crate::connection::{connect_tls, ImapStream};
 use crate::envelope::summary_from_fetch;
@@ -25,6 +25,29 @@ const INITIAL_FETCH_LIMIT: u32 = 200;
 /// and dropping the `Handle`'s `StopSource` cancels the wait immediately,
 /// so a command arriving mid-IDLE is picked up right away.
 const IDLE_SLICE: Duration = Duration::from_secs(25 * 60);
+
+/// How many previewless messages one sync will fetch snippets for. The list
+/// only ever shows a screenful at a time, and `sync_mailbox` re-runs on
+/// every IDLE wake - so this bounds the *first* sync of a mailbox (one extra
+/// round trip, ~50 x 4 KB) while steady-state resyncs, where almost every
+/// uid already has a cached preview, fetch only the handful that are new.
+/// Anything past this keeps `preview: None` and renders a blank snippet line
+/// until a later sync reaches it.
+const PREVIEW_FETCH_LIMIT: usize = 50;
+
+/// How much of each message body to pull for its preview. `BODY.PEEK[]<0.N>`
+/// asks for a byte prefix, which needs no BODYSTRUCTURE round trip and no
+/// part-number guessing - `preview_from_raw` is built to tolerate the
+/// truncated MIME that comes back.
+///
+/// Generous because the *raw* prefix is what's bounded, not the readable
+/// text in it: a marketing HTML mail can spend its first several KB on
+/// headers and a `<style>` block, and quoted-printable/base64 inflates
+/// whatever text follows. Too small a window reliably yields an empty
+/// snippet for exactly the bulk mail whose subject lines say least. At the
+/// `PREVIEW_FETCH_LIMIT` above this is ~800 KB on a mailbox's first sync
+/// only - steady-state resyncs fetch just the newly-arrived uids.
+const PREVIEW_FETCH_BYTES: u32 = 16384;
 
 #[derive(Debug, Clone)]
 pub enum ConnectionState {
@@ -470,27 +493,108 @@ async fn sync_mailbox(
         }
     }
 
+    // Carry cached snippets forward before `replace_messages` wipes them.
+    // The envelope fetch above can't produce a preview, so without this every
+    // resync would blank the whole list and re-fetch every body.
+    if let Some(cache) = cache {
+        match cache.load_previews(mailbox_id) {
+            Ok(previews) if !previews.is_empty() => {
+                for msg in &mut messages {
+                    msg.preview = previews.get(&msg.uid).cloned();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("failed to load cached previews for {mailbox_id}: {e}"),
+        }
+    }
+
     tracing::debug!(account = %account_id, mailbox = %folder_path, count = messages.len(), "synced mailbox");
+    emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
+
+    // Phase two: fill in the snippets this sync is still missing, then emit a
+    // second update. Deliberately *after* the first emit - the list paints at
+    // the envelope fetch's latency, and previews arrive a beat later rather
+    // than holding up first paint.
+    if let Err(e) = fetch_previews(session, mailbox_id, uidvalidity, messages, events, cache).await {
+        // Never propagated: this function's caller tears the connection down
+        // on `Err`, and a malformed message or a server that dislikes partial
+        // fetches must not cost the user their IMAP session over a cosmetic
+        // snippet.
+        tracing::warn!("preview fetch for {mailbox_id} failed: {e}");
+    }
+    Ok(())
+}
+
+/// Caches `messages` and publishes them to the UI, minus anything currently
+/// snoozed. Snoozed messages are still fetched and cached normally - only
+/// what's emitted is filtered, so a snooze is purely a display concern.
+async fn emit_messages(
+    mailbox_id: &MailboxId,
+    uidvalidity: UidValidity,
+    messages: &[EmailSummary],
+    events: &async_channel::Sender<AccountEvent>,
+    cache: Option<&crate::cache::Cache>,
+) {
+    let mut messages = messages.to_vec();
     if let Some(cache) = cache {
         if let Err(e) = cache.replace_messages(mailbox_id, uidvalidity, &messages) {
             tracing::warn!("failed to cache messages for {mailbox_id}: {e}");
         }
-    }
-
-    // Snoozed messages are still fetched/cached normally above - only what's
-    // emitted to the UI is filtered, so a snooze is purely a display concern.
-    if let Some(cache) = cache {
         if let Ok(snoozed) = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()) {
             messages.retain(|m| !snoozed.contains(&m.uid));
         }
     }
-
     let _ = events
         .send(AccountEvent::MessagesUpdated {
             mailbox: mailbox_id.clone(),
             messages,
         })
         .await;
+}
+
+/// Fetches list-row snippets for the newest `PREVIEW_FETCH_LIMIT` messages in
+/// `messages` that don't have one yet, and re-publishes the enriched set.
+///
+/// A no-op (no round trip, no second event) when every message already has a
+/// preview, which is the steady state once a mailbox has been synced once.
+async fn fetch_previews(
+    session: &mut Session<ImapStream>,
+    mailbox_id: &MailboxId,
+    uidvalidity: UidValidity,
+    mut messages: Vec<EmailSummary>,
+    events: &async_channel::Sender<AccountEvent>,
+    cache: Option<&crate::cache::Cache>,
+) -> Result<()> {
+    let mut wanted: Vec<Uid> = messages.iter().filter(|m| m.preview.is_none()).map(|m| m.uid).collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    // Newest first: the top of the list is what the user is looking at.
+    wanted.sort_by_key(|uid| std::cmp::Reverse(uid.0));
+    wanted.truncate(PREVIEW_FETCH_LIMIT);
+
+    let uid_set = wanted.iter().map(|u| u.0.to_string()).collect::<Vec<_>>().join(",");
+    let query = format!("(UID BODY.PEEK[]<0.{PREVIEW_FETCH_BYTES}>)");
+    let fetches: Vec<_> = session.uid_fetch(&uid_set, &query).await?.try_collect().await?;
+
+    let mut previews = std::collections::HashMap::new();
+    for fetch in &fetches {
+        let (Some(uid), Some(raw)) = (fetch.uid, fetch.body()) else { continue };
+        if let Some(preview) = preview_from_raw(raw) {
+            previews.insert(Uid(uid), preview);
+        }
+    }
+    if previews.is_empty() {
+        return Ok(());
+    }
+
+    for msg in &mut messages {
+        if msg.preview.is_none() {
+            msg.preview = previews.get(&msg.uid).cloned();
+        }
+    }
+    tracing::debug!(mailbox = %mailbox_id, count = previews.len(), "fetched message previews");
+    emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
     Ok(())
 }
 

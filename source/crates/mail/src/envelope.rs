@@ -155,7 +155,7 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
         keywords,
         size: fetch.size.unwrap_or(0),
         has_attachment: false, // Requires BODYSTRUCTURE traversal - deferred to Phase 2.
-        preview: None,         // Requires a body fetch - deferred to the message viewer step.
+        preview: None,         // Requires a body fetch; filled in by `sync_mailbox`'s second phase.
     })
 }
 

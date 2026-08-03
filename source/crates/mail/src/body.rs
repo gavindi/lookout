@@ -46,6 +46,65 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
     })
 }
 
+/// The longest snippet kept for a list row.
+///
+/// The row shows one ellipsized line and lets Pango cut it at whatever the
+/// pane's current width allows - so this cap exists only to bound what gets
+/// cached and serialized, and is set well past what even a maximised
+/// full-width message pane can display. Trimming closer to the visible
+/// length would leave a wide pane's line ending early in whitespace instead
+/// of running to the edge.
+const PREVIEW_MAX_CHARS: usize = 500;
+
+/// Extracts the one-line snippet the message list shows under each row, from
+/// the *leading bytes* of a raw message (`BODY.PEEK[]<0.N>`).
+///
+/// Tolerates truncated input by design: the caller deliberately fetches only
+/// a prefix, so the closing MIME boundary is usually missing. `mail_parser`
+/// is lenient enough to still surface the first text part, and a message it
+/// can't make sense of just yields `None` and renders a blank preview line.
+pub fn preview_from_raw(raw: &[u8]) -> Option<String> {
+    let message = MessageParser::default().parse(raw)?;
+    let text = message.body_text(0).map(|c| c.into_owned()).or_else(|| message.body_html(0).map(|c| strip_html(&c)))?;
+    let preview = normalize_preview(&text);
+    (!preview.is_empty()).then_some(preview)
+}
+
+/// Crude tag-stripper for the HTML fallback - enough to turn markup into
+/// readable words, not a sanitizer. The reading pane renders real HTML
+/// through WebKit; this is only ever a list row's worth of plain text.
+fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Collapses a body's leading text into a single display line.
+fn normalize_preview(text: &str) -> String {
+    // Zero-width characters first: bulk senders pad the top of a message
+    // with runs of them as "preheader" spacing, and left in place they'd
+    // make the preview render as an apparently empty line.
+    let cleaned: String = text.chars().filter(|c| !matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}')).collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    match collapsed.char_indices().nth(PREVIEW_MAX_CHARS) {
+        // Slice on a char boundary - a byte-index truncation would panic on
+        // any multi-byte character straddling the cut.
+        Some((byte_index, _)) => collapsed[..byte_index].trim_end().to_string(),
+        None => collapsed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +155,52 @@ mod tests {
     fn malformed_html_fixture_does_not_panic() {
         let body = parse_body(Uid(0), &fixture("html-malformed.eml")).expect("parses");
         assert!(body.html_body.is_some());
+    }
+
+    #[test]
+    fn preview_reads_a_single_line_from_a_plain_text_message() {
+        let preview = preview_from_raw(&fixture("plain-text.eml")).expect("has a preview");
+        assert!(!preview.is_empty());
+        assert!(!preview.contains('\n'));
+        assert!(preview.chars().count() <= PREVIEW_MAX_CHARS);
+    }
+
+    #[test]
+    fn preview_falls_back_to_stripped_html() {
+        let preview = preview_from_raw(&fixture("html-inline-css.eml")).expect("has a preview");
+        assert!(!preview.contains('<'));
+        assert!(!preview.contains("</"));
+    }
+
+    /// The fetch is deliberately a byte-prefix, so the closing MIME boundary
+    /// is normally missing. That must degrade to a shorter (or absent)
+    /// preview, never a panic.
+    #[test]
+    fn preview_survives_a_truncated_fetch() {
+        let full = fixture("html-inline-css.eml");
+        for cut in [64, 256, 1024, 4096] {
+            let truncated = &full[..cut.min(full.len())];
+            let _ = preview_from_raw(truncated);
+        }
+    }
+
+    #[test]
+    fn preview_collapses_whitespace_and_drops_preheader_padding() {
+        let padded = "\u{200b}\u{200b}\u{feff}  Hello   there\n\n\tworld  ";
+        assert_eq!(normalize_preview(padded), "Hello there world");
+    }
+
+    #[test]
+    fn preview_truncates_on_a_character_boundary() {
+        // Multi-byte characters straddling the cut would panic a byte slice.
+        let long = "é".repeat(PREVIEW_MAX_CHARS + 50);
+        let preview = normalize_preview(&long);
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS);
+    }
+
+    #[test]
+    fn empty_body_yields_no_preview() {
+        assert_eq!(normalize_preview("   \u{200b} \n "), "");
+        assert!(preview_from_raw(b"").is_none());
     }
 }

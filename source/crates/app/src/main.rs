@@ -9,6 +9,7 @@ mod goa_calendar_credentials;
 mod goa_credentials;
 mod last_view;
 mod message_header;
+mod message_list;
 mod window;
 mod worker;
 

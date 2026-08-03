@@ -109,15 +109,7 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
     let mut folder_roots_by_account: HashMap<AccountId, Vec<Rc<FolderNode>>> = HashMap::new();
     let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
     root_store.append(&glib::BoxedAnyObject::new(TreeItem::Unified));
-    let favorite_nodes: Vec<Rc<FolderNode>> = favorites
-        .into_iter()
-        .map(|mailbox| {
-            Rc::new(FolderNode {
-                mailbox,
-                children: Vec::new(),
-            })
-        })
-        .collect();
+    let favorite_nodes: Vec<Rc<FolderNode>> = favorites.into_iter().map(|mailbox| Rc::new(FolderNode { mailbox, children: Vec::new() })).collect();
     if !favorite_nodes.is_empty() {
         root_store.append(&glib::BoxedAnyObject::new(TreeItem::Favorites));
     }

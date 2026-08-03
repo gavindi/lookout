@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -155,6 +155,30 @@ impl Cache {
         Ok(messages)
     }
 
+    /// The list-row snippets already cached for `mailbox_id`, keyed by uid.
+    ///
+    /// Previews cost a body fetch, but `sync_mailbox` re-fetches its whole
+    /// envelope window on every IDLE wake and `replace_messages` wipes the
+    /// mailbox's rows each time. Reading them back before that wipe is what
+    /// makes a preview stick: without it every resync would blank every
+    /// snippet and then re-fetch the lot.
+    pub fn load_previews(&self, mailbox_id: &MailboxId) -> Result<HashMap<Uid, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1")?;
+        let rows = stmt.query_map([&mailbox_id.0], |row| row.get::<_, String>(0))?;
+        let mut previews = HashMap::new();
+        for row in rows {
+            // Rows cached before previews existed simply deserialize with
+            // `preview: None` and get backfilled by the next sync.
+            if let Ok(msg) = serde_json::from_str::<EmailSummary>(&row?) {
+                if let Some(preview) = msg.preview {
+                    previews.insert(msg.uid, preview);
+                }
+            }
+        }
+        Ok(previews)
+    }
+
     /// Records that `uid` (in `mailbox_id`) should be hidden from
     /// `MessagesUpdated` until `until` - purely client-side state, IMAP has
     /// no native snooze concept. `INSERT OR REPLACE` so re-snoozing an
@@ -253,6 +277,51 @@ mod tests {
         // rather than erroring or duplicating the row.
         cache.snooze_message(&mailbox_id, Uid(1), now - chrono::Duration::hours(1)).unwrap();
         assert!(cache.active_snoozed_uids(&mailbox_id, now).unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn sample_summary(mailbox_id: &MailboxId, uid: u32, preview: Option<&str>) -> EmailSummary {
+        EmailSummary {
+            uid: Uid(uid),
+            mailbox: mailbox_id.clone(),
+            message_id: None,
+            in_reply_to: None,
+            references: Vec::new(),
+            thread_key: lookout_core::ThreadKey(String::new()),
+            subject: Some(format!("subject {uid}")),
+            from: Vec::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: Utc::now(),
+            flags: Default::default(),
+            keywords: Default::default(),
+            size: 0,
+            has_attachment: false,
+            preview: preview.map(|p| p.to_string()),
+        }
+    }
+
+    /// The stickiness `sync_mailbox` depends on: a preview written once is
+    /// readable back after the wholesale `replace_messages` wipe, so a resync
+    /// doesn't blank every snippet and re-fetch them all.
+    #[test]
+    fn round_trips_previews_and_omits_messages_without_one() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let messages = vec![
+            sample_summary(&mailbox_id, 1, Some("Truffle Security Co. says it scanned...")),
+            sample_summary(&mailbox_id, 2, None),
+        ];
+        cache.replace_messages(&mailbox_id, UidValidity(1), &messages).unwrap();
+
+        let previews = cache.load_previews(&mailbox_id).unwrap();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews.get(&Uid(1)).map(String::as_str), Some("Truffle Security Co. says it scanned..."));
+        assert!(!previews.contains_key(&Uid(2)));
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

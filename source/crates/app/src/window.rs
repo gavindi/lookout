@@ -18,6 +18,7 @@ use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::last_view::{self, LastSelection};
+use crate::message_list::{format_row_date, MessageItem, MessageListModel, SelectionKind, SortKey};
 use crate::worker::Worker;
 
 /// Per-account state the UI needs once an `AccountSession` actor is running:
@@ -48,44 +49,30 @@ enum MailView {
     UnifiedInbox,
 }
 
-/// Which field the message list is ordered by. Paired with
-/// `UiState::sort_descending`, this is the whole of the list's ordering
-/// policy - see `sort_messages`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    Date,
-    Sender,
-    Subject,
-}
-
-impl SortKey {
-    /// The sort dropdown's button label for this key.
-    fn label(self) -> &'static str {
-        match self {
-            SortKey::Date => "By Date",
-            SortKey::Sender => "By Sender",
-            SortKey::Subject => "By Subject",
-        }
-    }
-
-    /// The key's name in the `sort-key` `gio::SimpleAction`'s state, which is
-    /// what the sort menu's radio items are bound to.
-    fn action_state(self) -> &'static str {
-        match self {
-            SortKey::Date => "date",
-            SortKey::Sender => "sender",
-            SortKey::Subject => "subject",
-        }
-    }
-
-    fn from_action_state(name: &str) -> Option<Self> {
-        match name {
-            "date" => Some(SortKey::Date),
-            "sender" => Some(SortKey::Sender),
-            "subject" => Some(SortKey::Subject),
-            _ => None,
-        }
-    }
+/// Every widget one message-list row owns, stashed on the `Gtk.ListItem` at
+/// setup so `bind` can address them by name instead of walking the widget
+/// tree with a chain of `first_child()`/`last_child()` downcasts - which the
+/// two-branch row below is far too deep for.
+///
+/// Stored under a single `set_data` key: the `set_data`/`data` pair is
+/// `unsafe` and reads back whatever type you name, so one struct under one
+/// key keeps the two ends impossible to mismatch.
+#[derive(Clone)]
+struct MessageRowWidgets {
+    header_box: gtk::Box,
+    expander: gtk::TreeExpander,
+    header_label: gtk::Label,
+    message_box: gtk::Box,
+    accent: gtk::Box,
+    avatar: gtk::Label,
+    sender_label: gtk::Label,
+    subject_label: gtk::Label,
+    date_label: gtk::Label,
+    preview_label: gtk::Label,
+    action_box: gtk::Box,
+    /// The message this row currently shows. Set by `bind`, read by the
+    /// quick-action handlers when they fire.
+    bound: Rc<RefCell<Option<EmailSummary>>>,
 }
 
 /// Mutable UI-thread state the various signal handlers close over. Plain
@@ -311,6 +298,44 @@ fn install_paned_css() {
             min-width: 24px;
             min-height: 24px;
             padding: 2px;
+        }
+        /* Zeroing the row's own padding is what lets the unread accent bar
+           sit flush against the pane's leading edge, and flattens the
+           selection highlight's inset to a full-bleed band. */
+        .message-list > row {
+            padding: 0;
+        }
+        .message-row {
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .message-accent-bar {
+            background-color: transparent;
+        }
+        .message-accent-bar.unread {
+            background-color: #4d9dff;
+        }
+        .message-sender-unread,
+        .message-subject-unread,
+        .message-date-unread {
+            color: #4d9dff;
+            font-weight: bold;
+        }
+        .message-sender-read,
+        .message-date-read {
+            color: #a9b7c6;
+        }
+        .message-subject-read {
+            color: #c1815c;
+        }
+        .message-preview {
+            color: #a9b7c6;
+            opacity: 0.75;
+            font-size: 0.95em;
+        }
+        .message-section-header {
+            background-color: rgba(0, 0, 0, 0.55);
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -438,8 +463,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     folder_card.set_margin_end(0);
 
     // --- Message list ---
-    let message_store = gio::ListStore::new::<glib::BoxedAnyObject>();
-    let message_selection = gtk::SingleSelection::new(Some(message_store.clone()));
+    let message_list = MessageListModel::build();
     let last_selection = last_view::load();
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
@@ -461,33 +485,91 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }));
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
+    let state_clone2 = state.clone();
     let reading_stack_clone = reading_stack.clone();
     let message_factory = gtk::SignalListItemFactory::new();
     message_factory.connect_setup(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-        // Main vertical box for sender, date, subject
-        let vbox = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
-            .margin_top(6)
-            .margin_bottom(6)
+        // A row is either a date-section header or a message. Both branches
+        // are built once here and toggled with `set_visible` rather than
+        // being separate factories or a `Gtk.Stack` - a Stack would size
+        // every row to the taller of the two, giving headers message height.
+        let header_label = gtk::Label::builder().xalign(0.0).css_classes(["heading"]).build();
+        let expander = gtk::TreeExpander::new();
+        expander.set_child(Some(&header_label));
+        let header_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .margin_top(4)
+            .margin_bottom(4)
             .margin_start(10)
             .margin_end(10)
             .build();
-        // Top row: sender and date
-        let hbox = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-        let sender_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
-        let date_label = gtk::Label::builder().xalign(1.0).css_classes(["dim-label", "caption"]).build();
-        hbox.append(&sender_label);
-        hbox.append(&date_label);
-        // Subject label
-        let subject_label = gtk::Label::builder()
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["dim-label"])
+        header_box.add_css_class("message-section-header");
+        header_box.append(&expander);
+
+        // The unread accent bar: full row height, flush against the pane's
+        // leading edge (which is why `.message-list > row` zeroes its
+        // padding), colored only when the message is unread.
+        let accent = gtk::Box::builder().width_request(3).vexpand(true).build();
+        accent.add_css_class("message-accent-bar");
+        let avatar = gtk::Label::builder()
+            .css_classes(["avatar-circle"])
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .margin_start(8)
+            .margin_end(8)
             .build();
-        vbox.append(&hbox);
-        vbox.append(&subject_label);
+
+        // Fixed-width sender, expanding subject: that's what lines every
+        // row's subject up in one column, rather than letting it start
+        // wherever the sender happens to end.
+        let sender_label = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let subject_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let date_label = gtk::Label::builder().xalign(1.0).build();
+        let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+        top_row.append(&sender_label);
+        top_row.append(&subject_label);
+        top_row.append(&date_label);
+
+        // Spans the full row and ellipsizes, so the snippet shows as much of
+        // the body as the pane's current width fits and re-flows when the
+        // pane is resized - the cached text is deliberately longer than any
+        // width can display (see `PREVIEW_MAX_CHARS`).
+        //
+        // Always present, even when there's no preview text: an empty label
+        // still reserves its line, so read and unread rows stay the same
+        // height and the list doesn't ripple as previews arrive.
+        let preview_label = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .css_classes(["message-preview"])
+            .build();
+
+        let text_column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .hexpand(true)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_end(10)
+            .build();
+        text_column.append(&top_row);
+        text_column.append(&preview_label);
+
+        let message_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
+        message_box.add_css_class("message-row");
+        message_box.append(&accent);
+        message_box.append(&avatar);
+        message_box.append(&text_column);
+
+        let row_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+        row_box.append(&header_box);
+        row_box.append(&message_box);
+
         // Action box (initially hidden)
         let action_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -515,140 +597,234 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         action_box.set_visible(false);
         // Overlay to overlay actions on top of content
         let overlay = gtk::Overlay::new();
-        overlay.set_child(Some(&vbox));
+        overlay.set_child(Some(&row_box));
         overlay.add_overlay(&action_box);
-        unsafe {
-            list_item.set_data("action-box", action_box.clone());
-            list_item.set_data("archive-button", archive_btn.clone());
-            list_item.set_data("delete-button", delete_btn.clone());
-            list_item.set_data("reply-button", reply_btn.clone());
-        }
-        list_item.set_child(Some(&overlay));
-    });
-    message_factory.connect_bind(move |_, list_item| {
-        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-        let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else { return };
-        let summary = boxed.borrow::<EmailSummary>().clone();
-        let overlay = list_item.child().and_downcast::<gtk::Overlay>().expect("overlay");
-        let action_box = unsafe { list_item.data::<gtk::Box>("action-box").expect("action box").as_ref().clone() };
-        let vbox = overlay.child().and_downcast::<gtk::Box>().expect("vbox");
-        let hbox = vbox.first_child().and_downcast::<gtk::Box>().expect("hbox");
-        let sender_label = hbox.first_child().and_downcast::<gtk::Label>().expect("sender label");
-        let date_label = hbox.last_child().and_downcast::<gtk::Label>().expect("date label");
-        let subject_label = vbox.last_child().and_downcast::<gtk::Label>().expect("subject label");
-        let from = summary.from.first().map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
-        // In the unified "All Inboxes" view, stamp each row with its owning
-        // account so mail from mixed mailboxes stays readable.
-        let account_label = {
-            let st = state_clone.borrow();
-            if matches!(st.mail_view, MailView::UnifiedInbox) {
-                mailbox_account_id(&summary.mailbox)
-                    .and_then(|id| st.accounts.get(&id))
-                    .map(|h| if h.display_name.is_empty() { h.email.clone() } else { h.display_name.clone() })
-            } else {
-                None
-            }
-        };
-        sender_label.set_label(&match account_label {
-            Some(acc) => format!("{from} · {acc}"),
-            None => from,
-        });
-        sender_label.set_css_classes(if summary.is_unread() { &["heading"] } else { &[] });
-        let now = chrono::Utc::now();
-        let recent = now.signed_duration_since(summary.date) < chrono::Duration::hours(24);
-        let date = glib::DateTime::from_unix_local(summary.date.timestamp())
-            .ok()
-            .and_then(|dt| dt.format(if recent { "%X" } else { "%x" }).ok())
-            .unwrap_or_default();
-        date_label.set_label(&date);
-        subject_label.set_label(summary.subject.as_deref().unwrap_or("(no subject)"));
-        let action_box_for_hover = action_box.clone();
-        let hover_controller = gtk::EventControllerMotion::new();
-        hover_controller.connect_enter(move |_, _, _| {
-            action_box_for_hover.set_visible(true);
-        });
-        let action_box_for_leave = action_box.clone();
-        hover_controller.connect_leave(move |_| {
-            action_box_for_leave.set_visible(false);
-        });
-        overlay.add_controller(hover_controller);
-        // Button click handlers
-        let state_clone = state_clone.clone();
-        let reading_stack_clone = reading_stack_clone.clone();
-        let mailbox_for_archive = summary.mailbox.clone();
-        let uid_for_archive = summary.uid;
-        let mailbox_for_delete = summary.mailbox.clone();
-        let uid_for_delete = summary.uid;
-        let mailbox_for_reply = summary.mailbox.clone();
-        let uid_for_reply = summary.uid;
-        let summary_for_reply = summary.clone();
-        // Archive button: first child of action_box
+
+        // Which message this row is currently showing. Written by `bind`,
+        // read by the handlers below *at click time* - which is what lets
+        // every signal be connected once here instead of on every rebind.
+        // The old per-bind connections accumulated on recycled rows (nothing
+        // ever disconnected them), so a scrolled list eventually fired one
+        // click at several messages at once.
+        let bound: Rc<RefCell<Option<EmailSummary>>> = Rc::new(RefCell::new(None));
+
         {
-            let archive_btn = unsafe { list_item.data::<gtk::Button>("archive-button").expect("archive button").as_ref().clone() };
-            let state_for_archive = state_clone.clone();
+            let action_box = action_box.clone();
+            let message_box = message_box.clone();
+            let hover_controller = gtk::EventControllerMotion::new();
+            let action_box_for_leave = action_box.clone();
+            hover_controller.connect_enter(move |_, _, _| {
+                // Section headers have no quick actions.
+                if message_box.is_visible() {
+                    action_box.set_visible(true);
+                }
+            });
+            hover_controller.connect_leave(move |_| {
+                action_box_for_leave.set_visible(false);
+            });
+            overlay.add_controller(hover_controller);
+        }
+
+        {
+            let state = state_clone.clone();
+            let bound = bound.clone();
             archive_btn.connect_clicked(move |_| {
-                let Some(account_id) = mailbox_account_id(&mailbox_for_archive) else {
+                let Some((mailbox, uid)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid)) else {
                     return;
                 };
-                let state = state_for_archive.borrow();
+                let Some(account_id) = mailbox_account_id(&mailbox) else { return };
+                let state = state.borrow();
                 if let Some(handle) = state.accounts.get(&account_id) {
                     let _ = handle.cmd_tx.send_blocking(AccountCommand::MoveMessage {
-                        mailbox: mailbox_for_archive.clone(),
-                        uid: uid_for_archive,
+                        mailbox,
+                        uid,
                         role: MailboxRole::Archive,
                     });
                 }
             });
         }
-        // Delete button: second child of action_box
         {
-            let delete_btn = unsafe { list_item.data::<gtk::Button>("delete-button").expect("delete button").as_ref().clone() };
-            let state_for_delete = state_clone.clone();
+            let state = state_clone.clone();
+            let bound = bound.clone();
             delete_btn.connect_clicked(move |_| {
-                let Some(account_id) = mailbox_account_id(&mailbox_for_delete) else {
+                let Some((mailbox, uid)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid)) else {
                     return;
                 };
-                let state = state_for_delete.borrow();
+                let Some(account_id) = mailbox_account_id(&mailbox) else { return };
+                let state = state.borrow();
                 if let Some(handle) = state.accounts.get(&account_id) {
                     let _ = handle.cmd_tx.send_blocking(AccountCommand::MoveMessage {
-                        mailbox: mailbox_for_delete.clone(),
-                        uid: uid_for_delete,
+                        mailbox,
+                        uid,
                         role: MailboxRole::Trash,
                     });
                 }
             });
         }
-        // Reply button: third child of action_box
         {
-            let reply_btn = unsafe { list_item.data::<gtk::Button>("reply-button").expect("reply button").as_ref().clone() };
-            let state_for_reply = state_clone.clone();
-            let reading_stack_for_reply = reading_stack_clone.clone();
+            let state = state_clone.clone();
+            let reading_stack = reading_stack_clone.clone();
+            let bound = bound.clone();
             reply_btn.connect_clicked(move |_| {
-                let state = state_for_reply.borrow();
-                // Check if we have the body for this message
-                if let Some((body_mailbox, body_uid, body)) = state.current_body.as_ref() {
-                    if *body_mailbox == mailbox_for_reply && *body_uid == uid_for_reply {
-                        // We have the body, can reply
-                        let Some(account_id) = mailbox_account_id(&mailbox_for_reply) else {
-                            return;
-                        };
-                        if let Some(handle) = state.accounts.get(&account_id) {
-                            let from_email = handle.email.clone();
-                            let prefill = crate::compose::build_reply_prefill(&summary_for_reply, body, &from_email, crate::compose::ReplyMode::Reply);
-                            // Show composer in reading pane
-                            let on_done = Rc::new(|| {});
-                            let composer = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done);
-                            reading_stack_for_reply.add_named(&composer, Some("compose"));
-                            reading_stack_for_reply.set_visible_child_name("compose");
-                        }
-                    }
+                let Some(summary) = bound.borrow().clone() else { return };
+                let state = state.borrow();
+                // Only possible once the body has arrived - the composer
+                // needs it to quote. Silently a no-op until then.
+                let Some((body_mailbox, body_uid, body)) = state.current_body.as_ref() else { return };
+                if *body_mailbox != summary.mailbox || *body_uid != summary.uid {
+                    return;
                 }
+                let Some(account_id) = mailbox_account_id(&summary.mailbox) else { return };
+                let Some(handle) = state.accounts.get(&account_id) else { return };
+                let from_email = handle.email.clone();
+                let prefill = crate::compose::build_reply_prefill(&summary, body, &from_email, crate::compose::ReplyMode::Reply);
+                let on_done = Rc::new(|| {});
+                let composer = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done);
+                reading_stack.add_named(&composer, Some("compose"));
+                reading_stack.set_visible_child_name("compose");
             });
         }
+
+        unsafe {
+            list_item.set_data(
+                "row-widgets",
+                MessageRowWidgets {
+                    header_box,
+                    expander,
+                    header_label,
+                    message_box,
+                    accent,
+                    avatar,
+                    sender_label,
+                    subject_label,
+                    date_label,
+                    preview_label,
+                    action_box,
+                    bound,
+                },
+            );
+        }
+        list_item.set_child(Some(&overlay));
     });
-    message_factory.connect_unbind(move |_, _| {});
-    let message_list_view = gtk::ListView::new(Some(message_selection.clone()), Some(message_factory));
-    let message_scroller = gtk::ScrolledWindow::builder().child(&message_list_view).vexpand(true).build();
+    message_factory.connect_bind(move |_, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(row) = list_item.item().and_downcast::<gtk::TreeListRow>() else { return };
+        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
+        let widgets = unsafe { list_item.data::<MessageRowWidgets>("row-widgets").expect("row widgets").as_ref().clone() };
+        let item = boxed.borrow::<MessageItem>();
+        match &*item {
+            MessageItem::Section(section) => {
+                widgets.header_box.set_visible(true);
+                widgets.message_box.set_visible(false);
+                widgets.action_box.set_visible(false);
+                // What actually draws the disclosure chevron and drives
+                // expand/collapse. The expansion *state* is applied in
+                // `MessageListModel::repopulate`, not here - bind only runs
+                // for rows in the viewport, so doing it here would leave
+                // scrolled-off sections unexpanded and the list's row count
+                // wrong.
+                widgets.expander.set_list_row(Some(&row));
+                widgets.header_label.set_label(&section.label);
+                // Headers aren't a selection target for the mouse. This does
+                // not stop `GtkSingleSelection`'s autoselect from landing on
+                // one, which is why the selection handler also treats a
+                // header as a no-op.
+                list_item.set_selectable(false);
+                list_item.set_activatable(false);
+                *widgets.bound.borrow_mut() = None;
+            }
+            MessageItem::Message(summary) => {
+                widgets.header_box.set_visible(false);
+                widgets.message_box.set_visible(true);
+                // Must be set explicitly, not just left alone: these are
+                // `ListItem` properties that survive widget recycling, so a
+                // row that last rendered a header would stay unclickable.
+                list_item.set_selectable(true);
+                list_item.set_activatable(true);
+
+                let sender = summary.from.first();
+                match sender {
+                    Some(address) => {
+                        widgets.avatar.set_label(&crate::message_header::initials(address.name.as_deref(), &address.address));
+                        for class in crate::message_header::AVATAR_COLOR_CLASSES {
+                            widgets.avatar.remove_css_class(class);
+                        }
+                        widgets.avatar.add_css_class(crate::message_header::avatar_color_class(&address.address));
+                    }
+                    None => widgets.avatar.set_label("?"),
+                }
+
+                let from = sender.map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
+                // In the unified "All Inboxes" view, stamp each row with its
+                // owning account so mail from mixed mailboxes stays readable.
+                let account_label = {
+                    let st = state_clone2.borrow();
+                    if matches!(st.mail_view, MailView::UnifiedInbox) {
+                        mailbox_account_id(&summary.mailbox).and_then(|id| st.accounts.get(&id)).map(|h| {
+                            if h.display_name.is_empty() {
+                                h.email.clone()
+                            } else {
+                                h.display_name.clone()
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                };
+                widgets.sender_label.set_label(&match account_label {
+                    Some(acc) => format!("{from} · {acc}"),
+                    None => from,
+                });
+                widgets.subject_label.set_label(summary.subject.as_deref().unwrap_or("(no subject)"));
+                widgets.date_label.set_label(&format_row_date(summary.date, chrono::Utc::now()));
+                widgets.preview_label.set_label(summary.preview.as_deref().unwrap_or(""));
+
+                let unread = summary.is_unread();
+                widgets
+                    .sender_label
+                    .set_css_classes(if unread { &["message-sender-unread"] } else { &["message-sender-read"] });
+                widgets
+                    .subject_label
+                    .set_css_classes(if unread { &["message-subject-unread"] } else { &["message-subject-read"] });
+                widgets.date_label.set_css_classes(if unread {
+                    &["caption", "message-date-unread"]
+                } else {
+                    &["caption", "message-date-read"]
+                });
+                if unread {
+                    widgets.accent.add_css_class("unread");
+                } else {
+                    widgets.accent.remove_css_class("unread");
+                }
+
+                *widgets.bound.borrow_mut() = Some((**summary).clone());
+            }
+        }
+    });
+    message_factory.connect_unbind(move |_, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(widgets) = (unsafe { list_item.data::<MessageRowWidgets>("row-widgets") }) else {
+            return;
+        };
+        let widgets = unsafe { widgets.as_ref() };
+        *widgets.bound.borrow_mut() = None;
+        widgets.action_box.set_visible(false);
+        // Don't keep a recycled row pinned to a `TreeListRow` it no longer
+        // renders.
+        widgets.expander.set_list_row(None);
+    });
+    let message_list_view = gtk::ListView::new(Some(message_list.selection.clone()), Some(message_factory));
+    message_list_view.add_css_class("message-list");
+    // Never scrolls sideways: every row's text ellipsizes to the pane's
+    // width instead. Without pinning this, the preview line's natural width
+    // request - it holds far more text than fits, by design, so the snippet
+    // runs to the pane's edge at any width - would let the list report a
+    // huge natural width and grow a horizontal scrollbar.
+    let message_scroller = gtk::ScrolledWindow::builder()
+        .child(&message_list_view)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
     // Header row atop the message list: what's being shown on the left (the
     // folder's name over its account, plus the favorite star), and the list's
     // own controls on the right - sync, filter, sort direction, sort key.
@@ -755,19 +931,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // --- Sort direction toggle -> flip the order and re-sort in place. The
-    // re-sort reads the visible list back out of the store rather than
+    // re-sort reads the visible list back out of the model rather than
     // re-fetching, so it costs nothing and keeps the selection (see
-    // `snapshot_message_store`). ---
+    // `MessageListModel::displayed_messages`). ---
     {
         let state = state.clone();
-        let message_store = message_store.clone();
-        let message_selection = message_selection.clone();
+        let message_list = message_list.clone();
         sort_direction_button.connect_toggled(move |button| {
             let descending = button.is_active();
             button.set_icon_name(sort_direction_icon(descending));
             button.set_tooltip_text(Some(if descending { "Newest first" } else { "Oldest first" }));
             state.borrow_mut().sort_descending = descending;
-            resort_message_list(&state, &message_store, &message_selection);
+            resort_message_list(&state, &message_list);
         });
     }
 
@@ -778,8 +953,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let sort_key_action = gio::SimpleAction::new_stateful("sort-key", Some(glib::VariantTy::STRING), &SortKey::Date.action_state().to_variant());
     {
         let state = state.clone();
-        let message_store = message_store.clone();
-        let message_selection = message_selection.clone();
+        let message_list = message_list.clone();
         let sort_key_button = sort_key_button.clone();
         sort_key_action.connect_activate(move |action, parameter| {
             let Some(key) = parameter.and_then(|p| p.str()).and_then(SortKey::from_action_state) else {
@@ -788,7 +962,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             action.set_state(&key.action_state().to_variant());
             sort_key_button.set_label(key.label());
             state.borrow_mut().sort_key = key;
-            resort_message_list(&state, &message_store, &message_selection);
+            resort_message_list(&state, &message_list);
         });
     }
 
@@ -1584,16 +1758,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let reading_stack = reading_stack.clone();
-        let message_selection = message_selection.clone();
+        let message_list = message_list.clone();
         compose_button.connect_clicked(move |_| {
             let st = state.borrow();
-            let account_id = message_selection
-                .selected_item()
-                .and_downcast::<glib::BoxedAnyObject>()
-                .and_then(|b| {
-                    let summary = b.borrow::<EmailSummary>();
-                    mailbox_account_id(&summary.mailbox)
-                })
+            // A section header is selected exactly like "nothing selected"
+            // here: fall through to the open mailbox's account.
+            let account_id = message_list
+                .selected_summary()
+                .and_then(|summary| mailbox_account_id(&summary.mailbox))
                 .or_else(|| st.current_account.clone())
                 .or_else(|| st.accounts.keys().next().cloned());
             let Some(handle) = account_id.and_then(|id| st.accounts.get(&id)) else { return };
@@ -1617,22 +1789,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         (&reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
         (&message_header.reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
     ] {
-        let message_selection = message_selection.clone();
+        let message_list = message_list.clone();
         let state = state.clone();
         let reading_stack = reading_stack.clone();
         button.connect_clicked(move |_| {
-            if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_selection, &state) {
+            if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
                 show_composer_in_reading_pane(&reading_stack, title, from_email, cmd_tx, prefill);
             }
         });
     }
     for button in [&forward_button, &message_header.forward_button] {
-        let message_selection = message_selection.clone();
+        let message_list = message_list.clone();
         let state = state.clone();
         let reading_stack = reading_stack.clone();
         button.connect_clicked(move |_| {
-            if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_selection, &state) {
+            if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 show_composer_in_reading_pane(&reading_stack, "Forward", from_email, cmd_tx, prefill);
             }
@@ -1693,8 +1865,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // changes funnel through. ---
     {
         let state = state.clone();
-        let message_store = message_store.clone();
-        let message_selection = message_selection.clone();
+        let message_list = message_list.clone();
         let list_header = list_header.clone();
         folder_selection.connect_selected_item_notify(move |sel| {
             let Some(row) = sel.selected_item().and_downcast::<gtk::TreeListRow>() else { return };
@@ -1703,7 +1874,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             match &*tree_item {
                 TreeItem::Unified => {
                     drop(tree_item);
-                    enter_unified_inbox(&state, &message_store, &message_selection);
+                    enter_unified_inbox(&state, &message_list);
                     refresh_list_header(&state, &list_header);
                 }
                 TreeItem::Folder(node) | TreeItem::Favorite(node) => {
@@ -1723,18 +1894,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let reading_stack = reading_stack.clone();
         let message_header = message_header.clone();
-        message_selection.connect_selected_item_notify(move |sel| {
-            let Some(boxed) = sel.selected_item().and_downcast::<glib::BoxedAnyObject>() else {
-                let mut st = state.borrow_mut();
-                st.pending_body_request = None;
-                st.pending_html_reveal = false;
-                st.pending_header = None;
-                st.rendered_message = None;
-                drop(st);
-                reading_stack.set_visible_child_name("empty");
-                return;
+        let message_list_for_selection = message_list.clone();
+        message_list.selection.connect_selected_item_notify(move |_| {
+            let summary = match message_list_for_selection.selection_kind() {
+                SelectionKind::Message(summary) => *summary,
+                // A date section header. Deliberately a no-op rather than a
+                // clear: `GtkSingleSelection` autoselects row 0 after every
+                // rebuild, and in a grouped list row 0 *is* a header - so
+                // clearing here would yank the reading pane to "empty" and
+                // reset `rendered_message` on every cache replay and live
+                // sync, which is precisely the startup flicker bug the
+                // `already_shown` guard below exists to prevent. Collapsing
+                // the section holding the selected message lands here too,
+                // and keeping the message on screen is the right answer
+                // there as well.
+                SelectionKind::Section => return,
+                SelectionKind::Empty => {
+                    let mut st = state.borrow_mut();
+                    st.pending_body_request = None;
+                    st.pending_html_reveal = false;
+                    st.pending_header = None;
+                    st.rendered_message = None;
+                    drop(st);
+                    reading_stack.set_visible_child_name("empty");
+                    return;
+                }
             };
-            let summary = boxed.borrow::<EmailSummary>();
             let uid = summary.uid;
             let mailbox = summary.mailbox.clone();
             // Re-selecting the message that's already on the reading pane -
@@ -1755,9 +1940,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // to the next email while the previous message is still fading
             // out. `render_body` applies it once the new body is about to be
             // shown (the pane is on "empty" by then, so it can't flash).
-            let pending_header = summary.clone();
-            drop(summary);
-            state.borrow_mut().pending_header = Some(pending_header);
+            state.borrow_mut().pending_header = Some(summary);
 
             let body_is_cached = {
                 let st = state.borrow();
@@ -1807,19 +1990,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         (&archive_button, MailboxRole::Archive),
         (&report_button, MailboxRole::Junk),
     ] {
-        let message_selection = message_selection.clone();
+        let message_list = message_list.clone();
         let state = state.clone();
         button.connect_clicked(move |_| {
-            if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_selection, &state) {
+            if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_list, &state) {
                 let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage { mailbox, uid, role });
             }
         });
     }
     {
-        let message_selection = message_selection.clone();
+        let message_list = message_list.clone();
         let state = state.clone();
         snooze_button.connect_clicked(move |_| {
-            if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_selection, &state) {
+            if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_list, &state) {
                 let tomorrow_9am = chrono::Local::now()
                     .date_naive()
                     .succ_opt()
@@ -1905,8 +2088,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         root_stack.clone(),
         toast_overlay.clone(),
         folder_selection,
-        message_selection,
-        message_store,
+        message_list,
         message_header,
         reading_stack,
         current_mail_page,
@@ -1997,8 +2179,7 @@ fn spawn_account_discovery(
     root_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
     folder_selection: gtk::SingleSelection,
-    message_selection: gtk::SingleSelection,
-    message_store: gio::ListStore,
+    message_list: MessageListModel,
     message_header: crate::message_header::MessageHeader,
     reading_stack: gtk::Stack,
     current_mail_page: Rc<Cell<&'static str>>,
@@ -2038,8 +2219,7 @@ fn spawn_account_discovery(
                         worker.clone(),
                         state.clone(),
                         folder_selection.clone(),
-                        message_selection.clone(),
-                        message_store.clone(),
+                        message_list.clone(),
                         message_header.clone(),
                         reading_stack.clone(),
                         toast_overlay.clone(),
@@ -2066,8 +2246,7 @@ fn connect_account(
     worker: Rc<Worker>,
     state: Rc<RefCell<UiState>>,
     folder_selection: gtk::SingleSelection,
-    message_selection: gtk::SingleSelection,
-    message_store: gio::ListStore,
+    message_list: MessageListModel,
     message_header: crate::message_header::MessageHeader,
     reading_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
@@ -2216,7 +2395,7 @@ fn connect_account(
                             None => merge_unified_snapshots(&state.borrow().unified_snapshots),
                         };
                         let (key, descending) = current_sort(&state);
-                        repopulate_message_list(&message_store, &message_selection, all, key, descending);
+                        message_list.repopulate(all, key, descending);
                     }
                 }
                 AccountEvent::BodyFetched { mailbox, uid, body } => {
@@ -2731,7 +2910,7 @@ fn resync_current_view(state: &Rc<RefCell<UiState>>) {
 /// Enters the "All Inboxes" view: asks every connected account that has an
 /// Inbox to sync it, and immediately repopulates the list from whatever the
 /// per-mailbox snapshots already hold.
-fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_store: &gio::ListStore, message_selection: &gtk::SingleSelection) {
+fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel) {
     let inboxes = account_inboxes(state);
     {
         let mut st = state.borrow_mut();
@@ -2749,7 +2928,7 @@ fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_store: &gio::ListSt
     }
     let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
     let (key, descending) = current_sort(state);
-    repopulate_message_list(message_store, message_selection, all, key, descending);
+    message_list.repopulate(all, key, descending);
 }
 
 /// Merges the unified view's per-mailbox snapshots into a single newest-first
@@ -2777,164 +2956,32 @@ fn current_sort(state: &Rc<RefCell<UiState>>) -> (SortKey, bool) {
     (st.sort_key, st.sort_descending)
 }
 
-/// Orders the message list by the header's chosen key. Every key tie-breaks on
-/// date, newest first, so the order is total - two messages with the same
-/// sender or subject can't shuffle between otherwise-identical rebuilds and
-/// defeat `store_matches`.
-fn sort_messages(messages: &mut [EmailSummary], key: SortKey, descending: bool) {
-    fn sender_of(m: &EmailSummary) -> String {
-        m.from.first().map(|a| a.display_label().to_lowercase()).unwrap_or_default()
-    }
-    match key {
-        SortKey::Date => messages.sort_by(|a, b| b.date.cmp(&a.date)),
-        SortKey::Sender => messages.sort_by(|a, b| sender_of(a).cmp(&sender_of(b)).then_with(|| b.date.cmp(&a.date))),
-        SortKey::Subject => {
-            let subject_of = |m: &EmailSummary| m.subject.clone().unwrap_or_default().to_lowercase();
-            messages.sort_by(|a, b| subject_of(a).cmp(&subject_of(b)).then_with(|| b.date.cmp(&a.date)));
-        }
-    }
-    // Ascending is the descending order reversed rather than a second set of
-    // comparators - which also flips the date tie-break, so "oldest first"
-    // really is the exact mirror of what was on screen.
-    if !descending {
-        messages.reverse();
-    }
-}
-
-/// Every summary currently in the message store, in display order. Lets a sort
-/// change re-order the visible list without re-fetching: single-mailbox views
-/// keep no snapshot in `UiState` (only the unified view does), so the store
-/// itself is the only copy of what's on screen.
-fn snapshot_message_store(message_store: &gio::ListStore) -> Vec<EmailSummary> {
-    (0..message_store.n_items())
-        .filter_map(|i| message_store.item(i).and_downcast::<glib::BoxedAnyObject>())
-        .map(|boxed| boxed.borrow::<EmailSummary>().clone())
-        .collect()
-}
-
 /// Re-orders the visible list under the current sort. The rebuild goes through
-/// `repopulate_message_list`, so the selected message stays selected and the
-/// reading pane doesn't re-render (and re-crossfade) the email it's already
-/// showing.
-fn resort_message_list(state: &Rc<RefCell<UiState>>, message_store: &gio::ListStore, message_selection: &gtk::SingleSelection) {
-    let messages = snapshot_message_store(message_store);
+/// `MessageListModel::repopulate`, so the selected message stays selected and
+/// the reading pane doesn't re-render (and re-crossfade) the email it's
+/// already showing.
+fn resort_message_list(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel) {
+    let messages = message_list.displayed_messages();
     if messages.is_empty() {
         return;
     }
     let (key, descending) = current_sort(state);
-    repopulate_message_list(message_store, message_selection, messages, key, descending);
+    message_list.repopulate(messages, key, descending);
 }
 
-/// Replaces the message store's contents with `messages` in the list's current
-/// sort order, preserving the current highlight where possible - the
-/// selection-restore dance the old inline `MessagesUpdated` rebuild did,
-/// shared by the single-mailbox and unified paths.
-///
-/// A no-op when the incoming list is identical to what's already displayed:
-/// the startup burst - each account's cache replay plus its live sync plus
-/// the app's on-demand syncs - delivers the same envelope set several times
-/// in a row, and rebuilding for each one would re-select the first row
-/// (`GtkSingleSelection` autoselects), refiring the selection handler and
-/// crossfading the same email every time.
-///
-/// The store is rebuilt with a single `splice` rather than `remove_all` +
-/// `append`: the two-step version transiently empties the model, which
-/// flips `GtkSingleSelection` to "nothing selected" and fires the selection
-/// handler's empty branch - yanking the reading pane to "empty" and clearing
-/// `rendered_message` so the re-selection of the same email no longer
-/// matches the `already_shown` guard and re-renders (crossfading) it. A
-/// splice is one `items-changed` signal in which the selection position
-/// survives, so the guard keeps working across rebuilds.
-fn repopulate_message_list(
-    message_store: &gio::ListStore,
-    message_selection: &gtk::SingleSelection,
-    mut messages: Vec<EmailSummary>,
-    sort_key: SortKey,
-    sort_descending: bool,
-) {
-    // Sorting here, before the identity check, makes this the list's canonical
-    // order no matter which event produced the rebuild - so the check compares
-    // like with like, and a sort change is itself detected as a real change.
-    sort_messages(&mut messages, sort_key, sort_descending);
-    if store_matches(message_store, &messages) {
-        return;
-    }
-
-    // Remember the current highlight before the rebuild wipes the store: the
-    // splice drops the old row objects, which would otherwise lose the user's
-    // selection every time a delete/archive/snooze lands a `MessagesUpdated`.
-    let previous_selection = message_selection.selected_item().and_downcast::<glib::BoxedAnyObject>().map(|b| {
-        let summary = b.borrow::<EmailSummary>();
-        (summary.mailbox.clone(), summary.uid)
-    });
-    let previous_index = message_selection.selected();
-
-    let additions: Vec<glib::Object> = messages.into_iter().map(|m| glib::BoxedAnyObject::new(m).upcast()).collect();
-    message_store.splice(0, message_store.n_items(), &additions);
-
-    // Restore the highlight: the same message if it's still present (the
-    // rebuild wasn't a delete of the selected row), otherwise the message
-    // that now occupies its old spot.
-    let restored = previous_selection.map(|(mailbox, uid)| {
-        let mut restored = None;
-        for i in 0..message_store.n_items() {
-            let Some(boxed) = message_store.item(i).and_downcast::<glib::BoxedAnyObject>() else {
-                continue;
-            };
-            let summary = boxed.borrow::<EmailSummary>();
-            if summary.mailbox == mailbox && summary.uid == uid {
-                restored = Some(i);
-                break;
-            }
-        }
-        restored
-    });
-    if let Some(index) = restored.flatten() {
-        message_selection.set_selected(index);
-    } else if previous_index != u32::MAX && message_store.n_items() > 0 {
-        message_selection.set_selected(previous_index.min(message_store.n_items() - 1));
-    }
-}
-
-/// A compact fingerprint of the fields one message-list row displays
-/// (sender, unread emphasis, date, subject), keyed to keep the row distinct
-/// from any other. Used by `store_matches` to detect "nothing changed".
-fn message_row_key(m: &EmailSummary) -> (MailboxId, Uid, bool, chrono::DateTime<chrono::Utc>, Option<String>, String) {
-    let from = m.from.first().map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
-    (m.mailbox.clone(), m.uid, m.is_unread(), m.date, m.subject.clone(), from)
-}
-
-/// True when the message store already holds exactly `messages`, in the same
-/// order and with the same displayed content - so `repopulate_message_list`
-/// can skip the rebuild (and the selection churn it causes) as a no-op.
-fn store_matches(message_store: &gio::ListStore, messages: &[EmailSummary]) -> bool {
-    if message_store.n_items() as usize != messages.len() {
-        return false;
-    }
-    messages.iter().enumerate().all(|(i, m)| {
-        message_store
-            .item(i as u32)
-            .and_downcast::<glib::BoxedAnyObject>()
-            .map(|b| message_row_key(&b.borrow::<EmailSummary>()) == message_row_key(m))
-            .unwrap_or(false)
-    })
-}
-
-/// Resolves the currently-selected message in `message_selection` to its
+/// Resolves the currently-selected message in `message_list` to its
 /// mailbox/uid and its owning account's command channel, for the
 /// Delete/Archive/Report/Snooze button handlers - mirrors the lookup already
 /// done inline by the `FetchBody`-on-selection handler above. The account is
 /// derived from the message's own `MailboxId` rather than the view's
 /// `current_account`, so the unified "All Inboxes" list routes each message
-/// to the right account. Returns `None` if nothing is selected or its
-/// account has since disconnected, in which case the calling handler is a
-/// silent no-op.
-fn selected_message_command_target(message_selection: &gtk::SingleSelection, state: &Rc<RefCell<UiState>>) -> Option<(MailboxId, Uid, async_channel::Sender<AccountCommand>)> {
-    let boxed = message_selection.selected_item().and_downcast::<glib::BoxedAnyObject>()?;
-    let summary = boxed.borrow::<EmailSummary>();
+/// to the right account. Returns `None` if nothing is selected, a section
+/// header is selected, or the account has since disconnected, in which case
+/// the calling handler is a silent no-op.
+fn selected_message_command_target(message_list: &MessageListModel, state: &Rc<RefCell<UiState>>) -> Option<(MailboxId, Uid, async_channel::Sender<AccountCommand>)> {
+    let summary = message_list.selected_summary()?;
     let uid = summary.uid;
     let mailbox = summary.mailbox.clone();
-    drop(summary);
 
     let account_id = mailbox_account_id(&mailbox)?;
     let st = state.borrow();
@@ -2944,18 +2991,18 @@ fn selected_message_command_target(message_selection: &gtk::SingleSelection, sta
 
 /// Resolves the currently-selected message plus its already-fetched body,
 /// for the Reply/Reply-All/Forward button handlers. Returns `None` if
-/// nothing is selected, its account has disconnected, or the cached
+/// nothing is selected, a section header is selected, its account has
+/// disconnected, or the cached
 /// `current_body` doesn't match the selection (its body hasn't arrived yet,
 /// or is stale from a previous selection) - the calling handler is then a
 /// silent no-op, same convention as `selected_message_command_target`. The
 /// "From" identity is the message's owning account, so replies composed from
 /// the unified view go out from the right address.
 fn selected_message_reply_context(
-    message_selection: &gtk::SingleSelection,
+    message_list: &MessageListModel,
     state: &Rc<RefCell<UiState>>,
 ) -> Option<(EmailSummary, EmailBody, String, async_channel::Sender<AccountCommand>)> {
-    let boxed = message_selection.selected_item().and_downcast::<glib::BoxedAnyObject>()?;
-    let summary = boxed.borrow::<EmailSummary>().clone();
+    let summary = message_list.selected_summary()?;
 
     let st = state.borrow();
     let (body_mailbox, body_uid, body) = st.current_body.as_ref()?;
@@ -3217,42 +3264,6 @@ mod tests {
     }
 
     #[test]
-    fn identical_message_lists_are_skipped_but_any_displayed_change_is_not() {
-        let a = vec![summary(Uid(2), "a:INBOX", 2024, 1, 10, 10), summary(Uid(1), "a:INBOX", 2024, 1, 10, 9)];
-        // The startup burst: the same envelope set replayed by cache + live
-        // sync + on-demand sync. Display-identical, so no repopulate needed.
-        assert!(same_message_list(&a, &a));
-
-        // A message arriving (extra row) is a real change.
-        let with_new = vec![
-            summary(Uid(3), "a:INBOX", 2024, 1, 10, 11),
-            summary(Uid(2), "a:INBOX", 2024, 1, 10, 10),
-            summary(Uid(1), "a:INBOX", 2024, 1, 10, 9),
-        ];
-        assert!(!same_message_list(&a, &with_new));
-
-        // A re-order of the same messages is a real change.
-        let reordered = vec![summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), summary(Uid(2), "a:INBOX", 2024, 1, 10, 10)];
-        assert!(!same_message_list(&a, &reordered));
-
-        // An unread->read flip is a real change (the row's emphasis changes).
-        let mut read_flip = a.clone();
-        read_flip[0].flags = {
-            use std::collections::BTreeSet;
-            let mut flags = BTreeSet::new();
-            flags.insert(lookout_core::SystemFlagBit::Seen);
-            flags
-        };
-        assert!(!same_message_list(&a, &read_flip));
-    }
-
-    /// True when two ordered message lists are display-identical - the pure
-    /// counterpart of `store_matches`, testable without a widget tree.
-    fn same_message_list(a: &[EmailSummary], b: &[EmailSummary]) -> bool {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| message_row_key(x) == message_row_key(y))
-    }
-
-    #[test]
     fn request_mailbox_sync_dedupes_until_answered_or_reconnected() {
         let account_id = AccountId("acc".into());
         let inbox = MailboxId("acc:INBOX".into());
@@ -3303,61 +3314,6 @@ mod tests {
         state.borrow_mut().syncing.insert(inbox.clone());
         state.borrow_mut().syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
         assert!(!state.borrow().syncing.contains(&inbox));
-    }
-
-    #[test]
-    fn sort_messages_orders_by_the_chosen_key_and_mirrors_exactly_when_ascending() {
-        // Same date on the two "b"/"c" rows so the sender/subject keys are what
-        // actually decides their order, not the date tie-break.
-        let mut messages = vec![
-            with_sender_and_subject(summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), "Carol", "Zebra"),
-            with_sender_and_subject(summary(Uid(2), "a:INBOX", 2024, 1, 10, 11), "alice", "middle"),
-            with_sender_and_subject(summary(Uid(3), "a:INBOX", 2024, 1, 10, 10), "Bob", "Apple"),
-        ];
-
-        sort_messages(&mut messages, SortKey::Date, true);
-        assert_eq!(uids(&messages), vec![2, 3, 1]);
-
-        // Sender and subject are case-insensitive - "alice" must lead "Bob".
-        sort_messages(&mut messages, SortKey::Sender, true);
-        assert_eq!(uids(&messages), vec![2, 3, 1]);
-        sort_messages(&mut messages, SortKey::Subject, true);
-        assert_eq!(uids(&messages), vec![3, 2, 1]);
-
-        // Ascending is the exact mirror of descending, tie-break included.
-        sort_messages(&mut messages, SortKey::Sender, false);
-        assert_eq!(uids(&messages), vec![1, 3, 2]);
-        sort_messages(&mut messages, SortKey::Date, false);
-        assert_eq!(uids(&messages), vec![1, 3, 2]);
-    }
-
-    #[test]
-    fn sort_messages_tie_breaks_equal_keys_by_date_so_rebuilds_are_stable() {
-        // Two messages the sender key can't tell apart: only the date decides,
-        // and it must decide the same way every time - otherwise identical
-        // rebuilds could shuffle and defeat `store_matches`.
-        let older = with_sender_and_subject(summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), "Dana", "one");
-        let newer = with_sender_and_subject(summary(Uid(2), "a:INBOX", 2024, 1, 10, 12), "Dana", "two");
-
-        let mut forwards = vec![older.clone(), newer.clone()];
-        let mut backwards = vec![newer, older];
-        sort_messages(&mut forwards, SortKey::Sender, true);
-        sort_messages(&mut backwards, SortKey::Sender, true);
-        assert_eq!(uids(&forwards), vec![2, 1]);
-        assert_eq!(uids(&forwards), uids(&backwards));
-    }
-
-    fn uids(messages: &[EmailSummary]) -> Vec<u32> {
-        messages.iter().map(|m| m.uid.0).collect()
-    }
-
-    fn with_sender_and_subject(mut summary: EmailSummary, sender: &str, subject: &str) -> EmailSummary {
-        summary.from = vec![lookout_core::EmailAddress {
-            name: Some(sender.to_string()),
-            address: format!("{}@example.com", sender.to_lowercase()),
-        }];
-        summary.subject = Some(subject.to_string());
-        summary
     }
 
     fn summary(uid: Uid, mailbox: &str, year: i32, month: u32, day: u32, hour: u32) -> EmailSummary {

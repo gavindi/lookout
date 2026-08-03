@@ -1,7 +1,7 @@
 use gtk::prelude::*;
 use lookout_core::EmailSummary;
 
-const AVATAR_COLOR_CLASSES: [&str; 6] = ["avatar-color-0", "avatar-color-1", "avatar-color-2", "avatar-color-3", "avatar-color-4", "avatar-color-5"];
+pub const AVATAR_COLOR_CLASSES: [&str; 6] = ["avatar-color-0", "avatar-color-1", "avatar-color-2", "avatar-color-3", "avatar-color-4", "avatar-color-5"];
 
 /// Reading-pane header shown above the message body: subject, sender
 /// avatar/name/email, recipients, date, and a second set of Reply/Reply-All/
@@ -120,7 +120,7 @@ impl MessageHeader {
 
 /// First+last initials for a multi-word name ("Microsoft Security" -> "MS"),
 /// else the first two characters of whatever single word/address is given.
-fn initials(name: Option<&str>, address: &str) -> String {
+pub fn initials(name: Option<&str>, address: &str) -> String {
     let source = name.filter(|n| !n.trim().is_empty()).unwrap_or(address);
     let mut words = source.split_whitespace();
     match (words.next(), words.next()) {
@@ -138,7 +138,7 @@ fn initials(name: Option<&str>, address: &str) -> String {
 /// sender's address), so the same sender always gets the same color - a
 /// fixed palette of CSS classes registered once (see `install_paned_css`)
 /// rather than per-instance inline styling.
-fn avatar_color_class(seed: &str) -> &'static str {
+pub fn avatar_color_class(seed: &str) -> &'static str {
     let hash = seed.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     AVATAR_COLOR_CLASSES[(hash as usize) % AVATAR_COLOR_CLASSES.len()]
 }
