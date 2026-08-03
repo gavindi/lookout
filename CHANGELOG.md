@@ -1,10 +1,22 @@
 # Changelog
 
+## 0.6.17 (2026-08-04)
+
+### Changed
+
+- **Build**: `build.sh` now defaults to an optimized release build (`cargo build --workspace --release`, binary at `target/release/lookout`) instead of the unoptimized debug build. `--debug` opts back into the fast unoptimized build for day-to-day iteration, and the old `--release` flag still works unchanged.
+
+### Fixed
+
+- **Mail**: Delete/Archive/Report now recognize the Trash/Archive/Junk folders on providers that don't use the default names. The role heuristic (`guess_role_from_name`) only knew "Trash"/"Deleted Items"/"Deleted Messages" for Trash, so a provider whose trash is named "Bin" (Gmail en-GB, `[Gmail]/Bin`), "Recycle Bin", or just "Deleted" got role `Custom` and Delete failed with "No Trash folder found". Added those spellings (plus "Deleted" and "Recycle Bin") and covered each provider spelling with a regression test.
+- **Mail**: deleting a message no longer drops the selection in the message list. The list is rebuilt from scratch on every `MessagesUpdated` event, and `remove_all` was resetting the `SingleSelection` to "nothing selected" - so after deleting (or archiving/snoozing) via the hover/toolbar button, the highlight was lost. The handler now snapshots the selected message (mailbox + UID) before the rebuild and restores it afterward: the same message if it's still present, otherwise the message that now occupies the deleted row's old position.
+
 ## 0.6.16 (2026-08-04)
 
 ### Added
 
 - **UI**: the menu bar's Home/View buttons are now real ribbon tabs instead of disabled placeholders. Home and View are mutually-exclusive toggle tabs (the same `set_group` trick as the nav rail) that switch the ribbon content row below: Home shows the existing command toolbar (New/Reply/Reply All/Forward/Delete/Archive/Report/Snooze), and View is a new "Layout" group with three pane-visibility toggles - Folder pane, Reading pane, and the Mail screen's Calendar-overview pane - each hiding/showing its pane live via `set_visible` on the `Gtk.Paned` child. The tabs are Mail-only: they grey out while a Calendar or Config module is active (those keep their own non-tabbed command toolbars), and returning to Mail restores the last-active tab. The active tab is styled with a pressed-state background, and the overview-pane toggle is respected on module round-trips (hiding it in View stays hidden after visiting Calendar/Config). The layout toggles are session-only until Phase 5's GSettings landing.
+- **UI**: the folder view now defaults to the first account's Inbox on startup - the first `FoldersUpdated` event auto-selects the first account's Inbox in the folder tree (accounts sort by label, folders Inbox-first), routing through the same `selected-item` handler as a real click, which sets the current mailbox and issues the `SyncMailbox` that fills the message list. Guarded by `current_mailbox` being unset, so later folder resyncs never yank the user's selection away.
 
 ## 0.6.14 (2026-08-03)
 

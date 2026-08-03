@@ -1443,6 +1443,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         root_stack.clone(),
         toast_overlay.clone(),
         folder_selection,
+        message_selection,
         message_store,
         reading_stack,
         current_mail_page,
@@ -1532,6 +1533,7 @@ fn spawn_account_discovery(
     root_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
     folder_selection: gtk::SingleSelection,
+    message_selection: gtk::SingleSelection,
     message_store: gio::ListStore,
     reading_stack: gtk::Stack,
     current_mail_page: Rc<Cell<&'static str>>,
@@ -1570,6 +1572,7 @@ fn spawn_account_discovery(
                         worker.clone(),
                         state.clone(),
                         folder_selection.clone(),
+                        message_selection.clone(),
                         message_store.clone(),
                         reading_stack.clone(),
                         toast_overlay.clone(),
@@ -1595,6 +1598,7 @@ fn connect_account(
     worker: Rc<Worker>,
     state: Rc<RefCell<UiState>>,
     folder_selection: gtk::SingleSelection,
+    message_selection: gtk::SingleSelection,
     message_store: gio::ListStore,
     reading_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
@@ -1672,7 +1676,7 @@ fn connect_account(
                     if let Some(handle) = state.borrow_mut().accounts.get_mut(&account_id) {
                         handle.folders = folders;
                     }
-                    rebuild_folder_tree(&state.borrow(), &folder_selection);
+                    rebuild_folder_tree(&state, &folder_selection);
                 }
                 AccountEvent::MessagesUpdated { mailbox, messages } => {
                     let should_display = {
@@ -1691,12 +1695,42 @@ fn connect_account(
                         st.current_mailbox.as_ref() == Some(&mailbox)
                     };
                     if should_display {
+                        // Remember the current highlight before the rebuild
+                        // wipes the store: `remove_all` reverts the
+                        // SingleSelection to "nothing selected", which would
+                        // otherwise drop the user's selection every time a
+                        // delete/archive/snooze lands this event.
+                        let previous_selection = message_selection.selected_item().and_downcast::<glib::BoxedAnyObject>().map(|b| {
+                            let summary = b.borrow::<EmailSummary>();
+                            (summary.mailbox.clone(), summary.uid)
+                        });
+                        let previous_index = message_selection.selected();
+
                         message_store.remove_all();
                         // Newest first for the reading list.
                         let mut messages = messages;
                         messages.sort_by_key(|m| std::cmp::Reverse(m.date));
                         for m in messages {
                             message_store.append(&glib::BoxedAnyObject::new(m));
+                        }
+
+                        // Restore the highlight: the same message if it's
+                        // still in the mailbox (the rebuild wasn't a delete
+                        // of the selected row), otherwise the message that
+                        // now occupies its old spot.
+                        let restored = previous_selection.map(|(mailbox, uid)| {
+                            (0..message_store.n_items()).find_map(|i| {
+                                let Some(boxed) = message_store.item(i).and_downcast::<glib::BoxedAnyObject>() else {
+                                    return None;
+                                };
+                                let summary = boxed.borrow::<EmailSummary>();
+                                (summary.mailbox == mailbox && summary.uid == uid).then_some(i)
+                            })
+                        });
+                        if let Some(index) = restored.flatten() {
+                            message_selection.set_selected(index);
+                        } else if previous_index != u32::MAX && message_store.n_items() > 0 {
+                            message_selection.set_selected(previous_index.min(message_store.n_items() - 1));
                         }
                     }
                 }
@@ -2080,23 +2114,63 @@ fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String
 /// account's latest folder snapshot. Accounts are sorted by email for a
 /// stable order across rebuilds (`HashMap` iteration order isn't stable,
 /// and accounts visibly reshuffling on every resync would be jarring).
-fn rebuild_folder_tree(state: &UiState, folder_selection: &gtk::SingleSelection) {
-    let mut accounts: Vec<(AccountId, String, Vec<Mailbox>)> = state
-        .accounts
-        .iter()
-        .map(|(id, handle)| {
-            let label = if handle.display_name.is_empty() {
-                handle.email.clone()
-            } else {
-                handle.display_name.clone()
-            };
-            (id.clone(), label, handle.folders.clone())
-        })
-        .collect();
+/// On startup - before any folder has been selected or message adopted -
+/// the first account's Inbox is auto-selected (see `select_first_inbox`),
+/// so the folder view opens on the inbox instead of nothing.
+fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::SingleSelection) {
+    // Borrow only long enough to snapshot the account data. `set_selected`
+    // inside `select_first_inbox` synchronously fires the `selected-item`
+    // handler, which itself borrows `state` mutably - so no borrow may be
+    // live across that call.
+    let (auto_select_inbox, mut accounts): (bool, Vec<(AccountId, String, Vec<Mailbox>)>) = {
+        let st = state.borrow();
+        let accounts = st
+            .accounts
+            .iter()
+            .map(|(id, handle)| {
+                let label = if handle.display_name.is_empty() {
+                    handle.email.clone()
+                } else {
+                    handle.display_name.clone()
+                };
+                (id.clone(), label, handle.folders.clone())
+            })
+            .collect();
+        (st.current_mailbox.is_none(), accounts)
+    };
     accounts.sort_by_key(|a| a.1.to_lowercase());
 
     let model = build_multi_account_tree_model(accounts);
     folder_selection.set_model(Some(&model));
+    if auto_select_inbox {
+        select_first_inbox(&model, folder_selection);
+    }
+}
+
+/// Selects the first account's Inbox in the folder sidebar, so the folder
+/// view starts on the inbox. On the flat `TreeListModel` the first
+/// `TreeItem::Folder` with an Inbox role is the first account's inbox
+/// (accounts sort by label, folders Inbox-first). Selecting it routes
+/// through the normal `selected-item` handler, which sets `current_mailbox`
+/// and issues the `SyncMailbox` that fills the message list. No-op (returns
+/// `false`) if no account reports an Inbox.
+fn select_first_inbox(model: &gtk::TreeListModel, folder_selection: &gtk::SingleSelection) -> bool {
+    for i in 0..model.n_items() {
+        let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else {
+            continue;
+        };
+        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else {
+            continue;
+        };
+        let tree_item = boxed.borrow::<TreeItem>();
+        if let TreeItem::Folder(node) = &*tree_item {
+            if matches!(node.mailbox.role, MailboxRole::Inbox) {
+                folder_selection.set_selected(i);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Wraps `content` directly in a `.card`-styled box - libadwaita's real,

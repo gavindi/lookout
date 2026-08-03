@@ -8,13 +8,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$SCRIPT_DIR/source"
 WEBMAIL_DIR="$SCRIPT_DIR/webmail"
 
-RELEASE=false
+RELEASE=true
 for arg in "$@"; do
     case "$arg" in
         --release) RELEASE=true ;;
+        --debug) RELEASE=false ;;
         -h|--help)
-            echo "Usage: ./build.sh [--release]"
-            echo "  --release   Build with optimizations (cargo build --release)"
+            echo "Usage: ./build.sh [--release|--debug]"
+            echo "  --release   Build with optimizations (default)"
+            echo "  --debug     Build without optimizations (cargo build)"
             exit 0
             ;;
         *)

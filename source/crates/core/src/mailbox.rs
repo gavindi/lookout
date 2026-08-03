@@ -37,7 +37,10 @@ pub struct Mailbox {
 
 /// Guesses a [`MailboxRole`] from a folder's display name when the server
 /// doesn't advertise `SPECIAL-USE` attributes. Case-insensitive, matches the
-/// common names used by Gmail, Dovecot, and other major IMAP servers.
+/// common names used by Gmail, Outlook/Exchange, Dovecot, and other major
+/// IMAP servers - note providers disagree even on the base concept ("Trash"
+/// vs Gmail's "Bin" vs Outlook's "Deleted Items"), so every spelling they use
+/// needs an entry here.
 ///
 /// This is only a fallback; the result should be user-overridable and the
 /// override persisted (see the Folders settings tab in the roadmap).
@@ -46,7 +49,7 @@ pub fn guess_role_from_name(name: &str) -> MailboxRole {
         "inbox" => MailboxRole::Inbox,
         "sent" | "sent items" | "sent mail" | "sent messages" => MailboxRole::Sent,
         "drafts" | "draft" => MailboxRole::Drafts,
-        "trash" | "deleted items" | "deleted messages" => MailboxRole::Trash,
+        "trash" | "bin" | "recycle bin" | "deleted" | "deleted items" | "deleted messages" => MailboxRole::Trash,
         "junk" | "spam" | "junk e-mail" | "bulk mail" => MailboxRole::Junk,
         "archive" | "all mail" => MailboxRole::Archive,
         _ => MailboxRole::Custom,
@@ -81,6 +84,17 @@ mod tests {
         assert_eq!(guess_role_from_name("Junk E-mail"), MailboxRole::Junk);
         assert_eq!(guess_role_from_name("Deleted Items"), MailboxRole::Trash);
         assert_eq!(guess_role_from_name("Projects"), MailboxRole::Custom);
+    }
+
+    #[test]
+    fn recognizes_providers_own_trash_spellings() {
+        // Gmail names its trash "Bin" (en-GB) / "Trash" (en-US); Outlook
+        // uses "Deleted Items", some servers just "Deleted".
+        assert_eq!(guess_role_from_name("Bin"), MailboxRole::Trash);
+        assert_eq!(guess_role_from_name("TRASH"), MailboxRole::Trash);
+        assert_eq!(guess_role_from_name("Deleted"), MailboxRole::Trash);
+        assert_eq!(guess_role_from_name("Deleted Messages"), MailboxRole::Trash);
+        assert_eq!(guess_role_from_name("Recycle Bin"), MailboxRole::Trash);
     }
 
     #[test]
