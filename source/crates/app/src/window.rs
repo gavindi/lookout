@@ -50,6 +50,24 @@ struct UiState {
     /// whatever the user is currently looking at).
     current_account: Option<AccountId>,
     current_mailbox: Option<MailboxId>,
+    /// The most recently requested body fetch, used to ignore stale
+    /// `BodyFetched` updates that arrive after the user has moved on to a
+    /// different message.
+    pending_body_request: Option<(MailboxId, Uid)>,
+    /// A body is currently loading into the reading pane's WebView and
+    /// should be revealed when its load finishes. Cleared on every selection
+    /// change so a load started for a message the user has already navigated
+    /// away from can never pop the pane back open (the persistent
+    /// `load-changed` handler in the reading-pane build consults this before
+    /// revealing).
+    pending_html_reveal: bool,
+    /// The summary of the message whose body is next to be revealed. The
+    /// reading-pane header is updated from this only when the message page
+    /// actually renders (`render_body`), never when the selection changes -
+    /// so the previous message's header stays on screen for the whole
+    /// fade-out instead of being swapped to the next email mid-fade.
+    /// Cleared/overwritten on every selection change.
+    pending_header: Option<EmailSummary>,
     /// The most recently fetched message body, kept alongside its
     /// mailbox/uid so Reply/Reply-All/Forward can find it again without a
     /// second fetch - see `selected_message_reply_context`. `None` until the
@@ -309,6 +327,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         accounts: HashMap::new(),
         current_account: None,
         current_mailbox: None,
+        pending_body_request: None,
+        pending_html_reveal: false,
+        pending_header: None,
         current_body: None,
     }));
     let reading_stack = gtk::Stack::new();
@@ -542,12 +563,62 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     let text_scroller = gtk::ScrolledWindow::builder().child(&text_view).build();
 
+    // --- Reading-pane header: subject/sender/avatar/To/date, plus a second
+    // set of Reply/Reply-All/Forward buttons duplicating the top command
+    // toolbar's (see below). Lives inside the "message" page below, so it's
+    // visible only while an actual message is shown, not for the empty
+    // placeholder or the in-place composer.
+    let message_header = crate::message_header::build();
+
+    // The reading pane crossfades between three top-level pages: a single
+    // "message" page that groups the message header with the body - so both
+    // fade out/in together instead of the header popping out of sync with
+    // the crossfading content - plus the "empty" placeholder and the
+    // in-place composer. Inside the message page, a small no-transition
+    // content stack toggles between the HTML web view and the plain-text
+    // view without disturbing the outer crossfade.
     let reading_stack = gtk::Stack::new();
-    reading_stack.add_named(&web_view, Some("html"));
-    reading_stack.add_named(&text_scroller, Some("text"));
+    let content_stack = gtk::Stack::new();
+    content_stack.set_transition_type(gtk::StackTransitionType::None);
+    content_stack.add_named(&web_view, Some("html"));
+    content_stack.add_named(&text_scroller, Some("text"));
+    let message_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    message_page.append(&message_header.widget);
+    message_page.append(&content_stack);
+    reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
     reading_stack.set_visible_child_name("empty");
+    // Interpolated crossfade between the reading pane's pages so a
+    // message's header + body fade out and the next fades in instead of
+    // snapping. Message switches already pass through the "empty" page
+    // (the selection handler flips there before the body arrives), so both
+    // halves of the transition fire for free - `render_body` handles the
+    // same-page re-render case by routing through "empty" explicitly.
+    reading_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    reading_stack.set_transition_duration(100);
+    // WebKit paints asynchronously - revealing the HTML page while a fresh
+    // body is still loading would show a blank/white page before the message
+    // appears. So the body is loaded while the pane holds on "empty", and a
+    // single persistent `load-changed` handler reveals the page only once the
+    // load completes. `render_body` arms this with `pending_html_reveal`; the
+    // selection handler disarms it whenever the user moves on, so a load
+    // started for a stale message can never yank the pane back open (the
+    // older per-render one-shot handlers instead fired on *any* Finished and
+    // caused double reveals / stale emails appearing).
+    let state_for_reveal = state.clone();
+    let content_stack_for_reveal = content_stack.clone();
+    let reading_stack_for_reveal = reading_stack.clone();
+    web_view.connect_load_changed(move |_, event| {
+        if event != webkit::LoadEvent::Finished {
+            return;
+        }
+        let armed = state_for_reveal.borrow_mut().pending_html_reveal;
+        if armed {
+            state_for_reveal.borrow_mut().pending_html_reveal = false;
+            reveal_message_page(&reading_stack_for_reveal, &content_stack_for_reveal, "html");
+        }
+    });
     // Floor so the reading pane never gets squeezed down to something
     // unusably short if the window itself is resized very short - since
     // both Paneds here are horizontal, every pane always spans the full
@@ -559,15 +630,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the window's own size negotiation.
     reading_stack.set_size_request(-1, 300);
 
-    // --- Reading-pane header: subject/sender/avatar/To/date, plus a second
-    // set of Reply/Reply-All/Forward buttons duplicating the top command
-    // toolbar's (see below) - visible only while an actual message is shown,
-    // not for the empty placeholder or the in-place composer.
-    let message_header = crate::message_header::build();
-    message_header.widget.set_visible(false);
-
     let reading_pane_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
-    reading_pane_box.append(&message_header.widget);
     reading_pane_box.append(&reading_stack);
 
     let reading_card = card_section(&reading_pane_box);
@@ -593,18 +656,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     update_reading_card_transparency(&reading_stack);
     reading_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
         update_reading_card_transparency(stack);
-    });
-
-    let update_message_header_visibility = {
-        let message_header_widget = message_header.widget.clone();
-        move |stack: &gtk::Stack| {
-            let show = matches!(stack.visible_child_name().as_deref(), Some("html") | Some("text"));
-            message_header_widget.set_visible(show);
-        }
-    };
-    update_message_header_visibility(&reading_stack);
-    reading_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
-        update_message_header_visibility(stack);
     });
 
     // --- Resizable panes: folders | (messages | reading), each its own
@@ -1077,6 +1128,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     config_card.add_css_class("folder-pane");
     root_stack.add_named(&config_card, Some("config"));
 
+    // Config → Appearance → "Animate transitions": flips the reading pane's
+    // crossfade on/off live. Session-only state until Phase 5's GSettings
+    // lands; off sets the transition type to `None`, which also makes
+    // `render_body` skip its fade-specific dance (see below).
+    {
+        let reading_stack = reading_stack.clone();
+        config_view.animations_row.connect_active_notify(move |row| {
+            let transition = if row.is_active() {
+                gtk::StackTransitionType::Crossfade
+            } else {
+                gtk::StackTransitionType::None
+            };
+            reading_stack.set_transition_type(transition);
+        });
+    }
+
     {
         let add_account_row = config_view.add_account_row.clone();
         add_account_row.connect_activated(|_| {
@@ -1249,9 +1316,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     #[cfg(debug_assertions)]
     {
         let window = window.clone();
+        let state = state.clone();
+        let message_header = message_header.clone();
         let reading_stack = reading_stack.clone();
         open_eml_button.connect_clicked(move |_| {
             let window = window.clone();
+            let state = state.clone();
+            let message_header = message_header.clone();
             let reading_stack = reading_stack.clone();
             glib::spawn_future_local(async move {
                 let filter = gtk::FileFilter::new();
@@ -1266,7 +1337,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let Some(path) = file.path() else { return };
                 let Ok(raw) = std::fs::read(&path) else { return };
                 if let Some(body) = lookout_mail::body::parse_body(lookout_core::Uid(0), &raw) {
-                    render_body(&reading_stack, body);
+                    render_body(&state, &reading_stack, &message_header, body);
                 }
             });
         });
@@ -1316,23 +1387,60 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_header = message_header.clone();
         message_selection.connect_selected_item_notify(move |sel| {
             let Some(boxed) = sel.selected_item().and_downcast::<glib::BoxedAnyObject>() else {
+                let mut st = state.borrow_mut();
+                st.pending_body_request = None;
+                st.pending_html_reveal = false;
+                st.pending_header = None;
+                drop(st);
+                reading_stack.set_visible_child_name("empty");
                 return;
             };
             let summary = boxed.borrow::<EmailSummary>();
             let uid = summary.uid;
             let mailbox = summary.mailbox.clone();
-            message_header.update(&summary);
+            let request = (mailbox.clone(), uid);
+            // Deferred to the reveal: updating the header here would swap it
+            // to the next email while the previous message is still fading
+            // out. `render_body` applies it once the new body is about to be
+            // shown (the pane is on "empty" by then, so it can't flash).
+            let pending_header = summary.clone();
             drop(summary);
+            state.borrow_mut().pending_header = Some(pending_header);
 
-            let st = state.borrow();
-            if let Some(handle) = st.current_account.as_ref().and_then(|id| st.accounts.get(id)) {
-                let _ = handle.cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox, uid });
+            let body_is_cached = {
+                let st = state.borrow();
+                st.current_body
+                    .as_ref()
+                    .is_some_and(|(body_mailbox, body_uid, _)| body_mailbox == &mailbox && body_uid == &uid)
+            };
+            let should_request = {
+                let mut st = state.borrow_mut();
+                // Disarm any body load still in flight for the previously
+                // selected message, so its `Finished` can't reveal a stale
+                // email once the user has moved on.
+                st.pending_html_reveal = false;
+                let should_request = !body_is_cached && st.pending_body_request.as_ref() != Some(&request);
+                if should_request || st.pending_body_request.as_ref() != Some(&request) {
+                    st.pending_body_request = Some(request.clone());
+                }
+                should_request
+            };
+            if should_request {
+                let st = state.borrow();
+                if let Some(handle) = st.current_account.as_ref().and_then(|id| st.accounts.get(id)) {
+                    let _ = handle.cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox, uid });
+                }
             }
-            drop(st);
             // Also silently abandons an in-progress composer in the reading
             // pane, if one's open - no "discard draft?" prompt, consistent
             // with this app's existing no-confirmation-dialog convention.
             reading_stack.set_visible_child_name("empty");
+            if body_is_cached {
+                let body = state.borrow().current_body.as_ref().map(|(_, _, body)| body.clone());
+                if let Some(body) = body {
+                    render_body(&state, &reading_stack, &message_header, body);
+                }
+            }
         });
     }
 
@@ -1445,6 +1553,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         folder_selection,
         message_selection,
         message_store,
+        message_header,
         reading_stack,
         current_mail_page,
         mail_view_button,
@@ -1535,6 +1644,7 @@ fn spawn_account_discovery(
     folder_selection: gtk::SingleSelection,
     message_selection: gtk::SingleSelection,
     message_store: gio::ListStore,
+    message_header: crate::message_header::MessageHeader,
     reading_stack: gtk::Stack,
     current_mail_page: Rc<Cell<&'static str>>,
     mail_view_button: gtk::ToggleButton,
@@ -1574,6 +1684,7 @@ fn spawn_account_discovery(
                         folder_selection.clone(),
                         message_selection.clone(),
                         message_store.clone(),
+                        message_header.clone(),
                         reading_stack.clone(),
                         toast_overlay.clone(),
                         client.clone(),
@@ -1600,6 +1711,7 @@ fn connect_account(
     folder_selection: gtk::SingleSelection,
     message_selection: gtk::SingleSelection,
     message_store: gio::ListStore,
+    message_header: crate::message_header::MessageHeader,
     reading_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
     goa_client: GoaClient,
@@ -1719,13 +1831,18 @@ fn connect_account(
                         // of the selected row), otherwise the message that
                         // now occupies its old spot.
                         let restored = previous_selection.map(|(mailbox, uid)| {
-                            (0..message_store.n_items()).find_map(|i| {
+                            let mut restored = None;
+                            for i in 0..message_store.n_items() {
                                 let Some(boxed) = message_store.item(i).and_downcast::<glib::BoxedAnyObject>() else {
-                                    return None;
+                                    continue;
                                 };
                                 let summary = boxed.borrow::<EmailSummary>();
-                                (summary.mailbox == mailbox && summary.uid == uid).then_some(i)
-                            })
+                                if summary.mailbox == mailbox && summary.uid == uid {
+                                    restored = Some(i);
+                                    break;
+                                }
+                            }
+                            restored
                         });
                         if let Some(index) = restored.flatten() {
                             message_selection.set_selected(index);
@@ -1735,8 +1852,17 @@ fn connect_account(
                     }
                 }
                 AccountEvent::BodyFetched { mailbox, uid, body } => {
-                    state.borrow_mut().current_body = Some((mailbox, uid, body.clone()));
-                    render_body(&reading_stack, body);
+                    let should_render = {
+                        let mut st = state.borrow_mut();
+                        let is_current = body_request_matches(&mailbox, &uid, st.pending_body_request.as_ref());
+                        if is_current {
+                            st.current_body = Some((mailbox.clone(), uid, body.clone()));
+                        }
+                        is_current
+                    };
+                    if should_render {
+                        render_body(&state, &reading_stack, &message_header, body);
+                    }
                 }
                 AccountEvent::SendCompleted => {
                     toast_overlay.add_toast(adw::Toast::new("Message sent"));
@@ -2210,19 +2336,124 @@ fn folder_icon_name(role: MailboxRole) -> &'static str {
     }
 }
 
-fn render_body(reading_stack: &gtk::Stack, body: lookout_core::EmailBody) {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_request_matches_the_current_pending_selection() {
+        let pending = Some((MailboxId("acc:inbox".into()), Uid(42)));
+        assert!(body_request_matches(&MailboxId("acc:inbox".into()), &Uid(42), pending.as_ref()));
+        assert!(!body_request_matches(&MailboxId("acc:inbox".into()), &Uid(43), pending.as_ref()));
+    }
+
+    #[test]
+    fn body_request_is_rejected_when_no_selection_is_pending() {
+        assert!(!body_request_matches(&MailboxId("acc:inbox".into()), &Uid(42), None));
+    }
+}
+
+fn body_request_matches(mailbox: &MailboxId, uid: &Uid, pending_request: Option<&(MailboxId, Uid)>) -> bool {
+    pending_request.is_some_and(|(pending_mailbox, pending_uid)| pending_mailbox == mailbox && pending_uid == uid)
+}
+
+/// Reveals the reading pane's "message" page (switching `content_stack` to
+/// `content_page` and the reading stack to "message"). If the stack is
+/// mid-transition - e.g. a message → "empty" fade-out still settling after a
+/// fast body load - the reveal is deferred until that transition completes,
+/// so the next message never appears before the previous one has fully faded
+/// away.
+fn reveal_message_page(reading_stack: &gtk::Stack, content_stack: &gtk::Stack, content_page: &'static str) {
+    if reading_stack.is_transition_running() {
+        let reading_stack = reading_stack.clone();
+        let content_stack = content_stack.clone();
+        let settled = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+        let settled_for_notify = settled.clone();
+        let handler_id = reading_stack.connect_notify_local(Some("transition-running"), move |stack, _| {
+            if !stack.is_transition_running() {
+                if let Some(handler_id) = settled_for_notify.take() {
+                    stack.disconnect(handler_id);
+                }
+                content_stack.set_visible_child_name(content_page);
+                stack.set_visible_child_name("message");
+            }
+        });
+        settled.set(Some(handler_id));
+    } else {
+        content_stack.set_visible_child_name(content_page);
+        reading_stack.set_visible_child_name("message");
+    }
+}
+
+fn render_body(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, message_header: &crate::message_header::MessageHeader, body: lookout_core::EmailBody) {
+    // Apply the header for the message being rendered now. The selection
+    // handler stores the summary here instead of updating the header
+    // immediately, so the previous message's header stays on screen through
+    // its whole fade-out; by the time we get here the pane is already on the
+    // "empty" placeholder, so updating the (hidden) header can't flash.
+    if let Some(summary) = state.borrow_mut().pending_header.take() {
+        message_header.update(&summary);
+    }
+    // Config → Appearance → "Animate transitions" can switch the stack's
+    // transition type to `None`; when it's off, skip the fade-specific paths
+    // below (routing through "empty", waiting for the WebView to paint) and
+    // swap content in directly, matching the pre-fade behavior.
+    let animated = reading_stack.transition_type() != gtk::StackTransitionType::None;
+    // The "message" page groups the header with the body's content stack
+    // (web view / text view), so revealing it - vs. the "empty" page - is
+    // what crossfades, carrying the whole header + body together.
+    let Some(content_stack) = reading_stack
+        .child_by_name("message")
+        .and_downcast::<gtk::Box>()
+        .and_then(|page| page.last_child())
+        .and_then(|child| child.downcast::<gtk::Stack>().ok())
+    else {
+        return;
+    };
     if let Some(html) = &body.html_body {
-        if let Some(web_view) = reading_stack.child_by_name("html").and_downcast::<webkit::WebView>() {
+        if let Some(web_view) = content_stack.child_by_name("html").and_downcast::<webkit::WebView>() {
+            if !animated {
+                web_view.load_html(html, None);
+                content_stack.set_visible_child_name("html");
+                reading_stack.set_visible_child_name("message");
+                return;
+            }
+            // Re-render of the same page: GTK only transitions when the
+            // visible child actually changes, so drop back to "empty" first
+            // and let the reveal crossfade the fresh body in.
+            if reading_stack.visible_child_name().as_deref() == Some("message") {
+                reading_stack.set_visible_child_name("empty");
+            }
+            // WebKit paints asynchronously - crossfading into the HTML page
+            // while a fresh body is still loading would show a blank/white
+            // page before the message appears. So arm the persistent
+            // `load-changed` handler (`pending_html_reveal`) and let it
+            // reveal the page once the load completes. The selection handler
+            // disarms it on every selection change, so a load started for a
+            // message the user has already moved on from can never reveal.
+            state.borrow_mut().pending_html_reveal = true;
             web_view.load_html(html, None);
-            reading_stack.set_visible_child_name("html");
             return;
         }
     }
     if let Some(text) = &body.text_body {
-        if let Some(scroller) = reading_stack.child_by_name("text").and_downcast::<gtk::ScrolledWindow>() {
+        if let Some(scroller) = content_stack.child_by_name("text").and_downcast::<gtk::ScrolledWindow>() {
             if let Some(text_view) = scroller.child().and_downcast::<gtk::TextView>() {
                 text_view.buffer().set_text(text);
-                reading_stack.set_visible_child_name("text");
+                if animated && reading_stack.visible_child_name().as_deref() == Some("message") {
+                    // Same-page re-render: route through "empty", wait out
+                    // the fade-out, then reveal so both halves of the
+                    // transition are visible.
+                    let reading_stack_for_reveal = reading_stack.clone();
+                    let content_stack_for_reveal = content_stack.clone();
+                    let duration = reading_stack.transition_duration() as u64;
+                    reading_stack.set_visible_child_name("empty");
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(duration), move || {
+                        reveal_message_page(&reading_stack_for_reveal, &content_stack_for_reveal, "text");
+                    });
+                } else {
+                    reveal_message_page(reading_stack, &content_stack, "text");
+                }
                 return;
             }
         }

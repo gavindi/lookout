@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.18 (2026-08-04)
+
+### Changed
+
+- **UI**: the reading pane now crossfades (100ms `Crossfade` transition) between its pages instead of snapping, so switching messages fades the old body out and the new body in. The message header (subject/avatar/recipients) now lives *inside* the crossfading "message" page alongside the body - grouped with the body's web/text views in a no-transition inner stack - so the header and body fade out and in together instead of the header popping out of sync with the content. Message switches already pass through the pane's "empty" placeholder, so both halves of the fade fire for free; the HTML page is held on the placeholder until WebKit actually finishes loading the new body (`load-changed` Finished) so the fade-in never reveals a still-blank white page. Same-page re-renders (e.g. the debug `.eml` opener loading into an already-visible page) route through "empty" explicitly to force the transition.
+- **UI**: the Config view's "Appearance" section is now live (it was a disabled placeholder) with an "Animate transitions" switch that disables the reading pane's crossfades. It's the first real preference in the Phase 5 settings taxonomy and, like the layout toggles, is session-only until GSettings lands. Flipping it off swaps the stack's transition type to `None` and makes the body-render path skip its fade dance (no routing through the empty page, no waiting for the WebView to paint), restoring the instant pre-fade behavior.
+- **UI**: the reading pane's crossfade is race-condition-proofed. The old per-render `load-changed` handler attached a fresh one-shot per HTML body render, so rapid selection changes could accumulate handlers that double-revealed or revealed a stale email after the user had already moved on; the reveal now goes through a single persistent handler gated by a `pending_html_reveal` flag in `UiState`, which the selection handler disarms on every selection change so an in-flight load for an abandoned message can never reveal. The text-body path also now waits out the full fade-out duration instead of a hardcoded 200ms (it reads the stack's real `transition_duration`) and defers its reveal through the same `reveal_message_page` helper, which re-checks `is_transition_running` so the next message can't pop in mid-fade on fast clicks.
+- **UI**: the reading-pane header no longer jumps to the next email mid-fade. It was updated synchronously in the selection handler - before the previous message's fade-out even started - so during the 100ms crossfade you'd see the *next* message's subject/sender over the still-fading *previous* body. The header update is now deferred: the selection handler stashes the summary in a `pending_header` in `UiState`, and `render_body` applies it only when the new body actually renders (the pane is on the "empty" placeholder by then, so the swap is invisible until the message page fades back in).
+
 ## 0.6.17 (2026-08-04)
 
 ### Changed
