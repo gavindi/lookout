@@ -179,6 +179,16 @@ fn install_paned_css() {
         button.hover-quick-action:hover {
             background-color: @theme_selected_bg_color;
             color: @theme_selected_fg_color;
+        }
+        .ribbon-tab {
+            border-radius: 8px;
+            margin: 2px 0;
+        }
+        .ribbon-tab:checked {
+            background-color: #2e2e32;
+        }
+        .ribbon-group-label {
+            margin-right: 6px;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -662,20 +672,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
 
-    // --- Menu bar row (File/Home/View/Help). Only File (Quit) and Help
-    // (About) have real actions behind them, so only those two are
-    // `MenuButton`s with a real popover; Home/View have no ribbon-tab
-    // content to show yet, so they're honestly disabled instead of opening
-    // an empty popover.
+    // --- Menu bar row (File/Home/View/Help). File (Quit) and Help (About)
+    // are `MenuButton`s with a real popover; Home/View are the ribbon's tab
+    // strip - mutually-exclusive toggle buttons that switch the ribbon
+    // content row below (see `view_toolbar_stack`). Home holds the command
+    // toolbar; View holds the pane-visibility layout toggles. Mail-only:
+    // they're disabled while a Calendar/Config module is active (see the
+    // nav-rail handlers), matching the codebase's honest-disabled convention.
     let file_menu = gio::Menu::new();
     file_menu.append(Some("Quit"), Some("app.quit"));
     let help_menu = gio::Menu::new();
     help_menu.append(Some("About Lookout"), Some("app.about"));
 
     let file_button = gtk::MenuButton::builder().label("File").css_classes(["flat"]).menu_model(&file_menu).build();
-    let home_button = gtk::Button::builder().label("Home").css_classes(["flat"]).sensitive(false).build();
-    let view_button = gtk::Button::builder().label("View").css_classes(["flat"]).sensitive(false).build();
+    let home_button = gtk::ToggleButton::builder().label("Home").css_classes(["flat", "ribbon-tab"]).active(true).build();
+    let view_button = gtk::ToggleButton::builder().label("View").css_classes(["flat", "ribbon-tab"]).build();
+    view_button.set_group(Some(&home_button));
     let help_button = gtk::MenuButton::builder().label("Help").css_classes(["flat"]).menu_model(&help_menu).build();
+
+    // Which ribbon tab is active ("home" | "view") and which nav-rail module
+    // is selected ("mail" | "calendar" | "config") - together they decide the
+    // `view_toolbar_stack`'s visible child (see `ribbon_stack_name`). The tab
+    // state persists across module switches; the nav-rail handlers re-enable
+    // Home/View on Mail and disable them elsewhere.
+    let active_ribbon_tab: Rc<Cell<&'static str>> = Rc::new(Cell::new("home"));
+    let current_module: Rc<Cell<&'static str>> = Rc::new(Cell::new("mail"));
 
     let menu_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).css_classes(["toolbar"]).build();
     menu_bar.append(&file_button);
@@ -780,8 +801,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     calendar_command_toolbar.append(&share_button);
     calendar_command_toolbar.append(&print_button);
 
+    // --- View tab's ribbon content (Mail module): a "Layout" group of
+    // pane-visibility toggles - Folder pane / Reading pane / Calendar
+    // overview. All three default on; their click handlers live in a later
+    // block (after every pane widget exists) and are session-only toggles
+    // until Phase 5's GSettings landing.
+    let layout_label = gtk::Label::builder().label("Layout").css_classes(["ribbon-group-label", "dim-label"]).build();
+    let folder_pane_toggle = gtk::ToggleButton::builder().icon_name("folder-symbolic").build();
+    folder_pane_toggle.set_tooltip_text(Some("Folder pane"));
+    folder_pane_toggle.set_active(true);
+    let reading_pane_toggle = gtk::ToggleButton::builder().icon_name("document-preview-symbolic").build();
+    reading_pane_toggle.set_tooltip_text(Some("Reading pane"));
+    reading_pane_toggle.set_active(true);
+    let overview_pane_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").build();
+    overview_pane_toggle.set_tooltip_text(Some("Calendar overview"));
+    overview_pane_toggle.set_active(true);
+    let view_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
+    view_toolbar.append(&layout_label);
+    view_toolbar.append(&folder_pane_toggle);
+    view_toolbar.append(&reading_pane_toggle);
+    view_toolbar.append(&overview_pane_toggle);
+
     let view_toolbar_stack = gtk::Stack::new();
-    view_toolbar_stack.add_named(&command_toolbar, Some("mail"));
+    view_toolbar_stack.add_named(&command_toolbar, Some("mail-home"));
+    view_toolbar_stack.add_named(&view_toolbar, Some("mail-view"));
     view_toolbar_stack.add_named(&calendar_command_toolbar, Some("calendar"));
 
     // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
@@ -837,6 +880,54 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     mail_calendar_overview_card.add_css_class("folder-pane");
     mail_calendar_overview_card.set_vexpand(true);
 
+    // --- Ribbon tab strip + View-tab pane toggles. Home/View swap the
+    // ribbon content row (`view_toolbar_stack`) between Mail's command
+    // toolbar and the Layout toggles; the three toggles show/hide their
+    // pane. Home/View only make sense on the Mail module - the Calendar/
+    // Config nav handlers disable them below, so the tab buttons can't be
+    // clicked there (and the `if btn.is_active()` guard makes re-entrant
+    // toggles no-ops anyway).
+    {
+        let view_toolbar_stack = view_toolbar_stack.clone();
+        let active_ribbon_tab = active_ribbon_tab.clone();
+        let current_module = current_module.clone();
+        home_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                active_ribbon_tab.set("home");
+                view_toolbar_stack.set_visible_child_name(ribbon_stack_name(current_module.get(), "home"));
+            }
+        });
+    }
+    {
+        let view_toolbar_stack = view_toolbar_stack.clone();
+        let active_ribbon_tab = active_ribbon_tab.clone();
+        let current_module = current_module.clone();
+        view_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                active_ribbon_tab.set("view");
+                view_toolbar_stack.set_visible_child_name(ribbon_stack_name(current_module.get(), "view"));
+            }
+        });
+    }
+    {
+        let folder_card = folder_card.clone();
+        folder_pane_toggle.connect_toggled(move |btn| {
+            folder_card.set_visible(btn.is_active());
+        });
+    }
+    {
+        let reading_card = reading_card.clone();
+        reading_pane_toggle.connect_toggled(move |btn| {
+            reading_card.set_visible(btn.is_active());
+        });
+    }
+    {
+        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        overview_pane_toggle.connect_toggled(move |btn| {
+            mail_calendar_overview_card.set_visible(btn.is_active());
+        });
+    }
+
     // Which sub-page each view should show when its nav-rail button becomes
     // active - kept up to date by the discovery/event handlers below (which
     // only actually flip `root_stack`'s visible child if their own button is
@@ -850,11 +941,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_mail_page = current_mail_page.clone();
         let view_toolbar_stack = view_toolbar_stack.clone();
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let active_ribbon_tab = active_ribbon_tab.clone();
+        let current_module = current_module.clone();
+        let overview_pane_toggle = overview_pane_toggle.clone();
+        let home_button = home_button.clone();
+        let view_button = view_button.clone();
         mail_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
+                current_module.set("mail");
                 root_stack.set_visible_child_name(current_mail_page.get());
-                view_toolbar_stack.set_visible_child_name("mail");
-                mail_calendar_overview_card.set_visible(true);
+                view_toolbar_stack.set_visible_child_name(ribbon_stack_name("mail", active_ribbon_tab.get()));
+                // Respect the View tab's toggle rather than forcing the
+                // overview pane back on after a Calendar/Config round-trip.
+                mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active());
+                home_button.set_sensitive(true);
+                view_button.set_sensitive(true);
             }
         });
     }
@@ -863,11 +964,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_calendar_page = current_calendar_page.clone();
         let view_toolbar_stack = view_toolbar_stack.clone();
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let current_module = current_module.clone();
+        let home_button = home_button.clone();
+        let view_button = view_button.clone();
         calendar_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
+                current_module.set("calendar");
                 root_stack.set_visible_child_name(current_calendar_page.get());
                 view_toolbar_stack.set_visible_child_name("calendar");
                 mail_calendar_overview_card.set_visible(false);
+                home_button.set_sensitive(false);
+                view_button.set_sensitive(false);
             }
         });
     }
@@ -1039,11 +1146,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_toolbar_stack = view_toolbar_stack.clone();
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         let refresh_config = refresh_config.clone();
+        let current_module = current_module.clone();
+        let home_button = home_button.clone();
+        let view_button = view_button.clone();
         config_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
+                current_module.set("config");
                 root_stack.set_visible_child_name("config");
                 view_toolbar_stack.set_visible_child_name("config");
                 mail_calendar_overview_card.set_visible(false);
+                home_button.set_sensitive(false);
+                view_button.set_sensitive(false);
                 refresh_config();
             }
         });
@@ -1396,6 +1509,20 @@ fn current_month_start() -> chrono::NaiveDate {
 fn first_of_month(date: chrono::NaiveDate) -> chrono::NaiveDate {
     use chrono::Datelike;
     date.with_day(1).unwrap_or(date)
+}
+
+/// Maps a (nav-rail module, ribbon tab) pair to the `view_toolbar_stack`
+/// child to show. Mail is tabbed - Home shows the command toolbar, View the
+/// layout toggles; Calendar/Config each have a single non-tabbed toolbar of
+/// their own, so they ignore the tab. Unknown combos fall back to Mail-Home.
+fn ribbon_stack_name(module: &str, tab: &str) -> &'static str {
+    match (module, tab) {
+        ("mail", "view") => "mail-view",
+        ("mail", _) => "mail-home",
+        ("calendar", _) => "calendar",
+        ("config", _) => "config",
+        _ => "mail-home",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

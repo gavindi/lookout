@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.16 (2026-08-04)
+
+### Added
+
+- **UI**: the menu bar's Home/View buttons are now real ribbon tabs instead of disabled placeholders. Home and View are mutually-exclusive toggle tabs (the same `set_group` trick as the nav rail) that switch the ribbon content row below: Home shows the existing command toolbar (New/Reply/Reply All/Forward/Delete/Archive/Report/Snooze), and View is a new "Layout" group with three pane-visibility toggles - Folder pane, Reading pane, and the Mail screen's Calendar-overview pane - each hiding/showing its pane live via `set_visible` on the `Gtk.Paned` child. The tabs are Mail-only: they grey out while a Calendar or Config module is active (those keep their own non-tabbed command toolbars), and returning to Mail restores the last-active tab. The active tab is styled with a pressed-state background, and the overview-pane toggle is respected on module round-trips (hiding it in View stays hidden after visiting Calendar/Config). The layout toggles are session-only until Phase 5's GSettings landing.
+
 ## 0.6.14 (2026-08-03)
 
 ### Changed
