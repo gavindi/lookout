@@ -54,7 +54,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [ ] Collapsible thread UI (reuse the folder tree's `TreeListModel` trick)
 - [ ] Color-tag keywords (`$Lookout-tag-*` namespace) + tag management
 - [ ] Recipient-chip/autocomplete composer widget
-- [ ] Unified mailbox + cross-account views; full multi-account switcher
+- [x] Unified mailbox + cross-account views; full multi-account switcher
 - [ ] Batch actions + `Gtk.MultiSelection`
 - [x] Hover quick-actions
 - [ ] Physical-keycode global keyboard shortcuts

@@ -22,9 +22,13 @@ pub struct AccountNode {
     pub label: String,
 }
 
-/// What a `Gtk.TreeListRow`'s `glib::BoxedAnyObject` actually holds - either
-/// the account-grouping row itself, or one of that account's mailboxes.
+/// What a `Gtk.TreeListRow`'s `glib::BoxedAnyObject` actually holds - the
+/// synthetic "All Inboxes" unified row pinned above every account group, an
+/// account-grouping row itself, or one of that account's mailboxes.
 pub enum TreeItem {
+    /// The virtual "All Inboxes" folder: merges every connected account's
+    /// Inbox into one cross-account message list. A leaf row (no children).
+    Unified,
     Account(AccountNode),
     Folder(Rc<FolderNode>),
 }
@@ -82,13 +86,15 @@ fn sort_paths(paths: &mut [String], by_path: &HashMap<String, Mailbox>) {
 }
 
 /// Builds the `Gtk.TreeListModel` for the folder sidebar from every
-/// connected account's flat mailbox list: one top-level, expanded-by-default
+/// connected account's flat mailbox list: the synthetic "All Inboxes" unified
+/// row pinned at the top, then one top-level, expanded-by-default
 /// `TreeItem::Account` row per account (Thunderbird-style grouping), each
 /// expanding to that account's own folder tree. Each row's item is a
 /// `glib::BoxedAnyObject` wrapping a `TreeItem`.
 pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mailbox>)>) -> gtk::TreeListModel {
     let mut folder_roots_by_account: HashMap<AccountId, Vec<Rc<FolderNode>>> = HashMap::new();
     let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
+    root_store.append(&glib::BoxedAnyObject::new(TreeItem::Unified));
     for (account_id, label, mailboxes) in accounts {
         let roots = build_folder_roots(mailboxes, &account_id);
         root_store.append(&glib::BoxedAnyObject::new(TreeItem::Account(AccountNode {
@@ -102,6 +108,7 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
         let boxed = item.downcast_ref::<glib::BoxedAnyObject>()?;
         let tree_item = boxed.borrow::<TreeItem>();
         let children = match &*tree_item {
+            TreeItem::Unified => return None,
             TreeItem::Account(acc) => folder_roots_by_account.get(&acc.account_id)?.clone(),
             TreeItem::Folder(node) => node.children.clone(),
         };
@@ -118,8 +125,9 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
     // Expand every account row by default so folders are immediately
     // visible without an extra click - matches the single-account
     // behavior this replaces. Only the top level: subfolders still start
-    // collapsed.
-    for i in 0..model.n_items() {
+    // collapsed. The "All Inboxes" leaf at index 0 has no children to
+    // expand, so it's skipped.
+    for i in 1..model.n_items() {
         if let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() {
             row.set_expanded(true);
         }

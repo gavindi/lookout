@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.19 (2026-08-04)
+
+### Fixed
+
+- **UI**: the reading pane no longer crossfades the same email in and out several times in a row on startup. The startup burst - each account's SQLite-cache replay plus its live sync plus the app's on-demand syncs - delivers the same envelope set to the message list up to six times in quick succession, and each one used to trigger a full list rebuild. Rebuilding reset the selection, which re-selected the first row and re-rendered its already-displayed body, routing the reading pane through its "empty" placeholder and crossfading the same email again (two accounts × three duplicate events ≈ six fades). Three layered fixes: (1) `repopulate_message_list` now compares the incoming envelopes against what's already displayed and skips the rebuild entirely when the list is identical, which is the normal case for a duplicate; (2) the selection handler recognizes a re-selection of the exact message already on screen and returns early instead of re-rendering it; and (3) duplicate `SyncMailbox` requests are deduped per account until the earlier one is answered, so the app's own on-demand syncs stop piling onto the cache-replay ones. The remaining fades came from the rebuild itself: it ran as `remove_all` + `append`, which momentarily emptied the model, dropped the selection, and fired the handler's empty branch - clearing the same-message guard so the re-selected email got re-rendered (and re-faded) one more time. That is now a single atomic in-place `splice` that preserves the selection position, so the guard survives rebuilds. Startup now settles to one fade-in of the actual newest message instead of fading the same email in and out.
+
 ## 0.6.18 (2026-08-04)
 
 ### Changed
