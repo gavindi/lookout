@@ -29,8 +29,18 @@ pub enum TreeItem {
     /// The virtual "All Inboxes" folder: merges every connected account's
     /// Inbox into one cross-account message list. A leaf row (no children).
     Unified,
+    /// The "Favorites" grouping row, pinned between "All Inboxes" and the
+    /// account groups. Present only while at least one folder is starred.
+    Favorites,
     Account(AccountNode),
     Folder(Rc<FolderNode>),
+    /// A starred mailbox, shown inside the Favorites section. Selecting one
+    /// behaves exactly like selecting its `Folder` row - but it is a *second*
+    /// row for a mailbox that also appears under its account, so anything
+    /// resolving a `MailboxId` back to a tree position must skip these or it
+    /// will land on the favorite copy instead of the folder's real row (see
+    /// `find_mailbox_index`).
+    Favorite(Rc<FolderNode>),
 }
 
 /// Reconstructs a folder hierarchy from the flat mailbox list IMAP's `LIST`
@@ -87,14 +97,30 @@ fn sort_paths(paths: &mut [String], by_path: &HashMap<String, Mailbox>) {
 
 /// Builds the `Gtk.TreeListModel` for the folder sidebar from every
 /// connected account's flat mailbox list: the synthetic "All Inboxes" unified
-/// row pinned at the top, then one top-level, expanded-by-default
-/// `TreeItem::Account` row per account (Thunderbird-style grouping), each
-/// expanding to that account's own folder tree. Each row's item is a
-/// `glib::BoxedAnyObject` wrapping a `TreeItem`.
-pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mailbox>)>) -> gtk::TreeListModel {
+/// row pinned at the top, the "Favorites" section (omitted when nothing is
+/// starred), then one top-level, expanded-by-default `TreeItem::Account` row
+/// per account (Thunderbird-style grouping), each expanding to that account's
+/// own folder tree. Each row's item is a `glib::BoxedAnyObject` wrapping a
+/// `TreeItem`.
+///
+/// `favorites` are rendered as flat leaves - a favorite is one folder, not a
+/// subtree - and are duplicates of rows that also live under their account.
+pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mailbox>)>, favorites: Vec<Mailbox>) -> gtk::TreeListModel {
     let mut folder_roots_by_account: HashMap<AccountId, Vec<Rc<FolderNode>>> = HashMap::new();
     let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
     root_store.append(&glib::BoxedAnyObject::new(TreeItem::Unified));
+    let favorite_nodes: Vec<Rc<FolderNode>> = favorites
+        .into_iter()
+        .map(|mailbox| {
+            Rc::new(FolderNode {
+                mailbox,
+                children: Vec::new(),
+            })
+        })
+        .collect();
+    if !favorite_nodes.is_empty() {
+        root_store.append(&glib::BoxedAnyObject::new(TreeItem::Favorites));
+    }
     for (account_id, label, mailboxes) in accounts {
         let roots = build_folder_roots(mailboxes, &account_id);
         root_store.append(&glib::BoxedAnyObject::new(TreeItem::Account(AccountNode {
@@ -107,8 +133,18 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
     let model = gtk::TreeListModel::new(root_store, false, false, move |item| {
         let boxed = item.downcast_ref::<glib::BoxedAnyObject>()?;
         let tree_item = boxed.borrow::<TreeItem>();
+        // The Favorites section's children are `Favorite` rows, not `Folder`
+        // ones, so the tree-index scanners can tell the starred duplicate
+        // apart from the mailbox's real row under its account.
+        if matches!(&*tree_item, TreeItem::Favorites) {
+            let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+            for node in &favorite_nodes {
+                store.append(&glib::BoxedAnyObject::new(TreeItem::Favorite(node.clone())));
+            }
+            return Some(store.upcast::<gio::ListModel>());
+        }
         let children = match &*tree_item {
-            TreeItem::Unified => return None,
+            TreeItem::Unified | TreeItem::Favorites | TreeItem::Favorite(_) => return None,
             TreeItem::Account(acc) => folder_roots_by_account.get(&acc.account_id)?.clone(),
             TreeItem::Folder(node) => node.children.clone(),
         };
@@ -122,11 +158,11 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
         Some(store.upcast::<gio::ListModel>())
     });
 
-    // Expand every account row by default so folders are immediately
-    // visible without an extra click - matches the single-account
-    // behavior this replaces. Only the top level: subfolders still start
-    // collapsed. The "All Inboxes" leaf at index 0 has no children to
-    // expand, so it's skipped.
+    // Expand every account row (and the Favorites section) by default so
+    // folders are immediately visible without an extra click - matches the
+    // single-account behavior this replaces. Only the top level: subfolders
+    // still start collapsed. The "All Inboxes" leaf at index 0 has no children
+    // to expand, so it's skipped.
     for i in 1..model.n_items() {
         if let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() {
             row.set_expanded(true);

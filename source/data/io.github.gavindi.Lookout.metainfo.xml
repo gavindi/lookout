@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.20" date="2026-08-04">
+      <description>
+        <p>The message list has a new header: it names the folder you are reading and the account it belongs to, and adds controls to sort the list by date, sender, or subject, sync the open folder, and star a folder into a Favorites section at the top of the folder tree.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-07-27">
       <description>
         <p>Initial release: browse folders, read mail, and send plain-text messages through an account configured in GNOME Online Accounts.</p>

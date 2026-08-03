@@ -48,6 +48,46 @@ enum MailView {
     UnifiedInbox,
 }
 
+/// Which field the message list is ordered by. Paired with
+/// `UiState::sort_descending`, this is the whole of the list's ordering
+/// policy - see `sort_messages`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    Date,
+    Sender,
+    Subject,
+}
+
+impl SortKey {
+    /// The sort dropdown's button label for this key.
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::Date => "By Date",
+            SortKey::Sender => "By Sender",
+            SortKey::Subject => "By Subject",
+        }
+    }
+
+    /// The key's name in the `sort-key` `gio::SimpleAction`'s state, which is
+    /// what the sort menu's radio items are bound to.
+    fn action_state(self) -> &'static str {
+        match self {
+            SortKey::Date => "date",
+            SortKey::Sender => "sender",
+            SortKey::Subject => "subject",
+        }
+    }
+
+    fn from_action_state(name: &str) -> Option<Self> {
+        match name {
+            "date" => Some(SortKey::Date),
+            "sender" => Some(SortKey::Sender),
+            "subject" => Some(SortKey::Subject),
+            _ => None,
+        }
+    }
+}
+
 /// Mutable UI-thread state the various signal handlers close over. Plain
 /// `Rc<RefCell<_>>` is fine here - GTK is single-threaded, so there's no
 /// need for `Arc<Mutex<_>>` on this side of the worker-thread boundary.
@@ -121,6 +161,18 @@ struct UiState {
     /// reconnects and sends fresh folders, so a request that dies with a
     /// dropped connection can't suppress a later one.
     syncing: HashSet<MailboxId>,
+    /// How the message list is ordered, set from the list header's sort
+    /// controls. Applied in `repopulate_message_list` - the single choke point
+    /// every list rebuild passes through - so the order is uniform no matter
+    /// which event produced the rebuild.
+    sort_key: SortKey,
+    /// True for newest/Z-A first, the order the list was hardcoded to before
+    /// the sort controls existed.
+    sort_descending: bool,
+    /// Mailboxes the user has starred in the message-list header, rendered as
+    /// a "Favorites" section pinned to the top of the folder tree. Session-only
+    /// until GSettings lands, matching the View tab's layout toggles.
+    favorites: HashSet<MailboxId>,
 }
 
 /// Per-calendar-account state, kept separate from `UiState`/`AccountHandle`
@@ -254,6 +306,11 @@ fn install_paned_css() {
         }
         .ribbon-group-label {
             margin-right: 6px;
+        }
+        button.list-header-action {
+            min-width: 24px;
+            min-height: 24px;
+            padding: 2px;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -346,12 +403,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 label.set_label("All Inboxes");
                 label.set_css_classes(&["heading"]);
             }
+            TreeItem::Favorites => {
+                icon.set_visible(true);
+                icon.set_icon_name(Some(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])));
+                label.set_label("Favorites");
+                label.set_css_classes(&["heading"]);
+            }
             TreeItem::Account(account) => {
                 icon.set_visible(false);
                 label.set_label(&account.label);
                 label.set_css_classes(&["heading"]);
             }
-            TreeItem::Folder(node) => {
+            // A favorite renders exactly like the folder it duplicates.
+            TreeItem::Folder(node) | TreeItem::Favorite(node) => {
                 let unread = node.mailbox.unread;
                 let text = if unread > 0 {
                     format!("{}  ({unread})", node.mailbox.name)
@@ -391,6 +455,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         restore_pending: last_selection.is_some(),
         rendered_message: None,
         syncing: HashSet::new(),
+        sort_key: SortKey::Date,
+        sort_descending: true,
+        favorites: HashSet::new(),
     }));
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
@@ -582,24 +649,98 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_factory.connect_unbind(move |_, _| {});
     let message_list_view = gtk::ListView::new(Some(message_selection.clone()), Some(message_factory));
     let message_scroller = gtk::ScrolledWindow::builder().child(&message_list_view).vexpand(true).build();
-    // Slim header row atop the message list: the account switcher ("All
-    // Inboxes" + one entry per connected account). Lets the user jump
-    // between the unified view and any account's Inbox without drilling
-    // through the folder tree. Populated by `refresh_account_switcher`,
-    // which runs on every `rebuild_folder_tree`.
-    let account_switcher_list = gtk::StringList::new(&["All Inboxes"]);
-    let account_switcher = gtk::DropDown::new(Some(account_switcher_list.clone()), None::<gtk::Expression>);
-    account_switcher.set_halign(gtk::Align::Start);
-    account_switcher.add_css_class("flat");
-    let account_switcher_suppress = Rc::new(Cell::new(false));
+    // Header row atop the message list: what's being shown on the left (the
+    // folder's name over its account, plus the favorite star), and the list's
+    // own controls on the right - sync, filter, sort direction, sort key.
+    // `title_column`'s hexpand is what pushes the control cluster to the
+    // trailing edge, so no spacer widget is needed.
+    let folder_title_label = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["heading"])
+        .label("Inbox")
+        .build();
+    let account_title_label = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    let title_column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .build();
+    title_column.append(&folder_title_label);
+    title_column.append(&account_title_label);
+
+    let favorite_button = gtk::ToggleButton::builder()
+        .icon_name(themed_icon_name(&["non-starred-symbolic", "starred-symbolic", "mail-mark-important-symbolic"]))
+        .tooltip_text("Add to Favorites")
+        .css_classes(["flat", "list-header-action"])
+        .valign(gtk::Align::Center)
+        .build();
+    // `refresh_list_header` sets the star's state programmatically on every
+    // view change; without this guard that would fire `toggled` and re-write
+    // the favorites set from under the user.
+    let favorite_suppress = Rc::new(Cell::new(false));
+
+    let sync_button = gtk::Button::builder()
+        .icon_name(themed_icon_name(&["view-refresh-symbolic", "emblem-synchronizing-symbolic"]))
+        .tooltip_text("Sync")
+        .css_classes(["flat", "list-header-action"])
+        .valign(gtk::Align::Center)
+        .build();
+    // Honest-disabled, like the Flag button in the command toolbar: a real
+    // filter needs unread/flagged plumbing that doesn't exist yet.
+    let list_filter_button = gtk::Button::builder()
+        .icon_name(themed_icon_name(&["funnel-symbolic", "view-filter-symbolic", "edit-find-symbolic"]))
+        .tooltip_text("Filter")
+        .css_classes(["flat", "list-header-action"])
+        .valign(gtk::Align::Center)
+        .sensitive(false)
+        .build();
+    let sort_direction_button = gtk::ToggleButton::builder()
+        .icon_name(sort_direction_icon(true))
+        .tooltip_text("Newest first")
+        .css_classes(["flat", "list-header-action"])
+        .valign(gtk::Align::Center)
+        .active(true)
+        .build();
+    let sort_key_menu = gio::Menu::new();
+    sort_key_menu.append(Some("By Date"), Some("win.sort-key('date')"));
+    sort_key_menu.append(Some("By Sender"), Some("win.sort-key('sender')"));
+    sort_key_menu.append(Some("By Subject"), Some("win.sort-key('subject')"));
+    let sort_key_button = gtk::MenuButton::builder()
+        .label(SortKey::Date.label())
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .menu_model(&sort_key_menu)
+        .build();
+
     let message_header_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
         .margin_start(10)
         .margin_end(10)
         .margin_top(6)
         .margin_bottom(4)
         .build();
-    message_header_row.append(&account_switcher);
+    message_header_row.append(&title_column);
+    message_header_row.append(&favorite_button);
+    message_header_row.append(&sync_button);
+    message_header_row.append(&list_filter_button);
+    message_header_row.append(&sort_direction_button);
+    message_header_row.append(&sort_key_button);
+
+    let list_header = ListHeader {
+        folder_label: folder_title_label,
+        account_label: account_title_label,
+        favorite_button: favorite_button.clone(),
+        favorite_suppress: favorite_suppress.clone(),
+    };
+    refresh_list_header(&state, &list_header);
+
     let message_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_box.append(&message_header_row);
     message_box.append(&message_scroller);
@@ -607,42 +748,78 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_card.add_css_class("card-flush-start");
     message_card.set_margin_start(0);
 
-    // --- Account switcher -> jump to "All Inboxes" or a chosen account's
-    // Inbox. Routing through `folder_selection.set_selected` (rather than
-    // calling the view helpers directly) keeps the folder-tree highlight and
-    // the switcher dropdown in lockstep, since the `selected-item` handler
-    // does both. ---
+    // --- Sync button -> re-sync whatever the list is showing. ---
+    {
+        let state = state.clone();
+        sync_button.connect_clicked(move |_| resync_current_view(&state));
+    }
+
+    // --- Sort direction toggle -> flip the order and re-sort in place. The
+    // re-sort reads the visible list back out of the store rather than
+    // re-fetching, so it costs nothing and keeps the selection (see
+    // `snapshot_message_store`). ---
+    {
+        let state = state.clone();
+        let message_store = message_store.clone();
+        let message_selection = message_selection.clone();
+        sort_direction_button.connect_toggled(move |button| {
+            let descending = button.is_active();
+            button.set_icon_name(sort_direction_icon(descending));
+            button.set_tooltip_text(Some(if descending { "Newest first" } else { "Oldest first" }));
+            state.borrow_mut().sort_descending = descending;
+            resort_message_list(&state, &message_store, &message_selection);
+        });
+    }
+
+    // --- Sort key -> a stateful action so the menu renders radio checks. The
+    // action is added to the window once it exists (see `sort_key_action`
+    // below); menu actions resolve through the widget hierarchy at activation
+    // time, so registering it after the menu is built is fine. ---
+    let sort_key_action = gio::SimpleAction::new_stateful("sort-key", Some(glib::VariantTy::STRING), &SortKey::Date.action_state().to_variant());
+    {
+        let state = state.clone();
+        let message_store = message_store.clone();
+        let message_selection = message_selection.clone();
+        let sort_key_button = sort_key_button.clone();
+        sort_key_action.connect_activate(move |action, parameter| {
+            let Some(key) = parameter.and_then(|p| p.str()).and_then(SortKey::from_action_state) else {
+                return;
+            };
+            action.set_state(&key.action_state().to_variant());
+            sort_key_button.set_label(key.label());
+            state.borrow_mut().sort_key = key;
+            resort_message_list(&state, &message_store, &message_selection);
+        });
+    }
+
+    // --- Favorite star -> add/remove the open folder from the tree's
+    // Favorites section. Session-only (see `UiState::favorites`). ---
     {
         let state = state.clone();
         let folder_selection = folder_selection.clone();
-        let suppress = account_switcher_suppress.clone();
-        account_switcher.connect_selected_notify(move |dropdown| {
+        let suppress = favorite_suppress.clone();
+        favorite_button.connect_toggled(move |button| {
             if suppress.get() {
                 return;
             }
-            let selected = dropdown.selected();
-            if selected == 0 {
-                folder_selection.set_selected(0);
-                return;
+            let Some(mailbox) = state.borrow().current_mailbox.clone() else { return };
+            {
+                let mut st = state.borrow_mut();
+                if button.is_active() {
+                    st.favorites.insert(mailbox.clone());
+                } else {
+                    st.favorites.remove(&mailbox);
+                }
             }
-            let entries = sorted_account_entries(&state);
-            let Some((account_id, _)) = entries.get((selected - 1) as usize) else { return };
-            let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() else {
-                return;
-            };
-            if let Some(index) = find_account_inbox_index(&model, account_id) {
-                folder_selection.set_selected(index);
-                return;
-            }
-            // Folders not yet loaded for this account: fall back to a direct
-            // selection from its last-known folder list.
-            let inbox = state
-                .borrow()
-                .accounts
-                .get(account_id)
-                .and_then(|h| h.folders.iter().find(|m| matches!(m.role, MailboxRole::Inbox)).map(|m| m.id.clone()));
-            if let Some(inbox_id) = inbox {
-                select_mailbox(&state, account_id.clone(), inbox_id);
+            apply_favorite_visual(button, button.is_active());
+            // The tree grows/loses a whole section, so it has to be rebuilt -
+            // which swaps the model and drops the highlight. Put it back on the
+            // folder the user is still looking at.
+            rebuild_folder_tree(&state, &folder_selection);
+            if let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() {
+                if let Some(index) = find_mailbox_index(&model, &mailbox) {
+                    folder_selection.set_selected(index);
+                }
             }
         });
     }
@@ -1239,6 +1416,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .default_height(900)
         .content(&window_overlay)
         .build();
+    // The message list's sort menu is built long before the window exists;
+    // `win.`-scoped actions resolve through the widget hierarchy when the menu
+    // item is activated, so registering it here is in time.
+    window.add_action(&sort_key_action);
 
     let state = state.clone();
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
@@ -1504,17 +1685,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // --- Folder selection -> AccountCommand::SyncMailbox on that folder's
-    // own account (selecting an account-group row itself is a no-op - it
-    // just expands/collapses). The synthetic "All Inboxes" row instead
-    // enters the unified view. Both paths re-sync the account switcher so
-    // the dropdown always matches the tree. ---
+    // own account (selecting an account-group row, or the Favorites section
+    // header, is a no-op - it just expands/collapses). The synthetic "All
+    // Inboxes" row instead enters the unified view. A `Favorite` row is the
+    // same mailbox as its `Folder` row, so it takes the identical path. Every
+    // live path re-renders the list header, which is the one place both view
+    // changes funnel through. ---
     {
         let state = state.clone();
         let message_store = message_store.clone();
         let message_selection = message_selection.clone();
-        let account_switcher = account_switcher.clone();
-        let account_switcher_list = account_switcher_list.clone();
-        let account_switcher_suppress = account_switcher_suppress.clone();
+        let list_header = list_header.clone();
         folder_selection.connect_selected_item_notify(move |sel| {
             let Some(row) = sel.selected_item().and_downcast::<gtk::TreeListRow>() else { return };
             let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
@@ -1523,16 +1704,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 TreeItem::Unified => {
                     drop(tree_item);
                     enter_unified_inbox(&state, &message_store, &message_selection);
-                    refresh_account_switcher(&account_switcher, &account_switcher_list, &state, &account_switcher_suppress);
+                    refresh_list_header(&state, &list_header);
                 }
-                TreeItem::Folder(node) => {
+                TreeItem::Folder(node) | TreeItem::Favorite(node) => {
                     let mailbox_id = node.mailbox.id.clone();
                     let account_id = node.mailbox.account_id.clone();
                     drop(tree_item);
                     select_mailbox(&state, account_id, mailbox_id);
-                    refresh_account_switcher(&account_switcher, &account_switcher_list, &state, &account_switcher_suppress);
+                    refresh_list_header(&state, &list_header);
                 }
-                TreeItem::Account(_) => {}
+                TreeItem::Account(_) | TreeItem::Favorites => {}
             }
         });
     }
@@ -1730,9 +1911,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         reading_stack,
         current_mail_page,
         mail_view_button,
-        account_switcher,
-        account_switcher_list,
-        account_switcher_suppress,
+        list_header,
         refresh_config.clone(),
     );
     spawn_calendar_discovery(
@@ -1824,9 +2003,7 @@ fn spawn_account_discovery(
     reading_stack: gtk::Stack,
     current_mail_page: Rc<Cell<&'static str>>,
     mail_view_button: gtk::ToggleButton,
-    account_switcher: gtk::DropDown,
-    account_switcher_list: gtk::StringList,
-    account_switcher_suppress: Rc<Cell<bool>>,
+    list_header: ListHeader,
     refresh_config: Rc<dyn Fn()>,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
@@ -1867,9 +2044,7 @@ fn spawn_account_discovery(
                         reading_stack.clone(),
                         toast_overlay.clone(),
                         client.clone(),
-                        account_switcher.clone(),
-                        account_switcher_list.clone(),
-                        account_switcher_suppress.clone(),
+                        list_header.clone(),
                         account,
                     );
                 }
@@ -1897,9 +2072,7 @@ fn connect_account(
     reading_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
     goa_client: GoaClient,
-    account_switcher: gtk::DropDown,
-    account_switcher_list: gtk::StringList,
-    account_switcher_suppress: Rc<Cell<bool>>,
+    list_header: ListHeader,
     account: lookout_goa::GoaMailAccount,
 ) {
     let account_id = AccountId(account.account_id.0.clone());
@@ -1981,7 +2154,11 @@ fn connect_account(
                         // wrongly suppressed by an entry that'll never resolve.
                         st.syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
                     }
-                    rebuild_folder_tree(&state, &folder_selection, &account_switcher, &account_switcher_list, &account_switcher_suppress);
+                    rebuild_folder_tree(&state, &folder_selection);
+                    // Folder names and account labels only exist once this
+                    // event lands, so a view restored before it (or adopted by
+                    // the race below) gets its header filled in here.
+                    refresh_list_header(&state, &list_header);
                 }
                 AccountEvent::MessagesUpdated { mailbox, messages } => {
                     // The sync this mailbox was asked for (if any) has landed.
@@ -2028,17 +2205,18 @@ fn connect_account(
                             (is_current, is_current.then_some(messages), adopted)
                         }
                     };
-                    // The adopt-first path picked a default account; make the
-                    // switcher dropdown match it.
+                    // The adopt-first path picked a default view; name it in
+                    // the list header.
                     if adopted {
-                        refresh_account_switcher(&account_switcher, &account_switcher_list, &state, &account_switcher_suppress);
+                        refresh_list_header(&state, &list_header);
                     }
                     if display {
                         let all = match single_messages {
                             Some(messages) => messages,
                             None => merge_unified_snapshots(&state.borrow().unified_snapshots),
                         };
-                        repopulate_message_list(&message_store, &message_selection, all);
+                        let (key, descending) = current_sort(&state);
+                        repopulate_message_list(&message_store, &message_selection, all, key, descending);
                     }
                 }
                 AccountEvent::BodyFetched { mailbox, uid, body } => {
@@ -2377,47 +2555,106 @@ fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
     mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
 }
 
-/// The connected accounts sorted the same way the folder tree and the
-/// account switcher render them (by display label, case-insensitive).
-fn sorted_account_entries(state: &Rc<RefCell<UiState>>) -> Vec<(AccountId, String)> {
-    let mut entries: Vec<(AccountId, String)> = state
-        .borrow()
-        .accounts
-        .iter()
-        .map(|(id, handle)| {
-            let label = if handle.display_name.is_empty() {
-                handle.email.clone()
-            } else {
-                handle.display_name.clone()
-            };
-            (id.clone(), label)
-        })
-        .collect();
-    entries.sort_by_key(|e| e.1.to_lowercase());
-    entries
+/// The message-list header's mutable parts: the two title lines and the
+/// favorite star. Bundled so the handful of places that change the active view
+/// can refresh the header without each threading four widgets through its own
+/// signature.
+#[derive(Clone)]
+struct ListHeader {
+    folder_label: gtk::Label,
+    account_label: gtk::Label,
+    favorite_button: gtk::ToggleButton,
+    /// Set while the star's state is being written programmatically, so the
+    /// `toggled` handler can tell a refresh apart from a real user click.
+    favorite_suppress: Rc<Cell<bool>>,
 }
 
-/// Rebuilds the account switcher's entry list ("All Inboxes" + one entry per
-/// connected account) and syncs its selection to the current view without
-/// re-entering the `selected-notify` handler (guarded by `suppress`).
-fn refresh_account_switcher(switcher: &gtk::DropDown, list: &gtk::StringList, state: &Rc<RefCell<UiState>>, suppress: &Cell<bool>) {
-    suppress.set(true);
-    let entries = sorted_account_entries(state);
-    let labels: Vec<String> = std::iter::once("All Inboxes".to_string()).chain(entries.iter().map(|(_, label)| label.clone())).collect();
-    let additions: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    list.splice(0, list.n_items(), &additions);
+/// The header's two title lines for the active view: the open folder's display
+/// name over its owning account. The unified view has no single mailbox behind
+/// it, so it names itself and the whole account set.
+fn current_view_title(state: &Rc<RefCell<UiState>>) -> (String, String) {
     let st = state.borrow();
-    let selected = if matches!(st.mail_view, MailView::UnifiedInbox) {
-        0
-    } else {
-        st.current_account
-            .as_ref()
-            .and_then(|id| entries.iter().position(|(account_id, _)| account_id == id))
-            .map(|i| (i + 1) as u32)
-            .unwrap_or(0)
+    if matches!(st.mail_view, MailView::UnifiedInbox) {
+        return ("All Inboxes".to_string(), "All accounts".to_string());
+    }
+    let Some(mailbox_id) = st.current_mailbox.as_ref() else {
+        return ("Inbox".to_string(), String::new());
     };
-    switcher.set_selected(selected);
-    suppress.set(false);
+    let account_id = st.current_account.clone().or_else(|| mailbox_account_id(mailbox_id));
+    let handle = account_id.as_ref().and_then(|id| st.accounts.get(id));
+    // Folders can arrive after the selection does (a restored view names a
+    // mailbox its account hasn't listed yet), so fall back to the id's path
+    // segment rather than showing nothing.
+    let folder = handle
+        .and_then(|h| h.folders.iter().find(|m| &m.id == mailbox_id))
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| mailbox_id.0.split_once(':').map(|(_, path)| path.to_string()).unwrap_or_else(|| mailbox_id.0.clone()));
+    let account = handle
+        .map(|h| if h.display_name.is_empty() { h.email.clone() } else { h.display_name.clone() })
+        .unwrap_or_default();
+    (folder, account)
+}
+
+/// Renders the header for whatever the message list is currently showing:
+/// title lines, plus the star's pressed state and whether it's actionable at
+/// all (the unified view spans every account, so there's no single folder to
+/// favorite).
+fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHeader) {
+    let (folder, account) = current_view_title(state);
+    header.folder_label.set_label(&folder);
+    header.account_label.set_label(&account);
+    header.account_label.set_visible(!account.is_empty());
+
+    let (favorable, starred) = {
+        let st = state.borrow();
+        match st.current_mailbox.as_ref() {
+            Some(mailbox) => (true, st.favorites.contains(mailbox)),
+            None => (false, false),
+        }
+    };
+    header.favorite_suppress.set(true);
+    header.favorite_button.set_sensitive(favorable);
+    header.favorite_button.set_active(starred);
+    apply_favorite_visual(&header.favorite_button, starred);
+    header.favorite_suppress.set(false);
+}
+
+/// Keeps the favorite star's icon and tooltip in step with its pressed state.
+fn apply_favorite_visual(button: &gtk::ToggleButton, starred: bool) {
+    let icon = if starred {
+        themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])
+    } else {
+        themed_icon_name(&["non-starred-symbolic", "starred-symbolic", "mail-mark-important-symbolic"])
+    };
+    button.set_icon_name(icon);
+    button.set_tooltip_text(Some(if starred { "Remove from Favorites" } else { "Add to Favorites" }));
+}
+
+/// The first of `candidates` the current icon theme actually has. Icon names
+/// in this app resolve against the machine's theme rather than a bundled set
+/// (see `folder_icon_name`), and the header's sort/filter/star icons are names
+/// this codebase hasn't used before - so fall back to one that's already
+/// proven in-tree instead of rendering a "missing image" box. The last
+/// candidate is used unconditionally if none match.
+fn themed_icon_name(candidates: &[&'static str]) -> &'static str {
+    let theme = gtk::gdk::Display::default().map(|display| gtk::IconTheme::for_display(&display));
+    if let Some(theme) = theme {
+        for name in candidates {
+            if theme.has_icon(name) {
+                return name;
+            }
+        }
+    }
+    candidates.last().copied().unwrap_or("image-missing-symbolic")
+}
+
+/// The sort-direction toggle's icon for the current order.
+fn sort_direction_icon(descending: bool) -> &'static str {
+    if descending {
+        themed_icon_name(&["view-sort-descending-symbolic", "go-down-symbolic"])
+    } else {
+        themed_icon_name(&["view-sort-ascending-symbolic", "go-up-symbolic"])
+    }
 }
 
 /// Switches the message list to a single mailbox and asks its owning account
@@ -2459,16 +2696,43 @@ fn request_mailbox_sync(state: &Rc<RefCell<UiState>>, account_id: &AccountId, ma
     true
 }
 
-/// Enters the "All Inboxes" view: asks every connected account that has an
-/// Inbox to sync it, and immediately repopulates the list from whatever the
-/// per-mailbox snapshots already hold.
-fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_store: &gio::ListStore, message_selection: &gtk::SingleSelection) {
-    let inboxes: Vec<(AccountId, MailboxId)> = state
+/// Every connected account's Inbox - the mailbox set the unified view is
+/// built from.
+fn account_inboxes(state: &Rc<RefCell<UiState>>) -> Vec<(AccountId, MailboxId)> {
+    state
         .borrow()
         .accounts
         .iter()
         .filter_map(|(id, handle)| handle.folders.iter().find(|m| matches!(m.role, MailboxRole::Inbox)).map(|m| (id.clone(), m.id.clone())))
-        .collect();
+        .collect()
+}
+
+/// Re-syncs whatever the message list is currently showing: the open mailbox,
+/// or every account's Inbox in the unified view. `request_mailbox_sync`
+/// dedupes against in-flight requests, so pressing Sync while a sync is
+/// already outstanding is deliberately a no-op rather than a second round
+/// trip.
+fn resync_current_view(state: &Rc<RefCell<UiState>>) {
+    if matches!(state.borrow().mail_view, MailView::UnifiedInbox) {
+        for (account_id, inbox_id) in account_inboxes(state) {
+            request_mailbox_sync(state, &account_id, &inbox_id);
+        }
+        return;
+    }
+    let current = {
+        let st = state.borrow();
+        st.current_account.clone().zip(st.current_mailbox.clone())
+    };
+    if let Some((account_id, mailbox_id)) = current {
+        request_mailbox_sync(state, &account_id, &mailbox_id);
+    }
+}
+
+/// Enters the "All Inboxes" view: asks every connected account that has an
+/// Inbox to sync it, and immediately repopulates the list from whatever the
+/// per-mailbox snapshots already hold.
+fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_store: &gio::ListStore, message_selection: &gtk::SingleSelection) {
+    let inboxes = account_inboxes(state);
     {
         let mut st = state.borrow_mut();
         st.mail_view = MailView::UnifiedInbox;
@@ -2484,7 +2748,8 @@ fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_store: &gio::ListSt
         request_mailbox_sync(state, &account_id, &inbox_id);
     }
     let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
-    repopulate_message_list(message_store, message_selection, all);
+    let (key, descending) = current_sort(state);
+    repopulate_message_list(message_store, message_selection, all, key, descending);
 }
 
 /// Merges the unified view's per-mailbox snapshots into a single newest-first
@@ -2505,10 +2770,65 @@ fn merge_unified_snapshots(snapshots: &HashMap<MailboxId, Vec<EmailSummary>>) ->
     merged
 }
 
-/// Replaces the message store's contents with `messages` (newest-first),
-/// preserving the current highlight where possible - the selection-restore
-/// dance the old inline `MessagesUpdated` rebuild did, shared by the
-/// single-mailbox and unified paths.
+/// The active sort, snapshotted so callers don't hold a `state` borrow across
+/// a `repopulate_message_list` (whose splice re-enters the selection handler).
+fn current_sort(state: &Rc<RefCell<UiState>>) -> (SortKey, bool) {
+    let st = state.borrow();
+    (st.sort_key, st.sort_descending)
+}
+
+/// Orders the message list by the header's chosen key. Every key tie-breaks on
+/// date, newest first, so the order is total - two messages with the same
+/// sender or subject can't shuffle between otherwise-identical rebuilds and
+/// defeat `store_matches`.
+fn sort_messages(messages: &mut [EmailSummary], key: SortKey, descending: bool) {
+    fn sender_of(m: &EmailSummary) -> String {
+        m.from.first().map(|a| a.display_label().to_lowercase()).unwrap_or_default()
+    }
+    match key {
+        SortKey::Date => messages.sort_by(|a, b| b.date.cmp(&a.date)),
+        SortKey::Sender => messages.sort_by(|a, b| sender_of(a).cmp(&sender_of(b)).then_with(|| b.date.cmp(&a.date))),
+        SortKey::Subject => {
+            let subject_of = |m: &EmailSummary| m.subject.clone().unwrap_or_default().to_lowercase();
+            messages.sort_by(|a, b| subject_of(a).cmp(&subject_of(b)).then_with(|| b.date.cmp(&a.date)));
+        }
+    }
+    // Ascending is the descending order reversed rather than a second set of
+    // comparators - which also flips the date tie-break, so "oldest first"
+    // really is the exact mirror of what was on screen.
+    if !descending {
+        messages.reverse();
+    }
+}
+
+/// Every summary currently in the message store, in display order. Lets a sort
+/// change re-order the visible list without re-fetching: single-mailbox views
+/// keep no snapshot in `UiState` (only the unified view does), so the store
+/// itself is the only copy of what's on screen.
+fn snapshot_message_store(message_store: &gio::ListStore) -> Vec<EmailSummary> {
+    (0..message_store.n_items())
+        .filter_map(|i| message_store.item(i).and_downcast::<glib::BoxedAnyObject>())
+        .map(|boxed| boxed.borrow::<EmailSummary>().clone())
+        .collect()
+}
+
+/// Re-orders the visible list under the current sort. The rebuild goes through
+/// `repopulate_message_list`, so the selected message stays selected and the
+/// reading pane doesn't re-render (and re-crossfade) the email it's already
+/// showing.
+fn resort_message_list(state: &Rc<RefCell<UiState>>, message_store: &gio::ListStore, message_selection: &gtk::SingleSelection) {
+    let messages = snapshot_message_store(message_store);
+    if messages.is_empty() {
+        return;
+    }
+    let (key, descending) = current_sort(state);
+    repopulate_message_list(message_store, message_selection, messages, key, descending);
+}
+
+/// Replaces the message store's contents with `messages` in the list's current
+/// sort order, preserving the current highlight where possible - the
+/// selection-restore dance the old inline `MessagesUpdated` rebuild did,
+/// shared by the single-mailbox and unified paths.
 ///
 /// A no-op when the incoming list is identical to what's already displayed:
 /// the startup burst - each account's cache replay plus its live sync plus
@@ -2525,10 +2845,17 @@ fn merge_unified_snapshots(snapshots: &HashMap<MailboxId, Vec<EmailSummary>>) ->
 /// matches the `already_shown` guard and re-renders (crossfading) it. A
 /// splice is one `items-changed` signal in which the selection position
 /// survives, so the guard keeps working across rebuilds.
-fn repopulate_message_list(message_store: &gio::ListStore, message_selection: &gtk::SingleSelection, mut messages: Vec<EmailSummary>) {
-    // Newest first for the reading list - the list's canonical order, so the
-    // identity check below compares like with like.
-    messages.sort_by_key(|m| std::cmp::Reverse(m.date));
+fn repopulate_message_list(
+    message_store: &gio::ListStore,
+    message_selection: &gtk::SingleSelection,
+    mut messages: Vec<EmailSummary>,
+    sort_key: SortKey,
+    sort_descending: bool,
+) {
+    // Sorting here, before the identity check, makes this the list's canonical
+    // order no matter which event produced the rebuild - so the check compares
+    // like with like, and a sort change is itself detected as a real change.
+    sort_messages(&mut messages, sort_key, sort_descending);
     if store_matches(message_store, &messages) {
         return;
     }
@@ -2591,28 +2918,6 @@ fn store_matches(message_store: &gio::ListStore, messages: &[EmailSummary]) -> b
             .map(|b| message_row_key(&b.borrow::<EmailSummary>()) == message_row_key(m))
             .unwrap_or(false)
     })
-}
-
-/// Finds the flattened index of an account's Inbox row in the folder tree's
-/// `TreeListModel`, for the account switcher to jump the tree selection to.
-/// `Gtk.TreeListModel` is flattened - expanded child rows are counted - so
-/// iterating top-level indices reaches folders inside expanded account rows.
-fn find_account_inbox_index(model: &gtk::TreeListModel, account_id: &AccountId) -> Option<u32> {
-    for i in 0..model.n_items() {
-        let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else {
-            continue;
-        };
-        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else {
-            continue;
-        };
-        let tree_item = boxed.borrow::<TreeItem>();
-        if let TreeItem::Folder(node) = &*tree_item {
-            if node.mailbox.account_id == *account_id && matches!(node.mailbox.role, MailboxRole::Inbox) {
-                return Some(i);
-            }
-        }
-    }
-    None
 }
 
 /// Resolves the currently-selected message in `message_selection` to its
@@ -2679,18 +2984,12 @@ fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String
 /// the pane opens on the user's remembered view (see `last_view`), or the
 /// "All Inboxes" unified row by default (see
 /// `restore_or_default_initial_view`).
-fn rebuild_folder_tree(
-    state: &Rc<RefCell<UiState>>,
-    folder_selection: &gtk::SingleSelection,
-    account_switcher: &gtk::DropDown,
-    account_switcher_list: &gtk::StringList,
-    account_switcher_suppress: &Rc<Cell<bool>>,
-) {
+fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::SingleSelection) {
     // Borrow only long enough to snapshot the account data. `set_selected`
     // inside `select_first_inbox` synchronously fires the `selected-item`
     // handler, which itself borrows `state` mutably - so no borrow may be
     // live across that call.
-    let (auto_select_inbox, mut accounts): (bool, Vec<(AccountId, String, Vec<Mailbox>)>) = {
+    let (auto_select_inbox, mut accounts, mut favorites): (bool, Vec<(AccountId, String, Vec<Mailbox>)>, Vec<Mailbox>) = {
         let st = state.borrow();
         let accounts = st
             .accounts
@@ -2704,17 +3003,25 @@ fn rebuild_folder_tree(
                 (id.clone(), label, handle.folders.clone())
             })
             .collect();
+        // Starred mailboxes are held as bare ids; resolve each against its
+        // account's current folder list, dropping any whose folder has since
+        // disappeared (or whose account hasn't connected yet).
+        let favorites = st
+            .favorites
+            .iter()
+            .filter_map(|mailbox_id| {
+                let account_id = mailbox_account_id(mailbox_id)?;
+                let handle = st.accounts.get(&account_id)?;
+                handle.folders.iter().find(|m| &m.id == mailbox_id).cloned()
+            })
+            .collect();
         // Don't yank a user already in the unified view back to the first
         // account's Inbox just because some account resynced its folders.
         let auto_select_inbox = st.current_mailbox.is_none() && !matches!(st.mail_view, MailView::UnifiedInbox);
-        (auto_select_inbox, accounts)
+        (auto_select_inbox, accounts, favorites)
     };
     accounts.sort_by_key(|a| a.1.to_lowercase());
-
-    // Fold the rebuilt account set into the switcher dropdown before the
-    // tree, so its index-to-account mapping stays aligned with the sorted
-    // tree order.
-    refresh_account_switcher(account_switcher, account_switcher_list, state, account_switcher_suppress);
+    favorites.sort_by_key(|m| m.name.to_lowercase());
 
     // While the unified view is active, any account whose Inbox just appeared
     // (or reconnected) gets asked to sync so it populates the merged list.
@@ -2739,7 +3046,7 @@ fn rebuild_folder_tree(
         }
     }
 
-    let model = build_multi_account_tree_model(accounts);
+    let model = build_multi_account_tree_model(accounts, favorites);
     folder_selection.set_model(Some(&model));
     if auto_select_inbox {
         restore_or_default_initial_view(state, &model, folder_selection);
@@ -2800,8 +3107,13 @@ fn restore_or_default_initial_view(state: &Rc<RefCell<UiState>>, model: &gtk::Tr
 /// Finds the flattened index of a specific mailbox row in the folder tree's
 /// `TreeListModel`, by exact `MailboxId`. On the flat `TreeListModel`,
 /// iterating top-level indices reaches folder rows inside expanded account
-/// groups, like `find_account_inbox_index`. Used to restore the remembered
-/// view on startup.
+/// groups. Used to restore the remembered view on startup and to put the
+/// highlight back after a favorite toggle rebuilds the tree.
+///
+/// Deliberately matches only `TreeItem::Folder`: a starred mailbox also has a
+/// `TreeItem::Favorite` row in the pinned Favorites section, which sorts
+/// *above* its real row, so matching both would resolve every favorite to its
+/// duplicate.
 fn find_mailbox_index(model: &gtk::TreeListModel, mailbox_id: &MailboxId) -> Option<u32> {
     for i in 0..model.n_items() {
         let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else {
@@ -2971,6 +3283,9 @@ mod tests {
             restore_pending: false,
             rendered_message: None,
             syncing: HashSet::new(),
+            sort_key: SortKey::Date,
+            sort_descending: true,
+            favorites: HashSet::new(),
         }));
 
         // First request goes out and is marked pending.
@@ -2988,6 +3303,61 @@ mod tests {
         state.borrow_mut().syncing.insert(inbox.clone());
         state.borrow_mut().syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
         assert!(!state.borrow().syncing.contains(&inbox));
+    }
+
+    #[test]
+    fn sort_messages_orders_by_the_chosen_key_and_mirrors_exactly_when_ascending() {
+        // Same date on the two "b"/"c" rows so the sender/subject keys are what
+        // actually decides their order, not the date tie-break.
+        let mut messages = vec![
+            with_sender_and_subject(summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), "Carol", "Zebra"),
+            with_sender_and_subject(summary(Uid(2), "a:INBOX", 2024, 1, 10, 11), "alice", "middle"),
+            with_sender_and_subject(summary(Uid(3), "a:INBOX", 2024, 1, 10, 10), "Bob", "Apple"),
+        ];
+
+        sort_messages(&mut messages, SortKey::Date, true);
+        assert_eq!(uids(&messages), vec![2, 3, 1]);
+
+        // Sender and subject are case-insensitive - "alice" must lead "Bob".
+        sort_messages(&mut messages, SortKey::Sender, true);
+        assert_eq!(uids(&messages), vec![2, 3, 1]);
+        sort_messages(&mut messages, SortKey::Subject, true);
+        assert_eq!(uids(&messages), vec![3, 2, 1]);
+
+        // Ascending is the exact mirror of descending, tie-break included.
+        sort_messages(&mut messages, SortKey::Sender, false);
+        assert_eq!(uids(&messages), vec![1, 3, 2]);
+        sort_messages(&mut messages, SortKey::Date, false);
+        assert_eq!(uids(&messages), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn sort_messages_tie_breaks_equal_keys_by_date_so_rebuilds_are_stable() {
+        // Two messages the sender key can't tell apart: only the date decides,
+        // and it must decide the same way every time - otherwise identical
+        // rebuilds could shuffle and defeat `store_matches`.
+        let older = with_sender_and_subject(summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), "Dana", "one");
+        let newer = with_sender_and_subject(summary(Uid(2), "a:INBOX", 2024, 1, 10, 12), "Dana", "two");
+
+        let mut forwards = vec![older.clone(), newer.clone()];
+        let mut backwards = vec![newer, older];
+        sort_messages(&mut forwards, SortKey::Sender, true);
+        sort_messages(&mut backwards, SortKey::Sender, true);
+        assert_eq!(uids(&forwards), vec![2, 1]);
+        assert_eq!(uids(&forwards), uids(&backwards));
+    }
+
+    fn uids(messages: &[EmailSummary]) -> Vec<u32> {
+        messages.iter().map(|m| m.uid.0).collect()
+    }
+
+    fn with_sender_and_subject(mut summary: EmailSummary, sender: &str, subject: &str) -> EmailSummary {
+        summary.from = vec![lookout_core::EmailAddress {
+            name: Some(sender.to_string()),
+            address: format!("{}@example.com", sender.to_lowercase()),
+        }];
+        summary.subject = Some(subject.to_string());
+        summary
     }
 
     fn summary(uid: Uid, mailbox: &str, year: i32, month: u32, day: u32, hour: u32) -> EmailSummary {
