@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.14 (2026-08-03)
+
+### Changed
+
+- **Calendar**: the Day/Week/Work week time grids are now a real timeline instead of fixed per-hour buckets. Each grid is a split view: a fixed all-day band (drawn on its own canvas, never scrolls away) above a vertically scrollable 24-hour day (48px per hour slot, 8am-6pm shaded as business hours, hour markers down the left gutter). Event chips are positioned by their exact start/end time rather than dropped into a per-hour cell - so short and long events render to scale, overlapping events split their day column into side-by-side lanes, and multi-day events stretch across day columns as a single full-width chip. Switching to a time-grid view auto-scrolls it to the current time, and hovering a chip raises a tooltip with the event’s summary and time range plus a white highlight ring. The agenda lists are now grouped under “Today”/“Tomorrow”/date headers.
+
 ## 0.6.13 (2026-08-03)
 
 ### Fixed
