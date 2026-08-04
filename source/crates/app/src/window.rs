@@ -1407,6 +1407,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `window_body`, not nested inside `root_stack`). Mail-only - the
     // Calendar view already has its own full sidebar with a mini-calendar.
     let mail_calendar_overview = calendar_view::build_mini();
+    // Half-width day cells (see `.mini-calendar-compact` in
+    // `install_calendar_css`). The day buttons' own natural size is what set
+    // the pane's real width - the `width_request` below is only a floor - so
+    // narrowing the pane means narrowing the buttons.
+    mail_calendar_overview.root.add_css_class("mini-calendar-compact");
     let mail_overview_day_list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(8).build();
     // Matches `build_sidebar()`'s own width_request - without an explicit
     // cap here, the mini-calendar's day-button grid requests its natural

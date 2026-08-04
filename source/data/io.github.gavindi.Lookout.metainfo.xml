@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.22" date="2026-08-04">
+      <description>
+        <p>The calendar overview pane on the right of the Mail screen is now about half as wide, leaving more room for the message list and reading pane.</p>
+      </description>
+    </release>
     <release version="0.6.21" date="2026-08-04">
       <description>
         <p>The message list has a new look: each message shows a sender avatar, the subject, the date, and a preview of the message body. Unread messages are highlighted, and messages are now grouped under collapsible date headings such as Today, Yesterday, and Older.</p>

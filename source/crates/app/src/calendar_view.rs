@@ -96,6 +96,21 @@ fn install_calendar_css() {
         .mini-calendar-today {
             font-weight: bold;
         }
+        /* Half-width variant of the mini month grid, used by the Mail view's
+           right-hand overview pane. A `Gtk.Button` under Adwaita asks for
+           min-width 16px + 10px horizontal padding either side, so seven of
+           them force the grid to ~260px of natural width no matter what
+           `width_request` the surrounding box sets. Stripping the padding and
+           dropping to a caption-sized font halves each cell, which is what
+           lets the pane actually render at its requested width. */
+        .mini-calendar-compact button {
+            min-width: 0;
+            min-height: 0;
+            padding: 1px 2px;
+        }
+        .mini-calendar-compact label {
+            font-size: 0.8em;
+        }
         .mini-calendar-today {
             color: @accent_bg_color;
         }

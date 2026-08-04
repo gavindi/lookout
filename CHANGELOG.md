@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.22 (2026-08-04)
+
+### Changed
+
+- **UI**: the Mail screen's right-hand calendar overview pane now renders its mini month grid at roughly half its previous width. The pane has always carried a `width_request(140)`, but a `width_request` is only a floor - the grid's seven day buttons were each asking for Adwaita's default button metrics (16px min-width plus 10px of horizontal padding either side, so ~36px a cell), which made the grid's *natural* width ~260px and that, not the request, is what the pane actually rendered at. A new `.mini-calendar-compact` CSS class (applied only to the Mail pane's mini calendar, not the Calendar view's own 240px sidebar copy) drops the day buttons to `min-width: 0` with 2px of horizontal padding and sizes their labels at 0.8em, taking each cell to ~20px so seven columns finally fit inside the requested width.
+
 ## 0.6.21 (2026-08-04)
 
 ### Added
