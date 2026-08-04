@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.26 (2026-08-05)
+
+### Fixed
+
+- **Mail**: a folder could silently stay empty - the message list never populated - when a `SyncMailbox` request arrived queued behind another command (e.g. you clicked a message and then quickly a folder). The pre-IDLE cached emit only fired when `SyncMailbox` was the command that *woke* the session; when it was processed out of the drain queue with a cache hit, the cache-skip path did `continue` without emitting anything or running a live sync. The app's pending-sync entry for that folder was then never cleared, and it suppressed every later sync request for the folder until the next reconnect. The `SyncMailbox` handler now emits the cached message list itself on a cache hit (via a shared `emit_cached_messages` helper), so the list populates and the pending-sync entry clears regardless of how the command arrived.
+- **Mail**: IDLE could end up monitoring the wrong folder after a cache-served folder switch. The cache-skip path serves the switch without a `SELECT`, leaving the session selected on the old folder; IDLE only reports changes to the *selected* folder, so new mail in the folder the user was actually viewing never triggered a resync. The session now tracks which mailbox it is actually selected on (`session_selected`) and re-selects the user's current folder before re-entering IDLE whenever they've drifted apart - a cheap round trip (no envelope fetch), skipped whenever the session already matches.
+- **Mail**: the background body prefetch issued two `SELECT`s back-to-back on its first visit to a mailbox - one whose result was discarded and one real one - wasting a full IMAP round trip per mailbox. The duplicate is gone.
+- **Performance**: the background body prefetch is now genuinely interruptible instead of just cooperative in name. It already yielded between IDLE cycles, but once a batch started it could hold the session through the `SELECT`, the envelope-UID fetch, and up to `PREFETCH_BATCH_SIZE` body downloads while user commands sat in the queue. It now checks for pending commands before the `SELECT`, before the envelope fetch, and before each body fetch, returning the un-downloaded UIDs to the queue and breaking out so the user's action is processed promptly. The final re-select of the user's folder is also skipped when a command is pending (the command handler selects the folder it needs, and the new top-of-loop check re-selects the user's folder anyway).
+
 ## 0.6.25 (2026-08-04)
 
 ### Fixed

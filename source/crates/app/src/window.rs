@@ -1796,7 +1796,33 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 })
                 .collect();
             calendar.sort_by_key(|a| a.display_name.to_lowercase());
-            crate::config_view::refresh(&config_view, &mail, &calendar);
+
+            let (mail_cache_dir, mail_files) = lookout_mail::cache_info();
+            let mail_cache_files: Vec<crate::config_view::CacheFile> = mail_files
+                .into_iter()
+                .map(|(name, size)| crate::config_view::CacheFile {
+                    name,
+                    size: crate::config_view::format_size(size),
+                })
+                .collect();
+            let (calendar_cache_dir, cal_files) = lookout_dav::cache_info();
+            let calendar_cache_files: Vec<crate::config_view::CacheFile> = cal_files
+                .into_iter()
+                .map(|(name, size)| crate::config_view::CacheFile {
+                    name,
+                    size: crate::config_view::format_size(size),
+                })
+                .collect();
+
+            crate::config_view::refresh(
+                &config_view,
+                &mail,
+                &calendar,
+                &mail_cache_dir,
+                &mail_cache_files,
+                &calendar_cache_dir,
+                &calendar_cache_files,
+            );
         }
     });
     // Populate the placeholder rows now (both groups are empty at startup).

@@ -29,6 +29,12 @@ pub struct CalendarAccountInfo {
     pub uri: String,
 }
 
+/// One cached database file to display in the Advanced section.
+pub struct CacheFile {
+    pub name: String,
+    pub size: String,
+}
+
 /// The config screen's widget tree. `root` goes into the main `root_stack`;
 /// the account groups are kept here so `refresh` can repopulate them in
 /// place without rebuilding the whole page.
@@ -50,6 +56,10 @@ pub struct ConfigView {
     calendar_group: adw::PreferencesGroup,
     mail_rows: RefCell<Vec<adw::ActionRow>>,
     calendar_rows: RefCell<Vec<adw::ActionRow>>,
+    mail_cache_group: adw::PreferencesGroup,
+    calendar_cache_group: adw::PreferencesGroup,
+    mail_cache_rows: RefCell<Vec<adw::ActionRow>>,
+    calendar_cache_rows: RefCell<Vec<adw::ActionRow>>,
 }
 
 /// Phase 5 roadmap's settings taxonomy, each rendered as a disabled
@@ -96,6 +106,17 @@ pub fn build() -> ConfigView {
     }
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
+
+    let mail_cache_group = adw::PreferencesGroup::builder()
+        .title("Mail cache")
+        .build();
+    advanced_group.add(&mail_cache_group);
+
+    let calendar_cache_group = adw::PreferencesGroup::builder()
+        .title("Calendar cache")
+        .build();
+    advanced_group.add(&calendar_cache_group);
+
     let clear_cache_row = adw::ActionRow::builder()
         .title("Clear all caches")
         .subtitle("Delete locally-stored email and calendar data")
@@ -113,13 +134,25 @@ pub fn build() -> ConfigView {
         calendar_group,
         mail_rows: RefCell::new(Vec::new()),
         calendar_rows: RefCell::new(Vec::new()),
+        mail_cache_group,
+        calendar_cache_group,
+        mail_cache_rows: RefCell::new(Vec::new()),
+        calendar_cache_rows: RefCell::new(Vec::new()),
     }
 }
 
-/// Rebuilds the two account groups from the caller's latest state. Clears any
-/// rows added by a previous refresh first, and shows a dim placeholder row per
-/// group while it has no accounts.
-pub fn refresh(view: &ConfigView, mail: &[MailAccountInfo], calendar: &[CalendarAccountInfo]) {
+/// Rebuilds the two account groups and cache-info groups from the caller's
+/// latest state. Clears any rows added by a previous refresh first, and shows
+/// a dim placeholder row per group while it has no entries.
+pub fn refresh(
+    view: &ConfigView,
+    mail: &[MailAccountInfo],
+    calendar: &[CalendarAccountInfo],
+    mail_cache_dir: &std::path::Path,
+    mail_cache_files: &[CacheFile],
+    calendar_cache_dir: &std::path::Path,
+    calendar_cache_files: &[CacheFile],
+) {
     for row in view.mail_rows.borrow_mut().drain(..) {
         view.mail_group.remove(&row);
     }
@@ -143,6 +176,40 @@ pub fn refresh(view: &ConfigView, mail: &[MailAccountInfo], calendar: &[Calendar
             push_row(&view.calendar_group, &view.calendar_rows, account_row(&info.display_name, &info.uri));
         }
     }
+
+    // -- mail cache --
+    for row in view.mail_cache_rows.borrow_mut().drain(..) {
+        view.mail_cache_group.remove(&row);
+    }
+    view.mail_cache_group.set_title(&format!("Mail cache — {}", mail_cache_dir.display()));
+    if mail_cache_files.is_empty() {
+        push_row(&view.mail_cache_group, &view.mail_cache_rows, empty_row("No cached files"));
+    } else {
+        for file in mail_cache_files {
+            push_row(
+                &view.mail_cache_group,
+                &view.mail_cache_rows,
+                cache_file_row(&file.name, &file.size),
+            );
+        }
+    }
+
+    // -- calendar cache --
+    for row in view.calendar_cache_rows.borrow_mut().drain(..) {
+        view.calendar_cache_group.remove(&row);
+    }
+    view.calendar_cache_group.set_title(&format!("Calendar cache — {}", calendar_cache_dir.display()));
+    if calendar_cache_files.is_empty() {
+        push_row(&view.calendar_cache_group, &view.calendar_cache_rows, empty_row("No cached files"));
+    } else {
+        for file in calendar_cache_files {
+            push_row(
+                &view.calendar_cache_group,
+                &view.calendar_cache_rows,
+                cache_file_row(&file.name, &file.size),
+            );
+        }
+    }
 }
 
 fn account_row(title: &str, subtitle: &str) -> adw::ActionRow {
@@ -158,4 +225,20 @@ fn empty_row(title: &str) -> adw::ActionRow {
 fn push_row(group: &adw::PreferencesGroup, rows: &RefCell<Vec<adw::ActionRow>>, row: adw::ActionRow) {
     group.add(&row);
     rows.borrow_mut().push(row);
+}
+
+fn cache_file_row(name: &str, size: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(name).subtitle(size).build();
+    row.set_sensitive(false);
+    row
+}
+
+pub fn format_size(bytes: u64) -> String {
+    match bytes {
+        0 => "0 B".into(),
+        b if b < 1024 => format!("{b} B"),
+        b if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.0),
+        b if b < 1024 * 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+        b => format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0)),
+    }
 }

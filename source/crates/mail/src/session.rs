@@ -49,6 +49,52 @@ const PREVIEW_FETCH_LIMIT: usize = 50;
 /// only - steady-state resyncs fetch just the newly-arrived uids.
 const PREVIEW_FETCH_BYTES: u32 = 16384;
 
+/// How many full message bodies to fetch per IDLE cycle during background
+/// prefetch. Small enough to keep each batch fast (a few seconds), large
+/// enough to make progress across hundreds of messages.
+const PREFETCH_BATCH_SIZE: usize = 10;
+
+/// Tracks progress of the background body prefetch across all mailboxes.
+struct PrefetchState {
+    /// Mailbox IDs to prefetch, in processing order. INBOX is typically first.
+    mailboxes: Vec<MailboxId>,
+    /// Index into `mailboxes` — which mailbox we're currently prefetching.
+    current: usize,
+    /// UIDs remaining to fetch in the current mailbox, newest first.
+    pending_uids: Vec<Uid>,
+    /// The uidvalidity of the current mailbox.
+    uidvalidity: UidValidity,
+    /// Whether we've fetched envelope UIDs for the current mailbox.
+    envelopes_fetched: bool,
+    /// The IMAP folder path of the current prefetch mailbox (for SELECT).
+    current_folder_name: String,
+}
+
+impl PrefetchState {
+    fn new(mailboxes: Vec<MailboxId>) -> Self {
+        Self {
+            mailboxes,
+            current: 0,
+            pending_uids: Vec::new(),
+            uidvalidity: UidValidity(0),
+            envelopes_fetched: false,
+            current_folder_name: String::new(),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.current >= self.mailboxes.len()
+    }
+
+    fn advance(&mut self) {
+        self.current += 1;
+        self.pending_uids.clear();
+        self.uidvalidity = UidValidity(0);
+        self.envelopes_fetched = false;
+        self.current_folder_name.clear();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ConnectionState {
     Disconnected,
@@ -103,6 +149,11 @@ pub enum AccountCommand {
         uid: Uid,
         until: chrono::DateTime<chrono::Utc>,
     },
+    /// Kick off background body prefetch for all mailboxes. The prefetch
+    /// runs cooperatively in batches between IDLE cycles, fetching full
+    /// message bodies and caching them on disk so subsequent message views
+    /// are instant. Triggered automatically after the initial sync.
+    PrefetchBodies,
     Shutdown,
 }
 
@@ -232,10 +283,43 @@ async fn connect_and_run(
     sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache).await?;
 
     let mut current_mailbox_name = "INBOX".to_string();
-    let mut current_mailbox_id = inbox_id;
+    let mut current_mailbox_id = inbox_id.clone();
+
+    // The mailbox the IMAP session is actually SELECTed on. This normally
+    // tracks `current_mailbox_id`, but diverges whenever the cache-skip path
+    // serves a folder switch without a SELECT (see `SyncMailbox`). IDLE waits
+    // monitor whichever folder is selected, so before re-entering IDLE we
+    // re-SELECT the user's folder if they've drifted apart.
+    let mut session_selected = inbox_id.clone();
+
+    // Build the initial prefetch list from all selectable mailboxes except
+    // INBOX (already synced above). The prefetch will run cooperatively in
+    // batches between IDLE cycles.
+    let prefetch_mailboxes: Vec<MailboxId> = folders
+        .iter()
+        .filter(|m| m.id != inbox_id)
+        .map(|m| m.id.clone())
+        .collect();
+    let mut prefetch = if prefetch_mailboxes.is_empty() {
+        None
+    } else {
+        tracing::info!(count = prefetch_mailboxes.len(), "starting background body prefetch");
+        Some(PrefetchState::new(prefetch_mailboxes))
+    };
 
     loop {
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
+
+        // A cache-served folder switch (or an interrupted prefetch) can leave
+        // the session SELECTed on a different folder than the one the user is
+        // viewing. IDLE only reports changes to the currently-selected folder,
+        // so bring the session back in line before the wait. This is a cheap
+        // round trip (no FETCH) and is skipped whenever the session already
+        // matches.
+        if session_selected != current_mailbox_id {
+            session.select(&current_mailbox_name).await?;
+            session_selected = current_mailbox_id.clone();
+        }
 
         let mut handle = session.idle();
         handle.init().await?;
@@ -267,23 +351,7 @@ async fn connect_and_run(
         // switch arrives, *before* the IDLE teardown (handle.done().await)
         // so the UI paints from disk while we wait for the network round-trip.
         if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
-            if let Some(cache) = cache {
-                if let Ok(cached) = cache.load_messages(mailbox_id) {
-                    if !cached.is_empty() {
-                        let snoozed = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()).unwrap_or_default();
-                        let filtered: Vec<_> = cached.iter().filter(|m| !snoozed.contains(&m.uid)).cloned().collect();
-                        if !filtered.is_empty() {
-                            tracing::debug!(mailbox = %mailbox_id, count = filtered.len(), "emitting cached messages for instant display");
-                            let _ = events
-                                .send(AccountEvent::MessagesUpdated {
-                                    mailbox: mailbox_id.clone(),
-                                    messages: filtered,
-                                })
-                                .await;
-                        }
-                    }
-                }
-            }
+            emit_cached_messages(cache, mailbox_id, events).await;
         }
 
         drop(stop_source);
@@ -300,6 +368,7 @@ async fn connect_and_run(
             Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
             Wake::Idle(Ok(_)) => {
                 sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                session_selected = current_mailbox_id.clone();
             }
             Wake::Idle(Err(e)) => return Err(Error::Imap(e)),
             Wake::Command(cmd) => woke_on_command = Some(cmd),
@@ -323,13 +392,43 @@ async fn connect_and_run(
                     }
                     let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
                     sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                    session_selected = current_mailbox_id.clone();
+                    // Rebuild the prefetch list to include any new folders.
+                    let new_mailboxes: Vec<MailboxId> = folders
+                        .iter()
+                        .filter(|m| m.id != current_mailbox_id)
+                        .map(|m| m.id.clone())
+                        .collect();
+                    if !new_mailboxes.is_empty() {
+                        prefetch = Some(PrefetchState::new(new_mailboxes));
+                    }
                 }
                 AccountCommand::SyncMailbox(mailbox_id) => {
                     // MailboxId is "<account_id>:<folder path>"; recover the folder path.
                     if let Some(path) = mailbox_id.0.strip_prefix(&format!("{}:", account_id.0)) {
                         current_mailbox_name = path.to_string();
                         current_mailbox_id = mailbox_id;
+                        // If the cache already has envelope summaries for this
+                        // mailbox, emit them and skip the full IMAP sync to
+                        // avoid blocking the session for seconds on a network
+                        // round trip that would produce identical data. This
+                        // mirrors the pre-IDLE cached emit, but *must* happen
+                        // here too: a SyncMailbox that arrived queued behind
+                        // another command (e.g. a FetchBody that woke the
+                        // session) never goes through the wake-command path,
+                        // and without this emit the app's sync request would
+                        // be answered by nothing - its pending entry would
+                        // stick and suppress every later sync for this folder.
+                        let cached = cache.map_or(false, |c| {
+                            c.has_messages(&current_mailbox_id).unwrap_or(false)
+                        });
+                        if cached {
+                            tracing::debug!(mailbox = %current_mailbox_id, "SyncMailbox: cache hit, emitting cached messages without IMAP sync");
+                            emit_cached_messages(cache, &current_mailbox_id, events).await;
+                            continue;
+                        }
                         sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                        session_selected = current_mailbox_id.clone();
                     }
                 }
                 AccountCommand::FetchBody { mailbox, uid } => {
@@ -380,6 +479,7 @@ async fn connect_and_run(
                             }
                             let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
                             sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                            session_selected = current_mailbox_id.clone();
                         }
                         Err(e) => {
                             let _ = events.send(AccountEvent::Error(format!("Couldn't move message: {e}"))).await;
@@ -398,8 +498,148 @@ async fn connect_and_run(
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
                     sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                    session_selected = current_mailbox_id.clone();
+                }
+                AccountCommand::PrefetchBodies => {
+                    tracing::debug!("PrefetchBodies command received");
+                    // Already handled by the automatic trigger after initial
+                    // sync; this command is a no-op if prefetch is already
+                    // running or has completed.
                 }
             }
+        }
+
+        // --- background body prefetch batch ---
+        // Run a small batch of body fetches between IDLE cycles when no user
+        // commands are in flight. This is cooperative: every batch yields
+        // back to IDLE, so user actions (message clicks, folder switches)
+        // are never starved.
+        let mut did_prefetch_work = false;
+        if let Some(pf) = prefetch.as_mut() {
+            if !pf.is_done() {
+                // Check before starting any batch work (SELECT, envelope
+                // fetch, body fetch) so a rapid stream of user clicks
+                // never waits for even one IMAP round trip.
+                if commands.len() > 0 {
+                    continue;
+                }
+
+                // Resolve the current prefetch mailbox's folder path from the
+                // folder list if we haven't yet.
+                if pf.current_folder_name.is_empty() {
+                    if let Some(mailbox) = folders.iter().find(|m| m.id == pf.mailboxes[pf.current]) {
+                        pf.current_folder_name = pf
+                            .mailboxes[pf.current]
+                            .0
+                            .strip_prefix(&format!("{}:", account_id.0))
+                            .unwrap_or(&mailbox.name)
+                            .to_string();
+                        pf.uidvalidity = mailbox.uidvalidity;
+                    } else {
+                        // Mailbox not found (deleted since list); skip it.
+                        pf.advance();
+                        continue;
+                    }
+                }
+
+                // Fetch envelope UIDs for this mailbox if not done yet.
+                if !pf.envelopes_fetched {
+                    // Check before SELECT to avoid blocking the session if a
+                    // user command arrived during the previous body fetch.
+                    if commands.len() > 0 {
+                        continue;
+                    }
+                    let folder_name = pf.current_folder_name.clone();
+                    let mailbox_meta = session.select(&folder_name).await?;
+                    session_selected = pf.mailboxes[pf.current].clone();
+                    let uid_next = mailbox_meta.uid_next.unwrap_or(1);
+                    let fetch_from = uid_next.saturating_sub(INITIAL_FETCH_LIMIT).max(1);
+                    let uid_range = format!("{fetch_from}:*");
+                    let fetches: Vec<_> = session
+                        .uid_fetch(&uid_range, "(UID)")
+                        .await?
+                        .try_collect()
+                        .await?;
+
+                    // Collect UIDs, newest first.
+                    let mut uids: Vec<Uid> = fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
+                    uids.sort_by_key(|u| std::cmp::Reverse(u.0));
+
+                    // Filter out already-cached bodies.
+                    if let Some(cache) = cache {
+                        uids.retain(|uid| {
+                            cache.has_body(&pf.mailboxes[pf.current], *uid, pf.uidvalidity)
+                                .unwrap_or(false)
+                                == false
+                        });
+                    }
+
+                    tracing::debug!(
+                        mailbox = %pf.mailboxes[pf.current],
+                        total = uids.len(),
+                        "prefetch: queued UIDs for body download"
+                    );
+                    pf.pending_uids = uids;
+                    pf.envelopes_fetched = true;
+                    did_prefetch_work = true;
+                }
+
+                // Fetch up to PREFETCH_BATCH_SIZE bodies, yielding to user
+                // commands between each fetch so they are never blocked for
+                // more than one body download.
+                if !pf.pending_uids.is_empty() {
+                    // Check before starting body fetches.
+                    if commands.len() > 0 {
+                        continue;
+                    }
+                    let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(PREFETCH_BATCH_SIZE)).collect();
+                    let mut fetched = 0usize;
+                    for (i, uid) in batch.iter().enumerate() {
+                        // A user command may have arrived during the previous
+                        // body fetch. If so, put back the remaining UIDs and
+                        // break out so the command is processed promptly.
+                        if i > 0 && commands.len() > 0 {
+                            pf.pending_uids.splice(0..0, batch[i..].iter().cloned());
+                            break;
+                        }
+                        match fetch_body_cached(cache, &mut session, &pf.mailboxes[pf.current], *uid, pf.uidvalidity).await {
+                            Ok(Some(_)) => fetched += 1,
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(?uid, "prefetch: body fetch failed: {e}");
+                            }
+                        }
+                    }
+                    if fetched > 0 {
+                        tracing::debug!(
+                            mailbox = %pf.mailboxes[pf.current],
+                            fetched,
+                            remaining = pf.pending_uids.len(),
+                            "prefetch: batch complete"
+                        );
+                        did_prefetch_work = true;
+                    }
+                }
+
+                // If all UIDs for this mailbox are done, advance to the next.
+                if pf.pending_uids.is_empty() {
+                    pf.advance();
+                    if pf.is_done() {
+                        tracing::info!("background body prefetch complete");
+                    }
+                }
+            }
+        }
+
+        // Re-select the user's current mailbox before re-entering IDLE so the
+        // next IDLE wait operates on the right folder. Only needed when
+        // prefetch actually changed the selected mailbox (SELECT for envelope
+        // fetch or body fetches). Skip if a user command is pending — the
+        // command handler will SELECT the folder it needs, and the top-of-loop
+        // check re-selects the user's folder anyway.
+        if did_prefetch_work && commands.len() == 0 {
+            session.select(&current_mailbox_name).await?;
+            session_selected = current_mailbox_id.clone();
         }
     }
 }
@@ -558,6 +798,34 @@ async fn sync_mailbox(
         tracing::warn!("preview fetch for {mailbox_id} failed: {e}");
     }
     Ok(())
+}
+
+/// Emits whatever envelope summaries are cached on disk for `mailbox_id`,
+/// minus currently-snoozed messages, as a `MessagesUpdated` event. Used for
+/// instant paint on folder switch - both when `SyncMailbox` wakes the session
+/// (pre-IDLE teardown) and when it's processed out of the drain queue with a
+/// cache hit. A no-op when nothing is cached.
+async fn emit_cached_messages(
+    cache: Option<&crate::cache::Cache>,
+    mailbox_id: &MailboxId,
+    events: &async_channel::Sender<AccountEvent>,
+) {
+    let Some(cache) = cache else { return };
+    if let Ok(cached) = cache.load_messages(mailbox_id) {
+        if !cached.is_empty() {
+            let snoozed = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()).unwrap_or_default();
+            let filtered: Vec<_> = cached.iter().filter(|m| !snoozed.contains(&m.uid)).cloned().collect();
+            if !filtered.is_empty() {
+                tracing::debug!(mailbox = %mailbox_id, count = filtered.len(), "emitting cached messages for instant display");
+                let _ = events
+                    .send(AccountEvent::MessagesUpdated {
+                        mailbox: mailbox_id.clone(),
+                        messages: filtered,
+                    })
+                    .await;
+            }
+        }
+    }
 }
 
 /// Caches `messages` and publishes them to the UI, minus anything currently

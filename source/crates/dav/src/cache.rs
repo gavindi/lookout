@@ -33,6 +33,29 @@ fn cache_dir() -> std::path::PathBuf {
     base.join("lookout").join("calendar")
 }
 
+/// Returns the cache directory and a list of `(filename, size_bytes)` for each
+/// SQLite database file in it. Used by the config view to show per-file storage
+/// breakdowns.
+pub fn cache_info() -> (std::path::PathBuf, Vec<(String, u64)>) {
+    let dir = cache_dir();
+    let entries = if dir.exists() {
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "sqlite3"))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let size = e.metadata().ok()?.len();
+                Some((name, size))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (dir, entries)
+}
+
 /// Removes every cached per-account SQLite database under
 /// `$XDG_CACHE_HOME/lookout/calendar/` so the next sync starts fresh from the
 /// server. Safe to call while account sessions are live: each session keeps

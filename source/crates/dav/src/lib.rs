@@ -13,6 +13,6 @@ mod recurrence;
 pub mod session;
 mod xml;
 
-pub use cache::clear_all_caches;
+pub use cache::{cache_info, clear_all_caches};
 pub use config::{CalendarAccountConfig, Credential};
 pub use error::{Error, Result};
