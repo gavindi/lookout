@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.24 (2026-08-04)
+
+### Fixed
+
+- **Performance**: folder switches now show the cached message list instantly from the on-disk SQLite envelope cache before the IMAP fetch completes, eliminating the blank-list wait on every folder navigation. The existing `messages` table (populated by `replace_messages` after each sync) is now loaded and emitted as a `MessagesUpdated` event at the top of `sync_mailbox`, before the IMAP SELECT; the live fetch then runs in background and emits a second update with fresh data. First visits to a folder still wait for the IMAP round-trip (the cache is empty), but all subsequent visits within the same session or across restarts are instant.
+
 ## 0.6.23 (2026-08-04)
 
 ### Fixed
