@@ -19,6 +19,7 @@ use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::last_view::{self, LastSelection};
 use crate::message_list::{format_row_date, MessageItem, MessageListModel, SelectionKind, SortKey};
+use crate::microsoft_oauth::MicrosoftCredentialProvider;
 use crate::worker::Worker;
 
 /// Per-account state the UI needs once an `AccountSession` actor is running:
@@ -2513,7 +2514,16 @@ fn connect_account(
             username: account.smtp.username.clone(),
         },
     };
-    let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = Rc::new(GoaCredentialProvider::new(goa_client, account));
+    let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = if account.is_microsoft_365() {
+        // GOA's Microsoft 365 token carries only Microsoft Graph scopes and
+        // can't authenticate to Exchange Online IMAP/SMTP (verified live), so
+        // Microsoft accounts use Lookout's own OAuth2 flow instead - see
+        // `microsoft_oauth.rs`. The first connect opens a browser; afterwards
+        // the stored refresh token keeps it silent.
+        Rc::new(MicrosoftCredentialProvider::new(account_id.clone()))
+    } else {
+        Rc::new(GoaCredentialProvider::new(goa_client, account))
+    };
     // `run_account_session` requires `Arc<dyn CredentialProvider>` (it may
     // run reconnect attempts on the worker thread's own async tasks), so
     // wrap in a thread-safe handle even though only ever driven from one

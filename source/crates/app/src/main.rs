@@ -10,6 +10,7 @@ mod goa_credentials;
 mod last_view;
 mod message_header;
 mod message_list;
+mod microsoft_oauth;
 mod window;
 mod worker;
 

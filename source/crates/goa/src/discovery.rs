@@ -49,6 +49,20 @@ pub struct GoaMailAccount {
     pub imap: EndpointConfig,
     pub smtp: EndpointConfig,
     pub auth: AuthMethod,
+    /// GOA `ProviderType` for the account (`google`, `nextcloud`,
+    /// `ms_graph`, ...), when the account advertises one.
+    pub provider_type: Option<String>,
+}
+
+impl GoaMailAccount {
+    /// Microsoft 365 accounts (GOA provider types `ms_graph`, the legacy
+    /// `microsoft365`, and the older personal `microsoft`) are treated
+    /// specially by the app: GOA's token for them carries only Microsoft
+    /// Graph scopes and can't authenticate to Exchange Online IMAP/SMTP, so
+    /// the app supplies its own OAuth2 credentials instead of GOA's.
+    pub fn is_microsoft_365(&self) -> bool {
+        matches!(self.provider_type.as_deref(), Some("ms_graph") | Some("microsoft365") | Some("microsoft"))
+    }
 }
 
 /// How to obtain live credentials for a [`GoaCalendarAccount`]. A separate
@@ -123,9 +137,14 @@ impl GoaClient {
         if mail_disabled {
             return Ok(None);
         }
+        let microsoft_365 = is_microsoft365_provider(account_props);
         let imap_supported = get_bool(mail_props, "ImapSupported").unwrap_or(true);
         let smtp_supported = get_bool(mail_props, "SmtpSupported").unwrap_or(true);
-        if !imap_supported || !smtp_supported {
+        // GOA flags Microsoft 365 accounts as IMAP/SMTP-incapable (its
+        // `ms_graph`/`microsoft365` providers model mail as EWS/Graph), but
+        // the Exchange Online endpoints accept OAuth2 IMAP/SMTP - so those
+        // accounts bypass this gate and get hardcoded endpoints below.
+        if !microsoft_365 && (!imap_supported || !smtp_supported) {
             return Ok(None);
         }
 
@@ -134,22 +153,41 @@ impl GoaClient {
             .unwrap_or_default();
         let email = get_string(mail_props, "EmailAddress").unwrap_or_default();
 
-        let (imap_host, imap_port) = split_host_port(&get_string(mail_props, "ImapHost").unwrap_or_default());
-        let (smtp_host, smtp_port) = split_host_port(&get_string(mail_props, "SmtpHost").unwrap_or_default());
-
-        let imap = EndpointConfig {
-            host: imap_host,
-            port: imap_port,
-            use_tls: get_bool(mail_props, "ImapUseSsl").unwrap_or(false) || get_bool(mail_props, "ImapUseTls").unwrap_or(false),
-            accept_ssl_errors: get_bool(mail_props, "ImapAcceptSslErrors").unwrap_or(false),
-            username: get_string(mail_props, "ImapUserName").unwrap_or_default(),
+        let imap = if microsoft_365 {
+            EndpointConfig {
+                host: "outlook.office365.com".to_string(),
+                port: Some(993),
+                use_tls: true,
+                accept_ssl_errors: false,
+                username: email.clone(),
+            }
+        } else {
+            let (imap_host, imap_port) = split_host_port(&get_string(mail_props, "ImapHost").unwrap_or_default());
+            EndpointConfig {
+                host: imap_host,
+                port: imap_port,
+                use_tls: get_bool(mail_props, "ImapUseSsl").unwrap_or(false) || get_bool(mail_props, "ImapUseTls").unwrap_or(false),
+                accept_ssl_errors: get_bool(mail_props, "ImapAcceptSslErrors").unwrap_or(false),
+                username: get_string(mail_props, "ImapUserName").unwrap_or_default(),
+            }
         };
-        let smtp = EndpointConfig {
-            host: smtp_host,
-            port: smtp_port,
-            use_tls: get_bool(mail_props, "SmtpUseSsl").unwrap_or(false) || get_bool(mail_props, "SmtpUseTls").unwrap_or(false),
-            accept_ssl_errors: get_bool(mail_props, "SmtpAcceptSslErrors").unwrap_or(false),
-            username: get_string(mail_props, "SmtpUserName").unwrap_or_default(),
+        let smtp = if microsoft_365 {
+            EndpointConfig {
+                host: "smtp.office365.com".to_string(),
+                port: Some(587),
+                use_tls: true,
+                accept_ssl_errors: false,
+                username: email.clone(),
+            }
+        } else {
+            let (smtp_host, smtp_port) = split_host_port(&get_string(mail_props, "SmtpHost").unwrap_or_default());
+            EndpointConfig {
+                host: smtp_host,
+                port: smtp_port,
+                use_tls: get_bool(mail_props, "SmtpUseSsl").unwrap_or(false) || get_bool(mail_props, "SmtpUseTls").unwrap_or(false),
+                accept_ssl_errors: get_bool(mail_props, "SmtpAcceptSslErrors").unwrap_or(false),
+                username: get_string(mail_props, "SmtpUserName").unwrap_or_default(),
+            }
         };
 
         let auth = if ifaces.contains_key(IFACE_OAUTH2) {
@@ -172,6 +210,7 @@ impl GoaClient {
             imap,
             smtp,
             auth,
+            provider_type: get_string(account_props, "ProviderType"),
         }))
     }
 
@@ -298,6 +337,20 @@ fn get_bool(props: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
     props.get(key).and_then(|v| bool::try_from(v.clone()).ok())
 }
 
+/// Microsoft 365 accounts (GOA provider types `ms_graph`, the legacy
+/// `microsoft365`, and the older personal `microsoft`) advertise a Mail
+/// interface whose host fields are empty and whose `ImapSupported`/
+/// `SmtpSupported` flags are false, because GOA models their mail as
+/// EWS/Graph. The Exchange Online endpoints do accept OAuth2 IMAP/SMTP, so
+/// [`parse_mail_account`] supplies known-good settings for them instead of
+/// reading them from the account.
+fn is_microsoft365_provider(account_props: &HashMap<String, OwnedValue>) -> bool {
+    matches!(
+        get_string(account_props, "ProviderType").as_deref(),
+        Some("ms_graph") | Some("microsoft365") | Some("microsoft")
+    )
+}
+
 /// GOA embeds a port override in the host string itself (`"host:port"`) only
 /// when it differs from the protocol default; splits it back out. Only a
 /// *single* colon is treated as a host:port separator, since a bare IPv6
@@ -316,6 +369,7 @@ fn split_host_port(host: &str) -> (String, Option<u16>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zbus::zvariant::Value;
 
     #[test]
     fn splits_explicit_port_override() {
@@ -335,5 +389,21 @@ mod tests {
         let (host, port) = split_host_port("::1");
         assert_eq!(port, None);
         assert_eq!(host, "::1");
+    }
+
+    #[test]
+    fn recognizes_microsoft_365_provider_types() {
+        fn props_with_provider_type(t: &str) -> HashMap<String, OwnedValue> {
+            let mut props = HashMap::new();
+            props.insert("ProviderType".to_string(), OwnedValue::try_from(Value::from(t)).unwrap());
+            props
+        }
+        for t in ["ms_graph", "microsoft365", "microsoft"] {
+            assert!(is_microsoft365_provider(&props_with_provider_type(t)), "expected {t:?} to be treated as Microsoft 365");
+        }
+        for t in ["google", "nextcloud"] {
+            assert!(!is_microsoft365_provider(&props_with_provider_type(t)), "expected {t:?} not to be treated as Microsoft 365");
+        }
+        assert!(!is_microsoft365_provider(&HashMap::new()), "accounts without a ProviderType must not be special-cased");
     }
 }

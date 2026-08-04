@@ -30,3 +30,10 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Lookout's own OAuth2 client for Microsoft 365 accounts (GOA's token is
+# Graph-scoped only and can't authenticate to Exchange Online IMAP/SMTP).
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.2"

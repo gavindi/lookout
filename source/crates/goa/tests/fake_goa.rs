@@ -96,6 +96,33 @@ fn add_calendar_iface(ifaces: &mut HashMap<String, HashMap<String, OwnedValue>>,
     ifaces.insert("org.gnome.OnlineAccounts.Calendar".to_string(), calendar);
 }
 
+/// Microsoft 365-style account: GOA's `ms_graph`/`microsoft365`/`microsoft`
+/// providers leave the Mail interface's host/username fields empty and flag
+/// `ImapSupported`/`SmtpSupported` false (mirrors the real Microsoft 365
+/// account observed against live GOA during development). Such accounts must
+/// be listed by `list_mail_accounts()` with hardcoded Exchange Online
+/// endpoints, unlike the genuinely-unsupported `unsupported_account` below.
+fn microsoft365_account_props(email: &str) -> HashMap<String, HashMap<String, OwnedValue>> {
+    let mut ifaces = HashMap::new();
+
+    let mut account = HashMap::new();
+    account.insert("MailDisabled".to_string(), prop(false));
+    account.insert("ProviderType".to_string(), prop("ms_graph".to_string()));
+    ifaces.insert("org.gnome.OnlineAccounts.Account".to_string(), account);
+
+    let mut mail = HashMap::new();
+    mail.insert("EmailAddress".to_string(), prop(email.to_string()));
+    mail.insert("Name".to_string(), prop(email.to_string()));
+    mail.insert("ImapSupported".to_string(), prop(false));
+    mail.insert("SmtpSupported".to_string(), prop(false));
+    mail.insert("ImapHost".to_string(), prop("".to_string()));
+    mail.insert("SmtpHost".to_string(), prop("".to_string()));
+    ifaces.insert("org.gnome.OnlineAccounts.Mail".to_string(), mail);
+
+    ifaces.insert("org.gnome.OnlineAccounts.OAuth2Based".to_string(), HashMap::new());
+    ifaces
+}
+
 #[tokio::test]
 async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     let mut objects = HashMap::new();
@@ -110,10 +137,18 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     add_calendar_iface(&mut pw_ifaces, "https://caldav.example.com/dav/password@example.com/", true);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/pw_account").unwrap(), pw_ifaces);
 
-    // An account whose Mail interface is present but unusable (mirrors the
-    // real Microsoft 365 account observed against live GOA during
-    // development: Mail interface exists, ImapSupported is false) - must be
-    // filtered out by list_mail_accounts().
+    // A genuine Microsoft 365 account: Mail interface present but hosts
+    // empty and ImapSupported/SmtpSupported false (mirrors the live account),
+    // plus a Calendar interface with an empty Uri as GOA reports for these
+    // accounts. list_mail_accounts() must list it with hardcoded Exchange
+    // Online endpoints; the empty-Uri calendar must not be listed.
+    let mut ms_ifaces = microsoft365_account_props("work@contoso.com");
+    add_calendar_iface(&mut ms_ifaces, "", false);
+    objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/ms365_account").unwrap(), ms_ifaces);
+
+    // A non-Microsoft account whose Mail interface is unusable (no
+    // ProviderType, so not special-cased) - must be filtered out by
+    // list_mail_accounts().
     let mut unsupported_ifaces = mail_account_props("unsupported@example.com", false);
     unsupported_ifaces.insert("org.gnome.OnlineAccounts.OAuth2Based".to_string(), HashMap::new());
     objects.insert(
@@ -163,6 +198,21 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
         .unwrap();
     connection
         .object_server()
+        .at("/org/gnome/OnlineAccounts/Accounts/ms365_account", FakeAccount)
+        .await
+        .unwrap();
+    connection
+        .object_server()
+        .at(
+            "/org/gnome/OnlineAccounts/Accounts/ms365_account",
+            FakeOAuth2Based {
+                token: "fake-ms-token".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    connection
+        .object_server()
         .at("/org/gnome/OnlineAccounts/Accounts/no_mail_account", FakeAccount)
         .await
         .unwrap();
@@ -186,11 +236,25 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     let mut accounts = client.list_mail_accounts().await.unwrap();
     accounts.sort_by(|a, b| a.email.cmp(&b.email));
 
-    assert_eq!(accounts.len(), 2, "expected exactly the two usable-mail accounts, got: {accounts:?}");
+    assert_eq!(accounts.len(), 3, "expected exactly the three usable-mail accounts, got: {accounts:?}");
     assert_eq!(accounts[0].email, "oauth@example.com");
     assert!(matches!(accounts[0].auth, AuthMethod::OAuth2));
     assert_eq!(accounts[1].email, "password@example.com");
     assert!(matches!(accounts[1].auth, AuthMethod::Password { .. }));
+
+    // The Microsoft 365 account gets hardcoded Exchange Online endpoints
+    // (GOA reports empty hosts) and OAuth2 auth - the same credential path
+    // the Google account uses.
+    assert_eq!(accounts[2].email, "work@contoso.com");
+    assert!(matches!(accounts[2].auth, AuthMethod::OAuth2));
+    assert_eq!(accounts[2].imap.host, "outlook.office365.com");
+    assert_eq!(accounts[2].imap.port, Some(993));
+    assert!(accounts[2].imap.use_tls);
+    assert_eq!(accounts[2].imap.username, "work@contoso.com");
+    assert_eq!(accounts[2].smtp.host, "smtp.office365.com");
+    assert_eq!(accounts[2].smtp.port, Some(587));
+    assert!(accounts[2].smtp.use_tls);
+    assert_eq!(accounts[2].smtp.username, "work@contoso.com");
 
     client.ensure_credentials(&accounts[0]).await.unwrap();
     let (token, expires_in) = client.get_access_token(&accounts[0]).await.unwrap();
@@ -201,10 +265,11 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     assert_eq!(password, "fake-pw-imap-password");
 
     // Calendar accounts are a fully separate set: `unsupported_account` (no
-    // Calendar interface at all) must be excluded, while `no_mail_account`
-    // (no Mail interface, but a real Calendar one - mirrors the live
-    // Nextcloud account this fixture is modeled on) must now appear here
-    // even though it's absent from `list_mail_accounts()` above.
+    // Calendar interface at all) must be excluded, `ms365_account`'s
+    // empty-Uri Calendar interface is excluded too (matching live GOA), while
+    // `no_mail_account` (no Mail interface, but a real Calendar one - mirrors
+    // the live Nextcloud account this fixture is modeled on) must now appear
+    // here even though it's absent from `list_mail_accounts()` above.
     let mut cal_accounts = client.list_calendar_accounts().await.unwrap();
     cal_accounts.sort_by(|a, b| a.uri.cmp(&b.uri));
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.29 (2026-08-05)
+
+### Fixed
+
+- **Mail**: Microsoft 365 accounts (the "Microsoft 365" entry GOA's Online Accounts creates for Microsoft work/school and personal accounts) now actually work. Two separate problems blocked them. First, they silently vanished from the account sidebar: GOA's `ms_graph`/`microsoft365`/`microsoft` providers model mail as EWS/Graph, so their `Mail` interface reports `ImapSupported`/`SmtpSupported` false and leaves every IMAP/SMTP host, port, and username empty - which account discovery read as "no usable mail" and filtered out. Discovery now recognizes those provider types and, instead of discarding the account, supplies the known-good Exchange Online settings itself: `outlook.office365.com:993` for IMAP, `smtp.office365.com:587` for SMTP, TLS on both, and the account's own email address as the username. Second, even once listed, the account couldn't authenticate: GOA's OAuth2 token for Microsoft 365 accounts carries only Microsoft Graph scopes (`mail.readwrite`, `user.read`, ...) - there is no `https://outlook.office.com/IMAP.AccessAsUser.All` / `SMTP.Send` in GOA's provider config at all - and Exchange Online's IMAP/SMTP endpoints reject that token (`NO AUTHENTICATE failed`, verified live). Microsoft accounts therefore bypass GOA for credentials entirely: the app runs its own public-client OAuth2 authorization-code flow (`microsoft_oauth.rs`) against Microsoft's v2.0 endpoints with PKCE and a loopback redirect, requesting the two outlook.office.com scopes plus `offline_access`. The first connect opens a browser to sign in (and to consent the client id, which currently reuses Mozilla Thunderbird's public Microsoft app registration so no Azure setup is needed); the refresh token is then stored per account under `$XDG_DATA_HOME/lookout/oauth/` with 0600 permissions, and every later connect exchanges it silently for a fresh access token, cached in memory until near expiry. Non-Microsoft accounts still require GOA to advertise IMAP/SMTP support and still authenticate through GOA as before.
+
 ## 0.6.28 (2026-08-05)
 
 ### Added
