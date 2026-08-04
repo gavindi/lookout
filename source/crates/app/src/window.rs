@@ -218,6 +218,11 @@ struct UiState {
     /// a "Favorites" section pinned to the top of the folder tree. Session-only
     /// until GSettings lands, matching the View tab's layout toggles.
     favorites: HashSet<MailboxId>,
+    /// Config → Mail → "Load images from the web": whether the reading pane's
+    /// WebView may load remote `image/*` subresources. Consulted by the
+    /// load-policy handler on every resource decision. Session-only until
+    /// GSettings lands, matching the other Phase 5 preferences.
+    load_remote_images: bool,
 }
 
 /// Per-calendar-account state, kept separate from `UiState`/`AccountHandle`
@@ -394,6 +399,17 @@ fn install_paned_css() {
             background-color: rgba(0, 0, 0, 0.55);
             border-top: 1px solid rgba(255, 255, 255, 0.06);
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .message-column-header {
+            background-color: rgba(0, 0, 0, 0.3);
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            padding: 4px 0;
+        }
+        .message-column-header label {
+            color: #8a97a5;
+            font-size: 0.85em;
+            font-weight: bold;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -541,6 +557,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         sort_key: SortKey::Date,
         sort_descending: true,
         favorites: HashSet::new(),
+        load_remote_images: false,
     }));
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
@@ -973,8 +990,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     };
     refresh_list_header(&state, &list_header);
 
+    // Secondary header: the message list's column names, sitting directly
+    // above the rows they name. It mirrors each row's internal geometry - a
+    // gutter where the unread accent bar and avatar sit, then the fixed
+    // sender column, the expanding subject column, and the right-aligned
+    // date - so the titles line up exactly with the columns below.
+    let column_header_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_end(10)
+        .css_classes(["message-column-header"])
+        .build();
+    // The sender column starts 51px in (3px accent + 8px margin + 32px avatar
+    // + 8px margin); the box's own 8px spacing covers the last of that, so the
+    // gutter is 43 wide.
+    let avatar_gutter = gtk::Box::builder().width_request(43).build();
+    column_header_row.append(&avatar_gutter);
+    let sender_header = gtk::Label::builder().label("Sender").xalign(0.0).width_request(180).build();
+    let subject_header = gtk::Label::builder().label("Subject").xalign(0.0).hexpand(true).build();
+    let date_header = gtk::Label::builder().label("Date").xalign(1.0).build();
+    column_header_row.append(&sender_header);
+    column_header_row.append(&subject_header);
+    column_header_row.append(&date_header);
+
     let message_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_box.append(&message_header_row);
+    message_box.append(&column_header_row);
     message_box.append(&message_scroller);
     let message_card = card_section(&message_box);
     message_card.add_css_class("card-flush-start");
@@ -1090,6 +1131,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the reading pane blank for seconds; blocking these loads keeps the
     // reveal fast. `data:` (the body itself), `cid:` (inline parts, not yet
     // resolved but harmless) and `about:`/`file:` are all local and allowed.
+    // Config → Mail's "Load images from the web" relaxes the response veto
+    // for `image/*` subresources specifically; everything else (scripts,
+    // fonts, iframes) stays blocked, and the veto still applies to the
+    // navigation branch so an embedded remote `<iframe>` can't load either.
+    // The preference lives in `UiState::load_remote_images` - the single
+    // source of truth the Config toggle flips - and is re-read on every
+    // decision, so the viewer always reflects the current setting.
+    let state_for_policy = state.clone();
     web_view.connect_decide_policy(move |_view, decision, decision_type| {
         let uri_is_local = |uri: &str| -> bool {
             let scheme = uri.split(':').next().unwrap_or("");
@@ -1119,13 +1168,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // Veto remote subresource responses (images, fonts, scripts)
                 // so the page's load event isn't held hostage by external
                 // servers. The main frame's own resource - the `data:` body
-                // URL - is always let through.
+                // URL - is always let through. With "Load images from the
+                // web" on, remote `image/*` responses are allowed; everything
+                // else stays blocked.
                 if let Some(response) = decision.downcast_ref::<webkit::ResponsePolicyDecision>() {
                     if !response.is_main_frame_main_resource() {
                         if let Some(uri) = response.request().and_then(|r| r.uri()) {
                             if !uri_is_local(&uri) {
-                                decision.ignore();
-                                return true;
+                                let is_image = response.response().and_then(|r| r.mime_type()).is_some_and(|m| m.starts_with("image/"));
+                                let images_enabled = state_for_policy.borrow().load_remote_images;
+                                if !(images_enabled && is_image) {
+                                    decision.ignore();
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -1735,6 +1790,36 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 gtk::StackTransitionType::None
             };
             reading_stack.set_transition_type(transition);
+        });
+    }
+
+    // Config → Mail → "Load images from the web": flips the WebView's
+    // remote-image veto live, then re-renders whatever's on the reading pane
+    // so the change applies to the open message, not just the next selection.
+    // Skipped while a composer is up - `render_body` would route the pane
+    // back to the message page and yank the user out of their draft.
+    {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        let message_header = message_header.clone();
+        let message_list = message_list.clone();
+        config_view.remote_images_row.connect_active_notify(move |row| {
+            state.borrow_mut().load_remote_images = row.is_active();
+            if reading_stack.visible_child_name().as_deref() == Some("compose") {
+                return;
+            }
+            let (mailbox, uid, body) = {
+                let mut st = state.borrow_mut();
+                let Some(summary) = message_list.selected_summary() else { return };
+                let Some(body) = st.body_cache.get(&summary.mailbox, &summary.uid) else { return };
+                (summary.mailbox, summary.uid, body)
+            };
+            // Drop `rendered_message` and route through "empty" first, or
+            // `render_body`'s already-shown guard would treat the reload of
+            // the same message as a no-op and never re-issue the `load_html`.
+            reading_stack.set_visible_child_name("empty");
+            state.borrow_mut().rendered_message = None;
+            render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
         });
     }
 
@@ -3428,6 +3513,7 @@ mod tests {
             sort_key: SortKey::Date,
             sort_descending: true,
             favorites: HashSet::new(),
+            load_remote_images: false,
         }));
 
         // First request goes out and is marked pending.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.27 (2026-08-05)
+
+### Added
+
+- **UI**: the message-list pane now has a secondary header between the pane's main header (folder name over account, plus the sort/sync controls) and the message rows, naming the columns below it - Sender / Subject / Date. It mirrors each row's internal geometry rather than approximating it: a gutter where the unread accent bar and avatar sit, then the fixed-width sender column, the expanding subject column, and the right-aligned date - so each title sits exactly over the data it names instead of drifting as the pane resizes. A new `.message-column-header` CSS class styles it as a subtle dim band with hairline top/bottom borders, visually separating the list's title row from its controls above and its content below.
+- **Config**: the Config view's "Mail" section (previously a disabled placeholder) is now live with a "Load images from the web" switch. Off by default, it controls whether the reading pane's WebView may load images embedded in emails that are hosted on remote servers. The existing `connect_decide_policy` subresource veto - which blocked every non-local response (tracker pixels, remote images/fonts, `<iframe>`s) so a slow or broken external host couldn't hold the pane's HTML reveal hostage - now lets `image/*` responses through when the switch is on; everything else (scripts, fonts, iframes) stays blocked, the navigation veto is unchanged, and JavaScript is still disabled outright. The preference lives in `UiState::load_remote_images` - the single source of truth the switch flips - and is re-read on every resource decision, so the content viewer always reflects the current setting. Flipping it re-renders whichever message is open so the change takes effect immediately rather than on the next selection (skipped while a composer is up in the reading pane, which `render_body` would otherwise displace). Session-only until Phase 5's GSettings lands, matching the other preferences.
+
 ## 0.6.26 (2026-08-05)
 
 ### Fixed

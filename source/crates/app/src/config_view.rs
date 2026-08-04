@@ -52,6 +52,10 @@ pub struct ConfigView {
     /// widgets that animate) can wire its `active` state to disable the
     /// reading pane's crossfades.
     pub animations_row: adw::SwitchRow,
+    /// "Load images from the web" switch (Config → Mail), exposed so the
+    /// caller can wire its `active` state into the reading pane's remote-image
+    /// policy.
+    pub remote_images_row: adw::SwitchRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     mail_rows: RefCell<Vec<adw::ActionRow>>,
@@ -66,7 +70,8 @@ pub struct ConfigView {
 /// placeholder group until that work lands - same honest-disabled convention
 /// as the menu bar's Home/View ribbon tabs. "Appearance" is deliberately
 /// absent: it's a real, enabled group with the smooth-transitions preference
-/// (see `build`), as is "Advanced" below.
+/// (see `build`), as is "Advanced" below and the "Mail" group (the
+/// remote-images toggle) the loop's `Mail` entry hands off to.
 const PLACEHOLDER_SECTIONS: [&str; 5] = ["General", "Layout", "Mail", "Privacy", "Apps"];
 
 pub fn build() -> ConfigView {
@@ -97,7 +102,24 @@ pub fn build() -> ConfigView {
     appearance_group.add(&animations_row);
     page.add(&appearance_group);
 
+    // The real "Mail" group, replacing that section's placeholder: the
+    // reading pane's remote-images toggle, wired by the caller into WebKit's
+    // load policy.
+    let mail_settings_group = adw::PreferencesGroup::builder().title("Mail").build();
+    let remote_images_row = adw::SwitchRow::builder()
+        .title("Load images from the web")
+        .subtitle("Display images hosted on remote servers in messages")
+        .build();
+    mail_settings_group.add(&remote_images_row);
+
     for section in PLACEHOLDER_SECTIONS {
+        // "Mail" is a live group (see `mail_settings_group` above), not a
+        // placeholder - add it in this section's place so the taxonomy order
+        // is preserved.
+        if section == "Mail" {
+            page.add(&mail_settings_group);
+            continue;
+        }
         let group = adw::PreferencesGroup::builder().title(section).build();
         let row = adw::ActionRow::builder().title("Not implemented yet").build();
         row.set_sensitive(false);
@@ -130,6 +152,7 @@ pub fn build() -> ConfigView {
         add_account_row,
         clear_cache_row,
         animations_row,
+        remote_images_row,
         mail_group,
         calendar_group,
         mail_rows: RefCell::new(Vec::new()),
