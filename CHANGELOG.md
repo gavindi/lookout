@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.23 (2026-08-04)
+
+### Fixed
+
+- **Performance**: message body switching no longer re-fetches over IMAP for every selection. A disk-backed body cache (per-mailbox row cap with LRU eviction) serves previously seen messages instantly, and a small in-memory LRU cache (25 entries) avoids even the disk read for recently viewed messages.
+- **WebKit remote subresource blocking**: the reading pane now blocks non-local URI loads (remote images, scripts, etc.) via `connect_decide_policy`, preventing slow and broken subresource fetches from gating the HTML reveal. A 400ms fallback reveal ensures the pane shows even if a load stalls.
+- **Crash fix**: fixed a `RefCell` double-borrow panic in the body cache lookup path where a `RefMut` guard outlived a `render_body` call.
+
+### Added
+
+- **Tracing**: debug-level instrumentation across the body fetch and render pipeline (`FetchBody dispatch`, disk/in-memory cache hits, UI thread arrival, `Finished` reveal timing).
+
 ## 0.6.22 (2026-08-04)
 
 ### Changed

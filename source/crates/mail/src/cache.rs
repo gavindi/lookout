@@ -10,9 +10,14 @@ use crate::error::Result;
 /// A per-account local SQLite cache of mailbox/message metadata, used for a
 /// fast first paint on startup before the live IMAP fetch completes. Never
 /// the source of truth: every value here is superseded by the next
-/// `FoldersUpdated`/`MessagesUpdated` event from the live session. Full
-/// bodies/attachments are deliberately not cached here (Phase 1 fetches
-/// bodies on demand); a flat-file `.eml` cache is a Phase 2 addition.
+/// `FoldersUpdated`/`MessagesUpdated` event from the live session.
+///
+/// Since the body of every opened message used to be re-fetched from the
+/// server on each open (switching emails - even back to one already read -
+/// paid a full IMAP round trip), fetched raw message bytes are also cached
+/// here (the `bodies` table) so an already-viewed message renders without
+/// touching the network. Attachment bytes are cached along with the body for
+/// free; nothing fetches them separately yet.
 ///
 /// The connection is `Mutex`-wrapped purely to make `Cache: Sync` (and so
 /// `&Cache: Send`) - `rusqlite::Connection` itself isn't `Sync` because its
@@ -58,6 +63,12 @@ fn sanitize_filename(account_id: &AccountId) -> String {
         .collect()
 }
 
+/// How many raw message bodies to keep cached per mailbox. Bodies are fetched
+/// on demand and can be megabytes once attachments are in them, so the cache
+/// is bounded by count rather than allowed to grow without limit; the
+/// `rowid`-ordered eviction in `store_body` keeps the most recently stored.
+const BODY_CACHE_PER_MAILBOX: usize = 100;
+
 impl Cache {
     /// Opens (creating if needed) the cache database for `account_id` under
     /// `$XDG_CACHE_HOME/lookout/mail/`.
@@ -87,6 +98,14 @@ impl Cache {
                 snoozed_until INTEGER NOT NULL,
                 PRIMARY KEY (mailbox_id, uid)
             );
+            CREATE TABLE IF NOT EXISTS bodies (
+                mailbox_id TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                uidvalidity INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (mailbox_id, uid)
+            );
+            CREATE INDEX IF NOT EXISTS bodies_by_mailbox ON bodies (mailbox_id);
             ",
         )?;
         Ok(Cache { conn: Mutex::new(conn) })
@@ -153,6 +172,43 @@ impl Cache {
             }
         }
         Ok(messages)
+    }
+
+    /// Returns the raw RFC 5322 bytes of a previously-fetched message body,
+    /// or `None` if it isn't cached. `uidvalidity` guards the cache against
+    /// serving a body for a recycled uid after its mailbox was re-created
+    /// (RFC 3501 §2.3.1.1): a row written under a different uidvalidity is a
+    /// miss, never a stale body. Callers re-parse the bytes with
+    /// `parse_body`, which is cheap relative to the IMAP fetch this avoids.
+    pub fn load_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT data FROM bodies WHERE mailbox_id = ?1 AND uid = ?2 AND uidvalidity = ?3")?;
+        let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0], |row| row.get::<_, Vec<u8>>(0))?;
+        match rows.next() {
+            Some(Ok(raw)) => Ok(Some(raw)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Stores the raw bytes of a fetched message body for `uid`, replacing
+    /// any earlier body for the same `(mailbox, uid)`. Bounded per mailbox to
+    /// `BODY_CACHE_PER_MAILBOX` entries: `rowid` order is insertion order, so
+    /// deleting all but the newest N keeps the most recently opened messages.
+    pub fn store_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, raw: &[u8]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO bodies (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0, raw],
+        )?;
+        tx.execute(
+            "DELETE FROM bodies WHERE mailbox_id = ?1 AND rowid NOT IN \
+             (SELECT rowid FROM bodies WHERE mailbox_id = ?1 ORDER BY rowid DESC LIMIT ?2)",
+            rusqlite::params![mailbox_id.0, BODY_CACHE_PER_MAILBOX as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// The list-row snippets already cached for `mailbox_id`, keyed by uid.
@@ -333,5 +389,49 @@ mod tests {
         let sanitized = sanitize_filename(&id);
         assert!(!sanitized.contains('/'));
         assert_eq!(sanitized, "_org_gnome_OnlineAccounts_Accounts_account_1234");
+    }
+
+    #[test]
+    fn round_trips_message_bodies_through_the_cache() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let raw = b"From: a@b.c\r\n\r\nHello".to_vec();
+
+        // A never-fetched body is a miss.
+        assert!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap().is_none());
+
+        cache.store_body(&mailbox_id, Uid(7), UidValidity(3), &raw).unwrap();
+        assert_eq!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap(), Some(raw));
+
+        // A mailbox that was re-created (uidvalidity changed) reuses uids; a
+        // stale row must be a miss, not a wrong body.
+        assert!(cache.load_body(&mailbox_id, Uid(7), UidValidity(4)).unwrap().is_none());
+
+        // Re-storing the same (mailbox, uid) replaces the bytes.
+        cache.store_body(&mailbox_id, Uid(7), UidValidity(3), b"updated".as_slice()).unwrap();
+        assert_eq!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap(), Some(b"updated".to_vec()));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn body_cache_is_bounded_per_mailbox() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        for uid in 0..(BODY_CACHE_PER_MAILBOX + 20) {
+            cache.store_body(&mailbox_id, Uid(uid as u32), UidValidity(1), format!("body {uid}").as_bytes()).unwrap();
+        }
+
+        // The newest rows survive the cap...
+        assert!(cache.load_body(&mailbox_id, Uid((BODY_CACHE_PER_MAILBOX + 19) as u32), UidValidity(1)).unwrap().is_some());
+        // ...and the oldest are evicted.
+        assert!(cache.load_body(&mailbox_id, Uid(0), UidValidity(1)).unwrap().is_none());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
     }
 }

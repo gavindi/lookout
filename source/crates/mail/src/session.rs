@@ -313,8 +313,19 @@ async fn connect_and_run(
                         tracing::warn!("FetchBody requested for a mailbox other than the currently selected one; ignoring");
                         continue;
                     }
-                    if let Some(body) = fetch_body(&mut session, uid).await? {
-                        let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
+                    // The mailbox's uidvalidity guards the body cache against
+                    // serving a stale body for a recycled uid after the
+                    // mailbox was re-created (see `Cache::load_body`). The
+                    // `UidValidity(0)` fallback (mailbox not in the list) is
+                    // a deliberate cache-miss sentinel: no row can match 0.
+                    let uidvalidity = folders.iter().find(|m| m.id == mailbox).map(|m| m.uidvalidity).unwrap_or(UidValidity(0));
+                    let started = std::time::Instant::now();
+                    let raw = fetch_body_cached(cache, &mut session, &mailbox, uid, uidvalidity).await?;
+                    tracing::debug!(?mailbox, uid = uid.0, elapsed_ms = started.elapsed().as_millis(), "FetchBody: raw message ready");
+                    if let Some(raw) = raw {
+                        if let Some(body) = parse_body(uid, &raw) {
+                            let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
+                        }
                     }
                 }
                 AccountCommand::SendMessage(msg) => match send_message(config, credentials, &mut session, &folders, msg).await {
@@ -598,18 +609,51 @@ async fn fetch_previews(
     Ok(())
 }
 
-/// Fetches and parses the full body of `uid` in whatever mailbox is
+/// Fetches the full raw RFC 5322 message of `uid` in whatever mailbox is
 /// currently SELECTed. Uses `BODY.PEEK[]` rather than `BODY[]`/`RFC822` so
 /// reading a message doesn't implicitly set `\Seen` server-side - the UI
 /// layer decides if/when to mark as read, matching Bulwark's configurable
-/// mark-as-read-delay behavior.
-async fn fetch_body(session: &mut Session<ImapStream>, uid: Uid) -> Result<Option<EmailBody>> {
+/// mark-as-read-delay behavior. The raw bytes (not a parsed body) are
+/// returned because they're also what the body cache stores: a cache hit
+/// re-parses them, which is far cheaper than the network fetch it avoids.
+async fn fetch_body(session: &mut Session<ImapStream>, uid: Uid) -> Result<Option<Vec<u8>>> {
     let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
     let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {
         return Ok(None);
     };
-    let Some(raw) = fetch.body() else {
-        return Ok(None);
-    };
-    Ok(parse_body(uid, raw))
+    Ok(fetch.body().map(|body| body.to_vec()))
+}
+
+/// Resolves the raw body of `uid` in the currently SELECTed mailbox, serving
+/// a previously-fetched copy from the on-disk cache when one exists (no
+/// network round trip) and storing freshly-fetched bodies back into it, so
+/// re-opening a message doesn't re-download it. `uidvalidity` is passed
+/// through to the cache so a recycled uid can never resolve to another
+/// message's body.
+async fn fetch_body_cached(
+    cache: Option<&crate::cache::Cache>,
+    session: &mut Session<ImapStream>,
+    mailbox: &MailboxId,
+    uid: Uid,
+    uidvalidity: UidValidity,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(cache) = cache {
+        match cache.load_body(mailbox, uid, uidvalidity) {
+            Ok(Some(raw)) => {
+                tracing::debug!(?mailbox, uid = uid.0, "FetchBody: served from disk cache");
+                return Ok(Some(raw));
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(?mailbox, uid = uid.0, "failed to read cached message body: {e}"),
+        }
+    }
+    let raw = fetch_body(session, uid).await?;
+    if let Some(cache) = cache {
+        if let Some(raw) = &raw {
+            if let Err(e) = cache.store_body(mailbox, uid, uidvalidity, raw) {
+                tracing::warn!(?mailbox, uid = uid.0, "failed to cache message body: {e}");
+            }
+        }
+    }
+    Ok(raw)
 }

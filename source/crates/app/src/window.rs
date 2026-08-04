@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -75,6 +75,57 @@ struct MessageRowWidgets {
     bound: Rc<RefCell<Option<EmailSummary>>>,
 }
 
+/// How many recently-viewed message bodies to keep in memory. Every message
+/// switch used to re-fetch the whole body over IMAP - there was no cache
+/// beyond the single currently-open message - so flipping between emails (or
+/// re-opening one already read) re-downloaded everything, network round trip
+/// included. This LRU makes a revisit render instantly; `lookout-mail`'s disk
+/// cache covers the cross-restart and long-session cases.
+const BODY_CACHE_IN_MEMORY: usize = 25;
+
+/// If WebKit hasn't reported `Finished` for a body load within this long, the
+/// reading pane reveals the page anyway instead of sitting on the empty
+/// placeholder. Revealing is normally gated on `Finished` so the fade-in
+/// never shows a blank page, but a slow/hung load (e.g. a message referencing
+/// remote resources) must not hold the pane blank indefinitely.
+const HTML_REVEAL_TIMEOUT_MS: u64 = 400;
+
+/// A small bounded LRU of recently-viewed message bodies, keyed by
+/// `(mailbox, uid)`, front = most recently used. See `BODY_CACHE_IN_MEMORY`.
+struct BodyCache {
+    capacity: usize,
+    entries: VecDeque<(MailboxId, Uid, EmailBody)>,
+}
+
+impl BodyCache {
+    fn new(capacity: usize) -> Self {
+        BodyCache {
+            capacity,
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// Returns the cached body for `(mailbox, uid)`, promoting it to most
+    /// recently used, or `None` on a miss. O(capacity) - the cache is tiny,
+    /// and bodies are cloned out anyway so the scan is not the cost.
+    fn get(&mut self, mailbox: &MailboxId, uid: &Uid) -> Option<EmailBody> {
+        let pos = self.entries.iter().position(|(m, u, _)| m == mailbox && u == uid)?;
+        let entry = self.entries.remove(pos).expect("position came from this deque");
+        self.entries.push_front(entry);
+        Some(self.entries.front().expect("just pushed").2.clone())
+    }
+
+    fn insert(&mut self, mailbox: MailboxId, uid: Uid, body: EmailBody) {
+        if let Some(pos) = self.entries.iter().position(|(m, u, _)| *m == mailbox && *u == uid) {
+            self.entries.remove(pos);
+        }
+        self.entries.push_front((mailbox, uid, body));
+        while self.entries.len() > self.capacity {
+            self.entries.pop_back();
+        }
+    }
+}
+
 /// Mutable UI-thread state the various signal handlers close over. Plain
 /// `Rc<RefCell<_>>` is fine here - GTK is single-threaded, so there's no
 /// need for `Arc<Mutex<_>>` on this side of the worker-thread boundary.
@@ -114,12 +165,19 @@ struct UiState {
     /// fade-out instead of being swapped to the next email mid-fade.
     /// Cleared/overwritten on every selection change.
     pending_header: Option<EmailSummary>,
-    /// The most recently fetched message body, kept alongside its
-    /// mailbox/uid so Reply/Reply-All/Forward can find it again without a
-    /// second fetch - see `selected_message_reply_context`. `None` until the
-    /// first `BodyFetched` event lands, or if it's for a message other than
-    /// what's currently selected.
-    current_body: Option<(MailboxId, Uid, EmailBody)>,
+    /// Recently-viewed message bodies, so switching back to a message already
+    /// read this session - or quoting it via Reply/Reply-All/Forward - does
+    /// not re-fetch it from the server. Bounded LRU; see `BodyCache`. The
+    /// worker-side `bodies` table in `lookout-mail`'s cache complements this
+    /// with a disk layer that survives restarts.
+    body_cache: BodyCache,
+    /// Bumped on every selection change (alongside disarming
+    /// `pending_html_reveal`). The HTML reveal-fallback timeout in
+    /// `render_body` captures the value it was armed under and only reveals
+    /// if it's unchanged, so a stale timeout armed for a message the user has
+    /// already moved on from can never pop the *next* message's page open
+    /// mid-load.
+    reveal_generation: u64,
     /// The folder pane's last-selected view, loaded from disk at startup and
     /// rewritten whenever the selection changes (`select_mailbox` /
     /// `enter_unified_inbox`), so the pane reopens where the user left off -
@@ -474,7 +532,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         pending_body_request: None,
         pending_html_reveal: false,
         pending_header: None,
-        current_body: None,
+        body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),
+        reveal_generation: 0,
         last_selection: last_selection.clone(),
         restore_pending: last_selection.is_some(),
         rendered_message: None,
@@ -667,17 +726,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let bound = bound.clone();
             reply_btn.connect_clicked(move |_| {
                 let Some(summary) = bound.borrow().clone() else { return };
-                let state = state.borrow();
+                let mut state = state.borrow_mut();
                 // Only possible once the body has arrived - the composer
                 // needs it to quote. Silently a no-op until then.
-                let Some((body_mailbox, body_uid, body)) = state.current_body.as_ref() else { return };
-                if *body_mailbox != summary.mailbox || *body_uid != summary.uid {
-                    return;
-                }
+                let Some(body) = state.body_cache.get(&summary.mailbox, &summary.uid) else { return };
                 let Some(account_id) = mailbox_account_id(&summary.mailbox) else { return };
                 let Some(handle) = state.accounts.get(&account_id) else { return };
                 let from_email = handle.email.clone();
-                let prefill = crate::compose::build_reply_prefill(&summary, body, &from_email, crate::compose::ReplyMode::Reply);
+                let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, crate::compose::ReplyMode::Reply);
                 let on_done = Rc::new(|| {});
                 let composer = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done);
                 reading_stack.add_named(&composer, Some("compose"));
@@ -1025,17 +1081,57 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // initial content load was being cancelled before it started. External
     // links should ideally open in the system browser instead of just being
     // dropped - full "open externally" handling is a Phase 2 refinement.
-    web_view.connect_decide_policy(|_view, decision, decision_type| {
-        if decision_type == webkit::PolicyDecisionType::NavigationAction {
-            let is_user_gesture = decision
-                .downcast_ref::<webkit::NavigationPolicyDecision>()
-                .and_then(|d| d.navigation_action())
-                .map(|action| action.is_user_gesture())
-                .unwrap_or(false);
-            if is_user_gesture {
-                decision.ignore();
-                return true;
+    //
+    // Remote *subresources* (tracker pixels, remote images/fonts, `<iframe>`s
+    // pointing at outside URLs) are vetoed outright: they'd let external
+    // servers reach into the pane, and - the reason this matters for speed -
+    // `render_body` only reveals the page once WebKit reports `Finished`,
+    // which the document's load event waits on. A slow remote host can hold
+    // the reading pane blank for seconds; blocking these loads keeps the
+    // reveal fast. `data:` (the body itself), `cid:` (inline parts, not yet
+    // resolved but harmless) and `about:`/`file:` are all local and allowed.
+    web_view.connect_decide_policy(move |_view, decision, decision_type| {
+        let uri_is_local = |uri: &str| -> bool {
+            let scheme = uri.split(':').next().unwrap_or("");
+            matches!(scheme, "data" | "cid" | "about" | "file")
+        };
+        match decision_type {
+            webkit::PolicyDecisionType::NavigationAction => {
+                let navigation = decision.downcast_ref::<webkit::NavigationPolicyDecision>().and_then(|d| d.navigation_action());
+                let is_user_gesture = navigation.as_ref().map(|a| a.is_user_gesture()).unwrap_or(false);
+                if is_user_gesture {
+                    // A real click on a link: block it so we don't navigate
+                    // away from the loaded message body.
+                    decision.ignore();
+                    return true;
+                }
+                // A programmatic navigation (e.g. an `<iframe>` embedded in
+                // the message pointing at a remote URL) must not load. The
+                // initial `load_html()` is a `data:` URL and passes below.
+                if let Some(uri) = navigation.as_ref().and_then(|a| a.request()).and_then(|r| r.uri()) {
+                    if !uri_is_local(&uri) {
+                        decision.ignore();
+                        return true;
+                    }
+                }
             }
+            webkit::PolicyDecisionType::Response => {
+                // Veto remote subresource responses (images, fonts, scripts)
+                // so the page's load event isn't held hostage by external
+                // servers. The main frame's own resource - the `data:` body
+                // URL - is always let through.
+                if let Some(response) = decision.downcast_ref::<webkit::ResponsePolicyDecision>() {
+                    if !response.is_main_frame_main_resource() {
+                        if let Some(uri) = response.request().and_then(|r| r.uri()) {
+                            if !uri_is_local(&uri) {
+                                decision.ignore();
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         false
     });
@@ -1103,6 +1199,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
         let armed = state_for_reveal.borrow_mut().pending_html_reveal;
         if armed {
+            tracing::debug!("WebKit load finished; revealing reading pane");
             state_for_reveal.borrow_mut().pending_html_reveal = false;
             reveal_message_page(&reading_stack_for_reveal, &content_stack_for_reveal, "html");
         }
@@ -1918,6 +2015,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let mut st = state.borrow_mut();
                     st.pending_body_request = None;
                     st.pending_html_reveal = false;
+                    st.reveal_generation += 1;
                     st.pending_header = None;
                     st.rendered_message = None;
                     drop(st);
@@ -1947,18 +2045,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // shown (the pane is on "empty" by then, so it can't flash).
             state.borrow_mut().pending_header = Some(summary);
 
-            let body_is_cached = {
-                let st = state.borrow();
-                st.current_body
-                    .as_ref()
-                    .is_some_and(|(body_mailbox, body_uid, _)| body_mailbox == &mailbox && body_uid == &uid)
-            };
+            let body_is_cached = state.borrow_mut().body_cache.get(&mailbox, &uid).is_some();
             let should_request = {
                 let mut st = state.borrow_mut();
                 // Disarm any body load still in flight for the previously
                 // selected message, so its `Finished` can't reveal a stale
-                // email once the user has moved on.
+                // email once the user has moved on. The reveal-fallback
+                // timeouts capture `reveal_generation` at arm time, so the
+                // bump here also invalidates any timeout from an earlier
+                // selection whose load hasn't finished yet.
                 st.pending_html_reveal = false;
+                st.reveal_generation += 1;
                 let should_request = !body_is_cached && st.pending_body_request.as_ref() != Some(&request);
                 if should_request || st.pending_body_request.as_ref() != Some(&request) {
                     st.pending_body_request = Some(request.clone());
@@ -1969,6 +2066,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let st = state.borrow();
                 if let Some(account_id) = mailbox_account_id(&mailbox) {
                     if let Some(handle) = st.accounts.get(&account_id) {
+                        tracing::debug!(?mailbox, uid = uid.0, "FetchBody: dispatching to account actor");
                         let _ = handle.cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox.clone(), uid });
                     }
                 }
@@ -1978,8 +2076,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // with this app's existing no-confirmation-dialog convention.
             reading_stack.set_visible_child_name("empty");
             if body_is_cached {
-                let body = state.borrow().current_body.as_ref().map(|(_, _, body)| body.clone());
+                let body = state.borrow_mut().body_cache.get(&mailbox, &uid);
                 if let Some(body) = body {
+                    tracing::debug!(?mailbox, uid = uid.0, "FetchBody: serving from in-memory cache");
                     render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
                 }
             }
@@ -2407,12 +2506,15 @@ fn connect_account(
                     let should_render = {
                         let mut st = state.borrow_mut();
                         let is_current = body_request_matches(&mailbox, &uid, st.pending_body_request.as_ref());
-                        if is_current {
-                            st.current_body = Some((mailbox.clone(), uid, body.clone()));
-                        }
+                        // Cache the body regardless of whether the user is
+                        // still looking at this message - a fetch that
+                        // completed after they moved on is still worth
+                        // keeping for when they come back.
+                        st.body_cache.insert(mailbox.clone(), uid, body.clone());
                         is_current
                     };
                     if should_render {
+                        tracing::debug!(?mailbox, uid = uid.0, "FetchBody: body arrived on UI thread");
                         render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
                     }
                 }
@@ -2997,10 +3099,10 @@ fn selected_message_command_target(message_list: &MessageListModel, state: &Rc<R
 /// Resolves the currently-selected message plus its already-fetched body,
 /// for the Reply/Reply-All/Forward button handlers. Returns `None` if
 /// nothing is selected, a section header is selected, its account has
-/// disconnected, or the cached
-/// `current_body` doesn't match the selection (its body hasn't arrived yet,
-/// or is stale from a previous selection) - the calling handler is then a
-/// silent no-op, same convention as `selected_message_command_target`. The
+/// disconnected, or the selected message's body isn't in the in-memory cache
+/// (its body hasn't arrived yet, or it's outside the cache's bounded recency
+/// window) - the calling handler is then a silent no-op, same convention as
+/// `selected_message_command_target`. The
 /// "From" identity is the message's owning account, so replies composed from
 /// the unified view go out from the right address.
 fn selected_message_reply_context(
@@ -3009,14 +3111,11 @@ fn selected_message_reply_context(
 ) -> Option<(EmailSummary, EmailBody, String, async_channel::Sender<AccountCommand>)> {
     let summary = message_list.selected_summary()?;
 
-    let st = state.borrow();
-    let (body_mailbox, body_uid, body) = st.current_body.as_ref()?;
-    if *body_mailbox != summary.mailbox || *body_uid != summary.uid {
-        return None;
-    }
     let account_id = mailbox_account_id(&summary.mailbox)?;
+    let mut st = state.borrow_mut();
+    let body = st.body_cache.get(&summary.mailbox, &summary.uid)?;
     let handle = st.accounts.get(&account_id)?;
-    Some((summary, body.clone(), handle.email.clone(), handle.cmd_tx.clone()))
+    Some((summary, body, handle.email.clone(), handle.cmd_tx.clone()))
 }
 
 fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String {
@@ -3294,7 +3393,8 @@ mod tests {
             pending_body_request: None,
             pending_html_reveal: false,
             pending_header: None,
-            current_body: None,
+            body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),
+            reveal_generation: 0,
             last_selection: None,
             restore_pending: false,
             rendered_message: None,
@@ -3403,7 +3503,7 @@ fn render_body(
     // Remember what's being rendered so a later re-selection of the same
     // message (see the selection handler's `already_shown` guard) can be
     // recognized as a no-op instead of another crossfade.
-    state.borrow_mut().rendered_message = Some((mailbox, uid));
+    state.borrow_mut().rendered_message = Some((mailbox.clone(), uid));
     // Apply the header for the message being rendered now. The selection
     // handler stores the summary here instead of updating the header
     // immediately, so the previous message's header stays on screen through
@@ -3451,6 +3551,29 @@ fn render_body(
             // message the user has already moved on from can never reveal.
             state.borrow_mut().pending_html_reveal = true;
             web_view.load_html(html, None);
+            tracing::debug!(?mailbox, uid = uid.0, "render_body: load_html issued");
+            // The reveal above is gated on WebKit's `Finished` event, but a
+            // slow/hung load must not be able to hold the pane on "empty"
+            // indefinitely. Arm a fallback that reveals the page after a
+            // short grace period if the load hasn't finished. It captures
+            // `reveal_generation` at arm time and only reveals if the counter
+            // is unchanged, so a stale timeout from a message the user has
+            // already left can't pop the next message's page open mid-load
+            // (the selection handler bumps the counter when it disarms
+            // `pending_html_reveal`).
+            let generation = state.borrow().reveal_generation;
+            let state_for_timeout = state.clone();
+            let reading_stack_for_timeout = reading_stack.clone();
+            let content_stack_for_timeout = content_stack.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(HTML_REVEAL_TIMEOUT_MS), move || {
+                let mut st = state_for_timeout.borrow_mut();
+                let still_armed = st.pending_html_reveal && st.reveal_generation == generation;
+                if still_armed {
+                    st.pending_html_reveal = false;
+                    drop(st);
+                    reveal_message_page(&reading_stack_for_timeout, &content_stack_for_timeout, "html");
+                }
+            });
             return;
         }
     }
