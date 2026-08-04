@@ -28,16 +28,29 @@ pub struct ComposedMessage {
     pub in_reply_to: Option<String>,
     /// RFC 5322 `References`, when replying to a message.
     pub references: Vec<String>,
+    /// Pre-generated `Message-ID` (bare, no angle brackets). Drafts set this
+    /// to a stable per-compose-session id so every autosave carries the same
+    /// `Message-ID` - that's how a later save finds and replaces the earlier
+    /// one server-side. `None` for ordinary sends, which get a fresh id each
+    /// time (see `new_message_id`).
+    pub message_id: Option<String>,
+}
+
+/// Generates a fresh globally-unique bare `Message-ID` (no angle brackets -
+/// `mail_builder`'s header writer adds them).
+pub fn new_message_id() -> String {
+    format!("{}@lookout.local", uuid::Uuid::new_v4())
 }
 
 /// Builds the raw RFC 5322 message bytes for `msg`, generating a fresh
-/// `Message-ID`. Returns the bytes plus the generated Message-ID (the caller
-/// may want it for thread-tracking) and the flat recipient list (to/cc/bcc
-/// combined) needed for the SMTP envelope, since MIME headers alone aren't
-/// necessarily what the envelope's `RCPT TO` list should be (bcc must be in
-/// the envelope but never in a header).
+/// `Message-ID` unless the message carries a pre-generated one (drafts, see
+/// `ComposedMessage::message_id`). Returns the bytes plus the Message-ID in
+/// use (the caller may want it for thread-tracking) and the flat recipient
+/// list (to/cc/bcc combined) needed for the SMTP envelope, since MIME
+/// headers alone aren't necessarily what the envelope's `RCPT TO` list
+/// should be (bcc must be in the envelope but never in a header).
 pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>) {
-    let message_id = format!("{}@lookout.local", uuid::Uuid::new_v4());
+    let message_id = msg.message_id.clone().unwrap_or_else(new_message_id);
 
     let mut builder = MessageBuilder::new()
         .message_id(message_id.clone())
@@ -128,6 +141,7 @@ mod tests {
             html_body: html,
             in_reply_to: None,
             references: vec![],
+            message_id: None,
         }
     }
 
@@ -160,5 +174,20 @@ mod tests {
         let raw = raw_to_string(&sample_message(Some(String::new())));
         assert!(!raw.to_lowercase().contains("text/html"));
         assert!(raw.contains("plain part"));
+    }
+
+    #[test]
+    fn pregenerated_message_id_is_used_verbatim() {
+        let mut msg = sample_message(None);
+        msg.message_id = Some("stable-draft-id@lookout.local".to_string());
+        let (raw, message_id, _) = build_raw_message(&msg);
+        let raw = String::from_utf8(raw).unwrap();
+        assert_eq!(message_id, "stable-draft-id@lookout.local");
+        assert!(raw.contains("Message-ID: <stable-draft-id@lookout.local>"), "raw message:\n{raw}");
+    }
+
+    #[test]
+    fn generated_message_ids_are_unique() {
+        assert_ne!(new_message_id(), new_message_id());
     }
 }

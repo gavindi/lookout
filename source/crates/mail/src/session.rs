@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_imap::Session;
 use futures::TryStreamExt;
 use lookout_core::mailbox::role_from_special_use;
-use lookout_core::{AccountId, EmailBody, EmailSummary, Mailbox, MailboxId, MailboxRole, Uid, UidValidity};
+use lookout_core::{AccountId, EmailBody, EmailSummary, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, UidValidity};
 
 use crate::auth::XOAuth2Authenticator;
 use crate::body::{parse_body, preview_from_raw};
@@ -149,11 +149,44 @@ pub enum AccountCommand {
         uid: Uid,
         until: chrono::DateTime<chrono::Utc>,
     },
+    /// Adds and/or removes IMAP system flags on one message (`STORE`), for
+    /// the client-driven flag changes this app makes: marking a message read
+    /// when it's opened (bodies are fetched with `BODY.PEEK`, so the server
+    /// never sets `\Seen` on its own) and the toolbar's Flag/Unflag toggle.
+    /// Unlike `FetchBody`, this doesn't require `mailbox` to be the
+    /// currently-open folder - it SELECTs the message's own folder if
+    /// needed, and the main loop re-selects the user's folder before the
+    /// next IDLE.
+    StoreFlags {
+        mailbox: MailboxId,
+        uid: Uid,
+        add: Vec<SystemFlagBit>,
+        remove: Vec<SystemFlagBit>,
+    },
     /// Kick off background body prefetch for all mailboxes. The prefetch
     /// runs cooperatively in batches between IDLE cycles, fetching full
     /// message bodies and caching them on disk so subsequent message views
     /// are instant. Triggered automatically after the initial sync.
     PrefetchBodies,
+    /// Best-effort draft autosave: build `msg` into a raw RFC 5322 message
+    /// and `APPEND` it to the account's Drafts mailbox with `\Draft \Seen`
+    /// flags. `msg.message_id` carries a stable per-compose-session id; with
+    /// `replace` set, any draft already stored under that `Message-ID` is
+    /// deleted first, so repeated autosaves never accumulate duplicates. If
+    /// the account has no Drafts mailbox yet, one is `CREATE`d. Failures are
+    /// warning-level and silent in the UI (a draft is housekeeping, not a
+    /// user action - same convention as the Sent `APPEND` after sending).
+    SaveDraft {
+        msg: ComposedMessage,
+        replace: bool,
+    },
+    /// Best-effort counterpart of `SaveDraft`: permanently remove the draft
+    /// stored under `message_id` from the Drafts mailbox - sent right before
+    /// `SendMessage` when the message being sent was draft-autosaved, so the
+    /// sent mail doesn't linger in Drafts too.
+    DeleteDraft {
+        message_id: String,
+    },
     Shutdown,
 }
 
@@ -161,10 +194,25 @@ pub enum AccountCommand {
 pub enum AccountEvent {
     ConnectionStateChanged(ConnectionState),
     FoldersUpdated(Vec<Mailbox>),
-    MessagesUpdated { mailbox: MailboxId, messages: Vec<EmailSummary> },
-    BodyFetched { mailbox: MailboxId, uid: Uid, body: EmailBody },
+    MessagesUpdated {
+        mailbox: MailboxId,
+        messages: Vec<EmailSummary>,
+    },
+    BodyFetched {
+        mailbox: MailboxId,
+        uid: Uid,
+        body: EmailBody,
+    },
     SendCompleted,
-    MessageMoved { role: MailboxRole },
+    /// A `SaveDraft` request landed server-side; `message_id` is the draft's
+    /// stable `Message-ID`, so only the compose session that owns that id
+    /// acts on it.
+    DraftSaved {
+        message_id: String,
+    },
+    MessageMoved {
+        role: MailboxRole,
+    },
     MessageSnoozed,
     Error(String),
 }
@@ -452,6 +500,43 @@ async fn connect_and_run(
                         let _ = events.send(AccountEvent::Error(format!("Couldn't send message: {e}"))).await;
                     }
                 },
+                AccountCommand::SaveDraft { msg, replace } => {
+                    let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
+                    match save_draft(&mut session, &folders, &account_id, msg, replace).await {
+                        Ok(message_id) => {
+                            let _ = events.send(AccountEvent::DraftSaved { message_id }).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("draft save failed: {e}");
+                        }
+                    }
+                    // The draft path SELECTs the Drafts mailbox; bring the
+                    // session back to the user's folder so IDLE and the next
+                    // command operate on what's actually on screen.
+                    session.select(&current_mailbox_name).await?;
+                    session_selected = current_mailbox_id.clone();
+                    // `save_draft` may have CREATEd a Drafts mailbox the
+                    // folder list doesn't know about; refresh the list so
+                    // the next save finds it (instead of CREATE-ing again)
+                    // and the folder tree shows it. Same pattern as
+                    // `MoveMessage`.
+                    if !had_drafts_folder {
+                        folders = list_mailboxes(&mut session, &account_id).await?;
+                        if let Some(cache) = cache {
+                            if let Err(e) = cache.replace_mailboxes(&account_id, &folders) {
+                                tracing::warn!("failed to cache mailbox list: {e}");
+                            }
+                        }
+                        let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
+                    }
+                }
+                AccountCommand::DeleteDraft { message_id } => {
+                    if let Err(e) = delete_draft(&mut session, &folders, &account_id, &message_id).await {
+                        tracing::warn!("draft delete failed: {e}");
+                    }
+                    session.select(&current_mailbox_name).await?;
+                    session_selected = current_mailbox_id.clone();
+                }
                 // Already connected - nothing to reconnect. This variant
                 // only does something useful while backed off between
                 // connection attempts, see `run_account_session`.
@@ -492,6 +577,53 @@ async fn connect_and_run(
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
                     sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                     session_selected = current_mailbox_id.clone();
+                }
+                AccountCommand::StoreFlags { mailbox, uid, add, remove } => {
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    // A flag change is triggered by the user's own selection,
+                    // which can race a folder switch (and in the unified
+                    // "All Inboxes" view the message needn't be in the folder
+                    // this session has open at all). SELECTing here rather
+                    // than dropping the command keeps mark-as-read reliable;
+                    // the top of the loop puts the session back on the user's
+                    // folder before the next IDLE wait.
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    match store_flags(&mut session, uid, &add, &remove).await {
+                        Ok(()) => {
+                            // The server is now authoritative-and-changed;
+                            // patch the cached summary to match so the list
+                            // repaints from cache without a re-fetch (and so
+                            // a restart before the next sync doesn't show the
+                            // message unread again).
+                            let patched = match cache {
+                                Some(cache) => match cache.update_flags(&mailbox, uid, &add, &remove) {
+                                    Ok(patched) => patched,
+                                    Err(e) => {
+                                        tracing::warn!("failed to update cached flags: {e}");
+                                        false
+                                    }
+                                },
+                                None => false,
+                            };
+                            if patched {
+                                emit_cached_messages(cache, &mailbox, events).await;
+                            } else if mailbox == current_mailbox_id {
+                                // No cache (or the uid fell outside the
+                                // cached window): re-sync so the UI still
+                                // sees the new flags.
+                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                                session_selected = current_mailbox_id.clone();
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't update message flags: {e}"))).await;
+                        }
+                    }
                 }
                 AccountCommand::PrefetchBodies => {
                     tracing::debug!("PrefetchBodies command received");
@@ -624,6 +756,27 @@ async fn connect_and_run(
     }
 }
 
+/// Adds and/or removes system flags on `uid` in the currently selected
+/// mailbox. Uses `.SILENT` so the server doesn't echo an untagged FETCH per
+/// affected message: the caller already knows the resulting flag set (it
+/// applies the same add/remove to its cached summary), and the next
+/// `sync_mailbox` re-reads the real flags from the server regardless.
+///
+/// Add and remove are two separate STOREs because IMAP has no combined form;
+/// an empty side is skipped rather than sent as an empty flag list, which
+/// servers are entitled to reject.
+async fn store_flags(session: &mut Session<ImapStream>, uid: Uid, add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<()> {
+    for (op, flags) in [('+', add), ('-', remove)] {
+        if flags.is_empty() {
+            continue;
+        }
+        let list = flags.iter().map(|f| f.as_imap_flag()).collect::<Vec<_>>().join(" ");
+        let query = format!("{op}FLAGS.SILENT ({list})");
+        let _: Vec<_> = session.uid_store(uid.0.to_string(), &query).await?.try_collect().await?;
+    }
+    Ok(())
+}
+
 /// Moves `uid` from the currently selected mailbox into the account's
 /// mailbox with special-use role `role`, via IMAP MOVE (RFC 6851) if the
 /// server advertises it, else COPY + STORE `\Deleted` + EXPUNGE.
@@ -669,6 +822,74 @@ async fn send_message(config: &AccountConfig, credentials: &dyn CredentialProvid
         tracing::warn!("message was sent but APPEND to Sent failed: {e}");
     }
     Ok(())
+}
+
+/// The account's Drafts folder path from the latest folder list, or `None`
+/// if it has no Drafts mailbox (yet).
+fn drafts_path<'a>(folders: &'a [Mailbox], account_id: &AccountId) -> Option<&'a str> {
+    let drafts = folders.iter().find(|m| matches!(m.role, MailboxRole::Drafts))?;
+    drafts.id.0.strip_prefix(&format!("{}:", account_id.0))
+}
+
+/// Permanently removes every message in the *currently selected* mailbox
+/// whose `Message-ID` header equals `message_id` (bare id, no brackets).
+/// `UID SEARCH HEADER` + `\Deleted` + EXPUNGE rather than MOVE so it works
+/// on servers without RFC 6851; the EXPUNGE-everything-`\Deleted` caveat
+/// from `move_message_to_role` applies, and is harmless here because this
+/// crate only ever sets `\Deleted` on the very uids it just flagged.
+async fn purge_by_message_id(session: &mut Session<ImapStream>, message_id: &str) -> Result<()> {
+    let uids = session.uid_search(format!("HEADER Message-Id <{message_id}>")).await?;
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let uid_set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    Ok(())
+}
+
+/// Saves `msg` as a draft: `APPEND`s the raw message to the account's
+/// Drafts mailbox with `\Draft \Seen` flags (drafts must not show as
+/// unread). With `replace`, any draft already stored under the same
+/// `Message-ID` is purged first so autosaves update in place instead of
+/// accumulating. Accounts without a Drafts mailbox get one `CREATE`d -
+/// servers aren't required to pre-create it, and refusing to autosave on
+/// such an account would be a worse surprise than a new folder. Leaves the
+/// session SELECTed on the Drafts mailbox; the caller re-selects the
+/// user's folder. Returns the draft's `Message-ID`.
+async fn save_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], account_id: &AccountId, msg: ComposedMessage, replace: bool) -> Result<String> {
+    let path = match drafts_path(folders, account_id) {
+        Some(path) => path.to_string(),
+        None => {
+            tracing::debug!("no Drafts mailbox in folder list; creating one");
+            // Tolerate a CREATE failure: the folder may exist server-side
+            // already (created by another client since our last LIST, or
+            // excluded from it) - the SELECT below is the real test.
+            if let Err(e) = session.create("Drafts").await {
+                tracing::debug!("CREATE Drafts failed (continuing, it may already exist): {e}");
+            }
+            "Drafts".to_string()
+        }
+    };
+    let (raw, message_id, _) = build_raw_message(&msg);
+    session.select(&path).await?;
+    if replace {
+        purge_by_message_id(session, &message_id).await?;
+    }
+    session.append(&path, Some("\\Draft \\Seen"), None, raw.as_slice()).await?;
+    Ok(message_id)
+}
+
+/// Deletes the draft stored under `message_id` from the account's Drafts
+/// mailbox (a no-op when the account has no Drafts mailbox or the draft
+/// isn't there). Leaves the session SELECTed on the Drafts mailbox; the
+/// caller re-selects the user's folder.
+async fn delete_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], account_id: &AccountId, message_id: &str) -> Result<()> {
+    let Some(path) = drafts_path(folders, account_id) else {
+        return Ok(());
+    };
+    session.select(path).await?;
+    purge_by_message_id(session, message_id).await
 }
 
 async fn login(config: &AccountConfig, credential: Credential) -> Result<Session<ImapStream>> {

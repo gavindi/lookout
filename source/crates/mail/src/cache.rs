@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, Uid, UidValidity};
+use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
 use rusqlite::Connection;
 
 use crate::error::Result;
@@ -264,6 +264,40 @@ impl Cache {
         Ok(previews)
     }
 
+    /// Applies a flag change to one cached summary, mirroring the `STORE`
+    /// the session just issued against the server. Returns `false` if the
+    /// message isn't in the cached window (nothing to update).
+    ///
+    /// The cached row is patched in place rather than re-fetched: a
+    /// mark-as-read is a single-uid change the client already knows the
+    /// outcome of, and the next `sync_mailbox` overwrites the whole window
+    /// from the server anyway - so this only has to hold until then.
+    pub fn update_flags(&self, mailbox_id: &MailboxId, uid: Uid, add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+        let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
+        let Some(data) = rows.next().transpose()? else {
+            return Ok(false);
+        };
+        let Ok(mut summary) = serde_json::from_str::<EmailSummary>(&data) else {
+            return Ok(false);
+        };
+        for flag in add {
+            summary.flags.insert(*flag);
+        }
+        for flag in remove {
+            summary.flags.remove(flag);
+        }
+        let data = serde_json::to_string(&summary)?;
+        drop(rows);
+        drop(stmt);
+        conn.execute(
+            "UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3",
+            rusqlite::params![data, mailbox_id.0, uid.0],
+        )?;
+        Ok(true)
+    }
+
     /// Records that `uid` (in `mailbox_id`) should be hidden from
     /// `MessagesUpdated` until `until` - purely client-side state, IMAP has
     /// no native snooze concept. `INSERT OR REPLACE` so re-snoozing an
@@ -407,6 +441,35 @@ mod tests {
         assert_eq!(previews.len(), 1);
         assert_eq!(previews.get(&Uid(1)).map(String::as_str), Some("Truffle Security Co. says it scanned..."));
         assert!(!previews.contains_key(&Uid(2)));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// What makes a mark-as-read stick between the `STORE` and the next full
+    /// sync: the patched row must survive a reload, and a uid outside the
+    /// cached window must report "nothing updated" rather than erroring.
+    #[test]
+    fn patches_flags_on_a_cached_summary() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None)]).unwrap();
+        assert!(cache.load_messages(&mailbox_id).unwrap()[0].is_unread());
+
+        assert!(cache.update_flags(&mailbox_id, Uid(1), &[SystemFlagBit::Seen, SystemFlagBit::Flagged], &[]).unwrap());
+        let loaded = &cache.load_messages(&mailbox_id).unwrap()[0];
+        assert!(!loaded.is_unread());
+        assert!(loaded.is_starred());
+
+        assert!(cache.update_flags(&mailbox_id, Uid(1), &[], &[SystemFlagBit::Flagged]).unwrap());
+        let loaded = &cache.load_messages(&mailbox_id).unwrap()[0];
+        assert!(!loaded.is_unread());
+        assert!(!loaded.is_starred());
+
+        // A uid that isn't in the cached window is a no-op, not an error.
+        assert!(!cache.update_flags(&mailbox_id, Uid(99), &[SystemFlagBit::Seen], &[]).unwrap());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

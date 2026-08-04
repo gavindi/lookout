@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                         got_body = true;
                     }
                     AccountEvent::SendCompleted => println!("send completed"),
+                    AccountEvent::DraftSaved { message_id } => println!("draft saved: {message_id}"),
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed => {}
                     AccountEvent::Error(e) => println!("ERROR: {e}"),
                 }

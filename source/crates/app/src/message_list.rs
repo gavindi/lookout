@@ -227,6 +227,11 @@ fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>) -
     ListLayout::Grouped(sections)
 }
 
+/// Message identity, the two flag-derived styles (unread, flagged), and the
+/// four text fields a row renders. Named rather than written inline so the
+/// tuple stays under clippy's type-complexity threshold.
+type MessageRowKey = (MailboxId, Uid, bool, bool, DateTime<Utc>, Option<String>, String, Option<String>);
+
 /// A compact fingerprint of the fields one message-list row displays, keyed
 /// to keep the row distinct from any other. Used to detect "nothing changed"
 /// and skip a rebuild.
@@ -236,9 +241,13 @@ fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>) -
 /// *second* `MessagesUpdated` that is otherwise byte-identical to the first
 /// (see `lookout_mail::session::sync_mailbox`'s two-phase sync), so omitting
 /// it would silently discard every snippet.
-fn message_row_key(m: &EmailSummary) -> (MailboxId, Uid, bool, DateTime<Utc>, Option<String>, String, Option<String>) {
+fn message_row_key(m: &EmailSummary) -> MessageRowKey {
     let from = m.from.first().map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
-    (m.mailbox.clone(), m.uid, m.is_unread(), m.date, m.subject.clone(), from, m.preview.clone())
+    // Read *and* flagged state are both part of the key: each drives how the
+    // row is drawn, so a `STORE` that only changes a flag must still count as
+    // a change - otherwise `repopulate`'s no-op check would swallow the
+    // rebuild and the row would keep its old accent bar / flag icon.
+    (m.mailbox.clone(), m.uid, m.is_unread(), m.is_starred(), m.date, m.subject.clone(), from, m.preview.clone())
 }
 
 /// The list's contents as last rendered, plus the sort that produced them -

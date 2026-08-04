@@ -17,13 +17,13 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [x] Folder tree UI wired to live data (`Gtk.TreeListModel`)
 - [x] Message list UI wired to live data (`message_list.rs`) - Outlook-style rows (initials avatar, sender/subject/date columns, dimmed body preview, unread accent), grouped under collapsible date sections (Today / Yesterday / This Week / … / Older) on a `Gtk.TreeListModel`, plus a pane header naming the open folder/account with Sync, sort-key (date/sender/subject), sort-direction and folder-favorite controls. `thread_key` is computed but conversations are still not grouped in the UI (see Phase 2's collapsible thread UI)
   - [x] Body previews - `sync_mailbox` runs a second `BODY.PEEK[]<0.16384>` pass for previewless messages and the snippets are carried across resyncs via `Cache::load_previews`
-  - [ ] Message-list filter (unread/flagged) - the header's Filter button is a disabled placeholder pending the unread/flagged plumbing and new `AccountCommand`s
+  - [ ] Message-list filter (unread/flagged) - the header's Filter button is still a disabled placeholder, but no longer for want of flag state (see Phase 2's flag plumbing). What it needs now is an unfiltered source of truth to filter *from*: `MessageListModel`'s `displayed` snapshot is what every rebuild diffs against, so filtering in place would make the filtered subset the thing the next sync is compared to
 - [x] Message viewer: body fetch → `mail-parser` → sandboxed WebView with `Gtk.TextView` fallback
   - [ ] Switch from whole-message fetch to `BODYSTRUCTURE`-driven partial fetch
   - [ ] Inline `cid:` image resolution via a custom WebKit URI scheme handler
 - [x] Compose window: plain-text body, `mail-builder` MIME, `lettre` SMTP send (XOAUTH2/password), `APPEND` to Sent - validated live end-to-end against Gmail
   - [x] reply/reply-all/forward entry points - pre-filled subject/quoted body/`In-Reply-To`/`References` threading, Reply-All carries over To/Cc minus the account's own address. New/Reply/Reply-All/Forward all open in place of the reading pane's content (a `"compose"` page in its `gtk::Stack`) rather than a separate modal window
-  - [ ] Rich-text/contenteditable WebView body (currently plain-text only, per the plan's own descope fallback)
+  - [x] Rich-text/contenteditable WebView body - a "Rich text" switch in the composer flips between the plain `Gtk.TextView` and a contenteditable WebKit `WebView` with a formatting toolbar (bold/italic/underline/strikethrough, lists, font size, text color, links); rich send emits `multipart/alternative` HTML+text, and the default mode is settable under Config → Mail
   - [ ] Recipient chip widget with autocomplete (currently comma-separated text)
   - [ ] Autosave drafts
   - [ ] Multiple sending identities (currently always sends as the account's own address)
@@ -57,6 +57,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [ ] Collapsible thread UI (reuse the folder tree's `TreeListModel` trick)
 - [ ] Color-tag keywords (`$Lookout-tag-*` namespace) + tag management
 - [ ] Recipient-chip/autocomplete composer widget
+- [x] Message flags (`STORE`) - `AccountCommand::StoreFlags` adds/removes IMAP system flags on a message, backing two things: opening a message in the reading pane marks it `\Seen` (bodies are fetched with `BODY.PEEK`, so the server never sets it), and the toolbar's Flag button toggles `\Flagged`, drawn as an amber marker in the message row. The command SELECTs the message's own folder when it isn't the open one - mark-as-read races folder switches, and the unified view mixes mailboxes - and the main loop's existing re-select puts the session back before the next IDLE. Successful stores patch the cached summary in place (`Cache::update_flags`) and re-emit from cache rather than re-syncing, so a mark-as-read costs one `STORE` and no fetch
 - [x] Unified mailbox + cross-account views; full multi-account switcher
 - [ ] Batch actions + `Gtk.MultiSelection`
 - [x] Hover quick-actions
@@ -92,6 +93,6 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 
 ## Phase 5 — Settings/theming (roadmap)
 
-- [ ] `AdwPreferencesWindow` mirroring Bulwark's tab taxonomy (General/Appearance/Layout/Mail/Privacy/Apps/Advanced) - in-window Config view exists (`config_view.rs`, third nav-rail button) with a live account overview, a working Appearance → "Animate transitions" switch, and a working Advanced → "Clear all caches" action; the remaining sections are still disabled placeholders
-- [ ] GSettings (scalars) + serde config file (relational data: identities, folder-role overrides, tag colors) - nothing persists yet, so the layout toggles, "Animate transitions", the sort key/direction, and folder favorites are all session-only
+- [ ] `AdwPreferencesWindow` mirroring Bulwark's tab taxonomy (General/Appearance/Layout/Mail/Privacy/Apps/Advanced) - in-window Config view exists (`config_view.rs`, third nav-rail button) with a live account overview, a live Appearance section ("Animate transitions" switch plus the "Window background" image picker and "Restore default background" action), a live Mail section ("Load images from the web" and "Rich text" switches), and a working Advanced → "Clear all caches" action; the General/Layout/Privacy/Apps sections are still disabled placeholders
+- [ ] GSettings (scalars) + serde config file (relational data: identities, folder-role overrides, tag colors) - the layout toggles, "Animate transitions", the sort key/direction, folder favorites, and the Mail-section switches are still session-only; only calendar colours and the window-background choice persist today, as best-effort plain files under `$XDG_CONFIG_HOME/lookout/`
 - [ ] libadwaita named-color theming; optional bundled flat-token themes (web-only CSS-injection "skin" themes have no native equivalent and are out of scope)

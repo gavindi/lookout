@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, CalendarId, CalendarInfo, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, Uid};
+use lookout_core::{AccountId, CalendarId, CalendarInfo, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};
@@ -68,6 +68,7 @@ struct MessageRowWidgets {
     avatar: gtk::Label,
     sender_label: gtk::Label,
     subject_label: gtk::Label,
+    flag_icon: gtk::Image,
     date_label: gtk::Label,
     preview_label: gtk::Label,
     action_box: gtk::Box,
@@ -228,6 +229,13 @@ struct UiState {
     /// sessions, read when the composer opens. Session-only until GSettings
     /// lands, matching the other Phase 5 preferences.
     rich_text_default: bool,
+    /// Relay to the currently-open composer for its draft-autosave
+    /// confirmations: the account event loops forward `DraftSaved`
+    /// Message-Ids here, and the composer flips its "Saving draft…" label to
+    /// "Draft saved" when its own id arrives. `None` while no composer is
+    /// open; replaced whenever a new composer opens (dropping the previous
+    /// sender lets the old composer's consumer exit).
+    draft_saved_tx: Option<async_channel::Sender<String>>,
 }
 
 /// Per-calendar-account state, kept separate from `UiState`/`AccountHandle`
@@ -381,6 +389,11 @@ fn install_paned_css() {
         }
         .message-accent-bar.unread {
             background-color: #4d9dff;
+        }
+        /* Amber rather than the list's blue: the flag has to read as a
+           separate axis from unread, which owns every blue accent here. */
+        .message-flag-icon {
+            color: #e5a50a;
         }
         .message-sender-unread,
         .message-subject-unread,
@@ -577,6 +590,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         favorites: HashSet::new(),
         load_remote_images: false,
         rich_text_default: true,
+        draft_saved_tx: None,
     }));
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
@@ -623,9 +637,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let sender_label = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let subject_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let date_label = gtk::Label::builder().xalign(1.0).build();
+        // Sits between the expanding subject and the date, so a flagged row
+        // shows its marker without shifting the date column - hidden (not
+        // just blank) on unflagged rows so it takes no width at all there.
+        let flag_icon = gtk::Image::builder()
+            .icon_name(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"]))
+            .pixel_size(12)
+            .css_classes(["message-flag-icon"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
         top_row.append(&sender_label);
         top_row.append(&subject_label);
+        top_row.append(&flag_icon);
         top_row.append(&date_label);
 
         // Spans the full row and ellipsizes, so the snippet shows as much of
@@ -771,7 +796,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let from_email = handle.email.clone();
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, crate::compose::ReplyMode::Reply);
                 let on_done = Rc::new(|| {});
-                let composer = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done, state.rich_text_default);
+                let (composer, draft_tx) = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done, state.rich_text_default);
+                state.draft_saved_tx = Some(draft_tx);
                 reading_stack.add_named(&composer, Some("compose"));
                 reading_stack.set_visible_child_name("compose");
             });
@@ -789,6 +815,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     avatar,
                     sender_label,
                     subject_label,
+                    flag_icon,
                     date_label,
                     preview_label,
                     action_box,
@@ -888,6 +915,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 } else {
                     widgets.accent.remove_css_class("unread");
                 }
+                widgets.flag_icon.set_visible(summary.is_starred());
 
                 *widgets.bound.borrow_mut() = Some((**summary).clone());
             }
@@ -959,8 +987,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .css_classes(["flat", "list-header-action"])
         .valign(gtk::Align::Center)
         .build();
-    // Honest-disabled, like the Flag button in the command toolbar: a real
-    // filter needs unread/flagged plumbing that doesn't exist yet.
+    // Still honest-disabled, but no longer for want of flag state: read and
+    // flagged are both live now (see `AccountCommand::StoreFlags`). What's
+    // missing is the filter itself - a filtered list needs its own unfiltered
+    // source of truth, since `MessageListModel`'s `displayed` snapshot is
+    // what a rebuild diffs against and would otherwise become the filtered
+    // subset.
     let list_filter_button = gtk::Button::builder()
         .icon_name(themed_icon_name(&["funnel-symbolic", "view-filter-symbolic", "edit-find-symbolic"]))
         .tooltip_text("Filter")
@@ -1416,10 +1448,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Command toolbar row. `compose_button`, `reply_button`,
     // `reply_all_button`, `forward_button`, `delete_button`,
-    // `archive_button`, `report_button`, and `snooze_button` are backed by
-    // real functionality; `flag_button`/`more_button` mirror Outlook's row
-    // visually but are disabled since Lookout doesn't implement
-    // flag/unflag or the "More" menu yet.
+    // `archive_button`, `report_button`, `flag_button`, and `snooze_button`
+    // are backed by real functionality; `more_button` mirrors Outlook's row
+    // visually but is disabled since Lookout doesn't implement the "More"
+    // menu yet.
     let reply_button = gtk::Button::from_icon_name("mail-reply-sender-symbolic");
     reply_button.set_tooltip_text(Some("Reply"));
     let reply_all_button = gtk::Button::from_icon_name("mail-reply-all-symbolic");
@@ -1434,7 +1466,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     report_button.set_tooltip_text(Some("Report"));
     let flag_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
     flag_button.set_tooltip_text(Some("Flag/Unflag"));
-    flag_button.set_sensitive(false);
     let snooze_button = gtk::Button::from_icon_name("appointment-soon-symbolic");
     snooze_button.set_tooltip_text(Some("Snooze"));
     let more_button = gtk::Button::from_icon_name("view-more-symbolic");
@@ -2073,6 +2104,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let rich_text_default = state.borrow().rich_text_default;
             drop(st);
             show_composer_in_reading_pane(
+                &state,
                 &reading_stack,
                 "New Message",
                 from_email,
@@ -2103,7 +2135,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&reading_stack, title, from_email, cmd_tx, prefill, rich_text_default);
+                show_composer_in_reading_pane(&state, &reading_stack, title, from_email, cmd_tx, prefill, rich_text_default);
             }
         });
     }
@@ -2115,7 +2147,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&reading_stack, "Forward", from_email, cmd_tx, prefill, rich_text_default);
+                show_composer_in_reading_pane(&state, &reading_stack, "Forward", from_email, cmd_tx, prefill, rich_text_default);
             }
         });
     }
@@ -2246,11 +2278,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 return;
             }
             let request = (mailbox.clone(), uid);
+            // Opening a message is what marks it read - bodies are fetched
+            // with `BODY.PEEK`, so the server never sets `\Seen` itself (see
+            // `fetch_body` in lookout-mail). Sent past the `already_shown`
+            // guard above, so the rebuild this triggers can't loop: the
+            // message comes back with `\Seen` set, and a re-selection of the
+            // row already on the reading pane returns before reaching here.
+            // Bulwark's configurable mark-as-read delay is a later refinement;
+            // this marks on open, as Outlook's default reading pane does.
+            let mark_read = summary.is_unread();
             // Deferred to the reveal: updating the header here would swap it
             // to the next email while the previous message is still fading
             // out. `render_body` applies it once the new body is about to be
             // shown (the pane is on "empty" by then, so it can't flash).
             state.borrow_mut().pending_header = Some(summary);
+            if mark_read {
+                let st = state.borrow();
+                if let Some(handle) = mailbox_account_id(&mailbox).and_then(|id| st.accounts.get(&id)) {
+                    let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreFlags {
+                        mailbox: mailbox.clone(),
+                        uid,
+                        add: vec![SystemFlagBit::Seen],
+                        remove: Vec::new(),
+                    });
+                }
+            }
 
             let body_is_cached = state.borrow_mut().body_cache.get(&mailbox, &uid).is_some();
             let should_request = {
@@ -2307,6 +2359,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_list, &state) {
                 let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage { mailbox, uid, role });
             }
+        });
+    }
+    // --- Flag/Unflag -> AccountCommand::StoreFlags toggling `\Flagged`.
+    // The direction comes from the selected row's own flags, so the one
+    // button covers both halves the way Outlook's does.
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        flag_button.connect_clicked(move |_| {
+            let Some(summary) = message_list.selected_summary() else { return };
+            let st = state.borrow();
+            let Some(handle) = mailbox_account_id(&summary.mailbox).and_then(|id| st.accounts.get(&id)) else {
+                return;
+            };
+            let (add, remove) = if summary.is_starred() {
+                (Vec::new(), vec![SystemFlagBit::Flagged])
+            } else {
+                (vec![SystemFlagBit::Flagged], Vec::new())
+            };
+            let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreFlags {
+                mailbox: summary.mailbox.clone(),
+                uid: summary.uid,
+                add,
+                remove,
+            });
         });
     }
     {
@@ -2741,6 +2818,13 @@ fn connect_account(
                 }
                 AccountEvent::SendCompleted => {
                     toast_overlay.add_toast(adw::Toast::new("Message sent"));
+                }
+                AccountEvent::DraftSaved { message_id } => {
+                    // Relay the confirmation to whichever composer is open;
+                    // it decides whether the id is its own.
+                    if let Some(tx) = state.borrow().draft_saved_tx.clone() {
+                        let _ = tx.try_send(message_id);
+                    }
                 }
                 AccountEvent::MessageMoved { role } => {
                     let label = match role {
@@ -3718,6 +3802,7 @@ fn render_body(
 /// Cancel lands back on the same message, and New Message's Cancel lands
 /// back on the empty placeholder.
 fn show_composer_in_reading_pane(
+    state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
     title: &str,
     from_email: String,
@@ -3730,13 +3815,20 @@ fn show_composer_in_reading_pane(
     }
     let previous_page = reading_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_else(|| "empty".to_string());
     let reading_stack_for_close = reading_stack.clone();
+    let state_for_close = state.clone();
     let on_done: Rc<dyn Fn()> = Rc::new(move || {
         if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
             reading_stack_for_close.remove(&existing);
         }
         reading_stack_for_close.set_visible_child_name(&previous_page);
+        // The composer is gone; drop its draft-confirmation relay so its
+        // consumer future exits and late events go nowhere.
+        state_for_close.borrow_mut().draft_saved_tx = None;
     });
-    let composer = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done, rich_text_default);
+    let (composer, draft_tx) = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done, rich_text_default);
+    // Replacing any previous composer's relay (dropped sender = its consumer
+    // exits).
+    state.borrow_mut().draft_saved_tx = Some(draft_tx);
     reading_stack.add_named(&composer, Some("compose"));
     reading_stack.set_visible_child_name("compose");
 }
@@ -3825,6 +3917,7 @@ mod tests {
             favorites: HashSet::new(),
             load_remote_images: false,
             rich_text_default: true,
+            draft_saved_tx: None,
         }));
 
         // First request goes out and is marked pending.

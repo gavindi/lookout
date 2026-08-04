@@ -104,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
                                 html_body: None,
                                 in_reply_to: None,
                                 references: vec![],
+                                message_id: None,
                             };
                             let _ = cmd_tx.send(AccountCommand::SendMessage(msg)).await;
                             sent_command = true;
@@ -135,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     AccountEvent::MessagesUpdated { .. } => {}
                     AccountEvent::BodyFetched { .. } => {}
+                    AccountEvent::DraftSaved { .. } => {}
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed => {}
                     AccountEvent::Error(e) => {
                         println!("ERROR: {e}");

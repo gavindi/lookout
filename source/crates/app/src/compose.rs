@@ -1,11 +1,20 @@
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
 use lookout_core::{EmailBody, EmailSummary};
 use lookout_mail::session::AccountCommand;
-use lookout_mail::ComposedMessage;
+use lookout_mail::{new_message_id, ComposedMessage};
 use webkit::prelude::*;
+
+/// How long the composer waits after the last check before autosaving the
+/// draft again. The autosave runs on a fixed tick and compares the current
+/// fields against the last saved snapshot, so this is the worst-case gap
+/// between an edit and its draft landing server-side. A draft save is
+/// several IMAP round trips (replace + append), so this errs slow.
+const DRAFT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Everything the compose window can be pre-filled with, beyond a blank "New
 /// Message" (`ComposePrefill::default()`). Grouped into one struct rather
@@ -292,6 +301,36 @@ fn toolbar_command_button(toolbar: &gtk::Box, icon_name: &str, tooltip: &str, co
     toolbar.append(&button);
 }
 
+/// Splits a comma-separated recipient field (the To/Cc rows) into trimmed,
+/// non-empty addresses.
+fn parse_recipients(field: &str) -> Vec<String> {
+    field.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+/// Everything one draft-autosave needs to know to decide "did anything
+/// change since the last save?" and to rebuild the message: the header rows
+/// verbatim plus whichever body mode is live (`body` is the HTML in rich
+/// mode and the plain text otherwise; `body_text` is always the plain-text
+/// rendering).
+#[derive(Clone, PartialEq)]
+struct DraftSnapshot {
+    to: String,
+    cc: String,
+    subject: String,
+    rich: bool,
+    body: String,
+    body_text: String,
+}
+
+/// A draft with no recipients, no subject and no body content is not worth
+/// storing - an untouched "New Message" composer must not litter the Drafts
+/// folder with empty messages. Whitespace-only counts as empty; the rich
+/// editor's blank document (`<p><br></p>`) renders to whitespace-only text,
+/// so it's caught by the same check.
+fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
+    snap.to.trim().is_empty() && snap.cc.trim().is_empty() && snap.subject.trim().is_empty() && snap.body_text.trim().is_empty()
+}
+
 /// Builds the rich-text editor page: a formatting toolbar above an editable
 /// WebKit `WebView`. The whole page behaves as a contenteditable document,
 /// so formatting actions map to WebKit editing commands (`Bold`,
@@ -428,6 +467,18 @@ fn build_rich_editor(initial_html: String) -> (gtk::Box, Rc<webkit::WebView>) {
 /// The HTML mode sends `multipart/alternative` - both the rich HTML and a
 /// plain-text rendering - so recipients without HTML support still get the
 /// text.
+///
+/// Draft autosave: while the composer is open, a periodic timer compares
+/// the fields against the last saved snapshot and, when they differ (and
+/// the content isn't trivial), `APPEND`s the message to the account's
+/// Drafts mailbox via `AccountCommand::SaveDraft` - replacing the previous
+/// autosave in place, keyed by a stable per-compose-session `Message-ID`.
+/// Cancel saves one final time (so closing the composer never loses work);
+/// Send deletes the stored draft before sending. The returned `Sender` is
+/// how the account's event loop forwards `DraftSaved` confirmations back to
+/// this composer (which flips the status label from "Saving draft…" to
+/// "Draft saved"); dropping it lets the composer's confirmation consumer
+/// exit.
 pub fn build_compose_view(
     title: &str,
     from_email: String,
@@ -435,7 +486,7 @@ pub fn build_compose_view(
     prefill: ComposePrefill,
     on_done: Rc<dyn Fn()>,
     rich_text_default: bool,
-) -> gtk::Box {
+) -> (gtk::Box, async_channel::Sender<String>) {
     let to_row = adw::EntryRow::builder().title("To").build();
     if let Some(to) = &prefill.to {
         to_row.set_text(to);
@@ -493,6 +544,127 @@ pub fn build_compose_view(
     // the stack to the right page and focuses the editor.
     rich_toggle.set_active(rich_text_default);
 
+    // --- Draft autosave state ---
+    // One stable Message-ID per compose session: every autosave carries it,
+    // and `replace` purges whatever the previous save stored under it, so
+    // the Drafts folder only ever holds one copy of this draft.
+    let draft_message_id = Rc::new(new_message_id());
+    // Set the moment a SaveDraft is queued for this session - gates the
+    // `replace` flag and the delete-before-send, so it must be optimistic
+    // (a queued-but-failed save still means "ask the server to replace /
+    // delete by Message-ID"; both are harmless no-ops if nothing is there).
+    let draft_queued = Rc::new(Cell::new(false));
+    // The last snapshot actually queued for saving; the autosave tick skips
+    // work while the fields still match it.
+    let last_saved: Rc<RefCell<Option<DraftSnapshot>>> = Rc::new(RefCell::new(None));
+    // Set when the composer closes (Send or Cancel) so the autosave timer
+    // can't fire against a torn-down page.
+    let closed = Rc::new(Cell::new(false));
+
+    let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
+
+    let take_snapshot: Rc<dyn Fn() -> Option<DraftSnapshot>> = Rc::new({
+        let to_row = to_row.clone();
+        let cc_row = cc_row.clone();
+        let subject_row = subject_row.clone();
+        let rich_toggle = rich_toggle.clone();
+        let body_view = body_view.clone();
+        let rich_web_view = rich_web_view.clone();
+        move || {
+            let rich = rich_toggle.is_active();
+            let (body, body_text) = if rich {
+                // A failed read (document still loading) means "no snapshot
+                // this tick" - the next one retries.
+                read_content(&rich_web_view)?
+            } else {
+                let buffer = body_view.buffer();
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+                (text.clone(), text)
+            };
+            Some(DraftSnapshot {
+                to: to_row.text().to_string(),
+                cc: cc_row.text().to_string(),
+                subject: subject_row.text().to_string(),
+                rich,
+                body,
+                body_text,
+            })
+        }
+    });
+
+    let attempt_autosave: Rc<dyn Fn()> = Rc::new({
+        let take_snapshot = take_snapshot.clone();
+        let last_saved = last_saved.clone();
+        let draft_queued = draft_queued.clone();
+        let draft_message_id = draft_message_id.clone();
+        let cmd_tx = cmd_tx.clone();
+        let from_email = from_email.clone();
+        let in_reply_to = prefill.in_reply_to.clone();
+        let references = prefill.references.clone();
+        let status_label = status_label.clone();
+        move || {
+            let Some(snap) = take_snapshot() else { return };
+            if draft_is_trivial(&snap) {
+                return;
+            }
+            if last_saved.borrow().as_ref() == Some(&snap) {
+                return;
+            }
+            let replace = draft_queued.get();
+            *last_saved.borrow_mut() = Some(snap.clone());
+            draft_queued.set(true);
+            let msg = ComposedMessage {
+                from: from_email.clone(),
+                to: parse_recipients(&snap.to),
+                cc: parse_recipients(&snap.cc),
+                bcc: Vec::new(),
+                subject: snap.subject.clone(),
+                text_body: snap.body_text.clone(),
+                html_body: snap.rich.then(|| snap.body.clone()),
+                in_reply_to: in_reply_to.clone(),
+                references: references.clone(),
+                message_id: Some((*draft_message_id).clone()),
+            };
+            let _ = cmd_tx.send_blocking(AccountCommand::SaveDraft { msg, replace });
+            status_label.set_label("Saving draft…");
+        }
+    });
+
+    // The autosave tick: fixed interval, change-detected by snapshot
+    // comparison rather than edit signals (WebKit's contenteditable view has
+    // no usable "content changed" signal, so polling is the only mode that
+    // covers both body editors uniformly).
+    {
+        let attempt_autosave = attempt_autosave.clone();
+        let closed = closed.clone();
+        glib::spawn_future_local(async move {
+            loop {
+                glib::timeout_future(DRAFT_AUTOSAVE_INTERVAL).await;
+                if closed.get() {
+                    break;
+                }
+                attempt_autosave();
+            }
+        });
+    }
+
+    // DraftSaved confirmations arrive on the account's event loop and are
+    // relayed here; flip the status label once the save is actually
+    // server-side. Events for other compose sessions' ids (stale relay
+    // delivery) are ignored.
+    let (draft_saved_tx, draft_saved_rx) = async_channel::bounded(8);
+    {
+        let draft_message_id = draft_message_id.clone();
+        let status_label = status_label.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(message_id) = draft_saved_rx.recv().await {
+                if message_id == *draft_message_id {
+                    status_label.set_label("Draft saved");
+                }
+            }
+        });
+    }
+
     let cancel_button = gtk::Button::builder().label("Cancel").build();
     let send_button = gtk::Button::builder().label("Send").css_classes(["suggested-action"]).build();
     let title_label = gtk::Label::builder().label(title).hexpand(true).build();
@@ -507,6 +679,7 @@ pub fn build_compose_view(
         .build();
     top_row.append(&cancel_button);
     top_row.append(&title_label);
+    top_row.append(&status_label);
     top_row.append(&send_button);
 
     let content = gtk::Box::builder()
@@ -523,12 +696,25 @@ pub fn build_compose_view(
 
     {
         let on_done = on_done.clone();
-        cancel_button.connect_clicked(move |_| on_done());
+        let attempt_autosave = attempt_autosave.clone();
+        let closed = closed.clone();
+        cancel_button.connect_clicked(move |_| {
+            // One final save before teardown, so closing the composer never
+            // loses work (the draft stays in Drafts; there's no "discard"
+            // affordance yet). `closed` is set *after* the save so the
+            // attempt isn't vetoed by it.
+            attempt_autosave();
+            closed.set(true);
+            on_done();
+        });
     }
     {
         let in_reply_to = prefill.in_reply_to;
         let references = prefill.references;
         let prefill_body_text = prefill.body.clone().unwrap_or_default();
+        let draft_queued = draft_queued.clone();
+        let draft_message_id = draft_message_id.clone();
+        let closed = closed.clone();
         send_button.connect_clicked(move |_| {
             let to: Vec<String> = to_row.text().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             if to.is_empty() {
@@ -557,6 +743,15 @@ pub fn build_compose_view(
                 let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
                 (text, None)
             };
+            // If this message was draft-autosaved, delete the stored draft
+            // first so the sent mail doesn't linger in Drafts. Queued ahead
+            // of the send on the same command channel, so the session
+            // processes them in order.
+            if draft_queued.get() {
+                let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft {
+                    message_id: (*draft_message_id).clone(),
+                });
+            }
             let msg = ComposedMessage {
                 from: from_email.clone(),
                 to,
@@ -567,13 +762,15 @@ pub fn build_compose_view(
                 html_body,
                 in_reply_to: in_reply_to.clone(),
                 references: references.clone(),
+                message_id: None,
             };
             let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(msg));
+            closed.set(true);
             on_done();
         });
     }
 
-    content
+    (content, draft_saved_tx)
 }
 
 #[cfg(test)]
@@ -735,5 +932,53 @@ mod tests {
             text_to_html("intro\n\n> quoted line\n> second quote"),
             "<p>intro</p><blockquote>quoted line<br>second quote</blockquote>"
         );
+    }
+
+    #[test]
+    fn parse_recipients_splits_trims_and_drops_blanks() {
+        assert_eq!(parse_recipients("a@example.com, b@example.com"), vec!["a@example.com", "b@example.com"]);
+        assert_eq!(parse_recipients("  only@example.com  "), vec!["only@example.com"]);
+        assert_eq!(parse_recipients("a@example.com,, ,b@example.com,"), vec!["a@example.com", "b@example.com"]);
+        assert!(parse_recipients("").is_empty());
+        assert!(parse_recipients(" , ").is_empty());
+    }
+
+    fn snapshot(to: &str, subject: &str, body_text: &str) -> DraftSnapshot {
+        DraftSnapshot {
+            to: to.to_string(),
+            cc: String::new(),
+            subject: subject.to_string(),
+            rich: false,
+            body: body_text.to_string(),
+            body_text: body_text.to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_composer_is_trivial_and_never_autosaved() {
+        assert!(draft_is_trivial(&snapshot("", "", "")));
+        assert!(draft_is_trivial(&snapshot("  ", "", "\n  ")));
+    }
+
+    #[test]
+    fn any_recipient_subject_or_body_makes_a_draft_worth_saving() {
+        assert!(!draft_is_trivial(&snapshot("a@example.com", "", "")));
+        assert!(!draft_is_trivial(&snapshot("", "subject", "")));
+        assert!(!draft_is_trivial(&snapshot("", "", "body")));
+    }
+
+    #[test]
+    fn rich_blank_document_is_trivial() {
+        // The rich editor's untouched document renders to whitespace-only
+        // text even though its HTML is non-empty.
+        let snap = DraftSnapshot {
+            to: String::new(),
+            cc: String::new(),
+            subject: String::new(),
+            rich: true,
+            body: "<p><br></p>".to_string(),
+            body_text: "\n".to_string(),
+        };
+        assert!(draft_is_trivial(&snap));
     }
 }

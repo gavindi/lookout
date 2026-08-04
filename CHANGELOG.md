@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.32 (2026-08-05)
+
+### Added
+
+- **Mail**: messages can now be marked read and flagged. Neither was possible before: the only `STORE` in the codebase was the `\Deleted` one inside the move fallback, so opening a message left it unread forever (bodies are fetched with `BODY.PEEK[]` precisely so the client decides when `\Seen` is set - but nothing ever set it), and the toolbar's Flag button was a disabled placeholder. A new `AccountCommand::StoreFlags { mailbox, uid, add, remove }` issues the add and remove halves as two separate `+FLAGS.SILENT`/`-FLAGS.SILENT` stores (IMAP has no combined form; an empty side is skipped rather than sent as an empty flag list, which servers may reject). `.SILENT` because the caller already knows the resulting flag set and the next sync re-reads the real flags anyway. Opening a message in the reading pane marks it `\Seen` - on open, as Outlook's default reading pane does; Bulwark's configurable mark-as-read delay is a later refinement. The Flag button is live and toggles `\Flagged` in whichever direction the selected row's own flags call for, and flagged rows draw an amber marker between the subject and date columns, hidden entirely (not merely blank) when unflagged so it costs no width on ordinary rows. Unlike `FetchBody`, which drops any request for a folder other than the open one, `StoreFlags` selects the message's own folder when they differ - a mark-as-read can race a folder switch, and the unified "All Inboxes" view mixes mailboxes by construction - and the main loop's existing pre-IDLE re-select puts the session back on the user's folder afterwards. A successful store patches the cached summary in place (`Cache::update_flags`) and re-emits the mailbox from cache instead of re-syncing, so a mark-as-read costs one `STORE` and no fetch, and a restart before the next sync doesn't show the message unread again; if the uid falls outside the cached window (or there's no cache at all) it falls back to a full re-sync. `message_row_key` gained the flagged bit alongside the unread one, so a flag-only change is seen as a real change rather than swallowed by the message list's no-op-rebuild check.
+
 ## 0.6.31 (2026-08-05)
 
 ### Fixed
