@@ -787,19 +787,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let bound = bound.clone();
             reply_btn.connect_clicked(move |_| {
                 let Some(summary) = bound.borrow().clone() else { return };
-                let mut state = state.borrow_mut();
-                // Only possible once the body has arrived - the composer
-                // needs it to quote. Silently a no-op until then.
-                let Some(body) = state.body_cache.get(&summary.mailbox, &summary.uid) else { return };
-                let Some(account_id) = mailbox_account_id(&summary.mailbox) else { return };
-                let Some(handle) = state.accounts.get(&account_id) else { return };
-                let from_email = handle.email.clone();
-                let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, crate::compose::ReplyMode::Reply);
-                let on_done = Rc::new(|| {});
-                let (composer, draft_tx) = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done, state.rich_text_default);
-                state.draft_saved_tx = Some(draft_tx);
-                reading_stack.add_named(&composer, Some("compose"));
-                reading_stack.set_visible_child_name("compose");
+                // Everything the composer needs is read out first and the
+                // borrow dropped: `show_composer_in_reading_pane` takes its
+                // own `borrow_mut` to install the draft-confirmation relay.
+                let opened = {
+                    let mut st = state.borrow_mut();
+                    // Only possible once the body has arrived - the composer
+                    // needs it to quote. Silently a no-op until then.
+                    let body = st.body_cache.get(&summary.mailbox, &summary.uid);
+                    body.and_then(|body| {
+                        let account_id = mailbox_account_id(&summary.mailbox)?;
+                        let handle = st.accounts.get(&account_id)?;
+                        let from_email = handle.email.clone();
+                        let cmd_tx = handle.cmd_tx.clone();
+                        let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, crate::compose::ReplyMode::Reply);
+                        Some((from_email, cmd_tx, prefill, st.rich_text_default))
+                    })
+                };
+                // Routed through the shared opener rather than building the
+                // composer inline: that's what replaces any composer already
+                // in the pane (so its autosave loop stops), restores the
+                // previous page on close, and owns the `draft_saved_tx` slot.
+                if let Some((from_email, cmd_tx, prefill, rich_text_default)) = opened {
+                    show_composer_in_reading_pane(&state, &reading_stack, "Reply", from_email, cmd_tx, prefill, rich_text_default);
+                }
             });
         }
 

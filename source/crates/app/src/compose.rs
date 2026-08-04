@@ -261,7 +261,17 @@ blockquote {{ margin: 4px 0 4px 16px; padding-left: 8px; border-left: 2px solid 
 /// tags. Returns `None` if the evaluation fails (e.g. the document hasn't
 /// finished loading), so callers can fall back to a known-good body rather
 /// than dropping the message.
-fn read_content(web_view: &webkit::WebView) -> Option<(String, String)> {
+///
+/// Must stay `async`. This used to `block_on` the evaluation to keep its
+/// callers synchronous, which aborted the process the moment a caller ran
+/// inside a glib-spawned future: `block_on` runs a *nested* main loop, that
+/// loop dispatches another `TaskSource`, and its `futures_executor::enter()`
+/// fails with `EnterError` because this thread already has an executor
+/// entered for the outer dispatch. glib unwraps that, and `TaskSource::
+/// dispatch` is an `extern "C"` callback that cannot unwind, so the panic
+/// becomes an abort. Awaiting on the executor that's already running avoids
+/// the nested loop entirely.
+async fn read_content(web_view: &webkit::WebView) -> Option<(String, String)> {
     const READ_SCRIPT: &str = r#"(
         function () {
             document.querySelectorAll('font').forEach(function (el) {
@@ -284,8 +294,7 @@ fn read_content(web_view: &webkit::WebView) -> Option<(String, String)> {
         }
     )()"#;
 
-    let result = glib::MainContext::default().block_on(web_view.evaluate_javascript_future(READ_SCRIPT, None, None));
-    let value = result.ok()?;
+    let value = web_view.evaluate_javascript_future(READ_SCRIPT, None, None).await.ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&value.to_string()).ok()?;
     let html = parsed.get("html").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let text = parsed.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -320,6 +329,109 @@ struct DraftSnapshot {
     rich: bool,
     body: String,
     body_text: String,
+}
+
+/// Everything the draft autosave touches, in one clonable bundle. This exists
+/// because reading the rich editor is `async` (see `read_content`) and an
+/// `Rc<dyn Fn()>` closure can't hold an `async` body - each caller clones a
+/// context and awaits its methods instead.
+#[derive(Clone)]
+struct AutosaveCtx {
+    to_row: adw::EntryRow,
+    cc_row: adw::EntryRow,
+    subject_row: adw::EntryRow,
+    rich_toggle: adw::SwitchRow,
+    body_view: gtk::TextView,
+    rich_web_view: Rc<webkit::WebView>,
+    /// The last snapshot queued for saving; a tick whose fields still match
+    /// it does nothing.
+    last_saved: Rc<RefCell<Option<DraftSnapshot>>>,
+    /// Set the moment a `SaveDraft` is queued for this session - gates the
+    /// `replace` flag and the delete-before-send, so it's deliberately
+    /// optimistic (a queued-but-failed save still means "ask the server to
+    /// replace / delete by Message-ID"; both are harmless no-ops if nothing
+    /// is there).
+    draft_queued: Rc<Cell<bool>>,
+    /// Held for the duration of one save. Both the tick and Cancel can start
+    /// a save, and each awaits a WebKit round trip in the middle - without
+    /// this, two overlapping saves could both observe `draft_queued == false`
+    /// and each `APPEND`, leaving two copies under one `Message-ID`.
+    in_flight: Rc<Cell<bool>>,
+    /// One stable Message-ID per compose session: every autosave carries it,
+    /// and `replace` purges whatever the previous save stored under it, so
+    /// the Drafts folder only ever holds one copy of this draft.
+    draft_message_id: Rc<String>,
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    from_email: String,
+    in_reply_to: Option<String>,
+    references: Vec<String>,
+    status_label: gtk::Label,
+}
+
+impl AutosaveCtx {
+    /// The composer's current contents, or `None` when the rich editor can't
+    /// be read this tick (document still loading) - the next tick retries.
+    async fn snapshot(&self) -> Option<DraftSnapshot> {
+        let rich = self.rich_toggle.is_active();
+        let (body, body_text) = if rich {
+            read_content(&self.rich_web_view).await?
+        } else {
+            let buffer = self.body_view.buffer();
+            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+            (text.clone(), text)
+        };
+        Some(DraftSnapshot {
+            to: self.to_row.text().to_string(),
+            cc: self.cc_row.text().to_string(),
+            subject: self.subject_row.text().to_string(),
+            rich,
+            body,
+            body_text,
+        })
+    }
+
+    /// Saves the draft if anything worth saving has changed since the last
+    /// save. Safe to call at any time: trivial, unchanged, and concurrent
+    /// invocations all return without queueing anything.
+    async fn attempt(&self) {
+        if self.in_flight.get() {
+            return;
+        }
+        self.in_flight.set(true);
+        self.save_if_changed().await;
+        self.in_flight.set(false);
+    }
+
+    async fn save_if_changed(&self) {
+        let Some(snap) = self.snapshot().await else { return };
+        if draft_is_trivial(&snap) {
+            return;
+        }
+        // Scoped so no borrow is held across the sends below - and, more to
+        // the point, never across the `.await` above, which yields to the
+        // main loop and lets other handlers run.
+        let unchanged = self.last_saved.borrow().as_ref() == Some(&snap);
+        if unchanged {
+            return;
+        }
+        let replace = self.draft_queued.get();
+        *self.last_saved.borrow_mut() = Some(snap.clone());
+        self.draft_queued.set(true);
+        let msg = ComposedMessage {
+            from: self.from_email.clone(),
+            to: parse_recipients(&snap.to),
+            cc: parse_recipients(&snap.cc),
+            bcc: Vec::new(),
+            subject: snap.subject.clone(),
+            text_body: snap.body_text.clone(),
+            html_body: snap.rich.then(|| snap.body.clone()),
+            in_reply_to: self.in_reply_to.clone(),
+            references: self.references.clone(),
+            message_id: Some((*self.draft_message_id).clone()),
+        };
+        let _ = self.cmd_tx.send_blocking(AccountCommand::SaveDraft { msg, replace });
+        self.status_label.set_label("Saving draft…");
+    }
 }
 
 /// A draft with no recipients, no subject and no body content is not worth
@@ -545,97 +657,36 @@ pub fn build_compose_view(
     rich_toggle.set_active(rich_text_default);
 
     // --- Draft autosave state ---
-    // One stable Message-ID per compose session: every autosave carries it,
-    // and `replace` purges whatever the previous save stored under it, so
-    // the Drafts folder only ever holds one copy of this draft.
-    let draft_message_id = Rc::new(new_message_id());
-    // Set the moment a SaveDraft is queued for this session - gates the
-    // `replace` flag and the delete-before-send, so it must be optimistic
-    // (a queued-but-failed save still means "ask the server to replace /
-    // delete by Message-ID"; both are harmless no-ops if nothing is there).
-    let draft_queued = Rc::new(Cell::new(false));
-    // The last snapshot actually queued for saving; the autosave tick skips
-    // work while the fields still match it.
-    let last_saved: Rc<RefCell<Option<DraftSnapshot>>> = Rc::new(RefCell::new(None));
-    // Set when the composer closes (Send or Cancel) so the autosave timer
-    // can't fire against a torn-down page.
+    // Set when the composer closes (Send, Cancel, or being unrooted) so the
+    // autosave timer can't fire against a torn-down page.
     let closed = Rc::new(Cell::new(false));
-
     let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
+    let draft_message_id = Rc::new(new_message_id());
 
-    let take_snapshot: Rc<dyn Fn() -> Option<DraftSnapshot>> = Rc::new({
-        let to_row = to_row.clone();
-        let cc_row = cc_row.clone();
-        let subject_row = subject_row.clone();
-        let rich_toggle = rich_toggle.clone();
-        let body_view = body_view.clone();
-        let rich_web_view = rich_web_view.clone();
-        move || {
-            let rich = rich_toggle.is_active();
-            let (body, body_text) = if rich {
-                // A failed read (document still loading) means "no snapshot
-                // this tick" - the next one retries.
-                read_content(&rich_web_view)?
-            } else {
-                let buffer = body_view.buffer();
-                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
-                (text.clone(), text)
-            };
-            Some(DraftSnapshot {
-                to: to_row.text().to_string(),
-                cc: cc_row.text().to_string(),
-                subject: subject_row.text().to_string(),
-                rich,
-                body,
-                body_text,
-            })
-        }
-    });
-
-    let attempt_autosave: Rc<dyn Fn()> = Rc::new({
-        let take_snapshot = take_snapshot.clone();
-        let last_saved = last_saved.clone();
-        let draft_queued = draft_queued.clone();
-        let draft_message_id = draft_message_id.clone();
-        let cmd_tx = cmd_tx.clone();
-        let from_email = from_email.clone();
-        let in_reply_to = prefill.in_reply_to.clone();
-        let references = prefill.references.clone();
-        let status_label = status_label.clone();
-        move || {
-            let Some(snap) = take_snapshot() else { return };
-            if draft_is_trivial(&snap) {
-                return;
-            }
-            if last_saved.borrow().as_ref() == Some(&snap) {
-                return;
-            }
-            let replace = draft_queued.get();
-            *last_saved.borrow_mut() = Some(snap.clone());
-            draft_queued.set(true);
-            let msg = ComposedMessage {
-                from: from_email.clone(),
-                to: parse_recipients(&snap.to),
-                cc: parse_recipients(&snap.cc),
-                bcc: Vec::new(),
-                subject: snap.subject.clone(),
-                text_body: snap.body_text.clone(),
-                html_body: snap.rich.then(|| snap.body.clone()),
-                in_reply_to: in_reply_to.clone(),
-                references: references.clone(),
-                message_id: Some((*draft_message_id).clone()),
-            };
-            let _ = cmd_tx.send_blocking(AccountCommand::SaveDraft { msg, replace });
-            status_label.set_label("Saving draft…");
-        }
-    });
+    let autosave = AutosaveCtx {
+        to_row: to_row.clone(),
+        cc_row: cc_row.clone(),
+        subject_row: subject_row.clone(),
+        rich_toggle: rich_toggle.clone(),
+        body_view: body_view.clone(),
+        rich_web_view: rich_web_view.clone(),
+        last_saved: Rc::new(RefCell::new(None)),
+        draft_queued: Rc::new(Cell::new(false)),
+        in_flight: Rc::new(Cell::new(false)),
+        draft_message_id: draft_message_id.clone(),
+        cmd_tx: cmd_tx.clone(),
+        from_email: from_email.clone(),
+        in_reply_to: prefill.in_reply_to.clone(),
+        references: prefill.references.clone(),
+        status_label: status_label.clone(),
+    };
 
     // The autosave tick: fixed interval, change-detected by snapshot
     // comparison rather than edit signals (WebKit's contenteditable view has
     // no usable "content changed" signal, so polling is the only mode that
     // covers both body editors uniformly).
     {
-        let attempt_autosave = attempt_autosave.clone();
+        let autosave = autosave.clone();
         let closed = closed.clone();
         glib::spawn_future_local(async move {
             loop {
@@ -643,7 +694,7 @@ pub fn build_compose_view(
                 if closed.get() {
                     break;
                 }
-                attempt_autosave();
+                autosave.attempt().await;
             }
         });
     }
@@ -696,14 +747,18 @@ pub fn build_compose_view(
 
     {
         let on_done = on_done.clone();
-        let attempt_autosave = attempt_autosave.clone();
+        let autosave = autosave.clone();
         let closed = closed.clone();
         cancel_button.connect_clicked(move |_| {
             // One final save before teardown, so closing the composer never
             // loses work (the draft stays in Drafts; there's no "discard"
-            // affordance yet). `closed` is set *after* the save so the
-            // attempt isn't vetoed by it.
-            attempt_autosave();
+            // affordance yet). The save runs on its own task and outlives
+            // the widget - `AutosaveCtx` holds the editor by `Rc`, so the
+            // read still resolves after the pane has closed, and the task
+            // never consults `closed` (which is set right below, and would
+            // otherwise veto the very save this exists to perform).
+            let autosave = autosave.clone();
+            glib::spawn_future_local(async move { autosave.attempt().await });
             closed.set(true);
             on_done();
         });
@@ -712,7 +767,7 @@ pub fn build_compose_view(
         let in_reply_to = prefill.in_reply_to;
         let references = prefill.references;
         let prefill_body_text = prefill.body.clone().unwrap_or_default();
-        let draft_queued = draft_queued.clone();
+        let autosave = autosave.clone();
         let draft_message_id = draft_message_id.clone();
         let closed = closed.clone();
         send_button.connect_clicked(move |_| {
@@ -721,52 +776,85 @@ pub fn build_compose_view(
                 return;
             }
             let cc: Vec<String> = cc_row.text().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-            let (text_body, html_body) = if rich_toggle.is_active() {
-                // Reading the editor's live HTML back out is a round trip
-                // through WebKit; if that fails (e.g. the page hasn't
-                // finished loading yet) fall back to the prefill body so a
-                // Send click can never silently drop the message.
-                match read_content(&rich_web_view) {
-                    Some((html, text)) => {
-                        let text = text.trim().to_string();
-                        if text.is_empty() {
-                            (String::new(), None)
-                        } else {
-                            let html = html.trim().to_string();
-                            (text, Some(html))
+            // Everything from here on has to await the editor read, so the
+            // rest of the send runs on its own task. `closed` and `on_done`
+            // stay behind at the end of it rather than firing early: the
+            // pane must not close before the body has been read out of the
+            // (still-parented) WebView.
+            let rich = rich_toggle.is_active();
+            let body_view = body_view.clone();
+            let rich_web_view = rich_web_view.clone();
+            let subject = subject_row.text().to_string();
+            let prefill_body_text = prefill_body_text.clone();
+            let autosave = autosave.clone();
+            let draft_message_id = draft_message_id.clone();
+            let cmd_tx = cmd_tx.clone();
+            let from_email = from_email.clone();
+            let in_reply_to = in_reply_to.clone();
+            let references = references.clone();
+            let closed = closed.clone();
+            let on_done = on_done.clone();
+            glib::spawn_future_local(async move {
+                let (text_body, html_body) = if rich {
+                    // Reading the editor's live HTML back out is a round trip
+                    // through WebKit; if that fails (e.g. the page hasn't
+                    // finished loading yet) fall back to the prefill body so a
+                    // Send click can never silently drop the message.
+                    match read_content(&rich_web_view).await {
+                        Some((html, text)) => {
+                            let text = text.trim().to_string();
+                            if text.is_empty() {
+                                (String::new(), None)
+                            } else {
+                                let html = html.trim().to_string();
+                                (text, Some(html))
+                            }
                         }
+                        None => (prefill_body_text, None),
                     }
-                    None => (prefill_body_text.clone(), None),
+                } else {
+                    let buffer = body_view.buffer();
+                    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+                    (text, None)
+                };
+                // If this message was draft-autosaved, delete the stored draft
+                // first so the sent mail doesn't linger in Drafts. Queued ahead
+                // of the send on the same command channel, so the session
+                // processes them in order.
+                if autosave.draft_queued.get() {
+                    let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft {
+                        message_id: (*draft_message_id).clone(),
+                    });
                 }
-            } else {
-                let buffer = body_view.buffer();
-                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
-                (text, None)
-            };
-            // If this message was draft-autosaved, delete the stored draft
-            // first so the sent mail doesn't linger in Drafts. Queued ahead
-            // of the send on the same command channel, so the session
-            // processes them in order.
-            if draft_queued.get() {
-                let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft {
-                    message_id: (*draft_message_id).clone(),
-                });
+                let msg = ComposedMessage {
+                    from: from_email,
+                    to,
+                    cc,
+                    bcc: Vec::new(),
+                    subject,
+                    text_body,
+                    html_body,
+                    in_reply_to,
+                    references,
+                    message_id: None,
+                };
+                let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(msg));
+                closed.set(true);
+                on_done();
+            });
+        });
+    }
+
+    // Belt and braces for the autosave timer: Cancel and Send set `closed`
+    // themselves, but a composer displaced some other way (a second composer
+    // opening over this one) would otherwise leave its 5-second loop running
+    // forever against a detached editor - still writing drafts.
+    {
+        let closed = closed.clone();
+        content.connect_root_notify(move |widget| {
+            if widget.root().is_none() {
+                closed.set(true);
             }
-            let msg = ComposedMessage {
-                from: from_email.clone(),
-                to,
-                cc,
-                bcc: Vec::new(),
-                subject: subject_row.text().to_string(),
-                text_body,
-                html_body,
-                in_reply_to: in_reply_to.clone(),
-                references: references.clone(),
-                message_id: None,
-            };
-            let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(msg));
-            closed.set(true);
-            on_done();
         });
     }
 
