@@ -56,6 +56,9 @@ pub struct ConfigView {
     /// caller can wire its `active` state into the reading pane's remote-image
     /// policy.
     pub remote_images_row: adw::SwitchRow,
+    /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
+    /// `active` state into the composer's default body mode.
+    pub rich_text_row: adw::SwitchRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     mail_rows: RefCell<Vec<adw::ActionRow>>,
@@ -71,7 +74,7 @@ pub struct ConfigView {
 /// as the menu bar's Home/View ribbon tabs. "Appearance" is deliberately
 /// absent: it's a real, enabled group with the smooth-transitions preference
 /// (see `build`), as is "Advanced" below and the "Mail" group (the
-/// remote-images toggle) the loop's `Mail` entry hands off to.
+/// remote-images and rich-text toggles) the loop's `Mail` entry hands off to.
 const PLACEHOLDER_SECTIONS: [&str; 5] = ["General", "Layout", "Mail", "Privacy", "Apps"];
 
 pub fn build() -> ConfigView {
@@ -103,14 +106,21 @@ pub fn build() -> ConfigView {
     page.add(&appearance_group);
 
     // The real "Mail" group, replacing that section's placeholder: the
-    // reading pane's remote-images toggle, wired by the caller into WebKit's
-    // load policy.
+    // reading pane's remote-images toggle and the composer's rich-text
+    // default, wired by the caller into WebKit's load policy and the compose
+    // window respectively.
     let mail_settings_group = adw::PreferencesGroup::builder().title("Mail").build();
     let remote_images_row = adw::SwitchRow::builder()
         .title("Load images from the web")
         .subtitle("Display images hosted on remote servers in messages")
         .build();
     mail_settings_group.add(&remote_images_row);
+    let rich_text_row = adw::SwitchRow::builder()
+        .title("Rich text")
+        .subtitle("Start new messages in the formatted editor")
+        .active(true)
+        .build();
+    mail_settings_group.add(&rich_text_row);
 
     for section in PLACEHOLDER_SECTIONS {
         // "Mail" is a live group (see `mail_settings_group` above), not a
@@ -129,14 +139,10 @@ pub fn build() -> ConfigView {
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
 
-    let mail_cache_group = adw::PreferencesGroup::builder()
-        .title("Mail cache")
-        .build();
+    let mail_cache_group = adw::PreferencesGroup::builder().title("Mail cache").build();
     advanced_group.add(&mail_cache_group);
 
-    let calendar_cache_group = adw::PreferencesGroup::builder()
-        .title("Calendar cache")
-        .build();
+    let calendar_cache_group = adw::PreferencesGroup::builder().title("Calendar cache").build();
     advanced_group.add(&calendar_cache_group);
 
     let clear_cache_row = adw::ActionRow::builder()
@@ -153,6 +159,7 @@ pub fn build() -> ConfigView {
         clear_cache_row,
         animations_row,
         remote_images_row,
+        rich_text_row,
         mail_group,
         calendar_group,
         mail_rows: RefCell::new(Vec::new()),
@@ -209,11 +216,7 @@ pub fn refresh(
         push_row(&view.mail_cache_group, &view.mail_cache_rows, empty_row("No cached files"));
     } else {
         for file in mail_cache_files {
-            push_row(
-                &view.mail_cache_group,
-                &view.mail_cache_rows,
-                cache_file_row(&file.name, &file.size),
-            );
+            push_row(&view.mail_cache_group, &view.mail_cache_rows, cache_file_row(&file.name, &file.size));
         }
     }
 
@@ -226,11 +229,7 @@ pub fn refresh(
         push_row(&view.calendar_cache_group, &view.calendar_cache_rows, empty_row("No cached files"));
     } else {
         for file in calendar_cache_files {
-            push_row(
-                &view.calendar_cache_group,
-                &view.calendar_cache_rows,
-                cache_file_row(&file.name, &file.size),
-            );
+            push_row(&view.calendar_cache_group, &view.calendar_cache_rows, cache_file_row(&file.name, &file.size));
         }
     }
 }

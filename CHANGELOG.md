@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.28 (2026-08-05)
+
+### Added
+
+- **Compose**: the composer's body is no longer plain-text only - a "Rich text" switch above the body flips between the existing `Gtk.TextView` and a contenteditable WebKit `WebView` with a formatting toolbar (bold / italic / underline / strikethrough, bulleted and numbered lists, font size, text color, and link insertion). Sending in rich mode emits a `multipart/alternative` message - both the formatted HTML and a plain-text rendering - via `mail_builder`, so HTML-capable clients get the rich version and everything else falls back to the text. Reply/Reply-All/Forward keep their existing plain-text prefills, converted to simple HTML (escaped, `>` quotes become blockquotes, `---` lines become horizontal rules) so both modes start from identical content. Only one mode is live at a time. The editor vetoes navigation and all remote subresources in its `connect_decide_policy` handler (compose must never fetch remote content, regardless of the reading pane's "Load images" setting), and reads its content back out with a single `evaluate_javascript` round trip that also normalizes WebKit's `<font>` wrappers from the size/color commands into styled spans; if that read fails it falls back to the prefill body so a Send click can never drop the message.
+- **Config**: the Config view's "Mail" section now also has a "Rich text" switch, next to "Load images from the web". On by default, it sets which body mode new composers open in - the formatted WebKit editor or the plain-text fallback - for New Message, Reply, Reply-All, and Forward alike. Like the other preferences it's session-only until Phase 5's GSettings lands, and it's read when a composer opens, so an already-open draft is never switched underneath the user.
+
 ## 0.6.27 (2026-08-05)
 
 ### Added

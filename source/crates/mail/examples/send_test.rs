@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
                                 bcc: vec![],
                                 subject: marker.clone(),
                                 text_body: "This is an automated self-test from Lookout's send_test example.".into(),
+                                html_body: None,
                                 in_reply_to: None,
                                 references: vec![],
                             };

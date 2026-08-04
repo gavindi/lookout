@@ -223,6 +223,10 @@ struct UiState {
     /// load-policy handler on every resource decision. Session-only until
     /// GSettings lands, matching the other Phase 5 preferences.
     load_remote_images: bool,
+    /// Config → Mail → "Rich text": the default body mode for new compose
+    /// sessions, read when the composer opens. Session-only until GSettings
+    /// lands, matching the other Phase 5 preferences.
+    rich_text_default: bool,
 }
 
 /// Per-calendar-account state, kept separate from `UiState`/`AccountHandle`
@@ -558,6 +562,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         sort_descending: true,
         favorites: HashSet::new(),
         load_remote_images: false,
+        rich_text_default: true,
     }));
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
@@ -752,7 +757,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let from_email = handle.email.clone();
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, crate::compose::ReplyMode::Reply);
                 let on_done = Rc::new(|| {});
-                let composer = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done);
+                let composer = crate::compose::build_compose_view("Reply", from_email, handle.cmd_tx.clone(), prefill, on_done, state.rich_text_default);
                 reading_stack.add_named(&composer, Some("compose"));
                 reading_stack.set_visible_child_name("compose");
             });
@@ -1823,6 +1828,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Rich text": sets the default body mode for future
+    // compose sessions. Read at composer-open time, so an already-open
+    // composer is untouched.
+    {
+        let state = state.clone();
+        config_view.rich_text_row.connect_active_notify(move |row| {
+            state.borrow_mut().rich_text_default = row.is_active();
+        });
+    }
+
     {
         let add_account_row = config_view.add_account_row.clone();
         add_account_row.connect_activated(|_| {
@@ -1984,8 +1999,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let Some(handle) = account_id.and_then(|id| st.accounts.get(&id)) else { return };
             let cmd_tx = handle.cmd_tx.clone();
             let from_email = handle.email.clone();
+            let rich_text_default = state.borrow().rich_text_default;
             drop(st);
-            show_composer_in_reading_pane(&reading_stack, "New Message", from_email, cmd_tx, crate::compose::ComposePrefill::default());
+            show_composer_in_reading_pane(
+                &reading_stack,
+                "New Message",
+                from_email,
+                cmd_tx,
+                crate::compose::ComposePrefill::default(),
+                rich_text_default,
+            );
         });
     }
 
@@ -2008,7 +2031,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         button.connect_clicked(move |_| {
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
-                show_composer_in_reading_pane(&reading_stack, title, from_email, cmd_tx, prefill);
+                let rich_text_default = state.borrow().rich_text_default;
+                show_composer_in_reading_pane(&reading_stack, title, from_email, cmd_tx, prefill, rich_text_default);
             }
         });
     }
@@ -2019,7 +2043,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         button.connect_clicked(move |_| {
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
-                show_composer_in_reading_pane(&reading_stack, "Forward", from_email, cmd_tx, prefill);
+                let rich_text_default = state.borrow().rich_text_default;
+                show_composer_in_reading_pane(&reading_stack, "Forward", from_email, cmd_tx, prefill, rich_text_default);
             }
         });
     }
@@ -3514,6 +3539,7 @@ mod tests {
             sort_descending: true,
             favorites: HashSet::new(),
             load_remote_images: false,
+            rich_text_default: true,
         }));
 
         // First request goes out and is marked pending.
@@ -3728,6 +3754,7 @@ fn show_composer_in_reading_pane(
     from_email: String,
     cmd_tx: async_channel::Sender<AccountCommand>,
     prefill: crate::compose::ComposePrefill,
+    rich_text_default: bool,
 ) {
     if let Some(existing) = reading_stack.child_by_name("compose") {
         reading_stack.remove(&existing);
@@ -3740,7 +3767,7 @@ fn show_composer_in_reading_pane(
         }
         reading_stack_for_close.set_visible_child_name(&previous_page);
     });
-    let composer = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done);
+    let composer = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done, rich_text_default);
     reading_stack.add_named(&composer, Some("compose"));
     reading_stack.set_visible_child_name("compose");
 }

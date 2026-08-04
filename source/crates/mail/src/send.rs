@@ -9,8 +9,10 @@ use crate::error::{Error, Result};
 
 /// A message the user has composed, ready to be built into a raw RFC 5322
 /// document and sent. Deliberately simple for Phase 1: a single `From`
-/// address (the account's own address - no sending-identity selection yet),
-/// plain-text body only (rich HTML compose is a Phase 2 item per the plan).
+/// address (the account's own address - no sending-identity selection yet).
+/// `text_body` is always set (the plain-text fallback); `html_body`, when
+/// present, is emitted alongside it as a `multipart/alternative` so
+/// HTML-capable clients get the rich version and everything else the text.
 #[derive(Debug)]
 pub struct ComposedMessage {
     pub from: String,
@@ -19,6 +21,9 @@ pub struct ComposedMessage {
     pub bcc: Vec<String>,
     pub subject: String,
     pub text_body: String,
+    /// Optional HTML rendering of the same body. Both parts are sent when
+    /// set; recipients that only handle plain text fall back to `text_body`.
+    pub html_body: Option<String>,
     /// RFC 5322 `In-Reply-To`, when replying to a message.
     pub in_reply_to: Option<String>,
     /// RFC 5322 `References`, when replying to a message.
@@ -39,6 +44,12 @@ pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>
         .from(BuilderAddress::new_address(None::<String>, msg.from.clone()))
         .subject(msg.subject.clone())
         .text_body(msg.text_body.clone());
+    // `mail_builder` turns a message with both text and html bodies into a
+    // `multipart/alternative` (text/plain first, text/html second), so the
+    // HTML body is strictly an enhancement over the plain text part.
+    if let Some(html) = msg.html_body.as_deref().filter(|h| !h.is_empty()) {
+        builder = builder.html_body(html.to_string());
+    }
 
     if !msg.to.is_empty() {
         builder = builder.to(BuilderAddress::new_list(
@@ -100,4 +111,54 @@ pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: 
 
     transport.send_raw(&envelope, raw).await.map_err(|e| Error::LoginFailed(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_message(html: Option<String>) -> ComposedMessage {
+        ComposedMessage {
+            from: "me@example.com".to_string(),
+            to: vec!["you@example.com".to_string()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "test".to_string(),
+            text_body: "plain part".to_string(),
+            html_body: html,
+            in_reply_to: None,
+            references: vec![],
+        }
+    }
+
+    fn raw_to_string(msg: &ComposedMessage) -> String {
+        let (raw, _, _) = build_raw_message(msg);
+        String::from_utf8(raw).expect("raw message is valid UTF-8")
+    }
+
+    #[test]
+    fn plain_text_only_message_has_no_html_part() {
+        let raw = raw_to_string(&sample_message(None));
+        assert!(!raw.to_lowercase().contains("multipart/alternative"));
+        assert!(raw.contains("plain part"));
+        assert!(!raw.contains("text/html"));
+    }
+
+    #[test]
+    fn html_body_produces_multipart_alternative_with_both_parts() {
+        let raw = raw_to_string(&sample_message(Some("<p>html <b>part</b></p>".to_string())));
+        let lower = raw.to_lowercase();
+        assert!(lower.contains("multipart/alternative"), "expected multipart/alternative in:\n{raw}");
+        assert!(lower.contains("text/plain"));
+        assert!(lower.contains("text/html"));
+        assert!(raw.contains("<p>html <b>part</b></p>"));
+        assert!(raw.contains("plain part"));
+    }
+
+    #[test]
+    fn empty_html_body_is_skipped() {
+        let raw = raw_to_string(&sample_message(Some(String::new())));
+        assert!(!raw.to_lowercase().contains("text/html"));
+        assert!(raw.contains("plain part"));
+    }
 }

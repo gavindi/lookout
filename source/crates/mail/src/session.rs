@@ -295,11 +295,7 @@ async fn connect_and_run(
     // Build the initial prefetch list from all selectable mailboxes except
     // INBOX (already synced above). The prefetch will run cooperatively in
     // batches between IDLE cycles.
-    let prefetch_mailboxes: Vec<MailboxId> = folders
-        .iter()
-        .filter(|m| m.id != inbox_id)
-        .map(|m| m.id.clone())
-        .collect();
+    let prefetch_mailboxes: Vec<MailboxId> = folders.iter().filter(|m| m.id != inbox_id).map(|m| m.id.clone()).collect();
     let mut prefetch = if prefetch_mailboxes.is_empty() {
         None
     } else {
@@ -394,11 +390,7 @@ async fn connect_and_run(
                     sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                     session_selected = current_mailbox_id.clone();
                     // Rebuild the prefetch list to include any new folders.
-                    let new_mailboxes: Vec<MailboxId> = folders
-                        .iter()
-                        .filter(|m| m.id != current_mailbox_id)
-                        .map(|m| m.id.clone())
-                        .collect();
+                    let new_mailboxes: Vec<MailboxId> = folders.iter().filter(|m| m.id != current_mailbox_id).map(|m| m.id.clone()).collect();
                     if !new_mailboxes.is_empty() {
                         prefetch = Some(PrefetchState::new(new_mailboxes));
                     }
@@ -419,9 +411,7 @@ async fn connect_and_run(
                         // and without this emit the app's sync request would
                         // be answered by nothing - its pending entry would
                         // stick and suppress every later sync for this folder.
-                        let cached = cache.map_or(false, |c| {
-                            c.has_messages(&current_mailbox_id).unwrap_or(false)
-                        });
+                        let cached = cache.map_or(false, |c| c.has_messages(&current_mailbox_id).unwrap_or(false));
                         if cached {
                             tracing::debug!(mailbox = %current_mailbox_id, "SyncMailbox: cache hit, emitting cached messages without IMAP sync");
                             emit_cached_messages(cache, &current_mailbox_id, events).await;
@@ -528,12 +518,7 @@ async fn connect_and_run(
                 // folder list if we haven't yet.
                 if pf.current_folder_name.is_empty() {
                     if let Some(mailbox) = folders.iter().find(|m| m.id == pf.mailboxes[pf.current]) {
-                        pf.current_folder_name = pf
-                            .mailboxes[pf.current]
-                            .0
-                            .strip_prefix(&format!("{}:", account_id.0))
-                            .unwrap_or(&mailbox.name)
-                            .to_string();
+                        pf.current_folder_name = pf.mailboxes[pf.current].0.strip_prefix(&format!("{}:", account_id.0)).unwrap_or(&mailbox.name).to_string();
                         pf.uidvalidity = mailbox.uidvalidity;
                     } else {
                         // Mailbox not found (deleted since list); skip it.
@@ -555,11 +540,7 @@ async fn connect_and_run(
                     let uid_next = mailbox_meta.uid_next.unwrap_or(1);
                     let fetch_from = uid_next.saturating_sub(INITIAL_FETCH_LIMIT).max(1);
                     let uid_range = format!("{fetch_from}:*");
-                    let fetches: Vec<_> = session
-                        .uid_fetch(&uid_range, "(UID)")
-                        .await?
-                        .try_collect()
-                        .await?;
+                    let fetches: Vec<_> = session.uid_fetch(&uid_range, "(UID)").await?.try_collect().await?;
 
                     // Collect UIDs, newest first.
                     let mut uids: Vec<Uid> = fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
@@ -567,11 +548,7 @@ async fn connect_and_run(
 
                     // Filter out already-cached bodies.
                     if let Some(cache) = cache {
-                        uids.retain(|uid| {
-                            cache.has_body(&pf.mailboxes[pf.current], *uid, pf.uidvalidity)
-                                .unwrap_or(false)
-                                == false
-                        });
+                        uids.retain(|uid| cache.has_body(&pf.mailboxes[pf.current], *uid, pf.uidvalidity).unwrap_or(false) == false);
                     }
 
                     tracing::debug!(
@@ -805,11 +782,7 @@ async fn sync_mailbox(
 /// instant paint on folder switch - both when `SyncMailbox` wakes the session
 /// (pre-IDLE teardown) and when it's processed out of the drain queue with a
 /// cache hit. A no-op when nothing is cached.
-async fn emit_cached_messages(
-    cache: Option<&crate::cache::Cache>,
-    mailbox_id: &MailboxId,
-    events: &async_channel::Sender<AccountEvent>,
-) {
+async fn emit_cached_messages(cache: Option<&crate::cache::Cache>, mailbox_id: &MailboxId, events: &async_channel::Sender<AccountEvent>) {
     let Some(cache) = cache else { return };
     if let Ok(cached) = cache.load_messages(mailbox_id) {
         if !cached.is_empty() {

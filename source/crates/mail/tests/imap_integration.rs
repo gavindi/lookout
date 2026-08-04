@@ -119,6 +119,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
                                 bcc: vec![],
                                 subject: "integration test".to_string(),
                                 text_body: "hello from imap_integration.rs".to_string(),
+                                html_body: None,
                                 in_reply_to: None,
                                 references: vec![],
                             };

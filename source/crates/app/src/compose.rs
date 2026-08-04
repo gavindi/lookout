@@ -1,9 +1,11 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use lookout_core::{EmailBody, EmailSummary};
 use lookout_mail::session::AccountCommand;
 use lookout_mail::ComposedMessage;
+use webkit::prelude::*;
 
 /// Everything the compose window can be pre-filled with, beyond a blank "New
 /// Message" (`ComposePrefill::default()`). Grouped into one struct rather
@@ -147,16 +149,293 @@ pub fn build_forward_prefill(summary: &EmailSummary, body: &EmailBody) -> Compos
     }
 }
 
-/// Builds a plain-text composer widget, meant to be embedded as a page in
-/// the reading pane's `gtk::Stack` (see `window.rs`'s
+/// HTML-escapes the characters that would otherwise break out of element
+/// text. Applied to the plain-text prefill before it's embedded in the
+/// editor document, so `&`, `<`, `>`, quotes and apostrophes stay literal.
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn push_blockquote(out: &mut String, lines: &[String]) {
+    out.push_str("<blockquote>");
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push_str("<br>");
+        }
+        out.push_str(&escape_html(line));
+    }
+    out.push_str("</blockquote>");
+}
+
+fn flush_paragraph(out: &mut String, lines: &mut Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    out.push_str("<p>");
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push_str("<br>");
+        }
+        out.push_str(&escape_html(line));
+    }
+    out.push_str("</p>");
+    lines.clear();
+}
+
+/// Converts a plain-text body into simple HTML for seeding the rich editor:
+/// special characters are escaped, `> `-prefixed lines are grouped into a
+/// blockquote, `---`/`___`/`***` lines become a horizontal rule, blank lines
+/// start a new paragraph and single newlines become `<br>`s. The plain-text
+/// prefill is the source for the HTML mode too (the original message's HTML
+/// is deliberately not reused for quoting), so both modes start from the
+/// same content.
+fn text_to_html(text: &str) -> String {
+    let mut out = String::new();
+    let mut para_lines: Vec<String> = Vec::new();
+    let mut quote_lines: Vec<String> = Vec::new();
+
+    for raw in text.lines() {
+        if let Some(rest) = raw.strip_prefix('>') {
+            flush_paragraph(&mut out, &mut para_lines);
+            quote_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            continue;
+        }
+        if !quote_lines.is_empty() {
+            push_blockquote(&mut out, &quote_lines);
+            quote_lines.clear();
+        }
+        let trimmed = raw.trim();
+        if trimmed.len() >= 3 && trimmed.chars().all(|c| matches!(c, '-' | '_' | '*')) {
+            flush_paragraph(&mut out, &mut para_lines);
+            out.push_str("<hr>");
+        } else if trimmed.is_empty() {
+            flush_paragraph(&mut out, &mut para_lines);
+        } else {
+            para_lines.push(raw.to_string());
+        }
+    }
+    if !quote_lines.is_empty() {
+        push_blockquote(&mut out, &quote_lines);
+    }
+    flush_paragraph(&mut out, &mut para_lines);
+    out
+}
+
+/// Wraps the editor's body HTML in a full document for `WebView::load_html`,
+/// with a minimal stylesheet so quoted text stays visually distinct while
+/// composing.
+fn html_document(body: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body {{ font-family: system-ui, sans-serif; font-size: 12pt; margin: 8px; }}
+blockquote {{ margin: 4px 0 4px 16px; padding-left: 8px; border-left: 2px solid #999; color: #555; }}
+</style></head><body>{body}</body></html>"#
+    )
+}
+
+/// Reads the editor's content back out of the WebView with one
+/// `evaluate_javascript` round trip, returning the normalized HTML and the
+/// plain-text rendering. WebKit's `FontSize`/`ForeColor` editing commands
+/// wrap their selection in `<font>` elements; the script rewrites those into
+/// styled spans so the outgoing HTML is clean instead of full of obsolete
+/// tags. Returns `None` if the evaluation fails (e.g. the document hasn't
+/// finished loading), so callers can fall back to a known-good body rather
+/// than dropping the message.
+fn read_content(web_view: &webkit::WebView) -> Option<(String, String)> {
+    const READ_SCRIPT: &str = r#"(
+        function () {
+            document.querySelectorAll('font').forEach(function (el) {
+                var span = document.createElement('span');
+                var size = el.getAttribute('size');
+                var color = el.getAttribute('color');
+                if (size) {
+                    var pt = size <= 1 ? 8 : size == 2 ? 10 : size == 3 ? 12 : size == 4 ? 14 : size == 5 ? 18 : size == 6 ? 24 : 36;
+                    span.style.fontSize = pt + 'pt';
+                }
+                if (color) {
+                    span.style.color = color;
+                }
+                while (el.firstChild) {
+                    span.appendChild(el.firstChild);
+                }
+                el.parentNode.replaceChild(span, el);
+            });
+            return JSON.stringify({ html: document.body.innerHTML, text: document.body.innerText });
+        }
+    )()"#;
+
+    let result = glib::MainContext::default().block_on(web_view.evaluate_javascript_future(READ_SCRIPT, None, None));
+    let value = result.ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&value.to_string()).ok()?;
+    let html = parsed.get("html").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = parsed.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    Some((html, text))
+}
+
+/// Adds a toolbar button that fires a plain WebKit editing command (bold,
+/// italic, list, ...) on click.
+fn toolbar_command_button(toolbar: &gtk::Box, icon_name: &str, tooltip: &str, command: &'static str, web_view: &Rc<webkit::WebView>) {
+    let button = gtk::Button::builder().icon_name(icon_name).tooltip_text(tooltip).build();
+    let web_view = web_view.clone();
+    button.connect_clicked(move |_| web_view.execute_editing_command(command));
+    toolbar.append(&button);
+}
+
+/// Builds the rich-text editor page: a formatting toolbar above an editable
+/// WebKit `WebView`. The whole page behaves as a contenteditable document,
+/// so formatting actions map to WebKit editing commands (`Bold`,
+/// `InsertUnorderedList`, `FontSize`, `ForeColor`, `CreateLink`, ...) and
+/// the final content is read back with `evaluate_javascript` at send time
+/// (see `read_content`). Navigation and remote subresources are vetoed
+/// regardless of the reading pane's "Load images" setting - composing must
+/// never fetch remote content. Returns the page plus the WebView, which the
+/// caller keeps alive for send-time content reads.
+fn build_rich_editor(initial_html: String) -> (gtk::Box, Rc<webkit::WebView>) {
+    let settings = webkit::Settings::builder().enable_javascript(true).build();
+    let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).build());
+
+    {
+        let web_view = web_view.clone();
+        web_view.connect_decide_policy(move |_view, decision, decision_type| {
+            let uri_is_local = |uri: &str| matches!(uri.split(':').next().unwrap_or(""), "data" | "cid" | "about" | "file");
+            match decision_type {
+                webkit::PolicyDecisionType::NavigationAction => {
+                    let navigation = decision.downcast_ref::<webkit::NavigationPolicyDecision>().and_then(|d| d.navigation_action());
+                    if let Some(uri) = navigation.as_ref().and_then(|a| a.request()).and_then(|r| r.uri()) {
+                        if !uri_is_local(&uri) {
+                            decision.ignore();
+                            return true;
+                        }
+                    }
+                }
+                webkit::PolicyDecisionType::Response => {
+                    if let Some(response) = decision.downcast_ref::<webkit::ResponsePolicyDecision>() {
+                        if !response.is_main_frame_main_resource() {
+                            if let Some(uri) = response.request().and_then(|r| r.uri()) {
+                                if !uri_is_local(&uri) {
+                                    decision.ignore();
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            false
+        });
+    }
+
+    let initial_body = if initial_html.trim().is_empty() { "<p><br></p>".to_string() } else { initial_html };
+    web_view.load_html(&html_document(&initial_body), None);
+
+    let toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
+    toolbar_command_button(&toolbar, "format-text-bold-symbolic", "Bold", "Bold", &web_view);
+    toolbar_command_button(&toolbar, "format-text-italic-symbolic", "Italic", "Italic", &web_view);
+    toolbar_command_button(&toolbar, "format-text-underline-symbolic", "Underline", "Underline", &web_view);
+    toolbar_command_button(&toolbar, "format-text-strikethrough-symbolic", "Strikethrough", "StrikeThrough", &web_view);
+    toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
+    toolbar_command_button(&toolbar, "list-bullet-symbolic", "Bulleted list", "InsertUnorderedList", &web_view);
+    toolbar_command_button(&toolbar, "list-number-symbolic", "Numbered list", "InsertOrderedList", &web_view);
+
+    let font_sizes = gtk::StringList::new(&["Small", "Normal", "Large", "Huge"]);
+    let font_size_args = ["2", "3", "5", "7"];
+    let font_size = gtk::DropDown::builder().model(&font_sizes).selected(1).tooltip_text("Font size").build();
+    {
+        let web_view = web_view.clone();
+        font_size.connect_selected_notify(move |dropdown| {
+            if let Some(arg) = font_size_args.get(dropdown.selected() as usize) {
+                web_view.execute_editing_command_with_argument("FontSize", arg);
+            }
+        });
+    }
+    toolbar.append(&font_size);
+
+    let color_dialog = gtk::ColorDialog::new();
+    let color_button = gtk::ColorDialogButton::builder().dialog(&color_dialog).tooltip_text("Text color").build();
+    {
+        let web_view = web_view.clone();
+        color_button.connect_rgba_notify(move |button| {
+            let rgba = button.rgba();
+            let hex = format!(
+                "#{:02x}{:02x}{:02x}",
+                (rgba.red() * 255.0).round() as u8,
+                (rgba.green() * 255.0).round() as u8,
+                (rgba.blue() * 255.0).round() as u8
+            );
+            web_view.execute_editing_command_with_argument("ForeColor", &hex);
+        });
+    }
+    toolbar.append(&color_button);
+
+    let link_entry = gtk::Entry::builder().placeholder_text("https://example.com").build();
+    let link_dialog = adw::AlertDialog::builder()
+        .heading("Insert link")
+        .body("Enter the destination URL")
+        .default_response("insert")
+        .close_response("cancel")
+        .build();
+    link_dialog.add_response("cancel", "Cancel");
+    link_dialog.add_response("insert", "Insert");
+    link_dialog.set_response_appearance("insert", adw::ResponseAppearance::Suggested);
+    link_dialog.set_extra_child(Some(&link_entry));
+    let link_dialog = Rc::new(link_dialog);
+    let link_entry = Rc::new(link_entry);
+    {
+        let web_view = web_view.clone();
+        link_dialog.connect_response(None, move |_dialog, response| {
+            let url = link_entry.text().to_string();
+            link_entry.set_text("");
+            if response == "insert" && !url.is_empty() {
+                web_view.execute_editing_command_with_argument("CreateLink", &url);
+            }
+        });
+    }
+    let link_button = gtk::Button::builder().icon_name("insert-link-symbolic").tooltip_text("Insert link").build();
+    link_button.connect_clicked(move |button| link_dialog.present(Some(button)));
+    toolbar.append(&link_button);
+
+    let scroller = gtk::ScrolledWindow::builder().child(&*web_view).hexpand(true).vexpand(true).build();
+    let page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    page.append(&toolbar);
+    page.append(&scroller);
+
+    (page, web_view)
+}
+
+/// Builds a composer widget, meant to be embedded as a page in the reading
+/// pane's `gtk::Stack` (see `window.rs`'s
 /// `show_composer_in_reading_pane`) rather than presented as its own window.
 /// `on_done` is called once Cancel or Send is clicked, so the caller can
 /// tear the page down and restore whatever the reading pane showed before.
-/// Rich-text/contenteditable compose was the plan's own flagged
-/// highest-risk Phase 1 item; this ships the documented fallback (plain
-/// `Gtk.TextView` body, comma-separated recipients) so sending mail works
-/// end-to-end now, with a richer composer as Phase 2 work.
-pub fn build_compose_view(title: &str, from_email: String, cmd_tx: async_channel::Sender<AccountCommand>, prefill: ComposePrefill, on_done: Rc<dyn Fn()>) -> gtk::Box {
+///
+/// The body supports two modes, switched with the "Rich text" row: the
+/// plain `gtk::TextView` fallback (also a send-time fallback for HTML
+/// clients), and a contenteditable `WebKit.WebView` with a formatting
+/// toolbar (see `build_rich_editor`). Only one mode is live at a time;
+/// `rich_text_default` picks which one the composer opens on (Config → Mail).
+/// The HTML mode sends `multipart/alternative` - both the rich HTML and a
+/// plain-text rendering - so recipients without HTML support still get the
+/// text.
+pub fn build_compose_view(
+    title: &str,
+    from_email: String,
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    prefill: ComposePrefill,
+    on_done: Rc<dyn Fn()>,
+    rich_text_default: bool,
+) -> gtk::Box {
     let to_row = adw::EntryRow::builder().title("To").build();
     if let Some(to) = &prefill.to {
         to_row.set_text(to);
@@ -170,10 +449,13 @@ pub fn build_compose_view(title: &str, from_email: String, cmd_tx: async_channel
         subject_row.set_text(subject);
     }
 
+    let rich_toggle = adw::SwitchRow::builder().title("Rich text").subtitle("Formatting (bold, lists, links, ...)").build();
+
     let fields_group = adw::PreferencesGroup::new();
     fields_group.add(&to_row);
     fields_group.add(&cc_row);
     fields_group.add(&subject_row);
+    fields_group.add(&rich_toggle);
 
     let body_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
@@ -185,7 +467,31 @@ pub fn build_compose_view(title: &str, from_email: String, cmd_tx: async_channel
     if let Some(body) = &prefill.body {
         body_view.buffer().set_text(body);
     }
-    let body_scroller = gtk::ScrolledWindow::builder().child(&body_view).vexpand(true).build();
+    let text_scroller = gtk::ScrolledWindow::builder().child(&body_view).hexpand(true).vexpand(true).build();
+
+    let (rich_page, rich_web_view) = build_rich_editor(prefill.body.as_deref().map(text_to_html).unwrap_or_default());
+
+    let body_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
+    body_stack.add_named(&text_scroller, Some("text"));
+    body_stack.add_named(&rich_page, Some("rich"));
+    body_stack.set_visible_child_name("text");
+
+    {
+        let web_view = rich_web_view.clone();
+        let stack_for_toggle = body_stack.clone();
+        rich_toggle.connect_active_notify(move |toggle| {
+            if toggle.is_active() {
+                stack_for_toggle.set_visible_child_name("rich");
+                web_view.grab_focus();
+            } else {
+                stack_for_toggle.set_visible_child_name("text");
+            }
+        });
+    }
+    // Wire the Config → Mail preference into the composer's opening mode. The
+    // notify handler above is connected first, so `set_active` also routes
+    // the stack to the right page and focuses the editor.
+    rich_toggle.set_active(rich_text_default);
 
     let cancel_button = gtk::Button::builder().label("Cancel").build();
     let send_button = gtk::Button::builder().label("Send").css_classes(["suggested-action"]).build();
@@ -213,7 +519,7 @@ pub fn build_compose_view(title: &str, from_email: String, cmd_tx: async_channel
         .build();
     content.append(&top_row);
     content.append(&fields_group);
-    content.append(&body_scroller);
+    content.append(&body_stack);
 
     {
         let on_done = on_done.clone();
@@ -222,14 +528,35 @@ pub fn build_compose_view(title: &str, from_email: String, cmd_tx: async_channel
     {
         let in_reply_to = prefill.in_reply_to;
         let references = prefill.references;
+        let prefill_body_text = prefill.body.clone().unwrap_or_default();
         send_button.connect_clicked(move |_| {
             let to: Vec<String> = to_row.text().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             if to.is_empty() {
                 return;
             }
             let cc: Vec<String> = cc_row.text().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-            let buffer = body_view.buffer();
-            let text_body = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+            let (text_body, html_body) = if rich_toggle.is_active() {
+                // Reading the editor's live HTML back out is a round trip
+                // through WebKit; if that fails (e.g. the page hasn't
+                // finished loading yet) fall back to the prefill body so a
+                // Send click can never silently drop the message.
+                match read_content(&rich_web_view) {
+                    Some((html, text)) => {
+                        let text = text.trim().to_string();
+                        if text.is_empty() {
+                            (String::new(), None)
+                        } else {
+                            let html = html.trim().to_string();
+                            (text, Some(html))
+                        }
+                    }
+                    None => (prefill_body_text.clone(), None),
+                }
+            } else {
+                let buffer = body_view.buffer();
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+                (text, None)
+            };
             let msg = ComposedMessage {
                 from: from_email.clone(),
                 to,
@@ -237,6 +564,7 @@ pub fn build_compose_view(title: &str, from_email: String, cmd_tx: async_channel
                 bcc: Vec::new(),
                 subject: subject_row.text().to_string(),
                 text_body,
+                html_body,
                 in_reply_to: in_reply_to.clone(),
                 references: references.clone(),
             };
@@ -367,5 +695,45 @@ mod tests {
         assert!(forward.references.is_empty());
         assert_eq!(forward.subject.as_deref(), Some("Fwd: Hello there"));
         assert!(forward.body.unwrap().contains("original text"));
+    }
+
+    #[test]
+    fn text_to_html_escapes_special_characters() {
+        assert_eq!(text_to_html("a < b & c > d"), "<p>a &lt; b &amp; c &gt; d</p>");
+        assert_eq!(text_to_html("\"quoted\" and 'apostrophe'"), "<p>&quot;quoted&quot; and &#39;apostrophe&#39;</p>");
+    }
+
+    #[test]
+    fn text_to_html_quotes_become_blockquote() {
+        assert_eq!(text_to_html("> quoted\n> still quoted"), "<blockquote>quoted<br>still quoted</blockquote>");
+        assert_eq!(text_to_html("> one"), "<blockquote>one</blockquote>");
+    }
+
+    #[test]
+    fn text_to_html_paragraphs_and_breaks() {
+        assert_eq!(text_to_html("first line\nsecond line\n\nnew para"), "<p>first line<br>second line</p><p>new para</p>");
+        assert_eq!(text_to_html("just one"), "<p>just one</p>");
+    }
+
+    #[test]
+    fn text_to_html_horizontal_rules() {
+        assert_eq!(text_to_html("---"), "<hr>");
+        assert_eq!(text_to_html("text\n\n***"), "<p>text</p><hr>");
+        assert_eq!(text_to_html("___"), "<hr>");
+        assert_eq!(text_to_html("--"), "<p>--</p>");
+    }
+
+    #[test]
+    fn text_to_html_empty_and_blank() {
+        assert_eq!(text_to_html(""), "");
+        assert_eq!(text_to_html("\n\n"), "");
+    }
+
+    #[test]
+    fn text_to_html_mixed_quote_and_text() {
+        assert_eq!(
+            text_to_html("intro\n\n> quoted line\n> second quote"),
+            "<p>intro</p><blockquote>quoted line<br>second quote</blockquote>"
+        );
     }
 }
