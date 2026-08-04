@@ -262,6 +262,30 @@ async fn connect_and_run(
                 Err(_) => Wake::ChannelClosed,
             },
         };
+
+        // Emit cached messages for instant display the instant a folder
+        // switch arrives, *before* the IDLE teardown (handle.done().await)
+        // so the UI paints from disk while we wait for the network round-trip.
+        if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
+            if let Some(cache) = cache {
+                if let Ok(cached) = cache.load_messages(mailbox_id) {
+                    if !cached.is_empty() {
+                        let snoozed = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()).unwrap_or_default();
+                        let filtered: Vec<_> = cached.iter().filter(|m| !snoozed.contains(&m.uid)).cloned().collect();
+                        if !filtered.is_empty() {
+                            tracing::debug!(mailbox = %mailbox_id, count = filtered.len(), "emitting cached messages for instant display");
+                            let _ = events
+                                .send(AccountEvent::MessagesUpdated {
+                                    mailbox: mailbox_id.clone(),
+                                    messages: filtered,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+
         drop(stop_source);
         session = handle.done().await?;
 
@@ -487,25 +511,6 @@ async fn sync_mailbox(
     events: &async_channel::Sender<AccountEvent>,
     cache: Option<&crate::cache::Cache>,
 ) -> Result<()> {
-    // Emit cached messages for instant display before the IMAP fetch.
-    if let Some(cache) = cache {
-        if let Ok(cached) = cache.load_messages(mailbox_id) {
-            if !cached.is_empty() {
-                let snoozed = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()).unwrap_or_default();
-                let filtered: Vec<_> = cached.iter().filter(|m| !snoozed.contains(&m.uid)).cloned().collect();
-                if !filtered.is_empty() {
-                    tracing::debug!(mailbox = %mailbox_id, count = filtered.len(), "emitting cached messages for instant display");
-                    let _ = events
-                        .send(AccountEvent::MessagesUpdated {
-                            mailbox: mailbox_id.clone(),
-                            messages: filtered,
-                        })
-                        .await;
-                }
-            }
-        }
-    }
-
     let mailbox_meta = session.select(folder_path).await?;
     let uid_next = mailbox_meta.uid_next.unwrap_or(1);
     let uidvalidity = UidValidity(mailbox_meta.uid_validity.unwrap_or(0));
