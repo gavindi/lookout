@@ -183,7 +183,7 @@ mod tests {
     fn info(id: &str, color: Option<&str>) -> CalendarInfo {
         let account_id = AccountId("account".to_string());
         CalendarInfo {
-            id: CalendarId(format!("{id}")),
+            id: CalendarId(id.to_string()),
             account_id,
             display_name: id.to_string(),
             color: color.map(|c| c.to_string()),

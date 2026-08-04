@@ -446,12 +446,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     app.add_action(&about_action);
 
     let bg_bytes = include_bytes!("../../../Assets/backgrounds/background2.png");
-    let bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes)).expect("bundled background image should decode");
-    let background = gtk::Picture::for_paintable(&bg_texture);
+    let default_bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes)).expect("bundled background image should decode");
+    let background = gtk::Picture::for_paintable(&default_bg_texture);
     background.set_content_fit(gtk::ContentFit::Cover);
     background.set_can_shrink(true);
     background.set_hexpand(true);
     background.set_vexpand(true);
+    // A custom background chosen under Config → Appearance → "Window
+    // background" wins over the bundled artwork when it's still around and
+    // still decodes; the Config view rows are told about it further down.
+    let custom_background_name = crate::background_image::load().and_then(|path| match gtk::gdk::Texture::from_filename(&path) {
+        Ok(texture) => {
+            background.set_paintable(Some(&texture));
+            path.file_name().map(|name| name.to_string_lossy().into_owned())
+        }
+        Err(_) => {
+            tracing::warn!(path = %path.display(), "ignoring unreadable custom background image");
+            None
+        }
+    });
 
     let toast_overlay = adw::ToastOverlay::new();
 
@@ -1843,6 +1856,63 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let add_account_row = config_view.add_account_row.clone();
         add_account_row.connect_activated(|_| {
             let _ = std::process::Command::new("gnome-control-center").arg("online-accounts").spawn();
+        });
+    }
+
+    // Config → Appearance → "Window background": reflect a stored custom
+    // background (if one applied at startup) in the row subtitle and arm the
+    // restore row; then wire the picker to a file chooser and "Restore
+    // default background" back to the bundled artwork.
+    if let Some(name) = &custom_background_name {
+        config_view.background_image_row.set_subtitle(name);
+        config_view.restore_background_row.set_sensitive(true);
+    }
+    {
+        let background_image_row = config_view.background_image_row.clone();
+        let restore_background_row = config_view.restore_background_row.clone();
+        let background = background.clone();
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        background_image_row.connect_activated(move |row| {
+            let row = row.clone();
+            let window = window.clone();
+            let background = background.clone();
+            let toast_overlay = toast_overlay.clone();
+            let restore_background_row = restore_background_row.clone();
+            glib::spawn_future_local(async move {
+                let filter = gtk::FileFilter::new();
+                filter.add_pixbuf_formats();
+                filter.set_name(Some("Images"));
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+
+                let dialog = gtk::FileDialog::builder().title("Choose a background image").filters(&filters).build();
+                let Ok(file) = dialog.open_future(Some(&window)).await else { return };
+                let Some(path) = file.path() else { return };
+                match gtk::gdk::Texture::from_filename(&path) {
+                    Ok(texture) => {
+                        background.set_paintable(Some(&texture));
+                        crate::background_image::save(&path);
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                        row.set_subtitle(&name);
+                        restore_background_row.set_sensitive(true);
+                    }
+                    Err(e) => {
+                        toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't load background image: {e}")));
+                    }
+                }
+            });
+        });
+    }
+    {
+        let restore_background_row = config_view.restore_background_row.clone();
+        let background_image_row = config_view.background_image_row.clone();
+        let background = background.clone();
+        restore_background_row.connect_activated(move |row| {
+            crate::background_image::clear();
+            background.set_paintable(Some(&default_bg_texture));
+            background_image_row.set_subtitle("Default Lookout artwork");
+            row.set_sensitive(false);
         });
     }
 
@@ -3285,6 +3355,11 @@ fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String
         .unwrap_or_else(|| account_id.0.clone())
 }
 
+/// The snapshot `rebuild_folder_tree` takes of `UiState` before touching the
+/// selection: whether to auto-select the first Inbox, then each account's
+/// (id, label, folders), then the resolved starred mailboxes.
+type FolderTreeSnapshot = (bool, Vec<(AccountId, String, Vec<Mailbox>)>, Vec<Mailbox>);
+
 /// Rebuilds the folder sidebar's `Gtk.TreeListModel` from every connected
 /// account's latest folder snapshot. Accounts are sorted by email for a
 /// stable order across rebuilds (`HashMap` iteration order isn't stable,
@@ -3298,7 +3373,7 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
     // inside `select_first_inbox` synchronously fires the `selected-item`
     // handler, which itself borrows `state` mutably - so no borrow may be
     // live across that call.
-    let (auto_select_inbox, mut accounts, mut favorites): (bool, Vec<(AccountId, String, Vec<Mailbox>)>, Vec<Mailbox>) = {
+    let (auto_select_inbox, mut accounts, mut favorites): FolderTreeSnapshot = {
         let st = state.borrow();
         let accounts = st
             .accounts
@@ -3475,134 +3550,6 @@ fn folder_icon_name(role: MailboxRole) -> &'static str {
         MailboxRole::Junk => "mail-spam-symbolic",
         MailboxRole::Archive => "mail-archive-symbolic",
         MailboxRole::Custom => "folder-symbolic",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn body_request_matches_the_current_pending_selection() {
-        let pending = Some((MailboxId("acc:inbox".into()), Uid(42)));
-        assert!(body_request_matches(&MailboxId("acc:inbox".into()), &Uid(42), pending.as_ref()));
-        assert!(!body_request_matches(&MailboxId("acc:inbox".into()), &Uid(43), pending.as_ref()));
-    }
-
-    #[test]
-    fn body_request_is_rejected_when_no_selection_is_pending() {
-        assert!(!body_request_matches(&MailboxId("acc:inbox".into()), &Uid(42), None));
-    }
-
-    #[test]
-    fn mailbox_account_id_splits_the_account_prefix() {
-        assert_eq!(
-            mailbox_account_id(&MailboxId("/org/gnome/OnlineAccounts/Accounts/account_7:INBOX".into())),
-            Some(AccountId("/org/gnome/OnlineAccounts/Accounts/account_7".into()))
-        );
-        // No account prefix (an id not shaped "account:path").
-        assert_eq!(mailbox_account_id(&MailboxId("INBOX".into())), None);
-    }
-
-    #[test]
-    fn unified_merge_dedupes_by_mailbox_and_uid_and_sorts_newest_first() {
-        let snapshots = HashMap::from([
-            (
-                MailboxId("a:INBOX".into()),
-                vec![summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), summary(Uid(2), "a:INBOX", 2024, 1, 10, 8)],
-            ),
-            (
-                MailboxId("b:INBOX".into()),
-                // Duplicate of a:INBOX/2 (same uid, different mailbox) is kept;
-                // the doubled a:INBOX/1 in this snapshot must collapse.
-                vec![summary(Uid(2), "b:INBOX", 2024, 1, 10, 10), summary(Uid(1), "a:INBOX", 2024, 1, 10, 9)],
-            ),
-        ]);
-
-        let merged = merge_unified_snapshots(&snapshots);
-        let keys: Vec<(String, u32)> = merged.iter().map(|m| (m.mailbox.0.clone(), m.uid.0)).collect();
-        // Newest first; a:INBOX/1 appears once despite being in both snapshots.
-        assert_eq!(keys, vec![("b:INBOX".into(), 2), ("a:INBOX".into(), 1), ("a:INBOX".into(), 2)]);
-    }
-
-    #[test]
-    fn request_mailbox_sync_dedupes_until_answered_or_reconnected() {
-        let account_id = AccountId("acc".into());
-        let inbox = MailboxId("acc:INBOX".into());
-        let (cmd_tx, _cmd_rx) = async_channel::unbounded();
-        let state = Rc::new(RefCell::new(UiState {
-            accounts: HashMap::from([(
-                account_id.clone(),
-                AccountHandle {
-                    cmd_tx,
-                    email: "a@b.c".into(),
-                    display_name: String::new(),
-                    imap_host: "imap".into(),
-                    imap_port: 993,
-                    smtp_host: "smtp".into(),
-                    smtp_port: 465,
-                    folders: Vec::new(),
-                },
-            )]),
-            current_account: None,
-            current_mailbox: None,
-            mail_view: MailView::Single,
-            unified_snapshots: HashMap::new(),
-            pending_body_request: None,
-            pending_html_reveal: false,
-            pending_header: None,
-            body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),
-            reveal_generation: 0,
-            last_selection: None,
-            restore_pending: false,
-            rendered_message: None,
-            syncing: HashSet::new(),
-            sort_key: SortKey::Date,
-            sort_descending: true,
-            favorites: HashSet::new(),
-            load_remote_images: false,
-            rich_text_default: true,
-        }));
-
-        // First request goes out and is marked pending.
-        assert!(request_mailbox_sync(&state, &account_id, &inbox));
-        // A duplicate while the first is still in flight is dropped.
-        assert!(!request_mailbox_sync(&state, &account_id, &inbox));
-
-        // The sync landing clears the pending mark, so a later request - a
-        // genuine re-sync - is allowed again.
-        state.borrow_mut().syncing.remove(&inbox);
-        assert!(request_mailbox_sync(&state, &account_id, &inbox));
-
-        // A reconnect (fresh folders) also clears it, so a request that died
-        // with a dropped connection can't suppress the next one.
-        state.borrow_mut().syncing.insert(inbox.clone());
-        state.borrow_mut().syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
-        assert!(!state.borrow().syncing.contains(&inbox));
-    }
-
-    fn summary(uid: Uid, mailbox: &str, year: i32, month: u32, day: u32, hour: u32) -> EmailSummary {
-        use chrono::TimeZone;
-        use lookout_core::ThreadKey;
-        use std::collections::BTreeSet;
-        EmailSummary {
-            uid,
-            mailbox: MailboxId(mailbox.into()),
-            message_id: None,
-            in_reply_to: None,
-            references: vec![],
-            thread_key: ThreadKey("t".into()),
-            subject: None,
-            from: vec![],
-            to: vec![],
-            cc: vec![],
-            date: chrono::Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap(),
-            flags: BTreeSet::new(),
-            keywords: BTreeSet::new(),
-            size: 0,
-            has_attachment: false,
-            preview: None,
-        }
     }
 }
 
@@ -3792,4 +3739,132 @@ fn show_composer_in_reading_pane(
     let composer = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done, rich_text_default);
     reading_stack.add_named(&composer, Some("compose"));
     reading_stack.set_visible_child_name("compose");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_request_matches_the_current_pending_selection() {
+        let pending = Some((MailboxId("acc:inbox".into()), Uid(42)));
+        assert!(body_request_matches(&MailboxId("acc:inbox".into()), &Uid(42), pending.as_ref()));
+        assert!(!body_request_matches(&MailboxId("acc:inbox".into()), &Uid(43), pending.as_ref()));
+    }
+
+    #[test]
+    fn body_request_is_rejected_when_no_selection_is_pending() {
+        assert!(!body_request_matches(&MailboxId("acc:inbox".into()), &Uid(42), None));
+    }
+
+    #[test]
+    fn mailbox_account_id_splits_the_account_prefix() {
+        assert_eq!(
+            mailbox_account_id(&MailboxId("/org/gnome/OnlineAccounts/Accounts/account_7:INBOX".into())),
+            Some(AccountId("/org/gnome/OnlineAccounts/Accounts/account_7".into()))
+        );
+        // No account prefix (an id not shaped "account:path").
+        assert_eq!(mailbox_account_id(&MailboxId("INBOX".into())), None);
+    }
+
+    #[test]
+    fn unified_merge_dedupes_by_mailbox_and_uid_and_sorts_newest_first() {
+        let snapshots = HashMap::from([
+            (
+                MailboxId("a:INBOX".into()),
+                vec![summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), summary(Uid(2), "a:INBOX", 2024, 1, 10, 8)],
+            ),
+            (
+                MailboxId("b:INBOX".into()),
+                // Duplicate of a:INBOX/2 (same uid, different mailbox) is kept;
+                // the doubled a:INBOX/1 in this snapshot must collapse.
+                vec![summary(Uid(2), "b:INBOX", 2024, 1, 10, 10), summary(Uid(1), "a:INBOX", 2024, 1, 10, 9)],
+            ),
+        ]);
+
+        let merged = merge_unified_snapshots(&snapshots);
+        let keys: Vec<(String, u32)> = merged.iter().map(|m| (m.mailbox.0.clone(), m.uid.0)).collect();
+        // Newest first; a:INBOX/1 appears once despite being in both snapshots.
+        assert_eq!(keys, vec![("b:INBOX".into(), 2), ("a:INBOX".into(), 1), ("a:INBOX".into(), 2)]);
+    }
+
+    #[test]
+    fn request_mailbox_sync_dedupes_until_answered_or_reconnected() {
+        let account_id = AccountId("acc".into());
+        let inbox = MailboxId("acc:INBOX".into());
+        let (cmd_tx, _cmd_rx) = async_channel::unbounded();
+        let state = Rc::new(RefCell::new(UiState {
+            accounts: HashMap::from([(
+                account_id.clone(),
+                AccountHandle {
+                    cmd_tx,
+                    email: "a@b.c".into(),
+                    display_name: String::new(),
+                    imap_host: "imap".into(),
+                    imap_port: 993,
+                    smtp_host: "smtp".into(),
+                    smtp_port: 465,
+                    folders: Vec::new(),
+                },
+            )]),
+            current_account: None,
+            current_mailbox: None,
+            mail_view: MailView::Single,
+            unified_snapshots: HashMap::new(),
+            pending_body_request: None,
+            pending_html_reveal: false,
+            pending_header: None,
+            body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),
+            reveal_generation: 0,
+            last_selection: None,
+            restore_pending: false,
+            rendered_message: None,
+            syncing: HashSet::new(),
+            sort_key: SortKey::Date,
+            sort_descending: true,
+            favorites: HashSet::new(),
+            load_remote_images: false,
+            rich_text_default: true,
+        }));
+
+        // First request goes out and is marked pending.
+        assert!(request_mailbox_sync(&state, &account_id, &inbox));
+        // A duplicate while the first is still in flight is dropped.
+        assert!(!request_mailbox_sync(&state, &account_id, &inbox));
+
+        // The sync landing clears the pending mark, so a later request - a
+        // genuine re-sync - is allowed again.
+        state.borrow_mut().syncing.remove(&inbox);
+        assert!(request_mailbox_sync(&state, &account_id, &inbox));
+
+        // A reconnect (fresh folders) also clears it, so a request that died
+        // with a dropped connection can't suppress the next one.
+        state.borrow_mut().syncing.insert(inbox.clone());
+        state.borrow_mut().syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
+        assert!(!state.borrow().syncing.contains(&inbox));
+    }
+
+    fn summary(uid: Uid, mailbox: &str, year: i32, month: u32, day: u32, hour: u32) -> EmailSummary {
+        use chrono::TimeZone;
+        use lookout_core::ThreadKey;
+        use std::collections::BTreeSet;
+        EmailSummary {
+            uid,
+            mailbox: MailboxId(mailbox.into()),
+            message_id: None,
+            in_reply_to: None,
+            references: vec![],
+            thread_key: ThreadKey("t".into()),
+            subject: None,
+            from: vec![],
+            to: vec![],
+            cc: vec![],
+            date: chrono::Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap(),
+            flags: BTreeSet::new(),
+            keywords: BTreeSet::new(),
+            size: 0,
+            has_attachment: false,
+            preview: None,
+        }
+    }
 }

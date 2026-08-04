@@ -414,7 +414,7 @@ async fn connect_and_run(
                         // and without this emit the app's sync request would
                         // be answered by nothing - its pending entry would
                         // stick and suppress every later sync for this folder.
-                        let cached = cache.map_or(false, |c| c.has_messages(&current_mailbox_id).unwrap_or(false));
+                        let cached = cache.is_some_and(|c| c.has_messages(&current_mailbox_id).unwrap_or(false));
                         if cached {
                             tracing::debug!(mailbox = %current_mailbox_id, "SyncMailbox: cache hit, emitting cached messages without IMAP sync");
                             emit_cached_messages(cache, &current_mailbox_id, events).await;
@@ -513,7 +513,7 @@ async fn connect_and_run(
                 // Check before starting any batch work (SELECT, envelope
                 // fetch, body fetch) so a rapid stream of user clicks
                 // never waits for even one IMAP round trip.
-                if commands.len() > 0 {
+                if !commands.is_empty() {
                     continue;
                 }
 
@@ -534,7 +534,7 @@ async fn connect_and_run(
                 if !pf.envelopes_fetched {
                     // Check before SELECT to avoid blocking the session if a
                     // user command arrived during the previous body fetch.
-                    if commands.len() > 0 {
+                    if !commands.is_empty() {
                         continue;
                     }
                     let folder_name = pf.current_folder_name.clone();
@@ -551,7 +551,7 @@ async fn connect_and_run(
 
                     // Filter out already-cached bodies.
                     if let Some(cache) = cache {
-                        uids.retain(|uid| cache.has_body(&pf.mailboxes[pf.current], *uid, pf.uidvalidity).unwrap_or(false) == false);
+                        uids.retain(|uid| !cache.has_body(&pf.mailboxes[pf.current], *uid, pf.uidvalidity).unwrap_or(false));
                     }
 
                     tracing::debug!(
@@ -569,7 +569,7 @@ async fn connect_and_run(
                 // more than one body download.
                 if !pf.pending_uids.is_empty() {
                     // Check before starting body fetches.
-                    if commands.len() > 0 {
+                    if !commands.is_empty() {
                         continue;
                     }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(PREFETCH_BATCH_SIZE)).collect();
@@ -578,7 +578,7 @@ async fn connect_and_run(
                         // A user command may have arrived during the previous
                         // body fetch. If so, put back the remaining UIDs and
                         // break out so the command is processed promptly.
-                        if i > 0 && commands.len() > 0 {
+                        if i > 0 && !commands.is_empty() {
                             pf.pending_uids.splice(0..0, batch[i..].iter().cloned());
                             break;
                         }
@@ -617,7 +617,7 @@ async fn connect_and_run(
         // fetch or body fetches). Skip if a user command is pending — the
         // command handler will SELECT the folder it needs, and the top-of-loop
         // check re-selects the user's folder anyway.
-        if did_prefetch_work && commands.len() == 0 {
+        if did_prefetch_work && commands.is_empty() {
             session.select(&current_mailbox_name).await?;
             session_selected = current_mailbox_id.clone();
         }

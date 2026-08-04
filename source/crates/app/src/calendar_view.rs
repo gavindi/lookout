@@ -2061,7 +2061,7 @@ mod tests {
             blue: 0.0,
             alpha: 0.0,
         };
-        let resolved = unsafe { gtk::ffi::gtk_style_context_lookup_color(context, b"probe\0".as_ptr().cast(), &mut probe) };
+        let resolved = unsafe { gtk::ffi::gtk_style_context_lookup_color(context, c"probe".as_ptr(), &mut probe) };
         assert!(resolved != 0, "display-level @define-color did not resolve on the widget's style context");
         assert!((probe.red - ((0x35_u32 as f64) / 255.0) as f32).abs() < 0.01, "probe red = {}", probe.red);
 

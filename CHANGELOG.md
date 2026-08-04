@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.31 (2026-08-05)
+
+### Fixed
+
+- **Config**: the window-background picker added in 0.6.30 did not compile as written. Both signal closures moved `config_view` into themselves while the `connect_activated` call still borrowed the row widget off it as the receiver, and the picker closure additionally carried the borrowed `&ActionRow` parameter into the spawned file-chooser future, which needs `'static`. The widgets are now cloned before connecting - each handler captures only the two rows it actually touches plus the background `Picture`, never the whole `ConfigView` - and the row is cloned again for the async block.
+- **Testing**: the `background_image` round-trip test was flaky. Both of the module's tests set `XDG_CONFIG_HOME` - a process-global env var - and Rust runs tests on parallel threads, so the stale-path test could rewrite the variable while the round-trip test sat between its `save` and `load`, making the load read the wrong directory. A single test now owns the env var and covers both the save/load/clear round trip and the stale-path fallback.
+- **Build**: the workspace is clippy-clean again under the current stable toolchain, whose new lints had pushed eleven pre-existing spots past CI's `-D warnings` gate. The mail session's prefetch path swaps `len() > 0` / `len() == 0` for `is_empty()` and `map_or(false, …)` for `is_some_and(…)`; the calendar-colours test's `format!("{id}")` becomes `to_string()`; the calendar style-context probe builds its C string with a `c"probe"` literal instead of a hand-rolled NUL-terminated byte string; `rebuild_folder_tree`'s snapshot tuple is factored into a `FolderTreeSnapshot` type alias instead of an inline "very complex type" annotation; and the `window.rs` test module moved to the end of the file to satisfy the items-after-test-module lint. Behavior is unchanged throughout - pure lint hygiene.
+
+## 0.6.30 (2026-08-05)
+
+### Added
+
+- **Config**: the Config view's "Appearance" section can now replace the window's background artwork. A "Window background" row opens a file chooser filtered to whatever formats `GdkPixbuf` can decode; the chosen image replaces the bundled artwork behind every pane immediately, and the row's subtitle names the file in use. A second "Restore default background" row - only active while a custom image is set - switches back to the bundled artwork. The choice persists across restarts as a plain path in `$XDG_CONFIG_HOME/lookout/background-image-path` (the same best-effort file convention as calendar colours, until Phase 5's GSettings lands): it's re-applied at startup, and a stored path whose file has since been deleted, moved, or become unreadable falls back to the bundled artwork silently rather than blocking the window or erroring at launch.
+
 ## 0.6.29 (2026-08-05)
 
 ### Fixed

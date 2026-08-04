@@ -1,7 +1,7 @@
 //! Config view: a read-only overview of the Mail/Calendar accounts Lookout
 //! is connected to, a live Appearance section (the smooth-transitions
-//! preference), disabled placeholder sections mirroring the rest of the
-//! Phase 5 settings taxonomy (General/Layout/Mail/Privacy/Apps) and a live
+//! preference and the window-background image picker), disabled placeholder
+//! sections mirroring the rest of the Phase 5 settings taxonomy (General/Layout/Mail/Privacy/Apps) and a live
 //! Advanced section with a cache-clear action. Data-in/widget-out like
 //! `calendar_view.rs` and `folder_tree.rs`: the caller (window.rs) owns the
 //! session state and feeds plain display structs into `refresh`.
@@ -52,6 +52,14 @@ pub struct ConfigView {
     /// widgets that animate) can wire its `active` state to disable the
     /// reading pane's crossfades.
     pub animations_row: adw::SwitchRow,
+    /// "Window background" row, exposed so the caller can wire its `activated`
+    /// signal to a file chooser and update its subtitle to reflect the image
+    /// currently in use.
+    pub background_image_row: adw::ActionRow,
+    /// "Restore default background" row, exposed so the caller can wire its
+    /// `activated` signal back to the bundled artwork (and re-enable it only
+    /// when a custom image is actually set).
+    pub restore_background_row: adw::ActionRow,
     /// "Load images from the web" switch (Config → Mail), exposed so the
     /// caller can wire its `active` state into the reading pane's remote-image
     /// policy.
@@ -103,6 +111,19 @@ pub fn build() -> ConfigView {
         .active(true)
         .build();
     appearance_group.add(&animations_row);
+    let background_image_row = adw::ActionRow::builder()
+        .title("Window background")
+        .subtitle("Default Lookout artwork")
+        .activatable(true)
+        .build();
+    appearance_group.add(&background_image_row);
+    let restore_background_row = adw::ActionRow::builder()
+        .title("Restore default background")
+        .subtitle("Use the bundled artwork again")
+        .activatable(true)
+        .sensitive(false)
+        .build();
+    appearance_group.add(&restore_background_row);
     page.add(&appearance_group);
 
     // The real "Mail" group, replacing that section's placeholder: the
@@ -158,6 +179,8 @@ pub fn build() -> ConfigView {
         add_account_row,
         clear_cache_row,
         animations_row,
+        background_image_row,
+        restore_background_row,
         remote_images_row,
         rich_text_row,
         mail_group,
