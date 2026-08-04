@@ -227,7 +227,10 @@ pub async fn run_account_session(
             }
             Err(e) => {
                 tracing::warn!("account session error, will reconnect: {e}");
-                let _ = events.send(AccountEvent::Error(e.to_string())).await;
+                // Connection failures are warning-level: the loop below
+                // retries with backoff, so only the connection-lifecycle
+                // event is sent (no duplicate `AccountEvent::Error`). The UI
+                // treats retryable states as non-actionable and stays quiet.
                 let _ = events
                     .send(AccountEvent::ConnectionStateChanged(ConnectionState::Error {
                         message: e.to_string(),

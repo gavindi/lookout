@@ -27,12 +27,12 @@ use lookout_core::AccountId;
 use lookout_mail::session::CredentialProvider;
 use lookout_mail::Credential;
 
-/// Client id for the public authorization-code flow. This is Mozilla
-/// Thunderbird's multi-tenant Microsoft app (publisher-verified, loopback
-/// redirect), reused so the flow works without the user registering an Azure
-/// application; Thunderbird's source asks not to copy it, so replace with a
-/// Lookout-registered client id if one becomes available.
-const CLIENT_ID: &str = "9e5f94bc-e8a4-4e73-b8be-63364c29d753";
+/// Client id of Lookout's own public authorization-code flow app in Entra,
+/// registered as a public/native client with the `http://localhost` loopback
+/// redirect, "Allow public client flows" enabled, and the
+/// `IMAP.AccessAsUser.All` / `SMTP.Send` delegated permissions on the
+/// Office 365 Exchange Online resource.
+const CLIENT_ID: &str = "07725d7c-f588-41ae-bdd0-7ee625fed328";
 
 /// Scopes Exchange Online's IMAP/SMTP endpoints require. A token carrying
 /// both works for either protocol (same `outlook.office.com` resource), and
@@ -102,6 +102,16 @@ impl TokenStore {
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    fn delete(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Outcome of trying to exchange a stored refresh token.
+enum RefreshOutcome {
+    AccessToken(String),
+    ReauthNeeded,
 }
 
 /// Manages one Microsoft 365 account's access token, running the interactive
@@ -128,22 +138,35 @@ impl MicrosoftOAuth {
         }
 
         let store = TokenStore::for_account(&self.account_id);
-        let token = match store.load().ok() {
-            Some(stored) => self.refresh(&store, &stored.refresh_token).await,
-            None => self.authorize(&store).await,
-        }?;
+        if let Ok(stored) = store.load() {
+            match self.refresh(&store, &stored.refresh_token).await? {
+                RefreshOutcome::AccessToken(token) => return Ok(token),
+                // The token endpoint rejected the stored refresh token
+                // (revoked, expired, or issued for a different client id).
+                // It can never be fixed by retrying, so drop it and ask the
+                // user to authorize again.
+                RefreshOutcome::ReauthNeeded => store.delete(),
+            }
+        }
 
-        Ok(token)
+        self.authorize(&store).await
     }
 
-    async fn refresh(&self, store: &TokenStore, refresh_token: &str) -> Result<String, String> {
+    async fn refresh(&self, store: &TokenStore, refresh_token: &str) -> Result<RefreshOutcome, String> {
         let params = [
             ("client_id", CLIENT_ID),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("scope", SCOPES),
         ];
-        let resp = post_token_request(&params).await?;
+        let resp = match post_token_request(&params).await {
+            // A rejected grant is permanent (the token is unusable), so
+            // re-authorize instead of failing; anything else (network, 5xx,
+            // unparseable body) is transient and worth retrying later.
+            Err(TokenRequestError::Rejected { .. }) => return Ok(RefreshOutcome::ReauthNeeded),
+            Err(TokenRequestError::Transient(e)) => return Err(e),
+            Ok(resp) => resp,
+        };
         if let Some(new_refresh) = resp.refresh_token.filter(|t| !t.is_empty()) {
             // Microsoft rotates refresh tokens; persist the new one so a
             // stale stored token can't trigger a silent re-auth later.
@@ -151,7 +174,7 @@ impl MicrosoftOAuth {
         }
         let (access_token, expires_in) = (resp.access_token, resp.expires_in);
         self.cache(access_token.clone(), expires_in);
-        Ok(access_token)
+        Ok(RefreshOutcome::AccessToken(access_token))
     }
 
     async fn authorize(&self, store: &TokenStore) -> Result<String, String> {
@@ -186,7 +209,7 @@ impl MicrosoftOAuth {
             ("redirect_uri", redirect_uri.as_str()),
             ("code_verifier", verifier.as_str()),
         ];
-        let resp = post_token_request(&params).await?;
+        let resp = post_token_request(&params).await.map_err(|e| e.to_string())?;
         let refresh_token = resp.refresh_token.ok_or("Microsoft token response didn't include a refresh token")?;
         store.save(&StoredToken { refresh_token })?;
         let (access_token, expires_in) = (resp.access_token, resp.expires_in);
@@ -227,20 +250,40 @@ impl CredentialProvider for MicrosoftCredentialProvider {
     }
 }
 
-async fn post_token_request(params: &[(&str, &str)]) -> Result<TokenResponse, String> {
+/// Why a token request failed. `Rejected` means Microsoft refused the grant
+/// itself (bad/revoked refresh token, wrong client, denied consent) - retrying
+/// will never help; `Transient` covers network and parsing failures.
+enum TokenRequestError {
+    Rejected { status: u16, body: String },
+    Transient(String),
+}
+
+impl std::fmt::Display for TokenRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenRequestError::Rejected { status, body } => write!(f, "Microsoft token endpoint returned {status}: {body}"),
+            TokenRequestError::Transient(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+async fn post_token_request(params: &[(&str, &str)]) -> Result<TokenResponse, TokenRequestError> {
     let client = reqwest::Client::new();
     let resp = client
         .post(TOKEN_URL)
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("Microsoft OAuth token request failed: {e}"))?;
+        .map_err(|e| TokenRequestError::Transient(format!("Microsoft OAuth token request failed: {e}")))?;
     let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("couldn't read Microsoft token response: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| TokenRequestError::Transient(format!("couldn't read Microsoft token response: {e}")))?;
     if !status.is_success() {
-        return Err(format!("Microsoft token endpoint returned {status}: {body}"));
+        return Err(TokenRequestError::Rejected { status: status.as_u16(), body });
     }
-    serde_json::from_str(&body).map_err(|e| format!("couldn't parse Microsoft token response: {e} ({body})"))
+    serde_json::from_str(&body).map_err(|e| TokenRequestError::Transient(format!("couldn't parse Microsoft token response: {e} ({body})")))
 }
 
 /// Serves the loopback redirect until the browser delivers the

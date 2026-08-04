@@ -104,7 +104,9 @@ pub async fn run_calendar_session(
             }
             Err(e) => {
                 tracing::warn!("calendar session error, will reconnect: {e}");
-                let _ = events.send(CalendarSessionEvent::Error(e.to_string())).await;
+                // Connection failures are warning-level: the loop below
+                // retries with backoff, so only the connection-lifecycle
+                // event is sent (no duplicate `CalendarSessionEvent::Error`).
                 let _ = events
                     .send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Error {
                         message: e.to_string(),

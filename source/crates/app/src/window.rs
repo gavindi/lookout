@@ -2567,8 +2567,13 @@ fn connect_account(
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
             match event {
-                AccountEvent::ConnectionStateChanged(ConnectionState::Error { message, .. }) => {
-                    toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", account_label(&state, &account_id))));
+                AccountEvent::ConnectionStateChanged(ConnectionState::Error { message, retryable }) => {
+                    // Retryable failures are warnings: the session reconnects
+                    // itself with backoff, so they must not pop a toast on
+                    // every attempt. Only non-retryable (fatal) errors surface.
+                    if !retryable {
+                        toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", account_label(&state, &account_id))));
+                    }
                 }
                 AccountEvent::ConnectionStateChanged(_) => {}
                 AccountEvent::FoldersUpdated(folders) => {
@@ -2934,8 +2939,15 @@ fn connect_calendar_account(
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
                         handle.connection_state = state.clone();
                     }
-                    if let CalConnectionState::Error { message, .. } = &state {
-                        toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
+                    if let CalConnectionState::Error { message, retryable } = &state {
+                        // Retryable failures are warnings (the session
+                        // reconnects itself with backoff); the account's
+                        // sidebar status text still shows the message, but no
+                        // toast spams on every attempt. Only non-retryable
+                        // (fatal) errors surface.
+                        if !retryable {
+                            toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
+                        }
                     }
                     refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
                 }
