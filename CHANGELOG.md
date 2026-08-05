@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.40 (2026-08-06)
+
+### Added
+
+- **Contacts UI**: a new Contacts module is now available from the left navigation rail, with its own page in the main content stack and module-specific toolbar routing.
+- **Contacts UI**: the Contacts page now uses a split-pane layout: a left-side category list and a right-side contact list. The left pane is populated per account with an "All contacts" entry plus each discovered CardDAV address book category.
+- **Contacts UI**: selecting a left-side category now filters the right-side list immediately, and activating a contact row opens a modal details dialog showing the contact's full vCard-derived information (emails, phones, addresses, organization/title, and notes).
+
+### Changed
+
+- **Contacts/CardDAV**: synced CardDAV contact data is now retained as richer per-account snapshots (account label, category buckets, and flattened suggestion addresses) so the same source feeds both the Contacts UI and composer autocomplete.
+- **Roadmap tracking**: the Phase 4 Contacts UI checklist in `TODO.md` (split layout, category model, selection wiring, right-side list, and details dialog) is now marked complete to match the implemented behavior.
+
 ## 0.6.39 (2026-08-06)
 
 ### Added

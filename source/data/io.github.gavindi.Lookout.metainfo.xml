@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.40" date="2026-08-06">
+      <description>
+        <p>Lookout now includes a Contacts tab with a split layout: categories on the left and a filtered contact list on the right. Opening a contact shows a details dialog with richer information from synced address books.</p>
+      </description>
+    </release>
     <release version="0.6.39" date="2026-08-06">
       <description>
         <p>Composer recipient suggestions now include contacts from your online address books, not just recent correspondents from mail history, and contact sync refreshes in the background. This release also improves Contacts groundwork with GNOME Online Accounts contacts discovery and CardDAV integration.</p>

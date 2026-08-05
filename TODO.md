@@ -88,12 +88,12 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 
 - [x] Shared `lookout-dav` plumbing for CardDAV (incl. RFC 6578 sync-collection REPORT)
 - [x] vCard parser/writer (RFC 6350) — hand-rolled parser/writer in `lookout-core` with CardDAV parsing wired through `lookout-dav`
-- [ ] Contacts UI tab
-  - [ ] Layout scaffold: split-pane Contacts view with left navigation and right content list
-  - [ ] Left pane model: per-account contact category tree/list (e.g. All contacts, groups, directories/address books)
-  - [ ] Selection wiring: selecting an account/category updates the right-side list query/filter
-  - [ ] Right pane list: contact rows (name, primary email, optional avatar/org) bound to the active left-side selection
-  - [ ] Contact details dialog: clicking a contact opens a dialog showing full contact information (emails, phones, addresses, org/title, notes)
+- [x] Contacts UI tab
+  - [x] Layout scaffold: split-pane Contacts view with left navigation and right content list
+  - [x] Left pane model: per-account contact category tree/list (e.g. All contacts, groups, directories/address books)
+  - [x] Selection wiring: selecting an account/category updates the right-side list query/filter
+  - [x] Right pane list: contact rows (name, primary email, optional avatar/org) bound to the active left-side selection
+  - [x] Contact details dialog: clicking a contact opens a dialog showing full contact information (emails, phones, addresses, org/title, notes)
 - [ ] Address book CRUD, groups, vCard import/export with duplicate detection
 - [ ] Shared `ContactsProvider` trait consumed by mail composer, calendar attendees, and the contacts app
   - [x] Mail composer consumes `ContactsProvider` (mail-cache + CardDAV-backed suggestions)

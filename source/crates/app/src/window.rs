@@ -4,7 +4,10 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
+use lookout_core::{
+    AccountId, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole,
+    SystemFlagBit, Uid, VCard,
+};
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::{CalendarAccountConfig, CardDavAccountConfig, Credential, DavClient};
 use lookout_goa::{ContactsAuthMethod, GoaCalendarAccount, GoaClient, GoaContactsAccount};
@@ -46,6 +49,33 @@ struct AccountHandle {
     /// trip the session is mid-way through. The cache opens WAL for exactly
     /// this, and a failed open just means no suggestions.
     address_cache: Option<Rc<lookout_mail::Cache>>,
+}
+
+#[derive(Clone)]
+struct ContactsCategorySnapshot {
+    name: String,
+    contacts: Vec<VCard>,
+}
+
+#[derive(Clone)]
+struct ContactsAccountSnapshot {
+    display_name: String,
+    categories: Vec<ContactsCategorySnapshot>,
+    suggestions: Vec<EmailAddress>,
+}
+
+#[derive(Clone)]
+struct ContactsCategoryChoice {
+    account_label: String,
+    category_label: String,
+    contacts: Vec<VCard>,
+}
+
+#[derive(Clone)]
+struct ContactsListEntry {
+    account_label: String,
+    category_label: String,
+    card: VCard,
 }
 
 /// What the message list is currently showing - either a single mailbox (the
@@ -151,9 +181,10 @@ impl BodyCache {
 /// need for `Arc<Mutex<_>>` on this side of the worker-thread boundary.
 struct UiState {
     accounts: HashMap<AccountId, AccountHandle>,
-    /// CardDAV-derived addresses discovered for each account. Kept in memory
-    /// and merged with the mail-history cache for compose autocomplete.
-    contacts_by_account: HashMap<AccountId, Vec<EmailAddress>>,
+    /// CardDAV-derived contacts discovered per account, including both
+    /// category buckets (for Contacts UI) and flattened suggestions (for
+    /// composer autocomplete).
+    contacts_by_account: HashMap<AccountId, ContactsAccountSnapshot>,
     /// Which account owns the currently-open mailbox - drives command
     /// routing (FetchBody, compose "From") and which account's
     /// `MessagesUpdated` events are allowed to update the message list (a
@@ -1556,6 +1587,57 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     root_stack.add_named(&calendar_status_page, Some("calendar-empty"));
     root_stack.add_named(&calendar_paned, Some("calendar"));
 
+    let contacts_status_page = adw::StatusPage::builder()
+        .icon_name("avatar-default-symbolic")
+        .title("No Contact Accounts")
+        .description("Add an account with Contacts enabled in GNOME Online Accounts to see contacts here.")
+        .build();
+
+    let contacts_category_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
+    let contacts_category_scroller = gtk::ScrolledWindow::builder()
+        .child(&contacts_category_list)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    let contacts_left_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    contacts_left_box.set_margin_start(8);
+    contacts_left_box.set_margin_end(8);
+    contacts_left_box.set_margin_top(8);
+    contacts_left_box.set_margin_bottom(8);
+    contacts_left_box.append(&gtk::Label::builder().label("Categories").xalign(0.0).css_classes(["heading"]).build());
+    contacts_left_box.append(&contacts_category_scroller);
+
+    let contacts_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
+    let contacts_scroller = gtk::ScrolledWindow::builder()
+        .child(&contacts_list)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    let contacts_right_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    contacts_right_box.set_margin_start(8);
+    contacts_right_box.set_margin_end(8);
+    contacts_right_box.set_margin_top(8);
+    contacts_right_box.set_margin_bottom(8);
+    contacts_right_box.append(&gtk::Label::builder().label("Contacts").xalign(0.0).css_classes(["heading"]).build());
+    contacts_right_box.append(&contacts_scroller);
+
+    let contacts_left_card = card_section(&contacts_left_box);
+    contacts_left_card.add_css_class("folder-pane");
+    let contacts_right_card = card_section(&contacts_right_box);
+    let contacts_paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(&contacts_left_card)
+        .end_child(&contacts_right_card)
+        .resize_start_child(false)
+        .resize_end_child(true)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(320)
+        .build();
+    contacts_paned.add_css_class("seamless-paned");
+    root_stack.add_named(&contacts_status_page, Some("contacts-empty"));
+    root_stack.add_named(&contacts_paned, Some("contacts"));
+
     // The one real title bar for the window - owns the actual
     // minimize/maximize/close buttons. The per-card header bars inside
     // `root_stack` are explicitly told not to show these (see
@@ -1719,10 +1801,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     view_toolbar_stack.add_named(&view_toolbar, Some("mail-view"));
     view_toolbar_stack.add_named(&calendar_command_toolbar, Some("calendar"));
 
+    let contacts_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
+    let contacts_toolbar_label = gtk::Label::builder().label("Contacts").xalign(0.0).css_classes(["dim-label"]).build();
+    contacts_command_toolbar.append(&contacts_toolbar_label);
+    view_toolbar_stack.add_named(&contacts_command_toolbar, Some("contacts"));
+
     // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
     // no background) strip along the window's left edge so the background
-    // image shows straight through it. Two views today (Mail/Calendar),
-    // joined into one toggle group for mutual-exclusive selection.
+    // image shows straight through it. Four views today (Mail/Calendar/
+    // Contacts/Config), joined into one toggle group for mutual-exclusive
+    // selection.
     let mail_icon_bytes = include_bytes!("../../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg");
     let mail_icon_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(mail_icon_bytes)).expect("bundled app icon should decode");
     let mail_icon_image = gtk::Image::from_paintable(Some(&mail_icon_texture));
@@ -1739,6 +1827,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .tooltip_text("Calendar")
         .build();
     calendar_view_button.set_group(Some(&mail_view_button));
+    let contacts_view_button = gtk::ToggleButton::builder()
+        .icon_name("avatar-default-symbolic")
+        .css_classes(["flat"])
+        .tooltip_text("Contacts")
+        .build();
+    contacts_view_button.set_group(Some(&calendar_view_button));
 
     // `vexpand(true)` so the rail stretches the window's full height (it
     // sits beside `outer_toolbar_view` - header bar, menu bar, and command
@@ -1753,6 +1847,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     nav_rail.append(&mail_view_button);
     nav_rail.append(&calendar_view_button);
+    nav_rail.append(&contacts_view_button);
 
     // --- Mail-screen calendar overview pane: a mini month-picker + a list
     // of the clicked day's events, docked to the far right of the window,
@@ -1833,6 +1928,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // looking at).
     let current_mail_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("empty"));
     let current_calendar_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("calendar-empty"));
+    let current_contacts_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("contacts-empty"));
     {
         let root_stack = root_stack.clone();
         let current_mail_page = current_mail_page.clone();
@@ -1869,6 +1965,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 current_module.set("calendar");
                 root_stack.set_visible_child_name(current_calendar_page.get());
                 view_toolbar_stack.set_visible_child_name("calendar");
+                mail_calendar_overview_card.set_visible(false);
+                home_button.set_sensitive(false);
+                view_button.set_sensitive(false);
+            }
+        });
+    }
+    {
+        let root_stack = root_stack.clone();
+        let current_contacts_page = current_contacts_page.clone();
+        let view_toolbar_stack = view_toolbar_stack.clone();
+        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let current_module = current_module.clone();
+        let home_button = home_button.clone();
+        let view_button = view_button.clone();
+        contacts_view_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                current_module.set("contacts");
+                root_stack.set_visible_child_name(current_contacts_page.get());
+                view_toolbar_stack.set_visible_child_name("contacts");
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
@@ -1966,6 +2081,44 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // (that's the main Calendar view's own concern).
     let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(chrono::Utc::now().date_naive()));
     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+
+    let contacts_categories: Rc<RefCell<Vec<ContactsCategoryChoice>>> = Rc::new(RefCell::new(Vec::new()));
+    let contacts_entries: Rc<RefCell<Vec<ContactsListEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let contacts_categories = contacts_categories.clone();
+        let contacts_entries = contacts_entries.clone();
+        let contacts_list = contacts_list.clone();
+        contacts_category_list.connect_row_selected(move |_list, row| {
+            let Some(row) = row else { return };
+            rebuild_contacts_list_ui(&contacts_list, &contacts_categories, &contacts_entries, row.index());
+        });
+    }
+    let refresh_contacts_ui: Rc<dyn Fn(Option<i32>)> = Rc::new({
+        let state = state.clone();
+        let contacts_category_list = contacts_category_list.clone();
+        let contacts_list = contacts_list.clone();
+        let contacts_categories = contacts_categories.clone();
+        let contacts_entries = contacts_entries.clone();
+        move |selected_index: Option<i32>| {
+            refresh_contacts_category_ui(
+                &state,
+                &contacts_category_list,
+                &contacts_list,
+                &contacts_categories,
+                &contacts_entries,
+                selected_index,
+            );
+        }
+    });
+    refresh_contacts_ui(None);
+    {
+        let window = window.clone();
+        let contacts_entries = contacts_entries.clone();
+        contacts_list.connect_row_activated(move |_list, row| {
+            let Some(entry) = contacts_entries.borrow().get(row.index() as usize).cloned() else { return };
+            show_contact_details_dialog(&window, &entry);
+        });
+    }
 
     // --- Config view: the third nav-rail view, a read-only overview of the
     // connected Mail/Calendar accounts (endpoints included, so it shows how
@@ -2115,7 +2268,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .css_classes(["flat"])
         .tooltip_text("Config")
         .build();
-    config_view_button.set_group(Some(&calendar_view_button));
+    config_view_button.set_group(Some(&contacts_view_button));
     // Anchored to the bottom of the rail: Mail/Calendar stay at the top, a
     // `vexpand(true)` spacer fills the middle, Config sits below it.
     let nav_rail_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -2660,7 +2813,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         list_header,
         refresh_config.clone(),
     );
-    spawn_contacts_discovery(worker.clone(), state.clone(), toast_overlay.clone());
+    spawn_contacts_discovery(
+        worker.clone(),
+        state.clone(),
+        root_stack.clone(),
+        toast_overlay.clone(),
+        current_contacts_page,
+        contacts_view_button,
+        refresh_contacts_ui,
+    );
     spawn_calendar_discovery(
         worker,
         calendar_state,
@@ -2691,6 +2852,142 @@ fn contacts_match_prefix(contact: &EmailAddress, prefix: &str) -> bool {
             .is_some_and(|name| name.to_lowercase().starts_with(&needle))
 }
 
+fn vcard_display_name(card: &VCard) -> String {
+    if let Some(name) = card.full_name.as_deref().filter(|n| !n.trim().is_empty()) {
+        return name.to_string();
+    }
+    if let Some(name) = &card.name {
+        let mut parts = Vec::new();
+        if !name.prefix.trim().is_empty() {
+            parts.push(name.prefix.trim().to_string());
+        }
+        if !name.given.trim().is_empty() {
+            parts.push(name.given.trim().to_string());
+        }
+        if !name.family.trim().is_empty() {
+            parts.push(name.family.trim().to_string());
+        }
+        if !name.suffix.trim().is_empty() {
+            parts.push(name.suffix.trim().to_string());
+        }
+        if !parts.is_empty() {
+            return parts.join(" ");
+        }
+    }
+    card.emails
+        .first()
+        .map(|email| email.address.clone())
+        .unwrap_or_else(|| "(unnamed contact)".to_string())
+}
+
+fn vcard_primary_email(card: &VCard) -> String {
+    card.emails
+        .first()
+        .map(|email| email.address.clone())
+        .unwrap_or_else(|| "No email address".to_string())
+}
+
+fn vcard_details_text(account_label: &str, category_label: &str, card: &VCard) -> String {
+    let mut lines = vec![
+        format!("Account: {account_label}"),
+        format!("Category: {category_label}"),
+        String::new(),
+        format!("Name: {}", vcard_display_name(card)),
+    ];
+
+    if !card.emails.is_empty() {
+        lines.push("Emails:".to_string());
+        for email in &card.emails {
+            let types = if email.types.is_empty() { "".to_string() } else { format!(" ({})", email.types.join(", ")) };
+            lines.push(format!("  - {}{}", email.address, types));
+        }
+    }
+
+    if !card.telephones.is_empty() {
+        lines.push("Phones:".to_string());
+        for phone in &card.telephones {
+            let types = if phone.types.is_empty() { "".to_string() } else { format!(" ({})", phone.types.join(", ")) };
+            lines.push(format!("  - {}{}", phone.number, types));
+        }
+    }
+
+    if !card.addresses.is_empty() {
+        lines.push("Addresses:".to_string());
+        for address in &card.addresses {
+            let mut parts = Vec::new();
+            for part in [&address.street, &address.locality, &address.region, &address.postal_code, &address.country] {
+                if !part.trim().is_empty() {
+                    parts.push(part.trim().to_string());
+                }
+            }
+            if !parts.is_empty() {
+                lines.push(format!("  - {}", parts.join(", ")));
+            }
+        }
+    }
+
+    if let Some(org) = &card.organization {
+        let value = org.iter().map(|part| part.trim()).filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" / ");
+        if !value.is_empty() {
+            lines.push(format!("Organization: {value}"));
+        }
+    }
+    if let Some(title) = &card.title {
+        if !title.trim().is_empty() {
+            lines.push(format!("Title: {}", title.trim()));
+        }
+    }
+    if let Some(note) = &card.note {
+        if !note.trim().is_empty() {
+            lines.push(String::new());
+            lines.push("Notes:".to_string());
+            lines.push(note.trim().to_string());
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn show_contact_details_dialog(window: &adw::ApplicationWindow, entry: &ContactsListEntry) {
+    let dialog = gtk::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title(vcard_display_name(&entry.card))
+        .default_width(520)
+        .default_height(420)
+        .build();
+
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).build();
+
+    let details = gtk::Label::builder()
+        .label(vcard_details_text(&entry.account_label, &entry.category_label, &entry.card))
+        .xalign(0.0)
+        .yalign(0.0)
+        .selectable(true)
+        .wrap(true)
+        .build();
+    details.set_margin_start(12);
+    details.set_margin_end(12);
+    details.set_margin_top(12);
+    details.set_margin_bottom(12);
+
+    let scroller = gtk::ScrolledWindow::builder().child(&details).vexpand(true).hexpand(true).build();
+
+    let close_button = gtk::Button::with_label("Close");
+    {
+        let dialog = dialog.clone();
+        close_button.connect_clicked(move |_| dialog.close());
+    }
+    close_button.set_halign(gtk::Align::End);
+    close_button.set_margin_end(12);
+    close_button.set_margin_bottom(12);
+
+    content.append(&scroller);
+    content.append(&close_button);
+    dialog.set_child(Some(&content));
+    dialog.present();
+}
+
 fn dedupe_addresses(addresses: Vec<EmailAddress>, limit: usize) -> Vec<EmailAddress> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -2714,7 +3011,143 @@ fn merge_contact_suggestions(mail_history: Vec<EmailAddress>, carddav: &[EmailAd
     dedupe_addresses(merged, limit)
 }
 
-fn spawn_contacts_discovery(worker: Rc<Worker>, state: Rc<RefCell<UiState>>, toast_overlay: adw::ToastOverlay) {
+fn refresh_contacts_category_ui(
+    state: &Rc<RefCell<UiState>>,
+    category_list: &gtk::ListBox,
+    contact_list: &gtk::ListBox,
+    categories: &Rc<RefCell<Vec<ContactsCategoryChoice>>>,
+    contacts: &Rc<RefCell<Vec<ContactsListEntry>>>,
+    selected_index: Option<i32>,
+) {
+    while let Some(child) = category_list.first_child() {
+        category_list.remove(&child);
+    }
+
+    let mut rows = Vec::new();
+    {
+        let st = state.borrow();
+        let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
+        accounts.sort_by_key(|(_, data)| data.display_name.to_lowercase());
+        for (_id, account) in accounts {
+            let mut all_contacts = Vec::new();
+            for category in &account.categories {
+                all_contacts.extend(category.contacts.clone());
+            }
+            rows.push(ContactsCategoryChoice {
+                account_label: account.display_name.clone(),
+                category_label: "All contacts".to_string(),
+                contacts: all_contacts,
+            });
+            for category in &account.categories {
+                rows.push(ContactsCategoryChoice {
+                    account_label: account.display_name.clone(),
+                    category_label: category.name.clone(),
+                    contacts: category.contacts.clone(),
+                });
+            }
+        }
+    }
+
+    *categories.borrow_mut() = rows;
+    for category in categories.borrow().iter() {
+        let row_label = gtk::Label::builder()
+            .label(format!("{} - {}", category.account_label, category.category_label))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        row_label.set_margin_start(8);
+        row_label.set_margin_end(8);
+        row_label.set_margin_top(6);
+        row_label.set_margin_bottom(6);
+        category_list.append(&row_label);
+    }
+
+    if categories.borrow().is_empty() {
+        while let Some(child) = contact_list.first_child() {
+            contact_list.remove(&child);
+        }
+        contacts.borrow_mut().clear();
+        let label = gtk::Label::builder().label("No contacts available yet").xalign(0.0).css_classes(["dim-label"]).build();
+        label.set_margin_start(10);
+        label.set_margin_end(10);
+        label.set_margin_top(10);
+        label.set_margin_bottom(10);
+        contact_list.append(&label);
+        return;
+    }
+
+    let desired = selected_index.unwrap_or(0).clamp(0, categories.borrow().len() as i32 - 1);
+    category_list.select_row(category_list.row_at_index(desired).as_ref());
+    rebuild_contacts_list_ui(contact_list, categories, contacts, desired);
+}
+
+fn rebuild_contacts_list_ui(
+    contact_list: &gtk::ListBox,
+    categories: &Rc<RefCell<Vec<ContactsCategoryChoice>>>,
+    contacts: &Rc<RefCell<Vec<ContactsListEntry>>>,
+    selected_category_index: i32,
+) {
+    while let Some(child) = contact_list.first_child() {
+        contact_list.remove(&child);
+    }
+
+    let Some(choice) = categories.borrow().get(selected_category_index as usize).cloned() else {
+        contacts.borrow_mut().clear();
+        return;
+    };
+
+    let mut entries: Vec<ContactsListEntry> = choice
+        .contacts
+        .into_iter()
+        .map(|card| ContactsListEntry {
+            account_label: choice.account_label.clone(),
+            category_label: choice.category_label.clone(),
+            card,
+        })
+        .collect();
+    entries.sort_by_key(|entry| vcard_display_name(&entry.card).to_lowercase());
+
+    if entries.is_empty() {
+        let label = gtk::Label::builder().label("No contacts in this category").xalign(0.0).css_classes(["dim-label"]).build();
+        label.set_margin_start(10);
+        label.set_margin_end(10);
+        label.set_margin_top(10);
+        label.set_margin_bottom(10);
+        contact_list.append(&label);
+        contacts.borrow_mut().clear();
+        return;
+    }
+
+    for entry in &entries {
+        let name = gtk::Label::builder().label(vcard_display_name(&entry.card)).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let email = gtk::Label::builder()
+            .label(vcard_primary_email(&entry.card))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let row_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+        row_box.set_margin_start(10);
+        row_box.set_margin_end(10);
+        row_box.set_margin_top(8);
+        row_box.set_margin_bottom(8);
+        row_box.append(&name);
+        row_box.append(&email);
+        contact_list.append(&row_box);
+    }
+    *contacts.borrow_mut() = entries;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_contacts_discovery(
+    worker: Rc<Worker>,
+    state: Rc<RefCell<UiState>>,
+    root_stack: gtk::Stack,
+    toast_overlay: adw::ToastOverlay,
+    current_contacts_page: Rc<Cell<&'static str>>,
+    contacts_view_button: gtk::ToggleButton,
+    refresh_contacts_ui: Rc<dyn Fn(Option<i32>)>,
+) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
         let result = async {
@@ -2728,20 +3161,43 @@ fn spawn_contacts_discovery(worker: Rc<Worker>, state: Rc<RefCell<UiState>>, toa
 
     glib::spawn_future_local(async move {
         let Ok(result) = goa_rx.recv().await else { return };
+        let show_page = |name: &'static str| {
+            current_contacts_page.set(name);
+            if contacts_view_button.is_active() {
+                root_stack.set_visible_child_name(name);
+            }
+        };
         match result {
-            Ok((client, accounts)) => {
+            Ok((client, accounts)) if !accounts.is_empty() => {
+                show_page("contacts");
                 for account in accounts {
-                    sync_contacts_account(worker.clone(), state.clone(), toast_overlay.clone(), client.clone(), account);
+                    sync_contacts_account(
+                        worker.clone(),
+                        state.clone(),
+                        toast_overlay.clone(),
+                        client.clone(),
+                        account,
+                        refresh_contacts_ui.clone(),
+                    );
                 }
             }
+            Ok(_) => show_page("contacts-empty"),
             Err(e) => {
+                show_page("contacts-empty");
                 toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't reach GNOME Online Accounts contacts: {e}")));
             }
         }
     });
 }
 
-fn sync_contacts_account(worker: Rc<Worker>, state: Rc<RefCell<UiState>>, toast_overlay: adw::ToastOverlay, goa_client: GoaClient, account: GoaContactsAccount) {
+fn sync_contacts_account(
+    worker: Rc<Worker>,
+    state: Rc<RefCell<UiState>>,
+    toast_overlay: adw::ToastOverlay,
+    goa_client: GoaClient,
+    account: GoaContactsAccount,
+    refresh_contacts_ui: Rc<dyn Fn(Option<i32>)>,
+) {
     let account_id = account.account_id.clone();
     let label = account.display_name.clone();
     let (tx, rx) = async_channel::unbounded();
@@ -2762,6 +3218,7 @@ fn sync_contacts_account(worker: Rc<Worker>, state: Rc<RefCell<UiState>>, toast_
             match result {
                 Ok(contacts) => {
                     state.borrow_mut().contacts_by_account.insert(account_id.clone(), contacts);
+                    refresh_contacts_ui(None);
                 }
                 Err(message) => {
                     tracing::warn!("CardDAV contact sync failed for {label}: {message}");
@@ -2776,7 +3233,7 @@ fn sync_contacts_account(worker: Rc<Worker>, state: Rc<RefCell<UiState>>, toast_
     });
 }
 
-async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccount) -> Result<Vec<EmailAddress>, String> {
+async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccount) -> Result<ContactsAccountSnapshot, String> {
     goa_client
         .ensure_credentials_contacts(&account)
         .await
@@ -2807,12 +3264,21 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
         .map_err(|e| e.to_string())?;
 
     let mut addresses = Vec::new();
+    let mut categories = Vec::new();
     for book in books {
         match client.fetch_addressbook_vcards(&book, &credential).await {
             Ok(vcards) => {
-                for card in vcards {
+                for card in &vcards {
                     addresses.extend(card.email_addresses());
                 }
+                categories.push(ContactsCategorySnapshot {
+                    name: if book.display_name.trim().is_empty() {
+                        "Unnamed address book".to_string()
+                    } else {
+                        book.display_name
+                    },
+                    contacts: vcards,
+                });
             }
             Err(e) => {
                 tracing::warn!("CardDAV addressbook fetch failed for {:?}: {e}", book.display_name);
@@ -2820,7 +3286,11 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
         }
     }
 
-    Ok(dedupe_addresses(addresses, usize::MAX))
+    Ok(ContactsAccountSnapshot {
+        display_name: account.display_name,
+        categories,
+        suggestions: dedupe_addresses(addresses, usize::MAX),
+    })
 }
 
 /// Re-anchors the main calendar panel's already-redrawn views, keeps the
@@ -2885,13 +3355,15 @@ fn last_of_month(date: chrono::NaiveDate) -> chrono::NaiveDate {
 
 /// Maps a (nav-rail module, ribbon tab) pair to the `view_toolbar_stack`
 /// child to show. Mail is tabbed - Home shows the command toolbar, View the
-/// layout toggles; Calendar/Config each have a single non-tabbed toolbar of
-/// their own, so they ignore the tab. Unknown combos fall back to Mail-Home.
+/// layout toggles; Calendar/Contacts/Config each have a single non-tabbed
+/// toolbar of their own, so they ignore the tab. Unknown combos fall back to
+/// Mail-Home.
 fn ribbon_stack_name(module: &str, tab: &str) -> &'static str {
     match (module, tab) {
         ("mail", "view") => "mail-view",
         ("mail", _) => "mail-home",
         ("calendar", _) => "calendar",
+        ("contacts", _) => "contacts",
         ("config", _) => "config",
         _ => "mail-home",
     }
@@ -4308,7 +4780,7 @@ fn show_composer_in_reading_pane(
         let mail_history = address_cache.as_ref().map(|cache| cache.search_contacts(prefix, 8)).unwrap_or_default();
         let carddav = account_id_for_suggestions
             .as_ref()
-            .and_then(|id| state_for_suggestions.borrow().contacts_by_account.get(id).cloned())
+            .and_then(|id| state_for_suggestions.borrow().contacts_by_account.get(id).map(|snapshot| snapshot.suggestions.clone()))
             .unwrap_or_default();
         merge_contact_suggestions(mail_history, &carddav, prefix.trim(), 8)
     });
