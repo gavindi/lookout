@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.41" date="2026-08-06">
+      <description>
+        <p>The People tab's left side now shows Your Contacts, Favourites, Your contact lists, and Deleted for each account, plus a Categories section for any tags you use. You can star a contact as a favourite from the contact list. This release also fixes several bugs that could leave an account's contacts showing empty, including one that silently dropped every contact from any address book using the very common older vCard format.</p>
+      </description>
+    </release>
     <release version="0.6.40" date="2026-08-06">
       <description>
         <p>Lookout now includes a Contacts tab with a split layout: categories on the left and a filtered contact list on the right. Opening a contact shows a details dialog with richer information from synced address books.</p>

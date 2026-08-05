@@ -52,27 +52,53 @@ struct AccountHandle {
 }
 
 #[derive(Clone)]
-struct ContactsCategorySnapshot {
-    name: String,
-    contacts: Vec<VCard>,
-}
-
-#[derive(Clone)]
 struct ContactsAccountSnapshot {
     display_name: String,
-    categories: Vec<ContactsCategorySnapshot>,
+    /// Every vCard from every CardDAV address book discovered for this
+    /// account, flattened - the People screen buckets these by fixed
+    /// criteria (all/favourites/lists/deleted) and by vCard `CATEGORIES`
+    /// rather than by which address book they came from (see
+    /// `refresh_contacts_category_ui`), so which book a card came from
+    /// doesn't need tracking here.
+    contacts: Vec<VCard>,
     suggestions: Vec<EmailAddress>,
 }
 
+/// Which bucket a left-pane row filters the right-hand contact list down to.
+/// The first four are fixed, always-present rows under each account's
+/// header; `Category` rows are dynamic, one per distinct vCard `CATEGORIES`
+/// value found across every connected account (see `refresh_contacts_category_ui`).
+#[derive(Clone)]
+enum ContactsBucketKind {
+    AllContacts,
+    Favourites,
+    ContactLists,
+    Deleted,
+    Category(String),
+}
+
+fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
+    match kind {
+        ContactsBucketKind::AllContacts => "Your Contacts".to_string(),
+        ContactsBucketKind::Favourites => "Favourites".to_string(),
+        ContactsBucketKind::ContactLists => "Your contact lists".to_string(),
+        ContactsBucketKind::Deleted => "Deleted".to_string(),
+        ContactsBucketKind::Category(name) => name.clone(),
+    }
+}
+
+/// A `Category` bucket can span multiple accounts (the same tag used in two
+/// address books), so contacts are tagged with their own account rather than
+/// the choice carrying one account for all of them.
 #[derive(Clone)]
 struct ContactsCategoryChoice {
-    account_label: String,
-    category_label: String,
-    contacts: Vec<VCard>,
+    kind: ContactsBucketKind,
+    contacts: Vec<(AccountId, String, VCard)>,
 }
 
 #[derive(Clone)]
 struct ContactsListEntry {
+    account_id: AccountId,
     account_label: String,
     category_label: String,
     card: VCard,
@@ -185,6 +211,16 @@ struct UiState {
     /// category buckets (for Contacts UI) and flattened suggestions (for
     /// composer autocomplete).
     contacts_by_account: HashMap<AccountId, ContactsAccountSnapshot>,
+    /// Contacts starred via the People screen's row toggle, keyed by
+    /// `(account, contact_identity)`. Local-only: never written back to the
+    /// vCard or synced to the server, so it resets if the identity a contact
+    /// resolves to (its `UID`, falling back to its first email) changes.
+    starred_contacts: HashSet<(AccountId, String)>,
+    /// Contacts that were present in a previous CardDAV sync for an account
+    /// but are missing from the latest one, accumulated client-side since
+    /// CardDAV sync-collection deletion tracking isn't implemented - see
+    /// `sync_contacts_account`. In-memory only; cleared on restart.
+    deleted_contacts: HashMap<AccountId, Vec<VCard>>,
     /// Which account owns the currently-open mailbox - drives command
     /// routing (FetchBody, compose "From") and which account's
     /// `MessagesUpdated` events are allowed to update the message list (a
@@ -701,6 +737,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
         contacts_by_account: HashMap::new(),
+        starred_contacts: HashSet::new(),
+        deleted_contacts: HashMap::new(),
         current_account: None,
         current_mailbox: None,
         mail_view: MailView::Single,
@@ -1590,7 +1628,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let contacts_status_page = adw::StatusPage::builder()
         .icon_name("avatar-default-symbolic")
         .title("No Contact Accounts")
-        .description("Add an account with Contacts enabled in GNOME Online Accounts to see contacts here.")
+        .description("Add an account with Contacts enabled in GNOME Online Accounts to see people here.")
         .build();
 
     let contacts_category_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
@@ -1604,7 +1642,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_left_box.set_margin_end(8);
     contacts_left_box.set_margin_top(8);
     contacts_left_box.set_margin_bottom(8);
-    contacts_left_box.append(&gtk::Label::builder().label("Categories").xalign(0.0).css_classes(["heading"]).build());
     contacts_left_box.append(&contacts_category_scroller);
 
     let contacts_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
@@ -1618,7 +1655,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_right_box.set_margin_end(8);
     contacts_right_box.set_margin_top(8);
     contacts_right_box.set_margin_bottom(8);
-    contacts_right_box.append(&gtk::Label::builder().label("Contacts").xalign(0.0).css_classes(["heading"]).build());
+    contacts_right_box.append(&gtk::Label::builder().label("People").xalign(0.0).css_classes(["heading"]).build());
     contacts_right_box.append(&contacts_scroller);
 
     let contacts_left_card = card_section(&contacts_left_box);
@@ -1802,7 +1839,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     view_toolbar_stack.add_named(&calendar_command_toolbar, Some("calendar"));
 
     let contacts_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    let contacts_toolbar_label = gtk::Label::builder().label("Contacts").xalign(0.0).css_classes(["dim-label"]).build();
+    let contacts_toolbar_label = gtk::Label::builder().label("People").xalign(0.0).css_classes(["dim-label"]).build();
     contacts_command_toolbar.append(&contacts_toolbar_label);
     view_toolbar_stack.add_named(&contacts_command_toolbar, Some("contacts"));
 
@@ -1830,7 +1867,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let contacts_view_button = gtk::ToggleButton::builder()
         .icon_name("avatar-default-symbolic")
         .css_classes(["flat"])
-        .tooltip_text("Contacts")
+        .tooltip_text("People")
         .build();
     contacts_view_button.set_group(Some(&calendar_view_button));
 
@@ -2088,9 +2125,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let contacts_categories = contacts_categories.clone();
         let contacts_entries = contacts_entries.clone();
         let contacts_list = contacts_list.clone();
+        let state = state.clone();
         contacts_category_list.connect_row_selected(move |_list, row| {
             let Some(row) = row else { return };
-            rebuild_contacts_list_ui(&contacts_list, &contacts_categories, &contacts_entries, row.index());
+            // Header rows ("gavindi@outlook.com", "Categories") sit in the
+            // list alongside selectable rows, so a row's position in the
+            // widget no longer matches its index in `contacts_categories` -
+            // that index is stashed on the row itself in
+            // `refresh_contacts_category_ui`.
+            let Some(idx) = (unsafe { row.data::<usize>("contacts-choice-index") }) else { return };
+            let idx = unsafe { *idx.as_ref() };
+            rebuild_contacts_list_ui(&contacts_list, &contacts_categories, &contacts_entries, idx as i32, &state);
         });
     }
     let refresh_contacts_ui: Rc<dyn Fn(Option<i32>)> = Rc::new({
@@ -3011,6 +3056,53 @@ fn merge_contact_suggestions(mail_history: Vec<EmailAddress>, carddav: &[EmailAd
     dedupe_addresses(merged, limit)
 }
 
+/// A stable-ish key for a contact, used for session-only state
+/// (`starred_contacts`, deletion diffing) that has nowhere else to hang off
+/// of: the vCard's `UID`, or its first email address if the server didn't
+/// send one.
+fn contact_identity(card: &VCard) -> String {
+    card.uid.clone().unwrap_or_else(|| vcard_primary_email(card))
+}
+
+/// Appends a non-selectable section-header row (an account's display name,
+/// or "Categories") to the People screen's left pane.
+fn append_contacts_header_row(list: &gtk::ListBox, label: &str) -> gtk::ListBoxRow {
+    let row_label = gtk::Label::builder().label(label).xalign(0.0).css_classes(["heading"]).ellipsize(gtk::pango::EllipsizeMode::End).build();
+    row_label.set_margin_start(8);
+    row_label.set_margin_end(8);
+    row_label.set_margin_top(10);
+    row_label.set_margin_bottom(4);
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&row_label));
+    row.set_selectable(false);
+    row.set_activatable(false);
+    list.append(&row);
+    row
+}
+
+/// Appends a selectable bucket/category row, indented under its section
+/// header, to the People screen's left pane.
+fn append_contacts_choice_row(list: &gtk::ListBox, label: &str) -> gtk::ListBoxRow {
+    let row_label = gtk::Label::builder().label(label).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+    row_label.set_margin_start(20);
+    row_label.set_margin_end(8);
+    row_label.set_margin_top(6);
+    row_label.set_margin_bottom(6);
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&row_label));
+    list.append(&row);
+    row
+}
+
+/// Rebuilds the People screen's left pane: each connected account gets a
+/// header followed by its four fixed buckets (Your Contacts/Favourites/Your
+/// contact lists/Deleted), then every distinct vCard `CATEGORIES` tag found
+/// across all accounts gets its own row under a trailing "Categories"
+/// header. Header rows aren't part of `categories` and can't be selected;
+/// each selectable row stashes its index into `categories` on itself (see
+/// `contacts_category_list.connect_row_selected` in `build`), since a row's
+/// position in the widget no longer matches its index in that list once
+/// headers are mixed in.
 fn refresh_contacts_category_ui(
     state: &Rc<RefCell<UiState>>,
     category_list: &gtk::ListBox,
@@ -3023,43 +3115,80 @@ fn refresh_contacts_category_ui(
         category_list.remove(&child);
     }
 
-    let mut rows = Vec::new();
+    let mut rows: Vec<ContactsCategoryChoice> = Vec::new();
+    // Parallel to `rows`: the widget for each row appended so far, alongside
+    // the `rows` index it selects (`None` for header rows).
+    let mut row_widgets: Vec<(gtk::ListBoxRow, Option<usize>)> = Vec::new();
+
     {
         let st = state.borrow();
         let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
         accounts.sort_by_key(|(_, data)| data.display_name.to_lowercase());
-        for (_id, account) in accounts {
-            let mut all_contacts = Vec::new();
-            for category in &account.categories {
-                all_contacts.extend(category.contacts.clone());
+
+        // Every distinct CATEGORIES tag across every account, so the same
+        // tag used by contacts in two different address books still gets
+        // one combined row rather than one per account.
+        let mut category_members: HashMap<String, Vec<(AccountId, String, VCard)>> = HashMap::new();
+
+        for (account_id, account) in accounts {
+            let all_contacts: Vec<(AccountId, String, VCard)> =
+                account.contacts.iter().map(|card| (account_id.clone(), account.display_name.clone(), card.clone())).collect();
+
+            for (_, _, card) in &all_contacts {
+                for tag in &card.categories {
+                    category_members.entry(tag.clone()).or_default().push((account_id.clone(), account.display_name.clone(), card.clone()));
+                }
             }
-            rows.push(ContactsCategoryChoice {
-                account_label: account.display_name.clone(),
-                category_label: "All contacts".to_string(),
-                contacts: all_contacts,
-            });
-            for category in &account.categories {
-                rows.push(ContactsCategoryChoice {
-                    account_label: account.display_name.clone(),
-                    category_label: category.name.clone(),
-                    contacts: category.contacts.clone(),
-                });
+
+            // vCard v4's KIND:group cards represent a named contact list
+            // rather than a person.
+            let contact_lists: Vec<(AccountId, String, VCard)> =
+                all_contacts.iter().filter(|(_, _, card)| card.kind.as_deref() == Some("group")).cloned().collect();
+            let deleted: Vec<(AccountId, String, VCard)> = st
+                .deleted_contacts
+                .get(account_id)
+                .into_iter()
+                .flatten()
+                .map(|card| (account_id.clone(), account.display_name.clone(), card.clone()))
+                .collect();
+
+            row_widgets.push((append_contacts_header_row(category_list, &account.display_name), None));
+
+            // Favourites keeps the full, unfiltered contact list - which
+            // contacts belong depends on session-only `starred_contacts`
+            // state that can change without a resync, so the filter is
+            // applied live in `rebuild_contacts_list_ui` instead of baked in
+            // here.
+            for kind in [ContactsBucketKind::AllContacts, ContactsBucketKind::Favourites] {
+                rows.push(ContactsCategoryChoice { kind: kind.clone(), contacts: all_contacts.clone() });
+                let label = contacts_bucket_label(&kind);
+                row_widgets.push((append_contacts_choice_row(category_list, &label), Some(rows.len() - 1)));
+            }
+
+            rows.push(ContactsCategoryChoice { kind: ContactsBucketKind::ContactLists, contacts: contact_lists });
+            row_widgets.push((append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::ContactLists)), Some(rows.len() - 1)));
+
+            rows.push(ContactsCategoryChoice { kind: ContactsBucketKind::Deleted, contacts: deleted });
+            row_widgets.push((append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::Deleted)), Some(rows.len() - 1)));
+        }
+
+        if !category_members.is_empty() {
+            row_widgets.push((append_contacts_header_row(category_list, "Categories"), None));
+            let mut names: Vec<String> = category_members.keys().cloned().collect();
+            names.sort_by_key(|name| name.to_lowercase());
+            for name in names {
+                let members = category_members.remove(&name).unwrap_or_default();
+                rows.push(ContactsCategoryChoice { kind: ContactsBucketKind::Category(name.clone()), contacts: members });
+                row_widgets.push((append_contacts_choice_row(category_list, &name), Some(rows.len() - 1)));
             }
         }
     }
 
     *categories.borrow_mut() = rows;
-    for category in categories.borrow().iter() {
-        let row_label = gtk::Label::builder()
-            .label(format!("{} - {}", category.account_label, category.category_label))
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
-        row_label.set_margin_start(8);
-        row_label.set_margin_end(8);
-        row_label.set_margin_top(6);
-        row_label.set_margin_bottom(6);
-        category_list.append(&row_label);
+    for (row, index) in &row_widgets {
+        if let Some(idx) = index {
+            unsafe { row.set_data("contacts-choice-index", *idx) };
+        }
     }
 
     if categories.borrow().is_empty() {
@@ -3077,15 +3206,24 @@ fn refresh_contacts_category_ui(
     }
 
     let desired = selected_index.unwrap_or(0).clamp(0, categories.borrow().len() as i32 - 1);
-    category_list.select_row(category_list.row_at_index(desired).as_ref());
-    rebuild_contacts_list_ui(contact_list, categories, contacts, desired);
+    if let Some((row, _)) = row_widgets.iter().find(|(_, idx)| *idx == Some(desired as usize)) {
+        category_list.select_row(Some(row));
+    }
+    rebuild_contacts_list_ui(contact_list, categories, contacts, desired, state);
 }
 
+/// Rebuilds the People screen's right-hand contact list for whichever
+/// bucket is selected in the left pane. Takes `state` so each row can show
+/// (and toggle) its favourite star live - Favourites membership is
+/// evaluated here rather than pre-filtered in `refresh_contacts_category_ui`
+/// so starring/unstarring a contact doesn't require rebuilding the whole
+/// left pane, just this list.
 fn rebuild_contacts_list_ui(
     contact_list: &gtk::ListBox,
     categories: &Rc<RefCell<Vec<ContactsCategoryChoice>>>,
     contacts: &Rc<RefCell<Vec<ContactsListEntry>>>,
     selected_category_index: i32,
+    state: &Rc<RefCell<UiState>>,
 ) {
     while let Some(child) = contact_list.first_child() {
         contact_list.remove(&child);
@@ -3096,15 +3234,18 @@ fn rebuild_contacts_list_ui(
         return;
     };
 
-    let mut entries: Vec<ContactsListEntry> = choice
-        .contacts
-        .into_iter()
-        .map(|card| ContactsListEntry {
-            account_label: choice.account_label.clone(),
-            category_label: choice.category_label.clone(),
-            card,
-        })
-        .collect();
+    let category_label = contacts_bucket_label(&choice.kind);
+    let favourites_only = matches!(choice.kind, ContactsBucketKind::Favourites);
+
+    let mut entries: Vec<ContactsListEntry> = {
+        let st = state.borrow();
+        choice
+            .contacts
+            .into_iter()
+            .filter(|(account_id, _, card)| !favourites_only || st.starred_contacts.contains(&(account_id.clone(), contact_identity(card))))
+            .map(|(account_id, account_label, card)| ContactsListEntry { account_id, account_label, category_label: category_label.clone(), card })
+            .collect()
+    };
     entries.sort_by_key(|entry| vcard_display_name(&entry.card).to_lowercase());
 
     if entries.is_empty() {
@@ -3126,13 +3267,43 @@ fn rebuild_contacts_list_ui(
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
             .build();
-        let row_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+        let text_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).valign(gtk::Align::Center).build();
+        text_box.append(&name);
+        text_box.append(&email);
+
+        let identity = contact_identity(&entry.card);
+        let is_starred = state.borrow().starred_contacts.contains(&(entry.account_id.clone(), identity.clone()));
+        let star_button = gtk::ToggleButton::builder()
+            .icon_name("starred-symbolic")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .active(is_starred)
+            .tooltip_text("Favourite")
+            .build();
+        {
+            let state = state.clone();
+            let contact_list = contact_list.clone();
+            let categories = categories.clone();
+            let contacts = contacts.clone();
+            let account_id = entry.account_id.clone();
+            star_button.connect_toggled(move |btn| {
+                let key = (account_id.clone(), identity.clone());
+                if btn.is_active() {
+                    state.borrow_mut().starred_contacts.insert(key);
+                } else {
+                    state.borrow_mut().starred_contacts.remove(&key);
+                }
+                rebuild_contacts_list_ui(&contact_list, &categories, &contacts, selected_category_index, &state);
+            });
+        }
+
+        let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
         row_box.set_margin_start(10);
         row_box.set_margin_end(10);
-        row_box.set_margin_top(8);
-        row_box.set_margin_bottom(8);
-        row_box.append(&name);
-        row_box.append(&email);
+        row_box.set_margin_top(6);
+        row_box.set_margin_bottom(6);
+        row_box.append(&text_box);
+        row_box.append(&star_button);
         contact_list.append(&row_box);
     }
     *contacts.borrow_mut() = entries;
@@ -3217,7 +3388,28 @@ fn sync_contacts_account(
         while let Ok((is_first, result)) = rx.recv().await {
             match result {
                 Ok(contacts) => {
-                    state.borrow_mut().contacts_by_account.insert(account_id.clone(), contacts);
+                    let mut st = state.borrow_mut();
+                    // CardDAV sync-collection deletion reporting isn't
+                    // implemented (`fetch_carddav_contacts` always does a
+                    // full refetch), so a contact disappearing between one
+                    // poll and the next is the only signal this app has that
+                    // it was deleted upstream - diff against what the
+                    // previous poll saw and stash anything missing in
+                    // `deleted_contacts` before it's overwritten below.
+                    if let Some(previous) = st.contacts_by_account.get(&account_id) {
+                        let previously_seen: HashMap<String, VCard> =
+                            previous.contacts.iter().map(|card| (contact_identity(card), card.clone())).collect();
+                        let still_present: HashSet<String> = contacts.contacts.iter().map(contact_identity).collect();
+                        let deleted_bucket = st.deleted_contacts.entry(account_id.clone()).or_default();
+                        let already_tracked: HashSet<String> = deleted_bucket.iter().map(contact_identity).collect();
+                        for (identity, card) in previously_seen {
+                            if !still_present.contains(&identity) && !already_tracked.contains(&identity) {
+                                deleted_bucket.push(card);
+                            }
+                        }
+                    }
+                    st.contacts_by_account.insert(account_id.clone(), contacts);
+                    drop(st);
                     refresh_contacts_ui(None);
                 }
                 Err(message) => {
@@ -3262,33 +3454,29 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
         .list_addressbooks(&home, &config.account_id, &credential)
         .await
         .map_err(|e| e.to_string())?;
+    tracing::debug!("CardDAV discovery for {}: home={home:?}, {} addressbook(s) found", account.display_name, books.len());
 
     let mut addresses = Vec::new();
-    let mut categories = Vec::new();
-    for book in books {
-        match client.fetch_addressbook_vcards(&book, &credential).await {
+    let mut contacts = Vec::new();
+    for book in &books {
+        match client.fetch_addressbook_vcards(book, &credential).await {
             Ok(vcards) => {
+                tracing::debug!("CardDAV addressbook {:?} (href {:?}) returned {} vcard(s)", book.display_name, book.href, vcards.len());
                 for card in &vcards {
                     addresses.extend(card.email_addresses());
                 }
-                categories.push(ContactsCategorySnapshot {
-                    name: if book.display_name.trim().is_empty() {
-                        "Unnamed address book".to_string()
-                    } else {
-                        book.display_name
-                    },
-                    contacts: vcards,
-                });
+                contacts.extend(vcards);
             }
             Err(e) => {
                 tracing::warn!("CardDAV addressbook fetch failed for {:?}: {e}", book.display_name);
             }
         }
     }
+    tracing::debug!("CardDAV sync for {}: {} total vcard(s)", account.display_name, contacts.len());
 
     Ok(ContactsAccountSnapshot {
         display_name: account.display_name,
-        categories,
+        contacts,
         suggestions: dedupe_addresses(addresses, usize::MAX),
     })
 }
@@ -4912,6 +5100,8 @@ mod tests {
                 },
             )]),
             contacts_by_account: HashMap::new(),
+            starred_contacts: HashSet::new(),
+            deleted_contacts: HashMap::new(),
             current_account: None,
             current_mailbox: None,
             mail_view: MailView::Single,

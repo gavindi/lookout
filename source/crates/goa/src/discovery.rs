@@ -290,6 +290,23 @@ impl GoaClient {
 
         let mut accounts = Vec::new();
         for (path, ifaces) in &objects {
+            if !ifaces.contains_key(IFACE_ACCOUNT) {
+                continue;
+            }
+            // `parse_contacts_account` silently returns `None` for any of
+            // several reasons (no Contacts interface at all, an interface
+            // with an empty Uri, no OAuth2/Password interface) - log what
+            // GOA actually reported for every account so a "why didn't my
+            // account show up" question doesn't require re-deriving this by
+            // hand from a D-Bus introspection dump.
+            let contacts_props = ifaces.get(IFACE_CONTACTS);
+            tracing::debug!(
+                "GOA account {path}: Contacts interface = {}, Uri = {:?}, OAuth2 = {}, Password = {}",
+                contacts_props.is_some(),
+                contacts_props.and_then(|props| get_string(props, "Uri")),
+                ifaces.contains_key(IFACE_OAUTH2),
+                ifaces.contains_key(IFACE_PASSWORD),
+            );
             if let Some(account) = self.parse_contacts_account(path, ifaces)? {
                 accounts.push(account);
             }

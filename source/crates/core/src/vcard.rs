@@ -129,7 +129,13 @@ impl VCard {
             let (name, params, value) = parse_property(&line)?;
             match name.to_ascii_uppercase().as_str() {
                 "VERSION" => {
-                    if value != "4.0" {
+                    // vCard 3.0 (RFC 2426) is still what plenty of real-world
+                    // CardDAV servers actually export - Google's among them -
+                    // despite this app otherwise targeting 4.0 (RFC 6350).
+                    // The two versions' syntax is close enough for every
+                    // property parsed below that there's no need to branch
+                    // on which one a given card uses.
+                    if value != "4.0" && value != "3.0" {
                         return Err(VCardError::UnsupportedVersion(value));
                     }
                     card.version = value;

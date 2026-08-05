@@ -219,7 +219,7 @@ pub fn parse_multistatus(xml: &str) -> Result<Vec<DavResponse>> {
 pub fn build_propfind_body(props: &[&str]) -> String {
     let mut body = String::from(
         "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n\
-         <D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:IC=\"http://apple.com/ns/ical/\">\n  <D:prop>\n",
+         <D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CD=\"urn:ietf:params:xml:ns:carddav\" xmlns:IC=\"http://apple.com/ns/ical/\">\n  <D:prop>\n",
     );
     for p in props {
         body.push_str("    <");
@@ -253,6 +253,45 @@ pub fn build_calendar_query_body(start: DateTime<Utc>, end: DateTime<Utc>) -> St
     )
 }
 
+/// Builds an `addressbook-multiget` REPORT body (RFC 6352 §8.7) requesting
+/// the given, already-known member hrefs of a CardDAV collection. Used for
+/// a full fetch after a `PROPFIND` (Depth: 1) enumerates the collection's
+/// members - deliberately not `addressbook-query`'s filter mechanism (RFC
+/// 6352 §8.6), whose "match everything" idiom is an empty `<CD:filter/>` per
+/// the RFC's own example, but at least one real-world server (Google's
+/// CardDAV) instead treats a filter with no `prop-filter` children as
+/// matching *nothing* - confirmed by it returning a bare, response-less
+/// `<multistatus/>` for an account known to have contacts. Multiget carries
+/// no such filter-semantics ambiguity: it just asks for specific resources by
+/// name.
+pub fn build_addressbook_multiget_body(hrefs: &[String], props: &[&str]) -> String {
+    let mut body = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n\
+         <CD:addressbook-multiget xmlns:D=\"DAV:\" xmlns:CD=\"urn:ietf:params:xml:ns:carddav\">\n  <D:prop>\n",
+    );
+    for p in props {
+        body.push_str("    <");
+        body.push_str(p);
+        body.push_str("/>\n");
+    }
+    body.push_str("  </D:prop>\n");
+    for href in hrefs {
+        body.push_str("  <D:href>");
+        body.push_str(&escape_text(href));
+        body.push_str("</D:href>\n");
+    }
+    body.push_str("</CD:addressbook-multiget>");
+    body
+}
+
+/// Minimal XML text-content escaping for values interpolated into a request
+/// body (hrefs, sync tokens) - CardDAV hrefs are normally already
+/// percent-encoded and safe, but this is cheap insurance against a server
+/// handing back a raw `&`/`<`/`>` that would otherwise produce malformed XML.
+fn escape_text(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// Builds a `sync-collection` REPORT body for WebDAV collections such as
 /// CardDAV address books. The caller controls which props are requested and
 /// may pass an optional sync token for incremental sync.
@@ -261,11 +300,19 @@ pub fn build_sync_collection_body(sync_token: Option<&str>, props: &[&str]) -> S
         "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n\
          <D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CD=\"urn:ietf:params:xml:ns:carddav\" xmlns:IC=\"http://apple.com/ns/ical/\">\n",
     );
-    if let Some(token) = sync_token {
-        body.push_str("  <D:sync-token>");
-        body.push_str(token);
-        body.push_str("</D:sync-token>\n");
+    // RFC 6578 requires `sync-token` to be present even for the initial sync
+    // request - empty, meaning "start from scratch" - rather than omitted.
+    // At least one real-world server (Google's CardDAV) treats an omitted
+    // element as a malformed request instead of inferring an initial sync.
+    match sync_token {
+        Some(token) => {
+            body.push_str("  <D:sync-token>");
+            body.push_str(token);
+            body.push_str("</D:sync-token>\n");
+        }
+        None => body.push_str("  <D:sync-token/>\n"),
     }
+    body.push_str("  <D:sync-level>1</D:sync-level>\n");
     body.push_str("  <D:prop>\n");
     for p in props {
         body.push_str("    <");
@@ -474,6 +521,32 @@ mod tests {
     }
 
     #[test]
+    fn addressbook_multiget_body_is_well_formed_xml_and_lists_every_href() {
+        let hrefs = vec!["/carddav/v1/lists/default/card1.vcf".to_string(), "/carddav/v1/lists/default/card2.vcf".to_string()];
+        let body = build_addressbook_multiget_body(&hrefs, &["D:getetag", "CD:address-data"]);
+        assert!(body.contains("<D:getetag/>"));
+        assert!(body.contains("<CD:address-data/>"));
+        assert!(body.contains("<D:href>/carddav/v1/lists/default/card1.vcf</D:href>"));
+        assert!(body.contains("<D:href>/carddav/v1/lists/default/card2.vcf</D:href>"));
+
+        let mut reader = NsReader::from_str(&body);
+        loop {
+            match reader.read_resolved_event() {
+                Ok((_, Event::Eof)) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("build_addressbook_multiget_body produced malformed XML: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn addressbook_multiget_href_is_xml_escaped() {
+        let hrefs = vec!["/lists/default/a&b.vcf".to_string()];
+        let body = build_addressbook_multiget_body(&hrefs, &["D:getetag"]);
+        assert!(body.contains("<D:href>/lists/default/a&amp;b.vcf</D:href>"));
+    }
+
+    #[test]
     fn sync_collection_body_is_well_formed_xml() {
         let body = build_sync_collection_body(Some("token123"), &["D:getetag", "CD:address-data"]);
         assert!(body.contains("<D:sync-token>token123</D:sync-token>"));
@@ -488,5 +561,15 @@ mod tests {
                 Err(e) => panic!("build_sync_collection_body produced malformed XML: {e}"),
             }
         }
+    }
+
+    #[test]
+    fn initial_sync_collection_body_still_includes_an_empty_sync_token() {
+        // RFC 6578: `sync-token` must be present (empty, for "start from
+        // scratch") even on the very first sync - some servers (Google's
+        // CardDAV) reject the request outright if it's missing entirely.
+        let body = build_sync_collection_body(None, &["D:getetag"]);
+        assert!(body.contains("<D:sync-token/>"));
+        assert!(!body.contains("<D:sync-token>\n"), "an empty element should be self-closed, not an open/close pair with nothing between");
     }
 }

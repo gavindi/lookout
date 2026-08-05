@@ -74,17 +74,42 @@ impl DavClient {
         self.sync_collection(url, 1, credential, body).await
     }
 
+    /// Fetches every vCard in an address book: a `PROPFIND` (Depth: 1) to
+    /// enumerate the collection's member hrefs, then an
+    /// `addressbook-multiget` REPORT for their vCard bodies. Deliberately not
+    /// `sync_addressbook`'s `sync-collection` (this app never stores a sync
+    /// token between polls, and Google's CardDAV rejects a cold-start
+    /// `sync-collection` outright) nor an `addressbook-query` with an empty
+    /// "match everything" filter (confirmed against Google's CardDAV: it
+    /// returns a bare, response-less `<multistatus/>` for that on an account
+    /// known to have contacts, i.e. it reads the empty filter as "match
+    /// nothing" despite RFC 6352's own example using exactly that). Multiget
+    /// avoids filter semantics entirely by asking for specific known hrefs.
     pub async fn fetch_addressbook_contacts(&self, addressbook: &AddressBookInfo, credential: &Credential) -> Result<Vec<DavResponse>> {
         let url = self.resolve(&addressbook.href)?;
-        self.sync_addressbook(url, credential, None).await
+        let members = self.propfind(url.clone(), 1, credential, &["D:getetag"]).await?;
+        let own_href = addressbook.href.trim_end_matches('/');
+        let hrefs: Vec<String> = members.into_iter().map(|r| r.href).filter(|href| href.trim_end_matches('/') != own_href).collect();
+        if hrefs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = xml::build_addressbook_multiget_body(&hrefs, &["D:getetag", "CD:address-data"]);
+        self.report(url, 1, credential, body).await
     }
 
     pub async fn fetch_addressbook_vcards(&self, addressbook: &AddressBookInfo, credential: &Credential) -> Result<Vec<VCard>> {
         let responses = self.fetch_addressbook_contacts(addressbook, credential).await?;
         let mut vcards = Vec::new();
         for response in responses {
-            if let Some(data) = response.prop(NS_CARDDAV, "address-data") {
-                vcards.push(VCard::parse(data).map_err(|e| Error::Discovery(format!("vCard parse error: {e}")))?);
+            let Some(data) = response.prop(NS_CARDDAV, "address-data") else { continue };
+            // One malformed/unsupported card (a version this parser doesn't
+            // handle, a server-specific quirk, ...) used to abort the whole
+            // batch via `?` - discarding every other card the response also
+            // contained. Skip just that one instead; the rest of the account
+            // shouldn't go blank over a single bad card.
+            match VCard::parse(data) {
+                Ok(card) => vcards.push(card),
+                Err(e) => tracing::warn!("skipping unparseable vCard at {:?}: {e}", response.href),
             }
         }
         Ok(vcards)
@@ -193,8 +218,10 @@ impl DavClient {
         self.report(url, depth, credential, body).await
     }
 
-    async fn send_xml_request(&self, method: &str, url: reqwest::Url, depth: u8, credential: &Credential, body: String) -> Result<Vec<DavResponse>> {
-        let method = Method::from_bytes(method.as_bytes()).expect("method name is a valid HTTP token");
+    async fn send_xml_request(&self, method_name: &str, url: reqwest::Url, depth: u8, credential: &Credential, body: String) -> Result<Vec<DavResponse>> {
+        let method = Method::from_bytes(method_name.as_bytes()).expect("method name is a valid HTTP token");
+        let request_url = url.clone();
+        tracing::debug!("DAV {method_name} {request_url} (Depth: {depth}) body:\n{body}");
         let mut req = self
             .http
             .request(method, url)
@@ -210,7 +237,18 @@ impl DavClient {
         };
 
         let response = req.send().await?;
-        let text = response.error_for_status()?.text().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
+        if !status.is_success() {
+            // `error_for_status()` would discard the response body here -
+            // and CardDAV/CalDAV servers (Google, Nextcloud, ...) routinely
+            // explain exactly what they didn't like about the request in it,
+            // which is far more useful for diagnosing a 4xx than a bare
+            // "400 Bad Request" with no context.
+            let snippet: String = text.chars().take(500).collect();
+            return Err(Error::Discovery(format!("HTTP {status} for {request_url}: {snippet}")));
+        }
         xml::parse_multistatus(&text)
     }
 }
