@@ -324,20 +324,39 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
 /// produced them - the comparison `repopulate` skips a rebuild on.
 type DisplayedMessages = Option<(SortKey, bool, ListFilter, Vec<EmailSummary>)>;
 
-/// What the message list's selection currently points at. The three cases
-/// are genuinely distinct to the reading pane: nothing selected clears it, a
-/// section header leaves it alone, and a message drives it - see the
-/// selection handler in `window.rs`.
+/// What the message list's selection currently points at. The cases are
+/// genuinely distinct to the reading pane: nothing selected clears it, a
+/// section header leaves it alone (unreachable via click - headers are
+/// unselectable, see `bind()` in `window.rs` - but kept as a defensive
+/// no-op case), a single message drives it, and two or more messages show
+/// a "N selected" placeholder instead - see the selection handler in
+/// `window.rs`.
 pub enum SelectionKind {
     Empty,
+    // Never constructed by `selection_kind()` today - headers are
+    // unselectable, so no click/ctrl-click/shift-click can ever produce
+    // this - but kept as a real variant, not deleted, so the window.rs
+    // selection handler's defensive no-op arm for it has something to match
+    // against if a header is ever selected some other way (e.g. a future
+    // programmatic `select_item` on a header's row index).
+    #[allow(dead_code)]
     Section,
     Message(Box<EmailSummary>),
+    Multiple(Vec<EmailSummary>),
 }
 
 /// The message list's model: a two-level `Gtk.TreeListModel` whose root rows
 /// are collapsible date sections and whose children are the messages in each,
 /// plus the selection over it. Replaces what used to be a flat
 /// `gio::ListStore` of messages paired with a `SingleSelection`.
+///
+/// The selection is a `MultiSelection` (not `SingleSelection`) so batch
+/// actions can act on more than one message - `GtkListView` handles
+/// ctrl/shift-click natively once bound to a multi-selection model, and the
+/// per-row checkbox in `window.rs` toggles the same underlying selection
+/// through the ordinary `GtkSelectionModel` interface. Unlike
+/// `SingleSelection`, `MultiSelection` never autoselects row 0 on a rebuild -
+/// see `restore_selection`'s doc for what that means for this model.
 ///
 /// Cloning is cheap and shares the same underlying model - handlers close
 /// over clones freely, exactly as they did over the old store/selection pair.
@@ -347,7 +366,7 @@ pub struct MessageListModel {
     /// when flat.
     root: gio::ListStore,
     tree: gtk::TreeListModel,
-    pub selection: gtk::SingleSelection,
+    pub selection: gtk::MultiSelection,
     /// One child store per bucket, handed out by the tree's create-child
     /// closure. These must outlive any individual rebuild: a `TreeListRow`
     /// that survives a `splice` still holds the child model it was given, so
@@ -402,7 +421,7 @@ impl MessageListModel {
         // and the row factory see `Gtk.TreeListRow`s, which is what drives
         // the section expanders. `autoexpand = false` because expansion is
         // driven from `collapsed`, not left to the model.
-        let selection = gtk::SingleSelection::new(Some(tree.clone()));
+        let selection = gtk::MultiSelection::new(Some(tree.clone()));
         MessageListModel {
             root,
             tree,
@@ -424,8 +443,9 @@ impl MessageListModel {
         self.truth.borrow().clone()
     }
 
-    /// The selected row's message, or `None` when nothing is selected *or*
-    /// the selection has landed on a section header.
+    /// The selected row's message, or `None` when nothing is selected, the
+    /// selection has landed on a section header, or more than one message is
+    /// selected.
     pub fn selected_summary(&self) -> Option<EmailSummary> {
         match self.selection_kind() {
             SelectionKind::Message(summary) => Some(*summary),
@@ -433,17 +453,46 @@ impl MessageListModel {
         }
     }
 
+    /// Every message currently selected, in ascending row-position order.
+    /// Empty when nothing is selected; a lone section header can never
+    /// appear here since headers are unselectable (see `bind()` in
+    /// `window.rs`).
+    pub fn selected_summaries(&self) -> Vec<EmailSummary> {
+        let bitset = self.selection.selection();
+        let mut out = Vec::with_capacity(bitset.size() as usize);
+        if let Some((mut iter, first)) = gtk::BitsetIter::init_first(&bitset) {
+            let mut pos = Some(first);
+            while let Some(p) = pos {
+                if let Some(summary) = self.summary_at(p) {
+                    out.push(summary);
+                }
+                pos = iter.next();
+            }
+        }
+        out
+    }
+
     pub fn selection_kind(&self) -> SelectionKind {
-        let Some(row) = self.selection.selected_item().and_downcast::<gtk::TreeListRow>() else {
-            return SelectionKind::Empty;
-        };
-        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else {
-            return SelectionKind::Empty;
-        };
+        let mut summaries = self.selected_summaries();
+        match summaries.len() {
+            0 => SelectionKind::Empty,
+            1 => SelectionKind::Message(Box::new(summaries.remove(0))),
+            _ => SelectionKind::Multiple(summaries),
+        }
+    }
+
+    /// The full `EmailSummary` at flat position `i`, or `None` if that row is
+    /// a section header. Like `message_at`, but cloning the whole summary
+    /// rather than just its `(mailbox, uid)` identity - `message_at` stays
+    /// separate since `restore_selection`'s identity-only walk shouldn't pay
+    /// for a clone it doesn't need.
+    fn summary_at(&self, i: u32) -> Option<EmailSummary> {
+        let row = self.selection.item(i).and_downcast::<gtk::TreeListRow>()?;
+        let boxed = row.item().and_downcast::<glib::BoxedAnyObject>()?;
         let item = boxed.borrow::<MessageItem>();
         match &*item {
-            MessageItem::Section(_) => SelectionKind::Section,
-            MessageItem::Message(summary) => SelectionKind::Message(summary.clone()),
+            MessageItem::Message(summary) => Some((**summary).clone()),
+            MessageItem::Section(_) => None,
         }
     }
 
@@ -460,9 +509,11 @@ impl MessageListModel {
     /// A no-op when the incoming list is identical to what's already
     /// displayed: the startup burst - each account's cache replay plus its
     /// live sync plus the app's on-demand syncs - delivers the same envelope
-    /// set several times in a row, and rebuilding for each one would
-    /// re-select the first row (`GtkSingleSelection` autoselects), refiring
-    /// the selection handler and crossfading the same email every time.
+    /// set several times in a row, and rebuilding for each one would tear
+    /// down and rebuild every row for nothing, needlessly re-running
+    /// `restore_selection` below and risking a spurious flicker in the
+    /// reading pane even though the selection ultimately restores to the
+    /// same place.
     ///
     /// Every model mutation below - each `splice`, each `set_expanded` -
     /// synchronously fires `items-changed`, which reaches the selection
@@ -501,12 +552,20 @@ impl MessageListModel {
         // Snapshot what the user has collapsed before anything is spliced.
         self.capture_collapsed();
 
-        // Remember the current highlight before the rebuild wipes it: the
-        // splices drop the old row objects, which would otherwise lose the
-        // user's selection every time a delete/archive/snooze lands a
-        // `MessagesUpdated`.
-        let previous_selection = self.selected_summary().map(|s| (s.mailbox.clone(), s.uid));
-        let previous_index = self.selection.selected();
+        // Remember the current highlight(s) before the rebuild wipes them:
+        // the splices drop the old row objects, which would otherwise lose
+        // the user's selection every time a delete/archive/snooze lands a
+        // `MessagesUpdated`. The single previously-focused position is kept
+        // separately (only meaningful when exactly one row was selected) as
+        // the N=1 fallback `restore_selection` uses when that one row didn't
+        // survive the rebuild.
+        let bitset = self.selection.selection();
+        let previous_selection: Vec<(MailboxId, Uid)> = self.selected_summaries().iter().map(|s| (s.mailbox.clone(), s.uid)).collect();
+        let previous_single_index = if bitset.size() == 1 {
+            gtk::BitsetIter::init_first(&bitset).map(|(_, first)| first).unwrap_or(gtk::INVALID_LIST_POSITION)
+        } else {
+            gtk::INVALID_LIST_POSITION
+        };
 
         *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, messages.clone()));
 
@@ -548,7 +607,7 @@ impl MessageListModel {
             }
         }
 
-        self.restore_selection(previous_selection, previous_index);
+        self.restore_selection(previous_selection, previous_single_index);
     }
 
     /// Switches which messages the list shows and re-renders from the stored
@@ -655,35 +714,59 @@ impl MessageListModel {
         }
     }
 
-    /// Restores the highlight after a rebuild: the same message if it's still
-    /// present (the rebuild wasn't a delete of the selected row), otherwise
-    /// whatever now occupies its old spot.
-    fn restore_selection(&self, previous: Option<(MailboxId, Uid)>, previous_index: u32) {
+    /// Restores the highlight(s) after a rebuild: every previously-selected
+    /// message that's still present (the rebuild wasn't a delete of it),
+    /// plus - only when exactly one row was selected before and it didn't
+    /// survive - whatever now occupies its old spot. There is no equivalent
+    /// fallback for a multi-message selection that didn't survive at all:
+    /// unlike a single highlight, there's no one "next best" row to guess at
+    /// for several deleted messages, so the selection legitimately ends up
+    /// empty (the reading pane's `Empty` arm handles that correctly, unlike
+    /// `GtkSingleSelection`'s old autoselect-row-0 behavior, which this model
+    /// doesn't have - see `MessageListModel`'s doc).
+    ///
+    /// Every survivor is applied in one `set_selection` call rather than a
+    /// loop of `select_item` calls, so a rebuild that restores N previously-
+    /// selected rows fires `selection-changed` once, not N times - the
+    /// selection handler in `window.rs` re-derives its state from scratch
+    /// each time it fires, so N firings would re-run that logic (and briefly
+    /// flash through intermediate partial-selection states) for no reason.
+    fn restore_selection(&self, previous: Vec<(MailboxId, Uid)>, previous_single_index: u32) {
         let n = self.selection.n_items();
         if n == 0 {
             return;
         }
-        if let Some((mailbox, uid)) = previous {
-            for i in 0..n {
-                if let Some((m, u)) = self.message_at(i) {
-                    if m == mailbox && u == uid {
-                        self.selection.set_selected(i);
-                        return;
-                    }
+        let previous: HashSet<(MailboxId, Uid)> = previous.into_iter().collect();
+        let survivors = gtk::Bitset::new_empty();
+        let mut survivor_count = 0u32;
+        for i in 0..n {
+            if let Some((m, u)) = self.message_at(i) {
+                if previous.contains(&(m, u)) {
+                    survivors.add(i);
+                    survivor_count += 1;
                 }
             }
         }
-        if previous_index == gtk::INVALID_LIST_POSITION {
+        if survivor_count > 0 {
+            self.selection.set_selection(&survivors, &gtk::Bitset::new_range(0, n));
             return;
         }
-        // Fall back to the old position, walking forward past any section
-        // header so the highlight never parks on one.
-        let mut index = previous_index.min(n - 1);
+        if previous.len() != 1 || previous_single_index == gtk::INVALID_LIST_POSITION {
+            // Either nothing was selected before, or several messages were
+            // and none survived - there's no single fallback position that
+            // makes sense for a vanished multi-selection (see doc above).
+            return;
+        }
+        // Exactly one row was selected before and it's gone: preserve the
+        // old single-selection "highlight follows deletion" UX by falling
+        // back to whatever now occupies its old position, walking forward
+        // past any section header so the highlight never parks on one.
+        let mut index = previous_single_index.min(n - 1);
         while index < n && self.message_at(index).is_none() {
             index += 1;
         }
         if index < n {
-            self.selection.set_selected(index);
+            self.selection.select_item(index, true);
         }
     }
 

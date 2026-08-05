@@ -126,6 +126,17 @@ struct MessageRowWidgets {
     expander: gtk::TreeExpander,
     header_label: gtk::Label,
     message_box: gtk::Box,
+    /// Batch-select checkbox, kept in sync with the row's real selection
+    /// state (see `checkbox_suppress`'s note) rather than driving it
+    /// directly - clicking it and ctrl/shift-clicking the row are two inputs
+    /// to the same `MultiSelection`.
+    checkbox: gtk::CheckButton,
+    /// Set while `bind()`/the model's `notify::selected` handler are the
+    /// ones writing `checkbox.set_active()`, so `checkbox`'s own
+    /// `connect_toggled` (installed once in `connect_setup`) can tell a
+    /// programmatic sync apart from a real click and not feed it back into
+    /// the selection model - the same pattern as `ListHeader::favorite_suppress`.
+    checkbox_suppress: Rc<Cell<bool>>,
     accent: gtk::Box,
     avatar: gtk::Label,
     sender_label: gtk::Label,
@@ -799,6 +810,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let tags_for_rows = tags.clone();
     let tags_for_bind = tags.clone();
     let tag_colors_for_rows = tag_colors.clone();
+    // Declared here, ahead of the row factory below, so each row's `setup`
+    // can bind its avatar/checkbox visibility to this button's `active`
+    // state (see the property bindings inside `connect_setup`) - appended
+    // into the message-list header, after the favorite star, further down
+    // where the rest of that header's controls are built.
+    let select_mode_button = gtk::ToggleButton::builder()
+        .icon_name(themed_icon_name(&["checkbox-checked-symbolic", "list-add-symbolic", "edit-select-all-symbolic"]))
+        .tooltip_text("Select messages")
+        .css_classes(["flat", "list-header-action"])
+        .valign(gtk::Align::Center)
+        .build();
+    let select_mode_button_for_rows = select_mode_button.clone();
     let message_factory = gtk::SignalListItemFactory::new();
     message_factory.connect_setup(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -888,10 +911,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         text_column.append(&top_row);
         text_column.append(&preview_label);
 
+        // Same footprint as the avatar it replaces (32x32, centered) so
+        // toggling Select mode swaps one for the other in place rather than
+        // adding a separate column - `bind_property` below (not bind()/CSS)
+        // is what makes the swap live across every row, including ones
+        // already on screen, the moment the header's Select toggle flips.
+        let checkbox = gtk::CheckButton::builder()
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        // `sync_create` seeds each binding with the button's current state
+        // immediately (rows created while already in Select mode - e.g. one
+        // scrolled into view - must not default to showing the avatar), and
+        // both bindings keep matching it live without any rebind: a plain
+        // signal (message_factory has no per-toggle rebind hook) would only
+        // reach rows bound *after* the flip.
+        select_mode_button_for_rows.bind_property("active", &avatar, "visible").invert_boolean().sync_create().build();
+        select_mode_button_for_rows.bind_property("active", &checkbox, "visible").sync_create().build();
+
         let message_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
         message_box.add_css_class("message-row");
         message_box.append(&accent);
         message_box.append(&avatar);
+        message_box.append(&checkbox);
         message_box.append(&text_column);
 
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
@@ -941,6 +986,48 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // current message at press time.
         let tag_popover = gtk::Popover::new();
         tag_popover.set_parent(&overlay);
+
+        let checkbox_suppress: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        {
+            // Model -> checkbox, live: ctrl/shift-clicking a row already on
+            // screen changes `list_item`'s `selected` property, which
+            // `bind()` alone wouldn't see again until this row is recycled.
+            let checkbox = checkbox.clone();
+            let suppress = checkbox_suppress.clone();
+            list_item.connect_selected_notify(move |li| {
+                suppress.set(true);
+                checkbox.set_active(li.is_selected());
+                suppress.set(false);
+            });
+        }
+        {
+            // Checkbox -> model: an alternate input for the same selection
+            // the row's own click/ctrl-click/shift-click already drives,
+            // never a second, parallel selection concept. Weak, not a
+            // strong clone: `list_item` already owns `checkbox` transitively
+            // through the widget tree it holds as its child, so a strong
+            // capture here would close a reference cycle
+            // (list_item -> ... -> checkbox -> this closure -> list_item)
+            // that would never be freed.
+            let selection = message_list_for_rows.selection.clone();
+            let list_item_weak = list_item.downgrade();
+            let suppress = checkbox_suppress.clone();
+            checkbox.connect_toggled(move |cb| {
+                if suppress.get() {
+                    return;
+                }
+                let Some(list_item) = list_item_weak.upgrade() else { return };
+                let pos = list_item.position();
+                if pos == gtk::INVALID_LIST_POSITION {
+                    return;
+                }
+                if cb.is_active() {
+                    selection.select_item(pos, false);
+                } else {
+                    selection.unselect_item(pos);
+                }
+            });
+        }
 
         {
             let bound = bound.clone();
@@ -1064,6 +1151,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     expander,
                     header_label,
                     message_box,
+                    checkbox,
+                    checkbox_suppress,
                     accent,
                     avatar,
                     sender_label,
@@ -1100,10 +1189,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // wrong.
                 widgets.expander.set_list_row(Some(&row));
                 widgets.header_label.set_label(&section.label);
-                // Headers aren't a selection target for the mouse. This does
-                // not stop `GtkSingleSelection`'s autoselect from landing on
-                // one, which is why the selection handler also treats a
-                // header as a no-op.
+                // Headers aren't a selection target for the mouse:
+                // `set_selectable(false)` is a `ListItem` property enforced
+                // by `GtkListView`'s own click/ctrl-click/shift-click
+                // handling, independent of which `SelectionModel` backs the
+                // view, so a header can never enter `MultiSelection`'s
+                // selection set via the mouse. `SelectionKind::Section`
+                // stays a defensive no-op case in the selection handler
+                // regardless, in case a header is ever selected some other
+                // way.
                 list_item.set_selectable(false);
                 list_item.set_activatable(false);
                 *widgets.bound.borrow_mut() = None;
@@ -1116,6 +1210,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // row that last rendered a header would stay unclickable.
                 list_item.set_selectable(true);
                 list_item.set_activatable(true);
+                // Authoritative reset on every bind, not just a one-time
+                // connection: recycling a row must not leave it showing the
+                // previous occupant's checked state, and this is cheaper
+                // than reasoning about signal-timing races across recycles.
+                widgets.checkbox_suppress.set(true);
+                widgets.checkbox.set_active(list_item.is_selected());
+                widgets.checkbox_suppress.set(false);
 
                 let sender = summary.from.first();
                 match sender {
@@ -1296,6 +1397,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .valign(gtk::Align::Center)
         .menu_model(&sort_key_menu)
         .build();
+    // The button itself (and the property bindings each row's avatar/
+    // checkbox make to its `active` state) were built earlier, alongside
+    // the row factory - see the comment there. All that's left here is the
+    // one side effect that isn't per-row: clearing the selection on exit.
+    {
+        let message_list = message_list.clone();
+        select_mode_button.connect_toggled(move |button| {
+            if !button.is_active() {
+                // Leaving Select mode clears the selection - matches Gmail's
+                // "cancel selection" behavior and avoids stranding the
+                // reading pane on the "N selected" placeholder after the
+                // toggle that revealed it (and every row's checkbox) is gone.
+                message_list.selection.unselect_all();
+            }
+        });
+    }
 
     let message_header_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1307,6 +1424,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     message_header_row.append(&title_column);
     message_header_row.append(&favorite_button);
+    message_header_row.append(&select_mode_button);
     message_header_row.append(&sync_button);
     message_header_row.append(&list_filter_button);
     message_header_row.append(&sort_direction_button);
@@ -1582,6 +1700,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
+    // A separate page from "empty" (which several call sites already treat
+    // as a true blank state) - "nothing selected" and "several messages
+    // deliberately selected" are different states to the user even though
+    // both mean "no single body to show," so this gets its own name rather
+    // than overloading "empty" with a sometimes-visible label.
+    let reading_multi_label = gtk::Label::builder().css_classes(["dim-label"]).halign(gtk::Align::Center).valign(gtk::Align::Center).build();
+    let reading_multi = gtk::Box::builder().orientation(gtk::Orientation::Vertical).valign(gtk::Align::Center).vexpand(true).build();
+    reading_multi.append(&reading_multi_label);
+    reading_stack.add_named(&reading_multi, Some("multi"));
     reading_stack.set_visible_child_name("empty");
     // Interpolated crossfade between the reading pane's pages so a
     // message's header + body fade out and the next fades in instead of
@@ -1822,6 +1949,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     report_button.set_tooltip_text(Some("Report"));
     let flag_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
     flag_button.set_tooltip_text(Some("Flag/Unflag"));
+    // Mark read/unread: no explicit toolbar action for this existed before -
+    // only the implicit mark-as-read that opening a message already does.
+    // Same aggregate-direction policy as Flag/Unflag: any unread message in
+    // the selection means the action marks everything read; only when every
+    // selected message is already read does it become "mark all unread."
+    let mark_read_button = gtk::Button::from_icon_name(themed_icon_name(&["mail-mark-read-symbolic", "mail-read-symbolic", "emblem-ok-symbolic"]));
+    mark_read_button.set_tooltip_text(Some("Mark Read/Unread"));
     // Categorize: a menu of the defined color tags, toggle-checked against
     // the selected message. Its popover is rebuilt on every `show` so the
     // check states track whichever message is selected when it opens.
@@ -1857,6 +1991,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&archive_button);
     command_toolbar.append(&report_button);
     command_toolbar.append(&flag_button);
+    command_toolbar.append(&mark_read_button);
     command_toolbar.append(&categorize_button);
     command_toolbar.append(&snooze_button);
     command_toolbar.append(&more_button);
@@ -2710,22 +2845,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let reading_stack = reading_stack.clone();
+        let reading_multi_label = reading_multi_label.clone();
         let message_header = message_header.clone();
         let message_list_for_selection = message_list.clone();
-        message_list.selection.connect_selected_item_notify(move |_| {
+        message_list.selection.connect_selection_changed(move |_sel, _pos, _n_items| {
             let summary = match message_list_for_selection.selection_kind() {
                 SelectionKind::Message(summary) => *summary,
-                // A date section header. Deliberately a no-op rather than a
-                // clear: `GtkSingleSelection` autoselects row 0 after every
-                // rebuild, and in a grouped list row 0 *is* a header - so
-                // clearing here would yank the reading pane to "empty" and
-                // reset `rendered_message` on every cache replay and live
-                // sync, which is precisely the startup flicker bug the
-                // `already_shown` guard below exists to prevent. Collapsing
-                // the section holding the selected message lands here too,
-                // and keeping the message on screen is the right answer
-                // there as well.
+                // A date section header - unreachable via the mouse (headers
+                // are unselectable, see `bind()`), kept as a defensive no-op.
                 SelectionKind::Section => return,
+                SelectionKind::Multiple(summaries) => {
+                    // Two or more messages selected: show the "N selected"
+                    // placeholder and skip mark-as-read/body-fetch entirely -
+                    // the same state reset the `Empty` arm below does, since
+                    // both mean "the reading pane no longer shows a specific
+                    // message." Leaving `rendered_message` set here would
+                    // make a later re-selection of that same single message
+                    // look already-shown and skip re-rendering it.
+                    let mut st = state.borrow_mut();
+                    st.pending_body_request = None;
+                    st.pending_html_reveal = false;
+                    st.reveal_generation += 1;
+                    st.pending_header = None;
+                    st.rendered_message = None;
+                    drop(st);
+                    reading_multi_label.set_label(&format!("{} messages selected", summaries.len()));
+                    reading_stack.set_visible_child_name("multi");
+                    return;
+                }
                 SelectionKind::Empty => {
                     let mut st = state.borrow_mut();
                     st.pending_body_request = None;
@@ -2741,11 +2888,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let uid = summary.uid;
             let mailbox = summary.mailbox.clone();
             // Re-selecting the message that's already on the reading pane -
-            // which `GtkSingleSelection`'s autoselect does on every list
-            // rebuild that keeps the same row first - must be a no-op, not a
-            // fresh fetch/render. Routing it through "empty" and crossfading
-            // the same email back in is exactly the startup flicker bug; the
-            // body is already on screen, so there's nothing to re-render.
+            // which `restore_selection` can do across a rebuild that
+            // preserves the same selected row - must be a no-op, not a fresh
+            // fetch/render. Routing it through "empty" and crossfading the
+            // same email back in would be a startup flicker; the body is
+            // already on screen, so there's nothing to re-render.
             let already_shown = {
                 let st = state.borrow();
                 st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid)) && reading_stack.visible_child_name().as_deref() == Some("message")
@@ -2820,10 +2967,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // --- Delete/Archive/Report -> AccountCommand::MoveMessage against the
+    // --- Delete/Archive/Report -> AccountCommand::MoveMessages against the
     // account's Trash/Archive/Junk mailbox; Snooze -> AccountCommand::
-    // SnoozeMessage with a single fixed "tomorrow 9:00 AM local time"
-    // default. All four are silent no-ops with nothing selected.
+    // SnoozeMessages with a single fixed "tomorrow 9:00 AM local time"
+    // default applied to the whole selection. All four are silent no-ops
+    // with nothing selected, and send exactly one command per distinct
+    // mailbox in the selection (see `selected_message_command_targets`) -
+    // for today's ordinary single-selection case that's exactly one command,
+    // same as before.
     for (button, role) in [
         (&delete_button, MailboxRole::Trash),
         (&archive_button, MailboxRole::Archive),
@@ -2832,53 +2983,81 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list = message_list.clone();
         let state = state.clone();
         button.connect_clicked(move |_| {
-            if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_list, &state) {
-                let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage { mailbox, uid, role });
+            for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
+                let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages { mailbox, uids, role });
             }
         });
     }
-    // --- Flag/Unflag -> AccountCommand::StoreFlags toggling `\Flagged`.
-    // The direction comes from the selected row's own flags, so the one
-    // button covers both halves the way Outlook's does.
+    // --- Flag/Unflag -> AccountCommand::StoreFlagsMany toggling `\Flagged`
+    // on every selected message. The direction is computed once over the
+    // whole selection - Gmail/Outlook's convention: any unflagged message
+    // selected means the action flags everything; only when every selected
+    // message is already flagged does it become "unflag all" - rather than
+    // per-message, so a single selected message (the common case) sees
+    // exactly today's is_starred()-based toggle.
     {
         let message_list = message_list.clone();
         let state = state.clone();
         flag_button.connect_clicked(move |_| {
-            let Some(summary) = message_list.selected_summary() else { return };
-            let st = state.borrow();
-            let Some(handle) = mailbox_account_id(&summary.mailbox).and_then(|id| st.accounts.get(&id)) else {
+            let summaries = message_list.selected_summaries();
+            if summaries.is_empty() {
                 return;
-            };
-            let (add, remove) = if summary.is_starred() {
-                (Vec::new(), vec![SystemFlagBit::Flagged])
-            } else {
+            }
+            let (add, remove) = if summaries.iter().any(|s| !s.is_starred()) {
                 (vec![SystemFlagBit::Flagged], Vec::new())
+            } else {
+                (Vec::new(), vec![SystemFlagBit::Flagged])
             };
-            let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreFlags {
-                mailbox: summary.mailbox.clone(),
-                uid: summary.uid,
-                add,
-                remove,
-            });
+            for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
+                let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
+                    mailbox,
+                    uids,
+                    add: add.clone(),
+                    remove: remove.clone(),
+                });
+            }
+        });
+    }
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        mark_read_button.connect_clicked(move |_| {
+            let summaries = message_list.selected_summaries();
+            if summaries.is_empty() {
+                return;
+            }
+            let (add, remove) = if summaries.iter().any(|s| s.is_unread()) {
+                (vec![SystemFlagBit::Seen], Vec::new())
+            } else {
+                (Vec::new(), vec![SystemFlagBit::Seen])
+            };
+            for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
+                let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
+                    mailbox,
+                    uids,
+                    add: add.clone(),
+                    remove: remove.clone(),
+                });
+            }
         });
     }
     {
         let message_list = message_list.clone();
         let state = state.clone();
         snooze_button.connect_clicked(move |_| {
-            if let Some((mailbox, uid, cmd_tx)) = selected_message_command_target(&message_list, &state) {
-                let tomorrow_9am = chrono::Local::now()
-                    .date_naive()
-                    .succ_opt()
-                    .and_then(|d| d.and_hms_opt(9, 0, 0))
-                    .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(chrono::Utc::now);
-                let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessage {
-                    mailbox,
-                    uid,
-                    until: tomorrow_9am,
-                });
+            let targets = selected_message_command_targets(&message_list, &state);
+            if targets.is_empty() {
+                return;
+            }
+            let tomorrow_9am = chrono::Local::now()
+                .date_naive()
+                .succ_opt()
+                .and_then(|d| d.and_hms_opt(9, 0, 0))
+                .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+            for (cmd_tx, mailbox, uids) in targets {
+                let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessages { mailbox, uids, until: tomorrow_9am });
             }
         });
     }
@@ -4849,24 +5028,36 @@ fn resort_message_list(state: &Rc<RefCell<UiState>>, message_list: &MessageListM
     message_list.repopulate(messages, key, descending);
 }
 
-/// Resolves the currently-selected message in `message_list` to its
-/// mailbox/uid and its owning account's command channel, for the
-/// Delete/Archive/Report/Snooze button handlers - mirrors the lookup already
-/// done inline by the `FetchBody`-on-selection handler above. The account is
-/// derived from the message's own `MailboxId` rather than the view's
-/// `current_account`, so the unified "All Inboxes" list routes each message
-/// to the right account. Returns `None` if nothing is selected, a section
-/// header is selected, or the account has since disconnected, in which case
-/// the calling handler is a silent no-op.
-fn selected_message_command_target(message_list: &MessageListModel, state: &Rc<RefCell<UiState>>) -> Option<(MailboxId, Uid, async_channel::Sender<AccountCommand>)> {
-    let summary = message_list.selected_summary()?;
-    let uid = summary.uid;
-    let mailbox = summary.mailbox.clone();
-
-    let account_id = mailbox_account_id(&mailbox)?;
+/// Groups every currently-selected message in `message_list` by the
+/// `(account, mailbox)` it lives in, for the batch Delete/Archive/Report/
+/// Snooze/Flag/Mark-read button handlers - mirrors the lookup already done
+/// inline by the `FetchBody`-on-selection handler above, generalized from
+/// one message to a set of them. The account is derived from each message's
+/// own `MailboxId` rather than the view's `current_account`, so the unified
+/// "All Inboxes" list routes each message to the right account regardless of
+/// which mailboxes are mixed into the selection.
+///
+/// Returns one entry per distinct mailbox touched - so a batch action sends
+/// exactly one plural `AccountCommand` per mailbox, not one per message -
+/// with each group's uids in selection order. A message whose account has
+/// since disconnected is silently dropped from its group rather than failing
+/// the whole batch, same convention as this function's single-message
+/// predecessor. Empty (nothing selected, or every account disconnected)
+/// yields an empty `Vec`, which every caller below treats as a no-op loop.
+///
+/// For exactly one selected message this returns exactly one entry with
+/// `uids == vec![uid]` - a strict, behavior-preserving generalization of the
+/// function it replaces.
+fn selected_message_command_targets(message_list: &MessageListModel, state: &Rc<RefCell<UiState>>) -> Vec<(async_channel::Sender<AccountCommand>, MailboxId, Vec<Uid>)> {
+    let summaries = message_list.selected_summaries();
     let st = state.borrow();
-    let cmd_tx = st.accounts.get(&account_id)?.cmd_tx.clone();
-    Some((mailbox, uid, cmd_tx))
+    let mut groups: HashMap<(AccountId, MailboxId), (async_channel::Sender<AccountCommand>, Vec<Uid>)> = HashMap::new();
+    for summary in summaries {
+        let Some(account_id) = mailbox_account_id(&summary.mailbox) else { continue };
+        let Some(handle) = st.accounts.get(&account_id) else { continue };
+        groups.entry((account_id, summary.mailbox.clone())).or_insert_with(|| (handle.cmd_tx.clone(), Vec::new())).1.push(summary.uid);
+    }
+    groups.into_iter().map(|((_, mailbox), (cmd_tx, uids))| (cmd_tx, mailbox, uids)).collect()
 }
 
 /// Resolves the currently-selected message plus its already-fetched body,

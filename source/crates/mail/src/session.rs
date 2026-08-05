@@ -148,12 +148,28 @@ pub enum AccountCommand {
         uid: Uid,
         role: MailboxRole,
     },
+    /// `MoveMessage` for a whole batch of messages in one mailbox at once -
+    /// one `MOVE`/`COPY`+`STORE`+`EXPUNGE` over a joined UID set instead of
+    /// one round trip per message, and one resync at the end instead of one
+    /// per message. Cross-mailbox batches are the caller's job: send one of
+    /// these per `(account, mailbox)` group.
+    MoveMessages {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        role: MailboxRole,
+    },
     /// Client-side only - IMAP has no native snooze. Records `until` in the
     /// local cache and hides the message from `MessagesUpdated` until that
     /// time passes.
     SnoozeMessage {
         mailbox: MailboxId,
         uid: Uid,
+        until: chrono::DateTime<chrono::Utc>,
+    },
+    /// `SnoozeMessage` for a whole batch of messages in one mailbox at once.
+    SnoozeMessages {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
         until: chrono::DateTime<chrono::Utc>,
     },
     /// Adds and/or removes IMAP system flags on one message (`STORE`), for
@@ -167,6 +183,17 @@ pub enum AccountCommand {
     StoreFlags {
         mailbox: MailboxId,
         uid: Uid,
+        add: Vec<SystemFlagBit>,
+        remove: Vec<SystemFlagBit>,
+    },
+    /// `StoreFlags` for a whole batch of messages in one mailbox at once -
+    /// one `STORE` per add/remove side over a joined UID set, and the cache
+    /// patched (or a single resync issued) for the whole batch rather than
+    /// once per message. Backs the toolbar's batch Flag/Unflag and Mark
+    /// read/unread actions.
+    StoreFlagsMany {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
         add: Vec<SystemFlagBit>,
         remove: Vec<SystemFlagBit>,
     },
@@ -589,11 +616,21 @@ async fn connect_and_run(
                 // connection attempts, see `run_account_session`.
                 AccountCommand::Reconnect => {}
                 AccountCommand::MoveMessage { mailbox, uid, role } => {
-                    if mailbox != current_mailbox_id {
-                        tracing::warn!("MoveMessage requested for a mailbox other than the currently selected one; ignoring");
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
                         continue;
+                    };
+                    // SELECT the message's own folder on demand, same
+                    // contract as `StoreFlags` below: a move can race a
+                    // folder switch, and the unified "All Inboxes" view
+                    // shows messages from mailboxes this session doesn't
+                    // currently have open at all. The main loop's own
+                    // re-select puts the session back on the user's folder
+                    // before the next IDLE wait.
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
                     }
-                    match move_message_to_role(&mut session, &folders, &account_id, uid, role).await {
+                    match move_message_to_role(&mut session, &folders, &account_id, &[uid], role).await {
                         Ok(()) => {
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
                             // The MOVE already succeeded server-side, so drop the
@@ -620,14 +657,53 @@ async fn connect_and_run(
                         }
                     }
                 }
-                AccountCommand::SnoozeMessage { mailbox, uid, until } => {
-                    if mailbox != current_mailbox_id {
-                        tracing::warn!("SnoozeMessage requested for a mailbox other than the currently selected one; ignoring");
+                AccountCommand::MoveMessages { mailbox, uids, role } => {
+                    if uids.is_empty() {
                         continue;
                     }
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    match move_message_to_role(&mut session, &folders, &account_id, &uids, role).await {
+                        Ok(()) => {
+                            let _ = events.send(AccountEvent::MessageMoved { role }).await;
+                            if let Some(cache) = cache {
+                                for uid in &uids {
+                                    if let Err(e) = cache.delete_message(&mailbox, *uid) {
+                                        tracing::warn!("failed to drop moved message from cache: {e}");
+                                    }
+                                }
+                                emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                            }
+                            relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't move messages: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::SnoozeMessage { mailbox, uid, until } => {
                     if let Some(cache) = cache {
                         if let Err(e) = cache.snooze_message(&mailbox, uid, until) {
                             tracing::warn!("failed to record snooze: {e}");
+                        }
+                    }
+                    let _ = events.send(AccountEvent::MessageSnoozed).await;
+                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                    session_selected = current_mailbox_id.clone();
+                }
+                AccountCommand::SnoozeMessages { mailbox, uids, until } => {
+                    if let Some(cache) = cache {
+                        for uid in &uids {
+                            if let Err(e) = cache.snooze_message(&mailbox, *uid, until) {
+                                tracing::warn!("failed to record snooze: {e}");
+                            }
                         }
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
@@ -649,7 +725,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    match store_flags(&mut session, uid, &add, &remove).await {
+                    match store_flags(&mut session, &[uid], &add, &remove).await {
                         Ok(()) => {
                             // The server is now authoritative-and-changed;
                             // patch the cached summary to match so the list
@@ -706,6 +782,68 @@ async fn connect_and_run(
                         }
                     }
                 }
+                AccountCommand::StoreFlagsMany { mailbox, uids, add, remove } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    match store_flags(&mut session, &uids, &add, &remove).await {
+                        Ok(()) => {
+                            // Resync if even one uid couldn't be cache-patched
+                            // (fell outside the cached window, say), rather
+                            // than partially patching and partially resyncing -
+                            // a full resync is already the correct, cheap
+                            // fallback path for a single message, and stays
+                            // so for a batch.
+                            let all_patched = match cache {
+                                Some(cache) => uids.iter().all(|uid| cache.update_flags(&mailbox, *uid, &add, &remove).unwrap_or(false)),
+                                None => false,
+                            };
+                            if all_patched {
+                                emit_cached_messages(cache, &mailbox, events).await;
+                            } else if mailbox == current_mailbox_id {
+                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                                session_selected = current_mailbox_id.clone();
+                            }
+                            // Best-effort delta scaled by batch size, same
+                            // caveat as the single-message case above (and
+                            // same self-correction on the next STATUS
+                            // re-list): a uid whose \Seen state didn't
+                            // actually need to change (e.g. "mark all read"
+                            // applied to a selection that included some
+                            // already-read messages) still counts toward the
+                            // delta here.
+                            let mut delta = 0i64;
+                            if add.contains(&SystemFlagBit::Seen) {
+                                delta -= uids.len() as i64;
+                            }
+                            if remove.contains(&SystemFlagBit::Seen) {
+                                delta += uids.len() as i64;
+                            }
+                            let count_changed = delta != 0
+                                && folders.iter_mut().any(|f| {
+                                    if f.id == mailbox {
+                                        f.unread = (f.unread as i64 + delta).max(0) as u32;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            if count_changed {
+                                publish_folders(&folders, &account_id, cache, events).await;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't update message flags: {e}"))).await;
+                        }
+                    }
+                }
                 AccountCommand::StoreKeywords { mailbox, uid, add, remove } => {
                     let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
                         continue;
@@ -724,7 +862,7 @@ async fn connect_and_run(
                     // are entitled to reject the whole STORE).
                     let add: Vec<String> = add.into_iter().filter(|k| valid_keyword_atom(k)).collect();
                     let remove: Vec<String> = remove.into_iter().filter(|k| valid_keyword_atom(k)).collect();
-                    match store_raw_flags(&mut session, uid, &add, &remove).await {
+                    match store_raw_flags(&mut session, &[uid], &add, &remove).await {
                         Ok(()) => {
                             let patched = match cache {
                                 Some(cache) => match cache.update_keywords(&mailbox, uid, &add, &remove) {
@@ -917,34 +1055,42 @@ async fn connect_and_run(
     }
 }
 
+/// Joins a UID set into the comma-separated sequence-set syntax IMAP's
+/// `UID`-prefixed commands accept in place of a single UID - a batch of N
+/// messages costs one `STORE`/`MOVE`/`COPY` round trip instead of N.
+fn join_uids(uids: &[Uid]) -> String {
+    uids.iter().map(|u| u.0.to_string()).collect::<Vec<_>>().join(",")
+}
+
 /// Issues `STORE +FLAGS.SILENT` / `STORE -FLAGS.SILENT` for raw flag atoms
-/// on `uid` in the currently selected mailbox. `.SILENT` so the server doesn't
-/// echo an untagged FETCH per affected message: the caller already knows the
-/// resulting flag set (it applies the same add/remove to its cached summary),
-/// and the next `sync_mailbox` re-reads the real flags from the server
-/// regardless.
+/// on `uids` (one or many) in the currently selected mailbox. `.SILENT` so the
+/// server doesn't echo an untagged FETCH per affected message: the caller
+/// already knows the resulting flag set (it applies the same add/remove to
+/// its cached summary), and the next `sync_mailbox` re-reads the real flags
+/// from the server regardless.
 ///
 /// Add and remove are two separate STOREs because IMAP has no combined form;
 /// an empty side is skipped rather than sent as an empty flag list, which
 /// servers are entitled to reject.
-async fn store_raw_flags(session: &mut Session<ImapStream>, uid: Uid, add: &[String], remove: &[String]) -> Result<()> {
+async fn store_raw_flags(session: &mut Session<ImapStream>, uids: &[Uid], add: &[String], remove: &[String]) -> Result<()> {
+    let uid_set = join_uids(uids);
     for (op, flags) in [('+', add), ('-', remove)] {
         if flags.is_empty() {
             continue;
         }
         let list = flags.join(" ");
         let query = format!("{op}FLAGS.SILENT ({list})");
-        let _: Vec<_> = session.uid_store(uid.0.to_string(), &query).await?.try_collect().await?;
+        let _: Vec<_> = session.uid_store(uid_set.clone(), &query).await?.try_collect().await?;
     }
     Ok(())
 }
 
 /// `store_raw_flags` for system flags: maps each `SystemFlagBit` to its IMAP
 /// atom and delegates.
-async fn store_flags(session: &mut Session<ImapStream>, uid: Uid, add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<()> {
+async fn store_flags(session: &mut Session<ImapStream>, uids: &[Uid], add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<()> {
     let add = add.iter().map(|f| f.as_imap_flag().to_string()).collect::<Vec<_>>();
     let remove = remove.iter().map(|f| f.as_imap_flag().to_string()).collect::<Vec<_>>();
-    store_raw_flags(session, uid, &add, &remove).await
+    store_raw_flags(session, uids, &add, &remove).await
 }
 
 /// A keyword atom must be non-empty, not start with `\` (that's a flag), and
@@ -961,24 +1107,25 @@ fn valid_keyword_atom(keyword: &str) -> bool {
             .all(|c| c.is_ascii_graphic() && !matches!(c, '(' | ')' | '{' | '}' | '%' | '*' | '"' | '\\'))
 }
 
-/// Moves `uid` from the currently selected mailbox into the account's
-/// mailbox with special-use role `role`, via IMAP MOVE (RFC 6851) if the
-/// server advertises it, else COPY + STORE `\Deleted` + EXPUNGE.
-async fn move_message_to_role(session: &mut Session<ImapStream>, folders: &[Mailbox], account_id: &AccountId, uid: Uid, role: MailboxRole) -> Result<()> {
+/// Moves `uids` (one or many) from the currently selected mailbox into the
+/// account's mailbox with special-use role `role`, via IMAP MOVE (RFC 6851)
+/// if the server advertises it, else COPY + STORE `\Deleted` + EXPUNGE.
+async fn move_message_to_role(session: &mut Session<ImapStream>, folders: &[Mailbox], account_id: &AccountId, uids: &[Uid], role: MailboxRole) -> Result<()> {
     let Some(target) = folders.iter().find(|m| m.role == role) else {
         return Err(Error::NoSuchFolder(role));
     };
     let Some(path) = target.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
         return Ok(());
     };
+    let uid_set = join_uids(uids);
     let caps = session.capabilities().await?;
     if caps.has_str("MOVE") {
-        session.uid_mv(uid.0.to_string(), path).await?;
+        session.uid_mv(uid_set, path).await?;
     } else {
-        session.uid_copy(uid.0.to_string(), path).await?;
-        let _: Vec<_> = session.uid_store(uid.0.to_string(), "+FLAGS (\\Deleted)").await?.try_collect().await?;
+        session.uid_copy(uid_set.clone(), path).await?;
+        let _: Vec<_> = session.uid_store(uid_set, "+FLAGS (\\Deleted)").await?.try_collect().await?;
         // NB: expunges every \Deleted-flagged message in the currently
-        // selected mailbox, not just this one - a documented, accepted
+        // selected mailbox, not just this batch - a documented, accepted
         // simplification since nothing else in this crate ever sets \Deleted.
         let _: Vec<_> = session.expunge().await?.try_collect().await?;
     }

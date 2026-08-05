@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.43 (2026-08-06)
+
+### Added
+
+- **Mail**: the message list can now select more than one message at once. The list's backing model switched from `Gtk.SingleSelection` to `Gtk.MultiSelection`, so `GtkListView` handles ctrl-click (toggle) and shift-click (range) natively; a new **Select** toggle button, placed right after the favorite star in the message-list header, is a second input onto that same selection. Toggling Select swaps every row's two-letter avatar for a checkbox in the exact same 32x32 slot - `select_mode_button.bind_property("active", ...)` bindings on each row's avatar/checkbox visibility (rather than a CSS class or a rebind) keep the swap live across every row, including ones already on screen, with no extra column and no reflow. `MessageListModel::selected_summaries()`/`SelectionKind::Multiple` generalize the previous single-message API; `selected_summary()` keeps its exact old meaning (`Some` only for exactly one message), so Reply/Reply-All/Forward/Categorize correctly no-op on a multi-selection with no changes of their own.
+- **Mail**: Delete, Archive, Report, Flag/Unflag, Snooze, and a **new** Mark read/unread toolbar button (there was previously only the implicit mark-on-open) all now act on the whole selection. A new `selected_message_command_targets` resolver groups the selection by `(account, mailbox)` and sends one new plural `AccountCommand` per group (`MoveMessages`/`SnoozeMessages`/`StoreFlagsMany`) - one batched IMAP `MOVE`/`COPY`/`STORE` over a comma-joined UID sequence-set and one resync per mailbox touched, not one round trip per message. Flag/Unflag and Mark read/unread compute a Gmail-style aggregate direction once over the whole selection (any unflagged/unread message selected acts on all; only all-flagged/all-read flips the other way), which reduces to exactly today's per-message behavior when just one message is selected. The reading pane shows a new "N messages selected" placeholder whenever more than one message is selected, and structurally skips mark-as-read/body-fetch in that case - `selection_kind()` only ever produces `SelectionKind::Message` for exactly one selected row.
+
+### Fixed
+
+- **Mail**: `MoveMessage`/`SnoozeMessage` required the target mailbox to already be the account session's currently-`SELECT`ed one, and silently dropped the command otherwise - unlike `StoreFlags`, which already selects on demand. Acting on a message from a mailbox other than the one currently open (most visibly from the unified "All Inboxes" view) could therefore silently do nothing. Both now select on demand too, matching `StoreFlags`' existing contract.
+
+### Changed
+
+- **Mail**: `Gtk.MultiSelection` doesn't autoselect row 0 the way `Gtk.SingleSelection` did. This is a deliberate, desired side effect of the model switch: a freshly-opened or filtered-to-empty folder can now legitimately show no highlight, matching Gmail/Outlook rather than always forcing a highlight onto some row.
+
 ## 0.6.42 (2026-08-06)
 
 ### Added
