@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.35 (2026-08-05)
+
+### Added
+
+- **Mail**: the message-list header's Filter button is no longer a disabled placeholder - it's a live `MenuButton` with radio items (All / Unread / Flagged) bound to a `win.list-filter` stateful action, mirroring the sort-key menu beside it. The active filter is applied inside `MessageListModel::repopulate`, the single choke point every list rebuild passes through, but against a new *unfiltered* source of truth: `repopulate` stashes the full message set in the model before filtering, so the `displayed` snapshot stays the filtered subset the next sync's no-op-rebuild check diffs against while `set_filter` (and the sort controls, which now read `MessageListModel::all_messages`) re-render from the full set. `Unread`↔`All` therefore round-trips without losing a message, a flag flip on a message that's filtered out is seen as no change (a `STORE` on it costs no rebuild), and the filter persists across folder switches and view changes for the session.
+
 ## 0.6.34 (2026-08-05)
 
 ### Added

@@ -18,7 +18,7 @@ use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::last_view::{self, LastSelection};
-use crate::message_list::{format_row_date, MessageItem, MessageListModel, SelectionKind, SortKey};
+use crate::message_list::{format_row_date, ListFilter, MessageItem, MessageListModel, SelectionKind, SortKey};
 use crate::microsoft_oauth::MicrosoftCredentialProvider;
 use crate::worker::Worker;
 
@@ -1037,18 +1037,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .css_classes(["flat", "list-header-action"])
         .valign(gtk::Align::Center)
         .build();
-    // Still honest-disabled, but no longer for want of flag state: read and
-    // flagged are both live now (see `AccountCommand::StoreFlags`). What's
-    // missing is the filter itself - a filtered list needs its own unfiltered
-    // source of truth, since `MessageListModel`'s `displayed` snapshot is
-    // what a rebuild diffs against and would otherwise become the filtered
-    // subset.
-    let list_filter_button = gtk::Button::builder()
-        .icon_name(themed_icon_name(&["funnel-symbolic", "view-filter-symbolic", "edit-find-symbolic"]))
+    // The filter menu, mirroring the sort-key one: a stateful action renders
+    // the items as radio checks. `MessageListModel` owns the active filter -
+    // it's applied inside `repopulate`, the single choke point every rebuild
+    // passes through, against the model's unfiltered source of truth (see
+    // `MessageListModel::set_filter`) - so the action just tells the model
+    // which one to use.
+    let list_filter_menu = gio::Menu::new();
+    list_filter_menu.append(Some("All"), Some("win.list-filter('all')"));
+    list_filter_menu.append(Some("Unread"), Some("win.list-filter('unread')"));
+    list_filter_menu.append(Some("Flagged"), Some("win.list-filter('flagged')"));
+    let list_filter_button = gtk::MenuButton::builder()
+        .label(ListFilter::All.label())
         .tooltip_text("Filter")
-        .css_classes(["flat", "list-header-action"])
+        .css_classes(["flat"])
         .valign(gtk::Align::Center)
-        .sensitive(false)
+        .menu_model(&list_filter_menu)
         .build();
     let sort_direction_button = gtk::ToggleButton::builder()
         .icon_name(sort_direction_icon(true))
@@ -1161,6 +1165,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             sort_key_button.set_label(key.label());
             state.borrow_mut().sort_key = key;
             resort_message_list(&state, &message_list);
+        });
+    }
+
+    // --- Filter -> a stateful action so the menu renders radio checks,
+    // mirroring the sort-key action above. The active filter lives in the
+    // model, so changing it just re-renders the list from the model's
+    // unfiltered source of truth (see `MessageListModel::set_filter`). ---
+    let list_filter_action = gio::SimpleAction::new_stateful("list-filter", Some(glib::VariantTy::STRING), &ListFilter::All.action_state().to_variant());
+    {
+        let message_list = message_list.clone();
+        let list_filter_button = list_filter_button.clone();
+        list_filter_action.connect_activate(move |action, parameter| {
+            let Some(filter) = parameter.and_then(|p| p.str()).and_then(ListFilter::from_action_state) else {
+                return;
+            };
+            action.set_state(&filter.action_state().to_variant());
+            list_filter_button.set_label(filter.label());
+            message_list.set_filter(filter);
         });
     }
 
@@ -1851,6 +1873,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `win.`-scoped actions resolve through the widget hierarchy when the menu
     // item is activated, so registering it here is in time.
     window.add_action(&sort_key_action);
+    window.add_action(&list_filter_action);
 
     let state = state.clone();
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
@@ -3459,7 +3482,7 @@ fn current_sort(state: &Rc<RefCell<UiState>>) -> (SortKey, bool) {
 /// the reading pane doesn't re-render (and re-crossfade) the email it's
 /// already showing.
 fn resort_message_list(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel) {
-    let messages = message_list.displayed_messages();
+    let messages = message_list.all_messages();
     if messages.is_empty() {
         return;
     }

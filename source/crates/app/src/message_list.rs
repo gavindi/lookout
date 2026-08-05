@@ -58,6 +58,59 @@ impl SortKey {
     }
 }
 
+/// Which messages the list shows, applied as a pre-sort subset of the
+/// incoming message set. The model keeps the *unfiltered* set as its source
+/// of truth (see `MessageListModel::all_messages`), so switching the filter
+/// re-renders from the full set rather than from an already-filtered subset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListFilter {
+    All,
+    Unread,
+    Flagged,
+}
+
+impl ListFilter {
+    /// The filter menu's item label - also the `MenuButton`'s text, mirroring
+    /// `SortKey::label`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ListFilter::All => "All",
+            ListFilter::Unread => "Unread",
+            ListFilter::Flagged => "Flagged",
+        }
+    }
+
+    /// The filter's name in the `list-filter` `gio::SimpleAction`'s state,
+    /// which is what the filter menu's radio items are bound to.
+    pub fn action_state(self) -> &'static str {
+        match self {
+            ListFilter::All => "all",
+            ListFilter::Unread => "unread",
+            ListFilter::Flagged => "flagged",
+        }
+    }
+
+    pub fn from_action_state(name: &str) -> Option<Self> {
+        match name {
+            "all" => Some(ListFilter::All),
+            "unread" => Some(ListFilter::Unread),
+            "flagged" => Some(ListFilter::Flagged),
+            _ => None,
+        }
+    }
+
+    /// Whether `message` passes this filter. Unread and Flagged are drawn
+    /// from the system flags the row itself renders, so the two can overlap -
+    /// a flagged-but-unread message belongs to both.
+    fn matches(self, message: &EmailSummary) -> bool {
+        match self {
+            ListFilter::All => true,
+            ListFilter::Unread => message.is_unread(),
+            ListFilter::Flagged => message.is_starred(),
+        }
+    }
+}
+
 /// The date range one section header covers.
 ///
 /// Deliberately payload-free and `Copy + Eq + Hash`: the set of
@@ -250,9 +303,9 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
     (m.mailbox.clone(), m.uid, m.is_unread(), m.is_starred(), m.date, m.subject.clone(), from, m.preview.clone())
 }
 
-/// The list's contents as last rendered, plus the sort that produced them -
-/// the comparison `repopulate` skips a rebuild on.
-type DisplayedMessages = Option<(SortKey, bool, Vec<EmailSummary>)>;
+/// The list's contents as last rendered, plus the sort and filter that
+/// produced them - the comparison `repopulate` skips a rebuild on.
+type DisplayedMessages = Option<(SortKey, bool, ListFilter, Vec<EmailSummary>)>;
 
 /// What the message list's selection currently points at. The three cases
 /// are genuinely distinct to the reading pane: nothing selected clears it, a
@@ -289,11 +342,22 @@ pub struct MessageListModel {
     /// open. Lives outside the model so it survives the constant rebuilds
     /// (cache replay, live sync, on-demand sync) that recreate every row.
     collapsed: Rc<RefCell<HashSet<DateBucket>>>,
-    /// What's currently on screen, in display order, and the sort that
-    /// produced it. Kept here rather than in `UiState` so `repopulate` never
-    /// has to hold a `UiState` borrow across a `splice` - which synchronously
-    /// re-enters the selection handler, and would panic on the re-borrow.
+    /// What's currently on screen, in display order, and the sort + filter
+    /// that produced it. Kept here rather than in `UiState` so `repopulate`
+    /// never has to hold a `UiState` borrow across a `splice` - which
+    /// synchronously re-enters the selection handler, and would panic on the
+    /// re-borrow.
     displayed: Rc<RefCell<DisplayedMessages>>,
+    /// The *unfiltered* message set from the last `repopulate` - the source
+    /// of truth a filter change re-renders from. `displayed` is derived from
+    /// this (filtered, then sorted), so toggling the filter off can bring
+    /// back messages the filtered subset no longer contains.
+    truth: Rc<RefCell<Vec<EmailSummary>>>,
+    /// The active filter, applied inside `repopulate` to every incoming
+    /// message set. Owned by the model rather than `UiState` (unlike the
+    /// sort), so every caller that rebuilds the list gets the same subset
+    /// without threading the filter through each call site.
+    filter: Rc<RefCell<ListFilter>>,
 }
 
 impl MessageListModel {
@@ -329,15 +393,18 @@ impl MessageListModel {
             sections,
             collapsed: Rc::new(RefCell::new(HashSet::new())),
             displayed: Rc::new(RefCell::new(None)),
+            truth: Rc::new(RefCell::new(Vec::new())),
+            filter: Rc::new(RefCell::new(ListFilter::All)),
         }
     }
 
-    /// Every summary currently on screen, in display order. Lets a sort
-    /// change re-order the visible list without re-fetching: single-mailbox
-    /// views keep no snapshot in `UiState` (only the unified view does), so
-    /// this is the only copy of what's being shown.
-    pub fn displayed_messages(&self) -> Vec<EmailSummary> {
-        self.displayed.borrow().as_ref().map(|(_, _, m)| m.clone()).unwrap_or_default()
+    /// Every message the list is currently backed by, before filtering - the
+    /// unfiltered source of truth. Lets a sort or filter change re-order /
+    /// re-subset the visible list without re-fetching: single-mailbox views
+    /// keep no snapshot in `UiState` (only the unified view does), so this is
+    /// the only copy of what's being shown.
+    pub fn all_messages(&self) -> Vec<EmailSummary> {
+        self.truth.borrow().clone()
     }
 
     /// The selected row's message, or `None` when nothing is selected *or*
@@ -364,8 +431,14 @@ impl MessageListModel {
     }
 
     /// Replaces the list's contents with `messages` in the given sort order,
-    /// grouped into date sections when sorting by date, preserving the
-    /// current highlight and the user's collapsed sections where possible.
+    /// filtered by the active `ListFilter`, grouped into date sections when
+    /// sorting by date, preserving the current highlight and the user's
+    /// collapsed sections where possible.
+    ///
+    /// The *unfiltered* `messages` are kept as the model's source of truth
+    /// before the filter is applied, so `set_filter` and the sort controls can
+    /// re-derive the display from the full set rather than from an
+    /// already-filtered subset.
     ///
     /// A no-op when the incoming list is identical to what's already
     /// displayed: the startup burst - each account's cache replay plus its
@@ -379,19 +452,28 @@ impl MessageListModel {
     /// handler and thence `UiState`. So no `RefCell` borrow may be held
     /// across one; each step snapshots what it needs and drops the borrow
     /// first.
-    pub fn repopulate(&self, mut messages: Vec<EmailSummary>, sort_key: SortKey, sort_descending: bool) {
-        // Sorting here, before the identity check, makes this the list's
-        // canonical order no matter which event produced the rebuild - so the
-        // check compares like with like, and a sort change is itself detected
-        // as a real change.
+    pub fn repopulate(&self, messages: Vec<EmailSummary>, sort_key: SortKey, sort_descending: bool) {
+        // Remember the full, unfiltered set first - a filter toggle
+        // re-renders from this, so messages hidden by the filter aren't lost.
+        *self.truth.borrow_mut() = messages.clone();
+
+        // Apply the active filter, then sort the surviving subset. Filtering
+        // first keeps the no-op check comparing like with like: the subset
+        // this rebuild produced against the subset already displayed.
+        let mut messages = messages;
+        let filter = *self.filter.borrow();
+        messages.retain(|m| filter.matches(m));
         sort_messages(&mut messages, sort_key, sort_descending);
 
         // The sort is part of the comparison, not just the contents: a list
         // can be element-identical under ascending and descending order yet
-        // still need re-grouping, because the sections come out mirrored.
-        let unchanged = self.displayed.borrow().as_ref().is_some_and(|(key, descending, current)| {
+        // still need re-grouping, because the sections come out mirrored. So
+        // is the filter - a change to it must rebuild even when the surviving
+        // subset happens to be element-identical.
+        let unchanged = self.displayed.borrow().as_ref().is_some_and(|(key, descending, shown_filter, current)| {
             *key == sort_key
                 && *descending == sort_descending
+                && *shown_filter == filter
                 && current.len() == messages.len()
                 && current.iter().zip(messages.iter()).all(|(a, b)| message_row_key(a) == message_row_key(b))
         });
@@ -409,7 +491,7 @@ impl MessageListModel {
         let previous_selection = self.selected_summary().map(|s| (s.mailbox.clone(), s.uid));
         let previous_index = self.selection.selected();
 
-        *self.displayed.borrow_mut() = Some((sort_key, sort_descending, messages.clone()));
+        *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, messages.clone()));
 
         match build_layout(messages, sort_key, Local::now()) {
             ListLayout::Flat(messages) => {
@@ -450,6 +532,24 @@ impl MessageListModel {
         }
 
         self.restore_selection(previous_selection, previous_index);
+    }
+
+    /// Switches which messages the list shows and re-renders from the stored
+    /// unfiltered set under the current sort, so `Unread` ↔ `All` round-trips
+    /// without losing a message. A no-op when the filter is already in effect.
+    pub fn set_filter(&self, filter: ListFilter) {
+        if *self.filter.borrow() == filter {
+            return;
+        }
+        *self.filter.borrow_mut() = filter;
+        let (sort_key, sort_descending) = match *self.displayed.borrow() {
+            Some((key, descending, _, _)) => (key, descending),
+            // Nothing has ever been rendered; the defaults are what a first
+            // repopulate would use anyway.
+            None => (SortKey::Date, true),
+        };
+        let truth = self.all_messages();
+        self.repopulate(truth, sort_key, sort_descending);
     }
 
     /// Empties every section store whose bucket isn't in `live`, so a bucket
@@ -681,6 +781,49 @@ mod tests {
         // Switching back to date regroups, expanded.
         flat.repopulate(vec![summary(1, today), summary(2, older)], SortKey::Date, true);
         assert_eq!(flat.selection.n_items(), 4);
+
+        // --- A filter renders a subset and re-renders from the unfiltered
+        // truth when it changes ---
+        let filtered = MessageListModel::build();
+        let seen = {
+            let mut s = summary(1, today);
+            s.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen]);
+            s
+        };
+        let unread = summary(2, older);
+        let flagged_unread = {
+            let mut s = summary(3, today);
+            s.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Flagged]);
+            s
+        };
+        let flagged_read = {
+            let mut s = summary(4, today);
+            s.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen, lookout_core::SystemFlagBit::Flagged]);
+            s
+        };
+        let full = vec![seen.clone(), unread.clone(), flagged_unread.clone(), flagged_read.clone()];
+        filtered.repopulate(full.clone(), SortKey::Date, true);
+        assert_eq!(filtered.selection.n_items(), 6, "unfiltered: two sections + four messages");
+        assert_eq!(filtered.all_messages().len(), 4, "the unfiltered truth is kept");
+
+        filtered.set_filter(ListFilter::Unread);
+        // `seen` and `flagged_read` are read; the two unread survive.
+        assert_eq!(filtered.selection.n_items(), 4, "Unread: two sections + two messages");
+        assert_eq!(filtered.all_messages().len(), 4, "filtering never discards the truth");
+
+        filtered.set_filter(ListFilter::Flagged);
+        // Both flagged messages, read or not, in the single Today section.
+        assert_eq!(filtered.selection.n_items(), 3, "Flagged: one section + two messages");
+
+        // A repopulate carrying the same full set under the same filter is
+        // the identity case - the rebuild is skipped, so the row count (and
+        // the selection that goes with it) is untouched.
+        filtered.repopulate(full.clone(), SortKey::Date, true);
+        assert_eq!(filtered.selection.n_items(), 3);
+
+        // Switching back to All restores everything from the truth.
+        filtered.set_filter(ListFilter::All);
+        assert_eq!(filtered.selection.n_items(), 6, "switching back to All restored the hidden rows");
     }
 
     #[test]
@@ -890,5 +1033,33 @@ mod tests {
         // No leading zero on the day, per the reference screenshot.
         let older = Local.with_ymd_and_hms(2025, 12, 4, 9, 0, 0).unwrap().with_timezone(&Utc);
         assert_eq!(format_row_date(older, now.with_timezone(&Utc)), "4/12/2025");
+    }
+
+    #[test]
+    fn list_filter_matches_read_and_flagged_state() {
+        let mut read = summary(1, Utc::now());
+        read.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen]);
+        assert!(ListFilter::All.matches(&read));
+        assert!(!ListFilter::Unread.matches(&read));
+        assert!(!ListFilter::Flagged.matches(&read));
+
+        let unread = summary(2, Utc::now());
+        assert!(ListFilter::Unread.matches(&unread));
+        assert!(!ListFilter::Flagged.matches(&unread));
+
+        let mut flagged = summary(3, Utc::now());
+        flagged.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Flagged]);
+        assert!(ListFilter::Unread.matches(&flagged), "a flagged-but-unread message belongs to both filters");
+        assert!(ListFilter::Flagged.matches(&flagged));
+
+        let mut flagged_read = summary(4, Utc::now());
+        flagged_read.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen, lookout_core::SystemFlagBit::Flagged]);
+        assert!(ListFilter::Flagged.matches(&flagged_read));
+        assert!(!ListFilter::Unread.matches(&flagged_read));
+
+        // The menu wiring's label/state round-trips.
+        assert_eq!(ListFilter::All.label(), "All");
+        assert_eq!(ListFilter::from_action_state(ListFilter::Flagged.action_state()), Some(ListFilter::Flagged));
+        assert_eq!(ListFilter::from_action_state("bogus"), None);
     }
 }
