@@ -207,4 +207,19 @@ mod tests {
         let encoded = "=?ISO-8859-1?Q?caf=E9?=";
         assert_eq!(decode_mime_words(encoded), "café");
     }
+
+    #[test]
+    fn custom_flags_map_to_keyword_atoms() {
+        use async_imap::types::Flag;
+        // The `summary_from_fetch` keyword path: a `Flag::Custom` atom is
+        // rendered verbatim, and since it's not a `SystemFlagBit` (and not
+        // `\Recent`) it lands in `EmailSummary::keywords` untouched - which is
+        // what lets `$Lookout-tag-*` color tags flow through the envelope
+        // fetch into the cache and UI for free.
+        assert_eq!(imap_flag_to_string(&Flag::Custom("$Lookout-tag-work".into())), "$Lookout-tag-work");
+        assert_eq!(imap_flag_to_string(&Flag::Custom("mykeyword".into())), "mykeyword");
+        // System flags still resolve to their bits.
+        assert_eq!(SystemFlagBit::from_imap_flag(&imap_flag_to_string(&Flag::Seen)), Some(SystemFlagBit::Seen));
+        assert_eq!(SystemFlagBit::from_imap_flag(&imap_flag_to_string(&Flag::Custom("$Lookout-tag-work".into()))), None);
+    }
 }

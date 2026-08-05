@@ -170,6 +170,18 @@ pub enum AccountCommand {
         add: Vec<SystemFlagBit>,
         remove: Vec<SystemFlagBit>,
     },
+    /// Adds and/or removes custom IMAP keywords (raw flag atoms, e.g.
+    /// `$Lookout-tag-<key>` - see `lookout_core::tag_keyword`) on one
+    /// message: the server side of color tags. Same `STORE .SILENT`
+    /// mechanics and the same folder-handling contract as `StoreFlags` (it
+    /// SELECTs the message's own folder when it isn't the open one, and the
+    /// main loop re-selects the user's folder before the next IDLE).
+    StoreKeywords {
+        mailbox: MailboxId,
+        uid: Uid,
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
     /// Kick off background body prefetch for all mailboxes. The prefetch
     /// runs cooperatively in batches between IDLE cycles, fetching full
     /// message bodies and caching them on disk so subsequent message views
@@ -584,6 +596,21 @@ async fn connect_and_run(
                     match move_message_to_role(&mut session, &folders, &account_id, uid, role).await {
                         Ok(()) => {
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
+                            // The MOVE already succeeded server-side, so drop the
+                            // message from the cache and republish the remaining
+                            // cached set right away. Without this, the row only
+                            // disappears once the authoritative resync below has
+                            // re-fetched the whole envelope window - seconds of
+                            // network round trips the user experiences as lag.
+                            // The subsequent `sync_mailbox` emit is byte-identical
+                            // (the message is gone from the server too), so the UI
+                            // rebuilds once and the list never flickers.
+                            if let Some(cache) = cache {
+                                if let Err(e) = cache.delete_message(&mailbox, uid) {
+                                    tracing::warn!("failed to drop moved message from cache: {e}");
+                                }
+                                emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                            }
                             relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
                             sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                             session_selected = current_mailbox_id.clone();
@@ -676,6 +703,51 @@ async fn connect_and_run(
                         }
                         Err(e) => {
                             let _ = events.send(AccountEvent::Error(format!("Couldn't update message flags: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::StoreKeywords { mailbox, uid, add, remove } => {
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    // Same folder-handling contract as `StoreFlags`: the
+                    // command races a folder switch (or the unified view),
+                    // so SELECT the message's own folder when needed; the
+                    // top of the loop re-selects the user's folder before
+                    // the next IDLE wait.
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    // Keywords are client-supplied atoms; drop anything that
+                    // isn't one so a malformed atom can't be sent (servers
+                    // are entitled to reject the whole STORE).
+                    let add: Vec<String> = add.into_iter().filter(|k| valid_keyword_atom(k)).collect();
+                    let remove: Vec<String> = remove.into_iter().filter(|k| valid_keyword_atom(k)).collect();
+                    match store_raw_flags(&mut session, uid, &add, &remove).await {
+                        Ok(()) => {
+                            let patched = match cache {
+                                Some(cache) => match cache.update_keywords(&mailbox, uid, &add, &remove) {
+                                    Ok(patched) => patched,
+                                    Err(e) => {
+                                        tracing::warn!("failed to update cached keywords: {e}");
+                                        false
+                                    }
+                                },
+                                None => false,
+                            };
+                            if patched {
+                                emit_cached_messages(cache, &mailbox, events).await;
+                            } else if mailbox == current_mailbox_id {
+                                // No cache (or the uid fell outside the
+                                // cached window): re-sync so the UI still
+                                // sees the new keywords.
+                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                                session_selected = current_mailbox_id.clone();
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't update message tags: {e}"))).await;
                         }
                     }
                 }
@@ -845,25 +917,48 @@ async fn connect_and_run(
     }
 }
 
-/// Adds and/or removes system flags on `uid` in the currently selected
-/// mailbox. Uses `.SILENT` so the server doesn't echo an untagged FETCH per
-/// affected message: the caller already knows the resulting flag set (it
-/// applies the same add/remove to its cached summary), and the next
-/// `sync_mailbox` re-reads the real flags from the server regardless.
+/// Issues `STORE +FLAGS.SILENT` / `STORE -FLAGS.SILENT` for raw flag atoms
+/// on `uid` in the currently selected mailbox. `.SILENT` so the server doesn't
+/// echo an untagged FETCH per affected message: the caller already knows the
+/// resulting flag set (it applies the same add/remove to its cached summary),
+/// and the next `sync_mailbox` re-reads the real flags from the server
+/// regardless.
 ///
 /// Add and remove are two separate STOREs because IMAP has no combined form;
 /// an empty side is skipped rather than sent as an empty flag list, which
 /// servers are entitled to reject.
-async fn store_flags(session: &mut Session<ImapStream>, uid: Uid, add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<()> {
+async fn store_raw_flags(session: &mut Session<ImapStream>, uid: Uid, add: &[String], remove: &[String]) -> Result<()> {
     for (op, flags) in [('+', add), ('-', remove)] {
         if flags.is_empty() {
             continue;
         }
-        let list = flags.iter().map(|f| f.as_imap_flag()).collect::<Vec<_>>().join(" ");
+        let list = flags.join(" ");
         let query = format!("{op}FLAGS.SILENT ({list})");
         let _: Vec<_> = session.uid_store(uid.0.to_string(), &query).await?.try_collect().await?;
     }
     Ok(())
+}
+
+/// `store_raw_flags` for system flags: maps each `SystemFlagBit` to its IMAP
+/// atom and delegates.
+async fn store_flags(session: &mut Session<ImapStream>, uid: Uid, add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<()> {
+    let add = add.iter().map(|f| f.as_imap_flag().to_string()).collect::<Vec<_>>();
+    let remove = remove.iter().map(|f| f.as_imap_flag().to_string()).collect::<Vec<_>>();
+    store_raw_flags(session, uid, &add, &remove).await
+}
+
+/// A keyword atom must be non-empty, not start with `\` (that's a flag), and
+/// contain none of the characters RFC 3501 reserves for flag-list
+/// punctuation: spaces, control characters, and `( ) { } % * " \`. Lookout's
+/// own tag keys are sanitized into this shape at creation (see
+/// `lookout_core::sanitize_tag_key`); this guard just keeps an arbitrary
+/// atom from ever reaching the wire.
+fn valid_keyword_atom(keyword: &str) -> bool {
+    !keyword.is_empty()
+        && !keyword.starts_with('\\')
+        && keyword
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '(' | ')' | '{' | '}' | '%' | '*' | '"' | '\\'))
 }
 
 /// Moves `uid` from the currently selected mailbox into the account's
@@ -1245,6 +1340,24 @@ async fn emit_cached_messages(cache: Option<&crate::cache::Cache>, mailbox_id: &
                     .await;
             }
         }
+    }
+}
+
+/// Emits the cached summaries for `mailbox_id` (minus snoozed) after one has
+/// been deleted, publishing even an *empty* remaining set. Unlike
+/// `emit_cached_messages`'s no-op-on-empty, the empty set is meaningful here:
+/// the caller has just removed a message, so "no cached rows left" means the
+/// list should be cleared, not "nothing cached yet, don't blank the list".
+async fn emit_cached_messages_after_removal(cache: &crate::cache::Cache, mailbox_id: &MailboxId, events: &async_channel::Sender<AccountEvent>) {
+    if let Ok(cached) = cache.load_messages(mailbox_id) {
+        let snoozed = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()).unwrap_or_default();
+        let filtered: Vec<_> = cached.iter().filter(|m| !snoozed.contains(&m.uid)).cloned().collect();
+        let _ = events
+            .send(AccountEvent::MessagesUpdated {
+                mailbox: mailbox_id.clone(),
+                messages: filtered,
+            })
+            .await;
     }
 }
 

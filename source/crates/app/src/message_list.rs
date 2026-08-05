@@ -280,10 +280,11 @@ fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>) -
     ListLayout::Grouped(sections)
 }
 
-/// Message identity, the two flag-derived styles (unread, flagged), and the
-/// four text fields a row renders. Named rather than written inline so the
-/// tuple stays under clippy's type-complexity threshold.
-type MessageRowKey = (MailboxId, Uid, bool, bool, DateTime<Utc>, Option<String>, String, Option<String>);
+/// Message identity, the two flag-derived styles (unread, flagged), the four
+/// text fields a row renders, and the color-tag keywords it carries. Named
+/// rather than written inline so the tuple stays under clippy's
+/// type-complexity threshold.
+type MessageRowKey = (MailboxId, Uid, bool, bool, DateTime<Utc>, Option<String>, String, Option<String>, Vec<String>);
 
 /// A compact fingerprint of the fields one message-list row displays, keyed
 /// to keep the row distinct from any other. Used to detect "nothing changed"
@@ -300,7 +301,23 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
     // row is drawn, so a `STORE` that only changes a flag must still count as
     // a change - otherwise `repopulate`'s no-op check would swallow the
     // rebuild and the row would keep its old accent bar / flag icon.
-    (m.mailbox.clone(), m.uid, m.is_unread(), m.is_starred(), m.date, m.subject.clone(), from, m.preview.clone())
+    // The `$Lookout-tag-*` keyword subset is here for the same reason: a tag
+    // toggle changes only the message's keywords, and the row's tag dots are
+    // drawn from them, so without it the rebuild that drops/adds a dot would
+    // be skipped. (A tag *recolor/rename* changes no keyword, so it can't be
+    // detected here - `MessageListModel::refresh` exists for that.)
+    let tags: Vec<String> = m.keywords.iter().filter(|k| lookout_core::tag_key_from_keyword(k).is_some()).cloned().collect();
+    (
+        m.mailbox.clone(),
+        m.uid,
+        m.is_unread(),
+        m.is_starred(),
+        m.date,
+        m.subject.clone(),
+        from,
+        m.preview.clone(),
+        tags,
+    )
 }
 
 /// The list's contents as last rendered, plus the sort and filter that
@@ -550,6 +567,24 @@ impl MessageListModel {
         };
         let truth = self.all_messages();
         self.repopulate(truth, sort_key, sort_descending);
+    }
+
+    /// Re-renders from the unfiltered source of truth under the current sort
+    /// and filter, bypassing the "nothing changed" check. Used after tag
+    /// definition edits: a rename or recolor changes how existing rows draw
+    /// without changing any message's keywords, so `repopulate`'s identity
+    /// comparison (`message_row_key`) would see identical input and skip the
+    /// rebuild. Clearing `displayed` first makes the no-op check see "nothing
+    /// rendered yet" and rebuild unconditionally.
+    pub fn refresh(&self) {
+        let (sort_key, sort_descending) = match *self.displayed.borrow() {
+            Some((key, descending, _, _)) => (key, descending),
+            None => (SortKey::Date, true),
+        };
+        // Clearing `displayed` first makes the no-op check see "nothing
+        // rendered yet" and rebuild unconditionally.
+        *self.displayed.borrow_mut() = None;
+        self.repopulate(self.all_messages(), sort_key, sort_descending);
     }
 
     /// Empties every section store whose bucket isn't in `live`, so a bucket

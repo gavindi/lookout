@@ -70,6 +70,50 @@ impl SystemFlagBit {
     }
 }
 
+/// The IMAP keyword namespace Lookout uses for color tags: a message tagged
+/// with key `k` carries the keyword `$Lookout-tag-k`. Following the RFC 3501
+/// convention (and Outlook's `$Category-*` precedent) that keywords beginning
+/// with `$` are reserved for informational semantics rather than client
+/// junk.
+pub const TAG_KEYWORD_PREFIX: &str = "$Lookout-tag-";
+
+/// The full IMAP keyword atom for a tag key.
+pub fn tag_keyword(key: &str) -> String {
+    format!("{TAG_KEYWORD_PREFIX}{key}")
+}
+
+/// The tag key a keyword atom refers to, if it is one of ours.
+pub fn tag_key_from_keyword(keyword: &str) -> Option<&str> {
+    keyword.strip_prefix(TAG_KEYWORD_PREFIX)
+}
+
+/// Converts a user-typed tag name into the key stored in the `$Lookout-tag-*`
+/// keyword. Lowercases and keeps only `[a-z0-9]`, collapsing whitespace and
+/// runs of other punctuation to a single `-`, so the result is always a legal
+/// RFC 3501 keyword atom: no spaces, no control characters, and none of the
+/// reserved characters `( ) { } % * " \`. An empty name (or one of only
+/// punctuation) sanitizes to an empty string, which callers reject as
+/// "invalid key".
+pub fn sanitize_tag_key(name: &str) -> String {
+    let mut out = String::new();
+    let mut pending_hyphen = false;
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            if pending_hyphen && !out.is_empty() {
+                out.push('-');
+            }
+            pending_hyphen = false;
+            out.push(ch);
+        } else {
+            pending_hyphen = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 /// List-row weight projection of a message — cheap to fetch (`ENVELOPE` +
 /// `FLAGS` + `RFC822.SIZE` + `BODYSTRUCTURE`, no body) and cache in SQLite.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -204,5 +248,29 @@ mod tests {
             assert_eq!(SystemFlagBit::from_imap_flag(flag.as_imap_flag()), Some(flag));
         }
         assert_eq!(SystemFlagBit::from_imap_flag("\\Recent"), None);
+    }
+
+    #[test]
+    fn tag_keyword_round_trips_through_the_namespace() {
+        assert_eq!(tag_keyword("work"), "$Lookout-tag-work");
+        assert_eq!(tag_key_from_keyword("$Lookout-tag-work"), Some("work"));
+        assert_eq!(tag_key_from_keyword("$Lookout-tag-work"), tag_key_from_keyword(&tag_keyword("work")));
+        // Not ours, or not a keyword at all.
+        assert_eq!(tag_key_from_keyword("$Other-tag-work"), None);
+        assert_eq!(tag_key_from_keyword("\\Seen"), None);
+        assert_eq!(tag_key_from_keyword("work"), None);
+    }
+
+    #[test]
+    fn sanitize_tag_key_produces_legal_atoms() {
+        assert_eq!(sanitize_tag_key("Work"), "work");
+        assert_eq!(sanitize_tag_key("Project: Xmas"), "project-xmas");
+        assert_eq!(sanitize_tag_key("  IMPORTANT  "), "important");
+        assert_eq!(sanitize_tag_key("a{b}*\"\\%"), "a-b");
+        assert_eq!(sanitize_tag_key("!!!"), "");
+        // The RFC 3501 reserved atom characters never survive sanitization.
+        for c in "(){%*\"\\".chars() {
+            assert!(!sanitize_tag_key(&format!("x{c}y")).contains(c));
+        }
     }
 }

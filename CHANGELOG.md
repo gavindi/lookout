@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.42 (2026-08-06)
+
+### Added
+
+- **Mail**: messages can now be color-tagged (`$Lookout-tag-*` IMAP keywords), Outlook-style. A tag is a client-side `{key, name, color}` definition persisted as `$XDG_CONFIG_HOME/lookout/tags.json` (the same best-effort convention as calendar colours); assigning one to a message stores the keyword `$Lookout-tag-<key>` on it server-side via a new `AccountCommand::StoreKeywords` (`STORE +FLAGS.SILENT` / `-FLAGS.SILENT` for raw keyword atoms, sharing the session's `store_raw_flags` helper with the system-flag path and patching the cache through `Cache::update_keywords` so the row repaints immediately without a resync). Keywords were already parsed into `EmailSummary.keywords` by the envelope fetch and persisted in the cache, so assigned tags survive restarts and re-syncs for free. Two assignment surfaces share one menu builder: a **Categorize** button in the command toolbar (its popover is rebuilt on every open, so the checkmarks track the selected message) and a **right-click context menu** on message rows. Tagged rows draw up to three small color dots beside the subject, colored by per-tag CSS rules kept in sync with the definitions; the list's rebuild-skip check includes the tag-keyword subset so a toggle repaints the row, and `MessageListModel::refresh` re-renders after a recolor or rename (which change no message's keywords). A "Manage tags…" dialog - reachable from either surface - adds, renames, recolors, and deletes tags; the tag `key` is derived once from the name at creation and stays stable across renames so keywords already on the server keep matching. Deleting a tag is non-destructive: only the definition is removed, and the stored keywords simply stop displaying. Keys are sanitized into legal RFC 3501 atoms (`lookout_core::sanitize_tag_key`), and the session additionally drops any malformed atom before it reaches the wire; servers must advertise `\*` in `PERMANENTFLAGS` to store arbitrary keywords, and a rejection surfaces through the existing error toast.
+
+### Fixed
+
+- **Mail**: deleting (or archiving/reporting) a message took ~5 seconds to disappear from the message list. The MOVE itself is a single fast round trip, but the list only ever repainted on a `MessagesUpdated` event, and the move path emitted that only *after* re-listing every folder and re-fetching the whole envelope window (`relist_folders` + `sync_mailbox`) - seconds of network round trips. The `MessageMoved` event sent right after the MOVE merely showed a toast. The session now drops the moved message from the SQLite cache (`Cache::delete_message`, which also removes its cached body and any snooze entry) and republishes the remaining cached set as a `MessagesUpdated` immediately, so the row vanishes the instant the MOVE succeeds; the authoritative resync still runs afterwards to correct counts, and its emit is byte-identical to the optimistic one, so the list rebuilds once and never flickers.
+
 ## 0.6.41 (2026-08-06)
 
 ### Added

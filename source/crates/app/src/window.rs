@@ -5,8 +5,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::{
-    AccountId, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole,
-    SystemFlagBit, Uid, VCard,
+    AccountId, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, VCard,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::{CalendarAccountConfig, CardDavAccountConfig, Credential, DavClient};
@@ -132,9 +131,15 @@ struct MessageRowWidgets {
     sender_label: gtk::Label,
     subject_label: gtk::Label,
     flag_icon: gtk::Image,
+    /// The color-tag dots: one small circle per configured tag the message
+    /// carries, rebuilt on every bind.
+    tag_dots: gtk::Box,
     date_label: gtk::Label,
     preview_label: gtk::Label,
     action_box: gtk::Box,
+    /// The right-click context menu's popover, parented to this row in setup
+    /// and repopulated at press time.
+    tag_popover: gtk::Popover,
     /// The message this row currently shows. Set by `bind`, read by the
     /// quick-action handlers when they fire.
     bound: Rc<RefCell<Option<EmailSummary>>>,
@@ -165,6 +170,11 @@ const CONTACTS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from
 /// folder names are a sliver. Applied to `folder_card`, not the scroller -
 /// see the call site.
 const FOLDER_PANE_MIN_WIDTH: i32 = 150;
+
+/// How many color-tag dots one message row renders. A message can carry any
+/// number of tags; past this the row draws the first few and leaves the rest
+/// to the Categorize menu, so a heavily-tagged row doesn't crowd out the date.
+const MAX_TAG_DOTS: usize = 3;
 
 /// A small bounded LRU of recently-viewed message bodies, keyed by
 /// `(mailbox, uid)`, front = most recently used. See `BODY_CACHE_IN_MEMORY`.
@@ -508,6 +518,14 @@ fn install_paned_css() {
         .message-flag-icon {
             color: #e5a50a;
         }
+        /* Color-tag dots. The circle shape is what makes one tag read as a
+           swatch at a glance; each tag's fill comes from the per-tag
+           `.message-tag-dot.tag-<key>` rules `apply_tag_colors` maintains,
+           not from this base rule. */
+        .message-tag-dot {
+            border-radius: 9999px;
+            background-color: transparent;
+        }
         /* Recipient chips. The pill shape is what separates one recipient
            from the next at a glance - the whole point of chips over a run of
            comma-separated text. */
@@ -765,6 +783,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let state_clone = state.clone();
     let state_clone2 = state.clone();
     let reading_stack_clone = reading_stack.clone();
+    // The shared tag-definition set, loaded from disk at startup. Mutated by
+    // the Manage-tags dialog, read by the Categorize menu, the row context
+    // menu, and every row's tag dots.
+    let tags = Rc::new(RefCell::new(crate::tags::load()));
+    // One provider encoding every tag's color as a `.message-tag-dot.tag-<key>`
+    // rule, re-`load_from_string` whenever tags change (replacing the previous
+    // rules wholesale). Registered once for the display's whole lifetime.
+    let tag_colors = gtk::CssProvider::new();
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &tag_colors, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+    apply_tag_colors(&tags, &tag_colors);
+    let message_list_for_rows = message_list.clone();
+    let tags_for_rows = tags.clone();
+    let tags_for_bind = tags.clone();
+    let tag_colors_for_rows = tag_colors.clone();
     let message_factory = gtk::SignalListItemFactory::new();
     message_factory.connect_setup(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -816,10 +850,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        // One dot per configured color tag the message carries, filled in on
+        // `bind`. Hidden when there are none (the container takes no space
+        // when empty), so an untagged row is identical to today's.
+        let tag_dots = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).valign(gtk::Align::Center).build();
         let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
         top_row.append(&sender_label);
         top_row.append(&subject_label);
         top_row.append(&flag_icon);
+        top_row.append(&tag_dots);
         top_row.append(&date_label);
 
         // Spans the full row and ellipsizes, so the snippet shows as much of
@@ -896,6 +935,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // ever disconnected them), so a scrolled list eventually fired one
         // click at several messages at once.
         let bound: Rc<RefCell<Option<EmailSummary>>> = Rc::new(RefCell::new(None));
+
+        // The right-click (Categorize) popover for this row. Parented once to
+        // the row's overlay; its contents are repopulated from the row's
+        // current message at press time.
+        let tag_popover = gtk::Popover::new();
+        tag_popover.set_parent(&overlay);
+
+        {
+            let bound = bound.clone();
+            let tag_popover = tag_popover.clone();
+            let tags = tags_for_rows.clone();
+            let state = state_clone.clone();
+            let message_list = message_list_for_rows.clone();
+            let tag_colors = tag_colors_for_rows.clone();
+            let context_menu = gtk::GestureClick::new();
+            context_menu.set_button(gtk::gdk::BUTTON_SECONDARY);
+            context_menu.connect_pressed(move |_, _, x, y| {
+                let Some(summary) = bound.borrow().clone() else { return };
+                let boxed = build_tag_menu(&tags, &state, Some(summary), &message_list, &tag_colors);
+                tag_popover.set_child(Some(&boxed));
+                tag_popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                tag_popover.popup();
+            });
+            overlay.add_controller(context_menu);
+        }
 
         {
             let action_box = action_box.clone();
@@ -1005,9 +1069,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     sender_label,
                     subject_label,
                     flag_icon,
+                    tag_dots,
                     date_label,
                     preview_label,
                     action_box,
+                    tag_popover,
                     bound,
                 },
             );
@@ -1025,6 +1091,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.header_box.set_visible(true);
                 widgets.message_box.set_visible(false);
                 widgets.action_box.set_visible(false);
+                widgets.tag_dots.set_visible(false);
                 // What actually draws the disclosure chevron and drives
                 // expand/collapse. The expansion *state* is applied in
                 // `MessageListModel::repopulate`, not here - bind only runs
@@ -1106,6 +1173,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 widgets.flag_icon.set_visible(summary.is_starred());
 
+                // Rebuild the color-tag dots for this message. Colored by the
+                // `.message-tag-dot.tag-<key>` rules `apply_tag_colors` keeps
+                // in sync with the tag definitions.
+                while let Some(child) = widgets.tag_dots.first_child() {
+                    widgets.tag_dots.remove(&child);
+                }
+                let tags_borrow = tags_for_bind.borrow();
+                let shown = crate::tags::tags_for_keywords(&tags_borrow, &summary.keywords);
+                for tag in shown.iter().take(MAX_TAG_DOTS) {
+                    let dot = gtk::Box::builder()
+                        .width_request(8)
+                        .height_request(8)
+                        .css_classes(["message-tag-dot", &format!("tag-{}", tag.key)])
+                        .build();
+                    widgets.tag_dots.append(&dot);
+                }
+                widgets.tag_dots.set_visible(!shown.is_empty());
+
                 *widgets.bound.borrow_mut() = Some((**summary).clone());
             }
         }
@@ -1118,6 +1203,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let widgets = unsafe { widgets.as_ref() };
         *widgets.bound.borrow_mut() = None;
         widgets.action_box.set_visible(false);
+        widgets.tag_popover.popdown();
         // Don't keep a recycled row pinned to a `TreeListRow` it no longer
         // renders.
         widgets.expander.set_list_row(None);
@@ -1736,6 +1822,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     report_button.set_tooltip_text(Some("Report"));
     let flag_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
     flag_button.set_tooltip_text(Some("Flag/Unflag"));
+    // Categorize: a menu of the defined color tags, toggle-checked against
+    // the selected message. Its popover is rebuilt on every `show` so the
+    // check states track whichever message is selected when it opens.
+    let categorize_button = gtk::MenuButton::builder()
+        .icon_name(themed_icon_name(&["tag-symbolic", "mail-mark-important-symbolic"]))
+        .build();
+    categorize_button.set_tooltip_text(Some("Categorize"));
+    let categorize_popover = gtk::Popover::new();
+    categorize_button.set_popover(Some(&categorize_popover));
+    {
+        let tags = tags.clone();
+        let state = state.clone();
+        let message_list = message_list.clone();
+        let tag_colors = tag_colors.clone();
+        categorize_popover.connect_show(move |popover| {
+            let target = message_list.selected_summary();
+            let boxed = build_tag_menu(&tags, &state, target, &message_list, &tag_colors);
+            popover.set_child(Some(&boxed));
+        });
+    }
     let snooze_button = gtk::Button::from_icon_name("appointment-soon-symbolic");
     snooze_button.set_tooltip_text(Some("Snooze"));
     let more_button = gtk::Button::from_icon_name("view-more-symbolic");
@@ -1751,6 +1857,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&archive_button);
     command_toolbar.append(&report_button);
     command_toolbar.append(&flag_button);
+    command_toolbar.append(&categorize_button);
     command_toolbar.append(&snooze_button);
     command_toolbar.append(&more_button);
 
@@ -2145,14 +2252,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let contacts_categories = contacts_categories.clone();
         let contacts_entries = contacts_entries.clone();
         move |selected_index: Option<i32>| {
-            refresh_contacts_category_ui(
-                &state,
-                &contacts_category_list,
-                &contacts_list,
-                &contacts_categories,
-                &contacts_entries,
-                selected_index,
-            );
+            refresh_contacts_category_ui(&state, &contacts_category_list, &contacts_list, &contacts_categories, &contacts_entries, selected_index);
         }
     });
     refresh_contacts_ui(None);
@@ -2160,7 +2260,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let window = window.clone();
         let contacts_entries = contacts_entries.clone();
         contacts_list.connect_row_activated(move |_list, row| {
-            let Some(entry) = contacts_entries.borrow().get(row.index() as usize).cloned() else { return };
+            let Some(entry) = contacts_entries.borrow().get(row.index() as usize).cloned() else {
+                return;
+            };
             show_contact_details_dialog(&window, &entry);
         });
     }
@@ -2890,11 +2992,7 @@ fn contacts_match_prefix(contact: &EmailAddress, prefix: &str) -> bool {
         return true;
     }
     let needle = prefix.to_lowercase();
-    contact.address.to_lowercase().starts_with(&needle)
-        || contact
-            .name
-            .as_deref()
-            .is_some_and(|name| name.to_lowercase().starts_with(&needle))
+    contact.address.to_lowercase().starts_with(&needle) || contact.name.as_deref().is_some_and(|name| name.to_lowercase().starts_with(&needle))
 }
 
 fn vcard_display_name(card: &VCard) -> String {
@@ -2919,17 +3017,11 @@ fn vcard_display_name(card: &VCard) -> String {
             return parts.join(" ");
         }
     }
-    card.emails
-        .first()
-        .map(|email| email.address.clone())
-        .unwrap_or_else(|| "(unnamed contact)".to_string())
+    card.emails.first().map(|email| email.address.clone()).unwrap_or_else(|| "(unnamed contact)".to_string())
 }
 
 fn vcard_primary_email(card: &VCard) -> String {
-    card.emails
-        .first()
-        .map(|email| email.address.clone())
-        .unwrap_or_else(|| "No email address".to_string())
+    card.emails.first().map(|email| email.address.clone()).unwrap_or_else(|| "No email address".to_string())
 }
 
 fn vcard_details_text(account_label: &str, category_label: &str, card: &VCard) -> String {
@@ -2943,7 +3035,11 @@ fn vcard_details_text(account_label: &str, category_label: &str, card: &VCard) -
     if !card.emails.is_empty() {
         lines.push("Emails:".to_string());
         for email in &card.emails {
-            let types = if email.types.is_empty() { "".to_string() } else { format!(" ({})", email.types.join(", ")) };
+            let types = if email.types.is_empty() {
+                "".to_string()
+            } else {
+                format!(" ({})", email.types.join(", "))
+            };
             lines.push(format!("  - {}{}", email.address, types));
         }
     }
@@ -2951,7 +3047,11 @@ fn vcard_details_text(account_label: &str, category_label: &str, card: &VCard) -
     if !card.telephones.is_empty() {
         lines.push("Phones:".to_string());
         for phone in &card.telephones {
-            let types = if phone.types.is_empty() { "".to_string() } else { format!(" ({})", phone.types.join(", ")) };
+            let types = if phone.types.is_empty() {
+                "".to_string()
+            } else {
+                format!(" ({})", phone.types.join(", "))
+            };
             lines.push(format!("  - {}{}", phone.number, types));
         }
     }
@@ -3067,7 +3167,12 @@ fn contact_identity(card: &VCard) -> String {
 /// Appends a non-selectable section-header row (an account's display name,
 /// or "Categories") to the People screen's left pane.
 fn append_contacts_header_row(list: &gtk::ListBox, label: &str) -> gtk::ListBoxRow {
-    let row_label = gtk::Label::builder().label(label).xalign(0.0).css_classes(["heading"]).ellipsize(gtk::pango::EllipsizeMode::End).build();
+    let row_label = gtk::Label::builder()
+        .label(label)
+        .xalign(0.0)
+        .css_classes(["heading"])
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
     row_label.set_margin_start(8);
     row_label.set_margin_end(8);
     row_label.set_margin_top(10);
@@ -3131,19 +3236,24 @@ fn refresh_contacts_category_ui(
         let mut category_members: HashMap<String, Vec<(AccountId, String, VCard)>> = HashMap::new();
 
         for (account_id, account) in accounts {
-            let all_contacts: Vec<(AccountId, String, VCard)> =
-                account.contacts.iter().map(|card| (account_id.clone(), account.display_name.clone(), card.clone())).collect();
+            let all_contacts: Vec<(AccountId, String, VCard)> = account
+                .contacts
+                .iter()
+                .map(|card| (account_id.clone(), account.display_name.clone(), card.clone()))
+                .collect();
 
             for (_, _, card) in &all_contacts {
                 for tag in &card.categories {
-                    category_members.entry(tag.clone()).or_default().push((account_id.clone(), account.display_name.clone(), card.clone()));
+                    category_members
+                        .entry(tag.clone())
+                        .or_default()
+                        .push((account_id.clone(), account.display_name.clone(), card.clone()));
                 }
             }
 
             // vCard v4's KIND:group cards represent a named contact list
             // rather than a person.
-            let contact_lists: Vec<(AccountId, String, VCard)> =
-                all_contacts.iter().filter(|(_, _, card)| card.kind.as_deref() == Some("group")).cloned().collect();
+            let contact_lists: Vec<(AccountId, String, VCard)> = all_contacts.iter().filter(|(_, _, card)| card.kind.as_deref() == Some("group")).cloned().collect();
             let deleted: Vec<(AccountId, String, VCard)> = st
                 .deleted_contacts
                 .get(account_id)
@@ -3160,16 +3270,31 @@ fn refresh_contacts_category_ui(
             // applied live in `rebuild_contacts_list_ui` instead of baked in
             // here.
             for kind in [ContactsBucketKind::AllContacts, ContactsBucketKind::Favourites] {
-                rows.push(ContactsCategoryChoice { kind: kind.clone(), contacts: all_contacts.clone() });
+                rows.push(ContactsCategoryChoice {
+                    kind: kind.clone(),
+                    contacts: all_contacts.clone(),
+                });
                 let label = contacts_bucket_label(&kind);
                 row_widgets.push((append_contacts_choice_row(category_list, &label), Some(rows.len() - 1)));
             }
 
-            rows.push(ContactsCategoryChoice { kind: ContactsBucketKind::ContactLists, contacts: contact_lists });
-            row_widgets.push((append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::ContactLists)), Some(rows.len() - 1)));
+            rows.push(ContactsCategoryChoice {
+                kind: ContactsBucketKind::ContactLists,
+                contacts: contact_lists,
+            });
+            row_widgets.push((
+                append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::ContactLists)),
+                Some(rows.len() - 1),
+            ));
 
-            rows.push(ContactsCategoryChoice { kind: ContactsBucketKind::Deleted, contacts: deleted });
-            row_widgets.push((append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::Deleted)), Some(rows.len() - 1)));
+            rows.push(ContactsCategoryChoice {
+                kind: ContactsBucketKind::Deleted,
+                contacts: deleted,
+            });
+            row_widgets.push((
+                append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::Deleted)),
+                Some(rows.len() - 1),
+            ));
         }
 
         if !category_members.is_empty() {
@@ -3178,7 +3303,10 @@ fn refresh_contacts_category_ui(
             names.sort_by_key(|name| name.to_lowercase());
             for name in names {
                 let members = category_members.remove(&name).unwrap_or_default();
-                rows.push(ContactsCategoryChoice { kind: ContactsBucketKind::Category(name.clone()), contacts: members });
+                rows.push(ContactsCategoryChoice {
+                    kind: ContactsBucketKind::Category(name.clone()),
+                    contacts: members,
+                });
                 row_widgets.push((append_contacts_choice_row(category_list, &name), Some(rows.len() - 1)));
             }
         }
@@ -3243,7 +3371,12 @@ fn rebuild_contacts_list_ui(
             .contacts
             .into_iter()
             .filter(|(account_id, _, card)| !favourites_only || st.starred_contacts.contains(&(account_id.clone(), contact_identity(card))))
-            .map(|(account_id, account_label, card)| ContactsListEntry { account_id, account_label, category_label: category_label.clone(), card })
+            .map(|(account_id, account_label, card)| ContactsListEntry {
+                account_id,
+                account_label,
+                category_label: category_label.clone(),
+                card,
+            })
             .collect()
     };
     entries.sort_by_key(|entry| vcard_display_name(&entry.card).to_lowercase());
@@ -3260,14 +3393,23 @@ fn rebuild_contacts_list_ui(
     }
 
     for entry in &entries {
-        let name = gtk::Label::builder().label(vcard_display_name(&entry.card)).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let name = gtk::Label::builder()
+            .label(vcard_display_name(&entry.card))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
         let email = gtk::Label::builder()
             .label(vcard_primary_email(&entry.card))
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
             .build();
-        let text_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).valign(gtk::Align::Center).build();
+        let text_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
         text_box.append(&name);
         text_box.append(&email);
 
@@ -3342,14 +3484,7 @@ fn spawn_contacts_discovery(
             Ok((client, accounts)) if !accounts.is_empty() => {
                 show_page("contacts");
                 for account in accounts {
-                    sync_contacts_account(
-                        worker.clone(),
-                        state.clone(),
-                        toast_overlay.clone(),
-                        client.clone(),
-                        account,
-                        refresh_contacts_ui.clone(),
-                    );
+                    sync_contacts_account(worker.clone(), state.clone(), toast_overlay.clone(), client.clone(), account, refresh_contacts_ui.clone());
                 }
             }
             Ok(_) => show_page("contacts-empty"),
@@ -3397,8 +3532,7 @@ fn sync_contacts_account(
                     // previous poll saw and stash anything missing in
                     // `deleted_contacts` before it's overwritten below.
                     if let Some(previous) = st.contacts_by_account.get(&account_id) {
-                        let previously_seen: HashMap<String, VCard> =
-                            previous.contacts.iter().map(|card| (contact_identity(card), card.clone())).collect();
+                        let previously_seen: HashMap<String, VCard> = previous.contacts.iter().map(|card| (contact_identity(card), card.clone())).collect();
                         let still_present: HashSet<String> = contacts.contacts.iter().map(contact_identity).collect();
                         let deleted_bucket = st.deleted_contacts.entry(account_id.clone()).or_default();
                         let already_tracked: HashSet<String> = deleted_bucket.iter().map(contact_identity).collect();
@@ -3426,10 +3560,7 @@ fn sync_contacts_account(
 }
 
 async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccount) -> Result<ContactsAccountSnapshot, String> {
-    goa_client
-        .ensure_credentials_contacts(&account)
-        .await
-        .map_err(|e| e.to_string())?;
+    goa_client.ensure_credentials_contacts(&account).await.map_err(|e| e.to_string())?;
     let credential = match &account.auth {
         ContactsAuthMethod::OAuth2 => {
             let (token, _expires_in) = goa_client.get_access_token_contacts(&account).await.map_err(|e| e.to_string())?;
@@ -3450,10 +3581,7 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
     };
     let client = DavClient::new(&config.base_url, config.accept_ssl_errors, config.username.clone()).map_err(|e| e.to_string())?;
     let home = client.discover_addressbook_home(&credential).await.map_err(|e| e.to_string())?;
-    let books = client
-        .list_addressbooks(&home, &config.account_id, &credential)
-        .await
-        .map_err(|e| e.to_string())?;
+    let books = client.list_addressbooks(&home, &config.account_id, &credential).await.map_err(|e| e.to_string())?;
     tracing::debug!("CardDAV discovery for {}: home={home:?}, {} addressbook(s) found", account.display_name, books.len());
 
     let mut addresses = Vec::new();
@@ -4251,6 +4379,332 @@ fn themed_icon_name(candidates: &[&'static str]) -> &'static str {
         }
     }
     candidates.last().copied().unwrap_or("image-missing-symbolic")
+}
+
+/// (Re)loads the `.message-tag-dot.tag-<key>` color rules for the current tag
+/// set into `provider`. `load_from_string` replaces the provider's previous
+/// rules wholesale, so a rename/recolor/delete takes effect immediately and a
+/// deleted tag's old class stops matching. Registered once for the display's
+/// lifetime (see `build_window`); this is the only thing that writes it.
+fn apply_tag_colors(tags: &Rc<RefCell<crate::tags::TagSet>>, provider: &gtk::CssProvider) {
+    let mut css = String::new();
+    for tag in &tags.borrow().tags {
+        css.push_str(&format!(".message-tag-dot.tag-{} {{ background-color: {}; }}\n", tag.key, tag.color));
+    }
+    provider.load_from_string(&css);
+}
+
+/// Sends a `StoreKeywords` command for `summary` to its owning account's
+/// session. The session `STORE`s the atoms, patches the cache, and re-emits,
+/// which repaints the row's tag dots.
+fn send_keyword_store(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, add: Vec<String>, remove: Vec<String>) {
+    let Some(account_id) = mailbox_account_id(&summary.mailbox) else { return };
+    let st = state.borrow();
+    let Some(handle) = st.accounts.get(&account_id) else { return };
+    let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreKeywords {
+        mailbox: summary.mailbox.clone(),
+        uid: summary.uid,
+        add,
+        remove,
+    });
+}
+
+/// Builds the tag menu shown by both the toolbar Categorize popover and the
+/// message row's right-click menu: one toggle row per defined tag (a color
+/// dot plus a check button, checked when `target` carries that tag's
+/// keyword), then a "Manage tags…" row. `target` is the message the toggles
+/// act on; `None` (nothing selected) renders the toggles disabled. The
+/// caller owns showing it - for the toolbar it's the popover child (rebuilt
+/// on every `show`), for a row it's the row's context popover.
+fn build_tag_menu(
+    tags: &Rc<RefCell<crate::tags::TagSet>>,
+    state: &Rc<RefCell<UiState>>,
+    target: Option<EmailSummary>,
+    message_list: &MessageListModel,
+    tag_colors: &gtk::CssProvider,
+) -> gtk::Box {
+    let set = tags.borrow();
+    let boxed = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+
+    if set.tags.is_empty() {
+        let empty = gtk::Label::builder()
+            .label("No tags defined yet")
+            .halign(gtk::Align::Start)
+            .css_classes(["dim-label"])
+            .margin_top(2)
+            .margin_bottom(2)
+            .build();
+        boxed.append(&empty);
+    } else {
+        for tag in &set.tags {
+            let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+            let dot = gtk::Box::builder()
+                .width_request(10)
+                .height_request(10)
+                .css_classes(["message-tag-dot", &format!("tag-{}", tag.key)])
+                .valign(gtk::Align::Center)
+                .build();
+            let toggle = gtk::CheckButton::builder().label(&tag.name).build();
+            let has = target.as_ref().is_some_and(|s| s.keywords.contains(&lookout_core::tag_keyword(&tag.key)));
+            toggle.set_active(has);
+            toggle.set_sensitive(target.is_some());
+            row.append(&dot);
+            row.append(&toggle);
+
+            let summary = target.clone();
+            let key = tag.key.clone();
+            let state = state.clone();
+            toggle.connect_toggled(move |t| {
+                if let Some(summary) = &summary {
+                    let keyword = lookout_core::tag_keyword(&key);
+                    let (add, remove) = if t.is_active() { (vec![keyword], Vec::new()) } else { (Vec::new(), vec![keyword]) };
+                    send_keyword_store(&state, summary, add, remove);
+                }
+            });
+            boxed.append(&row);
+        }
+    }
+
+    let manage = gtk::Button::builder().label("Manage tags…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    {
+        let tags = tags.clone();
+        let message_list = message_list.clone();
+        let tag_colors = tag_colors.clone();
+        let manage_button = manage.clone();
+        manage.connect_clicked(move |_| show_manage_tags_dialog(manage_button.upcast_ref::<gtk::Widget>(), tags.clone(), message_list.clone(), tag_colors.clone()));
+    }
+    boxed.append(&manage);
+    boxed
+}
+
+/// The tag-management dialog: list existing tags (color swatch + editable
+/// name + delete), with an "add" row for new ones. Mutates the shared
+/// `TagSet`, persists it via `crate::tags::save`, refreshes the row color
+/// rules (`apply_tag_colors`), and forces the message list to re-render -
+/// a recolor/rename doesn't change any message's keywords, so the list's
+/// no-op check would otherwise skip the rebuild.
+///
+/// Deleting a tag is non-destructive: only the definition is removed. The
+/// `$Lookout-tag-*` keywords already stored on messages stay on the server
+/// and simply stop displaying.
+fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::TagSet>>, message_list: MessageListModel, tag_colors: gtk::CssProvider) {
+    let window = anchor.root().and_downcast::<gtk::Window>();
+    let dialog = {
+        let mut builder = gtk::Window::builder().modal(true).title("Manage tags").default_width(440).default_height(520);
+        if let Some(win) = window {
+            builder = builder.transient_for(&win);
+        }
+        builder.build()
+    };
+
+    let list = gtk::ListBox::builder().css_classes(["boxed-list"]).build();
+    let scroller = gtk::ScrolledWindow::builder().child(&list).vexpand(true).build();
+
+    let color_dialog = gtk::ColorDialog::new();
+    // `rebuild` re-renders the tag list; its per-row handlers call it again
+    // after an edit. An `Rc<RefCell<Box<dyn Fn()>>>` so a handler created
+    // while it runs can still reach it. (The handlers clone the `Rc`, which
+    // forms a reference cycle that lives until the dialog's widgets drop -
+    // a bounded, one-off cost for a modal dialog.)
+    let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
+    let rebuild_handle = rebuild.clone();
+    {
+        let list = list.clone();
+        let tags_rc = tags.clone();
+        let tag_colors_rc = tag_colors.clone();
+        let color_dialog = color_dialog.clone();
+        *rebuild.borrow_mut() = Box::new(move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            let set = tags_rc.borrow();
+            if set.tags.is_empty() {
+                let empty = gtk::Label::builder()
+                    .label("No tags yet - add one below.")
+                    .halign(gtk::Align::Start)
+                    .css_classes(["dim-label"])
+                    .margin_top(12)
+                    .margin_bottom(12)
+                    .build();
+                list.append(&empty);
+            }
+            for tag in &set.tags {
+                let row = gtk::ListBoxRow::new();
+                let row_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(10)
+                    .margin_top(6)
+                    .margin_bottom(6)
+                    .margin_start(10)
+                    .margin_end(10)
+                    .build();
+
+                let swatch = gtk::ColorDialogButton::builder().dialog(&color_dialog).build();
+                swatch.set_rgba(&hex_to_rgba(&tag.color));
+                swatch.set_tooltip_text(Some("Change color"));
+
+                let name = gtk::Entry::builder().text(&tag.name).build();
+
+                let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+                delete.set_tooltip_text(Some("Delete tag"));
+                delete.add_css_class("flat");
+
+                row_box.append(&swatch);
+                row_box.append(&name);
+                row_box.append(&delete);
+                row.set_child(Some(&row_box));
+                list.append(&row);
+
+                let key = tag.key.clone();
+                let tags = tags_rc.clone();
+                let tag_colors = tag_colors_rc.clone();
+                let rebuild = rebuild_handle.clone();
+                swatch.connect_rgba_notify(move |swatch| {
+                    let mut set = tags.borrow_mut();
+                    if let Some(tag) = set.tags.iter_mut().find(|t| t.key == key) {
+                        tag.color = rgba_to_hex(&swatch.rgba());
+                    }
+                    drop(set);
+                    crate::tags::save(&tags.borrow());
+                    apply_tag_colors(&tags, &tag_colors);
+                    (rebuild.borrow())();
+                });
+
+                let key = tag.key.clone();
+                let tags = tags_rc.clone();
+                name.connect_changed(move |entry| {
+                    let mut set = tags.borrow_mut();
+                    if let Some(tag) = set.tags.iter_mut().find(|t| t.key == key) {
+                        tag.name = entry.text().trim().to_string();
+                    }
+                    drop(set);
+                    crate::tags::save(&tags.borrow());
+                });
+
+                let key = tag.key.clone();
+                let tags = tags_rc.clone();
+                let tag_colors = tag_colors_rc.clone();
+                let rebuild = rebuild_handle.clone();
+                delete.connect_clicked(move |_| {
+                    tags.borrow_mut().tags.retain(|t| t.key != key);
+                    crate::tags::save(&tags.borrow());
+                    apply_tag_colors(&tags, &tag_colors);
+                    (rebuild.borrow())();
+                });
+            }
+        });
+    }
+    (rebuild.borrow())();
+
+    // --- Add-a-tag row: name entry + color swatch + Add button ---
+    let add_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .margin_top(8)
+        .margin_start(10)
+        .margin_end(10)
+        .build();
+    let new_name = gtk::Entry::builder().placeholder_text("New tag name").hexpand(true).build();
+    let new_color = gtk::ColorDialogButton::builder().dialog(&color_dialog).build();
+    new_color.set_rgba(&hex_to_rgba(crate::tags::default_tag_color(tags.borrow().tags.len())));
+    let add_button = gtk::Button::with_label("Add");
+    add_button.add_css_class("suggested-action");
+    add_row.append(&new_name);
+    add_row.append(&new_color);
+    add_row.append(&add_button);
+
+    let error_label = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .css_classes(["error"])
+        .visible(false)
+        .margin_start(10)
+        .margin_end(10)
+        .build();
+    {
+        let tags = tags.clone();
+        let new_name = new_name.clone();
+        let new_color = new_color.clone();
+        let error_label = error_label.clone();
+        let tag_colors = tag_colors.clone();
+        let rebuild = rebuild.clone();
+        add_button.connect_clicked(move |_| {
+            let key = lookout_core::sanitize_tag_key(new_name.text().trim());
+            let name = new_name.text().trim().to_string();
+            if name.is_empty() || key.is_empty() {
+                error_label.set_label("Enter a tag name.");
+                error_label.set_visible(true);
+                return;
+            }
+            if tags.borrow().contains_key(&key) {
+                error_label.set_label("A tag with this name already exists.");
+                error_label.set_visible(true);
+                return;
+            }
+            let color = rgba_to_hex(&new_color.rgba());
+            tags.borrow_mut().tags.push(crate::tags::TagDef { key, name, color });
+            crate::tags::save(&tags.borrow());
+            apply_tag_colors(&tags, &tag_colors);
+            error_label.set_visible(false);
+            new_name.set_text("");
+            new_color.set_rgba(&hex_to_rgba(crate::tags::default_tag_color(tags.borrow().tags.len())));
+            (rebuild.borrow())();
+        });
+    }
+
+    let close_button = gtk::Button::with_label("Close");
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(12)
+        .margin_bottom(12)
+        .build();
+    content.append(&scroller);
+    content.append(&add_row);
+    content.append(&error_label);
+    {
+        let dialog = dialog.clone();
+        close_button.connect_clicked(move |_| dialog.close());
+    }
+    close_button.set_halign(gtk::Align::End);
+    close_button.set_margin_end(12);
+    content.append(&close_button);
+    dialog.set_child(Some(&content));
+    dialog.present();
+
+    // Opening the dialog is itself a tag-definition view change that can
+    // alter row colors if any were edited in an earlier session and then the
+    // file changed under us; a refresh is cheap and always correct.
+    message_list.refresh();
+}
+
+/// `#rrggbb` -> `gdk::RGBA`. Any malformed input degrades to a mid-grey
+/// rather than failing, matching the "colors are cosmetic" spirit of
+/// `calendar_colors::resolve_color`.
+fn hex_to_rgba(color: &str) -> gtk::gdk::RGBA {
+    let body = color.strip_prefix('#').unwrap_or(color);
+    let byte = |i: usize| u8::from_str_radix(&body[i..i + 2], 16).unwrap_or(128);
+    let (r, g, b) = match body.len() {
+        6 if body.bytes().all(|c| c.is_ascii_hexdigit()) => (byte(0), byte(2), byte(4)),
+        _ => (128, 128, 128),
+    };
+    gtk::gdk::RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+}
+
+/// `gdk::RGBA` -> `#rrggbb` (alpha dropped - tags are opaque).
+fn rgba_to_hex(rgba: &gtk::gdk::RGBA) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (rgba.red() * 255.0).round() as u8,
+        (rgba.green() * 255.0).round() as u8,
+        (rgba.blue() * 255.0).round() as u8
+    )
 }
 
 /// The sort-direction toggle's icon for the current order.

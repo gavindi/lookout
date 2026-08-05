@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.42" date="2026-08-06">
+      <description>
+        <p>Messages can now be color-tagged. A Categorize button in the toolbar (and a right-click menu on a message) assigns one of your tags to the selected message, which stores a keyword on it so the tag follows it across devices. Tagged messages show small color dots in the list. A Manage tags dialog lets you create, rename, recolour, or remove tags. Deleting, archiving, or reporting a message now also removes it from the list the moment the move succeeds, instead of waiting a few seconds for a full mailbox resync to finish.</p>
+      </description>
+    </release>
     <release version="0.6.41" date="2026-08-06">
       <description>
         <p>The People tab's left side now shows Your Contacts, Favourites, Your contact lists, and Deleted for each account, plus a Categories section for any tags you use. You can star a contact as a favourite from the contact list. This release also fixes several bugs that could leave an account's contacts showing empty, including one that silently dropped every contact from any address book using the very common older vCard format.</p>

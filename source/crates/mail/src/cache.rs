@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, ContactsProvider, EmailSummary, EmailAddress, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
+use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailSummary, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
 use rusqlite::Connection;
 
 use crate::error::Result;
@@ -380,6 +380,53 @@ impl Cache {
         Ok(true)
     }
 
+    /// Applies a keyword change to one cached summary, mirroring the `STORE`
+    /// the session just issued - the same contract as `update_flags`, for the
+    /// custom-flag atoms (e.g. `$Lookout-tag-<key>`) that carry color tags.
+    /// Keywords are plain strings in the set, so add/remove are simple set
+    /// operations on the deserialized summary.
+    pub fn update_keywords(&self, mailbox_id: &MailboxId, uid: Uid, add: &[String], remove: &[String]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+        let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
+        let Some(data) = rows.next().transpose()? else {
+            return Ok(false);
+        };
+        let Ok(mut summary) = serde_json::from_str::<EmailSummary>(&data) else {
+            return Ok(false);
+        };
+        for keyword in add {
+            summary.keywords.insert(keyword.clone());
+        }
+        for keyword in remove {
+            summary.keywords.remove(keyword);
+        }
+        let data = serde_json::to_string(&summary)?;
+        drop(rows);
+        drop(stmt);
+        conn.execute(
+            "UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3",
+            rusqlite::params![data, mailbox_id.0, uid.0],
+        )?;
+        Ok(true)
+    }
+
+    /// Removes a single message (plus its cached body and any snooze entry)
+    /// from the cache. Used right after a successful MOVE so the deleted or
+    /// archived message drops out of the next `MessagesUpdated` immediately
+    /// instead of waiting for the authoritative resync to re-fetch the whole
+    /// window. The next `replace_messages` wipes the window anyway, so this is
+    /// a display-latency optimization, never the source of truth.
+    pub fn delete_message(&self, mailbox_id: &MailboxId, uid: Uid) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
+        tx.execute("DELETE FROM bodies WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
+        tx.execute("DELETE FROM snoozed WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Records that `uid` (in `mailbox_id`) should be hidden from
     /// `MessagesUpdated` until `until` - purely client-side state, IMAP has
     /// no native snooze concept. `INSERT OR REPLACE` so re-snoozing an
@@ -489,6 +536,40 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The move path's instant-update relies on this: after a `delete_message`
+    /// the remaining cached set no longer contains the moved uid, its body is
+    /// gone, and a delete of a non-cached uid is a harmless no-op.
+    #[test]
+    fn deleting_a_message_drops_it_and_its_body_from_the_cache() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache
+            .replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)])
+            .unwrap();
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), b"raw one").unwrap();
+        cache.store_body(&mailbox_id, Uid(2), UidValidity(1), b"raw two").unwrap();
+        cache.snooze_message(&mailbox_id, Uid(2), Utc::now() + chrono::Duration::hours(1)).unwrap();
+
+        cache.delete_message(&mailbox_id, Uid(1)).unwrap();
+
+        let remaining = cache.load_messages(&mailbox_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].uid, Uid(2));
+        assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap());
+        assert!(cache.has_body(&mailbox_id, Uid(2), UidValidity(1)).unwrap());
+        assert_eq!(cache.active_snoozed_uids(&mailbox_id, Utc::now()).unwrap(), HashSet::from([Uid(2)]));
+
+        // Deleting a uid the cache doesn't know is fine - used when the moved
+        // message fell outside the cached window.
+        cache.delete_message(&mailbox_id, Uid(99)).unwrap();
+        assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
     fn sample_summary(mailbox_id: &MailboxId, uid: u32, preview: Option<&str>) -> EmailSummary {
         EmailSummary {
             uid: Uid(uid),
@@ -558,6 +639,39 @@ mod tests {
 
         // A uid that isn't in the cached window is a no-op, not an error.
         assert!(!cache.update_flags(&mailbox_id, Uid(99), &[SystemFlagBit::Seen], &[]).unwrap());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The tag-toggle contract: an `update_keywords` add/remove round-trips
+    /// through a reload (so a restart before the next sync keeps showing the
+    /// tag), and it leaves the summary's other fields - flags in particular -
+    /// untouched. A uid outside the cached window is a no-op, not an error.
+    #[test]
+    fn patches_keywords_on_a_cached_summary() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let work = lookout_core::tag_keyword("work");
+        let red = lookout_core::tag_keyword("red");
+
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None)]).unwrap();
+        assert!(cache.update_flags(&mailbox_id, Uid(1), &[SystemFlagBit::Seen], &[]).unwrap());
+
+        assert!(cache.update_keywords(&mailbox_id, Uid(1), &[work.clone(), red.clone()], &[]).unwrap());
+        let loaded = &cache.load_messages(&mailbox_id).unwrap()[0];
+        assert!(loaded.keywords.contains(&work));
+        assert!(loaded.keywords.contains(&red));
+        // The keyword patch must not have disturbed the flag patch.
+        assert!(!loaded.is_unread());
+
+        assert!(cache.update_keywords(&mailbox_id, Uid(1), &[], std::slice::from_ref(&red)).unwrap());
+        let loaded = &cache.load_messages(&mailbox_id).unwrap()[0];
+        assert!(loaded.keywords.contains(&work));
+        assert!(!loaded.keywords.contains(&red));
+
+        assert!(!cache.update_keywords(&mailbox_id, Uid(99), &[work], &[]).unwrap());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

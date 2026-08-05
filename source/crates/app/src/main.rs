@@ -13,6 +13,7 @@ mod message_header;
 mod message_list;
 mod microsoft_oauth;
 mod recipient_entry;
+mod tags;
 mod window;
 mod worker;
 
