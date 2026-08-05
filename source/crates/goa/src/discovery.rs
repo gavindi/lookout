@@ -10,6 +10,7 @@ use crate::{Error, Result};
 const IFACE_ACCOUNT: &str = "org.gnome.OnlineAccounts.Account";
 const IFACE_MAIL: &str = "org.gnome.OnlineAccounts.Mail";
 const IFACE_CALENDAR: &str = "org.gnome.OnlineAccounts.Calendar";
+const IFACE_CONTACTS: &str = "org.gnome.OnlineAccounts.Contacts";
 const IFACE_OAUTH2: &str = "org.gnome.OnlineAccounts.OAuth2Based";
 const IFACE_PASSWORD: &str = "org.gnome.OnlineAccounts.PasswordBased";
 
@@ -92,6 +93,30 @@ pub struct GoaCalendarAccount {
     pub uri: String,
     pub accept_ssl_errors: bool,
     pub auth: CalendarAuthMethod,
+}
+
+/// How to obtain live credentials for a [`GoaContactsAccount`]. Kept
+/// separate from Mail and Calendar auth types for clarity at call sites.
+#[derive(Debug, Clone)]
+pub enum ContactsAuthMethod {
+    OAuth2,
+    /// `password_id` is the `PasswordBased.GetPassword` slot id to use
+    /// (commonly `"contacts-password"`).
+    Password {
+        password_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct GoaContactsAccount {
+    pub account_id: AccountId,
+    pub object_path: OwnedObjectPath,
+    pub display_name: String,
+    /// `Contacts.Uri` - the CardDAV base URL GOA has configured for this
+    /// account.
+    pub uri: String,
+    pub accept_ssl_errors: bool,
+    pub auth: ContactsAuthMethod,
 }
 
 /// Thin wrapper over a session-bus [`Connection`] providing GOA account
@@ -258,6 +283,20 @@ impl GoaClient {
         Ok(accounts)
     }
 
+    /// Lists every GOA account with a usable `Contacts` interface.
+    pub async fn list_contacts_accounts(&self) -> Result<Vec<GoaContactsAccount>> {
+        let manager = ObjectManagerProxy::new(&self.connection).await?;
+        let objects: ManagedObjects = manager.get_managed_objects().await?;
+
+        let mut accounts = Vec::new();
+        for (path, ifaces) in &objects {
+            if let Some(account) = self.parse_contacts_account(path, ifaces)? {
+                accounts.push(account);
+            }
+        }
+        Ok(accounts)
+    }
+
     fn parse_calendar_account(&self, path: &OwnedObjectPath, ifaces: &HashMap<String, HashMap<String, OwnedValue>>) -> Result<Option<GoaCalendarAccount>> {
         let Some(account_props) = ifaces.get(IFACE_ACCOUNT) else {
             return Ok(None);
@@ -297,6 +336,41 @@ impl GoaClient {
         }))
     }
 
+    fn parse_contacts_account(&self, path: &OwnedObjectPath, ifaces: &HashMap<String, HashMap<String, OwnedValue>>) -> Result<Option<GoaContactsAccount>> {
+        let Some(account_props) = ifaces.get(IFACE_ACCOUNT) else {
+            return Ok(None);
+        };
+        let Some(contacts_props) = ifaces.get(IFACE_CONTACTS) else {
+            return Ok(None);
+        };
+
+        let display_name = get_string(account_props, "PresentationIdentity").unwrap_or_default();
+        let uri = get_string(contacts_props, "Uri").unwrap_or_default();
+        if uri.is_empty() {
+            return Ok(None);
+        }
+        let accept_ssl_errors = get_bool(contacts_props, "AcceptSslErrors").unwrap_or(false);
+
+        let auth = if ifaces.contains_key(IFACE_OAUTH2) {
+            ContactsAuthMethod::OAuth2
+        } else if ifaces.contains_key(IFACE_PASSWORD) {
+            ContactsAuthMethod::Password {
+                password_id: "contacts-password".to_string(),
+            }
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(GoaContactsAccount {
+            account_id: AccountId(path.to_string()),
+            object_path: path.clone(),
+            display_name,
+            uri,
+            accept_ssl_errors,
+            auth,
+        }))
+    }
+
     pub async fn ensure_credentials_calendar(&self, account: &GoaCalendarAccount) -> Result<()> {
         self.ensure_credentials_for(&account.object_path).await
     }
@@ -307,6 +381,21 @@ impl GoaClient {
 
     pub async fn get_calendar_password(&self, account: &GoaCalendarAccount) -> Result<String> {
         let CalendarAuthMethod::Password { password_id } = &account.auth else {
+            return Err(Error::WrongAuthMethod);
+        };
+        self.get_password_for(&account.object_path, password_id).await
+    }
+
+    pub async fn ensure_credentials_contacts(&self, account: &GoaContactsAccount) -> Result<()> {
+        self.ensure_credentials_for(&account.object_path).await
+    }
+
+    pub async fn get_access_token_contacts(&self, account: &GoaContactsAccount) -> Result<(String, i32)> {
+        self.get_access_token_for(&account.object_path).await
+    }
+
+    pub async fn get_contacts_password(&self, account: &GoaContactsAccount) -> Result<String> {
+        let ContactsAuthMethod::Password { password_id } = &account.auth else {
             return Err(Error::WrongAuthMethod);
         };
         self.get_password_for(&account.object_path, password_id).await

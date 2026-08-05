@@ -1,15 +1,95 @@
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, CalendarEvent, CalendarId, CalendarInfo};
+use lookout_core::{AccountId, CalendarEvent, CalendarId, CalendarInfo, VCard};
 use reqwest::Method;
 
 use crate::config::Credential;
 use crate::error::{Error, Result};
 use crate::ical;
-use crate::xml::{self, DavResponse};
+use crate::xml::{self, DavResponse, NS_CARDDAV};
 
 const NS_DAV: &[u8] = b"DAV:";
 const NS_CALDAV: &[u8] = b"urn:ietf:params:xml:ns:caldav";
 const NS_APPLE_ICAL: &[u8] = b"http://apple.com/ns/ical/";
+
+const ADDRESSBOOK_PROPS: [&str; 2] = ["D:displayname", "D:resourcetype"];
+
+#[derive(Debug, Clone)]
+pub struct AddressBookInfo {
+    pub account_id: AccountId,
+    pub display_name: String,
+    pub href: String,
+}
+
+impl AddressBookInfo {
+    fn new(account_id: &AccountId, href: &str, display_name: String) -> Self {
+        Self { account_id: account_id.clone(), display_name, href: href.to_string() }
+    }
+}
+
+impl DavClient {
+    pub async fn discover_addressbook_home(&self, credential: &Credential) -> Result<String> {
+        let principal = self
+            .propfind(self.base_url.clone(), 0, credential, &["D:current-user-principal"])
+            .await?
+            .into_iter()
+            .find_map(|r| r.prop(NS_DAV, "current-user-principal").map(str::to_string));
+
+        let principal_href = match principal {
+            Some(href) => href,
+            None => {
+                tracing::warn!("server didn't answer current-user-principal; treating the configured URL as the addressbook-home-set directly");
+                return Ok(self.base_url.to_string());
+            }
+        };
+        let principal_url = self.resolve(&principal_href)?;
+
+        let home_set = self
+            .propfind(principal_url, 0, credential, &["CD:addressbook-home-set"])
+            .await?
+            .into_iter()
+            .find_map(|r| r.prop(NS_CARDDAV, "addressbook-home-set").map(str::to_string));
+
+        match home_set {
+            Some(href) => Ok(href),
+            None => {
+                tracing::warn!("server didn't answer addressbook-home-set; treating the configured URL as the addressbook-home-set directly");
+                Ok(self.base_url.to_string())
+            }
+        }
+    }
+
+    pub async fn list_addressbooks(&self, home_set_href: &str, account_id: &AccountId, credential: &Credential) -> Result<Vec<AddressBookInfo>> {
+        let home_url = self.resolve(home_set_href)?;
+        let responses = self.propfind(home_url, 1, credential, &ADDRESSBOOK_PROPS).await?;
+
+        Ok(responses
+            .into_iter()
+            .filter(|r| r.prop(NS_DAV, "resourcetype").unwrap_or("").contains("addressbook"))
+            .map(|r| AddressBookInfo::new(account_id, &r.href, r.prop(NS_DAV, "displayname").unwrap_or("").to_string()))
+            .collect())
+    }
+
+    pub async fn sync_addressbook(&self, url: reqwest::Url, credential: &Credential, sync_token: Option<&str>) -> Result<Vec<DavResponse>> {
+        let body = xml::build_sync_collection_body(sync_token, &["D:getetag", "CD:address-data"]);
+        self.sync_collection(url, 1, credential, body).await
+    }
+
+    pub async fn fetch_addressbook_contacts(&self, addressbook: &AddressBookInfo, credential: &Credential) -> Result<Vec<DavResponse>> {
+        let url = self.resolve(&addressbook.href)?;
+        self.sync_addressbook(url, credential, None).await
+    }
+
+    pub async fn fetch_addressbook_vcards(&self, addressbook: &AddressBookInfo, credential: &Credential) -> Result<Vec<VCard>> {
+        let responses = self.fetch_addressbook_contacts(addressbook, credential).await?;
+        let mut vcards = Vec::new();
+        for response in responses {
+            if let Some(data) = response.prop(NS_CARDDAV, "address-data") {
+                vcards.push(VCard::parse(data).map_err(|e| Error::Discovery(format!("vCard parse error: {e}")))?);
+            }
+        }
+        Ok(vcards)
+    }
+}
 
 /// A thin CalDAV/WebDAV HTTP client for one account's calendar endpoint.
 /// Holds no credentials - a fresh [`Credential`] is passed to every request,
@@ -105,6 +185,12 @@ impl DavClient {
 
     async fn report(&self, url: reqwest::Url, depth: u8, credential: &Credential, body: String) -> Result<Vec<DavResponse>> {
         self.send_xml_request("REPORT", url, depth, credential, body).await
+    }
+
+    /// Sends a `sync-collection` REPORT request, used by CardDAV/other WebDAV
+    /// collection sync flows that require RFC 6578 incremental discovery.
+    pub async fn sync_collection(&self, url: reqwest::Url, depth: u8, credential: &Credential, body: String) -> Result<Vec<DavResponse>> {
+        self.report(url, depth, credential, body).await
     }
 
     async fn send_xml_request(&self, method: &str, url: reqwest::Url, depth: u8, credential: &Credential, body: String) -> Result<Vec<DavResponse>> {

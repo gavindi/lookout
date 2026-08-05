@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use lookout_goa::{AuthMethod, CalendarAuthMethod, GoaClient};
+use lookout_goa::{AuthMethod, CalendarAuthMethod, ContactsAuthMethod, GoaClient};
 use zbus::interface;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -96,6 +96,15 @@ fn add_calendar_iface(ifaces: &mut HashMap<String, HashMap<String, OwnedValue>>,
     ifaces.insert("org.gnome.OnlineAccounts.Calendar".to_string(), calendar);
 }
 
+/// Adds a `Contacts` interface's properties onto an already-built `ifaces`
+/// map, in place.
+fn add_contacts_iface(ifaces: &mut HashMap<String, HashMap<String, OwnedValue>>, uri: &str, accept_ssl_errors: bool) {
+    let mut contacts = HashMap::new();
+    contacts.insert("Uri".to_string(), prop(uri.to_string()));
+    contacts.insert("AcceptSslErrors".to_string(), prop(accept_ssl_errors));
+    ifaces.insert("org.gnome.OnlineAccounts.Contacts".to_string(), contacts);
+}
+
 /// Microsoft 365-style account: GOA's `ms_graph`/`microsoft365`/`microsoft`
 /// providers leave the Mail interface's host/username fields empty and flag
 /// `ImapSupported`/`SmtpSupported` false (mirrors the real Microsoft 365
@@ -130,11 +139,13 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     let mut oauth_ifaces = mail_account_props("oauth@example.com", true);
     oauth_ifaces.insert("org.gnome.OnlineAccounts.OAuth2Based".to_string(), HashMap::new());
     add_calendar_iface(&mut oauth_ifaces, "https://caldav.example.com/dav/oauth@example.com/", false);
+    add_contacts_iface(&mut oauth_ifaces, "https://carddav.example.com/dav/oauth@example.com/", false);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/oauth_account").unwrap(), oauth_ifaces);
 
     let mut pw_ifaces = mail_account_props("password@example.com", true);
     pw_ifaces.insert("org.gnome.OnlineAccounts.PasswordBased".to_string(), HashMap::new());
     add_calendar_iface(&mut pw_ifaces, "https://caldav.example.com/dav/password@example.com/", true);
+    add_contacts_iface(&mut pw_ifaces, "https://carddav.example.com/dav/password@example.com/", true);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/pw_account").unwrap(), pw_ifaces);
 
     // A genuine Microsoft 365 account: Mail interface present but hosts
@@ -166,6 +177,7 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     });
     no_mail_ifaces.insert("org.gnome.OnlineAccounts.PasswordBased".to_string(), HashMap::new());
     add_calendar_iface(&mut no_mail_ifaces, "https://cloud.example.com/remote.php/dav/", false);
+    add_contacts_iface(&mut no_mail_ifaces, "https://cloud.example.com/remote.php/dav/addressbooks/users/me/", false);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/no_mail_account").unwrap(), no_mail_ifaces);
 
     let connection = zbus::connection::Builder::session()
@@ -291,4 +303,24 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
 
     let nextcloud_password = client.get_calendar_password(&cal_accounts[2]).await.unwrap();
     assert_eq!(nextcloud_password, "fake-nc-pw-calendar-password");
+
+    // Contacts accounts are likewise a fully separate set from Mail.
+    let mut contacts_accounts = client.list_contacts_accounts().await.unwrap();
+    contacts_accounts.sort_by(|a, b| a.uri.cmp(&b.uri));
+
+    assert_eq!(contacts_accounts.len(), 3, "expected exactly the three usable-contacts accounts, got: {contacts_accounts:?}");
+    assert_eq!(contacts_accounts[0].uri, "https://carddav.example.com/dav/oauth@example.com/");
+    assert!(matches!(contacts_accounts[0].auth, ContactsAuthMethod::OAuth2));
+    assert_eq!(contacts_accounts[1].uri, "https://carddav.example.com/dav/password@example.com/");
+    assert!(matches!(contacts_accounts[1].auth, ContactsAuthMethod::Password { .. }));
+    assert_eq!(contacts_accounts[2].uri, "https://cloud.example.com/remote.php/dav/addressbooks/users/me/");
+    assert!(matches!(contacts_accounts[2].auth, ContactsAuthMethod::Password { .. }));
+
+    client.ensure_credentials_contacts(&contacts_accounts[0]).await.unwrap();
+    let (contacts_token, contacts_expires_in) = client.get_access_token_contacts(&contacts_accounts[0]).await.unwrap();
+    assert_eq!(contacts_token, "fake-access-token");
+    assert_eq!(contacts_expires_in, 3600);
+
+    let contacts_password = client.get_contacts_password(&contacts_accounts[1]).await.unwrap();
+    assert_eq!(contacts_password, "fake-pw-contacts-password");
 }

@@ -29,6 +29,12 @@ impl EmailAddress {
     }
 }
 
+/// A generic source of contact-address completions.
+pub trait ContactsProvider {
+    /// Returns matching addresses for `prefix`, in preference order.
+    fn search_contacts(&self, prefix: &str, limit: usize) -> Vec<EmailAddress>;
+}
+
 /// The standard IMAP system flags (RFC 3501 §2.3.2), excluding `\Recent`
 /// which is session-scoped and not meaningfully cacheable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]

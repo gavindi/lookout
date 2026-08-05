@@ -11,6 +11,8 @@ use quick_xml::reader::NsReader;
 
 use crate::error::Result;
 
+pub const NS_CARDDAV: &[u8] = b"urn:ietf:params:xml:ns:carddav";
+
 /// One `<response>` entry from a `multistatus` document: its href, plus
 /// whatever requested properties it reported, keyed by `(namespace, local
 /// name)` - resolved via the server's actual namespace URIs, not raw
@@ -251,6 +253,29 @@ pub fn build_calendar_query_body(start: DateTime<Utc>, end: DateTime<Utc>) -> St
     )
 }
 
+/// Builds a `sync-collection` REPORT body for WebDAV collections such as
+/// CardDAV address books. The caller controls which props are requested and
+/// may pass an optional sync token for incremental sync.
+pub fn build_sync_collection_body(sync_token: Option<&str>, props: &[&str]) -> String {
+    let mut body = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n\
+         <D:sync-collection xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CD=\"urn:ietf:params:xml:ns:carddav\" xmlns:IC=\"http://apple.com/ns/ical/\">\n",
+    );
+    if let Some(token) = sync_token {
+        body.push_str("  <D:sync-token>");
+        body.push_str(token);
+        body.push_str("</D:sync-token>\n");
+    }
+    body.push_str("  <D:prop>\n");
+    for p in props {
+        body.push_str("    <");
+        body.push_str(p);
+        body.push_str("/>\n");
+    }
+    body.push_str("  </D:prop>\n</D:sync-collection>");
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +471,22 @@ mod tests {
         }
         assert!(query.contains("20260701T000000Z"));
         assert!(query.contains("20260801T000000Z"));
+    }
+
+    #[test]
+    fn sync_collection_body_is_well_formed_xml() {
+        let body = build_sync_collection_body(Some("token123"), &["D:getetag", "CD:address-data"]);
+        assert!(body.contains("<D:sync-token>token123</D:sync-token>"));
+        assert!(body.contains("<D:getetag/>"));
+        assert!(body.contains("<CD:address-data/>"));
+
+        let mut reader = NsReader::from_str(&body);
+        loop {
+            match reader.read_resolved_event() {
+                Ok((_, Event::Eof)) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("build_sync_collection_body produced malformed XML: {e}"),
+            }
+        }
     }
 }

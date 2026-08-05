@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
+use lookout_core::{AccountId, ContactsProvider, EmailSummary, EmailAddress, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
 use rusqlite::Connection;
 
 use crate::error::Result;
@@ -407,6 +407,12 @@ impl Cache {
             uids.insert(Uid(row?));
         }
         Ok(uids)
+    }
+}
+
+impl ContactsProvider for Cache {
+    fn search_contacts(&self, prefix: &str, limit: usize) -> Vec<EmailAddress> {
+        self.search_addresses(prefix, limit).unwrap_or_default()
     }
 }
 

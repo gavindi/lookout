@@ -9,10 +9,12 @@ pub mod identity;
 pub mod ids;
 pub mod mailbox;
 pub mod thread;
+pub mod vcard;
 
 pub use calendar::{CalendarEvent, CalendarInfo, EventOccurrence};
-pub use email::{AuthenticationResults, BodyPart, DkimResult, DmarcResult, EmailAddress, EmailBody, EmailSummary, SpfResult, SystemFlagBit};
+pub use email::{AuthenticationResults, BodyPart, ContactsProvider, DkimResult, DmarcResult, EmailAddress, EmailBody, EmailSummary, SpfResult, SystemFlagBit};
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, Uid, UidValidity};
 pub use mailbox::{Mailbox, MailboxRole};
 pub use thread::{ThreadGroup, ThreadKey};
+pub use vcard::{AddressField, EmailField, Name, OtherProperty, Parameter, TelephoneField, VCard, VCardError};

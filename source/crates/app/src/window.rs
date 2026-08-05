@@ -4,10 +4,10 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, CalendarId, CalendarInfo, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
+use lookout_core::{AccountId, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
-use lookout_dav::CalendarAccountConfig;
-use lookout_goa::{GoaCalendarAccount, GoaClient};
+use lookout_dav::{CalendarAccountConfig, CardDavAccountConfig, Credential, DavClient};
+use lookout_goa::{ContactsAuthMethod, GoaCalendarAccount, GoaClient, GoaContactsAccount};
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
 use lookout_mail::{AccountConfig, EndpointConfig};
 use webkit::prelude::*;
@@ -99,6 +99,10 @@ const BODY_CACHE_IN_MEMORY: usize = 25;
 /// remote resources) must not hold the pane blank indefinitely.
 const HTML_REVEAL_TIMEOUT_MS: u64 = 400;
 
+/// CardDAV has no push equivalent in this app yet, so contacts are refreshed
+/// on a fixed polling interval.
+const CONTACTS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// How narrow the mail screen's folder pane may be dragged, in pixels. The
 /// pane holds a `Gtk.ScrolledWindow`, which reports no meaningful minimum
 /// width of its own, so without this the separator can be dragged until the
@@ -147,6 +151,9 @@ impl BodyCache {
 /// need for `Arc<Mutex<_>>` on this side of the worker-thread boundary.
 struct UiState {
     accounts: HashMap<AccountId, AccountHandle>,
+    /// CardDAV-derived addresses discovered for each account. Kept in memory
+    /// and merged with the mail-history cache for compose autocomplete.
+    contacts_by_account: HashMap<AccountId, Vec<EmailAddress>>,
     /// Which account owns the currently-open mailbox - drives command
     /// routing (FetchBody, compose "From") and which account's
     /// `MessagesUpdated` events are allowed to update the message list (a
@@ -662,6 +669,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let last_selection = last_view::load();
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
+        contacts_by_account: HashMap::new(),
         current_account: None,
         current_mailbox: None,
         mail_view: MailView::Single,
@@ -2640,7 +2648,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     spawn_account_discovery(
         worker.clone(),
-        state,
+        state.clone(),
         root_stack.clone(),
         toast_overlay.clone(),
         folder_selection,
@@ -2652,6 +2660,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         list_header,
         refresh_config.clone(),
     );
+    spawn_contacts_discovery(worker.clone(), state.clone(), toast_overlay.clone());
     spawn_calendar_discovery(
         worker,
         calendar_state,
@@ -2668,6 +2677,150 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     );
 
     window
+}
+
+fn contacts_match_prefix(contact: &EmailAddress, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    let needle = prefix.to_lowercase();
+    contact.address.to_lowercase().starts_with(&needle)
+        || contact
+            .name
+            .as_deref()
+            .is_some_and(|name| name.to_lowercase().starts_with(&needle))
+}
+
+fn dedupe_addresses(addresses: Vec<EmailAddress>, limit: usize) -> Vec<EmailAddress> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for addr in addresses {
+        let key = addr.address.trim().to_lowercase();
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        out.push(addr);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn merge_contact_suggestions(mail_history: Vec<EmailAddress>, carddav: &[EmailAddress], prefix: &str, limit: usize) -> Vec<EmailAddress> {
+    let mut merged = Vec::new();
+    merged.extend(mail_history);
+    merged.extend(carddav.iter().filter(|c| contacts_match_prefix(c, prefix)).cloned());
+    dedupe_addresses(merged, limit)
+}
+
+fn spawn_contacts_discovery(worker: Rc<Worker>, state: Rc<RefCell<UiState>>, toast_overlay: adw::ToastOverlay) {
+    let (goa_tx, goa_rx) = async_channel::bounded(1);
+    worker.spawn(async move {
+        let result = async {
+            let client = GoaClient::connect().await?;
+            let accounts = client.list_contacts_accounts().await?;
+            Ok::<_, lookout_goa::Error>((client, accounts))
+        }
+        .await;
+        let _ = goa_tx.send(result).await;
+    });
+
+    glib::spawn_future_local(async move {
+        let Ok(result) = goa_rx.recv().await else { return };
+        match result {
+            Ok((client, accounts)) => {
+                for account in accounts {
+                    sync_contacts_account(worker.clone(), state.clone(), toast_overlay.clone(), client.clone(), account);
+                }
+            }
+            Err(e) => {
+                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't reach GNOME Online Accounts contacts: {e}")));
+            }
+        }
+    });
+}
+
+fn sync_contacts_account(worker: Rc<Worker>, state: Rc<RefCell<UiState>>, toast_overlay: adw::ToastOverlay, goa_client: GoaClient, account: GoaContactsAccount) {
+    let account_id = account.account_id.clone();
+    let label = account.display_name.clone();
+    let (tx, rx) = async_channel::unbounded();
+    worker.spawn(async move {
+        let mut first = true;
+        loop {
+            let result = fetch_carddav_contacts(goa_client.clone(), account.clone()).await;
+            if tx.send((first, result)).await.is_err() {
+                break;
+            }
+            first = false;
+            tokio::time::sleep(CONTACTS_REFRESH_INTERVAL).await;
+        }
+    });
+
+    glib::spawn_future_local(async move {
+        while let Ok((is_first, result)) = rx.recv().await {
+            match result {
+                Ok(contacts) => {
+                    state.borrow_mut().contacts_by_account.insert(account_id.clone(), contacts);
+                }
+                Err(message) => {
+                    tracing::warn!("CardDAV contact sync failed for {label}: {message}");
+                    // Surface an initial failure to the user, but avoid
+                    // repeating the same toast every poll interval.
+                    if is_first {
+                        toast_overlay.add_toast(adw::Toast::new(&format!("{label}: {message}")));
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccount) -> Result<Vec<EmailAddress>, String> {
+    goa_client
+        .ensure_credentials_contacts(&account)
+        .await
+        .map_err(|e| e.to_string())?;
+    let credential = match &account.auth {
+        ContactsAuthMethod::OAuth2 => {
+            let (token, _expires_in) = goa_client.get_access_token_contacts(&account).await.map_err(|e| e.to_string())?;
+            Credential::OAuth2AccessToken(token)
+        }
+        ContactsAuthMethod::Password { .. } => {
+            let password = goa_client.get_contacts_password(&account).await.map_err(|e| e.to_string())?;
+            Credential::Password(password)
+        }
+    };
+
+    let config = CardDavAccountConfig {
+        account_id: account.account_id.clone(),
+        display_name: account.display_name.clone(),
+        base_url: account.uri.clone(),
+        accept_ssl_errors: account.accept_ssl_errors,
+        username: account.display_name.clone(),
+    };
+    let client = DavClient::new(&config.base_url, config.accept_ssl_errors, config.username.clone()).map_err(|e| e.to_string())?;
+    let home = client.discover_addressbook_home(&credential).await.map_err(|e| e.to_string())?;
+    let books = client
+        .list_addressbooks(&home, &config.account_id, &credential)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut addresses = Vec::new();
+    for book in books {
+        match client.fetch_addressbook_vcards(&book, &credential).await {
+            Ok(vcards) => {
+                for card in vcards {
+                    addresses.extend(card.email_addresses());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("CardDAV addressbook fetch failed for {:?}: {e}", book.display_name);
+            }
+        }
+    }
+
+    Ok(dedupe_addresses(addresses, usize::MAX))
 }
 
 /// Re-anchors the main calendar panel's already-redrawn views, keeps the
@@ -4144,16 +4297,20 @@ fn show_composer_in_reading_pane(
         // consumer future exits and late events go nowhere.
         state_for_close.borrow_mut().draft_saved_tx = None;
     });
-    // Recipient autocomplete, drawn from the addresses this account has seen
-    // in synced mail (there is no contacts source until Phase 4's CardDAV
-    // work). Runs synchronously on the UI thread: it's an indexed prefix
-    // query on a small table, and a keystroke can't wait on a channel round
-    // trip. Any failure - no cache, a locked database - is silently no
-    // suggestions rather than an error the user has to dismiss mid-sentence.
-    let address_cache = account_id.and_then(|id| state.borrow().accounts.get(&id).and_then(|h| h.address_cache.clone()));
+    // Recipient autocomplete combines local mail-history addresses with
+    // CardDAV contacts discovered for this account. Both are queried from UI
+    // memory/state synchronously so a keystroke never waits on a worker round
+    // trip.
+    let address_cache = account_id.clone().and_then(|id| state.borrow().accounts.get(&id).and_then(|h| h.address_cache.clone()));
+    let state_for_suggestions = state.clone();
+    let account_id_for_suggestions = account_id.clone();
     let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str| {
-        let Some(cache) = &address_cache else { return Vec::new() };
-        cache.search_addresses(prefix, 8).unwrap_or_default()
+        let mail_history = address_cache.as_ref().map(|cache| cache.search_contacts(prefix, 8)).unwrap_or_default();
+        let carddav = account_id_for_suggestions
+            .as_ref()
+            .and_then(|id| state_for_suggestions.borrow().contacts_by_account.get(id).cloned())
+            .unwrap_or_default();
+        merge_contact_suggestions(mail_history, &carddav, prefix.trim(), 8)
     });
     let (composer, draft_tx) = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done, rich_text_default, suggestions);
     // Replacing any previous composer's relay (dropped sender = its consumer
@@ -4282,6 +4439,7 @@ mod tests {
                     address_cache: None,
                 },
             )]),
+            contacts_by_account: HashMap::new(),
             current_account: None,
             current_mailbox: None,
             mail_view: MailView::Single,

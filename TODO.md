@@ -24,7 +24,7 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [x] Compose window: plain-text body, `mail-builder` MIME, `lettre` SMTP send (XOAUTH2/password), `APPEND` to Sent - validated live end-to-end against Gmail
   - [x] reply/reply-all/forward entry points - pre-filled subject/quoted body/`In-Reply-To`/`References` threading, Reply-All carries over To/Cc minus the account's own address. New/Reply/Reply-All/Forward all open in place of the reading pane's content (a `"compose"` page in its `gtk::Stack`) rather than a separate modal window
   - [x] Rich-text/contenteditable WebView body - a "Rich text" switch in the composer flips between the plain `Gtk.TextView` and a contenteditable WebKit `WebView` with a formatting toolbar (bold/italic/underline/strikethrough, lists, font size, text color, links); rich send emits `multipart/alternative` HTML+text, and the default mode is settable under Config → Mail
-  - [x] Recipient chip widget with autocomplete - To/Cc (and a new Bcc field) are `RecipientEntry` widgets (`recipient_entry.rs`): each recipient is a removable pill in a wrapping `Gtk.FlowBox` with the text entry trailing the last chip, committed on Enter/comma/semicolon/Tab, removed by its × or by Backspace on an empty entry. Tokenizing respects quoted display names, so `"Lovelace, Ada" <ada@example.com>` stays one recipient; an implausible address is styled as a warning rather than rejected. Typing offers completions from an address book harvested out of synced envelopes (`Cache::record_addresses`/`search_addresses`, ranked by how often each correspondent appears) - there's no contacts source until Phase 4's CardDAV work, and the lookup is a synchronous indexed query against a read-side cache handle rather than an `AccountCommand` round trip, since a keystroke can't wait on the IMAP session
+  - [x] Recipient chip widget with autocomplete - To/Cc (and a new Bcc field) are `RecipientEntry` widgets (`recipient_entry.rs`): each recipient is a removable pill in a wrapping `Gtk.FlowBox` with the text entry trailing the last chip, committed on Enter/comma/semicolon/Tab, removed by its × or by Backspace on an empty entry. Tokenizing respects quoted display names, so `"Lovelace, Ada" <ada@example.com>` stays one recipient; an implausible address is styled as a warning rather than rejected. Typing now merges two sources: a local address book harvested out of synced envelopes (`Cache::record_addresses`/`search_addresses`, ranked by correspondence frequency) plus CardDAV contacts fetched via `lookout-dav` and refreshed periodically in the background; the lookup remains synchronous from UI-owned state/read-side cache handles rather than an `AccountCommand` round trip, since a keystroke can't wait on the IMAP session
   - [x] Autosave drafts - a 5-second tick compares the composer's fields against the last saved snapshot and, when they differ (and aren't trivially empty), `APPEND`s the message to the account's Drafts mailbox via `AccountCommand::SaveDraft`, replacing the previous autosave in place by a stable per-compose-session `Message-ID`. Cancel saves once more so closing never loses work; Send deletes the stored draft first. Accounts without a Drafts mailbox get one `CREATE`d
   - [ ] Multiple sending identities (currently always sends as the account's own address)
 - [x] Connection lifecycle: state machine, backoff reconnect, IDLE re-issue before RFC 2177 timeout, `Gio.NetworkMonitor`-driven reconnect (cuts the backoff wait short once connectivity is back)
@@ -86,13 +86,21 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 
 ## Phase 4 — Contacts (roadmap)
 
-- [ ] Shared `lookout-dav` plumbing for CardDAV (incl. RFC 6578 sync-collection REPORT)
-- [ ] vCard parser/writer (RFC 6350) — no crate verified robust enough; likely hand-rolled
+- [x] Shared `lookout-dav` plumbing for CardDAV (incl. RFC 6578 sync-collection REPORT)
+- [x] vCard parser/writer (RFC 6350) — hand-rolled parser/writer in `lookout-core` with CardDAV parsing wired through `lookout-dav`
+- [ ] Contacts UI tab
+  - [ ] Layout scaffold: split-pane Contacts view with left navigation and right content list
+  - [ ] Left pane model: per-account contact category tree/list (e.g. All contacts, groups, directories/address books)
+  - [ ] Selection wiring: selecting an account/category updates the right-side list query/filter
+  - [ ] Right pane list: contact rows (name, primary email, optional avatar/org) bound to the active left-side selection
+  - [ ] Contact details dialog: clicking a contact opens a dialog showing full contact information (emails, phones, addresses, org/title, notes)
 - [ ] Address book CRUD, groups, vCard import/export with duplicate detection
 - [ ] Shared `ContactsProvider` trait consumed by mail composer, calendar attendees, and the contacts app
+  - [x] Mail composer consumes `ContactsProvider` (mail-cache + CardDAV-backed suggestions)
+  - [ ] Calendar attendees and dedicated contacts app still pending
 
 ## Phase 5 — Settings/theming (roadmap)
 
-- [ ] `AdwPreferencesWindow` mirroring Bulwark's tab taxonomy (General/Appearance/Layout/Mail/Privacy/Apps/Advanced) - in-window Config view exists (`config_view.rs`, third nav-rail button) with a live account overview, a live Appearance section ("Animate transitions" switch plus the "Window background" image picker and "Restore default background" action), a live Mail section ("Load images from the web" and "Rich text" switches), and a working Advanced → "Clear all caches" action; the General/Layout/Privacy/Apps sections are still disabled placeholders
+- [x] `AdwPreferencesWindow` mirroring Bulwark's tab taxonomy (General/Appearance/Layout/Mail/Privacy/Apps/Advanced) - in-window Config view exists (`config_view.rs`, third nav-rail button) with a live account overview, a live Appearance section ("Animate transitions" switch plus the "Window background" image picker and "Restore default background" action), a live Mail section ("Load images from the web" and "Rich text" switches), and a working Advanced → "Clear all caches" action; the General/Layout/Privacy/Apps sections are still disabled placeholders
 - [ ] GSettings (scalars) + serde config file (relational data: identities, folder-role overrides, tag colors) - the layout toggles, "Animate transitions", the sort key/direction, folder favorites, and the Mail-section switches are still session-only; only calendar colours and the window-background choice persist today, as best-effort plain files under `$XDG_CONFIG_HOME/lookout/`
 - [ ] libadwaita named-color theming; optional bundled flat-token themes (web-only CSS-injection "skin" themes have no native equivalent and are out of scope)

@@ -11,5 +11,7 @@ mod discovery;
 mod error;
 mod proxies;
 
-pub use discovery::{AuthMethod, CalendarAuthMethod, EndpointConfig, GoaCalendarAccount, GoaClient, GoaMailAccount};
+pub use discovery::{
+	AuthMethod, CalendarAuthMethod, ContactsAuthMethod, EndpointConfig, GoaCalendarAccount, GoaClient, GoaContactsAccount, GoaMailAccount,
+};
 pub use error::{Error, Result};

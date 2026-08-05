@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.39 (2026-08-06)
+
+### Added
+
+- **Contacts/GOA**: GOA Contacts discovery and credential plumbing are now first-class alongside Mail and Calendar. `lookout-goa` gained `list_contacts_accounts()` plus Contacts-specific auth modeling (`ContactsAuthMethod`) and credential helpers (`ensure_credentials_contacts`, `get_access_token_contacts`, `get_contacts_password`), with the fake GOA D-Bus integration test extended to cover Contacts interface discovery and both OAuth2/password credential paths.
+- **Contacts/CardDAV**: the app now performs CardDAV contacts sync on startup for GOA contacts-enabled accounts and refreshes it periodically in the background (15-minute poll). Contacts are fetched through `lookout-dav` (`discover_addressbook_home` → `list_addressbooks` → vCard fetch/parse), normalized to email-address suggestions, deduplicated by address, and stored in UI state per account.
+
+### Changed
+
+- **Compose**: recipient autocomplete now merges two sources for the active account: (1) correspondence-ranked local mail-history addresses from the SQLite cache and (2) CardDAV-derived contacts, both filtered by the current prefix and deduplicated before display. This keeps the keystroke path synchronous and low-latency while materially improving completion coverage beyond previously seen correspondents.
+- **Core API**: shared contacts lookup was formalized with `lookout-core::ContactsProvider`; `lookout-mail::Cache` now implements it, and composer suggestion call sites use the trait-facing `search_contacts` surface.
+- **Core/vCard**: `lookout-core`'s RFC 6350 implementation gained `VCard::email_addresses()` to project parsed vCards into shared `EmailAddress` values (with display-name derivation), and tests were expanded accordingly.
+
+### Fixed
+
+- **Build hygiene**: the previous dead-code warning suppressions around staged CardDAV helpers were removed by wiring those paths into real app usage. Workspace checks now complete cleanly (`cargo check -q`) with the CardDAV/contact code active rather than lint-silenced.
+
 ## 0.6.38 (2026-08-05)
 
 ### Changed

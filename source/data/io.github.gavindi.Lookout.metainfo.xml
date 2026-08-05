@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.39" date="2026-08-06">
+      <description>
+        <p>Composer recipient suggestions now include contacts from your online address books, not just recent correspondents from mail history, and contact sync refreshes in the background. This release also improves Contacts groundwork with GNOME Online Accounts contacts discovery and CardDAV integration.</p>
+      </description>
+    </release>
     <release version="0.6.38" date="2026-08-05">
       <description>
         <p>The message list starts wider, the space between it and the reading pane is narrower, and the folder pane can no longer be dragged narrower than its folder names.</p>

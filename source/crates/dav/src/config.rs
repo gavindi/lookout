@@ -17,6 +17,19 @@ pub struct CalendarAccountConfig {
     pub username: String,
 }
 
+/// Static connection parameters for one CardDAV account.
+#[derive(Debug, Clone)]
+pub struct CardDavAccountConfig {
+    pub account_id: lookout_core::AccountId,
+    pub display_name: String,
+    /// GOA's `Contacts.Uri` / CardDAV base URL to start discovery from.
+    pub base_url: String,
+    pub accept_ssl_errors: bool,
+    /// Username to pair with a `Credential::Password` over HTTP Basic Auth.
+    /// Unused for `Credential::OAuth2AccessToken`.
+    pub username: String,
+}
+
 /// A credential obtained from GOA immediately before use. `lookout-dav` never
 /// persists these; the caller (the app crate, via `lookout-goa`) is
 /// responsible for fetching a fresh one on every (re)connect.
