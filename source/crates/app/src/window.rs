@@ -243,6 +243,19 @@ struct UiState {
     /// open; replaced whenever a new composer opens (dropping the previous
     /// sender lets the old composer's consumer exit).
     draft_saved_tx: Option<async_channel::Sender<String>>,
+    /// What the folder sidebar currently has rendered (see
+    /// `folder_tree_signature`). `FoldersUpdated` now arrives repeatedly per
+    /// account as the unread counts fill in, and almost all of those carry
+    /// nothing the tree draws; comparing against this skips the rebuild
+    /// entirely for them. `None` until the first tree is built.
+    folder_tree: Option<FolderTreeSignature>,
+    /// Set while `rebuild_folder_tree` is putting the selection back after
+    /// swapping the model, so the `selected-item` handler doesn't mistake the
+    /// restore for the user clicking a folder. Without it, re-selecting the
+    /// open mailbox would re-issue its sync, and the momentary landing on row
+    /// 0 that `GtkSingleSelection`'s autoselect does on every `set_model`
+    /// would enter the unified view.
+    suppress_folder_selection: bool,
 }
 
 /// Per-calendar-account state, kept separate from `UiState`/`AccountHandle`
@@ -304,6 +317,18 @@ fn install_paned_css() {
         }
         .folder-pane {
             background-color: rgba(0, 0, 0, 0.5);
+        }
+        /* The folder rows' trailing unread count. Bold and accent-blue to
+           match the message list's unread rows. Tabular figures ('tnum') so
+           the digits are the same width in every row - without them the
+           counts visibly jitter as they update. Single-quoted because this
+           whole stylesheet is a plain Rust string literal. */
+        .folder-unread-count {
+            color: #62a0ea;
+            font-weight: bold;
+            font-size: 0.9em;
+            font-feature-settings: 'tnum';
+            padding-right: 6px;
         }
         .folder-pane listview,
         .folder-pane scrolledwindow {
@@ -532,15 +557,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     folder_factory.connect_setup(|_, list_item| {
         let expander = gtk::TreeExpander::new();
         let icon = gtk::Image::builder().icon_size(gtk::IconSize::Normal).build();
+        // `hexpand` on the name, not the box, is what pushes the count to the
+        // trailing edge: the name takes all the slack (and ellipsizes into it
+        // when the pane is narrow) and the count keeps its natural width.
         let label = gtk::Label::builder()
             .xalign(0.0)
+            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .margin_top(6)
             .margin_bottom(6)
             .build();
+        let count = gtk::Label::builder()
+            .xalign(1.0)
+            .margin_top(6)
+            .margin_bottom(6)
+            .css_classes(["folder-unread-count"])
+            .build();
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
         row_box.append(&icon);
         row_box.append(&label);
+        row_box.append(&count);
         expander.set_child(Some(&row_box));
         list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&expander));
     });
@@ -555,37 +591,46 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let tree_item = boxed.borrow::<TreeItem>();
         let Some(row_box) = expander.child().and_downcast::<gtk::Box>() else { return };
         let Some(icon) = row_box.first_child().and_downcast::<gtk::Image>() else { return };
-        let Some(label) = row_box.last_child().and_downcast::<gtk::Label>() else { return };
+        let Some(label) = icon.next_sibling().and_downcast::<gtk::Label>() else { return };
+        let Some(count) = row_box.last_child().and_downcast::<gtk::Label>() else { return };
+        // A zero count is hidden rather than blanked: an empty label still
+        // reserves its spacing, which would leave every quiet folder's name
+        // ending short of the ones beside it.
+        let set_count = |unread: u32| {
+            count.set_visible(unread > 0);
+            if unread > 0 {
+                count.set_label(&unread.to_string());
+            }
+        };
         match &*tree_item {
-            TreeItem::Unified => {
+            TreeItem::Unified(unread) => {
                 icon.set_visible(true);
                 icon.set_icon_name(Some("mail-inbox-symbolic"));
                 label.set_label("All Inboxes");
                 label.set_css_classes(&["heading"]);
+                set_count(*unread);
             }
             TreeItem::Favorites => {
                 icon.set_visible(true);
                 icon.set_icon_name(Some(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])));
                 label.set_label("Favorites");
                 label.set_css_classes(&["heading"]);
+                // A pure grouping row: every folder under it shows its own.
+                set_count(0);
             }
             TreeItem::Account(account) => {
                 icon.set_visible(false);
                 label.set_label(&account.label);
                 label.set_css_classes(&["heading"]);
+                set_count(account.unread);
             }
             // A favorite renders exactly like the folder it duplicates.
             TreeItem::Folder(node) | TreeItem::Favorite(node) => {
-                let unread = node.mailbox.unread;
-                let text = if unread > 0 {
-                    format!("{}  ({unread})", node.mailbox.name)
-                } else {
-                    node.mailbox.name.clone()
-                };
                 icon.set_visible(true);
                 icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
-                label.set_label(&text);
+                label.set_label(&node.mailbox.name);
                 label.set_css_classes(&[]);
+                set_count(node.mailbox.unread);
             }
         }
     });
@@ -621,6 +666,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         load_remote_images: false,
         rich_text_default: true,
         draft_saved_tx: None,
+        folder_tree: None,
+        suppress_folder_selection: false,
     }));
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
@@ -2301,11 +2348,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list = message_list.clone();
         let list_header = list_header.clone();
         folder_selection.connect_selected_item_notify(move |sel| {
+            // A rebuild putting the highlight back where it was is not the
+            // user navigating; see `UiState::suppress_folder_selection`.
+            if state.borrow().suppress_folder_selection {
+                return;
+            }
             let Some(row) = sel.selected_item().and_downcast::<gtk::TreeListRow>() else { return };
             let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
             let tree_item = boxed.borrow::<TreeItem>();
             match &*tree_item {
-                TreeItem::Unified => {
+                TreeItem::Unified(_) => {
                     drop(tree_item);
                     enter_unified_inbox(&state, &message_list);
                     refresh_list_header(&state, &list_header);
@@ -3562,6 +3614,31 @@ fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String
 /// (id, label, folders), then the resolved starred mailboxes.
 type FolderTreeSnapshot = (bool, Vec<(AccountId, String, Vec<Mailbox>)>, Vec<Mailbox>);
 
+/// Exactly the data the sidebar draws - per account its id and label, and per
+/// folder the id, display name, icon-selecting role, delimiter (the tree's
+/// parent/child structure is derived from it) and unread count - plus the
+/// favorites section's membership. Compared against the previous rebuild's
+/// value to decide whether a `FoldersUpdated` needs a rebuild at all.
+///
+/// Deliberately *not* the whole `Mailbox`: a STATUS refresh writes `uidnext`
+/// and `uidvalidity` on every pass, and including fields the tree never
+/// renders would make the guard fire on changes that can't be seen.
+type FolderTreeSignature = Vec<(AccountId, String, Vec<(MailboxId, String, MailboxRole, char, u32)>)>;
+
+fn folder_tree_signature(accounts: &[(AccountId, String, Vec<Mailbox>)], favorites: &[Mailbox]) -> FolderTreeSignature {
+    let row = |m: &Mailbox| (m.id.clone(), m.name.clone(), m.role, m.delimiter, m.unread);
+    let mut signature: FolderTreeSignature = accounts
+        .iter()
+        .map(|(id, label, folders)| (id.clone(), label.clone(), folders.iter().map(row).collect()))
+        .collect();
+    // The favorites section is a real part of the rendered tree (it appears
+    // and disappears with its membership), so it belongs in the signature.
+    // Carried under a reserved pseudo-account id rather than a separate field
+    // so the comparison stays a single `==`.
+    signature.push((AccountId("\u{0}favorites".into()), String::new(), favorites.iter().map(row).collect()));
+    signature
+}
+
 /// Rebuilds the folder sidebar's `Gtk.TreeListModel` from every connected
 /// account's latest folder snapshot. Accounts are sorted by email for a
 /// stable order across rebuilds (`HashMap` iteration order isn't stable,
@@ -3632,10 +3709,105 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
         }
     }
 
+    // Nothing the sidebar draws has changed - most `FoldersUpdated` events
+    // are now folder-count refreshes for folders whose counts didn't move, so
+    // this is the common case. Swapping in an identical model is not free:
+    // it rebuilds every row, collapses whatever subfolders the user had
+    // expanded, and drops the selection (see the restore below), so skipping
+    // it outright is what keeps the pane still while counts fill in.
+    let signature = folder_tree_signature(&accounts, &favorites);
+    {
+        let st = state.borrow();
+        if st.folder_tree.as_ref() == Some(&signature) && !auto_select_inbox && !st.restore_pending {
+            return;
+        }
+    }
+
+    // The selection and the expanded subfolders don't survive `set_model`, so
+    // note them first and put them back afterwards.
+    let expanded = expanded_mailboxes(folder_selection);
+    let restore_to = {
+        let st = state.borrow();
+        match st.mail_view {
+            // Row 0 is always the "All Inboxes" row.
+            MailView::UnifiedInbox => Some(SelectionTarget::Unified),
+            MailView::Single => st.current_mailbox.clone().map(SelectionTarget::Mailbox),
+        }
+    };
+
     let model = build_multi_account_tree_model(accounts, favorites);
+    // Everything from here to the flag being cleared is the rebuild putting
+    // the pane back the way the user left it, not the user navigating - so
+    // the `selected-item` handler has to stay out of it. `set_model` alone
+    // fires it, autoselecting row 0 and thereby entering the unified view.
+    state.borrow_mut().suppress_folder_selection = true;
     folder_selection.set_model(Some(&model));
+    expand_mailboxes(&model, &expanded);
+    match restore_to {
+        Some(SelectionTarget::Unified) => folder_selection.set_selected(0),
+        Some(SelectionTarget::Mailbox(mailbox)) => {
+            if let Some(index) = find_mailbox_index(&model, &mailbox) {
+                folder_selection.set_selected(index);
+            }
+        }
+        None => {}
+    }
+    state.borrow_mut().suppress_folder_selection = false;
+
+    state.borrow_mut().folder_tree = Some(signature);
     if auto_select_inbox {
         restore_or_default_initial_view(state, &model, folder_selection);
+    }
+}
+
+/// Where `rebuild_folder_tree` puts the sidebar highlight back after swapping
+/// the model: the pinned "All Inboxes" row, or the open mailbox's own row.
+enum SelectionTarget {
+    Unified,
+    Mailbox(MailboxId),
+}
+
+/// The mailboxes whose rows are currently expanded, so a rebuild can restore
+/// them. Only `TreeItem::Folder` rows are collected - account groups and the
+/// Favorites section are expanded unconditionally by
+/// `build_multi_account_tree_model`, and `Favorite` rows are leaves.
+fn expanded_mailboxes(folder_selection: &gtk::SingleSelection) -> HashSet<MailboxId> {
+    let mut expanded = HashSet::new();
+    let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() else {
+        return expanded;
+    };
+    for i in 0..model.n_items() {
+        let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
+        if !row.is_expanded() {
+            continue;
+        }
+        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { continue };
+        let tree_item = boxed.borrow::<TreeItem>();
+        if let TreeItem::Folder(node) = &*tree_item {
+            expanded.insert(node.mailbox.id.clone());
+        }
+    }
+    expanded
+}
+
+/// Re-expands the rows named by `expanded` in a freshly built model. Walks by
+/// index rather than over a snapshot because expanding a row inserts its
+/// children into the model, and those children may themselves need expanding.
+fn expand_mailboxes(model: &gtk::TreeListModel, expanded: &HashSet<MailboxId>) {
+    if expanded.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    while i < model.n_items() {
+        if let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() {
+            if let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() {
+                let is_wanted = matches!(&*boxed.borrow::<TreeItem>(), TreeItem::Folder(node) if expanded.contains(&node.mailbox.id));
+                if is_wanted {
+                    row.set_expanded(true);
+                }
+            }
+        }
+        i += 1;
     }
 }
 
@@ -3970,6 +4142,58 @@ fn show_composer_in_reading_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lookout_core::UidValidity;
+
+    fn test_mailbox(account: &AccountId, name: &str, unread: u32) -> Mailbox {
+        Mailbox {
+            id: MailboxId::new(account, name),
+            account_id: account.clone(),
+            name: name.to_string(),
+            parent: None,
+            delimiter: '/',
+            role: MailboxRole::Inbox,
+            uidvalidity: UidValidity(1),
+            uidnext: 1,
+            highest_modseq: None,
+            total: 0,
+            unread,
+            flags: vec![],
+            subscribed: true,
+        }
+    }
+
+    #[test]
+    fn folder_tree_signature_tracks_the_unread_count() {
+        let account = AccountId("acc".into());
+        let before = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[]);
+        let after = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 4)])], &[]);
+        assert_ne!(before, after, "a changed count must rebuild the tree - it's what the row draws");
+    }
+
+    #[test]
+    fn folder_tree_signature_ignores_fields_the_tree_never_draws() {
+        // A STATUS pass rewrites uidnext/uidvalidity on every folder every
+        // time. If those counted, the guard would fire on every pass and the
+        // sidebar would rebuild (collapsing subfolders, dropping the
+        // highlight) for changes that are invisible.
+        let account = AccountId("acc".into());
+        let mut noisy = test_mailbox(&account, "INBOX", 3);
+        noisy.uidnext = 999;
+        noisy.uidvalidity = UidValidity(42);
+        noisy.total = 1234;
+        let quiet = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[]);
+        let churned = folder_tree_signature(&[(account.clone(), "Me".into(), vec![noisy])], &[]);
+        assert_eq!(quiet, churned);
+    }
+
+    #[test]
+    fn folder_tree_signature_tracks_the_favorites_section() {
+        let account = AccountId("acc".into());
+        let accounts = [(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 0)])];
+        let without = folder_tree_signature(&accounts, &[]);
+        let with = folder_tree_signature(&accounts, &[test_mailbox(&account, "INBOX", 0)]);
+        assert_ne!(without, with, "starring a folder adds a whole section and must rebuild");
+    }
 
     #[test]
     fn body_request_matches_the_current_pending_selection() {
@@ -4053,6 +4277,8 @@ mod tests {
             load_remote_images: false,
             rich_text_default: true,
             draft_saved_tx: None,
+            folder_tree: None,
+            suppress_folder_selection: false,
         }));
 
         // First request goes out and is marked pending.

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_imap::Session;
@@ -25,6 +26,12 @@ const INITIAL_FETCH_LIMIT: u32 = 200;
 /// and dropping the `Handle`'s `StopSource` cancels the wait immediately,
 /// so a command arriving mid-IDLE is picked up right away.
 const IDLE_SLICE: Duration = Duration::from_secs(25 * 60);
+
+/// How many folder-count STATUS calls the drain runs between `FoldersUpdated`
+/// emits. The drain itself yields to the command queue before *every* round
+/// trip - this only bounds how often the sidebar repaints while the counts
+/// fill in, so a hundred-folder account doesn't emit a hundred folder lists.
+const COUNT_STATUS_BATCH: usize = 5;
 
 /// How many previewless messages one sync will fetch snippets for. The list
 /// only ever shows a screenful at a time, and `sync_mailbox` re-runs on
@@ -323,15 +330,31 @@ async fn connect_and_run(
 
     let account_id = config.account_id.clone();
     let mut folders = list_mailboxes(&mut session, &account_id).await?;
+    // Fast first paint: the folder tree shows immediately and the INBOX sync
+    // that fills the message list starts right away. The per-folder STATUS
+    // counts are queued for the main loop's cooperative drain (see below)
+    // rather than issued here, so a large account's count pass never stalls
+    // the session for commands.
+    //
+    // LIST reports no counts at all, so the ones learned last run are carried
+    // over from the cache first - otherwise this emit would visibly blank
+    // every count the pre-connect cache replay just painted, and the sidebar
+    // would flash counts -> zeros -> counts on every launch.
     if let Some(cache) = cache {
-        if let Err(e) = cache.replace_mailboxes(&account_id, &folders) {
-            tracing::warn!("failed to cache mailbox list: {e}");
+        if let Ok(known) = cache.load_mailboxes(&account_id) {
+            carry_counts_forward(&mut folders, &known);
         }
     }
-    let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
+    publish_folders(&folders, &account_id, cache, events).await;
 
     let inbox_id = MailboxId::new(&account_id, "INBOX");
     sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache).await?;
+
+    // Folders still awaiting their STATUS count, drained cooperatively below.
+    // Held as ids rather than indices so a re-list that reorders (or shortens)
+    // the folder list can't leave the queue pointing at the wrong mailbox.
+    // Re-filled by `relist_folders` whenever the list changes.
+    let mut counts_pending: VecDeque<MailboxId> = queue_folder_counts(&folders, &inbox_id);
 
     let mut current_mailbox_name = "INBOX".to_string();
     let mut current_mailbox_id = inbox_id.clone();
@@ -354,55 +377,76 @@ async fn connect_and_run(
         Some(PrefetchState::new(prefetch_mailboxes))
     };
 
+    // What ended a main-loop iteration's wait. Declared outside the loop
+    // because the wait itself is now conditional - a command already sitting
+    // in the queue produces a `Wake` without any IDLE at all.
+    enum Wake {
+        Idle(std::result::Result<async_imap::extensions::idle::IdleResponse, async_imap::error::Error>),
+        Command(AccountCommand),
+        ChannelClosed,
+    }
+
     loop {
-        let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
+        // Take a command that's *already* queued without entering IDLE first.
+        // Establishing an IDLE and tearing it down again costs two round
+        // trips, and the previous shape paid them both before the wake select
+        // could even look at the queue - so every command that arrived while
+        // the session was busy with background work (a prefetch batch, a
+        // folder-count STATUS) waited on a SELECT plus those two round trips
+        // purely to be handed something already in hand. That is most of what
+        // made a folder click land a beat late while counts were filling in.
+        let wake = match commands.try_recv() {
+            Ok(cmd) => Wake::Command(cmd),
+            Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
+            Err(async_channel::TryRecvError::Empty) => {
+                let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
-        // A cache-served folder switch (or an interrupted prefetch) can leave
-        // the session SELECTed on a different folder than the one the user is
-        // viewing. IDLE only reports changes to the currently-selected folder,
-        // so bring the session back in line before the wait. This is a cheap
-        // round trip (no FETCH) and is skipped whenever the session already
-        // matches.
-        if session_selected != current_mailbox_id {
-            session.select(&current_mailbox_name).await?;
-            session_selected = current_mailbox_id.clone();
-        }
+                // A cache-served folder switch (or an interrupted prefetch) can
+                // leave the session SELECTed on a different folder than the one
+                // the user is viewing. IDLE only reports changes to the
+                // currently-selected folder, so bring the session back in line
+                // before the wait. This is a cheap round trip (no FETCH) and is
+                // skipped whenever the session already matches. Only reached on
+                // the way *into* IDLE, so a queued command never pays for it -
+                // its own handler selects whatever folder it needs.
+                if session_selected != current_mailbox_id {
+                    session.select(&current_mailbox_name).await?;
+                    session_selected = current_mailbox_id.clone();
+                }
 
-        let mut handle = session.idle();
-        handle.init().await?;
-        let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
+                let mut handle = session.idle();
+                handle.init().await?;
+                let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
 
-        // Race the IDLE wait against the next command so an on-demand
-        // request (open a message, switch folders, ...) doesn't wait for
-        // IDLE_SLICE to elapse. If the command branch wins, `wait_fut` is
-        // dropped along with `stop_source`; dropping a `StopSource` cancels
-        // its associated wait immediately (see `stop_token::StopSource`'s
-        // docs) - but since we're also dropping `wait_fut` itself here, we
-        // don't even need to observe that cancellation, we just move
-        // straight on to `handle.done()` below to send IMAP's `DONE` and
-        // reclaim the session.
-        enum Wake {
-            Idle(std::result::Result<async_imap::extensions::idle::IdleResponse, async_imap::error::Error>),
-            Command(AccountCommand),
-            ChannelClosed,
-        }
-        let wake = tokio::select! {
-            r = wait_fut => Wake::Idle(r),
-            c = commands.recv() => match c {
-                Ok(cmd) => Wake::Command(cmd),
-                Err(_) => Wake::ChannelClosed,
-            },
+                // Race the IDLE wait against the next command so an on-demand
+                // request (open a message, switch folders, ...) doesn't wait for
+                // IDLE_SLICE to elapse. If the command branch wins, `wait_fut` is
+                // dropped along with `stop_source`; dropping a `StopSource` cancels
+                // its associated wait immediately (see `stop_token::StopSource`'s
+                // docs) - but since we're also dropping `wait_fut` itself here, we
+                // don't even need to observe that cancellation, we just move
+                // straight on to `handle.done()` below to send IMAP's `DONE` and
+                // reclaim the session.
+                let wake = tokio::select! {
+                    r = wait_fut => Wake::Idle(r),
+                    c = commands.recv() => match c {
+                        Ok(cmd) => Wake::Command(cmd),
+                        Err(_) => Wake::ChannelClosed,
+                    },
+                };
+
+                // Emit cached messages for instant display the instant a folder
+                // switch arrives, *before* the IDLE teardown (handle.done().await)
+                // so the UI paints from disk while we wait for the network round-trip.
+                if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
+                    emit_cached_messages(cache, mailbox_id, events).await;
+                }
+
+                drop(stop_source);
+                session = handle.done().await?;
+                wake
+            }
         };
-
-        // Emit cached messages for instant display the instant a folder
-        // switch arrives, *before* the IDLE teardown (handle.done().await)
-        // so the UI paints from disk while we wait for the network round-trip.
-        if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
-            emit_cached_messages(cache, mailbox_id, events).await;
-        }
-
-        drop(stop_source);
-        session = handle.done().await?;
 
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Busy)).await;
 
@@ -415,6 +459,9 @@ async fn connect_and_run(
             Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
             Wake::Idle(Ok(_)) => {
                 sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                // New mail just landed in (or was expunged from) the open
+                // folder; refresh its count so the sidebar matches the list.
+                refresh_one_folder_count(&mut session, &mut folders, &account_id, &current_mailbox_id, cache, events).await;
                 session_selected = current_mailbox_id.clone();
             }
             Wake::Idle(Err(e)) => return Err(Error::Imap(e)),
@@ -431,13 +478,7 @@ async fn connect_and_run(
                     return Ok(ShutdownReason::Requested);
                 }
                 AccountCommand::Refresh => {
-                    folders = list_mailboxes(&mut session, &account_id).await?;
-                    if let Some(cache) = cache {
-                        if let Err(e) = cache.replace_mailboxes(&account_id, &folders) {
-                            tracing::warn!("failed to cache mailbox list: {e}");
-                        }
-                    }
-                    let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
+                    relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
                     sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                     session_selected = current_mailbox_id.clone();
                     // Rebuild the prefetch list to include any new folders.
@@ -521,13 +562,7 @@ async fn connect_and_run(
                     // and the folder tree shows it. Same pattern as
                     // `MoveMessage`.
                     if !had_drafts_folder {
-                        folders = list_mailboxes(&mut session, &account_id).await?;
-                        if let Some(cache) = cache {
-                            if let Err(e) = cache.replace_mailboxes(&account_id, &folders) {
-                                tracing::warn!("failed to cache mailbox list: {e}");
-                            }
-                        }
-                        let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
+                        relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
                     }
                 }
                 AccountCommand::DeleteDraft { message_id } => {
@@ -549,13 +584,7 @@ async fn connect_and_run(
                     match move_message_to_role(&mut session, &folders, &account_id, uid, role).await {
                         Ok(()) => {
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
-                            folders = list_mailboxes(&mut session, &account_id).await?;
-                            if let Some(cache) = cache {
-                                if let Err(e) = cache.replace_mailboxes(&account_id, &folders) {
-                                    tracing::warn!("failed to cache mailbox list: {e}");
-                                }
-                            }
-                            let _ = events.send(AccountEvent::FoldersUpdated(folders.clone())).await;
+                            relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
                             sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                             session_selected = current_mailbox_id.clone();
                         }
@@ -619,6 +648,31 @@ async fn connect_and_run(
                                 sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                                 session_selected = current_mailbox_id.clone();
                             }
+                            // A \Seen store changes the folder's unread count;
+                            // patch it locally so the sidebar reflects the
+                            // change immediately instead of waiting for the
+                            // next re-list. The full STATUS pass corrects it
+                            // on the next re-list; saturating arithmetic keeps
+                            // a best-effort delta from going negative.
+                            let mut delta = 0i64;
+                            if add.contains(&SystemFlagBit::Seen) {
+                                delta -= 1;
+                            }
+                            if remove.contains(&SystemFlagBit::Seen) {
+                                delta += 1;
+                            }
+                            let count_changed = delta != 0
+                                && folders.iter_mut().any(|f| {
+                                    if f.id == mailbox {
+                                        f.unread = (f.unread as i64 + delta).max(0) as u32;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            if count_changed {
+                                publish_folders(&folders, &account_id, cache, events).await;
+                            }
                         }
                         Err(e) => {
                             let _ = events.send(AccountEvent::Error(format!("Couldn't update message flags: {e}"))).await;
@@ -631,6 +685,41 @@ async fn connect_and_run(
                     // sync; this command is a no-op if prefetch is already
                     // running or has completed.
                 }
+            }
+        }
+
+        // --- folder-count STATUS drain (cooperative) ---
+        // Runs to completion in this one iteration rather than a few calls
+        // per IDLE cycle: a STATUS is a single round trip, so a whole pass is
+        // cheap, whereas re-entering and tearing down IDLE around every few of
+        // them cost two extra round trips per batch and kept the session
+        // audibly busy for the entire pass - which is what a folder click had
+        // to queue behind. `commands.is_empty()` is checked before every round
+        // trip, so the longest a user action ever waits here is one in-flight
+        // STATUS; the queue is resumed on the next iteration exactly where it
+        // stopped. Deliberately ahead of the prefetch batch below: counts are
+        // one round trip each and immediately visible in the sidebar, while
+        // prefetch is minutes of bulk body downloading.
+        if !counts_pending.is_empty() {
+            let mut since_emit = 0usize;
+            let mut dirty = false;
+            while commands.is_empty() {
+                let Some(mailbox_id) = counts_pending.pop_front() else { break };
+                // The folder may have vanished from a re-list between being
+                // queued and being drained; skip it rather than miscounting.
+                let Some(index) = folders.iter().position(|m| m.id == mailbox_id) else { continue };
+                dirty |= refresh_folder_counts(&mut session, &mut folders[index], &account_id).await;
+                since_emit += 1;
+                if since_emit >= COUNT_STATUS_BATCH {
+                    since_emit = 0;
+                    if dirty {
+                        publish_folders(&folders, &account_id, cache, events).await;
+                        dirty = false;
+                    }
+                }
+            }
+            if dirty {
+                publish_folders(&folders, &account_id, cache, events).await;
             }
         }
 
@@ -932,7 +1021,7 @@ async fn list_mailboxes(session: &mut Session<ImapStream>, account_id: &AccountI
             parent: None, // Populated by the caller from the flat list via delimiter splitting (UI-layer concern).
             delimiter,
             role,
-            uidvalidity: UidValidity(0), // Filled in by sync_mailbox() once the folder is SELECTed.
+            uidvalidity: UidValidity(0), // Filled in by sync_mailbox() once the folder is SELECTed, or by STATUS below.
             uidnext: 0,
             highest_modseq: None,
             total: 0,
@@ -942,6 +1031,140 @@ async fn list_mailboxes(session: &mut Session<ImapStream>, account_id: &AccountI
         });
     }
     Ok(mailboxes)
+}
+
+/// One folder's best-effort STATUS count refresh (RFC 3501 §6.3.10): fills
+/// `total`/`unread` (and, for free, `uidnext`/`uidvalidity`) from the server
+/// and reports whether anything changed. Never fatal: a folder whose STATUS
+/// fails (deleted since LIST, or a server that rejects the command) keeps
+/// its LIST-only defaults, so unread counts degrade gracefully on servers
+/// without a useful STATUS. Note the crate's `Mailbox` type reports the
+/// STATUS `unseen` as a *count*, unlike SELECT's "sequence number of the
+/// first unseen message", so it maps straight onto `Mailbox::unread`.
+async fn refresh_folder_counts(session: &mut Session<ImapStream>, folder: &mut Mailbox, account_id: &AccountId) -> bool {
+    let Some(path) = folder.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
+        return false;
+    };
+    match session.status(path, "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY)").await {
+        Ok(meta) => {
+            let changed = meta.exists != folder.total || meta.unseen.unwrap_or(0) != folder.unread;
+            folder.total = meta.exists;
+            if let Some(unseen) = meta.unseen {
+                folder.unread = unseen;
+            }
+            if let Some(next) = meta.uid_next {
+                folder.uidnext = next;
+            }
+            if let Some(validity) = meta.uid_validity {
+                folder.uidvalidity = UidValidity(validity);
+            }
+            changed
+        }
+        Err(e) => {
+            tracing::debug!(mailbox = %folder.id, "STATUS failed for {}, leaving LIST-only defaults: {e}", folder.id);
+            false
+        }
+    }
+}
+
+/// The order the main loop refreshes folder counts in: the folder the user is
+/// looking at first, then the Inbox, then everything else in list order. The
+/// drain is interruptible and a large account's pass takes a while, so what
+/// matters is that the counts a user can actually see land first - draining in
+/// list order (or, worse, from the back) leaves the open folder's count until
+/// last on exactly the accounts where the pass is slowest.
+fn queue_folder_counts(folders: &[Mailbox], current: &MailboxId) -> VecDeque<MailboxId> {
+    let mut queue: VecDeque<MailboxId> = VecDeque::with_capacity(folders.len());
+    let rank = |m: &Mailbox| {
+        if m.id == *current {
+            0
+        } else if matches!(m.role, MailboxRole::Inbox) {
+            1
+        } else {
+            2
+        }
+    };
+    for wanted in 0..=2 {
+        queue.extend(folders.iter().filter(|m| rank(m) == wanted).map(|m| m.id.clone()));
+    }
+    queue
+}
+
+/// Copies the count fields a `LIST` can't report (`total`, `unread`, and the
+/// `uidnext`/`uidvalidity` that come free with a STATUS) from a previously
+/// known folder list onto a freshly listed one, matching by id. A folder
+/// that's new since the last list keeps its zeros until the drain reaches it.
+/// Without this, every re-list - on connect, on Refresh, after a message move
+/// - would reset the whole sidebar to no counts and then fill it back in.
+fn carry_counts_forward(folders: &mut [Mailbox], known: &[Mailbox]) {
+    for folder in folders {
+        if let Some(known) = known.iter().find(|m| m.id == folder.id) {
+            folder.total = known.total;
+            folder.unread = known.unread;
+            folder.uidnext = known.uidnext;
+            folder.uidvalidity = known.uidvalidity;
+        }
+    }
+}
+
+/// Persists the folder list to the cache and emits it to the UI - the one
+/// place a mutated `folders` becomes visible. Every count update funnels
+/// through here so the on-disk copy and the sidebar can never disagree.
+async fn publish_folders(folders: &[Mailbox], account_id: &AccountId, cache: Option<&crate::cache::Cache>, events: &async_channel::Sender<AccountEvent>) {
+    if let Some(cache) = cache {
+        if let Err(e) = cache.replace_mailboxes(account_id, folders) {
+            tracing::warn!("failed to cache mailbox list: {e}");
+        }
+    }
+    let _ = events.send(AccountEvent::FoldersUpdated(folders.to_vec())).await;
+}
+
+/// The re-list step shared by the Refresh command and the move/draft-create
+/// paths: `list_mailboxes` + cache + a `FoldersUpdated` emit, and re-queue
+/// every folder's STATUS count for the main loop's cooperative drain. The
+/// drain runs these one round trip at a time, yielding to the command queue
+/// before each, so these paths never block the session on a whole
+/// STATUS-per-folder pass.
+///
+/// The re-list resets every folder to its LIST-only zero counts, so the
+/// counts already learned are carried across by id - otherwise a Refresh (or
+/// any message move) would visibly blank the whole sidebar until the new pass
+/// caught up.
+async fn relist_folders(
+    session: &mut Session<ImapStream>,
+    folders: &mut Vec<Mailbox>,
+    counts_pending: &mut VecDeque<MailboxId>,
+    account_id: &AccountId,
+    current: &MailboxId,
+    cache: Option<&crate::cache::Cache>,
+    events: &async_channel::Sender<AccountEvent>,
+) -> Result<()> {
+    let mut relisted = list_mailboxes(session, account_id).await?;
+    carry_counts_forward(&mut relisted, folders);
+    *folders = relisted;
+    *counts_pending = queue_folder_counts(folders, current);
+    publish_folders(folders, account_id, cache, events).await;
+    Ok(())
+}
+
+/// Refreshes one folder's server-side counts in place and re-emits the
+/// folder list when they changed. Used after an IDLE notification so the
+/// open folder's sidebar count tracks the new-mail/expunge that just
+/// happened instead of waiting for the next full drain. Best-effort: a
+/// failed STATUS leaves the existing count and emits nothing.
+async fn refresh_one_folder_count(
+    session: &mut Session<ImapStream>,
+    folders: &mut [Mailbox],
+    account_id: &AccountId,
+    mailbox_id: &MailboxId,
+    cache: Option<&crate::cache::Cache>,
+    events: &async_channel::Sender<AccountEvent>,
+) {
+    let Some(index) = folders.iter().position(|m| m.id == *mailbox_id) else { return };
+    if !refresh_folder_counts(session, &mut folders[index], account_id).await {
+        return;
+    }
+    publish_folders(folders, account_id, cache, events).await;
 }
 
 async fn sync_mailbox(
@@ -1152,4 +1375,67 @@ async fn fetch_body_cached(
         }
     }
     Ok(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mailbox(account_id: &AccountId, name: &str, role: MailboxRole, unread: u32) -> Mailbox {
+        Mailbox {
+            id: MailboxId::new(account_id, name),
+            account_id: account_id.clone(),
+            name: name.to_string(),
+            parent: None,
+            delimiter: '/',
+            role,
+            uidvalidity: UidValidity(1),
+            uidnext: 1,
+            highest_modseq: None,
+            total: 0,
+            unread,
+            flags: vec![],
+            subscribed: true,
+        }
+    }
+
+    #[test]
+    fn count_queue_puts_the_open_folder_first_then_the_inbox() {
+        let account = AccountId("acc".into());
+        let folders = vec![
+            mailbox(&account, "Archive", MailboxRole::Archive, 0),
+            mailbox(&account, "INBOX", MailboxRole::Inbox, 0),
+            mailbox(&account, "Work", MailboxRole::Custom, 0),
+        ];
+        let open = MailboxId::new(&account, "Work");
+        let queue: Vec<MailboxId> = queue_folder_counts(&folders, &open).into();
+        assert_eq!(
+            queue,
+            vec![MailboxId::new(&account, "Work"), MailboxId::new(&account, "INBOX"), MailboxId::new(&account, "Archive"),]
+        );
+    }
+
+    #[test]
+    fn count_queue_covers_every_folder_exactly_once() {
+        // The open folder is also the Inbox here - it must not be queued
+        // twice by matching both the "current" and the "inbox" rank.
+        let account = AccountId("acc".into());
+        let folders = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0), mailbox(&account, "Work", MailboxRole::Custom, 0)];
+        let queue: Vec<MailboxId> = queue_folder_counts(&folders, &MailboxId::new(&account, "INBOX")).into();
+        assert_eq!(queue, vec![MailboxId::new(&account, "INBOX"), MailboxId::new(&account, "Work")]);
+    }
+
+    #[test]
+    fn a_relist_keeps_the_counts_already_learned() {
+        // LIST reports no counts, so a re-list arrives all-zero; without the
+        // carry-over the sidebar would blank on every Refresh and message move.
+        let account = AccountId("acc".into());
+        let known = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 7)];
+        let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0), mailbox(&account, "New", MailboxRole::Custom, 0)];
+        carry_counts_forward(&mut relisted, &known);
+        assert_eq!(relisted[0].unread, 7);
+        // A folder that's new since the last list has nothing to carry over
+        // and keeps its zeros until the drain reaches it.
+        assert_eq!(relisted[1].unread, 0);
+    }
 }

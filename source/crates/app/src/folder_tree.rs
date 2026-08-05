@@ -20,6 +20,11 @@ pub struct FolderNode {
 pub struct AccountNode {
     pub account_id: AccountId,
     pub label: String,
+    /// The account's Inbox unread count, shown at the row's trailing edge so
+    /// a collapsed account still reports whether it has new mail. Its Inbox
+    /// rather than a sum over every folder: a Junk folder with four thousand
+    /// unread would otherwise be all this number ever says.
+    pub unread: u32,
 }
 
 /// What a `Gtk.TreeListRow`'s `glib::BoxedAnyObject` actually holds - the
@@ -28,7 +33,9 @@ pub struct AccountNode {
 pub enum TreeItem {
     /// The virtual "All Inboxes" folder: merges every connected account's
     /// Inbox into one cross-account message list. A leaf row (no children).
-    Unified,
+    /// Carries the summed unread count of the inboxes it merges, since it is
+    /// a real destination the user reads mail in, not just a grouping row.
+    Unified(u32),
     /// The "Favorites" grouping row, pinned between "All Inboxes" and the
     /// account groups. Present only while at least one folder is starred.
     Favorites,
@@ -79,6 +86,13 @@ pub fn build_folder_roots(mailboxes: Vec<Mailbox>, account_id: &AccountId) -> Ve
     root_paths.iter().map(|p| build(p, &by_path, &children_of)).collect()
 }
 
+/// One account's Inbox unread count - the number its account row and the
+/// unified row are built from. Zero when the account has no Inbox (it hasn't
+/// finished connecting, or the server names it something unrecognized).
+fn inbox_unread(mailboxes: &[Mailbox]) -> u32 {
+    mailboxes.iter().find(|m| matches!(m.role, MailboxRole::Inbox)).map_or(0, |m| m.unread)
+}
+
 fn parent_path(path: &str, delimiter: char) -> Option<String> {
     path.rsplit_once(delimiter).map(|(parent, _)| parent.to_string())
 }
@@ -108,16 +122,21 @@ fn sort_paths(paths: &mut [String], by_path: &HashMap<String, Mailbox>) {
 pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mailbox>)>, favorites: Vec<Mailbox>) -> gtk::TreeListModel {
     let mut folder_roots_by_account: HashMap<AccountId, Vec<Rc<FolderNode>>> = HashMap::new();
     let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
-    root_store.append(&glib::BoxedAnyObject::new(TreeItem::Unified));
+    // The unified row merges exactly the inboxes the account rows count, so
+    // its number is their sum - computed before `accounts` is consumed below.
+    let unified_unread: u32 = accounts.iter().map(|(_, _, mailboxes)| inbox_unread(mailboxes)).sum();
+    root_store.append(&glib::BoxedAnyObject::new(TreeItem::Unified(unified_unread)));
     let favorite_nodes: Vec<Rc<FolderNode>> = favorites.into_iter().map(|mailbox| Rc::new(FolderNode { mailbox, children: Vec::new() })).collect();
     if !favorite_nodes.is_empty() {
         root_store.append(&glib::BoxedAnyObject::new(TreeItem::Favorites));
     }
     for (account_id, label, mailboxes) in accounts {
+        let unread = inbox_unread(&mailboxes);
         let roots = build_folder_roots(mailboxes, &account_id);
         root_store.append(&glib::BoxedAnyObject::new(TreeItem::Account(AccountNode {
             account_id: account_id.clone(),
             label,
+            unread,
         })));
         folder_roots_by_account.insert(account_id, roots);
     }
@@ -136,7 +155,7 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
             return Some(store.upcast::<gio::ListModel>());
         }
         let children = match &*tree_item {
-            TreeItem::Unified | TreeItem::Favorites | TreeItem::Favorite(_) => return None,
+            TreeItem::Unified(_) | TreeItem::Favorites | TreeItem::Favorite(_) => return None,
             TreeItem::Account(acc) => folder_roots_by_account.get(&acc.account_id)?.clone(),
             TreeItem::Folder(node) => node.children.clone(),
         };
