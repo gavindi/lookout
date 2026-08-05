@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.38 (2026-08-05)
+
+### Changed
+
+- **Mail**: three proportions on the mail screen. The message list starts 15% wider (the `Paned` position between it and the reading pane goes from 320px to 368px); since that `Paned` gives the extra space to the reading pane on resize (`resize_end_child(true)`), the 48px comes out of the reading pane rather than the folder pane. The gap between the message list and the reading pane is halved, 24px to 12px: that gap is the two cards' facing margins plus the separator between them, and it's the margins that are dropped to zero rather than the separator that's narrowed, so the full 12px stays draggable - the separator is transparent, so the two approaches look identical but only the separator grabs the pointer. The folder pane now has a 150px minimum width, so the separator can't be dragged left until the folder names are a sliver. That floor goes on the folder pane's card, not on the `Gtk.ScrolledWindow` inside it: a `ScrolledWindow` deliberately absorbs its child's size request instead of propagating it, which is why the pane had no meaningful minimum in the first place, and it only bites at all because the `Paned` sets `shrink_start_child(false)`.
+
 ## 0.6.37 (2026-08-05)
 
 ### Added

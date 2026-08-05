@@ -99,6 +99,13 @@ const BODY_CACHE_IN_MEMORY: usize = 25;
 /// remote resources) must not hold the pane blank indefinitely.
 const HTML_REVEAL_TIMEOUT_MS: u64 = 400;
 
+/// How narrow the mail screen's folder pane may be dragged, in pixels. The
+/// pane holds a `Gtk.ScrolledWindow`, which reports no meaningful minimum
+/// width of its own, so without this the separator can be dragged until the
+/// folder names are a sliver. Applied to `folder_card`, not the scroller -
+/// see the call site.
+const FOLDER_PANE_MIN_WIDTH: i32 = 150;
+
 /// A small bounded LRU of recently-viewed message bodies, keyed by
 /// `(mailbox, uid)`, front = most recently used. See `BODY_CACHE_IN_MEMORY`.
 struct BodyCache {
@@ -641,6 +648,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     folder_card.add_css_class("folder-pane");
     folder_card.add_css_class("card-flush-end");
     folder_card.set_margin_end(0);
+    // Floor on the folder pane's width, so the separator can't be dragged
+    // left until the folder names are a sliver. Set on the card rather than
+    // on `folder_scroller`'s child because `Gtk.ScrolledWindow` absorbs its
+    // child's size request instead of propagating it - the same reason
+    // `reading_stack`'s height floor is set where it is. It only bites
+    // because `main_paned` sets `shrink_start_child(false)`, which is what
+    // makes the Paned honour the child's minimum.
+    folder_card.set_size_request(FOLDER_PANE_MIN_WIDTH, -1);
 
     // --- Message list ---
     let message_list = MessageListModel::build();
@@ -1172,6 +1187,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let message_card = card_section(&message_box);
     message_card.add_css_class("card-flush-start");
     message_card.set_margin_start(0);
+    // Halves the gap to the reading pane: that gap is this margin plus the
+    // Paned separator (12px, see `install_paned_css`) plus the reading
+    // card's own start margin, so dropping both card margins to 0 takes it
+    // from 24px to 12px. Zeroing the margins rather than narrowing the
+    // separator keeps the whole gap draggable - the separator is
+    // transparent, so the two look identical but only it grabs the pointer.
+    message_card.set_margin_end(0);
 
     // --- Sync button -> re-sync whatever the list is showing. ---
     {
@@ -1444,6 +1466,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     reading_pane_box.append(&reading_stack);
 
     let reading_card = card_section(&reading_pane_box);
+    // See `message_card` above - the other half of the halved gap.
+    reading_card.set_margin_start(0);
 
     // Keep the reading pane's card fully transparent while it's showing the
     // "no message selected" placeholder, so the window background image
@@ -1480,7 +1504,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .resize_end_child(true)
         .shrink_start_child(false)
         .shrink_end_child(false)
-        .position(320)
+        .position(368)
         .build();
     let main_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)

@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.38" date="2026-08-05">
+      <description>
+        <p>The message list starts wider, the space between it and the reading pane is narrower, and the folder pane can no longer be dragged narrower than its folder names.</p>
+      </description>
+    </release>
     <release version="0.6.36" date="2026-08-05">
       <description>
         <p>Events that last more than one day now show on every day they run in the Calendar month view, instead of just their first day - including events that started before the month you are viewing. The mini calendar's event-day markers and the Mail screen's day list count every covered day too.</p>
