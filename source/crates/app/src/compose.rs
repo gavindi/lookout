@@ -9,6 +9,8 @@ use lookout_mail::session::AccountCommand;
 use lookout_mail::{new_message_id, ComposedMessage};
 use webkit::prelude::*;
 
+use crate::recipient_entry::{RecipientEntry, SuggestionSource};
+
 /// How long the composer waits after the last check before autosaving the
 /// draft again. The autosave runs on a fixed tick and compares the current
 /// fields against the last saved snapshot, so this is the worst-case gap
@@ -310,10 +312,14 @@ fn toolbar_command_button(toolbar: &gtk::Box, icon_name: &str, tooltip: &str, co
     toolbar.append(&button);
 }
 
-/// Splits a comma-separated recipient field (the To/Cc rows) into trimmed,
-/// non-empty addresses.
+/// Splits a recipient field's flattened text back into addresses.
+///
+/// Delegates to the chip widget's own tokenizer rather than splitting on
+/// commas: a display name of the form `"Lovelace, Ada" <ada@example.com>`
+/// carries a comma that is not a separator, and a draft autosave that split
+/// it naively would file the draft with two broken recipients.
 fn parse_recipients(field: &str) -> Vec<String> {
-    field.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    crate::recipient_entry::parse_address_tokens(field)
 }
 
 /// Everything one draft-autosave needs to know to decide "did anything
@@ -325,6 +331,7 @@ fn parse_recipients(field: &str) -> Vec<String> {
 struct DraftSnapshot {
     to: String,
     cc: String,
+    bcc: String,
     subject: String,
     rich: bool,
     body: String,
@@ -337,8 +344,9 @@ struct DraftSnapshot {
 /// context and awaits its methods instead.
 #[derive(Clone)]
 struct AutosaveCtx {
-    to_row: adw::EntryRow,
-    cc_row: adw::EntryRow,
+    to_row: RecipientEntry,
+    cc_row: RecipientEntry,
+    bcc_row: RecipientEntry,
     subject_row: adw::EntryRow,
     rich_toggle: adw::SwitchRow,
     body_view: gtk::TextView,
@@ -381,8 +389,9 @@ impl AutosaveCtx {
             (text.clone(), text)
         };
         Some(DraftSnapshot {
-            to: self.to_row.text().to_string(),
-            cc: self.cc_row.text().to_string(),
+            to: self.to_row.text_value(),
+            cc: self.cc_row.text_value(),
+            bcc: self.bcc_row.text_value(),
             subject: self.subject_row.text().to_string(),
             rich,
             body,
@@ -421,7 +430,7 @@ impl AutosaveCtx {
             from: self.from_email.clone(),
             to: parse_recipients(&snap.to),
             cc: parse_recipients(&snap.cc),
-            bcc: Vec::new(),
+            bcc: parse_recipients(&snap.bcc),
             subject: snap.subject.clone(),
             text_body: snap.body_text.clone(),
             html_body: snap.rich.then(|| snap.body.clone()),
@@ -440,7 +449,7 @@ impl AutosaveCtx {
 /// editor's blank document (`<p><br></p>`) renders to whitespace-only text,
 /// so it's caught by the same check.
 fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
-    snap.to.trim().is_empty() && snap.cc.trim().is_empty() && snap.subject.trim().is_empty() && snap.body_text.trim().is_empty()
+    snap.to.trim().is_empty() && snap.cc.trim().is_empty() && snap.bcc.trim().is_empty() && snap.subject.trim().is_empty() && snap.body_text.trim().is_empty()
 }
 
 /// Builds the rich-text editor page: a formatting toolbar above an editable
@@ -598,14 +607,21 @@ pub fn build_compose_view(
     prefill: ComposePrefill,
     on_done: Rc<dyn Fn()>,
     rich_text_default: bool,
+    suggestions: SuggestionSource,
 ) -> (gtk::Box, async_channel::Sender<String>) {
-    let to_row = adw::EntryRow::builder().title("To").build();
+    let to_row = RecipientEntry::new("To");
     if let Some(to) = &prefill.to {
-        to_row.set_text(to);
+        to_row.set_from_text(to);
     }
-    let cc_row = adw::EntryRow::builder().title("Cc").build();
+    let cc_row = RecipientEntry::new("Cc");
     if let Some(cc) = &prefill.cc {
-        cc_row.set_text(cc);
+        cc_row.set_from_text(cc);
+    }
+    // Bcc has no prefill: neither Reply nor Forward can know a blind copy
+    // list, by definition.
+    let bcc_row = RecipientEntry::new("Bcc");
+    for row in [&to_row, &cc_row, &bcc_row] {
+        row.set_suggestion_source(suggestions.clone());
     }
     let subject_row = adw::EntryRow::builder().title("Subject").build();
     if let Some(subject) = &prefill.subject {
@@ -615,8 +631,9 @@ pub fn build_compose_view(
     let rich_toggle = adw::SwitchRow::builder().title("Rich text").subtitle("Formatting (bold, lists, links, ...)").build();
 
     let fields_group = adw::PreferencesGroup::new();
-    fields_group.add(&to_row);
-    fields_group.add(&cc_row);
+    fields_group.add(to_row.widget());
+    fields_group.add(cc_row.widget());
+    fields_group.add(bcc_row.widget());
     fields_group.add(&subject_row);
     fields_group.add(&rich_toggle);
 
@@ -666,6 +683,7 @@ pub fn build_compose_view(
     let autosave = AutosaveCtx {
         to_row: to_row.clone(),
         cc_row: cc_row.clone(),
+        bcc_row: bcc_row.clone(),
         subject_row: subject_row.clone(),
         rich_toggle: rich_toggle.clone(),
         body_view: body_view.clone(),
@@ -771,11 +789,17 @@ pub fn build_compose_view(
         let draft_message_id = draft_message_id.clone();
         let closed = closed.clone();
         send_button.connect_clicked(move |_| {
-            let to: Vec<String> = to_row.text().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            // Commit anything typed but not yet turned into a chip, so the
+            // field ends up showing exactly what is about to be sent.
+            for row in [&to_row, &cc_row, &bcc_row] {
+                row.commit_pending();
+            }
+            let to = to_row.addresses();
             if to.is_empty() {
                 return;
             }
-            let cc: Vec<String> = cc_row.text().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let cc = cc_row.addresses();
+            let bcc = bcc_row.addresses();
             // Everything from here on has to await the editor read, so the
             // rest of the send runs on its own task. `closed` and `on_done`
             // stay behind at the end of it rather than firing early: the
@@ -830,7 +854,7 @@ pub fn build_compose_view(
                     from: from_email,
                     to,
                     cc,
-                    bcc: Vec::new(),
+                    bcc,
                     subject,
                     text_body,
                     html_body,
@@ -1029,12 +1053,16 @@ mod tests {
         assert_eq!(parse_recipients("a@example.com,, ,b@example.com,"), vec!["a@example.com", "b@example.com"]);
         assert!(parse_recipients("").is_empty());
         assert!(parse_recipients(" , ").is_empty());
+        // Delegating to the chip tokenizer is what keeps a "Surname, Given"
+        // display name one recipient instead of two broken ones.
+        assert_eq!(parse_recipients("\"Lovelace, Ada\" <ada@example.com>"), vec!["\"Lovelace, Ada\" <ada@example.com>"]);
     }
 
     fn snapshot(to: &str, subject: &str, body_text: &str) -> DraftSnapshot {
         DraftSnapshot {
             to: to.to_string(),
             cc: String::new(),
+            bcc: String::new(),
             subject: subject.to_string(),
             rich: false,
             body: body_text.to_string(),
@@ -1053,6 +1081,11 @@ mod tests {
         assert!(!draft_is_trivial(&snapshot("a@example.com", "", "")));
         assert!(!draft_is_trivial(&snapshot("", "subject", "")));
         assert!(!draft_is_trivial(&snapshot("", "", "body")));
+        // A blind copy is the whole message for some drafts - it must count
+        // as content, or a Bcc-only composer would never autosave.
+        let mut bcc_only = snapshot("", "", "");
+        bcc_only.bcc = "hidden@example.com".to_string();
+        assert!(!draft_is_trivial(&bcc_only));
     }
 
     #[test]
@@ -1062,6 +1095,7 @@ mod tests {
         let snap = DraftSnapshot {
             to: String::new(),
             cc: String::new(),
+            bcc: String::new(),
             subject: String::new(),
             rich: true,
             body: "<p><br></p>".to_string(),

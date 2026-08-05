@@ -1040,6 +1040,13 @@ async fn emit_messages(
         if let Err(e) = cache.replace_messages(mailbox_id, uidvalidity, &messages) {
             tracing::warn!("failed to cache messages for {mailbox_id}: {e}");
         }
+        // Feeds the composer's recipient autocomplete. Kept here rather than
+        // in `replace_messages` because the address book is cumulative -
+        // `replace_messages` wipes and rewrites a mailbox's window each sync,
+        // and addresses must survive that.
+        if let Err(e) = cache.record_addresses(&messages) {
+            tracing::warn!("failed to record addresses for {mailbox_id}: {e}");
+        }
         if let Ok(snoozed) = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()) {
             messages.retain(|m| !snoozed.contains(&m.uid));
         }

@@ -39,6 +39,13 @@ struct AccountHandle {
     smtp_host: String,
     smtp_port: u16,
     folders: Vec<Mailbox>,
+    /// Read-side handle on this account's cache, used only for the
+    /// composer's recipient autocomplete. Deliberately a second connection
+    /// to the file the session writes: routing a lookup through
+    /// `AccountCommand` would put every keystroke behind whatever IMAP round
+    /// trip the session is mid-way through. The cache opens WAL for exactly
+    /// this, and a failed open just means no suggestions.
+    address_cache: Option<Rc<lookout_mail::Cache>>,
 }
 
 /// What the message list is currently showing - either a single mailbox (the
@@ -394,6 +401,29 @@ fn install_paned_css() {
            separate axis from unread, which owns every blue accent here. */
         .message-flag-icon {
             color: #e5a50a;
+        }
+        /* Recipient chips. The pill shape is what separates one recipient
+           from the next at a glance - the whole point of chips over a run of
+           comma-separated text. */
+        .recipient-field {
+            padding: 6px 10px;
+        }
+        .recipient-chip {
+            background-color: rgba(77, 157, 255, 0.18);
+            border: 1px solid rgba(77, 157, 255, 0.35);
+            border-radius: 999px;
+            padding: 1px 2px 1px 10px;
+        }
+        /* A chip that doesn't parse as an address is flagged, never
+           rejected - the user has to be able to see and fix it. */
+        .recipient-chip.recipient-chip-invalid {
+            background-color: rgba(224, 108, 117, 0.18);
+            border-color: rgba(224, 108, 117, 0.55);
+        }
+        .recipient-chip-remove {
+            min-width: 18px;
+            min-height: 18px;
+            padding: 0;
         }
         .message-sender-unread,
         .message-subject-unread,
@@ -809,7 +839,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // in the pane (so its autosave loop stops), restores the
                 // previous page on close, and owns the `draft_saved_tx` slot.
                 if let Some((from_email, cmd_tx, prefill, rich_text_default)) = opened {
-                    show_composer_in_reading_pane(&state, &reading_stack, "Reply", from_email, cmd_tx, prefill, rich_text_default);
+                    show_composer_in_reading_pane(
+                        &state,
+                        &reading_stack,
+                        "Reply",
+                        from_email,
+                        cmd_tx,
+                        prefill,
+                        rich_text_default,
+                        mailbox_account_id(&summary.mailbox),
+                    );
                 }
             });
         }
@@ -2109,7 +2148,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .and_then(|summary| mailbox_account_id(&summary.mailbox))
                 .or_else(|| st.current_account.clone())
                 .or_else(|| st.accounts.keys().next().cloned());
-            let Some(handle) = account_id.and_then(|id| st.accounts.get(&id)) else { return };
+            let Some(handle) = account_id.clone().and_then(|id| st.accounts.get(&id)) else { return };
             let cmd_tx = handle.cmd_tx.clone();
             let from_email = handle.email.clone();
             let rich_text_default = state.borrow().rich_text_default;
@@ -2122,6 +2161,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 cmd_tx,
                 crate::compose::ComposePrefill::default(),
                 rich_text_default,
+                account_id,
             );
         });
     }
@@ -2146,7 +2186,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&state, &reading_stack, title, from_email, cmd_tx, prefill, rich_text_default);
+                show_composer_in_reading_pane(
+                    &state,
+                    &reading_stack,
+                    title,
+                    from_email,
+                    cmd_tx,
+                    prefill,
+                    rich_text_default,
+                    mailbox_account_id(&summary.mailbox),
+                );
             }
         });
     }
@@ -2158,7 +2207,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&state, &reading_stack, "Forward", from_email, cmd_tx, prefill, rich_text_default);
+                show_composer_in_reading_pane(
+                    &state,
+                    &reading_stack,
+                    "Forward",
+                    from_email,
+                    cmd_tx,
+                    prefill,
+                    rich_text_default,
+                    mailbox_account_id(&summary.mailbox),
+                );
             }
         });
     }
@@ -2717,6 +2775,16 @@ fn connect_account(
             smtp_host: config.smtp.host.clone(),
             smtp_port: config.smtp.port,
             folders: Vec::new(),
+            // Opened eagerly so the first composer already has completions.
+            // The session opens (and creates) the same file; whichever gets
+            // there first wins, and a failure here only costs suggestions.
+            address_cache: match lookout_mail::Cache::open(&account_id) {
+                Ok(cache) => Some(Rc::new(cache)),
+                Err(e) => {
+                    tracing::warn!("no address-book cache for {account_id}, recipient autocomplete disabled: {e}");
+                    None
+                }
+            },
         },
     );
 
@@ -3812,6 +3880,10 @@ fn render_body(
 /// visible beforehand once `on_done` fires (Cancel or Send) - so Reply's
 /// Cancel lands back on the same message, and New Message's Cancel lands
 /// back on the empty placeholder.
+// Cohesive arguments (they all describe one composer to open), so they stay
+// positional rather than being bundled into a single-use struct - same call
+// this file already makes for `spawn_calendar_discovery`.
+#[allow(clippy::too_many_arguments)]
 fn show_composer_in_reading_pane(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
@@ -3820,6 +3892,7 @@ fn show_composer_in_reading_pane(
     cmd_tx: async_channel::Sender<AccountCommand>,
     prefill: crate::compose::ComposePrefill,
     rich_text_default: bool,
+    account_id: Option<AccountId>,
 ) {
     if let Some(existing) = reading_stack.child_by_name("compose") {
         reading_stack.remove(&existing);
@@ -3836,7 +3909,18 @@ fn show_composer_in_reading_pane(
         // consumer future exits and late events go nowhere.
         state_for_close.borrow_mut().draft_saved_tx = None;
     });
-    let (composer, draft_tx) = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done, rich_text_default);
+    // Recipient autocomplete, drawn from the addresses this account has seen
+    // in synced mail (there is no contacts source until Phase 4's CardDAV
+    // work). Runs synchronously on the UI thread: it's an indexed prefix
+    // query on a small table, and a keystroke can't wait on a channel round
+    // trip. Any failure - no cache, a locked database - is silently no
+    // suggestions rather than an error the user has to dismiss mid-sentence.
+    let address_cache = account_id.and_then(|id| state.borrow().accounts.get(&id).and_then(|h| h.address_cache.clone()));
+    let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str| {
+        let Some(cache) = &address_cache else { return Vec::new() };
+        cache.search_addresses(prefix, 8).unwrap_or_default()
+    });
+    let (composer, draft_tx) = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done, rich_text_default, suggestions);
     // Replacing any previous composer's relay (dropped sender = its consumer
     // exits).
     state.borrow_mut().draft_saved_tx = Some(draft_tx);
@@ -3908,6 +3992,7 @@ mod tests {
                     smtp_host: "smtp".into(),
                     smtp_port: 465,
                     folders: Vec::new(),
+                    address_cache: None,
                 },
             )]),
             current_account: None,

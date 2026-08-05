@@ -21,6 +21,66 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.34" date="2026-08-05">
+      <description>
+        <p>Recipients in the composer are now individual chips you can remove one at a time, instead of a line of comma-separated text, and typing suggests people you have exchanged mail with. A Bcc field joins To and Cc.</p>
+      </description>
+    </release>
+    <release version="0.6.33" date="2026-08-05">
+      <description>
+        <p>Fixes a crash that closed the application a few seconds after opening the composer, and stops draft autosave from leaving duplicate drafts behind.</p>
+      </description>
+    </release>
+    <release version="0.6.32" date="2026-08-05">
+      <description>
+        <p>Opening a message now marks it as read, and the toolbar's Flag button marks a message for follow-up. Flagged messages show a marker in the message list.</p>
+      </description>
+    </release>
+    <release version="0.6.31" date="2026-08-05">
+      <description>
+        <p>Fixes for the window background picker added in the previous release.</p>
+      </description>
+    </release>
+    <release version="0.6.30" date="2026-08-05">
+      <description>
+        <p>You can now choose your own image for the window background, in Settings under Appearance, and restore the bundled artwork at any time. Your choice is remembered between sessions.</p>
+      </description>
+    </release>
+    <release version="0.6.29" date="2026-08-05">
+      <description>
+        <p>Microsoft 365 accounts added in GNOME Online Accounts now work: they appear in the account list and sign in correctly. Repeated connection-failure notifications no longer pile up while the application is reconnecting.</p>
+      </description>
+    </release>
+    <release version="0.6.28" date="2026-08-05">
+      <description>
+        <p>The composer can now write formatted mail - bold, italic, underline, strikethrough, bulleted and numbered lists, font sizes, text colour, and links - and sends a plain-text copy alongside it for recipients whose mail client cannot show formatting. Formatting can be turned off by default in Settings under Mail.</p>
+      </description>
+    </release>
+    <release version="0.6.27" date="2026-08-05">
+      <description>
+        <p>The message list gained column headings for Sender, Subject, and Date. A new Settings option under Mail controls whether images hosted on remote servers are loaded when reading a message; it is off by default.</p>
+      </description>
+    </release>
+    <release version="0.6.26" date="2026-08-05">
+      <description>
+        <p>Fixes a folder that could stay empty after clicking it quickly, and new mail not appearing in the folder you were reading. Background downloading of message bodies no longer delays your own clicks.</p>
+      </description>
+    </release>
+    <release version="0.6.25" date="2026-08-04">
+      <description>
+        <p>Switching folders feels roughly twice as fast: the previously seen messages appear immediately while the server is still responding.</p>
+      </description>
+    </release>
+    <release version="0.6.24" date="2026-08-04">
+      <description>
+        <p>Folders you have opened before now show their messages instantly, from a local copy, rather than waiting for the server.</p>
+      </description>
+    </release>
+    <release version="0.6.23" date="2026-08-04">
+      <description>
+        <p>Messages you have already opened now display instantly instead of being downloaded again, and a message whose images are hosted on a slow or unreachable server no longer holds up the reading pane.</p>
+      </description>
+    </release>
     <release version="0.6.22" date="2026-08-04">
       <description>
         <p>The calendar overview pane on the right of the Mail screen is now about half as wide, leaving more room for the message list and reading pane.</p>

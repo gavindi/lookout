@@ -19,7 +19,11 @@ mod error;
 pub mod send;
 pub mod session;
 
-pub use cache::{cache_info, clear_all_caches};
+// `Cache` itself is public so the app crate can open a read-side handle for
+// the composer's recipient autocomplete (`search_addresses`), which must not
+// go through the account session - a keystroke can't wait behind whatever
+// IMAP round trip that actor is mid-way through.
+pub use cache::{cache_info, clear_all_caches, Cache};
 pub use config::{AccountConfig, Credential, EndpointConfig};
 pub use error::{Error, Result};
 pub use send::{new_message_id, ComposedMessage};

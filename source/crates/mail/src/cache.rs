@@ -94,6 +94,15 @@ impl Cache {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.sqlite3", sanitize_filename(account_id)));
         let conn = Connection::open(path)?;
+        // WAL + a busy timeout because this file now has two readers: the
+        // account session writing synced envelopes, and the UI thread
+        // querying `addresses` for composer autocomplete. Under the default
+        // rollback journal those collide as `SQLITE_BUSY`; WAL lets a reader
+        // proceed against the last committed snapshot while a write is in
+        // flight. `journal_mode` is persistent (stored in the file header),
+        // so this also upgrades databases created before it was set.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS mailboxes (
@@ -123,6 +132,13 @@ impl Cache {
                 PRIMARY KEY (mailbox_id, uid)
             );
             CREATE INDEX IF NOT EXISTS bodies_by_mailbox ON bodies (mailbox_id);
+            CREATE TABLE IF NOT EXISTS addresses (
+                address TEXT PRIMARY KEY,
+                name TEXT,
+                seen_count INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS addresses_by_count ON addresses (seen_count DESC);
             ",
         )?;
         Ok(Cache { conn: Mutex::new(conn) })
@@ -262,6 +278,72 @@ impl Cache {
             }
         }
         Ok(previews)
+    }
+
+    /// Harvests every `From`/`To`/`Cc` address in `messages` into the address
+    /// book the composer's recipient autocomplete reads from. Called on each
+    /// sync, so the suggestions grow with whatever mail has actually been
+    /// seen - there is no contacts source to draw on until Phase 4's CardDAV
+    /// work lands.
+    ///
+    /// Addresses are keyed lowercased (the same person shouldn't appear twice
+    /// for a capitalisation difference) while `name` keeps the first
+    /// non-empty display name seen, so a later envelope that carries only a
+    /// bare address doesn't erase a name already learned.
+    pub fn record_addresses(&self, messages: &[EmailSummary]) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO addresses (address, name, seen_count, last_seen) VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(address) DO UPDATE SET
+                     seen_count = seen_count + 1,
+                     last_seen = ?3,
+                     name = COALESCE(NULLIF(name, ''), ?2)",
+            )?;
+            for msg in messages {
+                for addr in msg.from.iter().chain(&msg.to).chain(&msg.cc) {
+                    let address = addr.address.trim().to_lowercase();
+                    if address.is_empty() {
+                        continue;
+                    }
+                    let name = addr.name.as_deref().unwrap_or("").trim();
+                    stmt.execute(rusqlite::params![address, name, now])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Address-book completions for `prefix`, most-corresponded-with first.
+    /// Matches against the address and the display name both, since "gav" and
+    /// "Gavin" should each find the same person. An empty prefix returns the
+    /// top entries outright, which is what makes a freshly focused recipient
+    /// field able to offer anything at all.
+    pub fn search_addresses(&self, prefix: &str, limit: usize) -> Result<Vec<lookout_core::EmailAddress>> {
+        let conn = self.conn.lock().unwrap();
+        // `escape` so a user typing `%` or `_` searches for those characters
+        // rather than LIKE's wildcards.
+        let pattern = format!("{}%", prefix.trim().to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT address, name FROM addresses
+             WHERE address LIKE ?1 ESCAPE '\\' OR lower(name) LIKE ?1 ESCAPE '\\'
+             ORDER BY seen_count DESC, last_seen DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            Ok(lookout_core::EmailAddress {
+                address: row.get::<_, String>(0)?,
+                name: row.get::<_, Option<String>>(1)?.filter(|n| !n.trim().is_empty()),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Applies a flag change to one cached summary, mirroring the `STORE`
@@ -470,6 +552,62 @@ mod tests {
 
         // A uid that isn't in the cached window is a no-op, not an error.
         assert!(!cache.update_flags(&mailbox_id, Uid(99), &[SystemFlagBit::Seen], &[]).unwrap());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The composer's autocomplete contract: addresses accumulate across
+    /// syncs, repeat correspondents rank first, and a prefix matches the
+    /// display name as readily as the address.
+    #[test]
+    fn records_and_searches_the_address_book() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let addressed = |uid: u32, from: (&str, Option<&str>), to: &[&str]| {
+            let mut msg = sample_summary(&mailbox_id, uid, None);
+            msg.from = vec![lookout_core::EmailAddress {
+                name: from.1.map(str::to_string),
+                address: from.0.to_string(),
+            }];
+            msg.to = to.iter().map(|a| lookout_core::EmailAddress::new(*a)).collect();
+            msg
+        };
+
+        cache
+            .record_addresses(&[
+                addressed(1, ("Ada@Example.com", Some("Ada Lovelace")), &["bob@example.com"]),
+                addressed(2, ("ada@example.com", None), &[]),
+                addressed(3, ("carol@elsewhere.org", None), &[]),
+            ])
+            .unwrap();
+
+        // Case-folded to one entry, seen twice, and the name learned from the
+        // first envelope survives the second (which carried none).
+        let ada = cache.search_addresses("ada", 10).unwrap();
+        assert_eq!(ada.len(), 1);
+        assert_eq!(ada[0].address, "ada@example.com");
+        assert_eq!(ada[0].name.as_deref(), Some("Ada Lovelace"));
+
+        // A prefix matches the display name too, not just the address.
+        let by_name = cache.search_addresses("lovel", 10).unwrap();
+        assert!(by_name.is_empty(), "prefix match is anchored at the start of the name");
+        assert_eq!(cache.search_addresses("ada l", 10).unwrap().len(), 1);
+
+        // Ranked by how often each correspondent appears.
+        let all = cache.search_addresses("", 10).unwrap();
+        assert_eq!(all.first().map(|a| a.address.as_str()), Some("ada@example.com"));
+        assert_eq!(all.len(), 3);
+        assert_eq!(cache.search_addresses("", 2).unwrap().len(), 2);
+
+        // A later sync adds to the book rather than replacing it.
+        cache.record_addresses(&[addressed(4, ("dave@example.com", None), &[])]).unwrap();
+        assert_eq!(cache.search_addresses("", 10).unwrap().len(), 4);
+
+        // LIKE metacharacters are searched for literally, not as wildcards.
+        assert!(cache.search_addresses("%", 10).unwrap().is_empty());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

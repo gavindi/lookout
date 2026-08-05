@@ -12,6 +12,7 @@ mod last_view;
 mod message_header;
 mod message_list;
 mod microsoft_oauth;
+mod recipient_entry;
 mod window;
 mod worker;
 
