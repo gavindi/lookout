@@ -88,12 +88,15 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 
 - [x] Shared `lookout-dav` plumbing for CardDAV (incl. RFC 6578 sync-collection REPORT)
 - [x] vCard parser/writer (RFC 6350) — hand-rolled parser/writer in `lookout-core` with CardDAV parsing wired through `lookout-dav`
-- [x] Contacts UI tab
+- [x] Contacts UI tab (labeled "People" in the nav rail/toolbar)
   - [x] Layout scaffold: split-pane Contacts view with left navigation and right content list
   - [x] Left pane model: per-account contact category tree/list (e.g. All contacts, groups, directories/address books)
+    - [x] Real account/category tree: each connected account gets a non-selectable header followed by four fixed rows (Your Contacts, Favourites, Your contact lists, Deleted), plus a trailing cross-account "Categories" section built from every distinct vCard `CATEGORIES` tag
   - [x] Selection wiring: selecting an account/category updates the right-side list query/filter
   - [x] Right pane list: contact rows (name, primary email, optional avatar/org) bound to the active left-side selection
+    - [x] Favourites: per-row star toggle, session-only (`UiState::starred_contacts`, keyed by account + vCard UID) - never written back to the vCard or server
   - [x] Contact details dialog: clicking a contact opens a dialog showing full contact information (emails, phones, addresses, org/title, notes)
+  - [x] Deleted bucket: contacts absent from the latest CardDAV poll vs. the previous one are accumulated per-account (`UiState::deleted_contacts`) - in-memory only, no real CardDAV deletion-tracking protocol behind it
 - [ ] Address book CRUD, groups, vCard import/export with duplicate detection
 - [ ] Shared `ContactsProvider` trait consumed by mail composer, calendar attendees, and the contacts app
   - [x] Mail composer consumes `ContactsProvider` (mail-cache + CardDAV-backed suggestions)
