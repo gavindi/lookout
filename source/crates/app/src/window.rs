@@ -2612,17 +2612,21 @@ fn show_anchor(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &Ca
 
 /// The local dates within `month` that have at least one occurrence from a
 /// currently-checked calendar, unioned across every account that has synced
-/// that month - drives the mini-calendar's bold event-day numerals.
+/// that month - drives the mini-calendar's bold event-day numerals. Every
+/// date a multi-day occurrence covers counts, so an event spanning several
+/// days marks each of them (matching the main month grid).
 fn calendar_event_days(calendar_state: &Rc<RefCell<CalendarUiState>>, month: chrono::NaiveDate) -> HashSet<chrono::NaiveDate> {
     let st = calendar_state.borrow();
     let mut days = HashSet::new();
+    let month_start = first_of_month(month);
+    let month_end = last_of_month(month);
     for handle in st.accounts.values() {
         if handle.last_synced_month != Some(month) {
             continue;
         }
         for occ in &handle.last_occurrences {
             if st.checked_calendar_ids.contains(&occ.calendar_id) {
-                days.insert(occ.start.with_timezone(&chrono::Local).date_naive());
+                days.extend(calendar_view::covered_local_dates(occ, month_start, month_end));
             }
         }
     }
@@ -2636,6 +2640,18 @@ fn current_month_start() -> chrono::NaiveDate {
 fn first_of_month(date: chrono::NaiveDate) -> chrono::NaiveDate {
     use chrono::Datelike;
     date.with_day(1).unwrap_or(date)
+}
+
+/// The last day of `date`'s month.
+fn last_of_month(date: chrono::NaiveDate) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let first = first_of_month(date);
+    let next = if first.month() == 12 {
+        chrono::NaiveDate::from_ymd_opt(first.year() + 1, 1, 1).unwrap_or(first)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(first.year(), first.month() + 1, 1).unwrap_or(first)
+    };
+    next - chrono::Duration::days(1)
 }
 
 /// Maps a (nav-rail module, ribbon tab) pair to the `view_toolbar_stack`
@@ -3104,7 +3120,7 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
         .values()
         .flat_map(|h| h.last_occurrences.iter())
         .filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id))
-        .filter(|occ| occ.start.with_timezone(&chrono::Local).date_naive() == day)
+        .filter(|occ| !calendar_view::covered_local_dates(occ, day, day).is_empty())
         .collect();
     occurrences.sort_by_key(|occ| occ.start);
 

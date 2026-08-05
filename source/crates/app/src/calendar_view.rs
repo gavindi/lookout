@@ -216,8 +216,10 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
 /// Buckets `occurrences` by local calendar date and fills each visible day
 /// cell's event list, capped at [`MAX_VISIBLE_EVENTS_PER_DAY`] with a
 /// "+N more" label for the rest (no popover - kept simple for this pass).
-/// Occurrences for dates outside the grid's currently-displayed 6-week span
-/// are silently ignored.
+/// Occurrences are bucketed by *every* date they cover (so multi-day events
+/// appear in each day cell they occupy, and events that started before the
+/// grid's window still show on their in-grid days); dates outside the grid's
+/// currently-displayed 6-week span are silently ignored.
 pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>) {
     let grid_start = first_grid_day(*mg.anchor_month.borrow());
 
@@ -225,11 +227,7 @@ pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], co
         clear_children(&cell.events_box);
     }
 
-    let mut by_date: HashMap<NaiveDate, Vec<&EventOccurrence>> = HashMap::new();
-    for occ in occurrences {
-        let date = occ.start.with_timezone(&chrono::Local).date_naive();
-        by_date.entry(date).or_default().push(occ);
-    }
+    let by_date = bucket_by_date(occurrences, grid_start, mg.day_cells.len());
 
     for (i, cell) in mg.day_cells.iter().enumerate() {
         let date = grid_start + chrono::Duration::days(i as i64);
@@ -241,6 +239,73 @@ pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], co
             cell.events_box.append(&more_label(day_occurrences.len() - MAX_VISIBLE_EVENTS_PER_DAY));
         }
     }
+}
+
+/// Buckets `occurrences` by every local date they cover within the `n`-column
+/// window starting at `grid_start`, using [`occurrence_day_range`] so
+/// multi-day events land in each day cell they occupy (and events that started
+/// before the window still show on their in-grid days). Pure data-in/
+/// data-out - the widget-level rendering in [`set_month_occurrences`] is a
+/// thin layer over this.
+fn bucket_by_date(occurrences: &[EventOccurrence], grid_start: NaiveDate, n: usize) -> HashMap<NaiveDate, Vec<&EventOccurrence>> {
+    let mut by_date: HashMap<NaiveDate, Vec<&EventOccurrence>> = HashMap::new();
+    for occ in occurrences {
+        if let Some((start_col, end_col)) = occurrence_day_range(occ, grid_start, n) {
+            for col in start_col..end_col {
+                by_date.entry(grid_start + chrono::Duration::days(col as i64)).or_default().push(occ);
+            }
+        }
+    }
+    by_date
+}
+
+/// The half-open `[start_col, end_col)` range of day-column indices (relative
+/// to `first`, the grid's first day) that `occ` covers, clipped to a
+/// `n`-column window - or `None` if it doesn't touch the window at all. Uses
+/// the same column maths as [`compute_time_grid_chips`]: an occurrence ending
+/// exactly at local midnight of the day after it starts occupies no minutes of
+/// that day, so its end column drops off. Events starting before the window
+/// (and events ending after it) are clamped so they still render on their
+/// in-window days.
+fn occurrence_day_range(occ: &EventOccurrence, first: NaiveDate, n: usize) -> Option<(usize, usize)> {
+    if n == 0 {
+        return None;
+    }
+    let start_local = occ.start.with_timezone(&chrono::Local);
+    let end_local = occ.end.with_timezone(&chrono::Local);
+    let start_date = start_local.date_naive();
+    let end_date = end_local.date_naive();
+
+    let start_col = (start_date - first).num_days();
+    let mut end_col = (end_date - first).num_days();
+    if end_date != start_date && end_local.hour() == 0 && end_local.minute() == 0 && end_local.second() == 0 {
+        end_col -= 1;
+    }
+
+    let col_start = start_col.max(0);
+    let col_end = end_col.min(n as i64 - 1);
+    if col_start <= col_end {
+        Some((col_start as usize, col_end as usize + 1))
+    } else {
+        None
+    }
+}
+
+/// The local dates in the inclusive `[window_start, window_end]` range that
+/// `occ` covers, using the same column maths as [`occurrence_day_range`] - so
+/// multi-day events contribute every day they occupy, and events that start
+/// before or end after the window are clipped into it rather than dropped.
+/// Shared with window.rs so the mini-calendar's event-day markers and the Mail
+/// overview's day list agree with the month grid.
+pub(crate) fn covered_local_dates(occ: &EventOccurrence, window_start: NaiveDate, window_end: NaiveDate) -> Vec<NaiveDate> {
+    let days = (window_end - window_start).num_days();
+    if days < 0 {
+        return Vec::new();
+    }
+    let n = days as usize + 1;
+    occurrence_day_range(occ, window_start, n)
+        .map(|(start_col, end_col)| (start_col..end_col).map(|col| window_start + chrono::Duration::days(col as i64)).collect())
+        .unwrap_or_default()
 }
 
 /// One event rendered on a [`TimeGrid`] canvas: a rectangle whose horizontal
@@ -1933,6 +1998,139 @@ mod tests {
             occ("too late", later.and_hms_opt(9, 0, 0).unwrap(), later.and_hms_opt(10, 0, 0).unwrap(), false),
         ];
         assert!(compute_time_grid_chips(&test_week(), &occurrences).is_empty());
+    }
+
+    #[test]
+    fn occurrence_day_range_covers_every_day_of_a_multi_day_all_day_event() {
+        // Friday 2026-08-07 through Monday 2026-08-10 (all-day) covers Fri,
+        // Sat and Sun; a month-length window from the week's first day keeps
+        // the whole span visible.
+        let fri = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+        let mon = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let occ = occ("weekender", fri.and_hms_opt(0, 0, 0).unwrap(), mon.and_hms_opt(0, 0, 0).unwrap(), true);
+        let first = test_week()[0];
+        let range = occurrence_day_range(&occ, first, 31).unwrap();
+        assert_eq!(range, (5, 8));
+        for col in range.0..range.1 {
+            let covered = first + chrono::Duration::days(col as i64);
+            assert!(occ.start.with_timezone(&chrono::Local).date_naive() <= covered);
+            assert!(covered < occ.end.with_timezone(&chrono::Local).date_naive());
+        }
+    }
+
+    #[test]
+    fn occurrence_day_range_covers_both_days_of_a_midnight_crosser() {
+        // 22:00 Wednesday 2026-08-05 through 02:00 Thursday 2026-08-06.
+        let wed = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+        let thu = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        let occ = occ("overnight", wed.and_hms_opt(22, 0, 0).unwrap(), thu.and_hms_opt(2, 0, 0).unwrap(), false);
+        let week = test_week();
+        let first = week[0];
+        assert_eq!(occurrence_day_range(&occ, first, week.len()).unwrap(), (3, 5));
+    }
+
+    #[test]
+    fn occurrence_day_range_drops_the_day_an_event_ends_at_midnight() {
+        // 10:00 Wednesday 2026-08-05 through 00:00 Thursday 2026-08-06 occupies
+        // no minutes of Thursday, so it must only cover Wednesday.
+        let wed = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+        let thu = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        let occ = occ("closer", wed.and_hms_opt(10, 0, 0).unwrap(), thu.and_hms_opt(0, 0, 0).unwrap(), false);
+        let week = test_week();
+        let first = week[0];
+        assert_eq!(occurrence_day_range(&occ, first, week.len()).unwrap(), (3, 4));
+    }
+
+    #[test]
+    fn occurrence_day_range_clips_events_starting_before_the_window() {
+        // Starts 2026-08-01, before the week's Sunday 2026-08-02; must clamp to
+        // the window (covering Sun/Mon/Tue) rather than vanishing.
+        let before = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let wed = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+        let occ = occ("vacation", before.and_hms_opt(0, 0, 0).unwrap(), wed.and_hms_opt(0, 0, 0).unwrap(), true);
+        let week = test_week();
+        let first = week[0];
+        assert_eq!(occurrence_day_range(&occ, first, week.len()).unwrap(), (0, 3));
+    }
+
+    #[test]
+    fn occurrence_day_range_returns_none_for_events_outside_the_window() {
+        let earlier = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let later = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let occurrences = vec![
+            occ("too early", earlier.and_hms_opt(9, 0, 0).unwrap(), earlier.and_hms_opt(10, 0, 0).unwrap(), false),
+            occ("too late", later.and_hms_opt(9, 0, 0).unwrap(), later.and_hms_opt(10, 0, 0).unwrap(), false),
+        ];
+        let week = test_week();
+        let first = week[0];
+        for occ in &occurrences {
+            assert!(occurrence_day_range(occ, first, week.len()).is_none());
+        }
+    }
+
+    #[test]
+    fn covered_local_dates_clips_to_the_window_and_skips_outsiders() {
+        // All-day trip covering 2026-08-04 through 2026-08-07 (Tue/Wed/Thu).
+        let trip = occ(
+            "Trip",
+            NaiveDate::from_ymd_opt(2026, 8, 4).unwrap().and_hms_opt(0, 0, 0).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 7).unwrap().and_hms_opt(0, 0, 0).unwrap(),
+            true,
+        );
+        let window_start = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let window_end = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+        let covered = covered_local_dates(&trip, window_start, window_end);
+        assert_eq!(
+            covered,
+            vec![
+                NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 5).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 6).unwrap(),
+            ]
+        );
+
+        // An event entirely outside the window contributes nothing.
+        let outside = occ(
+            "Outside",
+            NaiveDate::from_ymd_opt(2026, 9, 5).unwrap().and_hms_opt(9, 0, 0).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 5).unwrap().and_hms_opt(10, 0, 0).unwrap(),
+            false,
+        );
+        assert!(covered_local_dates(&outside, window_start, window_end).is_empty());
+    }
+
+    #[test]
+    fn bucket_by_date_places_multi_day_events_on_every_covered_day() {
+        // An all-day trip covering Tue 4 Aug through Fri 7 Aug (i.e. Tue/Wed/Thu),
+        // plus a same-day meeting on the Wednesday. The grid starts Sunday 26 Jul
+        // (Sunday before 1 Aug 2026).
+        let trip = occ(
+            "Trip",
+            NaiveDate::from_ymd_opt(2026, 8, 4).unwrap().and_hms_opt(0, 0, 0).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 7).unwrap().and_hms_opt(0, 0, 0).unwrap(),
+            true,
+        );
+        let meeting = occ(
+            "Meeting",
+            NaiveDate::from_ymd_opt(2026, 8, 5).unwrap().and_hms_opt(9, 0, 0).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 5).unwrap().and_hms_opt(10, 0, 0).unwrap(),
+            false,
+        );
+        let grid_start = NaiveDate::from_ymd_opt(2026, 7, 26).unwrap();
+        let occurrences = [trip, meeting];
+        let by_date = bucket_by_date(&occurrences, grid_start, 42);
+
+        let summaries = |date: NaiveDate| {
+            let mut names: Vec<String> = by_date.get(&date).into_iter().flat_map(|occ| occ.iter()).filter_map(|occ| occ.summary.clone()).collect();
+            names.sort();
+            names
+        };
+        // The trip appears on each day it covers, alongside the meeting on the
+        // Wednesday, and doesn't leak into Friday (its end, midnight exclusive).
+        assert_eq!(summaries(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()), vec!["Trip"]);
+        assert_eq!(summaries(NaiveDate::from_ymd_opt(2026, 8, 5).unwrap()), vec!["Meeting", "Trip"]);
+        assert_eq!(summaries(NaiveDate::from_ymd_opt(2026, 8, 6).unwrap()), vec!["Trip"]);
+        assert!(summaries(NaiveDate::from_ymd_opt(2026, 8, 7).unwrap()).is_empty());
     }
 
     #[test]

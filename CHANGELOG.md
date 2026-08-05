@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.36 (2026-08-05)
+
+### Fixed
+
+- **Calendar**: the large month grid no longer swallows events that span more than one day. Occurrences were bucketed by their start date only, so a multi-day event appeared in just its first day's cell - and an event that *started* before the displayed 6-week window (a trip from the previous month, say) vanished entirely, since its start date isn't a cell in the grid. The grid now buckets by every date an occurrence covers, using the same column maths as the Day/Week/Work week chips (`occurrence_day_range`): a 3-day trip renders a chip on each of its days, an event ending exactly at local midnight still stops on its last real day rather than leaking into the next, and an event starting before the window shows on all of its in-grid days. The same bug class is fixed in the two places that share the occurrence list: the sidebar mini-calendar's bold event-day markers (`calendar_event_days`) and the Mail screen's overview-pane day list (`refresh_mail_overview_day_list`) now both count every covered day, so a multi-day event bolds each of its days and appears in the overview on every day it runs. Both route through a shared `covered_local_dates` helper so the three views stay in agreement.
+
 ## 0.6.35 (2026-08-05)
 
 ### Added
