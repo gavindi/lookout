@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, NaiveTime};
-use lookout_core::{CalendarInfo, EventOccurrence};
+use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, EventOccurrence};
 
 use crate::cache::CalendarCache;
 use crate::client::DavClient;
@@ -34,6 +34,26 @@ pub enum CalendarCommand {
     /// A hint that it's worth retrying the connection now rather than
     /// waiting out the current backoff delay. A no-op if already connected.
     Reconnect,
+    /// Store a brand-new event: PUT the serialized VEVENT as a new calendar
+    /// object under `event.calendar_id`'s collection (a client-generated
+    /// `<uid>.ics` href, `If-None-Match: *`). Resyncs the on-screen month on
+    /// success so the new occurrence renders.
+    CreateEvent {
+        event: Box<CalendarEvent>,
+    },
+    /// Store an edited event in place: PUT to `event.href` with `event.etag`
+    /// as `If-Match` (fails with a surfaced error rather than clobbering a
+    /// concurrent change if the etag is stale). Resyncs on success.
+    UpdateEvent {
+        event: Box<CalendarEvent>,
+    },
+    /// Delete the calendar object at `href` (with an optional `etag` as
+    /// `If-Match`). Resyncs on success.
+    DeleteEvent {
+        calendar_id: CalendarId,
+        href: String,
+        etag: Option<String>,
+    },
     Shutdown,
 }
 
@@ -123,9 +143,27 @@ pub async fn run_calendar_session(
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
             cmd = commands.recv() => {
-                if matches!(cmd, Ok(CalendarCommand::Shutdown)) {
-                    let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
-                    return;
+                match cmd {
+                    Ok(CalendarCommand::Shutdown) => {
+                        let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                        return;
+                    }
+                    // A write command can't be honoured while the connection
+                    // is down, and silently dropping it would lose the user's
+                    // edit with no trace - answer with an explicit error the
+                    // UI can toast. Read-only hints (SyncMonth/Refresh) are
+                    // safe to drop: the reconnect sync supersedes them.
+                    Ok(CalendarCommand::CreateEvent { event }) => {
+                        let _ = events.send(CalendarSessionEvent::Error(format!("not connected - \"{}\" was not saved", event.uid))).await;
+                    }
+                    Ok(CalendarCommand::UpdateEvent { event }) => {
+                        let _ = events.send(CalendarSessionEvent::Error(format!("not connected - changes to \"{}\" were not saved", event.uid))).await;
+                    }
+                    Ok(CalendarCommand::DeleteEvent { .. }) => {
+                        let _ = events.send(CalendarSessionEvent::Error("not connected - the event was not deleted".to_string())).await;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
                 }
             }
         }
@@ -189,6 +227,18 @@ async fn connect_and_run(
                     current_month = first_of_month(date);
                     sync_month(&client, &calendars, &credential, current_month, events, cache).await;
                 }
+                CalendarCommand::CreateEvent { event } => {
+                    write_event(&client, &calendars, &credential, &event, current_month, events, cache).await;
+                }
+                CalendarCommand::UpdateEvent { event } => {
+                    write_event(&client, &calendars, &credential, &event, current_month, events, cache).await;
+                }
+                CalendarCommand::DeleteEvent { calendar_id: _, href, etag } => match client.delete_calendar_object(&href, &credential, etag.as_deref()).await {
+                    Ok(()) => sync_month(&client, &calendars, &credential, current_month, events, cache).await,
+                    Err(e) => {
+                        let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete event: {e}"))).await;
+                    }
+                },
                 // Already connected - nothing to reconnect. Only useful
                 // while backed off between connection attempts, see
                 // `run_calendar_session`.
@@ -261,6 +311,78 @@ async fn sync_month(
     }
 }
 
+/// Creates or updates `event` on the server, sharing one code path: serialize
+/// to iCalendar, resolve the target calendar collection, PUT the VEVENT, then
+/// resync the on-screen month (and the event's own month, if different) so the
+/// change renders immediately. The create/update distinction falls out of the
+/// event's metadata - a fresh event has no `href` (so a client-generated
+/// `<uid>.ics` href under the collection and `If-None-Match: *`), an edit
+/// keeps its `href`/`etag` (so `If-Match` guards against clobbering).
+///
+/// Any failure (calendar not found, HTTP 412 on a stale etag, auth, ...) is
+/// reported via `CalendarSessionEvent::Error` rather than aborting the session;
+/// the caller's toast shows it.
+async fn write_event(
+    client: &DavClient,
+    calendars: &[CalendarInfo],
+    credential: &Credential,
+    event: &CalendarEvent,
+    current_month: NaiveDate,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+    cache: Option<&CalendarCache>,
+) {
+    let Some(calendar) = calendars.iter().find(|c| c.id == event.calendar_id) else {
+        let _ = events.send(CalendarSessionEvent::Error(format!("calendar for event \"{}\" not found", event.uid))).await;
+        return;
+    };
+
+    let ics = crate::ical::build_vcalendar(event);
+    let href = match &event.href {
+        Some(href) => href.clone(),
+        None => format!("{}{}.ics", calendar.href, url_safe_uid(&event.uid.0)),
+    };
+
+    match client.put_calendar_object(&href, &ics, credential, event.etag.as_deref()).await {
+        Ok(_new_etag) => {
+            let mut months = vec![current_month];
+            let event_month = first_of_month(event.start.date_naive());
+            if event_month != current_month {
+                months.push(event_month);
+            }
+            for month in months {
+                sync_month(client, calendars, credential, month, events, cache).await;
+            }
+        }
+        Err(e) => {
+            let _ = events.send(CalendarSessionEvent::Error(format!("failed to save event \"{}\": {e}", event.uid))).await;
+        }
+    }
+}
+
+/// Makes a UID safe to use as a URL path segment in a client-generated
+/// calendar-object href. UIDs are normally email-style (`evt-1@example.com`),
+/// and `@`/`%`/`/` are legal iCalendar text but need encoding in a URI - the
+/// round-trip only cares that the server stores the object under some
+/// collection-relative name; it never parses the UID back out of the href.
+fn url_safe_uid(uid: &str) -> String {
+    let mut out = String::with_capacity(uid.len());
+    let mut kept_alnum = false;
+    for c in uid.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            kept_alnum |= c.is_ascii_alphanumeric();
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    // A UID of nothing but URL-unsafe characters (or an empty string) would
+    // produce a bare-underscore name; fall back to something meaningful.
+    if !kept_alnum {
+        out = "event".to_string();
+    }
+    out
+}
+
 fn first_of_month(date: NaiveDate) -> NaiveDate {
     date.with_day(1).unwrap_or(date)
 }
@@ -290,5 +412,13 @@ mod tests {
     #[test]
     fn next_month_within_same_year() {
         assert_eq!(next_month(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()), NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
+    }
+
+    #[test]
+    fn url_safe_uid_preserves_ascii_and_underscores_the_rest() {
+        assert_eq!(url_safe_uid("evt-1@example.com"), "evt-1_example_com");
+        assert_eq!(url_safe_uid("plain"), "plain");
+        assert_eq!(url_safe_uid("###"), "event");
+        assert_eq!(url_safe_uid(""), "event");
     }
 }

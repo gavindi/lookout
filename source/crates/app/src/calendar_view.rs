@@ -54,6 +54,17 @@ const GRID_DIM_TEXT_RGBA: (f64, f64, f64, f64) = (0.66, 0.66, 0.72, 1.0);
 /// Pixels of slack the text baseline sits above a chip's vertical centre.
 const CHIP_TEXT_BASELINE_OFFSET: f64 = 0.36;
 
+/// A callback fired when the user activates (clicks) an event in any view, so
+/// the caller can open its editor. Multiple views share one subscription: the
+/// `CalendarMain`-level `connect_event_activated` hands the callback down to
+/// every sub-view's render pass.
+type ActivateEvent = Rc<dyn Fn(EventOccurrence)>;
+
+/// One entry in a widget's pending activation callback: set by the current
+/// render pass from `CalendarMain::connect_event_activated`, consumed by the
+/// widget's click handling.
+type PendingActivate = Rc<RefCell<Option<ActivateEvent>>>;
+
 struct DayCell {
     container: gtk::Box,
     date_label: gtk::Label,
@@ -119,6 +130,14 @@ fn install_calendar_css() {
         }
         .calendar-toggle-label {
             font-weight: normal;
+        }
+        /* Month-grid event chips are `Gtk.Button`s so they can open an editor;
+           strip the button chrome so they render as the plain colored chips the
+           `.calendar-event-<hex>` rule draws. */
+        .calendar-event-chip-button {
+            padding: 0;
+            min-width: 0;
+            min-height: 0;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -137,6 +156,7 @@ pub struct MonthGrid {
     pub root: gtk::Widget,
     day_cells: Vec<DayCell>,
     anchor_month: Rc<RefCell<NaiveDate>>,
+    on_activate: PendingActivate,
 }
 
 fn build_month_grid() -> MonthGrid {
@@ -178,6 +198,7 @@ fn build_month_grid() -> MonthGrid {
         root: root_box.upcast(),
         day_cells,
         anchor_month: Rc::new(RefCell::new(first_of_month(chrono::Utc::now().date_naive()))),
+        on_activate: Rc::new(RefCell::new(None)),
     }
 }
 
@@ -220,7 +241,8 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
 /// appear in each day cell they occupy, and events that started before the
 /// grid's window still show on their in-grid days); dates outside the grid's
 /// currently-displayed 6-week span are silently ignored.
-pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>) {
+pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>, on_activate: Option<ActivateEvent>) {
+    *mg.on_activate.borrow_mut() = on_activate;
     let grid_start = first_grid_day(*mg.anchor_month.borrow());
 
     for cell in &mg.day_cells {
@@ -233,7 +255,12 @@ pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], co
         let date = grid_start + chrono::Duration::days(i as i64);
         let Some(day_occurrences) = by_date.get(&date) else { continue };
         for occ in &day_occurrences[..day_occurrences.len().min(MAX_VISIBLE_EVENTS_PER_DAY)] {
-            cell.events_box.append(&event_label(occ, colors));
+            let label = event_label(occ, colors);
+            if let Some(callback) = mg.on_activate.borrow().as_ref() {
+                cell.events_box.append(&clickable_event_label(label, occ, callback));
+            } else {
+                cell.events_box.append(&label);
+            }
         }
         if day_occurrences.len() > MAX_VISIBLE_EVENTS_PER_DAY {
             cell.events_box.append(&more_label(day_occurrences.len() - MAX_VISIBLE_EVENTS_PER_DAY));
@@ -308,6 +335,22 @@ pub(crate) fn covered_local_dates(occ: &EventOccurrence, window_start: NaiveDate
         .unwrap_or_default()
 }
 
+/// Wraps a month-grid event chip in a clickable button that fires
+/// `on_activate` with the occurrence - the month view's edit entry point.
+/// The button chrome is stripped by `.calendar-event-chip-button` so it still
+/// renders as the plain colored chip.
+fn clickable_event_label(label: gtk::Label, occ: &EventOccurrence, on_activate: &Rc<dyn Fn(EventOccurrence)>) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .child(&label)
+        .css_classes(["flat", "calendar-event-chip-button"])
+        .halign(gtk::Align::Fill)
+        .build();
+    let occ = occ.clone();
+    let on_activate = on_activate.clone();
+    button.connect_clicked(move |_| on_activate(occ.clone()));
+    button
+}
+
 /// One event rendered on a [`TimeGrid`] canvas: a rectangle whose horizontal
 /// extent is the day column(s) it covers and whose vertical extent is its
 /// start/end time. Single-day timed events are lane-assigned within their
@@ -354,6 +397,8 @@ pub struct TimeGrid {
     weekdays: Vec<chrono::Weekday>,
     day_view: bool,
     data: TimeGridData,
+    /// The click-to-edit callback, set by each `set_time_grid` render pass.
+    on_activate: PendingActivate,
 }
 
 /// The per-grid render state shared with the draw/hover closures.
@@ -385,6 +430,7 @@ fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
         chips: Rc::new(RefCell::new(Vec::new())),
     };
     let hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let on_activate: PendingActivate = Rc::new(RefCell::new(None));
 
     {
         let data = data.clone();
@@ -403,6 +449,8 @@ fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
 
     attach_hover(&band, true, &data, &hover);
     attach_hover(&canvas, false, &data, &hover);
+    attach_click(&band, true, &data, &on_activate);
+    attach_click(&canvas, false, &data, &on_activate);
 
     let mut headers = Vec::new();
     let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
@@ -437,6 +485,7 @@ fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
         weekdays: weekdays.to_vec(),
         day_view,
         data,
+        on_activate,
     }
 }
 
@@ -478,6 +527,38 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
     canvas.add_controller(motion);
 }
 
+/// Wires a click handler onto a time-grid canvas so clicking a chip opens its
+/// editor. `band` selects the split half (all-day chips vs timed chips), the
+/// same convention as [`attach_hover`]; the hit-test is the shared
+/// [`hovered_chip`]. The callback comes from `on_activate`, set by the latest
+/// `set_time_grid` render pass.
+fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_activate: &PendingActivate) {
+    let gesture = gtk::GestureClick::new();
+    {
+        let canvas_widget = canvas.clone();
+        let data = data.clone();
+        let on_activate = on_activate.clone();
+        gesture.connect_pressed(move |_, _, x, y| {
+            let hit = {
+                let dates_guard = data.dates.borrow();
+                let chips_guard = data.chips.borrow();
+                hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band)
+            };
+            let Some(hit) = hit else { return };
+            let occ = {
+                let chips_guard = data.chips.borrow();
+                let occurrence_index = chips_guard[hit].occurrence;
+                data.occurrences.borrow().get(occurrence_index).cloned()
+            };
+            let Some(occ) = occ else { return };
+            if let Some(callback) = on_activate.borrow().as_ref() {
+                callback(occ);
+            }
+        });
+    }
+    canvas.add_controller(gesture);
+}
+
 /// The index of the chip under `(x, y)` among the chips of one split half
 /// (`band` = all-day chips, otherwise timed chips), or `None`. Uses the same
 /// geometry maths as the paint code, so hover hits exactly what is drawn.
@@ -503,7 +584,8 @@ fn hovered_chip(chips: &[TimeChip], canvas_width: f64, n_cols: usize, x: f64, y:
 /// the date itself for Day) and re-renders it with the given occurrences,
 /// replacing the old `set_week`/`set_week_occurrences`/`set_day`/
 /// `set_day_occurrences` calls.
-pub fn set_time_grid(t: &TimeGrid, anchor: NaiveDate, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>) {
+pub fn set_time_grid(t: &TimeGrid, anchor: NaiveDate, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>, on_activate: Option<ActivateEvent>) {
+    *t.on_activate.borrow_mut() = on_activate;
     *t.anchor.borrow_mut() = anchor;
     *t.data.occurrences.borrow_mut() = occurrences.to_vec();
     *t.data.colors.borrow_mut() = colors.clone();
@@ -956,6 +1038,7 @@ pub struct AgendaView {
     pub root: gtk::Widget,
     events_box: gtk::Box,
     anchor: Rc<RefCell<NaiveDate>>,
+    on_activate: PendingActivate,
 }
 
 fn build_agenda_view() -> AgendaView {
@@ -975,6 +1058,7 @@ fn build_agenda_view() -> AgendaView {
         root: root_box.upcast(),
         events_box,
         anchor: Rc::new(RefCell::new(chrono::Utc::now().date_naive())),
+        on_activate: Rc::new(RefCell::new(None)),
     }
 }
 
@@ -982,7 +1066,8 @@ fn build_agenda_view() -> AgendaView {
 /// day: a day header per local date ("Today"/"Tomorrow"/"Wed 12 Aug") with its
 /// events under it, each row a time column plus "5:00pm – 6:00pm summary" (or
 /// "All day summary").
-pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>) {
+pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>, on_activate: Option<ActivateEvent>) {
+    *a.on_activate.borrow_mut() = on_activate;
     *a.anchor.borrow_mut() = anchor;
     clear_children(&a.events_box);
 
@@ -1053,7 +1138,18 @@ pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurre
 
             row.append(&time_label);
             row.append(&summary_label);
-            a.events_box.append(&row);
+
+            // The row is a clickable button when an editor is wired up, so the
+            // agenda can open an event too. A plain box otherwise.
+            if let Some(callback) = a.on_activate.borrow().as_ref() {
+                let button = gtk::Button::builder().child(&row).css_classes(["flat"]).build();
+                let occ = occ.clone();
+                let callback = callback.clone();
+                button.connect_clicked(move |_| callback(occ.clone()));
+                a.events_box.append(&button);
+            } else {
+                a.events_box.append(&row);
+            }
         }
     }
 }
@@ -1135,6 +1231,9 @@ pub struct CalendarMain {
     /// and the window.rs caller rebuilds them via
     /// [`rebuild_calendar_checklist`].
     pub check_colors: gtk::CssProvider,
+    /// The click-to-edit callback, handed to every sub-view by each render
+    /// pass (see [`connect_event_activated`]).
+    on_activate: PendingActivate,
 }
 
 pub fn build_main() -> CalendarMain {
@@ -1215,6 +1314,7 @@ pub fn build_main() -> CalendarMain {
         occurrences: Rc::new(RefCell::new(Vec::new())),
         colors: Rc::new(RefCell::new(HashMap::new())),
         check_colors,
+        on_activate: Rc::new(RefCell::new(None)),
     };
     // Extracted into a local first (rather than inlined into the call
     // below) so the `Ref` temporary from `.borrow()` is dropped before
@@ -1277,6 +1377,14 @@ pub fn set_calendar_colors(c: &CalendarMain, colors: &HashMap<CalendarId, String
     *c.colors.borrow_mut() = colors.clone();
 }
 
+/// Registers `f` to run when the user activates (clicks) an event in any of
+/// the main panel's views - the month grid, the time grids, or the agenda -
+/// receiving the clicked occurrence so the caller can open its editor.
+/// One subscriber is expected (the window); a later registration replaces it.
+pub fn connect_event_activated(c: &CalendarMain, f: impl Fn(EventOccurrence) + 'static) {
+    *c.on_activate.borrow_mut() = Some(Rc::new(f));
+}
+
 /// Moves the anchor by `by` steps in the active view's natural unit: a day
 /// for Day/Agenda, a week for Week/Work week, a month for Month/Split.
 pub fn step(c: &CalendarMain, by: i64) {
@@ -1300,18 +1408,19 @@ fn refresh(c: &CalendarMain) {
     let anchor = *c.anchor.borrow();
     let occurrences = c.occurrences.borrow();
     let colors = c.colors.borrow();
+    let on_activate = c.on_activate.borrow().clone();
 
     set_month(&c.month, anchor);
-    set_month_occurrences(&c.month, &occurrences, &colors);
+    set_month_occurrences(&c.month, &occurrences, &colors, on_activate.clone());
     set_month(&c.split.month, anchor);
-    set_month_occurrences(&c.split.month, &occurrences, &colors);
+    set_month_occurrences(&c.split.month, &occurrences, &colors, on_activate.clone());
 
-    set_time_grid(&c.workweek, anchor, &occurrences, &colors);
-    set_time_grid(&c.week, anchor, &occurrences, &colors);
-    set_time_grid(&c.day, anchor, &occurrences, &colors);
+    set_time_grid(&c.workweek, anchor, &occurrences, &colors, on_activate.clone());
+    set_time_grid(&c.week, anchor, &occurrences, &colors, on_activate.clone());
+    set_time_grid(&c.day, anchor, &occurrences, &colors, on_activate.clone());
 
-    set_agenda(&c.agenda, anchor, &occurrences, &colors);
-    set_agenda(&c.split.agenda, anchor, &occurrences, &colors);
+    set_agenda(&c.agenda, anchor, &occurrences, &colors, on_activate.clone());
+    set_agenda(&c.split.agenda, anchor, &occurrences, &colors, on_activate);
 
     c.header_label.set_label(&header_text(c));
 }
@@ -1903,9 +2012,16 @@ mod tests {
             uid: EventUid(summary.to_string()),
             calendar_id: CalendarId("test".to_string()),
             summary: Some(summary.to_string()),
+            description: None,
+            location: None,
             start: chrono::Local.from_local_datetime(&start).single().unwrap().with_timezone(&chrono::Utc),
             end: chrono::Local.from_local_datetime(&end).single().unwrap().with_timezone(&chrono::Utc),
             all_day,
+            rrule: None,
+            master_start: None,
+            master_end: None,
+            href: None,
+            etag: None,
         }
     }
 

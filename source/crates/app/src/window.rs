@@ -3,9 +3,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::{
-    AccountId, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, VCard,
+    AccountId, CalendarEvent, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole,
+    SystemFlagBit, Uid, VCard,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::{CalendarAccountConfig, CardDavAccountConfig, Credential, DavClient};
@@ -2131,12 +2133,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Calendar's own command toolbar row, swapped in for the Mail one
     // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
-    // active. All five segmented options (Day/Work week/Week/Month/Split)
-    // switch the main panel's stack; the rest of the toolbar mirrors the
-    // Mail toolbar's disabled-placeholder convention.
+    // active. New Event opens the event editor (wired later, once
+    // `calendar_state` exists); all five segmented options (Day/Work
+    // week/Week/Month/Split) switch the main panel's stack; Filter/Share/Print
+    // remain disabled placeholders.
     let new_event_button = gtk::Button::from_icon_name("appointment-new-symbolic");
     new_event_button.set_tooltip_text(Some("New Event"));
-    new_event_button.set_sensitive(false);
 
     let day_view_button = gtk::ToggleButton::builder().label("Day").build();
     let work_week_view_button = gtk::ToggleButton::builder().label("Work week").build();
@@ -3287,6 +3289,88 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             for handle in calendar_state.borrow().accounts.values() {
                 let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
             }
+        });
+    }
+
+    // --- Calendar event editor: the "New Event" toolbar button opens a blank
+    // form prefilled for the displayed date; clicking an event in any calendar
+    // view opens it for editing/deleting. Both save and delete hand the
+    // result to the owning account's session (`route_calendar_save`/`_delete`),
+    // which PUTs/DELETEs it and resyncs the month - the UI repaints through the
+    // existing `OccurrencesUpdated` path, so there's no refresh work here.
+    {
+        let window = window.clone();
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let toast_overlay = toast_overlay.clone();
+        new_event_button.connect_clicked(move |_| {
+            let calendars = pickable_calendars(&calendar_state);
+            let Some(default_calendar) = default_pickable_calendar(&calendar_state) else {
+                toast_overlay.add_toast(adw::Toast::new("Connect a calendar account to create events."));
+                return;
+            };
+            let suggested_start = {
+                let anchor = calendar_view::anchor(&calendar_main);
+                let now = chrono::Local::now();
+                if now.date_naive() == anchor {
+                    if now.hour() == 23 {
+                        (anchor + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap()
+                    } else {
+                        anchor.and_hms_opt(now.hour() + 1, 0, 0).unwrap()
+                    }
+                } else {
+                    anchor.and_hms_opt(9, 0, 0).unwrap()
+                }
+            };
+            crate::event_editor::show_event_editor(
+                &window,
+                crate::event_editor::EventEditorPrefill {
+                    calendars: &calendars,
+                    default_calendar,
+                    existing: None,
+                    suggested_start: Some(suggested_start),
+                },
+                {
+                    let calendar_state = calendar_state.clone();
+                    move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
+                },
+                {
+                    let calendar_state = calendar_state.clone();
+                    move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
+                },
+            );
+        });
+    }
+    {
+        let window = window.clone();
+        let calendar_state = calendar_state.clone();
+        calendar_view::connect_event_activated(&calendar_main, move |occ| {
+            let calendars = pickable_calendars(&calendar_state);
+            if calendars.is_empty() {
+                return;
+            }
+            let default_calendar = if calendars.iter().any(|(_, id)| *id == occ.calendar_id) {
+                occ.calendar_id.clone()
+            } else {
+                default_pickable_calendar(&calendar_state).unwrap_or_else(|| CalendarId(String::new()))
+            };
+            crate::event_editor::show_event_editor(
+                &window,
+                crate::event_editor::EventEditorPrefill {
+                    calendars: &calendars,
+                    default_calendar,
+                    existing: Some(&occ),
+                    suggested_start: None,
+                },
+                {
+                    let calendar_state = calendar_state.clone();
+                    move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
+                },
+                {
+                    let calendar_state = calendar_state.clone();
+                    move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
+                },
+            );
         });
     }
 
@@ -4672,6 +4756,78 @@ fn calendar_account_label(state: &Rc<RefCell<CalendarUiState>>, account_id: &Acc
         .get(account_id)
         .map(|h| h.display_name.clone())
         .unwrap_or_else(|| account_id.0.clone())
+}
+
+/// The `(label, id)` list the event editor's calendar picker shows: every
+/// discovered calendar across every connected account, labelled
+/// "account · calendar" and sorted by account name.
+fn pickable_calendars(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<(String, CalendarId)> {
+    let st = calendar_state.borrow();
+    let mut handles: Vec<&CalendarAccountHandle> = st.accounts.values().collect();
+    handles.sort_by_key(|h| h.display_name.to_lowercase());
+    let mut out = Vec::new();
+    for handle in handles {
+        for calendar in &handle.calendars {
+            out.push((format!("{} · {}", handle.display_name, calendar.display_name), calendar.id.clone()));
+        }
+    }
+    out
+}
+
+/// The editor's default calendar for a new event: the first checked calendar
+/// (the one whose events are actually on screen), or any calendar if nothing
+/// is checked.
+fn default_pickable_calendar(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Option<CalendarId> {
+    let st = calendar_state.borrow();
+    for handle in st.accounts.values() {
+        for calendar in &handle.calendars {
+            if st.checked_calendar_ids.contains(&calendar.id) {
+                return Some(calendar.id.clone());
+            }
+        }
+    }
+    st.accounts.values().find_map(|handle| handle.calendars.first().map(|c| c.id.clone()))
+}
+
+/// The account session that owns `calendar_id`, so its command channel can
+/// carry create/update/delete writes.
+fn calendar_handle_for_id(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> Option<async_channel::Sender<CalendarCommand>> {
+    calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .find(|handle| handle.calendars.iter().any(|c| c.id == *calendar_id))
+        .map(|handle| handle.cmd_tx.clone())
+}
+
+/// Routes a saved (created or edited) event to its account's session. An event
+/// with a `href` is an edit in place (`UpdateEvent`, guarded by its etag); one
+/// without is a brand-new event (`CreateEvent`, fresh `<uid>.ics` href). The
+/// session resyncs on success, which repaints the views.
+fn route_calendar_save(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, event: CalendarEvent) {
+    let Some(handle) = calendar_handle_for_id(calendar_state, &calendar_id) else {
+        tracing::warn!("tried to save an event into an unknown calendar {calendar_id}");
+        return;
+    };
+    if event.href.is_some() {
+        let _ = handle.send_blocking(CalendarCommand::UpdateEvent { event: Box::new(event) });
+    } else {
+        let _ = handle.send_blocking(CalendarCommand::CreateEvent { event: Box::new(event) });
+    }
+}
+
+/// Routes an event deletion to its account's session. The editor's form isn't
+/// consulted - only the target resource (`calendar_id`, `href`, `etag`).
+fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, _uid: EventUid, href: Option<String>, etag: Option<String>) {
+    let Some(handle) = calendar_handle_for_id(calendar_state, &calendar_id) else {
+        tracing::warn!("tried to delete an event from an unknown calendar {calendar_id}");
+        return;
+    };
+    let Some(href) = href else {
+        tracing::warn!("tried to delete an event without a server href");
+        return;
+    };
+    let _ = handle.send_blocking(CalendarCommand::DeleteEvent { calendar_id, href, etag });
 }
 
 fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {

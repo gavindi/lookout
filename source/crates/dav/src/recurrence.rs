@@ -37,9 +37,16 @@ pub fn expand_occurrences(event: &CalendarEvent, window_start: DateTime<Utc>, wi
                         uid: event.uid.clone(),
                         calendar_id: event.calendar_id.clone(),
                         summary: event.summary.clone(),
+                        description: event.description.clone(),
+                        location: event.location.clone(),
                         start: start_utc,
                         end: start_utc + duration,
                         all_day: event.all_day,
+                        rrule: event.rrule.clone(),
+                        master_start: Some(event.start),
+                        master_end: Some(event.end),
+                        href: event.href.clone(),
+                        etag: event.etag.clone(),
                     }
                 })
                 .collect()
@@ -64,9 +71,16 @@ fn single_occurrence_if_overlapping(event: &CalendarEvent, window_start: DateTim
             uid: event.uid.clone(),
             calendar_id: event.calendar_id.clone(),
             summary: event.summary.clone(),
+            description: event.description.clone(),
+            location: event.location.clone(),
             start: event.start,
             end: event.end,
             all_day: event.all_day,
+            rrule: event.rrule.clone(),
+            master_start: Some(event.start),
+            master_end: Some(event.end),
+            href: event.href.clone(),
+            etag: event.etag.clone(),
         }]
     } else {
         Vec::new()
@@ -89,6 +103,8 @@ mod tests {
             end: end.parse().unwrap(),
             all_day: false,
             rrule: rrule.map(str::to_string),
+            href: None,
+            etag: None,
         }
     }
 
@@ -143,5 +159,21 @@ mod tests {
         let occurrences = expand_occurrences(&event, start, end);
         assert_eq!(occurrences.len(), 1);
         assert_eq!(occurrences[0].start, event.start);
+    }
+
+    #[test]
+    fn occurrences_carry_the_master_anchor_for_whole_series_edits() {
+        // A recurring master anchored weeks before the requested window, so no
+        // occurrence's own start equals the master's DTSTART - the editor must
+        // still be able to recover the series anchor from any occurrence.
+        let event = base_event("2026-06-01T09:00:00Z", "2026-06-01T09:30:00Z", Some("FREQ=WEEKLY"));
+        let (start, end) = window("2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+        let occurrences = expand_occurrences(&event, start, end);
+        assert!(occurrences.len() > 1);
+        for occ in &occurrences {
+            assert_eq!(occ.master_start, Some(event.start));
+            assert_eq!(occ.master_end, Some(event.end));
+            assert_ne!(occ.start, event.start, "the occurrence is an expansion, not the master");
+        }
     }
 }

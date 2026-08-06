@@ -199,9 +199,53 @@ impl DavClient {
 
         Ok(responses
             .into_iter()
-            .filter_map(|r| r.prop(NS_CALDAV, "calendar-data").map(str::to_string))
-            .flat_map(|ics| ical::parse_vevents(&calendar.id, &ics))
+            .filter_map(|r| {
+                let href = r.href.clone();
+                let etag = r.prop(NS_DAV, "getetag").map(str::to_string);
+                let data = r.prop(NS_CALDAV, "calendar-data")?.to_string();
+                Some((href, etag, data))
+            })
+            .flat_map(|(href, etag, ics)| ical::parse_vevents_with_meta(&calendar.id, &ics, Some(&href), etag.as_deref()))
             .collect())
+    }
+
+    /// Stores `ics` as a calendar object at `href` via `PUT` (RFC 4791 §5.3).
+    /// `etag` is the resource's current `getetag` for an update - sent as
+    /// `If-Match`, so a write based on a stale copy fails with HTTP 412 rather
+    /// than silently clobbering a concurrent change. `None` marks a create and
+    /// sends `If-None-Match: *`, refusing to overwrite an existing resource.
+    /// Returns the server's new etag (the `ETag` response header), if any.
+    pub async fn put_calendar_object(&self, href: &str, ics: &str, credential: &Credential, etag: Option<&str>) -> Result<Option<String>> {
+        let url = self.resolve(href)?;
+        let request_url = url.clone();
+        let mut headers = vec![("Content-Type", "text/calendar; charset=utf-8".to_string())];
+        match etag {
+            Some(etag) => headers.push(("If-Match", format!("\"{}\"", etag.trim_matches('"')))),
+            None => headers.push(("If-None-Match", "*".to_string())),
+        }
+        let response = self.send_request("PUT", url, credential, Some(ics.to_string()), &headers).await?;
+        tracing::debug!("DAV PUT {request_url} -> {}", response.status());
+        let new_etag = response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_string);
+        // Drain the body so the connection can be reused.
+        drop(response.text().await?);
+        Ok(new_etag)
+    }
+
+    /// Deletes the calendar object at `href` via `DELETE` (RFC 4791 §5.3.4).
+    /// An optional `etag` is sent as `If-Match` so deleting a resource that
+    /// has changed since it was fetched fails loudly instead of silently
+    /// removing a concurrent edit.
+    pub async fn delete_calendar_object(&self, href: &str, credential: &Credential, etag: Option<&str>) -> Result<()> {
+        let url = self.resolve(href)?;
+        let request_url = url.clone();
+        let mut headers: Vec<(&str, String)> = Vec::new();
+        if let Some(etag) = etag {
+            headers.push(("If-Match", format!("\"{}\"", etag.trim_matches('"'))));
+        }
+        let response = self.send_request("DELETE", url, credential, None, &headers).await?;
+        tracing::debug!("DAV DELETE {request_url} -> {}", response.status());
+        drop(response.text().await?);
+        Ok(())
     }
 
     fn resolve(&self, href: &str) -> Result<reqwest::Url> {
@@ -222,16 +266,30 @@ impl DavClient {
         self.report(url, depth, credential, body).await
     }
 
-    async fn send_xml_request(&self, method_name: &str, url: reqwest::Url, depth: u8, credential: &Credential, body: String) -> Result<Vec<DavResponse>> {
+    /// Sends `method_name` to `url` with `credential` auth applied and
+    /// `extra_headers`/`body` attached, erroring with the server's (truncated)
+    /// response body on any non-2xx - the same body-snippet convention every
+    /// other DAV method uses, since CalDAV servers explain their 4xxes in it.
+    /// Shared by the XML-multistatus methods (which parse the body) and the
+    /// calendar write methods (which only need status/headers).
+    async fn send_request(
+        &self,
+        method_name: &str,
+        url: reqwest::Url,
+        credential: &Credential,
+        body: Option<String>,
+        extra_headers: &[(&str, String)],
+    ) -> Result<reqwest::Response> {
         let method = Method::from_bytes(method_name.as_bytes()).expect("method name is a valid HTTP token");
         let request_url = url.clone();
-        tracing::debug!("DAV {method_name} {request_url} (Depth: {depth}) body:\n{body}");
-        let mut req = self
-            .http
-            .request(method, url)
-            .header("Depth", depth.to_string())
-            .header("Content-Type", "application/xml; charset=utf-8")
-            .body(body);
+        tracing::debug!("DAV {method_name} {request_url} body:\n{:?}", body);
+        let mut req = self.http.request(method, url);
+        for (name, value) in extra_headers {
+            req = req.header(*name, value);
+        }
+        if let Some(body) = body {
+            req = req.body(body);
+        }
         req = match credential {
             // CalDAV's actual auth mechanism is plain HTTP headers, not the
             // SASL-inside-IMAP `AUTHENTICATE XOAUTH2` Mail uses - nothing to
@@ -242,9 +300,9 @@ impl DavClient {
 
         let response = req.send().await?;
         let status = response.status();
-        let text = response.text().await?;
-        tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
         if !status.is_success() {
+            let text = response.text().await?;
+            tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
             // `error_for_status()` would discard the response body here -
             // and CardDAV/CalDAV servers (Google, Nextcloud, ...) routinely
             // explain exactly what they didn't like about the request in it,
@@ -253,6 +311,23 @@ impl DavClient {
             let snippet: String = text.chars().take(500).collect();
             return Err(Error::Discovery(format!("HTTP {status} for {request_url}: {snippet}")));
         }
+        Ok(response)
+    }
+
+    async fn send_xml_request(&self, method_name: &str, url: reqwest::Url, depth: u8, credential: &Credential, body: String) -> Result<Vec<DavResponse>> {
+        let request_url = url.clone();
+        let response = self
+            .send_request(
+                method_name,
+                url,
+                credential,
+                Some(body),
+                &[("Depth", depth.to_string()), ("Content-Type", "application/xml; charset=utf-8".to_string())],
+            )
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
         xml::parse_multistatus(&text)
     }
 }
@@ -370,5 +445,98 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].uid.0, "evt-1@example.com");
         assert_eq!(events[0].summary.as_deref(), Some("Team sync"));
+        // The multistatus `<href>`/`<getetag>` must have been stamped onto the
+        // event - the write path needs both to PUT/DELETE it back.
+        assert_eq!(events[0].href.as_deref(), Some("/calendars/alice/home/personal/event1.ics"));
+        assert_eq!(events[0].etag.as_deref(), Some("\"abc123\""));
+    }
+
+    #[tokio::test]
+    async fn put_calendar_object_creates_with_if_none_match_and_returns_new_etag() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/cal/events/new-event.ics"))
+            .and(wiremock::matchers::header("If-None-Match", "*"))
+            .and(wiremock::matchers::body_string_contains("SUMMARY:Created event"))
+            .respond_with(ResponseTemplate::new(201).insert_header("ETag", "\"etag-new\""))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        let etag = client
+            .put_calendar_object(
+                "/cal/events/new-event.ics",
+                "BEGIN:VCALENDAR\r\nSUMMARY:Created event\r\nEND:VCALENDAR\r\n",
+                &credential,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(etag.as_deref(), Some("\"etag-new\""));
+    }
+
+    #[tokio::test]
+    async fn put_calendar_object_updates_with_if_match_and_normalizes_the_etag_quotes() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/cal/events/evt.ics"))
+            .and(wiremock::matchers::header("If-Match", "\"old-etag\""))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        // An unquoted etag is normalized to the quoted form `If-Match` wants.
+        client
+            .put_calendar_object("/cal/events/evt.ics", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", &credential, Some("old-etag"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_calendar_object_412_surfaces_the_server_body_snippet() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(412).set_body_string("Precondition Failed: etag mismatch on server"))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        let err = client
+            .put_calendar_object("/cal/events/evt.ics", "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", &credential, Some("stale-etag"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("412"), "error should surface the HTTP status: {err}");
+        assert!(err.to_string().contains("etag mismatch"), "error should include the server's explanation: {err}");
+    }
+
+    #[tokio::test]
+    async fn delete_calendar_object_sends_if_match_and_succeeds() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/cal/events/evt.ics"))
+            .and(wiremock::matchers::header("If-Match", "\"etag-del\""))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        client.delete_calendar_object("/cal/events/evt.ics", &credential, Some("\"etag-del\"")).await.unwrap();
     }
 }

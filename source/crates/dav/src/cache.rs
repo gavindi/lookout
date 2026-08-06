@@ -151,9 +151,16 @@ mod tests {
             uid: lookout_core::EventUid(format!("uid-{day}")),
             calendar_id: calendar_id.clone(),
             summary: Some(summary.to_string()),
+            description: None,
+            location: None,
             start,
             end: start + Duration::hours(1),
             all_day: false,
+            rrule: None,
+            master_start: None,
+            master_end: None,
+            href: None,
+            etag: None,
         }
     }
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.46 (2026-08-06)
+
+### Added
+
+- **Calendar**: the calendar is no longer read-only - the "New Event" toolbar button (previously a disabled placeholder) now opens a modal event editor, and clicking an event in *any* view opens it for editing or deletion. The editor (`event_editor.rs`) has a title field, a calendar picker listing every connected account's calendars ("account · calendar", defaulting to the first *checked* one, locked while editing), an all-day toggle, start/end date pickers with `hh:mm` spin buttons (the times grey out while all-day, whose end stays exclusive per RFC 5545), a location field, a notes area, and Save/Delete buttons - a destructive Delete appears only when editing. "New Event" prefills for the displayed date (the next whole hour, or 9:00 on a non-today anchor); edits carry over the event's full identity. Click entry points were added to all five views: the month grid's chips (now buttons, chrome-stripped by a `.calendar-event-chip-button` CSS rule so they still render as colored chips), the Day/Week/Work week canvases (a `GestureClick` reusing the existing `hovered_chip` hit-test), and the agenda rows.
+- **Calendar**: edits and creates are written back over CalDAV. A new event is `PUT` to a client-generated `<uid>.ics` href under the chosen collection with `If-None-Match: *`; an edit `PUT`s to the resource's own href with its `getetag` as `If-Match`, so a write based on a stale copy fails with HTTP 412 instead of clobbering a concurrent change; delete is a conditional `DELETE` with the same etag guard. `EventOccurrence` now carries the resource href/etag (plus description/location/RRULE) so a clicked occurrence is the complete edit target without a separate lookup. The session resyncs the on-screen month after a write, so the change renders through the existing `OccurrencesUpdated` path; failures surface as error toasts, and a write issued while the connection is backed off gets an explicit "not connected" error rather than being dropped silently.
+- **Calendar**: recurring events can be edited as a whole series. The master's RRULE is preserved verbatim on save (`build_vcalendar` serializes it back unchanged), and the editor prefills the *series anchor* - the master `DTSTART`/`DTEND`, carried on every occurrence as `master_start`/`master_end` - rather than the clicked occurrence's expansion, so renaming a recurring event can't silently re-anchor the whole series. Per-occurrence edit scopes remain a later TODO. New events always get a fresh UUID `UID`.
+- **Testing**: the iCalendar serializer and the write verbs are now covered: `build_vcalendar` round-trips through the parser (timed, all-day, recurring, and the href/etag metadata path), and `lookout-dav` gains wiremock tests for PUT with `If-None-Match`/`If-Match` (including etag-quote normalization and the 412 body-snippet error) and conditional DELETE.
+
 ## 0.6.45 (2026-08-06)
 
 ### Added
