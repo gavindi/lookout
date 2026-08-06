@@ -1,0 +1,79 @@
+name: lookout
+base: core24
+version: 0.6.55
+summary: Native GNOME mail client built on GNOME Online Accounts
+description: |
+  Lookout is a native GNOME/libadwaita mail client. It connects to your mail
+  accounts through GNOME Online Accounts, so there is no separate sign-in -
+  add an account in Settings and Lookout picks it up automatically.
+grade: devel
+confinement: strict
+architectures:
+  - build-on: amd64
+
+apps:
+  lookout:
+    command: usr/bin/lookout
+    plugs:
+      - desktop
+      - desktop-legacy
+      - wayland
+      - x11
+      - network
+      - network-bind
+      - gsettings
+      - online-accounts-service
+      - password-manager-service
+      - opengl
+      - audio-playback
+    # WebKitGTK's own bubblewrap sandbox can't nest inside snap confinement;
+    # the snap itself is already the sandbox, so disable WebKit's inner one.
+    environment:
+      WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
+
+plugs:
+  dbus-settings:
+    interface: dbus
+    bus: session
+    name: org.gnome.Settings
+  dbus-control-center:
+    interface: dbus
+    bus: session
+    name: org.gnome.ControlCenter
+
+parts:
+  lookout:
+    plugin: rust
+    source: .
+    build-packages:
+      - pkg-config
+      - curl
+      - libgtk-4-dev
+      - libadwaita-1-dev
+      - libwebkitgtk-6.0-dev
+      - libglib2.0-dev
+      - libglib2.0-dev-bin
+    build-environment:
+      - PATH: /root/.cargo/bin:$PATH
+    stage-packages:
+      - libgtk-4-1
+      - libadwaita-1-0
+      - libwebkitgtk-6.0-0
+      - libsoup-3.0-0
+      - libglib2.0-0
+      - dconf-gsettings-backend
+      - gsettings-desktop-schemas
+      - adwaita-icon-theme
+      - shared-mime-info
+    override-build: |
+      if [ ! -x /root/.cargo/bin/rustup ]; then
+        curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+      fi
+      rustup default stable
+      snapcraftctl build
+      install -Dm755 -t $SNAPCRAFT_PART_INSTALL/usr/bin target/release/lookout
+      install -Dm644 -t $SNAPCRAFT_PART_INSTALL/usr/share/applications data/io.github.gavindi.Lookout.desktop
+      install -Dm644 -t $SNAPCRAFT_PART_INSTALL/usr/share/metainfo data/io.github.gavindi.Lookout.metainfo.xml
+      install -Dm644 -t $SNAPCRAFT_PART_INSTALL/usr/share/icons/hicolor/scalable/apps data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg
+      install -Dm644 -t $SNAPCRAFT_PART_INSTALL/usr/share/glib-2.0/schemas data/gschema/io.github.gavindi.Lookout.gschema.xml
+      glib-compile-schemas $SNAPCRAFT_PART_INSTALL/usr/share/glib-2.0/schemas

@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.55" date="2026-08-07">
+      <description>
+        <p>Lookout now builds its own distribution packages - .deb, .rpm, Flatpak, and snap - through a CI workflow, so it can be installed as a regular package on any Linux desktop. The Open Online Accounts Settings button also works inside those sandboxes, opening the settings panel over D-Bus instead of launching a system program.</p>
+      </description>
+    </release>
     <release version="0.6.54" date="2026-08-07">
       <description>
         <p>Search moves into the window's title bar: a permanent search field is always visible, and pressing Ctrl+F jumps straight to it with the previous query selected. Searching from any tab - Mail, Calendar, or People - now switches to Mail so the results are on screen.</p>

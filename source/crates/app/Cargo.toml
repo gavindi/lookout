@@ -3,6 +3,8 @@ name = "lookout-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Native GNOME mail client built on GNOME Online Accounts"
+repository.workspace = true
 
 [[bin]]
 name = "lookout"
@@ -31,3 +33,39 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 webkit = { package = "webkit6", version = "0.6" }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[package.metadata.deb]
+name = "lookout"
+maintainer = "Gavin Graham <gavindi@users.noreply.github.com>"
+copyright = "2026 Gavin Graham"
+depends = "libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), libwebkitgtk-6.0-0, libglib2.0-0"
+section = "mail"
+priority = "optional"
+assets = [
+    ["target/release/lookout", "usr/bin/", "755"],
+    ["../../data/io.github.gavindi.Lookout.desktop", "usr/share/applications/", "644"],
+    ["../../data/io.github.gavindi.Lookout.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../data/gschema/io.github.gavindi.Lookout.gschema.xml", "usr/share/glib-2.0/schemas/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "lookout"
+license = "GPL-3.0-or-later"
+summary = "Native GNOME mail client built on GNOME Online Accounts"
+url = "https://github.com/gavindi/lookout"
+group = "Applications/Internet"
+assets = [
+    { source = "target/release/lookout", dest = "/usr/bin/lookout", mode = "755" },
+    { source = "../../data/io.github.gavindi.Lookout.desktop", dest = "/usr/share/applications/io.github.gavindi.Lookout.desktop", mode = "644" },
+    { source = "../../data/io.github.gavindi.Lookout.metainfo.xml", dest = "/usr/share/metainfo/io.github.gavindi.Lookout.metainfo.xml", mode = "644" },
+    { source = "../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg", mode = "644" },
+    { source = "../../data/gschema/io.github.gavindi.Lookout.gschema.xml", dest = "/usr/share/glib-2.0/schemas/io.github.gavindi.Lookout.gschema.xml", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+gtk4 = ">= 4.14"
+libadwaita = ">= 1.5"
+"webkitgtk6.0" = "*"
+glib2 = "*"

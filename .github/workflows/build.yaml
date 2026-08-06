@@ -1,0 +1,84 @@
+name: Build packages
+
+on:
+  push:
+    branches: [build]
+
+defaults:
+  run:
+    working-directory: source
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deb-rpm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4/libadwaita/WebKitGTK dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libglib2.0-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+      - name: Install cargo-deb and cargo-generate-rpm
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+      - name: Build .deb
+        run: cargo deb -p lookout-app
+      # cargo-generate-rpm resolves asset paths against the crate directory
+      # and the target dir, so it runs from crates/app with CARGO_TARGET_DIR
+      # pointing back at the shared workspace target (where cargo already
+      # put the release binary).
+      - name: Build .rpm
+        working-directory: crates/app
+        env:
+          CARGO_TARGET_DIR: ../..
+        run: cargo generate-rpm
+      - name: Upload .deb and .rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-rpm
+          path: |
+            source/target/debian/*.deb
+            source/target/generate-rpm/*.rpm
+
+  flatpak:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate cargo-sources.json
+        run: |
+          python3 -m venv /tmp/fbtools
+          /tmp/fbtools/bin/pip install --quiet flatpak-builder-tools
+          /tmp/fbtools/bin/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
+      - uses: flathub-infra/flatpak-github-actions/flatpak-builder@master
+        with:
+          bundle: lookout.flatpak
+          manifest-path: source/flatpak/io.github.gavindi.Lookout.json
+          cache: true
+      - name: Upload .flatpak bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: lookout.flatpak
+
+  snap:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snapcore/action-build@v1
+        with:
+          path: source
+      - name: Upload .snap
+        uses: actions/upload-artifact@v4
+        with:
+          name: snap
+          path: source/*.snap

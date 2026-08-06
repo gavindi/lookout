@@ -16,7 +16,11 @@
 
         "--talk-name=org.gnome.OnlineAccounts",
 
-        "--talk-name=org.gnome.ControlCenter"
+        "--talk-name=org.gnome.Settings",
+        "--talk-name=org.gnome.ControlCenter",
+
+        "--talk-name=ca.desrt.dconf",
+        "--filesystem=xdg-run/dconf"
     ],
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin",
@@ -33,13 +37,16 @@
                 "install -Dm755 target/release/lookout /app/bin/lookout",
                 "install -Dm644 data/io.github.gavindi.Lookout.desktop /app/share/applications/io.github.gavindi.Lookout.desktop",
                 "install -Dm644 data/io.github.gavindi.Lookout.metainfo.xml /app/share/metainfo/io.github.gavindi.Lookout.metainfo.xml",
-                "install -Dm644 data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg /app/share/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg"
+                "install -Dm644 data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg /app/share/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg",
+                "install -Dm644 data/gschema/io.github.gavindi.Lookout.gschema.xml /app/share/glib-2.0/schemas/io.github.gavindi.Lookout.gschema.xml",
+                "glib-compile-schemas /app/share/glib-2.0/schemas"
             ],
             "sources": [
                 {
                     "type": "dir",
                     "path": "..",
-                    "dest": "."
+                    "dest": ".",
+                    "exclude": ["target", ".git"]
                 },
                 {
                     "type": "file",

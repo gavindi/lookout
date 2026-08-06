@@ -829,8 +829,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .halign(gtk::Align::Center)
         .css_classes(["suggested-action", "pill"])
         .build();
-    open_settings_button.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center").arg("online-accounts").spawn();
+    open_settings_button.connect_clicked({
+        let worker = worker.clone();
+        move |_| worker.spawn(crate::online_accounts::open_online_accounts())
     });
     status_page.set_child(Some(&open_settings_button));
 
@@ -3016,8 +3017,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     {
         let add_account_row = config_view.add_account_row.clone();
-        add_account_row.connect_activated(|_| {
-            let _ = std::process::Command::new("gnome-control-center").arg("online-accounts").spawn();
+        let worker = worker.clone();
+        add_account_row.connect_activated(move |_| {
+            worker.spawn(crate::online_accounts::open_online_accounts());
         });
     }
 
@@ -3085,9 +3087,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // like Mail's and Calendar's when the Config nav-rail button is active.
     let config_add_account_button = gtk::Button::from_icon_name("contact-new-symbolic");
     config_add_account_button.set_tooltip_text(Some("Add account"));
-    config_add_account_button.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center").arg("online-accounts").spawn();
-    });
+    {
+        let worker = worker.clone();
+        config_add_account_button.connect_clicked(move |_| {
+            worker.spawn(crate::online_accounts::open_online_accounts());
+        });
+    }
     let config_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     config_command_toolbar.append(&config_add_account_button);
     view_toolbar_stack.add_named(&config_command_toolbar, Some("config"));
