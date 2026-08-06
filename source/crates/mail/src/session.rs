@@ -14,9 +14,12 @@ use crate::envelope::summary_from_fetch;
 use crate::error::{Error, Result};
 use crate::send::{build_raw_message, send_smtp, ComposedMessage};
 
-/// How many of the most recent messages to fetch on initial folder sync.
-/// Cheap (envelope-only) so this can be generous; full CONDSTORE/QRESYNC
-/// incremental sync is Phase 2 - see the module docs.
+/// How many of the most recent messages the background body prefetch queues
+/// for download on a folder it hasn't warmed yet. Bounds the *body* warm-up
+/// only - the display/envelope sync fetches the whole folder (see
+/// `sync_mailbox`) - so a folder's newest N get bodies downloaded in batches
+/// while anything older fetches on demand. Full CONDSTORE/QRESYNC incremental
+/// sync is Phase 2 - see the module docs.
 const INITIAL_FETCH_LIMIT: u32 = 200;
 
 /// How long a single IDLE wait runs before we re-enter it purely as a
@@ -113,7 +116,7 @@ pub enum ConnectionState {
 
 #[derive(Debug)]
 pub enum AccountCommand {
-    /// Select a mailbox and (re)fetch its most recent envelopes.
+    /// Select a mailbox and (re)fetch its envelopes.
     SyncMailbox(MailboxId),
     /// Fetch the full body of a message in the *currently selected* mailbox
     /// (fetching a body from a different mailbox would require a SELECT,
@@ -493,8 +496,8 @@ async fn connect_and_run(
         match wake {
             // A server notification during IDLE (EXISTS/EXPUNGE/etc) means
             // the currently-selected mailbox changed; re-fetch its envelope
-            // window. This is a full bounded re-fetch rather than a
-            // CONDSTORE delta - see INITIAL_FETCH_LIMIT's doc comment.
+            // set. This is a full re-fetch rather than a CONDSTORE delta -
+            // see `sync_mailbox` and the module docs.
             Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
             Wake::Idle(Ok(_)) => {
                 sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
@@ -542,6 +545,16 @@ async fn connect_and_run(
                         // and without this emit the app's sync request would
                         // be answered by nothing - its pending entry would
                         // stick and suppress every later sync for this folder.
+                        //
+                        // The cache is safe to serve because `Cache::open`
+                        // wipes the envelope table once when the on-disk
+                        // format version changes, and every `sync_mailbox`
+                        // since then writes the whole folder - so a non-empty
+                        // cache is a complete snapshot, never a pre-fix
+                        // windowed subset. (A `STATUS (MESSAGES)` count is
+                        // *not* a safe completeness reference: on Gmail's All
+                        // Mail it over-reports vs. what a fetch returns, which
+                        // would force a pointless full re-sync every open.)
                         let cached = cache.is_some_and(|c| c.has_messages(&current_mailbox_id).unwrap_or(false));
                         if cached {
                             tracing::debug!(mailbox = %current_mailbox_id, "SyncMailbox: cache hit, emitting cached messages without IMAP sync");
@@ -971,10 +984,9 @@ async fn connect_and_run(
                     let folder_name = pf.current_folder_name.clone();
                     let mailbox_meta = session.select(&folder_name).await?;
                     session_selected = pf.mailboxes[pf.current].clone();
-                    let uid_next = mailbox_meta.uid_next.unwrap_or(1);
-                    let fetch_from = uid_next.saturating_sub(INITIAL_FETCH_LIMIT).max(1);
-                    let uid_range = format!("{fetch_from}:*");
-                    let fetches: Vec<_> = session.uid_fetch(&uid_range, "(UID)").await?.try_collect().await?;
+                    let fetch_from = mailbox_meta.exists.saturating_sub(INITIAL_FETCH_LIMIT - 1).max(1);
+                    let seq_range = format!("{fetch_from}:*");
+                    let fetches: Vec<_> = session.fetch(&seq_range, "(UID)").await?.try_collect().await?;
 
                     // Collect UIDs, newest first.
                     let mut uids: Vec<Uid> = fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
@@ -1418,12 +1430,14 @@ async fn sync_mailbox(
     cache: Option<&crate::cache::Cache>,
 ) -> Result<()> {
     let mailbox_meta = session.select(folder_path).await?;
-    let uid_next = mailbox_meta.uid_next.unwrap_or(1);
     let uidvalidity = UidValidity(mailbox_meta.uid_validity.unwrap_or(0));
-    let fetch_from = uid_next.saturating_sub(INITIAL_FETCH_LIMIT).max(1);
-    let uid_range = format!("{fetch_from}:*");
-
-    let fetches: Vec<_> = session.uid_fetch(&uid_range, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)").await?.try_collect().await?;
+    // The display list shows every message in the folder, so fetch it all:
+    // any window - UID or sequence - silently drops the older mail that large
+    // folders like Gmail's All Mail exist to show (the account-global UID
+    // counter makes a UID window miss still-present messages outright). Full
+    // CONDSTORE/QRESYNC incremental sync is Phase 2 - until then every sync
+    // is a full re-fetch of the folder's envelope set.
+    let fetches: Vec<_> = session.fetch("1:*", "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)").await?.try_collect().await?;
 
     let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)).collect();
 
@@ -1449,7 +1463,7 @@ async fn sync_mailbox(
         }
     }
 
-    tracing::debug!(account = %account_id, mailbox = %folder_path, count = messages.len(), "synced mailbox");
+    tracing::debug!(account = %account_id, mailbox = %folder_path, exists = mailbox_meta.exists, count = messages.len(), "synced mailbox");
     emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
 
     // Phase two: fill in the snippets this sync is still missing, then emit a

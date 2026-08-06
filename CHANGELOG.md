@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.44 (2026-08-06)
+
+### Added
+
+- **UI**: the message list now groups mail older than a year under headers named for the message's own calendar year ("2025", "2024", …), newest year first, instead of lumping it all under the catch-all "Older" section. Anything older than 12 months gets a year header; mail from roughly a month to a year ago still reads "Older". The cutoff is by *age*, not calendar year - a December 2025 mail is still "Older" in August 2026 even though a July 2025 mail is already "2025". `DateBucket` gains a `Year(i32)` variant, its one payload-carrying member; that's safe where a dated month variant was deliberately avoided: an old message's year is fixed for good, so a user-collapsed `Year(2024)` section can never silently stop matching as the calendar rolls over. Sections cut as consecutive runs of the date-sorted list, so the year headers fall out newest-first under a descending sort and oldest-first under an ascending one, exactly like the recent sections.
+
+### Changed
+
+- **Mail**: the message list is no longer limited to a folder's most recent messages. `sync_mailbox` now fetches the *whole* folder (`FETCH 1:*`) on every sync, so a folder with more than a couple of hundred messages - Gmail's All Mail in particular - shows all of it rather than a recent window. `INITIAL_FETCH_LIMIT` (200) is re-scoped to the background body prefetch only, which still queues bodies for just the newest messages while anything older fetches on demand. Full CONDSTORE/QRESYNC incremental sync remains Phase 2, so every sync is still a full re-fetch; the price of completeness is that a resync of a very large folder (a new-mail IDLE wake while it's open, Refresh, or a post-move/snooze resync) re-pulls its whole envelope set. One finding from verifying against live accounts: Gmail's `STATUS (MESSAGES)` over-reports All Mail (~14,850) versus what a `SELECT`/fetch actually returns (~12,296) - a Gmail-side count-vs-retrievability gap no IMAP client can bridge, so the folder-tree count can read higher than the list's rows.
+
+### Fixed
+
+- **Mail**: a Gmail inbox (or any folder) could silently hide messages that were still in it. Every sync fetched an envelope *UID* window - `UIDNEXT - 200 : *` - on the assumption that the newest 200 UIDs cover a mailbox's contents. On Gmail that assumption is false: the UID counter is effectively account-global (All Mail traffic drives it up) while messages linger in the Inbox with UIDs far older than `UIDNEXT - 200`, so those survivors were never fetched, never cached, never shown - an inbox reporting 22 messages on the server displayed only its 6 newest. Both `sync_mailbox` and the background body prefetch now window by message *count* (the newest N sequence numbers) rather than UID, which always covers exactly the messages currently in the mailbox, so low-UID survivors are fetched like any other message.
+- **Mail**: a folder whose envelope cache predated the full-sync change could keep hiding its older mail forever. The cache-hit path, which serves a folder's cached list on switch instead of re-syncing, treats any non-empty cache as complete - and pre-fix caches held only a windowed subset, so once a folder had been synced under the old code, opening it would keep serving that subset with no live sync to correct it. `Cache::open` now bumps a stored on-disk format version (`PRAGMA user_version`) and wipes the `messages` table once when the version changes, forcing every folder to re-sync in full on its next open. Message bodies, snooze entries, the address book, and the mailbox list are all untouched.
+
 ## 0.6.43 (2026-08-06)
 
 ### Added

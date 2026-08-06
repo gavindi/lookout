@@ -141,6 +141,21 @@ impl Cache {
             CREATE INDEX IF NOT EXISTS addresses_by_count ON addresses (seen_count DESC);
             ",
         )?;
+        // One-time envelope-cache migration. Pre-full-sync builds kept only a
+        // folder's newest ~200 messages, so their `messages` rows hold a
+        // *subset* of the mailbox - and the session's cache-hit path would
+        // serve that subset forever without a live sync, hiding the older
+        // mail a full sync would fetch. Every sync now writes the whole
+        // folder, so once this version is recorded the cache is trustworthy;
+        // wiping the envelope table now forces each folder to re-sync in full
+        // on its next open. Bodies, snoozes, addresses, and the mailbox list
+        // are all untouched.
+        const ENVELOPE_CACHE_VERSION: i64 = 1;
+        let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+        if stored < ENVELOPE_CACHE_VERSION {
+            conn.execute("DELETE FROM messages", [])?;
+            conn.pragma_update(None, "user_version", ENVELOPE_CACHE_VERSION)?;
+        }
         Ok(Cache { conn: Mutex::new(conn) })
     }
 
@@ -567,6 +582,42 @@ mod tests {
         assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 1);
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The one-time upgrade that makes the cache-hit path safe again: a cache
+    /// written by a pre-full-sync build holds only a windowed subset, so
+    /// opening it must wipe the envelope table (forcing full re-syncs) while
+    /// keeping message bodies - and must only do it once, since every sync
+    /// after the migration writes the whole folder.
+    #[test]
+    fn wiping_stale_envelope_cache_once_on_format_version_change() {
+        let account_id = temp_account_id();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        // First open under the current build: migration runs, wiping rows.
+        let cache = Cache::open(&account_id).unwrap();
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None)]).unwrap();
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), b"body survives").unwrap();
+
+        // Reopen: version already current, so the envelope rows must survive.
+        let cache = Cache::open(&account_id).unwrap();
+        assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 1, "a current-version cache must not be wiped on reopen");
+        assert_eq!(cache.load_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap().as_deref(), Some(&b"body survives"[..]));
+
+        // Simulate a pre-migration database: drop the version marker and
+        // rewrite the envelope rows; the next open must wipe them but keep
+        // the body.
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 0).unwrap();
+        }
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 2, None)]).unwrap();
+        let cache = Cache::open(&account_id).unwrap();
+        assert!(cache.load_messages(&mailbox_id).unwrap().is_empty(), "a pre-migration cache must be wiped");
+        assert_eq!(cache.load_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap().as_deref(), Some(&b"body survives"[..]));
+
         let _ = std::fs::remove_file(path);
     }
 

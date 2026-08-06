@@ -929,7 +929,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // both bindings keep matching it live without any rebind: a plain
         // signal (message_factory has no per-toggle rebind hook) would only
         // reach rows bound *after* the flip.
-        select_mode_button_for_rows.bind_property("active", &avatar, "visible").invert_boolean().sync_create().build();
+        select_mode_button_for_rows
+            .bind_property("active", &avatar, "visible")
+            .invert_boolean()
+            .sync_create()
+            .build();
         select_mode_button_for_rows.bind_property("active", &checkbox, "visible").sync_create().build();
 
         let message_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
@@ -1705,7 +1709,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // deliberately selected" are different states to the user even though
     // both mean "no single body to show," so this gets its own name rather
     // than overloading "empty" with a sometimes-visible label.
-    let reading_multi_label = gtk::Label::builder().css_classes(["dim-label"]).halign(gtk::Align::Center).valign(gtk::Align::Center).build();
+    let reading_multi_label = gtk::Label::builder()
+        .css_classes(["dim-label"])
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
     let reading_multi = gtk::Box::builder().orientation(gtk::Orientation::Vertical).valign(gtk::Align::Center).vexpand(true).build();
     reading_multi.append(&reading_multi_label);
     reading_stack.add_named(&reading_multi, Some("multi"));
@@ -3057,7 +3065,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(chrono::Utc::now);
             for (cmd_tx, mailbox, uids) in targets {
-                let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessages { mailbox, uids, until: tomorrow_9am });
+                let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessages {
+                    mailbox,
+                    uids,
+                    until: tomorrow_9am,
+                });
             }
         });
     }
@@ -5055,7 +5067,11 @@ fn selected_message_command_targets(message_list: &MessageListModel, state: &Rc<
     for summary in summaries {
         let Some(account_id) = mailbox_account_id(&summary.mailbox) else { continue };
         let Some(handle) = st.accounts.get(&account_id) else { continue };
-        groups.entry((account_id, summary.mailbox.clone())).or_insert_with(|| (handle.cmd_tx.clone(), Vec::new())).1.push(summary.uid);
+        groups
+            .entry((account_id, summary.mailbox.clone()))
+            .or_insert_with(|| (handle.cmd_tx.clone(), Vec::new()))
+            .1
+            .push(summary.uid);
     }
     groups.into_iter().map(|((_, mailbox), (cmd_tx, uids))| (cmd_tx, mailbox, uids)).collect()
 }

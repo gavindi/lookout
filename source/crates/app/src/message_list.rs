@@ -117,7 +117,10 @@ impl ListFilter {
 /// user-collapsed sections is keyed by this, and a `Month(year, month)`
 /// variant would silently orphan that state every time the calendar rolls
 /// over into a new month. `LastMonth` carries its name in the *label*
-/// instead (see `bucket_label`), so the identity stays stable.
+/// instead (see `bucket_label`), so the identity stays stable. `Year` is the
+/// one exception to being payload-free - an old message's calendar year is
+/// fixed for good, so a collapse recorded against `Year(2023)` can never
+/// silently stop matching.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DateBucket {
     /// Dated in the future - clock skew or a spammer's forged Date header.
@@ -131,7 +134,13 @@ pub enum DateBucket {
     ThisMonth,
     /// Labelled with the month's name ("July"), not "Last Month".
     LastMonth,
+    /// From a bit over a month to a year ago - not yet old enough for its own
+    /// year header.
     Older,
+    /// Dated more than a year ago, labelled with the message's own calendar
+    /// year ("2024"). `LastMonth` and `Older` shade into this as time passes,
+    /// but a message already in one `Year` never moves to another.
+    Year(i32),
 }
 
 /// The Monday on or before `date`.
@@ -182,6 +191,15 @@ pub fn bucket_for(date: DateTime<Utc>, now: DateTime<Local>) -> DateBucket {
     if (d.year(), d.month()) == previous_month(today) {
         return DateBucket::LastMonth;
     }
+    // Older than a year: give the message its own year header ("2024")
+    // rather than lumping every old mail under one "Older" section. The
+    // cutoff is by age (a December 2025 mail is still "Older" in August
+    // 2026), not by calendar year.
+    if let Some(cutoff) = today.checked_sub_months(chrono::Months::new(12)) {
+        if d < cutoff {
+            return DateBucket::Year(d.year());
+        }
+    }
     DateBucket::Older
 }
 
@@ -203,6 +221,7 @@ pub fn bucket_label(bucket: DateBucket, now: DateTime<Local>) -> String {
                 .unwrap_or_else(|| "Last Month".to_string())
         }
         DateBucket::Older => "Older".to_string(),
+        DateBucket::Year(year) => format!("{year}"),
     }
 }
 
@@ -846,6 +865,25 @@ mod tests {
         assert_eq!(bucket_for(utc_on(now, 2025, 12, 4), now), DateBucket::Older);
     }
 
+    /// Mail older than a year is grouped by its own calendar year rather than
+    /// lumped under "Older". The cutoff is by *age* (12 months), so a
+    /// December 2025 mail still reads "Older" in August 2026 while a July
+    /// 2025 mail is already "2025" - and the year is fixed for good, so a
+    /// collapse recorded against `Year(2024)` never goes stale.
+    #[test]
+    fn mail_older_than_a_year_is_grouped_by_its_own_year() {
+        let now = local(2026, 8, 4, 8);
+        // Exactly a year back is not *older* than a year; one day more is.
+        assert_eq!(bucket_for(utc_on(now, 2025, 8, 4), now), DateBucket::Older, "exactly 12 months old stays Older");
+        assert_eq!(bucket_for(utc_on(now, 2025, 8, 3), now), DateBucket::Year(2025));
+        assert_eq!(bucket_for(utc_on(now, 2025, 7, 15), now), DateBucket::Year(2025));
+        assert_eq!(bucket_label(DateBucket::Year(2025), now), "2025");
+        assert_eq!(bucket_for(utc_on(now, 2024, 12, 25), now), DateBucket::Year(2024));
+        assert_eq!(bucket_for(utc_on(now, 2023, 1, 1), now), DateBucket::Year(2023));
+        // Eleven months back is still "Older", not "2025".
+        assert_eq!(bucket_for(utc_on(now, 2025, 9, 4), now), DateBucket::Older);
+    }
+
     /// Drives the real `TreeListModel` end to end: default expansion, a
     /// collapse surviving rebuilds, and the flat (non-date) layout.
     ///
@@ -1025,6 +1063,31 @@ mod tests {
         assert_eq!(
             shape,
             vec![(DateBucket::Today, "Today", 2), (DateBucket::LastMonth, "July", 1), (DateBucket::Older, "Older", 1)]
+        );
+    }
+
+    /// Year headers cut as their own consecutive runs, newest year first -
+    /// the same run-cutting that makes the recent sections fall out in order.
+    #[test]
+    fn year_buckets_cut_one_section_per_year() {
+        let now = local(2026, 8, 4, 8);
+        let messages = vec![
+            summary(1, utc_on(now, 2025, 7, 15)),
+            summary(2, utc_on(now, 2025, 3, 10)),
+            summary(3, utc_on(now, 2024, 12, 25)),
+            summary(4, utc_on(now, 2023, 1, 1)),
+        ];
+        let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now) else {
+            panic!("expected a grouped layout");
+        };
+        let shape: Vec<(DateBucket, &str, usize)> = sections.iter().map(|(b, l, m)| (*b, l.as_str(), m.len())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (DateBucket::Year(2025), "2025", 2),
+                (DateBucket::Year(2024), "2024", 1),
+                (DateBucket::Year(2023), "2023", 1),
+            ]
         );
     }
 
