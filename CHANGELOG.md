@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.47 (2026-08-06)
+
+### Changed
+
+- **Mail**: opening a message no longer downloads the whole RFC 5322 message including attachments. The envelope sync now requests `BODYSTRUCTURE` and flattens it into a per-message part list (`EmailSummary::structure`, persisted in the envelope cache - `has_attachment` is now real, derived from it instead of hardcoded false), and the viewer's body fetch is `BODYSTRUCTURE`-driven: one `UID FETCH` pulls `BODY.PEEK[HEADER]` plus every `text/plain`/`text/html` part by its part number, and attachment parts (images, documents) are never downloaded - their metadata (filename, size, part number) is still available via `EmailBody::parts` for a later on-demand fetch. Each fetched part is decoded by wrapping it in a minimal single-part message carrying its own Content-Type/charset/transfer-encoding and re-parsing with `mail_parser`, so charset and base64/quoted-printable handling is the same battle-tested path the whole-message parse used; `multipart/alternative` picks the real HTML over the plain part's synthesized rendering. The background body prefetch learns each message's structure in its envelope pass, so it warms text-only bodies too - a marketing mail's megabytes of images are never pulled into the cache. Messages whose summaries predate this (or servers that omit `BODYSTRUCTURE`) fall back to the old whole-message `BODY.PEEK[]` fetch, as do partial fetches that fail or decode nothing readable. The on-disk body cache changed format accordingly (raw bytes → assembled `EmailBody` JSON; a version-2 wipe drops old raw rows once) and the FTS search index now upgrades from the assembled text rather than a raw re-parse.
+
 ## 0.6.46 (2026-08-06)
 
 ### Added

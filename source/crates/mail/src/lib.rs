@@ -18,6 +18,7 @@ mod envelope;
 mod error;
 pub mod send;
 pub mod session;
+mod structure;
 
 // `Cache` itself is public so the app crate can open a read-side handle for
 // the composer's recipient autocomplete (`search_addresses`), which must not

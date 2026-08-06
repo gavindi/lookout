@@ -926,6 +926,7 @@ mod tests {
             size: 100,
             has_attachment: false,
             preview: None,
+            structure: None,
         }
     }
 

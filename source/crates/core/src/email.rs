@@ -136,6 +136,15 @@ pub struct EmailSummary {
     pub size: u32,
     pub has_attachment: bool,
     pub preview: Option<String>,
+    /// The message's MIME part tree, flattened into its leaf parts (with
+    /// `BODYSTRUCTURE`-derived part numbers), or `None` if the server didn't
+    /// report a body structure for this message (or its envelope was cached
+    /// before BODYSTRUCTURE was fetched). `Some` enables the viewer's
+    /// partial-fetch path: the text parts' bytes are fetched by number, and
+    /// attachment parts are never downloaded. `has_attachment` is derived
+    /// from this.
+    #[serde(default)]
+    pub structure: Option<Vec<BodyPart>>,
 }
 
 impl EmailSummary {
@@ -148,16 +157,37 @@ impl EmailSummary {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BodyPart {
     /// IMAP body-part path, e.g. `"1.2"`, used for partial `BODY[]` fetches.
     pub part_number: String,
+    /// `type/subtype` of the MIME part, e.g. `text/plain` or `image/png`.
     pub content_type: String,
+    /// The part's declared charset (from the `charset` Content-Type parameter,
+    /// e.g. `utf-8` or `iso-8859-1`), used to decode text parts' bytes.
+    #[serde(default)]
+    pub charset: Option<String>,
+    /// The part's transfer encoding as the server reported it in
+    /// `BODYSTRUCTURE` (`base64`, `quoted-printable`, `7bit`, ...), used to
+    /// decode the bytes a partial `BODY[<part>]` fetch returns.
+    #[serde(default)]
+    pub transfer_encoding: Option<String>,
     pub filename: Option<String>,
     /// The `Content-ID` for inline `cid:` image resolution, if any.
     pub cid: Option<String>,
     pub size: u32,
     pub is_attachment: bool,
+}
+
+impl BodyPart {
+    /// Whether this part is one of the two body-carrying text types the
+    /// viewer renders (`text/plain` / `text/html`). This is the filter the
+    /// partial-fetch path uses to decide which parts to download: everything
+    /// else (images, attachments) is metadata-only until something asks for
+    /// its bytes.
+    pub fn is_text(&self) -> bool {
+        matches!(self.content_type.as_str(), "text/plain" | "text/html")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -192,16 +222,20 @@ pub enum DmarcResult {
 }
 
 /// Parsed from the `Authentication-Results` header (RFC 8601).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthenticationResults {
     pub spf: Option<SpfResult>,
     pub dkim: Option<DkimResult>,
     pub dmarc: Option<DmarcResult>,
 }
 
-/// Fetched lazily on message open, via `BODYSTRUCTURE`-driven partial fetch
-/// rather than a whole-`RFC822` download.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Fetched lazily on message open. With a `BODYSTRUCTURE`-derived part
+/// structure in the message's summary, only the text parts (and headers) are
+/// downloaded (`BODY.PEEK[<part>]`); without one, the whole message is
+/// fetched as a fallback. Attachment bytes are never fetched for display -
+/// `parts` carries their metadata (`BodyPart::size`, filename, ...) so a
+/// later on-demand download can target the right part number.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EmailBody {
     pub uid: Uid,
     pub text_body: Option<String>,

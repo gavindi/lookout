@@ -1035,6 +1035,7 @@ mod tests {
             size: 0,
             has_attachment: false,
             preview: None,
+            structure: None,
         }
     }
 

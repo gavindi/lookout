@@ -105,9 +105,13 @@ fn parse_addresses(addrs: &Option<Vec<async_imap::imap_proto::types::Address<'_>
 }
 
 /// Builds an [`EmailSummary`] from a `UID FETCH ... (UID FLAGS ENVELOPE
-/// RFC822.SIZE INTERNALDATE)` response item. `thread_key` is left as a
-/// placeholder (`ThreadKey(String::new())`) - callers compute it in bulk
-/// across the whole fetched set via `lookout_core::thread::compute_thread_keys`.
+/// RFC822.SIZE INTERNALDATE BODYSTRUCTURE)` response item. `thread_key` is
+/// left as a placeholder (`ThreadKey(String::new())`) - callers compute it in
+/// bulk across the whole fetched set via
+/// `lookout_core::thread::compute_thread_keys`. `BODYSTRUCTURE` rides along
+/// so `structure`/`has_attachment` are known without any body fetch; a server
+/// that omits it leaves `structure` as `None` and the viewer falls back to a
+/// whole-message fetch.
 pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSummary> {
     let uid = Uid(fetch.uid?);
     let envelope = fetch.envelope()?;
@@ -139,6 +143,9 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
         }
     }
 
+    let structure = fetch.bodystructure().map(crate::structure::parts_from_bodystructure);
+    let has_attachment = structure.as_ref().map(|p| crate::structure::has_attachments(p)).unwrap_or(false);
+
     Some(EmailSummary {
         uid,
         mailbox: mailbox.clone(),
@@ -154,8 +161,9 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
         flags,
         keywords,
         size: fetch.size.unwrap_or(0),
-        has_attachment: false, // Requires BODYSTRUCTURE traversal - deferred to Phase 2.
-        preview: None,         // Requires a body fetch; filled in by `sync_mailbox`'s second phase.
+        has_attachment,
+        preview: None, // Requires a body fetch; filled in by `sync_mailbox`'s second phase.
+        structure,
     })
 }
 

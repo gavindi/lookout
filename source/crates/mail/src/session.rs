@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use async_imap::Session;
 use futures::TryStreamExt;
 use lookout_core::mailbox::role_from_special_use;
-use lookout_core::{AccountId, EmailBody, EmailSummary, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, UidValidity};
+use lookout_core::{AccountId, BodyPart, EmailBody, EmailSummary, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, UidValidity};
 
 use crate::auth::XOAuth2Authenticator;
 use crate::body::{parse_body, preview_from_raw};
@@ -18,8 +18,10 @@ use crate::send::{build_raw_message, send_smtp, ComposedMessage};
 /// for download on a folder it hasn't warmed yet. Bounds the *body* warm-up
 /// only - the display/envelope sync fetches the whole folder (see
 /// `sync_mailbox`) - so a folder's newest N get bodies downloaded in batches
-/// while anything older fetches on demand. Full CONDSTORE/QRESYNC incremental
-/// sync is Phase 2 - see the module docs.
+/// while anything older fetches on demand. Since the prefetch learns each
+/// message's `BODYSTRUCTURE` in its envelope pass, "download" here means the
+/// text parts only - attachments are never fetched for the cache. Full
+/// CONDSTORE/QRESYNC incremental sync is Phase 2 - see the module docs.
 const INITIAL_FETCH_LIMIT: u32 = 200;
 
 /// How long a single IDLE wait runs before we re-enter it purely as a
@@ -78,6 +80,10 @@ struct PrefetchState {
     envelopes_fetched: bool,
     /// The IMAP folder path of the current prefetch mailbox (for SELECT).
     current_folder_name: String,
+    /// Per-uid `BODYSTRUCTURE`-derived part lists, learned in the envelope
+    /// pass so the body fetches can be text-parts-only (see
+    /// `fetch_body_partial`) instead of whole-message downloads.
+    structures: HashMap<Uid, Vec<BodyPart>>,
 }
 
 impl PrefetchState {
@@ -89,6 +95,7 @@ impl PrefetchState {
             uidvalidity: UidValidity(0),
             envelopes_fetched: false,
             current_folder_name: String::new(),
+            structures: HashMap::new(),
         }
     }
 
@@ -102,6 +109,7 @@ impl PrefetchState {
         self.uidvalidity = UidValidity(0);
         self.envelopes_fetched = false;
         self.current_folder_name.clear();
+        self.structures.clear();
     }
 }
 
@@ -118,10 +126,12 @@ pub enum ConnectionState {
 pub enum AccountCommand {
     /// Select a mailbox and (re)fetch its envelopes.
     SyncMailbox(MailboxId),
-    /// Fetch the full body of a message in the *currently selected* mailbox
-    /// (fetching a body from a different mailbox would require a SELECT,
-    /// which would drop out of IDLE on that other folder - out of scope for
-    /// Phase 1, where only the open folder's messages are readable).
+    /// Fetch a message's body - the viewer's renderable text, not
+    /// attachments. With a `BODYSTRUCTURE`-derived part structure in the
+    /// message's summary this SELECTs `mailbox` on demand and downloads only
+    /// the headers and text parts (`BODY.PEEK[HEADER]` + `BODY.PEEK[<part>]`);
+    /// without one (server omitted it, or the summary predates this feature)
+    /// it falls back to a whole-message `BODY.PEEK[]` fetch.
     FetchBody {
         mailbox: MailboxId,
         uid: Uid,
@@ -620,12 +630,14 @@ async fn connect_and_run(
                     // a deliberate cache-miss sentinel: no row can match 0.
                     let uidvalidity = folders.iter().find(|m| m.id == mailbox).map(|m| m.uidvalidity).unwrap_or(UidValidity(0));
                     let started = std::time::Instant::now();
-                    let raw = fetch_body_cached(cache, &mut session, &mailbox, uid, uidvalidity).await?;
-                    tracing::debug!(?mailbox, uid = uid.0, elapsed_ms = started.elapsed().as_millis(), "FetchBody: raw message ready");
-                    if let Some(raw) = raw {
-                        if let Some(body) = parse_body(uid, &raw) {
-                            let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
-                        }
+                    // `None` for the structure: the partial-fetch path reads
+                    // the message's summary (with its BODYSTRUCTURE-derived
+                    // part list) from the cache, and falls back to a
+                    // whole-message fetch when there isn't one.
+                    let body = fetch_body_cached(cache, &mut session, &mailbox, uid, uidvalidity, None).await?;
+                    tracing::debug!(?mailbox, uid = uid.0, elapsed_ms = started.elapsed().as_millis(), "FetchBody: body ready");
+                    if let Some(body) = body {
+                        let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
                     }
                 }
                 AccountCommand::SearchMailbox { mailbox, query } => {
@@ -1044,7 +1056,10 @@ async fn connect_and_run(
                     }
                 }
 
-                // Fetch envelope UIDs for this mailbox if not done yet.
+                // Fetch envelope UIDs for this mailbox if not done yet. The
+                // query also asks for BODYSTRUCTURE so the body fetches below
+                // can be text-parts-only rather than whole-message downloads
+                // (see `fetch_body_partial`).
                 if !pf.envelopes_fetched {
                     // Check before SELECT to avoid blocking the session if a
                     // user command arrived during the previous body fetch.
@@ -1056,7 +1071,7 @@ async fn connect_and_run(
                     session_selected = pf.mailboxes[pf.current].clone();
                     let fetch_from = mailbox_meta.exists.saturating_sub(INITIAL_FETCH_LIMIT - 1).max(1);
                     let seq_range = format!("{fetch_from}:*");
-                    let fetches: Vec<_> = session.fetch(&seq_range, "(UID)").await?.try_collect().await?;
+                    let fetches: Vec<_> = session.fetch(&seq_range, "(UID BODYSTRUCTURE)").await?.try_collect().await?;
 
                     // Collect UIDs, newest first.
                     let mut uids: Vec<Uid> = fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
@@ -1065,6 +1080,19 @@ async fn connect_and_run(
                     // Filter out already-cached bodies.
                     if let Some(cache) = cache {
                         uids.retain(|uid| !cache.has_body(&pf.mailboxes[pf.current], *uid, pf.uidvalidity).unwrap_or(false));
+                    }
+
+                    // Remember each still-wanted uid's part structure (only
+                    // the newest `INITIAL_FETCH_LIMIT`'s worth) so its body
+                    // fetch skips attachments entirely.
+                    pf.structures.clear();
+                    for fetch in &fetches {
+                        let (Some(uid), Some(structure)) = (fetch.uid.map(Uid), fetch.bodystructure()) else {
+                            continue;
+                        };
+                        if uids.contains(&uid) {
+                            pf.structures.insert(uid, crate::structure::parts_from_bodystructure(structure));
+                        }
                     }
 
                     tracing::debug!(
@@ -1095,7 +1123,16 @@ async fn connect_and_run(
                             pf.pending_uids.splice(0..0, batch[i..].iter().cloned());
                             break;
                         }
-                        match fetch_body_cached(cache, &mut session, &pf.mailboxes[pf.current], *uid, pf.uidvalidity).await {
+                        match fetch_body_cached(
+                            cache,
+                            &mut session,
+                            &pf.mailboxes[pf.current],
+                            *uid,
+                            pf.uidvalidity,
+                            pf.structures.get(uid).map(Vec::as_slice),
+                        )
+                        .await
+                        {
                             Ok(Some(_)) => fetched += 1,
                             Ok(None) => {}
                             Err(e) => {
@@ -1519,7 +1556,11 @@ async fn search_mailbox(session: &mut Session<ImapStream>, account_id: &AccountI
     let mut uid_list: Vec<u32> = uids.into_iter().collect();
     uid_list.sort_unstable();
     let uid_set = uid_list.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-    let fetches: Vec<_> = session.uid_fetch(&uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)").await?.try_collect().await?;
+    let fetches: Vec<_> = session
+        .uid_fetch(&uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
+        .await?
+        .try_collect()
+        .await?;
     let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox, f)).collect();
     let keys = lookout_core::thread::compute_thread_keys(&messages);
     for msg in &mut messages {
@@ -1547,7 +1588,14 @@ async fn sync_mailbox(
     // counter makes a UID window miss still-present messages outright). Full
     // CONDSTORE/QRESYNC incremental sync is Phase 2 - until then every sync
     // is a full re-fetch of the folder's envelope set.
-    let fetches: Vec<_> = session.fetch("1:*", "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)").await?.try_collect().await?;
+    // `BODYSTRUCTURE` rides along so `summary_from_fetch` can fill in the
+    // part structure / `has_attachment` without any body fetch - it's what
+    // lets opening a message download only its text parts.
+    let fetches: Vec<_> = session
+        .fetch("1:*", "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
+        .await?
+        .try_collect()
+        .await?;
 
     let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)).collect();
 
@@ -1713,12 +1761,12 @@ async fn fetch_previews(
 }
 
 /// Fetches the full raw RFC 5322 message of `uid` in whatever mailbox is
-/// currently SELECTed. Uses `BODY.PEEK[]` rather than `BODY[]`/`RFC822` so
-/// reading a message doesn't implicitly set `\Seen` server-side - the UI
-/// layer decides if/when to mark as read, matching Bulwark's configurable
-/// mark-as-read-delay behavior. The raw bytes (not a parsed body) are
-/// returned because they're also what the body cache stores: a cache hit
-/// re-parses them, which is far cheaper than the network fetch it avoids.
+/// currently SELECTed. This is the *fallback* body path, used when a
+/// message's summary carries no `BODYSTRUCTURE`-derived part structure (see
+/// `fetch_body_partial` for the normal path). Uses `BODY.PEEK[]` rather than
+/// `BODY[]`/`RFC822` so reading a message doesn't implicitly set `\Seen`
+/// server-side - the UI layer decides if/when to mark as read, matching
+/// Bulwark's configurable mark-as-read-delay behavior.
 async fn fetch_body(session: &mut Session<ImapStream>, uid: Uid) -> Result<Option<Vec<u8>>> {
     let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
     let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {
@@ -1727,38 +1775,112 @@ async fn fetch_body(session: &mut Session<ImapStream>, uid: Uid) -> Result<Optio
     Ok(fetch.body().map(|body| body.to_vec()))
 }
 
-/// Resolves the raw body of `uid` in the currently SELECTed mailbox, serving
-/// a previously-fetched copy from the on-disk cache when one exists (no
-/// network round trip) and storing freshly-fetched bodies back into it, so
-/// re-opening a message doesn't re-download it. `uidvalidity` is passed
-/// through to the cache so a recycled uid can never resolve to another
-/// message's body.
+/// Fetches just the parts a message viewer needs: the full header block and
+/// the bytes of every `text/plain`/`text/html` part, each by its
+/// `BODYSTRUCTURE`-derived section path. Attachment parts (images, documents,
+/// ...) are *never* downloaded - `EmailBody::parts` carries their metadata
+/// for a later on-demand fetch. One `UID FETCH` round trip covers the header
+/// and all text parts.
+///
+/// Returns `None` (rather than an error) when the message has no text parts
+/// to fetch or the server didn't return the requested sections; the caller
+/// falls back to a whole-message fetch rather than showing an empty pane.
+async fn fetch_body_partial(session: &mut Session<ImapStream>, uid: Uid, parts: &[BodyPart]) -> Result<Option<EmailBody>> {
+    let text_parts: Vec<&BodyPart> = parts.iter().filter(|p| p.is_text()).collect();
+    if text_parts.is_empty() {
+        return Ok(None);
+    }
+
+    let mut query = String::from("(BODY.PEEK[HEADER]");
+    for part in &text_parts {
+        query.push_str(&format!(" BODY.PEEK[{}]", part.part_number));
+    }
+    query.push(')');
+
+    let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), &query).await?.try_collect().await?;
+    let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {
+        return Ok(None);
+    };
+
+    let headers = fetch
+        .section(&async_imap::imap_proto::types::SectionPath::Full(async_imap::imap_proto::types::MessageSection::Header))
+        .map(crate::body::parse_headers_section)
+        .unwrap_or_default();
+
+    let mut fetched: Vec<(String, Vec<u8>)> = Vec::new();
+    for part in &text_parts {
+        // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part`
+        // value the server's response carries, so `Fetch::section` can match
+        // it by equality.
+        let path = async_imap::imap_proto::types::SectionPath::Part(part.part_number.split('.').filter_map(|n| n.parse().ok()).collect(), None);
+        if let Some(bytes) = fetch.section(&path) {
+            fetched.push((part.part_number.clone(), bytes.to_vec()));
+        }
+    }
+    if fetched.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(crate::body::assemble_body_from_parts(uid, headers, parts, &fetched)))
+}
+
+/// Resolves the body of `uid` in the currently SELECTed mailbox, serving a
+/// previously-fetched copy from the on-disk cache when one exists (no network
+/// round trip) and storing freshly-fetched bodies back into it, so re-opening
+/// a message doesn't re-download it. `uidvalidity` is passed through to the
+/// cache so a recycled uid can never resolve to another message's body.
+///
+/// The fetch itself is `BODYSTRUCTURE`-driven when a part structure is
+/// available - `known_structure` (the prefetch path already learned it) or
+/// the message's cached summary - and falls back to a whole-message
+/// `BODY.PEEK[]` fetch otherwise. The result is an assembled [`EmailBody`]
+/// either way.
 async fn fetch_body_cached(
     cache: Option<&crate::cache::Cache>,
     session: &mut Session<ImapStream>,
     mailbox: &MailboxId,
     uid: Uid,
     uidvalidity: UidValidity,
-) -> Result<Option<Vec<u8>>> {
+    known_structure: Option<&[BodyPart]>,
+) -> Result<Option<EmailBody>> {
     if let Some(cache) = cache {
         match cache.load_body(mailbox, uid, uidvalidity) {
-            Ok(Some(raw)) => {
+            Ok(Some(body)) => {
                 tracing::debug!(?mailbox, uid = uid.0, "FetchBody: served from disk cache");
-                return Ok(Some(raw));
+                return Ok(Some(body));
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(?mailbox, uid = uid.0, "failed to read cached message body: {e}"),
         }
     }
-    let raw = fetch_body(session, uid).await?;
+    // The part structure that makes a partial fetch possible: prefer the
+    // caller-provided one (the prefetch learns it in its envelope pass), else
+    // the cached summary's (the open-folder path synced it). Messages whose
+    // summaries predate BODYSTRUCTURE fetching - or servers that never
+    // returned one - fall back to the whole-message fetch below.
+    let structure = match known_structure {
+        Some(structure) => Some(structure.to_vec()),
+        None => cache.and_then(|c| c.load_summary(mailbox, uid).ok().flatten()).and_then(|s| s.structure),
+    };
+    let body = match &structure {
+        Some(parts) => match fetch_body_partial(session, uid, parts).await {
+            // A partial fetch that fails - or yields nothing readable (a
+            // weird server, a structure that didn't match reality, or text
+            // parts that didn't decode) - must degrade to the whole-message
+            // fetch, not an empty reading pane.
+            Ok(Some(body)) if body.text_body.is_some() || body.html_body.is_some() => Some(body),
+            _ => fetch_body(session, uid).await?.and_then(|raw| parse_body(uid, &raw)),
+        },
+        None => fetch_body(session, uid).await?.and_then(|raw| parse_body(uid, &raw)),
+    };
     if let Some(cache) = cache {
-        if let Some(raw) = &raw {
-            if let Err(e) = cache.store_body(mailbox, uid, uidvalidity, raw) {
+        if let Some(body) = &body {
+            if let Err(e) = cache.store_body(mailbox, uid, uidvalidity, body) {
                 tracing::warn!(?mailbox, uid = uid.0, "failed to cache message body: {e}");
             }
         }
     }
-    Ok(raw)
+    Ok(body)
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailSummary, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
+use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailBody, EmailSummary, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
 use rusqlite::Connection;
 
 use crate::error::Result;
@@ -14,10 +14,13 @@ use crate::error::Result;
 ///
 /// Since the body of every opened message used to be re-fetched from the
 /// server on each open (switching emails - even back to one already read -
-/// paid a full IMAP round trip), fetched raw message bytes are also cached
-/// here (the `bodies` table) so an already-viewed message renders without
-/// touching the network. Attachment bytes are cached along with the body for
-/// free; nothing fetches them separately yet.
+/// paid a full IMAP round trip), fetched message bodies are also cached here
+/// (the `bodies` table) so an already-viewed message renders without touching
+/// the network. Rows hold the assembled [`EmailBody`] as JSON - what the
+/// viewer actually consumes - not raw RFC 5322 bytes, because the
+/// BODYSTRUCTURE-driven partial-fetch path (the normal one) downloads only
+/// the text parts and never has the whole raw message. Attachment bytes are
+/// not cached (they're never fetched for display); only their metadata.
 ///
 /// The connection is `Mutex`-wrapped purely to make `Cache: Sync` (and so
 /// `&Cache: Send`) - `rusqlite::Connection` itself isn't `Sync` because its
@@ -141,28 +144,35 @@ fn index_upsert_message(conn: &rusqlite::Connection, msg: &EmailSummary, body: &
     index_message(conn, msg, body)
 }
 
-/// The searchable body text for `raw`: the plain-text part, or a stripped-HTML
-/// rendering when there's no text part. Mirrors `preview_from_raw`'s
-/// text-over-html preference, but returns the whole body rather than a snippet.
+/// The searchable body text of an assembled [`EmailBody`]: the plain-text
+/// part, or a stripped-HTML rendering when there's no text part. Mirrors
+/// `preview_from_raw`'s text-over-html preference, but returns the whole body
+/// rather than a snippet.
 ///
 /// Bodies over `FULL_BODY_INDEX_BYTES` are skipped (returning `None`, so the
-/// message keeps its preview-only index row): parsing them with `mail_parser`
-/// is expensive - a multi-megabyte marketing HTML mail shouldn't cost a
-/// re-parse every time it's fetched, in the prefetch or the backfill - and
-/// their first few KB of readable text is usually in the preview anyway.
-fn indexable_body_text(raw: &[u8]) -> Option<String> {
-    if raw.len() > FULL_BODY_INDEX_BYTES {
+/// message keeps its preview-only index row): indexing a multi-megabyte
+/// marketing HTML mail costs memory and makes every `store_body` rewrite slow,
+/// and its first few KB of readable text is usually in the preview anyway.
+fn body_index_text(body: &EmailBody) -> Option<String> {
+    let text = body.text_body.as_deref().unwrap_or("");
+    let html = body.html_body.as_deref().unwrap_or("");
+    let mut out = String::with_capacity(text.len() + html.len());
+    out.push_str(text);
+    if !html.is_empty() {
+        out.push(' ');
+        out.push_str(&crate::body::strip_html_for_index(html));
+    }
+    if out.trim().is_empty() {
         return None;
     }
-    let body = crate::body::parse_body(Uid(0), raw)?;
-    match body.text_body {
-        Some(text) if !text.trim().is_empty() => Some(text),
-        _ => body.html_body.map(|html| crate::body::strip_html_for_index(&html)),
+    if out.len() > FULL_BODY_INDEX_BYTES {
+        return None;
     }
+    Some(out)
 }
 
 /// Bodies larger than this aren't re-parsed for the search index (see
-/// `indexable_body_text`).
+/// `body_index_text`).
 const FULL_BODY_INDEX_BYTES: usize = 256 * 1024;
 
 /// Loads one cached summary by `(mailbox_id, uid)`, if present.
@@ -316,13 +326,25 @@ impl Cache {
         // mail a full sync would fetch. Every sync now writes the whole
         // folder, so once this version is recorded the cache is trustworthy;
         // wiping the envelope table now forces each folder to re-sync in full
-        // on its next open. Bodies, snoozes, addresses, and the mailbox list
-        // are all untouched.
+        // on its next open. Snoozes, addresses, and the mailbox list are all
+        // untouched.
         const ENVELOPE_CACHE_VERSION: i64 = 1;
+        // One-time body-cache migration: `bodies` rows changed format from
+        // raw RFC 5322 bytes to serialized `EmailBody` JSON (the partial-fetch
+        // path never assembles a whole raw message), so pre-partial-fetch
+        // caches' raw rows can't be served and are wiped once. Envelope rows
+        // survive; their `structure` stays `None` until the next sync, which
+        // is exactly the fallback path's cue.
+        const BODY_CACHE_VERSION: i64 = 2;
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         if stored < ENVELOPE_CACHE_VERSION {
             conn.execute("DELETE FROM messages", [])?;
-            conn.pragma_update(None, "user_version", ENVELOPE_CACHE_VERSION)?;
+        }
+        if stored < BODY_CACHE_VERSION {
+            conn.execute("DELETE FROM bodies", [])?;
+        }
+        if stored < BODY_CACHE_VERSION || stored < ENVELOPE_CACHE_VERSION {
+            conn.pragma_update(None, "user_version", BODY_CACHE_VERSION.max(ENVELOPE_CACHE_VERSION))?;
         }
 
         // NOTE: the one-time FTS backfill is *not* run here. `Cache::open` is
@@ -370,8 +392,9 @@ impl Cache {
             let mut stmt = tx.prepare("SELECT mailbox_id, uid, data FROM bodies")?;
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
             for row in rows {
-                let (mailbox, uid, raw) = row?;
-                let Some(text) = indexable_body_text(&raw) else { continue };
+                let (mailbox, uid, data) = row?;
+                let Ok(body) = serde_json::from_slice::<EmailBody>(&data) else { continue };
+                let Some(text) = body_index_text(&body) else { continue };
                 let mailbox_id = MailboxId(mailbox);
                 let summary = match load_summary_row(&tx, &mailbox_id, Uid(uid))? {
                     Some(msg) => msg,
@@ -462,46 +485,57 @@ impl Cache {
         Ok(rows.next().is_some())
     }
 
-    /// Returns the raw RFC 5322 bytes of a previously-fetched message body,
-    /// or `None` if it isn't cached. `uidvalidity` guards the cache against
-    /// serving a body for a recycled uid after its mailbox was re-created
-    /// (RFC 3501 §2.3.1.1): a row written under a different uidvalidity is a
-    /// miss, never a stale body. Callers re-parse the bytes with
-    /// `parse_body`, which is cheap relative to the IMAP fetch this avoids.
-    pub fn load_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<Option<Vec<u8>>> {
+    /// Loads the cached summary for one `(mailbox_id, uid)`, or `None` if it
+    /// isn't cached. Used by the session's body-fetch path to learn a
+    /// message's `BODYSTRUCTURE`-derived part structure without loading the
+    /// whole mailbox's message set.
+    pub fn load_summary(&self, mailbox_id: &MailboxId, uid: Uid) -> Result<Option<EmailSummary>> {
+        let conn = self.conn.lock().unwrap();
+        load_summary_row(&conn, mailbox_id, uid)
+    }
+
+    /// Returns the previously-fetched body of a message, or `None` if it
+    /// isn't cached. `uidvalidity` guards the cache against serving a body
+    /// for a recycled uid after its mailbox was re-created (RFC 3501
+    /// §2.3.1.1): a row written under a different uidvalidity is a miss,
+    /// never a stale body. Rows are the assembled [`EmailBody`] (JSON) -
+    /// what the viewer consumes - since the partial-fetch path never
+    /// assembles a whole raw message.
+    pub fn load_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<Option<EmailBody>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT data FROM bodies WHERE mailbox_id = ?1 AND uid = ?2 AND uidvalidity = ?3")?;
         let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0], |row| row.get::<_, Vec<u8>>(0))?;
         match rows.next() {
-            Some(Ok(raw)) => Ok(Some(raw)),
+            Some(Ok(data)) => Ok(serde_json::from_slice(&data).ok()),
             Some(Err(e)) => Err(e.into()),
             None => Ok(None),
         }
     }
 
-    /// Stores the raw bytes of a fetched message body for `uid`, replacing
-    /// any earlier body for the same `(mailbox, uid)`, and upgrades the
-    /// search index's body text from the preview to the full message.
-    pub fn store_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, raw: &[u8]) -> Result<()> {
+    /// Stores an assembled body for `uid`, replacing any earlier body for the
+    /// same `(mailbox, uid)`, and upgrades the search index's body text from
+    /// the preview to the message's full text.
+    pub fn store_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, body: &EmailBody) -> Result<()> {
+        let data = serde_json::to_vec(body)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO bodies (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0, raw],
+            rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0, data],
         )?;
         // Re-index the message with its full text, but only if the envelope is
         // cached (a stray body for a wiped envelope has no subject/sender to
         // index against). The preview text rides along so previously-indexed
         // phrasing stays findable.
         if let Some(summary) = load_summary_row(&tx, mailbox_id, uid)? {
-            let mut body = indexable_body_text(raw).unwrap_or_default();
+            let mut indexed = body_index_text(body).unwrap_or_default();
             if let Some(preview) = &summary.preview {
-                if !body.is_empty() {
-                    body.push(' ');
+                if !indexed.is_empty() {
+                    indexed.push(' ');
                 }
-                body.push_str(preview);
+                indexed.push_str(preview);
             }
-            index_upsert_message(&tx, &summary, &body)?;
+            index_upsert_message(&tx, &summary, &indexed)?;
         }
         tx.commit()?;
         Ok(())
@@ -860,8 +894,8 @@ mod tests {
         cache
             .replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)])
             .unwrap();
-        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), b"raw one").unwrap();
-        cache.store_body(&mailbox_id, Uid(2), UidValidity(1), b"raw two").unwrap();
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("raw one")).unwrap();
+        cache.store_body(&mailbox_id, Uid(2), UidValidity(1), &sample_body("raw two")).unwrap();
         cache.snooze_message(&mailbox_id, Uid(2), Utc::now() + chrono::Duration::hours(1)).unwrap();
 
         cache.delete_message(&mailbox_id, Uid(1)).unwrap();
@@ -882,38 +916,56 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The one-time upgrade that makes the cache-hit path safe again: a cache
+    /// The one-time upgrades that make the cache-hit path safe again: a cache
     /// written by a pre-full-sync build holds only a windowed subset, so
-    /// opening it must wipe the envelope table (forcing full re-syncs) while
-    /// keeping message bodies - and must only do it once, since every sync
-    /// after the migration writes the whole folder.
+    /// opening it must wipe the envelope table (forcing full re-syncs), and a
+    /// pre-partial-fetch build stored raw RFC 5322 bytes in `bodies`, so a
+    /// format change must wipe those too. Each wipe happens exactly once,
+    /// since every sync after the migration writes the whole folder (and
+    /// every body fetch writes the new format).
     #[test]
-    fn wiping_stale_envelope_cache_once_on_format_version_change() {
+    fn wiping_stale_caches_once_on_format_version_change() {
         let account_id = temp_account_id();
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
 
-        // First open under the current build: migration runs, wiping rows.
+        // First open under the current build: migrations run, wiping rows.
         let cache = Cache::open(&account_id).unwrap();
         cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None)]).unwrap();
-        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), b"body survives").unwrap();
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("body survives")).unwrap();
 
         // Reopen: version already current, so the envelope rows must survive.
         let cache = Cache::open(&account_id).unwrap();
         assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 1, "a current-version cache must not be wiped on reopen");
-        assert_eq!(cache.load_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap().as_deref(), Some(&b"body survives"[..]));
+        assert_eq!(
+            cache.load_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap().map(|b| b.text_body.unwrap()),
+            Some("body survives".to_string())
+        );
 
-        // Simulate a pre-migration database: drop the version marker and
-        // rewrite the envelope rows; the next open must wipe them but keep
-        // the body.
-        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        // Simulate a pre-everything database (version 0): the next open must
+        // wipe both the envelope rows and the bodies.
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.pragma_update(None, "user_version", 0).unwrap();
         }
         cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 2, None)]).unwrap();
+        cache.store_body(&mailbox_id, Uid(2), UidValidity(1), &sample_body("fresh body")).unwrap();
         let cache = Cache::open(&account_id).unwrap();
         assert!(cache.load_messages(&mailbox_id).unwrap().is_empty(), "a pre-migration cache must be wiped");
-        assert_eq!(cache.load_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap().as_deref(), Some(&b"body survives"[..]));
+        assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), "a pre-migration body must be wiped");
+
+        // Simulate a version-1 database (envelope migration done, body format
+        // not): envelope rows survive, bodies are wiped.
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 3, None)]).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("new-format body")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("old-format body")).unwrap();
+        let cache = Cache::open(&account_id).unwrap();
+        assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 1, "a version-1 cache's envelope rows must survive");
+        assert!(!cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(), "a version-1 cache's bodies must be wiped");
 
         let _ = std::fs::remove_file(path);
     }
@@ -936,6 +988,18 @@ mod tests {
             size: 0,
             has_attachment: false,
             preview: preview.map(|p| p.to_string()),
+            structure: None,
+        }
+    }
+
+    fn sample_body(text: &str) -> EmailBody {
+        EmailBody {
+            uid: Uid(0),
+            text_body: Some(text.to_string()),
+            html_body: None,
+            parts: Vec::new(),
+            headers: Vec::new(),
+            auth_results: None,
         }
     }
 
@@ -1094,21 +1158,22 @@ mod tests {
         let account_id = temp_account_id();
         let cache = Cache::open(&account_id).unwrap();
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
-        let raw = b"From: a@b.c\r\n\r\nHello".to_vec();
+        let body = sample_body("Hello from the cache");
 
         // A never-fetched body is a miss.
         assert!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap().is_none());
 
-        cache.store_body(&mailbox_id, Uid(7), UidValidity(3), &raw).unwrap();
-        assert_eq!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap(), Some(raw));
+        cache.store_body(&mailbox_id, Uid(7), UidValidity(3), &body).unwrap();
+        assert_eq!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap(), Some(body));
 
         // A mailbox that was re-created (uidvalidity changed) reuses uids; a
         // stale row must be a miss, not a wrong body.
         assert!(cache.load_body(&mailbox_id, Uid(7), UidValidity(4)).unwrap().is_none());
 
         // Re-storing the same (mailbox, uid) replaces the bytes.
-        cache.store_body(&mailbox_id, Uid(7), UidValidity(3), b"updated".as_slice()).unwrap();
-        assert_eq!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap(), Some(b"updated".to_vec()));
+        let updated = sample_body("updated");
+        cache.store_body(&mailbox_id, Uid(7), UidValidity(3), &updated).unwrap();
+        assert_eq!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap(), Some(updated));
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
@@ -1196,8 +1261,9 @@ mod tests {
         assert_eq!(cache.search("numbers", 10).unwrap().len(), 1);
         assert_eq!(cache.search("confidential", 10).unwrap().len(), 0);
 
-        let raw = b"From: ada@example.com\r\nTo: bob@example.com\r\nSubject: Quarterly report\r\n\r\nThis document is confidential.".to_vec();
-        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &raw).unwrap();
+        cache
+            .store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("This document is confidential."))
+            .unwrap();
 
         assert_eq!(cache.search("confidential", 10).unwrap().len(), 1);
         // The preview term still matches after the body replaces it.
@@ -1262,13 +1328,14 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         // Create a database with envelopes + a body but no search index at all,
-        // exactly what a pre-search build left on disk.
+        // exactly what a pre-search build left on disk (user_version 2: the
+        // envelope and body-format migrations done, the FTS index absent).
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 "
-                PRAGMA user_version = 1;
+                PRAGMA user_version = 2;
                 CREATE TABLE messages (
                     mailbox_id TEXT NOT NULL,
                     uid INTEGER NOT NULL,
@@ -1300,7 +1367,7 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO bodies (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![mailbox_id.0, 1u32, 1u32, b"From: ada@example.com\r\n\r\nburied body term".as_slice()],
+                rusqlite::params![mailbox_id.0, 1u32, 1u32, serde_json::to_vec(&sample_body("buried body term")).unwrap()],
             )
             .unwrap();
         }
