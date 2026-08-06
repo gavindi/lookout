@@ -20,6 +20,7 @@ mod message_list;
 mod microsoft_oauth;
 mod online_accounts;
 mod recipient_entry;
+mod resources;
 mod settings;
 mod tags;
 mod ui_state_db;
@@ -40,6 +41,9 @@ fn main() -> glib::ExitCode {
     let worker = Rc::new(worker::Worker::new());
 
     app.connect_activate(move |app| {
+        let display = gtk::gdk::Display::default().expect("GTK initializes a display");
+        crate::resources::register(&display);
+
         let win = window::build_window(app, worker.clone());
         win.present();
     });

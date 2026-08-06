@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.56 (2026-08-07)
+
+### Changed
+
+- **Build**: the bundled assets now ship in a real GResource bundle instead of bare `include_bytes!`s. A new `data/resources.gresource.xml` (prefix `/io/github/gavindi/Lookout/`) lists the nav-rail SVGs, the bundled window backgrounds, and the app icon; `build.rs` compiles it with `glib-compile-resources` into `$OUT_DIR/gres.bin`, and a new `resources` module registers it at startup (`gio::resources_register`) plus the display icon theme's resource path (`gtk_icon_theme_add_resource_path`), so `io.github.gavindi.Lookout` - the app window's icon name - resolves from the bundle even where the hicolor file isn't installed (Flatpak/snap runs, dev builds). The window's background and the nav-rail artwork load through `resources::bytes()` first, keeping the `include_bytes!` constants as fallbacks when a build machine lacks the tool, and the assets moved from `source/Assets/` to `source/data/resources/` (glib-compile-resources only bundles files inside the XML's directory).
+
+### Testing
+
+- A new unit test validates the embedded bundle end-to-end: the compiled `gres.bin` must carry the GVariant database magic and parse as a GResource, with the nav-rail icons resolvable through it - skipped when the build fell back to an empty marker, since the whole point of the fallback is that such builds keep working. Verified both paths against the live build: the compiled bundle registers cleanly (no warnings at startup), and a simulated missing `glib-compile-resources` (a shim binary failing on PATH) produces the marker, a build warning, and a runtime warning while the app renders the `include_bytes!` copies unchanged. One format gotcha surfaced during verification: compiled GResources are GVariant databases whose 8-byte magic is `GVariant`, not `GResource` - the original magic check would have silently taken the fallback path forever.
+
 ## 0.6.55 (2026-08-07)
 
 ### Added

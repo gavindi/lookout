@@ -796,8 +796,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     crate::last_view::migrate_legacy(&settings);
     crate::background_image::migrate_legacy(&settings);
 
-    let bg_bytes = include_bytes!("../../../Assets/backgrounds/background2.png");
-    let default_bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes)).expect("bundled background image should decode");
+    let bg_bytes = crate::resources::bytes("/io/github/gavindi/Lookout/backgrounds/background2.png")
+        .unwrap_or_else(|| glib::Bytes::from_static(include_bytes!("../../../data/resources/backgrounds/background2.png")));
+    let default_bg_texture = gtk::gdk::Texture::from_bytes(&bg_bytes).expect("bundled background image should decode");
     let background = gtk::Picture::for_paintable(&default_bg_texture);
     background.set_content_fit(gtk::ContentFit::Cover);
     background.set_can_shrink(true);
@@ -2403,21 +2404,27 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // image shows straight through it. Four views today (Mail/Calendar/
     // Contacts/Config), joined into one toggle group for mutual-exclusive
     // selection.
-    let mail_icon_image = nav_rail_image(include_bytes!("../../../Assets/icons/email-1.svg"));
+    let mail_icon_image = nav_rail_image("/io/github/gavindi/Lookout/icons/email-1.svg", include_bytes!("../../../data/resources/icons/email-1.svg"));
     let mail_view_button = gtk::ToggleButton::builder()
         .child(&mail_icon_image)
         .css_classes(["flat"])
         .tooltip_text("Mail")
         .active(true)
         .build();
-    let calendar_icon_image = nav_rail_image(include_bytes!("../../../Assets/icons/calendar-1.svg"));
+    let calendar_icon_image = nav_rail_image(
+        "/io/github/gavindi/Lookout/icons/calendar-1.svg",
+        include_bytes!("../../../data/resources/icons/calendar-1.svg"),
+    );
     let calendar_view_button = gtk::ToggleButton::builder()
         .child(&calendar_icon_image)
         .css_classes(["flat"])
         .tooltip_text("Calendar")
         .build();
     calendar_view_button.set_group(Some(&mail_view_button));
-    let contacts_icon_image = nav_rail_image(include_bytes!("../../../Assets/icons/contact-1.svg"));
+    let contacts_icon_image = nav_rail_image(
+        "/io/github/gavindi/Lookout/icons/contact-1.svg",
+        include_bytes!("../../../data/resources/icons/contact-1.svg"),
+    );
     let contacts_view_button = gtk::ToggleButton::builder()
         .child(&contacts_icon_image)
         .css_classes(["flat"])
@@ -5438,11 +5445,13 @@ fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHeader) {
     header.favorite_suppress.set(false);
 }
 
-/// Decodes a bundled SVG (embedded via `include_bytes!`) into a fixed-size
-/// `gtk::Image` for the nav-rail view buttons, which use full-colour artwork
-/// rather than theme icon names.
-fn nav_rail_image(bytes: &'static [u8]) -> gtk::Image {
-    let texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bytes)).expect("bundled nav-rail SVG should decode");
+/// Decodes a nav-rail SVG into a fixed-size `gtk::Image` for the view
+/// buttons, which use full-colour artwork rather than theme icon names.
+/// The bundled copy is preferred (see `resources.rs`); `fallback` covers
+/// builds whose GResource bundle couldn't be compiled.
+fn nav_rail_image(resource_path: &str, fallback: &'static [u8]) -> gtk::Image {
+    let bytes = crate::resources::bytes(resource_path).unwrap_or_else(|| glib::Bytes::from_static(fallback));
+    let texture = gtk::gdk::Texture::from_bytes(&bytes).expect("bundled nav-rail SVG should decode");
     let image = gtk::Image::from_paintable(Some(&texture));
     image.set_pixel_size(28);
     image

@@ -6,7 +6,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 
 - [x] Cargo workspace scaffolding (`lookout-core`, `lookout-goa`, `lookout-mail`, `lookout-app`)
 - [x] `.desktop` file + AppStream metainfo + placeholder icon
-- [ ] GResource bundle
+- [x] GResource bundle
 - [x] `AdwApplication` shell with empty-state page that spawns `gnome-control-center online-accounts`
 - [x] Window chrome: background image, translucent panes, per-role folder icons, view-switcher rail, Outlook-style menu bar + command toolbar
 - [x] `lookout-goa`: zbus proxies for GOA interfaces; `list_mail_accounts()`
