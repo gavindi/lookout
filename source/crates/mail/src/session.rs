@@ -229,6 +229,18 @@ pub enum AccountCommand {
         msg: ComposedMessage,
         replace: bool,
     },
+    /// The IMAP `SEARCH` fallback for full-text search: run `UID SEARCH TEXT
+    /// "<query>"` against `mailbox` (SELECTing it on demand, like
+    /// `StoreFlags`), fetch the matching messages' envelopes, and answer with
+    /// an `AccountEvent::SearchResults` - always emitted, even for an empty
+    /// match set, so the UI knows the live pass is complete. One round trip
+    /// per folder, which is why the app only sends it for the mailbox the
+    /// user is actually viewing; everything already synced is covered
+    /// instantly by the local FTS index (`Cache::search`).
+    SearchMailbox {
+        mailbox: MailboxId,
+        query: String,
+    },
     /// Best-effort counterpart of `SaveDraft`: permanently remove the draft
     /// stored under `message_id` from the Drafts mailbox - sent right before
     /// `SendMessage` when the message being sent was draft-autosaved, so the
@@ -263,6 +275,15 @@ pub enum AccountEvent {
         role: MailboxRole,
     },
     MessageSnoozed,
+    /// The answer to an `AccountCommand::SearchMailbox`: the envelopes of
+    /// every message in `mailbox` whose headers/body matched `query` per the
+    /// server's `UID SEARCH`. Emitted even when `messages` is empty, so the
+    /// UI can tell "searched, nothing found" apart from "still searching".
+    SearchResults {
+        mailbox: MailboxId,
+        query: String,
+        messages: Vec<EmailSummary>,
+    },
     Error(String),
 }
 
@@ -309,6 +330,16 @@ pub async fn run_account_session(
             if !messages.is_empty() {
                 let _ = events.send(AccountEvent::MessagesUpdated { mailbox: inbox_id, messages }).await;
             }
+        }
+        // One-time FTS backfill, on this worker thread rather than the UI
+        // thread: `Cache::open` deliberately doesn't do it (see that method's
+        // note), because the app also opens a read-side handle from the main
+        // thread at connect time and backfilling a large pre-search cache -
+        // re-parsing every cached body - would block startup. This runs
+        // before the connection is attempted, so it doesn't delay the cached
+        // first paint above, and it's a cheap no-op once the index exists.
+        if let Err(e) = cache.backfill_search_index() {
+            tracing::warn!("failed to backfill the search index: {e}");
         }
     }
 
@@ -566,9 +597,21 @@ async fn connect_and_run(
                     }
                 }
                 AccountCommand::FetchBody { mailbox, uid } => {
-                    if mailbox != current_mailbox_id {
-                        tracing::warn!("FetchBody requested for a mailbox other than the currently selected one; ignoring");
+                    // Fetch the body from whichever mailbox it actually lives
+                    // in. Previously this required `mailbox` to be the open
+                    // folder, which full-text search broke: a search result
+                    // can come from any folder (or account) the local index
+                    // covers, and opening it must not silently no-op. SELECTing
+                    // on demand has the same contract as `StoreFlags` - the
+                    // body may live anywhere - and the top of the loop puts
+                    // the session back on the user's folder before the next
+                    // IDLE wait.
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
                         continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
                     }
                     // The mailbox's uidvalidity guards the body cache against
                     // serving a stale body for a recycled uid after the
@@ -584,6 +627,33 @@ async fn connect_and_run(
                             let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
                         }
                     }
+                }
+                AccountCommand::SearchMailbox { mailbox, query } => {
+                    // The server-side search pass of full-text search. One
+                    // round trip per folder, so the app only sends this for
+                    // the mailbox the user is viewing; SELECTing on demand
+                    // (same contract as `StoreFlags`/`FetchBody` above) covers
+                    // a search result from any folder, and the top of the loop
+                    // puts the session back on the user's folder afterwards.
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    let messages = match search_mailbox(&mut session, &account_id, &mailbox, &query).await {
+                        Ok(messages) => messages,
+                        // A failed search must still complete the app's live
+                        // pass (an empty answer), or its "searching" state
+                        // would stick forever - and this is a background
+                        // nicety, not a user action, so a warning is enough.
+                        Err(e) => {
+                            tracing::warn!(%mailbox, "mailbox search failed: {e}");
+                            Vec::new()
+                        }
+                    };
+                    let _ = events.send(AccountEvent::SearchResults { mailbox, query, messages }).await;
                 }
                 AccountCommand::SendMessage(msg) => match send_message(config, credentials, &mut session, &folders, msg).await {
                     Ok(()) => {
@@ -1419,6 +1489,46 @@ async fn refresh_one_folder_count(
         return;
     }
     publish_folders(folders, account_id, cache, events).await;
+}
+
+/// Quotes an IMAP search criterion's argument per RFC 3501 §9 (quoted string):
+/// the value is wrapped in double quotes and any embedded `"` or `\` escaped
+/// with a backslash, so arbitrary user text can never break out of the string
+/// and inject search grammar.
+fn imap_quote(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// The IMAP `SEARCH` fallback for one mailbox: `UID SEARCH TEXT "<query>"`
+/// returns the matching uids, then a `UID FETCH` of those uids' envelopes
+/// yields the same `EmailSummary` shape the local index produces. `TEXT`
+/// searches headers and body together (subject, addresses, message text) -
+/// the same surface the FTS index covers. An empty match set is a valid
+/// answer; `sync_mailbox`'s whole-folder strategy is not used here because
+/// the server already did the filtering (and re-fetching a whole folder to
+/// filter locally would defeat the fallback's purpose).
+async fn search_mailbox(session: &mut Session<ImapStream>, account_id: &AccountId, mailbox: &MailboxId, query: &str) -> Result<Vec<EmailSummary>> {
+    let search_query = format!("TEXT {}", imap_quote(query));
+    let uids = session.uid_search(&search_query).await?;
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A sorted UID set gives the fetch (and the summaries) a stable order
+    // rather than the HashSet's arbitrary iteration order.
+    let mut uid_list: Vec<u32> = uids.into_iter().collect();
+    uid_list.sort_unstable();
+    let uid_set = uid_list.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    let fetches: Vec<_> = session.uid_fetch(&uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE)").await?.try_collect().await?;
+    let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox, f)).collect();
+    let keys = lookout_core::thread::compute_thread_keys(&messages);
+    for msg in &mut messages {
+        if let Some(key) = keys.get(&msg.uid) {
+            msg.thread_key = key.clone();
+        }
+    }
+    tracing::debug!(account = %account_id, mailbox = %mailbox, count = messages.len(), "mailbox search matched");
+    Ok(messages)
 }
 
 async fn sync_mailbox(

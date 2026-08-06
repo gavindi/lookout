@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.45" date="2026-08-06">
+      <description>
+        <p>Full-text search is here - press Ctrl+F (or the toolbar's Search button) to search across every synced folder and account, with results shown instantly from a local SQLite FTS5 index and a live IMAP search filling in the gaps. Clicking any result opens the message no matter which folder it lives in.</p>
+      </description>
+    </release>
     <release version="0.6.44" date="2026-08-06">
       <description>
         <p>Folders now show all their mail instead of just the most recent few hundred - the Gmail inboxes that were missing older messages and large folders like All Mail are fixed. The message list also groups mail older than a year under year headings, so old mail is easier to find than one long "Older" section.</p>

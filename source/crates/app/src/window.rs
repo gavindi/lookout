@@ -104,12 +104,16 @@ struct ContactsListEntry {
 }
 
 /// What the message list is currently showing - either a single mailbox (the
-/// classic folder-selection view) or the synthetic "All Inboxes" unified view
-/// merging every connected account's Inbox.
+/// classic folder-selection view), the synthetic "All Inboxes" unified view
+/// merging every connected account's Inbox, or full-text search results.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MailView {
     Single,
     UnifiedInbox,
+    /// Full-text search results across the local FTS index plus the live IMAP
+    /// pass on the open mailbox. Only ever active with a non-empty
+    /// `UiState::search_query`; exiting search restores the pre-search view.
+    Search,
 }
 
 /// Every widget one message-list row owns, stashed on the `Gtk.ListItem` at
@@ -181,6 +185,18 @@ const CONTACTS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from
 /// folder names are a sliver. Applied to `folder_card`, not the scroller -
 /// see the call site.
 const FOLDER_PANE_MIN_WIDTH: i32 = 150;
+
+/// How long after the last keystroke before a search query is committed. Long
+/// enough that a burst of typing runs one search, not one per keypress - the
+/// live IMAP pass costs a round trip, and even the FTS pass re-renders the
+/// list - but short enough that results feel immediate.
+const SEARCH_DEBOUNCE_MS: u32 = 300;
+
+/// How many hits each source contributes to a search: the FTS cache pass and
+/// the live IMAP pass each cap their answer so a search over a large mailbox
+/// doesn't hand the list an unbounded set to rebuild from. Generous - the
+/// user can refine the query to narrow further.
+const SEARCH_RESULT_LIMIT: usize = 300;
 
 /// How many color-tag dots one message row renders. A message can carry any
 /// number of tags; past this the row draws the first few and leaves the rest
@@ -358,6 +374,25 @@ struct UiState {
     /// 0 that `GtkSingleSelection`'s autoselect does on every `set_model`
     /// would enter the unified view.
     suppress_folder_selection: bool,
+    /// Whether the message list is showing full-text search results. True only
+    /// with a non-empty `search_query`; `MailView::Search` (see
+    /// `MailView`) is the list's view mode while active. Exiting restores the
+    /// pre-search view: `Single` when `current_mailbox` survived the search,
+    /// else the unified "All Inboxes" view.
+    search_active: bool,
+    /// The query being searched for, matching the search entry's text. The
+    /// list shows results as `(mailbox, uid)` sets that match it.
+    search_query: String,
+    /// The accumulated search results - the instant FTS cache pass over every
+    /// account merged with each live IMAP `SEARCH` answer as it arrives,
+    /// deduplicated by `(mailbox, uid)`. Repopulated into the message list on
+    /// every change.
+    search_results: Vec<EmailSummary>,
+    /// The `(account, mailbox)` pairs the live IMAP pass has asked for and not
+    /// yet been answered. `SearchResults` fires once per requested folder
+    /// (always, even for an empty match set - see the session docs), removing
+    /// its entry; an empty set means the live pass is done.
+    search_pending: HashSet<(AccountId, MailboxId)>,
 }
 
 /// Per-calendar-account state, kept separate from `UiState`/`AccountHandle`
@@ -789,6 +824,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         draft_saved_tx: None,
         folder_tree: None,
         suppress_folder_selection: false,
+        search_active: false,
+        search_query: String::new(),
+        search_results: Vec::new(),
+        search_pending: HashSet::new(),
     }));
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
@@ -1465,8 +1504,79 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     column_header_row.append(&subject_header);
     column_header_row.append(&date_header);
 
+    // --- Full-text search: a `gtk::SearchBar` between the list's header row
+    // and its column headers, revealed by the toolbar's Search button and by
+    // Ctrl+F. Typing (debounced) swaps the list into search mode - instant
+    // results from the local FTS index, with the open mailbox's live IMAP
+    // pass catching up a beat later. Esc or clearing the text leaves search
+    // mode and restores the previous view. ---
+    let search_bar = gtk::SearchBar::new();
+    let search_entry = gtk::SearchEntry::builder().placeholder_text("Search mail").width_request(360).build();
+    search_bar.set_child(Some(&search_entry));
+    search_bar.set_search_mode(false);
+    // A debounce token bumped on every keystroke and captured by each
+    // scheduled timeout, so a timeout whose token is stale knows the user has
+    // typed again and its query is superseded (the newer keystroke armed a
+    // newer timeout).
+    let search_debounce: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    {
+        let state = state.clone();
+        let message_list = message_list.clone();
+        let list_header = list_header.clone();
+        let search_bar = search_bar.clone();
+        let search_debounce = search_debounce.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let query = entry.text();
+            if query.trim().is_empty() {
+                // Clearing the field (its X, or a programmatic `set_text("")`
+                // from `exit_search`) ends the search right away - no debounce
+                // needed. Bumping the token also invalidates any timeout armed
+                // for a query still being typed.
+                search_debounce.set(search_debounce.get() + 1);
+                exit_search(&state, &message_list, &list_header, &search_bar, entry);
+                return;
+            }
+            let token = search_debounce.get() + 1;
+            search_debounce.set(token);
+            // Clone everything the timeout needs: the outer closure is `Fn`
+            // and fires again on the next keystroke, so the timeout's own
+            // `move` closure can't borrow from it.
+            let state = state.clone();
+            let message_list = message_list.clone();
+            let list_header = list_header.clone();
+            let search_bar = search_bar.clone();
+            let search_debounce = search_debounce.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS as u64), move || {
+                if search_debounce.get() != token {
+                    return;
+                }
+                start_search(&state, &message_list, &list_header, &search_bar, query.as_str());
+            });
+        });
+    }
+    {
+        let state = state.clone();
+        let message_list = message_list.clone();
+        let list_header = list_header.clone();
+        let search_bar = search_bar.clone();
+        let search_debounce = search_debounce.clone();
+        // Esc in the entry (the SearchBar routes it to `stop-search`): leave
+        // search mode entirely rather than just clearing the field.
+        search_entry.connect_stop_search(move |entry| {
+            if search_debounce.get() != 0 {
+                // Bump the debounce token so a timeout armed for the query
+                // being typed is invalidated before we clear the entry - the
+                // `set_text("")` below would otherwise fire `search-changed`
+                // and re-enter a search for the (already-cleared) query.
+                search_debounce.set(search_debounce.get() + 1);
+            }
+            exit_search(&state, &message_list, &list_header, &search_bar, entry);
+        });
+    }
+
     let message_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_box.append(&message_header_row);
+    message_box.append(&search_bar);
     message_box.append(&column_header_row);
     message_box.append(&message_scroller);
     let message_card = card_section(&message_box);
@@ -1989,6 +2099,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let more_button = gtk::Button::from_icon_name("view-more-symbolic");
     more_button.set_tooltip_text(Some("More"));
     more_button.set_sensitive(false);
+    // Search: a plain button that reveals the list's SearchBar and focuses
+    // the entry (Esc or the entry's X leaves search mode). A plain button
+    // rather than a toggle keeps it a pure opener - its pressed state would
+    // otherwise have to track every way a search can end.
+    let search_tool_button = gtk::Button::from_icon_name(themed_icon_name(&["edit-find-symbolic", "system-search-symbolic", "search-symbolic"]));
+    search_tool_button.set_tooltip_text(Some("Search mail (Ctrl+F)"));
+    {
+        let search_bar = search_bar.clone();
+        let search_entry = search_entry.clone();
+        search_tool_button.connect_clicked(move |_| {
+            search_bar.set_search_mode(true);
+            search_entry.grab_focus();
+        });
+    }
 
     let command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     command_toolbar.append(&compose_button);
@@ -2003,6 +2127,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&categorize_button);
     command_toolbar.append(&snooze_button);
     command_toolbar.append(&more_button);
+    command_toolbar.append(&search_tool_button);
 
     // --- Calendar's own command toolbar row, swapped in for the Mail one
     // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
@@ -2355,6 +2480,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // item is activated, so registering it here is in time.
     window.add_action(&sort_key_action);
     window.add_action(&list_filter_action);
+
+    // --- Ctrl+F reveals the search bar and focuses its entry, from anywhere
+    // in the window. A `ShortcutController` on the window itself (rather than
+    // an accelerator string, which this codebase doesn't use) so the keypress
+    // is caught even while a list row or the reading pane has focus. ---
+    {
+        let search_bar = search_bar.clone();
+        let search_entry = search_entry.clone();
+        let controller = gtk::ShortcutController::new();
+        let trigger = gtk::KeyvalTrigger::new(gtk::gdk::Key::f, gtk::gdk::ModifierType::CONTROL_MASK);
+        let action = gtk::CallbackAction::new(move |_widget, _args| {
+            search_bar.set_search_mode(true);
+            search_entry.grab_focus();
+            glib::Propagation::Proceed
+        });
+        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+        window.add_controller(controller);
+    }
+    // The SearchBar captures keys (including Esc, for `stop-search`) while
+    // visible; pointing it at the window means a Ctrl+F pressed anywhere is
+    // seen, and Esc in the entry bubbles to the bar's own handler.
+    search_bar.set_key_capture_widget(Some(&window));
 
     let state = state.clone();
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
@@ -2822,6 +2969,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let message_list = message_list.clone();
         let list_header = list_header.clone();
+        let search_bar = search_bar.clone();
+        let search_entry = search_entry.clone();
         folder_selection.connect_selected_item_notify(move |sel| {
             // A rebuild putting the highlight back where it was is not the
             // user navigating; see `UiState::suppress_folder_selection`.
@@ -2834,6 +2983,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             match &*tree_item {
                 TreeItem::Unified(_) => {
                     drop(tree_item);
+                    // Clicking a folder is a deliberate navigation away from
+                    // search; leave it and let the selection take over.
+                    exit_search(&state, &message_list, &list_header, &search_bar, &search_entry);
                     enter_unified_inbox(&state, &message_list);
                     refresh_list_header(&state, &list_header);
                 }
@@ -2841,6 +2993,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let mailbox_id = node.mailbox.id.clone();
                     let account_id = node.mailbox.account_id.clone();
                     drop(tree_item);
+                    exit_search(&state, &message_list, &list_header, &search_bar, &search_entry);
                     select_mailbox(&state, account_id, mailbox_id);
                     refresh_list_header(&state, &list_header);
                 }
@@ -4070,6 +4223,22 @@ fn connect_account(
                 AccountEvent::MessagesUpdated { mailbox, messages } => {
                     // The sync this mailbox was asked for (if any) has landed.
                     state.borrow_mut().syncing.remove(&mailbox);
+                    // While a search is active the results list owns the
+                    // pane: a background sync repopulating it would clobber
+                    // the results with the folder's full set. Still fold
+                    // inbox syncs into the unified snapshot so exiting search
+                    // restores fresh data.
+                    if state.borrow().search_active {
+                        let mut st = state.borrow_mut();
+                        let in_unified_set = st
+                            .accounts
+                            .values()
+                            .any(|h| h.folders.iter().any(|m| m.id == mailbox && matches!(m.role, MailboxRole::Inbox)));
+                        if in_unified_set {
+                            st.unified_snapshots.insert(mailbox, messages);
+                        }
+                        continue;
+                    }
                     // Decide whether this mailbox belongs to the view on
                     // screen, folding its payload into the unified snapshot
                     // when in "All Inboxes" mode. On fresh startup (nothing
@@ -4163,6 +4332,36 @@ fn connect_account(
                 }
                 AccountEvent::MessageSnoozed => {
                     toast_overlay.add_toast(adw::Toast::new("Snoozed until tomorrow 9:00 AM"));
+                }
+                AccountEvent::SearchResults { mailbox, query, messages } => {
+                    // An answer to the live IMAP pass. `mailbox` matches a
+                    // `search_pending` entry (the session always answers, even
+                    // with an empty match set); a result whose folder is no
+                    // longer pending - or whose query isn't the one on screen,
+                    // for the same-folder re-search race where an old answer
+                    // lands after the folder is pending again - belongs to a
+                    // stale search and is dropped.
+                    let account_id = mailbox_account_id(&mailbox);
+                    let pending_key = account_id.as_ref().map(|id| (id.clone(), mailbox.clone()));
+                    let wanted = pending_key.as_ref().is_some_and(|key| {
+                        let mut st = state.borrow_mut();
+                        st.search_pending.remove(key)
+                    });
+                    if !wanted || state.borrow().search_query != query {
+                        continue;
+                    }
+                    // Merge the answer into the accumulated results - a
+                    // search can also have surfaced this message in the cache
+                    // pass, so dedupe by `(mailbox, uid)`.
+                    let mut seen: HashSet<(MailboxId, Uid)> = state.borrow().search_results.iter().map(|m| (m.mailbox.clone(), m.uid)).collect();
+                    let mut st = state.borrow_mut();
+                    for m in messages {
+                        if seen.insert((m.mailbox.clone(), m.uid)) {
+                            st.search_results.push(m);
+                        }
+                    }
+                    drop(st);
+                    repopulate_search_results(&state, &message_list);
                 }
                 AccountEvent::Error(message) => {
                     toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", account_label(&state, &account_id))));
@@ -4498,6 +4697,9 @@ struct ListHeader {
 /// it, so it names itself and the whole account set.
 fn current_view_title(state: &Rc<RefCell<UiState>>) -> (String, String) {
     let st = state.borrow();
+    if matches!(st.mail_view, MailView::Search) {
+        return ("Search results".to_string(), format!("“{}”", st.search_query));
+    }
     if matches!(st.mail_view, MailView::UnifiedInbox) {
         return ("All Inboxes".to_string(), "All accounts".to_string());
     }
@@ -4531,9 +4733,12 @@ fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHeader) {
 
     let (favorable, starred) = {
         let st = state.borrow();
-        match st.current_mailbox.as_ref() {
-            Some(mailbox) => (true, st.favorites.contains(mailbox)),
-            None => (false, false),
+        // Search results span folders (and accounts), so the star - which
+        // favorites the *open folder* - is meaningless while searching.
+        match (st.mail_view, st.current_mailbox.as_ref()) {
+            (MailView::Search, _) => (false, false),
+            (_, Some(mailbox)) => (true, st.favorites.contains(mailbox)),
+            (_, None) => (false, false),
         }
     };
     header.favorite_suppress.set(true);
@@ -4978,6 +5183,155 @@ fn resync_current_view(state: &Rc<RefCell<UiState>>) {
     }
 }
 
+/// The FTS cache pass of a search: query every connected account's read-side
+/// cache handle and merge the hits, deduplicated by `(mailbox, uid)` so a
+/// message that matches on both subject and body still appears once. Runs on
+/// the UI thread against the on-disk index (the same read-side handles the
+/// composer's autocomplete uses) - no IMAP round trip, so this is what makes
+/// results feel instant.
+fn search_cached_results(state: &Rc<RefCell<UiState>>, query: &str) -> Vec<EmailSummary> {
+    let mut seen: HashSet<(MailboxId, Uid)> = HashSet::new();
+    let mut results = Vec::new();
+    for cache in state.borrow().accounts.values().map(|h| h.address_cache.clone()) {
+        let Some(cache) = cache else { continue };
+        let Ok(hits) = cache.search(query, SEARCH_RESULT_LIMIT) else { continue };
+        for m in hits {
+            if seen.insert((m.mailbox.clone(), m.uid)) {
+                results.push(m);
+            }
+        }
+    }
+    results
+}
+
+/// Repopulates the message list from the accumulated search results, under the
+/// current sort.
+fn repopulate_search_results(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel) {
+    let (key, descending) = current_sort(state);
+    let results = state.borrow().search_results.clone();
+    message_list.repopulate(results, key, descending);
+}
+
+/// Asks the live IMAP pass to cover the mailbox the user was viewing - or
+/// every account's Inbox when the pre-search view was the unified one (the
+/// same folders `account_inboxes` names). Searches arrive in these folders, so
+/// this is where the local index's gaps are: mail that has never been synced,
+/// and body text for messages never fetched. One `SearchMailbox` per folder
+/// (a SELECT + `UID SEARCH` + fetch each), which is why the fan-out stops at
+/// the open view instead of covering every folder of every account - a search
+/// over an unopened folder would otherwise pay a round trip for nothing the
+/// user is looking at.
+fn dispatch_search_fallbacks(state: &Rc<RefCell<UiState>>, query: &str) {
+    let targets: Vec<(AccountId, MailboxId)> = {
+        let st = state.borrow();
+        if st.current_mailbox.is_some() {
+            st.current_account.clone().zip(st.current_mailbox.clone()).into_iter().collect()
+        } else {
+            account_inboxes(state)
+        }
+    };
+    let mut sent: Vec<(AccountId, MailboxId)> = Vec::new();
+    {
+        let mut st = state.borrow_mut();
+        for (account_id, mailbox) in targets {
+            if st.search_pending.insert((account_id.clone(), mailbox.clone())) {
+                sent.push((account_id, mailbox));
+            }
+        }
+    }
+    for (account_id, mailbox) in sent {
+        if let Some(handle) = state.borrow().accounts.get(&account_id) {
+            let _ = handle.cmd_tx.send_blocking(AccountCommand::SearchMailbox {
+                mailbox,
+                query: query.to_string(),
+            });
+        }
+    }
+}
+
+/// Enters (or re-enters) full-text search for `query`: flips the list into
+/// search mode, repopulates instantly from the local FTS index across every
+/// account, and dispatches the live IMAP pass on the open view. An empty query
+/// is `exit_search` by another name (clearing the entry's X ends the search).
+fn start_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, list_header: &ListHeader, search_bar: &gtk::SearchBar, query: &str) {
+    let query = query.trim().to_string();
+    debug_assert!(!query.is_empty(), "start_search is only called with a non-empty query; empty text takes the exit path");
+    {
+        let mut st = state.borrow_mut();
+        st.search_active = true;
+        st.search_query = query.clone();
+        st.mail_view = MailView::Search;
+        // Drop any folders the *previous* query's live pass was waiting on.
+        // An answer arriving for them is then both un-pending and (via the
+        // `query != search_query` check in the event loop) for the wrong
+        // query, so it's discarded either way.
+        st.search_pending.clear();
+    }
+    let cached = search_cached_results(state, &query);
+    {
+        let mut st = state.borrow_mut();
+        st.search_results = cached;
+    }
+    dispatch_search_fallbacks(state, &query);
+    repopulate_search_results(state, message_list);
+    refresh_list_header(state, list_header);
+    search_bar.set_search_mode(true);
+}
+
+/// Leaves full-text search: hides the bar, clears the query entry, and
+/// restores the pre-search view - the open mailbox (`MailView::Single`,
+/// repopulated from its cache with a fresh sync requested) or the unified
+/// "All Inboxes" view (`MailView::UnifiedInbox`, repopulated from the
+/// per-mailbox snapshots). A no-op when no search is active, aside from hiding
+/// the bar so an Esc on an idle (empty) entry still dismisses it.
+fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, list_header: &ListHeader, search_bar: &gtk::SearchBar, search_entry: &gtk::SearchEntry) {
+    if !state.borrow().search_active {
+        search_bar.set_search_mode(false);
+        search_entry.set_text("");
+        return;
+    }
+    let restored_view = {
+        let mut st = state.borrow_mut();
+        st.search_active = false;
+        st.search_query.clear();
+        st.search_results.clear();
+        st.search_pending.clear();
+        if st.current_mailbox.is_some() {
+            MailView::Single
+        } else {
+            MailView::UnifiedInbox
+        }
+    };
+    state.borrow_mut().mail_view = restored_view;
+    search_bar.set_search_mode(false);
+    search_entry.set_text("");
+    refresh_list_header(state, list_header);
+    if restored_view == MailView::UnifiedInbox {
+        for (account_id, inbox_id) in account_inboxes(state) {
+            request_mailbox_sync(state, &account_id, &inbox_id);
+        }
+        let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
+        let (key, descending) = current_sort(state);
+        message_list.repopulate(all, key, descending);
+    } else {
+        // Single view: paint from the mailbox's cache now so the list doesn't
+        // linger on search results, then let the requested sync refresh it.
+        let (account_id, mailbox_id) = {
+            let st = state.borrow();
+            (st.current_account.clone(), st.current_mailbox.clone())
+        };
+        if let Some((account_id, mailbox_id)) = account_id.zip(mailbox_id) {
+            request_mailbox_sync(state, &account_id, &mailbox_id);
+            if let Some(cache) = state.borrow().accounts.get(&account_id).and_then(|h| h.address_cache.clone()) {
+                if let Ok(messages) = cache.load_messages(&mailbox_id) {
+                    let (key, descending) = current_sort(state);
+                    message_list.repopulate(messages, key, descending);
+                }
+            }
+        }
+    }
+}
+
 /// Enters the "All Inboxes" view: asks every connected account that has an
 /// Inbox to sync it, and immediately repopulates the list from whatever the
 /// per-mailbox snapshots already hold.
@@ -5229,7 +5583,10 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
         match st.mail_view {
             // Row 0 is always the "All Inboxes" row.
             MailView::UnifiedInbox => Some(SelectionTarget::Unified),
-            MailView::Single => st.current_mailbox.clone().map(SelectionTarget::Mailbox),
+            // During a search the folder pane still highlights the mailbox the
+            // search started from (or nothing, if it started from the unified
+            // view).
+            MailView::Single | MailView::Search => st.current_mailbox.clone().map(SelectionTarget::Mailbox),
         }
     };
 
@@ -5784,6 +6141,10 @@ mod tests {
             draft_saved_tx: None,
             folder_tree: None,
             suppress_folder_selection: false,
+            search_active: false,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_pending: HashSet::new(),
         }));
 
         // First request goes out and is marked pending.

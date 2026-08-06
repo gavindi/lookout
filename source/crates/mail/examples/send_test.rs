@@ -138,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::BodyFetched { .. } => {}
                     AccountEvent::DraftSaved { .. } => {}
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed => {}
+                    AccountEvent::SearchResults { .. } => {}
                     AccountEvent::Error(e) => {
                         println!("ERROR: {e}");
                         break;

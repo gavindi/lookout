@@ -308,7 +308,11 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     let mut contacts_accounts = client.list_contacts_accounts().await.unwrap();
     contacts_accounts.sort_by(|a, b| a.uri.cmp(&b.uri));
 
-    assert_eq!(contacts_accounts.len(), 3, "expected exactly the three usable-contacts accounts, got: {contacts_accounts:?}");
+    assert_eq!(
+        contacts_accounts.len(),
+        3,
+        "expected exactly the three usable-contacts accounts, got: {contacts_accounts:?}"
+    );
     assert_eq!(contacts_accounts[0].uri, "https://carddav.example.com/dav/oauth@example.com/");
     assert!(matches!(contacts_accounts[0].auth, ContactsAuthMethod::OAuth2));
     assert_eq!(contacts_accounts[1].uri, "https://carddav.example.com/dav/password@example.com/");

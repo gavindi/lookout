@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.45 (2026-08-06)
+
+### Added
+
+- **Mail**: full-text search across all synced mail, Gmail/Outlook-style. A `gtk::SearchBar` between the message-list header row and its column headers is revealed by a new Search button in the Home toolbar or by Ctrl+F (a `ShortcutController` on the window, so it works from any focus); typing - debounced 300 ms so a burst of keys is one search, not one per keypress - flips the list into a search mode and shows results instantly from a per-account SQLite FTS5 index (`search_fts`, using the bundled SQLite's FTS5), with the open mailbox's live IMAP `SEARCH` pass catching up a beat later for mail the local index hasn't seen. The index covers subject, sender, recipients, and body text: indexed from the envelope on every sync, upgraded to the full message text once a body is fetched (bodies over 256 KB stay preview-only rather than paying a re-parse), and rewritten only for rows whose text could change, so a flag/keyword `STORE` doesn't touch it. Queries AND their bare words and honour `"`-quoted phrases; FTS operator characters are neutralised, so typing `AND` searches for the word "and" rather than altering the query. Snoozed messages are excluded, matching the list. Results span every account and every synced folder; clicking a result opens it from any folder, because `FetchBody` now SELECTs its mailbox on demand instead of dropping non-current folders. Esc, clearing the field, or clicking a folder leaves search and restores the previous view (the open mailbox, or All Inboxes if search started there). The live pass is `AccountCommand::SearchMailbox` (`UID SEARCH TEXT` + envelope fetch, SELECTing on demand) covering the currently-open mailbox - or every account's Inbox from the unified view - and it always answers with an `AccountEvent::SearchResults` even for zero hits, so the UI can tell "searched, nothing found" from "still searching".
+- **Mail**: caches written before the search index existed are backfilled once on open, so old cached mail is searchable without forcing a full re-sync. The backfill deliberately runs on the account session's worker thread, not in `Cache::open` itself - the app also opens a read-side cache handle from the UI thread at connect time (for composer autocomplete), and re-parsing every cached body to index it would have frozen startup on a large pre-existing cache. It's a cheap no-op (a single count query) once the index exists, and idempotent under a re-run.
+
 ## 0.6.44 (2026-08-06)
 
 ### Added

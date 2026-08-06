@@ -86,6 +86,154 @@ fn sanitize_filename(account_id: &AccountId) -> String {
         .collect()
 }
 
+/// Joins the addresses of one header field (from/to/cc) into the space-joined
+/// token string the search index stores: the bare address and the display name
+/// each become their own tokens, so both `ada@example.com` and `Ada Lovelace`
+/// match the same message.
+fn index_addresses<'a>(addrs: impl IntoIterator<Item = &'a EmailAddress>) -> String {
+    let mut out = String::new();
+    for a in addrs {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&a.address);
+        if let Some(name) = a.name.as_deref().filter(|n| !n.trim().is_empty()) {
+            out.push(' ');
+            out.push_str(name);
+        }
+    }
+    out
+}
+
+/// Writes a new search-index row for `msg`, carrying `body` as the searchable
+/// body text. INSERT-only on purpose: callers either cleared the row first
+/// (`replace_messages` deletes the whole mailbox before inserting) or route
+/// through `index_upsert_message`, because FTS5 has no `UPDATE` - and
+/// `INSERT OR REPLACE` replaces by rowid, while the implicit autoincrement
+/// rowid would let re-indexing a `(mailbox_id, uid)` accumulate a duplicate.
+fn index_message(conn: &rusqlite::Connection, msg: &EmailSummary, body: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO search_fts (mailbox_id, uid, subject, sender, recipients, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            msg.mailbox.0,
+            msg.uid.0,
+            msg.subject.clone().unwrap_or_default(),
+            index_addresses(&msg.from),
+            index_addresses(msg.to.iter().chain(&msg.cc)),
+            body,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Removes the search-index row for `(mailbox_id, uid)`, if any.
+fn delete_index_row(conn: &rusqlite::Connection, mailbox_id: &MailboxId, uid: Uid) -> Result<()> {
+    conn.execute("DELETE FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
+    Ok(())
+}
+
+/// Rewrites the search-index row for `msg` in place (delete then insert), for
+/// callers that re-index an existing message - `store_body` upgrading the
+/// body text, and the one-time backfill. Idempotent even against a re-run,
+/// because the delete removes exactly this message's old row.
+fn index_upsert_message(conn: &rusqlite::Connection, msg: &EmailSummary, body: &str) -> Result<()> {
+    delete_index_row(conn, &msg.mailbox, msg.uid)?;
+    index_message(conn, msg, body)
+}
+
+/// The searchable body text for `raw`: the plain-text part, or a stripped-HTML
+/// rendering when there's no text part. Mirrors `preview_from_raw`'s
+/// text-over-html preference, but returns the whole body rather than a snippet.
+///
+/// Bodies over `FULL_BODY_INDEX_BYTES` are skipped (returning `None`, so the
+/// message keeps its preview-only index row): parsing them with `mail_parser`
+/// is expensive - a multi-megabyte marketing HTML mail shouldn't cost a
+/// re-parse every time it's fetched, in the prefetch or the backfill - and
+/// their first few KB of readable text is usually in the preview anyway.
+fn indexable_body_text(raw: &[u8]) -> Option<String> {
+    if raw.len() > FULL_BODY_INDEX_BYTES {
+        return None;
+    }
+    let body = crate::body::parse_body(Uid(0), raw)?;
+    match body.text_body {
+        Some(text) if !text.trim().is_empty() => Some(text),
+        _ => body.html_body.map(|html| crate::body::strip_html_for_index(&html)),
+    }
+}
+
+/// Bodies larger than this aren't re-parsed for the search index (see
+/// `indexable_body_text`).
+const FULL_BODY_INDEX_BYTES: usize = 256 * 1024;
+
+/// Loads one cached summary by `(mailbox_id, uid)`, if present.
+fn load_summary_row(conn: &rusqlite::Connection, mailbox_id: &MailboxId, uid: Uid) -> Result<Option<EmailSummary>> {
+    let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+    let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
+    match rows.next() {
+        Some(Ok(data)) => Ok(serde_json::from_str(&data).ok()),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// Converts a free-text user query into a valid FTS5 `MATCH` expression, or
+/// `None` when there's nothing to search for.
+///
+/// Every bare word becomes a quoted phrase and the phrases are ANDed, so
+/// `foo bar` means "match both words" and a `"`-quoted run of words stays a
+/// single phrase (adjacent-token match). Quoting neutralizes all FTS5 query
+/// syntax (`AND`/`OR`/`NOT`/`NEAR`, `*`, `^`, parens) by turning each term
+/// into a literal search - a user typing `AND` searches for the word "and",
+/// it can never alter the query's shape. The unicode61 tokenizer splits on
+/// the same characters in the query as in the indexed text, so an address
+/// query `ada@example.com` still matches the tokens `ada example com` a
+/// stored address tokenizes to.
+pub fn sanitize_fts_query(input: &str) -> Option<String> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut rest = input.trim();
+    while !rest.is_empty() {
+        match rest.find('"') {
+            Some(0) => {
+                let after = &rest[1..];
+                match after.find('"') {
+                    Some(end) => {
+                        let phrase = &after[..end];
+                        if !phrase.trim().is_empty() {
+                            clauses.push(format!("\"{}\"", phrase.replace('"', " ")));
+                        }
+                        rest = &after[end + 1..];
+                    }
+                    None => {
+                        // Unterminated quote: treat the remainder as bare words.
+                        rest = after;
+                    }
+                }
+            }
+            Some(q) => {
+                for word in rest[..q].split_whitespace() {
+                    if !word.is_empty() {
+                        clauses.push(format!("\"{}\"", word.replace('"', " ")));
+                    }
+                }
+                rest = &rest[q..];
+            }
+            None => {
+                for word in rest.split_whitespace() {
+                    if !word.is_empty() {
+                        clauses.push(format!("\"{}\"", word.replace('"', " ")));
+                    }
+                }
+                rest = "";
+            }
+        }
+    }
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(clauses.join(" AND "))
+    }
+}
+
 impl Cache {
     /// Opens (creating if needed) the cache database for `account_id` under
     /// `$XDG_CACHE_HOME/lookout/mail/`.
@@ -139,6 +287,26 @@ impl Cache {
                 last_seen INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS addresses_by_count ON addresses (seen_count DESC);
+            -- The full-text search index over cached envelopes + bodies. The
+            -- bundled SQLite is built with FTS5 (see libsqlite3-sys's
+            -- `-DSQLITE_ENABLE_FTS5`), so this is always available. Columns
+            -- are the searchable surface: subject, sender (name + address),
+            -- recipients (to/cc), and body (preview, upgraded to the full
+            -- cached text once a body is fetched). `mailbox_id`/`uid` are
+            -- UNINDEXED so they're usable as filter keys without being
+            -- tokenized. Rows are keyed by `(mailbox_id, uid)` and rewritten
+            -- wholesale by the callers below (`replace_messages`/`store_body`
+            -- delete-then-insert), so FTS5's autoincrement rowid never leaks
+            -- duplicates.
+            CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+                mailbox_id UNINDEXED,
+                uid UNINDEXED,
+                subject,
+                sender,
+                recipients,
+                body,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );
             ",
         )?;
         // One-time envelope-cache migration. Pre-full-sync builds kept only a
@@ -156,7 +324,64 @@ impl Cache {
             conn.execute("DELETE FROM messages", [])?;
             conn.pragma_update(None, "user_version", ENVELOPE_CACHE_VERSION)?;
         }
+
+        // NOTE: the one-time FTS backfill is *not* run here. `Cache::open` is
+        // also called on the UI thread (the app's read-side handle for
+        // composer autocomplete), and backfilling a large pre-search cache -
+        // re-parsing every cached body - could block startup for seconds.
+        // `run_account_session` calls `Cache::backfill_search_index()` on the
+        // worker thread instead (see session.rs), and `replace_messages`
+        // keeps the index populated for everything synced under this build.
+
         Ok(Cache { conn: Mutex::new(conn) })
+    }
+
+    /// One-time FTS backfill: populates an empty `search_fts` from the
+    /// `messages` and `bodies` tables, so caches created before the search
+    /// index existed become searchable without forcing a full re-sync. A
+    /// body's row replaces the preview-only row once its full text is
+    /// available; bodies without a matching envelope (their message was wiped
+    /// by the envelope-version migration) are skipped - there's no
+    /// subject/sender to index against.
+    ///
+    /// Cheap to call on every session start: a populated index short-circuits
+    /// at the count check. Idempotent against re-runs because every row is
+    /// written through `index_upsert_message` (delete-then-insert), so even a
+    /// hypothetical concurrent backfill can't duplicate a `(mailbox_id, uid)`.
+    /// Must run off the UI thread - see the note in `open`.
+    pub fn backfill_search_index(&self) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let fts_count: i64 = tx.query_row("SELECT count(*) FROM search_fts", [], |r| r.get(0)).unwrap_or(0);
+        if fts_count != 0 {
+            tx.commit()?;
+            return Ok(());
+        }
+        {
+            let mut stmt = tx.prepare("SELECT data FROM messages")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(msg) = serde_json::from_str::<EmailSummary>(&row?) {
+                    index_upsert_message(&tx, &msg, msg.preview.as_deref().unwrap_or(""))?;
+                }
+            }
+        }
+        {
+            let mut stmt = tx.prepare("SELECT mailbox_id, uid, data FROM bodies")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
+            for row in rows {
+                let (mailbox, uid, raw) = row?;
+                let Some(text) = indexable_body_text(&raw) else { continue };
+                let mailbox_id = MailboxId(mailbox);
+                let summary = match load_summary_row(&tx, &mailbox_id, Uid(uid))? {
+                    Some(msg) => msg,
+                    None => continue,
+                };
+                index_upsert_message(&tx, &summary, &text)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Replaces the full cached mailbox list for this account (the account's
@@ -198,12 +423,17 @@ impl Cache {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM messages WHERE mailbox_id = ?1", [&mailbox_id.0])?;
+        tx.execute("DELETE FROM search_fts WHERE mailbox_id = ?1", [&mailbox_id.0])?;
         for msg in messages {
             let data = serde_json::to_string(msg)?;
             tx.execute(
                 "INSERT INTO messages (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![mailbox_id.0, msg.uid.0, uidvalidity.0, data],
             )?;
+            // The body column starts as the preview (the only text a fresh
+            // envelope fetch carries); `store_body` upgrades it in place once
+            // the full message is cached.
+            index_message(&tx, msg, msg.preview.as_deref().unwrap_or(""))?;
         }
         tx.commit()?;
         Ok(())
@@ -250,7 +480,8 @@ impl Cache {
     }
 
     /// Stores the raw bytes of a fetched message body for `uid`, replacing
-    /// any earlier body for the same `(mailbox, uid)`.
+    /// any earlier body for the same `(mailbox, uid)`, and upgrades the
+    /// search index's body text from the preview to the full message.
     pub fn store_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, raw: &[u8]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -258,6 +489,20 @@ impl Cache {
             "INSERT OR REPLACE INTO bodies (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0, raw],
         )?;
+        // Re-index the message with its full text, but only if the envelope is
+        // cached (a stray body for a wiped envelope has no subject/sender to
+        // index against). The preview text rides along so previously-indexed
+        // phrasing stays findable.
+        if let Some(summary) = load_summary_row(&tx, mailbox_id, uid)? {
+            let mut body = indexable_body_text(raw).unwrap_or_default();
+            if let Some(preview) = &summary.preview {
+                if !body.is_empty() {
+                    body.push(' ');
+                }
+                body.push_str(preview);
+            }
+            index_upsert_message(&tx, &summary, &body)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -361,6 +606,57 @@ impl Cache {
         Ok(out)
     }
 
+    /// Full-text search over this account's cached envelopes and bodies.
+    /// Runs entirely against the local index (no IMAP round trip), returning
+    /// at most `limit` matches, most-relevant first, with snoozed messages
+    /// excluded to match what the message list shows.
+    ///
+    /// Coverage is bounded by what's been synced: a folder's envelope fields
+    /// (subject/sender/recipients) plus the preview are indexed the moment it
+    /// syncs, and the body text joins in once a full body is fetched or
+    /// prefetched. Mail that has never been synced (an unopened folder) and
+    /// body text for never-fetched messages need the IMAP `SEARCH` fallback -
+    /// see `AccountCommand::SearchMailbox`.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<EmailSummary>> {
+        let Some(match_query) = sanitize_fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT mailbox_id, uid FROM search_fts WHERE search_fts MATCH ?1 ORDER BY rank LIMIT ?2")?;
+        let rows = stmt.query_map(rusqlite::params![match_query, limit as i64], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let (mailbox, uid) = row?;
+            hits.push((MailboxId(mailbox), Uid(uid)));
+        }
+        drop(stmt);
+
+        // Snoozed messages stay hidden from the list, so they don't surface in
+        // search either. Read the active set once rather than per hit.
+        let now = Utc::now().timestamp();
+        let mut snoozed: HashSet<(String, u32)> = HashSet::new();
+        {
+            let mut stmt = conn.prepare("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
+            let rows = stmt.query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
+            for row in rows {
+                snoozed.insert(row?);
+            }
+        }
+
+        let mut out = Vec::new();
+        for (mailbox, uid) in hits {
+            if snoozed.contains(&(mailbox.0.clone(), uid.0)) {
+                continue;
+            }
+            // A hit whose envelope row is gone (the migration wiped the
+            // messages table once, on the version bump) is skipped, not fatal.
+            if let Some(msg) = load_summary_row(&conn, &mailbox, uid)? {
+                out.push(msg);
+            }
+        }
+        Ok(out)
+    }
+
     /// Applies a flag change to one cached summary, mirroring the `STORE`
     /// the session just issued against the server. Returns `false` if the
     /// message isn't in the cached window (nothing to update).
@@ -438,6 +734,7 @@ impl Cache {
         tx.execute("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
         tx.execute("DELETE FROM bodies WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
         tx.execute("DELETE FROM snoozed WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
+        tx.execute("DELETE FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
         tx.commit()?;
         Ok(())
     }
@@ -814,6 +1111,214 @@ mod tests {
         assert_eq!(cache.load_body(&mailbox_id, Uid(7), UidValidity(3)).unwrap(), Some(b"updated".to_vec()));
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Builds a message with a subject, a From address and a preview, so the
+    /// search tests have something to index beyond the bare `sample_summary`.
+    fn searchable_summary(mailbox_id: &MailboxId, uid: u32, subject: &str, from: &str, preview: Option<&str>) -> EmailSummary {
+        let mut msg = sample_summary(mailbox_id, uid, preview);
+        msg.subject = Some(subject.to_string());
+        msg.from = vec![lookout_core::EmailAddress::new(from)];
+        msg
+    }
+
+    #[test]
+    fn sanitize_fts_query_ands_bare_words_and_keeps_phrases() {
+        assert_eq!(sanitize_fts_query("hello world").as_deref(), Some("\"hello\" AND \"world\""));
+        assert_eq!(sanitize_fts_query("\"multi word\"").as_deref(), Some("\"multi word\""));
+        assert_eq!(sanitize_fts_query("foo \"bar baz\" qux").as_deref(), Some("\"foo\" AND \"bar baz\" AND \"qux\""));
+        // FTS operators become literal terms, not syntax.
+        assert_eq!(sanitize_fts_query("AND NOT NEAR").as_deref(), Some("\"AND\" AND \"NOT\" AND \"NEAR\""));
+        // An unterminated quote degrades to bare words rather than erroring.
+        assert_eq!(sanitize_fts_query("foo \"bar").as_deref(), Some("\"foo\" AND \"bar\""));
+        // Nothing to search for yields no query at all.
+        assert_eq!(sanitize_fts_query(""), None);
+        assert_eq!(sanitize_fts_query("   "), None);
+        assert_eq!(sanitize_fts_query("\"\""), None);
+    }
+
+    /// The FTS index's core contract: subject, sender, and body-preview terms
+    /// all find a message, ANDed terms narrow it, and a query that matches
+    /// nothing is an empty result, not an error.
+    #[test]
+    fn search_matches_subject_sender_preview_and_requires_all_terms() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[
+                    searchable_summary(&mailbox_id, 1, "Quarterly report", "ada@example.com", Some("The numbers are attached")),
+                    searchable_summary(&mailbox_id, 2, "Lunch plans", "bob@elsewhere.org", Some("Pizza at noon")),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(cache.search("quarterly", 10).unwrap().len(), 1);
+        assert_eq!(cache.search("ADA@example.com", 10).unwrap().len(), 1);
+        assert_eq!(cache.search("pizza", 10).unwrap().len(), 1);
+        // An address tokenizes into `ada example com`; any of them match.
+        assert_eq!(cache.search("elsewhere", 10).unwrap().len(), 1);
+
+        // AND semantics: both terms must be present in the same message.
+        assert_eq!(cache.search("quarterly report", 10).unwrap().len(), 1);
+        assert_eq!(cache.search("quarterly pizza", 10).unwrap().len(), 0);
+
+        // Case-insensitive, per the unicode61 tokenizer.
+        assert_eq!(cache.search("PIZZA NOON", 10).unwrap().len(), 1);
+
+        // No hits is a valid empty answer.
+        assert!(cache.search("no-such-term", 10).unwrap().is_empty());
+        // A whitespace-only query is not even sent to the index.
+        assert!(cache.search("   ", 10).unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `store_body` upgrades a message's indexed body text from the preview to
+    /// the full cached message, so a term that only appears in the body becomes
+    /// searchable once the message has been fetched.
+    #[test]
+    fn store_body_makes_full_body_text_searchable() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let msg = searchable_summary(&mailbox_id, 1, "Quarterly report", "ada@example.com", Some("The numbers"));
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[msg]).unwrap();
+
+        // Only the preview is indexed before the body arrives.
+        assert_eq!(cache.search("numbers", 10).unwrap().len(), 1);
+        assert_eq!(cache.search("confidential", 10).unwrap().len(), 0);
+
+        let raw = b"From: ada@example.com\r\nTo: bob@example.com\r\nSubject: Quarterly report\r\n\r\nThis document is confidential.".to_vec();
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &raw).unwrap();
+
+        assert_eq!(cache.search("confidential", 10).unwrap().len(), 1);
+        // The preview term still matches after the body replaces it.
+        assert_eq!(cache.search("numbers", 10).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Snoozed messages are excluded from results (they're hidden from the
+    /// list too), and a `replace_messages` rebuild drops the old mailbox's
+    /// index rows rather than accumulating stale hits.
+    #[test]
+    fn search_excludes_snoozed_and_rebuilds_with_the_mailbox() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[
+                    searchable_summary(&mailbox_id, 1, "Snoozed subject", "ada@example.com", None),
+                    searchable_summary(&mailbox_id, 2, "Visible subject", "bob@elsewhere.org", None),
+                ],
+            )
+            .unwrap();
+
+        cache.snooze_message(&mailbox_id, Uid(1), Utc::now() + chrono::Duration::hours(1)).unwrap();
+        let hits = cache.search("subject", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].uid, Uid(2));
+
+        // Replacing the mailbox's messages wipes its index rows: the snoozed
+        // message no longer matches at all, and the mailbox's old hits are gone.
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[searchable_summary(&mailbox_id, 2, "Visible subject", "bob@elsewhere.org", None)],
+            )
+            .unwrap();
+        assert_eq!(cache.search("snoozed", 10).unwrap().len(), 0);
+        assert_eq!(cache.search("subject", 10).unwrap().len(), 1);
+
+        // Deleting a message drops it from the index.
+        cache.delete_message(&mailbox_id, Uid(2)).unwrap();
+        assert!(cache.search("subject", 10).unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A cache written before the search index existed becomes searchable on
+    /// open: the backfill reads the stored envelopes (and bodies) into an
+    /// initially-empty `search_fts`, and a re-open with a populated index is a
+    /// no-op (no duplicate rows).
+    #[test]
+    fn backfill_makes_a_pre_search_cache_searchable() {
+        let account_id = temp_account_id();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        // Create a database with envelopes + a body but no search index at all,
+        // exactly what a pre-search build left on disk.
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "
+                PRAGMA user_version = 1;
+                CREATE TABLE messages (
+                    mailbox_id TEXT NOT NULL,
+                    uid INTEGER NOT NULL,
+                    uidvalidity INTEGER NOT NULL,
+                    data TEXT NOT NULL,
+                    PRIMARY KEY (mailbox_id, uid)
+                );
+                CREATE TABLE bodies (
+                    mailbox_id TEXT NOT NULL,
+                    uid INTEGER NOT NULL,
+                    uidvalidity INTEGER NOT NULL,
+                    data BLOB NOT NULL,
+                    PRIMARY KEY (mailbox_id, uid)
+                );
+                CREATE TABLE snoozed (
+                    mailbox_id TEXT NOT NULL,
+                    uid INTEGER NOT NULL,
+                    snoozed_until INTEGER NOT NULL,
+                    PRIMARY KEY (mailbox_id, uid)
+                );
+                ",
+            )
+            .unwrap();
+            let msg = searchable_summary(&mailbox_id, 1, "Ancient subject", "ada@example.com", Some("Old preview"));
+            conn.execute(
+                "INSERT INTO messages (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![mailbox_id.0, 1u32, 1u32, serde_json::to_string(&msg).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO bodies (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![mailbox_id.0, 1u32, 1u32, b"From: ada@example.com\r\n\r\nburied body term".as_slice()],
+            )
+            .unwrap();
+        }
+
+        let cache = Cache::open(&account_id).unwrap();
+        // The backfill is a separate step from `open` (run on the session's
+        // worker thread, not the UI thread's read-side open - see `open`'s
+        // note): search finds nothing until it runs.
+        assert!(cache.search("ancient", 10).unwrap().is_empty(), "an un-backfilled index has no rows");
+        cache.backfill_search_index().unwrap();
+        assert_eq!(cache.search("ancient", 10).unwrap().len(), 1, "backfilled envelope subject");
+        assert_eq!(cache.search("buried", 10).unwrap().len(), 1, "backfilled full body text");
+
+        // Re-running the backfill is a cheap no-op (the index is populated):
+        // nothing doubles up.
+        cache.backfill_search_index().unwrap();
+        assert_eq!(cache.search("ancient", 10).unwrap().len(), 1);
+
         let _ = std::fs::remove_file(path);
     }
 }

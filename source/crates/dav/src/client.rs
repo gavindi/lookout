@@ -22,7 +22,11 @@ pub struct AddressBookInfo {
 
 impl AddressBookInfo {
     fn new(account_id: &AccountId, href: &str, display_name: String) -> Self {
-        Self { account_id: account_id.clone(), display_name, href: href.to_string() }
+        Self {
+            account_id: account_id.clone(),
+            display_name,
+            href: href.to_string(),
+        }
     }
 }
 

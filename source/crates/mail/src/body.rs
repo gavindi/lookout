@@ -90,6 +90,12 @@ fn strip_html(html: &str) -> String {
     out
 }
 
+/// `strip_html`, exposed for the search index's whole-body indexing (a full
+/// HTML message needs its text made searchable the same way a preview is).
+pub fn strip_html_for_index(html: &str) -> String {
+    strip_html(html)
+}
+
 /// Collapses a body's leading text into a single display line.
 fn normalize_preview(text: &str) -> String {
     // Zero-width characters first: bulk senders pad the top of a message

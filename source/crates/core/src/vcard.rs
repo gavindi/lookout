@@ -247,32 +247,29 @@ impl VCard {
     /// Returns every email address exposed by this vCard, using the contact's
     /// full name or structured name as the display label when available.
     pub fn email_addresses(&self) -> Vec<EmailAddress> {
-        let display_name = self
-            .full_name
-            .clone()
-            .or_else(|| {
-                self.name.as_ref().and_then(|name| {
-                    let mut parts = Vec::new();
-                    if !name.prefix.trim().is_empty() {
-                        parts.push(name.prefix.clone());
-                    }
-                    if !name.given.trim().is_empty() {
-                        parts.push(name.given.clone());
-                    }
-                    if !name.family.trim().is_empty() {
-                        parts.push(name.family.clone());
-                    }
-                    if !name.suffix.trim().is_empty() {
-                        parts.push(name.suffix.clone());
-                    }
-                    let combined = parts.join(" ");
-                    if combined.trim().is_empty() {
-                        None
-                    } else {
-                        Some(combined)
-                    }
-                })
-            });
+        let display_name = self.full_name.clone().or_else(|| {
+            self.name.as_ref().and_then(|name| {
+                let mut parts = Vec::new();
+                if !name.prefix.trim().is_empty() {
+                    parts.push(name.prefix.clone());
+                }
+                if !name.given.trim().is_empty() {
+                    parts.push(name.given.clone());
+                }
+                if !name.family.trim().is_empty() {
+                    parts.push(name.family.clone());
+                }
+                if !name.suffix.trim().is_empty() {
+                    parts.push(name.suffix.clone());
+                }
+                let combined = parts.join(" ");
+                if combined.trim().is_empty() {
+                    None
+                } else {
+                    Some(combined)
+                }
+            })
+        });
 
         self.emails
             .iter()
@@ -320,7 +317,10 @@ fn parse_params(raw: &str) -> Vec<Parameter> {
             let values = split_param_values(value);
             params.push(Parameter { name: name.to_string(), values });
         } else {
-            params.push(Parameter { name: part.to_string(), values: vec![] });
+            params.push(Parameter {
+                name: part.to_string(),
+                values: vec![],
+            });
         }
     }
     params
@@ -333,11 +333,7 @@ fn split_param_values(value: &str) -> Vec<String> {
     } else {
         value
     };
-    unquoted
-        .split(',')
-        .map(|s| unescape_value(s.trim()))
-        .filter(|s| !s.is_empty())
-        .collect()
+    unquoted.split(',').map(|s| unescape_value(s.trim())).filter(|s| !s.is_empty()).collect()
 }
 
 fn parse_name(value: &str) -> Name {
@@ -352,11 +348,17 @@ fn parse_name(value: &str) -> Name {
 }
 
 fn parse_email_field(params: &[Parameter], value: &str) -> EmailField {
-    EmailField { types: param_values(params, "TYPE"), address: value.to_string() }
+    EmailField {
+        types: param_values(params, "TYPE"),
+        address: value.to_string(),
+    }
 }
 
 fn parse_telephone_field(params: &[Parameter], value: &str) -> TelephoneField {
-    TelephoneField { types: param_values(params, "TYPE"), number: value.to_string() }
+    TelephoneField {
+        types: param_values(params, "TYPE"),
+        number: value.to_string(),
+    }
 }
 
 fn parse_address_field(params: &[Parameter], value: &str) -> Result<AddressField, VCardError> {
@@ -388,11 +390,7 @@ fn param_values(params: &[Parameter], key: &str) -> Vec<String> {
 }
 
 fn escape_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace(';', "\\;")
-        .replace(',', "\\,")
+    value.replace('\\', "\\\\").replace('\n', "\\n").replace(';', "\\;").replace(',', "\\,")
 }
 
 fn unescape_value(value: &str) -> String {
@@ -488,8 +486,14 @@ mod tests {
             }),
             organization: Some(vec!["Example Corp".to_string()]),
             title: Some("Engineer".to_string()),
-            emails: vec![EmailField { types: vec!["work".to_string()], address: "ada@example.com".to_string() }],
-            telephones: vec![TelephoneField { types: vec!["home".to_string()], number: "+11234567890".to_string() }],
+            emails: vec![EmailField {
+                types: vec!["work".to_string()],
+                address: "ada@example.com".to_string(),
+            }],
+            telephones: vec![TelephoneField {
+                types: vec!["home".to_string()],
+                number: "+11234567890".to_string(),
+            }],
             addresses: vec![AddressField {
                 types: vec!["home".to_string()],
                 po_box: String::new(),
@@ -545,7 +549,10 @@ mod tests {
             }),
             organization: None,
             title: None,
-            emails: vec![EmailField { types: vec!["work".to_string()], address: "ada@example.com".to_string() }],
+            emails: vec![EmailField {
+                types: vec!["work".to_string()],
+                address: "ada@example.com".to_string(),
+            }],
             telephones: Vec::new(),
             addresses: Vec::new(),
             urls: Vec::new(),
@@ -555,6 +562,12 @@ mod tests {
             other: Vec::new(),
         };
         let addresses = card.email_addresses();
-        assert_eq!(addresses, vec![EmailAddress { name: Some("Ada Lovelace".to_string()), address: "ada@example.com".to_string() }]);
+        assert_eq!(
+            addresses,
+            vec![EmailAddress {
+                name: Some("Ada Lovelace".to_string()),
+                address: "ada@example.com".to_string()
+            }]
+        );
     }
 }

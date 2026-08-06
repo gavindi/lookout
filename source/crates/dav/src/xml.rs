@@ -570,6 +570,9 @@ mod tests {
         // CardDAV) reject the request outright if it's missing entirely.
         let body = build_sync_collection_body(None, &["D:getetag"]);
         assert!(body.contains("<D:sync-token/>"));
-        assert!(!body.contains("<D:sync-token>\n"), "an empty element should be self-closed, not an open/close pair with nothing between");
+        assert!(
+            !body.contains("<D:sync-token>\n"),
+            "an empty element should be self-closed, not an open/close pair with nothing between"
+        );
     }
 }
