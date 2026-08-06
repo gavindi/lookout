@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <enum id="io.github.gavindi.Lookout.SortKey">
+    <value nick="date" value="0"/>
+    <value nick="sender" value="1"/>
+    <value nick="subject" value="2"/>
+  </enum>
+
+  <schema id="io.github.gavindi.Lookout" path="/io/github/gavindi/Lookout/">
+
+    <!-- Appearance -->
+    <key name="animate-transitions" type="b">
+      <default>true</default>
+      <summary>Animate transitions</summary>
+      <description>Fade between views when switching messages.</description>
+    </key>
+    <key name="window-background-path" type="s">
+      <default>''</default>
+      <summary>Custom window background image</summary>
+      <description>Path to a user-picked image used as the window background; empty means the bundled artwork.</description>
+    </key>
+
+    <!-- View → Layout -->
+    <key name="layout-folder-pane" type="b">
+      <default>true</default>
+      <summary>Show the folder pane</summary>
+    </key>
+    <key name="layout-reading-pane" type="b">
+      <default>true</default>
+      <summary>Show the reading pane</summary>
+    </key>
+    <key name="layout-calendar-overview" type="b">
+      <default>true</default>
+      <summary>Show the calendar overview</summary>
+    </key>
+
+    <!-- Mail list -->
+    <key name="sort-key" enum="io.github.gavindi.Lookout.SortKey">
+      <default>'date'</default>
+      <summary>Message list sort key</summary>
+    </key>
+    <key name="sort-descending" type="b">
+      <default>true</default>
+      <summary>Sort newest first</summary>
+    </key>
+    <key name="mail-favorites" type="as">
+      <default>[]</default>
+      <summary>Favorite mailboxes</summary>
+      <description>MailboxIds of folders pinned to the top of the folder tree.</description>
+    </key>
+
+    <!-- Mail settings -->
+    <key name="mail-load-remote-images" type="b">
+      <default>false</default>
+      <summary>Load images from the web</summary>
+      <description>Allow the reading pane to load image resources from remote servers.</description>
+    </key>
+    <key name="mail-rich-text-default" type="b">
+      <default>true</default>
+      <summary>Start new messages in the formatted editor</summary>
+    </key>
+
+    <!-- Session memory -->
+    <key name="last-view-unified" type="b">
+      <default>false</default>
+      <summary>Folder pane was on the unified view</summary>
+    </key>
+    <key name="last-view-mailbox" type="s">
+      <default>''</default>
+      <summary>Last-open mailbox</summary>
+      <description>The MailboxId of the folder the pane reopened on; empty means none.</description>
+    </key>
+
+  </schema>
+</schemalist>

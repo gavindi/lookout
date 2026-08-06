@@ -26,6 +26,7 @@ base64.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 uuid.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }

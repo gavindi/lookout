@@ -254,7 +254,16 @@ struct UiState {
     /// `(account, contact_identity)`. Local-only: never written back to the
     /// vCard or synced to the server, so it resets if the identity a contact
     /// resolves to (its `UID`, falling back to its first email) changes.
+    /// Persisted in the UI-state database (`ui_state_db`), loaded at startup
+    /// and written through on every star toggle.
     starred_contacts: HashSet<(AccountId, String)>,
+    /// The UI-state database backing `starred_contacts`, opened best-effort
+    /// at startup. `None` when the database couldn't be opened - favourites
+    /// then fall back to session-only, never an error.
+    ui_db: Option<Rc<crate::ui_state_db::UiStateDb>>,
+    /// The GSettings-backed preference store (see `settings`), resolved once
+    /// in `build_window` and written through on every preference change.
+    settings: Rc<crate::settings::SettingsStore>,
     /// Contacts that were present in a previous CardDAV sync for an account
     /// but are missing from the latest one, accumulated client-side since
     /// CardDAV sync-collection deletion tracking isn't implemented - see
@@ -344,17 +353,18 @@ struct UiState {
     /// the sort controls existed.
     sort_descending: bool,
     /// Mailboxes the user has starred in the message-list header, rendered as
-    /// a "Favorites" section pinned to the top of the folder tree. Session-only
-    /// until GSettings lands, matching the View tab's layout toggles.
+    /// a "Favorites" section pinned to the top of the folder tree. Persisted
+    /// via the `mail-favorites` GSettings key, loaded at startup and written
+    /// through on every star toggle (see `settings`).
     favorites: HashSet<MailboxId>,
     /// Config → Mail → "Load images from the web": whether the reading pane's
     /// WebView may load remote `image/*` subresources. Consulted by the
-    /// load-policy handler on every resource decision. Session-only until
-    /// GSettings lands, matching the other Phase 5 preferences.
+    /// load-policy handler on every resource decision. Persisted via the
+    /// `mail-load-remote-images` GSettings key.
     load_remote_images: bool,
     /// Config → Mail → "Rich text": the default body mode for new compose
-    /// sessions, read when the composer opens. Session-only until GSettings
-    /// lands, matching the other Phase 5 preferences.
+    /// sessions, read when the composer opens. Persisted via the
+    /// `mail-rich-text-default` GSettings key.
     rich_text_default: bool,
     /// Relay to the currently-open composer for its draft-autosave
     /// confirmations: the account event loops forward `DraftSaved`
@@ -660,6 +670,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     });
     app.add_action(&about_action);
 
+    // Phase 5: the process-wide preference store, resolved once up front
+    // (GSettings-backed when the schema is available, session-only memory
+    // otherwise) and handed everywhere preferences are read or written -
+    // including `background_image`/`last_view`, which need it before
+    // `UiState` exists. One-time imports of the pre-GSettings plain files
+    // run before the first reads below.
+    let settings = Rc::new(crate::settings::resolve());
+    crate::last_view::migrate_legacy(&settings);
+    crate::background_image::migrate_legacy(&settings);
+
     let bg_bytes = include_bytes!("../../../Assets/backgrounds/background2.png");
     let default_bg_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bg_bytes)).expect("bundled background image should decode");
     let background = gtk::Picture::for_paintable(&default_bg_texture);
@@ -670,7 +690,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // A custom background chosen under Config → Appearance → "Window
     // background" wins over the bundled artwork when it's still around and
     // still decodes; the Config view rows are told about it further down.
-    let custom_background_name = crate::background_image::load().and_then(|path| match gtk::gdk::Texture::from_filename(&path) {
+    let custom_background_name = crate::background_image::load(&settings).and_then(|path| match gtk::gdk::Texture::from_filename(&path) {
         Ok(texture) => {
             background.set_paintable(Some(&texture));
             path.file_name().map(|name| name.to_string_lossy().into_owned())
@@ -799,11 +819,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Message list ---
     let message_list = MessageListModel::build();
-    let last_selection = last_view::load();
+    let last_selection = last_view::load(&settings);
+    // Phase 5: the scalars that used to be hardcoded here now come from the
+    // GSettings-backed store (see `settings`), so the session starts where
+    // the last one ended. The store falls back to its schema defaults when
+    // no schema is available, which is exactly these old values.
+    let ui_db = crate::ui_state_db::UiStateDb::open()
+        .map(Rc::new)
+        .inspect_err(|e| tracing::warn!("starred contacts won't persist: {e}"))
+        .ok();
+    let starred_contacts: HashSet<(AccountId, String)> = ui_db
+        .as_ref()
+        .and_then(|db| db.load_starred().ok())
+        .into_iter()
+        .flat_map(|by_account| {
+            by_account
+                .into_iter()
+                .flat_map(|(account, identities)| identities.into_iter().map(move |identity| (account.clone(), identity)))
+        })
+        .collect();
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
         contacts_by_account: HashMap::new(),
-        starred_contacts: HashSet::new(),
+        starred_contacts,
+        ui_db,
+        settings: settings.clone(),
         deleted_contacts: HashMap::new(),
         current_account: None,
         current_mailbox: None,
@@ -818,11 +858,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         restore_pending: last_selection.is_some(),
         rendered_message: None,
         syncing: HashSet::new(),
-        sort_key: SortKey::Date,
-        sort_descending: true,
-        favorites: HashSet::new(),
-        load_remote_images: false,
-        rich_text_default: true,
+        sort_key: SortKey::from_action_state(&settings.get_string(crate::settings::SORT_KEY)).unwrap_or(SortKey::Date),
+        sort_descending: settings.get_bool(crate::settings::SORT_DESCENDING),
+        favorites: settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId).collect(),
+        load_remote_images: settings.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES),
+        rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
         draft_saved_tx: None,
         folder_tree: None,
         suppress_folder_selection: false,
@@ -1437,7 +1477,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     sort_key_menu.append(Some("By Sender"), Some("win.sort-key('sender')"));
     sort_key_menu.append(Some("By Subject"), Some("win.sort-key('subject')"));
     let sort_key_button = gtk::MenuButton::builder()
-        .label(SortKey::Date.label())
+        .label(state.borrow().sort_key.label())
         .css_classes(["flat"])
         .valign(gtk::Align::Center)
         .menu_model(&sort_key_menu)
@@ -1603,6 +1643,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // re-fetching, so it costs nothing and keeps the selection (see
     // `MessageListModel::displayed_messages`). ---
     {
+        // Phase 5: put the button back on the persisted direction before the
+        // handler below is wired, so startup doesn't write anything through.
+        let descending = state.borrow().sort_descending;
+        sort_direction_button.set_active(descending);
+        sort_direction_button.set_icon_name(sort_direction_icon(descending));
+        sort_direction_button.set_tooltip_text(Some(if descending { "Newest first" } else { "Oldest first" }));
+    }
+    {
         let state = state.clone();
         let message_list = message_list.clone();
         sort_direction_button.connect_toggled(move |button| {
@@ -1610,6 +1658,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             button.set_icon_name(sort_direction_icon(descending));
             button.set_tooltip_text(Some(if descending { "Newest first" } else { "Oldest first" }));
             state.borrow_mut().sort_descending = descending;
+            state.borrow().settings.set_bool(crate::settings::SORT_DESCENDING, descending);
             resort_message_list(&state, &message_list);
         });
     }
@@ -1618,7 +1667,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // action is added to the window once it exists (see `sort_key_action`
     // below); menu actions resolve through the widget hierarchy at activation
     // time, so registering it after the menu is built is fine. ---
-    let sort_key_action = gio::SimpleAction::new_stateful("sort-key", Some(glib::VariantTy::STRING), &SortKey::Date.action_state().to_variant());
+    let sort_key_action = gio::SimpleAction::new_stateful("sort-key", Some(glib::VariantTy::STRING), &state.borrow().sort_key.action_state().to_variant());
     {
         let state = state.clone();
         let message_list = message_list.clone();
@@ -1630,6 +1679,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             action.set_state(&key.action_state().to_variant());
             sort_key_button.set_label(key.label());
             state.borrow_mut().sort_key = key;
+            state.borrow().settings.set_string(crate::settings::SORT_KEY, key.action_state());
             resort_message_list(&state, &message_list);
         });
     }
@@ -1671,6 +1721,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.favorites.remove(&mailbox);
                 }
             }
+            // Phase 5: write the whole favorites set through, so the tree's
+            // Favorites section survives restarts.
+            let favorites: Vec<String> = state.borrow().favorites.iter().map(|m| m.0.clone()).collect();
+            state.borrow().settings.set_strv(crate::settings::MAIL_FAVORITES, favorites);
             apply_favorite_visual(button, button.is_active());
             // The tree grows/loses a whole section, so it has to be rebuilt -
             // which swaps the model and drops the highlight. Put it back on the
@@ -2192,8 +2246,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- View tab's ribbon content (Mail module): a "Layout" group of
     // pane-visibility toggles - Folder pane / Reading pane / Calendar
     // overview. All three default on; their click handlers live in a later
-    // block (after every pane widget exists) and are session-only toggles
-    // until Phase 5's GSettings landing.
+    // block (after every pane widget exists), write through to GSettings
+    // (see `settings`), and are re-applied from there at startup.
     let layout_label = gtk::Label::builder().label("Layout").css_classes(["ribbon-group-label", "dim-label"]).build();
     let folder_pane_toggle = gtk::ToggleButton::builder().icon_name("folder-symbolic").build();
     folder_pane_toggle.set_tooltip_text(Some("Folder pane"));
@@ -2317,21 +2371,37 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     {
         let folder_card = folder_card.clone();
+        let state = state.clone();
         folder_pane_toggle.connect_toggled(move |btn| {
+            state.borrow().settings.set_bool(crate::settings::LAYOUT_FOLDER_PANE, btn.is_active());
             folder_card.set_visible(btn.is_active());
         });
     }
     {
         let reading_card = reading_card.clone();
+        let state = state.clone();
         reading_pane_toggle.connect_toggled(move |btn| {
+            state.borrow().settings.set_bool(crate::settings::LAYOUT_READING_PANE, btn.is_active());
             reading_card.set_visible(btn.is_active());
         });
     }
     {
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let state = state.clone();
         overview_pane_toggle.connect_toggled(move |btn| {
+            state.borrow().settings.set_bool(crate::settings::LAYOUT_CALENDAR_OVERVIEW, btn.is_active());
             mail_calendar_overview_card.set_visible(btn.is_active());
         });
+    }
+    // Phase 5: apply the persisted Layout toggles now that their handlers are
+    // wired (each `set_active` fires `toggled`, which sets the card's
+    // visibility), so the pane layout comes back as the user left it. The
+    // handlers' write-through makes these calls no-ops on restart.
+    {
+        let persisted = state.borrow().settings.clone();
+        folder_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_FOLDER_PANE));
+        reading_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_READING_PANE));
+        overview_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_CALENDAR_OVERVIEW));
     }
 
     // Which sub-page each view should show when its nav-rail button becomes
@@ -2577,7 +2647,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `render_body` skip its fade-specific dance (see below).
     {
         let reading_stack = reading_stack.clone();
+        let state = state.clone();
         config_view.animations_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::ANIMATE_TRANSITIONS, row.is_active());
             let transition = if row.is_active() {
                 gtk::StackTransitionType::Crossfade
             } else {
@@ -2599,6 +2671,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list = message_list.clone();
         config_view.remote_images_row.connect_active_notify(move |row| {
             state.borrow_mut().load_remote_images = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES, row.is_active());
             if reading_stack.visible_child_name().as_deref() == Some("compose") {
                 return;
             }
@@ -2624,7 +2697,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         config_view.rich_text_row.connect_active_notify(move |row| {
             state.borrow_mut().rich_text_default = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT, row.is_active());
         });
+    }
+    // Phase 5: apply the persisted Config → Appearance/Mail switch states now
+    // that their handlers are wired. Each `set_active` fires the notify
+    // handler above, which re-derives UiState and any widget effect from the
+    // new value, so startup can't drift from what was saved.
+    {
+        let persisted = state.borrow().settings.clone();
+        config_view.animations_row.set_active(persisted.get_bool(crate::settings::ANIMATE_TRANSITIONS));
+        config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
+        config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
     }
 
     {
@@ -2648,12 +2732,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let background = background.clone();
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
+        let settings = settings.clone();
         background_image_row.connect_activated(move |row| {
             let row = row.clone();
             let window = window.clone();
             let background = background.clone();
             let toast_overlay = toast_overlay.clone();
             let restore_background_row = restore_background_row.clone();
+            let settings = settings.clone();
             glib::spawn_future_local(async move {
                 let filter = gtk::FileFilter::new();
                 filter.add_pixbuf_formats();
@@ -2667,7 +2753,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 match gtk::gdk::Texture::from_filename(&path) {
                     Ok(texture) => {
                         background.set_paintable(Some(&texture));
-                        crate::background_image::save(&path);
+                        crate::background_image::save(&settings, &path);
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
                         row.set_subtitle(&name);
                         restore_background_row.set_sensitive(true);
@@ -2683,8 +2769,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let restore_background_row = config_view.restore_background_row.clone();
         let background_image_row = config_view.background_image_row.clone();
         let background = background.clone();
+        let settings = settings.clone();
         restore_background_row.connect_activated(move |row| {
-            crate::background_image::clear();
+            crate::background_image::clear(&settings);
             background.set_paintable(Some(&default_bg_texture));
             background_image_row.set_subtitle("Default Lookout artwork");
             row.set_sensitive(false);
@@ -3584,10 +3671,9 @@ fn merge_contact_suggestions(mail_history: Vec<EmailAddress>, carddav: &[EmailAd
     dedupe_addresses(merged, limit)
 }
 
-/// A stable-ish key for a contact, used for session-only state
-/// (`starred_contacts`, deletion diffing) that has nowhere else to hang off
-/// of: the vCard's `UID`, or its first email address if the server didn't
-/// send one.
+/// A stable-ish key for a contact, used for UI state (`starred_contacts`,
+/// deletion diffing) that has nowhere else to hang off of: the vCard's
+/// `UID`, or its first email address if the server didn't send one.
 fn contact_identity(card: &VCard) -> String {
     card.uid.clone().unwrap_or_else(|| vcard_primary_email(card))
 }
@@ -3693,10 +3779,10 @@ fn refresh_contacts_category_ui(
             row_widgets.push((append_contacts_header_row(category_list, &account.display_name), None));
 
             // Favourites keeps the full, unfiltered contact list - which
-            // contacts belong depends on session-only `starred_contacts`
-            // state that can change without a resync, so the filter is
-            // applied live in `rebuild_contacts_list_ui` instead of baked in
-            // here.
+            // contacts belong depends on `starred_contacts` (persisted in
+            // `ui_state_db`) state that can change without a resync, so the
+            // filter is applied live in `rebuild_contacts_list_ui` instead
+            // of baked in here.
             for kind in [ContactsBucketKind::AllContacts, ContactsBucketKind::Favourites] {
                 rows.push(ContactsCategoryChoice {
                     kind: kind.clone(),
@@ -3862,6 +3948,12 @@ fn rebuild_contacts_list_ui(
                     state.borrow_mut().starred_contacts.insert(key);
                 } else {
                     state.borrow_mut().starred_contacts.remove(&key);
+                }
+                // Phase 5: persist the star in the UI-state database so
+                // favourites survive restarts; a failing database is already
+                // logged at open time and only costs persistence.
+                if let Some(db) = state.borrow().ui_db.clone() {
+                    let _ = db.set_starred(&account_id, &identity, btn.is_active());
                 }
                 rebuild_contacts_list_ui(&contact_list, &categories, &contacts, selected_category_index, &state);
             });
@@ -5278,10 +5370,13 @@ fn select_mailbox(state: &Rc<RefCell<UiState>>, account_id: AccountId, mailbox_i
         st.current_account = Some(account_id.clone());
         st.current_mailbox = Some(mailbox_id.clone());
         st.restore_pending = false;
-        last_view::save(&LastSelection {
-            unified: false,
-            mailbox: Some(mailbox_id.0.clone()),
-        });
+        last_view::save(
+            &st.settings,
+            &LastSelection {
+                unified: false,
+                mailbox: Some(mailbox_id.0.clone()),
+            },
+        );
     }
     request_mailbox_sync(state, &account_id, &mailbox_id);
 }
@@ -5502,7 +5597,7 @@ fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_list: &MessageListM
         st.current_account = None;
         st.current_mailbox = None;
         st.restore_pending = false;
-        last_view::save(&LastSelection { unified: true, mailbox: None });
+        last_view::save(&st.settings, &LastSelection { unified: true, mailbox: None });
     }
     for (account_id, inbox_id) in inboxes {
         request_mailbox_sync(state, &account_id, &inbox_id);
@@ -6275,6 +6370,8 @@ mod tests {
             )]),
             contacts_by_account: HashMap::new(),
             starred_contacts: HashSet::new(),
+            ui_db: None,
+            settings: Rc::new(crate::settings::resolve()),
             deleted_contacts: HashMap::new(),
             current_account: None,
             current_mailbox: None,

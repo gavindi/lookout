@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.48" date="2026-08-06">
+      <description>
+        <p>Your preferences now stick around between sessions - pane layout, sort order, favorites, and the Mail and Appearance settings are remembered. Starred contacts are saved too.</p>
+      </description>
+    </release>
     <release version="0.6.46" date="2026-08-06">
       <description>
         <p>The calendar is now editable - a new Event button and clicking any event open an editor to create, change, or delete events, written back to your CalDAV account. Recurring events can be edited as a whole series.</p>

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.48 (2026-08-06)
+
+### Added
+
+- **Settings**: the app's scalar preferences now survive restarts. A new GSettings schema (`data/gschema/io.github.gavindi.Lookout.gschema.xml`, id matching the application id) holds them, and `settings.rs` resolves it once at startup: found in the system install first (the path a packaged install takes, `/usr/share/glib-2.0/schemas`), then in a bundle a new `build.rs` compiles into `OUT_DIR` with `glib-compile-schemas` and registers at runtime as an extra schema source (the path a `cargo run` dev build takes - a compile failure only logs a warning). A machine with neither degrades to a session-only in-memory store seeded with the schema's defaults, which is exactly the pre-GSettings behaviour, never an error. The store exposes typed get/set over `gio::Settings`; every preference is written through on change and re-applied at startup, so the session opens where the last one left off: the View tab's Layout toggles (Folder pane / Reading pane / Calendar overview), Config → Appearance's "Animate transitions", the message list's sort key and direction, the folder tree's Favorites section, and the Config → Mail switches ("Load images from the web", "Rich text") - all previously session-only.
+- **Settings**: the relational config half has a home and a tested shape. `app_config.rs` defines the serde `AppConfig` (`$XDG_CONFIG_HOME/lookout/settings.json`): `identities` and `folder_role_overrides`, empty until the multi-identity and folder-role-override roadmap features land, with best-effort load/save like the other config files. Tags and calendar colours keep their existing JSON files.
+- **People**: starred contacts now survive restarts. The Favourites state that was session-only (`UiState::starred_contacts`) persists in a new per-machine SQLite database (`$XDG_CACHE_HOME/lookout/ui-state.sqlite`, `ui_state_db.rs`), loaded at startup and written through on every star toggle. It's deliberately a separate database from the per-account mail caches: a contacts-only GOA account never gets a mail `Cache` handle, and Config → Advanced's "Clear all caches" wipes the mail/calendar caches - favourites are a preference, not a cache, so they're untouched. It follows the mail cache's `PRAGMA user_version` format-version convention: a schema bump wipes the table once.
+
+### Changed
+
+- **Settings**: the two preferences that already persisted on best-effort plain files moved into GSettings: the folder pane's last-open view (`last-view-unified`/`last-view-mailbox`, replacing `last-view.json`) and the window-background image path (`window-background-path`, replacing `background-image-path`). Both keep their existing public APIs, so the window code is unchanged. Machines upgrading from a plain-file build get a one-time import - only while the new keys still hold their defaults, so a choice already made under the new build is never clobbered - and the legacy files are then deleted.
+- **Testing**: new unit tests cover the settings store (bool/string/strv round trips and the schema defaults on the session-only path), the UI-state database (round trip, idempotent star/unstar, and the version-bump wipe), both legacy-file migrations (import-once, stale-file-dropped), and the `settings.json` round trip plus broken-file tolerance.
+
 ## 0.6.47 (2026-08-06)
 
 ### Changed
