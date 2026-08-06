@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.54 (2026-08-07)
+
+### Changed
+
+- **Mail**: full-text search moves out of the list into the window header bar. The search field is now a permanent `gtk::SearchEntry` packed at the header bar's start (its 62px start margin lines its left edge up with the menu bar's first item below, since the nav rail shifts the menu bar that far right of the header's own full-width left edge), instead of a `gtk::SearchBar` that had to be revealed by a toolbar button between the list header and the column headers - so the query and its field are always on screen, and the Search button (and the SearchBar's key-capture setup, which existed only to route Esc) are gone. Ctrl+F now focuses the entry directly from anywhere in the window and selects its existing text, so typing replaces the old query instead of appending to it. The list-level wiring is unchanged in spirit - typing debounces 300ms into instant FTS results with the live IMAP pass catching up, Esc or clearing the field exits search and restores the previous view - but a search started from *any* module now also activates the Mail nav button, re-running the module handler so the results land on screen, where the old bar could only be revealed while Mail was already showing. Esc in the entry works through `GtkSearchEntry`'s own `stop-search` signal, which survives without the bar that used to capture it.
+
 ## 0.6.53 (2026-08-07)
 
 ### Added

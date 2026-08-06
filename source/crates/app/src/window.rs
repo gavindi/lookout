@@ -1678,79 +1678,27 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     column_header_row.append(&subject_header);
     column_header_row.append(&date_header);
 
-    // --- Full-text search: a `gtk::SearchBar` between the list's header row
-    // and its column headers, revealed by the toolbar's Search button and by
-    // Ctrl+F. Typing (debounced) swaps the list into search mode - instant
-    // results from the local FTS index, with the open mailbox's live IMAP
-    // pass catching up a beat later. Esc or clearing the text leaves search
-    // mode and restores the previous view. ---
-    let search_bar = gtk::SearchBar::new();
-    let search_entry = gtk::SearchEntry::builder().placeholder_text("Search mail").width_request(360).build();
-    search_bar.set_child(Some(&search_entry));
-    search_bar.set_search_mode(false);
+    // --- Full-text search: a permanent `gtk::SearchEntry` in the window
+    // header bar (see the header section below), wired up after the nav-rail
+    // module buttons exist so a search started from any module lands on Mail.
+    // Typing (debounced) swaps the list into search mode - instant results
+    // from the local FTS index, with the open mailbox's live IMAP pass
+    // catching up a beat later. Esc or clearing the text leaves search mode
+    // and restores the previous view. The entry is built here, next to the
+    // state it searches, and parented to the header later.
+    let search_entry = gtk::SearchEntry::builder()
+        .placeholder_text("Search mail")
+        .width_request(360)
+        .tooltip_text("Search mail (Ctrl+F)")
+        .build();
     // A debounce token bumped on every keystroke and captured by each
     // scheduled timeout, so a timeout whose token is stale knows the user has
     // typed again and its query is superseded (the newer keystroke armed a
     // newer timeout).
     let search_debounce: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-    {
-        let state = state.clone();
-        let message_list = message_list.clone();
-        let list_header = list_header.clone();
-        let search_bar = search_bar.clone();
-        let search_debounce = search_debounce.clone();
-        search_entry.connect_search_changed(move |entry| {
-            let query = entry.text();
-            if query.trim().is_empty() {
-                // Clearing the field (its X, or a programmatic `set_text("")`
-                // from `exit_search`) ends the search right away - no debounce
-                // needed. Bumping the token also invalidates any timeout armed
-                // for a query still being typed.
-                search_debounce.set(search_debounce.get() + 1);
-                exit_search(&state, &message_list, &list_header, &search_bar, entry);
-                return;
-            }
-            let token = search_debounce.get() + 1;
-            search_debounce.set(token);
-            // Clone everything the timeout needs: the outer closure is `Fn`
-            // and fires again on the next keystroke, so the timeout's own
-            // `move` closure can't borrow from it.
-            let state = state.clone();
-            let message_list = message_list.clone();
-            let list_header = list_header.clone();
-            let search_bar = search_bar.clone();
-            let search_debounce = search_debounce.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS as u64), move || {
-                if search_debounce.get() != token {
-                    return;
-                }
-                start_search(&state, &message_list, &list_header, &search_bar, query.as_str());
-            });
-        });
-    }
-    {
-        let state = state.clone();
-        let message_list = message_list.clone();
-        let list_header = list_header.clone();
-        let search_bar = search_bar.clone();
-        let search_debounce = search_debounce.clone();
-        // Esc in the entry (the SearchBar routes it to `stop-search`): leave
-        // search mode entirely rather than just clearing the field.
-        search_entry.connect_stop_search(move |entry| {
-            if search_debounce.get() != 0 {
-                // Bump the debounce token so a timeout armed for the query
-                // being typed is invalidated before we clear the entry - the
-                // `set_text("")` below would otherwise fire `search-changed`
-                // and re-enter a search for the (already-cleared) query.
-                search_debounce.set(search_debounce.get() + 1);
-            }
-            exit_search(&state, &message_list, &list_header, &search_bar, entry);
-        });
-    }
 
     let message_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_box.append(&message_header_row);
-    message_box.append(&search_bar);
     message_box.append(&column_header_row);
     message_box.append(&message_scroller);
     let message_card = card_section(&message_box);
@@ -2251,6 +2199,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `card_section`), so there's exactly one set, not four.
     let window_header = adw::HeaderBar::new();
     window_header.set_title_widget(Some(&adw::WindowTitle::new("Lookout", "")));
+    // The permanent mail-search entry, packed at the header's start. Its
+    // 62px start margin lines its left edge up with the menu bar's first
+    // item (File) below - the nav rail (56px, `width_request` plus its 6px
+    // `margin_start`) shifts the menu bar's start that far right of the
+    // header's own left edge, which spans the full window width.
+    search_entry.set_margin_start(62);
+    window_header.pack_start(&search_entry);
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
 
@@ -2338,20 +2293,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let more_button = gtk::Button::from_icon_name("view-more-symbolic");
     more_button.set_tooltip_text(Some("More"));
     more_button.set_sensitive(false);
-    // Search: a plain button that reveals the list's SearchBar and focuses
-    // the entry (Esc or the entry's X leaves search mode). A plain button
-    // rather than a toggle keeps it a pure opener - its pressed state would
-    // otherwise have to track every way a search can end.
-    let search_tool_button = gtk::Button::from_icon_name(themed_icon_name(&["edit-find-symbolic", "system-search-symbolic", "search-symbolic"]));
-    search_tool_button.set_tooltip_text(Some("Search mail (Ctrl+F)"));
-    {
-        let search_bar = search_bar.clone();
-        let search_entry = search_entry.clone();
-        search_tool_button.connect_clicked(move |_| {
-            search_bar.set_search_mode(true);
-            search_entry.grab_focus();
-        });
-    }
 
     let command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     command_toolbar.append(&compose_button);
@@ -2366,7 +2307,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&categorize_button);
     command_toolbar.append(&snooze_button);
     command_toolbar.append(&more_button);
-    command_toolbar.append(&search_tool_button);
 
     // --- Calendar's own command toolbar row, swapped in for the Mail one
     // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
@@ -2657,6 +2597,68 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // --- Full-text search wiring: the entry lives permanently in the header
+    // bar, and a query started from *any* module switches to Mail (activating
+    // its nav button re-runs the module handler, which re-shows the mail
+    // page and re-enables Home/View) so the results are visible. The entry
+    // itself is built above, next to the state it searches. ---
+    {
+        let state = state.clone();
+        let message_list = message_list.clone();
+        let list_header = list_header.clone();
+        let search_debounce = search_debounce.clone();
+        let mail_view_button = mail_view_button.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let query = entry.text();
+            if query.trim().is_empty() {
+                // Clearing the field (its X, or a programmatic `set_text("")`
+                // from `exit_search`) ends the search right away - no debounce
+                // needed. Bumping the token also invalidates any timeout armed
+                // for a query still being typed.
+                search_debounce.set(search_debounce.get() + 1);
+                exit_search(&state, &message_list, &list_header, entry);
+                return;
+            }
+            let token = search_debounce.get() + 1;
+            search_debounce.set(token);
+            // Clone everything the timeout needs: the outer closure is `Fn`
+            // and fires again on the next keystroke, so the timeout's own
+            // `move` closure can't borrow from it.
+            let state = state.clone();
+            let message_list = message_list.clone();
+            let list_header = list_header.clone();
+            let search_debounce = search_debounce.clone();
+            let mail_view_button = mail_view_button.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS as u64), move || {
+                if search_debounce.get() != token {
+                    return;
+                }
+                start_search(&state, &message_list, &list_header, query.as_str());
+                // Land the results on screen: if the user started typing from
+                // another module, activate Mail (no-op if already active).
+                mail_view_button.set_active(true);
+            });
+        });
+    }
+    {
+        let state = state.clone();
+        let message_list = message_list.clone();
+        let list_header = list_header.clone();
+        let search_debounce = search_debounce.clone();
+        // Esc in the entry: leave search mode entirely rather than just
+        // clearing the field (`GtkSearchEntry` emits `stop-search` on Esc).
+        search_entry.connect_stop_search(move |entry| {
+            if search_debounce.get() != 0 {
+                // Bump the debounce token so a timeout armed for the query
+                // being typed is invalidated before we clear the entry - the
+                // `set_text("")` below would otherwise fire `search-changed`
+                // and re-enter a search for the (already-cleared) query.
+                search_debounce.set(search_debounce.get() + 1);
+            }
+            exit_search(&state, &message_list, &list_header, entry);
+        });
+    }
+
     // The nav rail runs the full height *below the title bar* - it sits
     // beside the menu bar/command toolbar/mail-or-calendar content, but not
     // beside `window_header` itself, which stays the one real title bar
@@ -2857,27 +2859,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // --- Ctrl+F reveals the search bar and focuses its entry, from anywhere
+    // --- Ctrl+F focuses the header's permanent search entry, from anywhere
     // in the window. A `ShortcutController` on the window itself (rather than
     // an accelerator string, which this codebase doesn't use) so the keypress
-    // is caught even while a list row or the reading pane has focus. ---
+    // is caught even while a list row or the reading pane has focus.
+    // Selecting the entry's existing text means typing replaces the old
+    // query. ---
     {
-        let search_bar = search_bar.clone();
         let search_entry = search_entry.clone();
         let controller = gtk::ShortcutController::new();
         let trigger = gtk::KeyvalTrigger::new(gtk::gdk::Key::f, gtk::gdk::ModifierType::CONTROL_MASK);
         let action = gtk::CallbackAction::new(move |_widget, _args| {
-            search_bar.set_search_mode(true);
+            search_entry.select_region(0, -1);
             search_entry.grab_focus();
             glib::Propagation::Proceed
         });
         controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
         window.add_controller(controller);
     }
-    // The SearchBar captures keys (including Esc, for `stop-search`) while
-    // visible; pointing it at the window means a Ctrl+F pressed anywhere is
-    // seen, and Esc in the entry bubbles to the bar's own handler.
-    search_bar.set_key_capture_widget(Some(&window));
 
     let state = state.clone();
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
@@ -3375,7 +3374,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let message_list = message_list.clone();
         let list_header = list_header.clone();
-        let search_bar = search_bar.clone();
         let search_entry = search_entry.clone();
         folder_selection.connect_selected_item_notify(move |sel| {
             // A rebuild putting the highlight back where it was is not the
@@ -3391,7 +3389,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     drop(tree_item);
                     // Clicking a folder is a deliberate navigation away from
                     // search; leave it and let the selection take over.
-                    exit_search(&state, &message_list, &list_header, &search_bar, &search_entry);
+                    exit_search(&state, &message_list, &list_header, &search_entry);
                     enter_unified_inbox(&state, &message_list);
                     refresh_list_header(&state, &list_header);
                 }
@@ -3399,7 +3397,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let mailbox_id = node.mailbox.id.clone();
                     let account_id = node.mailbox.account_id.clone();
                     drop(tree_item);
-                    exit_search(&state, &message_list, &list_header, &search_bar, &search_entry);
+                    exit_search(&state, &message_list, &list_header, &search_entry);
                     select_mailbox(&state, account_id, mailbox_id);
                     refresh_list_header(&state, &list_header);
                 }
@@ -5953,7 +5951,7 @@ fn dispatch_search_fallbacks(state: &Rc<RefCell<UiState>>, query: &str) {
 /// search mode, repopulates instantly from the local FTS index across every
 /// account, and dispatches the live IMAP pass on the open view. An empty query
 /// is `exit_search` by another name (clearing the entry's X ends the search).
-fn start_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, list_header: &ListHeader, search_bar: &gtk::SearchBar, query: &str) {
+fn start_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, list_header: &ListHeader, query: &str) {
     let query = query.trim().to_string();
     debug_assert!(!query.is_empty(), "start_search is only called with a non-empty query; empty text takes the exit path");
     {
@@ -5975,18 +5973,15 @@ fn start_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, l
     dispatch_search_fallbacks(state, &query);
     repopulate_search_results(state, message_list);
     refresh_list_header(state, list_header);
-    search_bar.set_search_mode(true);
 }
 
-/// Leaves full-text search: hides the bar, clears the query entry, and
-/// restores the pre-search view - the open mailbox (`MailView::Single`,
-/// repopulated from its cache with a fresh sync requested) or the unified
-/// "All Inboxes" view (`MailView::UnifiedInbox`, repopulated from the
-/// per-mailbox snapshots). A no-op when no search is active, aside from hiding
-/// the bar so an Esc on an idle (empty) entry still dismisses it.
-fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, list_header: &ListHeader, search_bar: &gtk::SearchBar, search_entry: &gtk::SearchEntry) {
+/// Leaves full-text search: clears the query entry and restores the
+/// pre-search view - the open mailbox (`MailView::Single`, repopulated from
+/// its cache with a fresh sync requested) or the unified "All Inboxes" view
+/// (`MailView::UnifiedInbox`, repopulated from the per-mailbox snapshots). A
+/// no-op when no search is active, aside from clearing an idle (empty) entry.
+fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, list_header: &ListHeader, search_entry: &gtk::SearchEntry) {
     if !state.borrow().search_active {
-        search_bar.set_search_mode(false);
         search_entry.set_text("");
         return;
     }
@@ -6003,7 +5998,6 @@ fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, li
         }
     };
     state.borrow_mut().mail_view = restored_view;
-    search_bar.set_search_mode(false);
     search_entry.set_text("");
     refresh_list_header(state, list_header);
     if restored_view == MailView::UnifiedInbox {
