@@ -570,7 +570,15 @@ fn install_paned_css() {
         }
         .message-header-subject {
             font-weight: bold;
-            font-size: 1.2em;
+            font-size: 1.05em;
+        }
+        .message-subject-bar {
+            background-color: rgba(255, 255, 255, 0.05);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            padding: 10px 12px;
+        }
+        .message-action-bar {
+            padding: 10px 12px;
         }
         .message-header-meta {
             opacity: 0.7;
@@ -1938,15 +1946,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // view without disturbing the outer crossfade.
     let reading_stack = gtk::Stack::new();
     let content_stack = gtk::Stack::new();
+    content_stack.set_widget_name("body");
     content_stack.set_transition_type(gtk::StackTransitionType::None);
     content_stack.add_named(&web_view, Some("html"));
     content_stack.add_named(&text_scroller, Some("text"));
     let message_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    message_page.append(&message_header.subject_bar);
     message_page.append(&message_header.widget);
-    // The attachment strip lives between the header and the body so that
-    // `content_stack` stays the message page's *last* child - `render_body`
-    // locates the body stack via `last_child()`. The strip is a named child so
-    // `render_body` can find it by walk; it's hidden (and emptied) when the
+    // The attachment strip and body content stack are named children -
+    // `find_named_child` locates them by walk rather than relying on sibling
+    // order, so `action_bar` can sit after the body without breaking
+    // `render_body`'s lookup. The strip is hidden (and emptied) when the
     // message has no attachments.
     let attachment_strip = gtk::Box::new(gtk::Orientation::Vertical, 6);
     attachment_strip.set_widget_name("attachments");
@@ -1957,6 +1967,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     attachment_strip.set_visible(false);
     message_page.append(&attachment_strip);
     message_page.append(&content_stack);
+    message_page.append(&message_header.action_bar);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
@@ -3162,12 +3173,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // pre-filled from whatever message is currently selected and has a body
     // loaded. Silent no-op if nothing's selected or the body hasn't arrived
     // yet (same convention as the Delete/Archive/Report/Snooze buttons below).
-    // Wired twice - once for the top command toolbar's buttons, once for the
-    // reading-pane header's own copies - by design, see the plan this
-    // shipped under.
+    // Wired to three copies of each button - the top command toolbar, the
+    // reading-pane header, and the bottom action bar below the message body -
+    // by design, see the plan this shipped under.
     for (button, mode, title) in [
         (&reply_button, crate::compose::ReplyMode::Reply, "Reply"),
         (&message_header.reply_button, crate::compose::ReplyMode::Reply, "Reply"),
+        (&message_header.bottom_reply_button, crate::compose::ReplyMode::Reply, "Reply"),
         (&reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
         (&message_header.reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
     ] {
@@ -3191,7 +3203,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
-    for button in [&forward_button, &message_header.forward_button] {
+    for button in [&forward_button, &message_header.forward_button, &message_header.bottom_forward_button] {
         let message_list = message_list.clone();
         let state = state.clone();
         let reading_stack = reading_stack.clone();
@@ -5320,7 +5332,7 @@ fn apply_favorite_visual(button: &gtk::ToggleButton, starred: bool) {
 /// this codebase hasn't used before - so fall back to one that's already
 /// proven in-tree instead of rendering a "missing image" box. The last
 /// candidate is used unconditionally if none match.
-fn themed_icon_name(candidates: &[&'static str]) -> &'static str {
+pub(crate) fn themed_icon_name(candidates: &[&'static str]) -> &'static str {
     let theme = gtk::gdk::Display::default().map(|display| gtk::IconTheme::for_display(&display));
     if let Some(theme) = theme {
         for name in candidates {
@@ -6372,19 +6384,28 @@ fn reveal_message_page(reading_stack: &gtk::Stack, content_stack: &gtk::Stack, c
     }
 }
 
-/// Locates the reading pane's attachment strip - the named `gtk::Box`
-/// (`"attachments"`) that `build_window` inserted between the message header
-/// and the body `content_stack`.
-fn find_attachment_strip(reading_stack: &gtk::Stack) -> Option<gtk::Box> {
+/// Locates a named child of the reading pane's `"message"` page by walking
+/// its children - used to find widgets by `widget_name()` rather than relying
+/// on their position among siblings, since the page mixes fixed structural
+/// children (attachment strip, body stack) with ones the header/action-bar
+/// widgets add around them.
+fn find_named_child(reading_stack: &gtk::Stack, name: &str) -> Option<gtk::Widget> {
     let page = reading_stack.child_by_name("message").and_downcast::<gtk::Box>()?;
     let mut child = page.first_child();
     while let Some(c) = child {
-        if c.widget_name() == "attachments" {
-            return c.downcast::<gtk::Box>().ok();
+        if c.widget_name() == name {
+            return Some(c);
         }
         child = c.next_sibling();
     }
     None
+}
+
+/// Locates the reading pane's attachment strip - the named `gtk::Box`
+/// (`"attachments"`) that `build_window` inserted between the message header
+/// and the body `content_stack`.
+fn find_attachment_strip(reading_stack: &gtk::Stack) -> Option<gtk::Box> {
+    find_named_child(reading_stack, "attachments")?.downcast::<gtk::Box>().ok()
 }
 
 /// Renders an attachment's size as a human-readable string (e.g. `"12.3 KB"`),
@@ -6833,12 +6854,7 @@ fn render_body(
     // The "message" page groups the header with the body's content stack
     // (web view / text view), so revealing it - vs. the "empty" page - is
     // what crossfades, carrying the whole header + body together.
-    let Some(content_stack) = reading_stack
-        .child_by_name("message")
-        .and_downcast::<gtk::Box>()
-        .and_then(|page| page.last_child())
-        .and_then(|child| child.downcast::<gtk::Stack>().ok())
-    else {
+    let Some(content_stack) = find_named_child(reading_stack, "body").and_then(|child| child.downcast::<gtk::Stack>().ok()) else {
         return;
     };
     if let Some(html) = &body.html_body {
