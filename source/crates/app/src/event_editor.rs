@@ -125,6 +125,7 @@ pub fn show_event_editor(
     // one hour long). A recurring event is prefilled from the series *anchor*
     // (master DTSTART/DTEND), not the clicked occurrence's expansion, so a
     // metadata-only edit can't silently re-anchor the whole series.
+    let existing_all_day = existing.as_ref().map(|occ| occ.all_day).unwrap_or(false);
     let (initial_start, initial_end) = existing
         .as_ref()
         .map(|occ| {
@@ -140,6 +141,9 @@ pub fn show_event_editor(
         })
         .or_else(|| prefill.suggested_start.map(|start| (start, start + chrono::Duration::hours(1))))
         .unwrap_or_else(default_event_times);
+    // The form's all-day end is the *last* day (inclusive, Outlook/Gmail
+    // convention); the model stores the exclusive day after, so show one less.
+    let initial_end = if existing_all_day { initial_end - chrono::Duration::days(1) } else { initial_end };
     set_calendar_date(&start_calendar, &start_date, initial_start.date());
     set_calendar_date(&end_calendar, &end_date, initial_end.date());
     wire_calendar(&start_calendar, &start_date);
@@ -149,17 +153,37 @@ pub fn show_event_editor(
     end_hour.set_value(f64::from(initial_end.hour()));
     end_minute.set_value(f64::from(initial_end.minute()));
 
-    let existing_all_day = existing.as_ref().map(|occ| occ.all_day).unwrap_or(false);
     all_day_switch.set_active(existing_all_day);
     for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
         spin.set_sensitive(!existing_all_day);
     }
     {
-        let time_spins = [start_hour.clone(), start_minute.clone(), end_hour.clone(), end_minute.clone()];
+        let start_date = start_date.clone();
+        let end_date = end_date.clone();
+        let start_hour = start_hour.clone();
+        let start_minute = start_minute.clone();
+        let end_hour = end_hour.clone();
+        let end_minute = end_minute.clone();
+        let end_calendar = end_calendar.clone();
         all_day_switch.connect_active_notify(move |switch| {
             let on = switch.is_active();
-            for spin in &time_spins {
+            for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
                 spin.set_sensitive(!on);
+            }
+            if !on {
+                // Coming off all-day, the times may no longer form a valid
+                // span - a same-day all-day event prefills both ends at 00:00.
+                // Nudge the end forward an hour rather than letting Save fail.
+                let start = start_date.get().and_hms_opt(start_hour.value() as u32, start_minute.value() as u32, 0).unwrap();
+                let end = end_date.get().and_hms_opt(end_hour.value() as u32, end_minute.value() as u32, 0).unwrap();
+                if end <= start {
+                    let bumped = start + chrono::Duration::hours(1);
+                    end_hour.set_value(f64::from(bumped.hour()));
+                    end_minute.set_value(f64::from(bumped.minute()));
+                    if bumped.date() != end_date.get() {
+                        set_calendar_date(&end_calendar, &end_date, bumped.date());
+                    }
+                }
             }
         });
     }
@@ -352,8 +376,9 @@ fn default_event_times() -> (NaiveDateTime, NaiveDateTime) {
 }
 
 /// Combines a tracked calendar date with the hour/minute spin buttons into a
-/// local naive datetime. All-day events are pinned to 00:00 (their model end
-/// is the exclusive next-day boundary, matching `CalendarEvent`).
+/// local naive datetime. All-day events are pinned to 00:00 - the +1-day
+/// exclusive-end shift from the form's inclusive last day happens in
+/// [`collect_event_from_form`].
 fn date_time_from_form(date: &Rc<Cell<NaiveDate>>, hour: &gtk::SpinButton, minute: &gtk::SpinButton, all_day: bool) -> NaiveDateTime {
     let (h, m) = if all_day { (0, 0) } else { (hour.value() as u32, minute.value() as u32) };
     date.get().and_hms_opt(h, m, 0).unwrap_or(date.get().and_hms_opt(0, 0, 0).unwrap())
@@ -381,7 +406,11 @@ fn collect_event_from_form(
     let all_day = all_day_switch.is_active();
     let start_local = date_time_from_form(start_date, start_hour, start_minute, all_day);
     let end_local = date_time_from_form(end_date, end_hour, end_minute, all_day);
-    if end_local <= start_local {
+    // The form's all-day end is the *last* day (inclusive); the model's end is
+    // the exclusive day after, so a same-day all-day event (end date == start
+    // date) stores `end = start + 1 day`.
+    let model_end = if all_day { end_local + chrono::Duration::days(1) } else { end_local };
+    if model_end <= start_local {
         return Err("The event's end must be after its start.".to_string());
     }
 
@@ -398,7 +427,7 @@ fn collect_event_from_form(
         description: if description.trim().is_empty() { None } else { Some(description.trim().to_string()) },
         location: if location.trim().is_empty() { None } else { Some(location.trim().to_string()) },
         start: local_to_utc(start_local),
-        end: local_to_utc(end_local),
+        end: local_to_utc(model_end),
         all_day,
         rrule,
         href,
