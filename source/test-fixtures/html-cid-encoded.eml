@@ -1,0 +1,21 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: HTML with percent-encoded cid: image
+Date: Tue, 28 Jul 2026 09:12:00 +0000
+Message-ID: <html-cid-encoded-fixture@lookout.test>
+Content-Type: multipart/related; boundary="cid-bound-03"
+
+--cid-bound-03
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>Inline image:</p><img src="cid:logo%40123"></body></html>
+
+--cid-bound-03
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-ID: <logo@123>
+Content-Disposition: inline; filename="logo.png"
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=
+
+--cid-bound-03--

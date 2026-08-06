@@ -190,6 +190,74 @@ impl BodyPart {
     }
 }
 
+/// Matches a `cid:` reference from a message's HTML against a MIME part's
+/// `Content-ID` (`BodyPart::cid`). The two rarely match verbatim: HTML
+/// references may drop the angle brackets of the RFC 2392 msg-id syntax
+/// (`<id@host>`), percent-encode characters (`logo%40123`), or reference
+/// only the local part of a full `id@host`. Matching ladder:
+///
+/// 1. exact equality after trimming whitespace and surrounding `<>`,
+/// 2. equality of the percent-decoded forms (WebKit's scheme-request path
+///    keeps percent-encoding intact; HTML may or may not encode),
+/// 3. equality of the local part (everything before the first `@`) - a
+///    reference like `cid:logo123` must resolve a part whose Content-ID is
+///    `<logo123@host.example>`.
+pub fn cid_matches(request_ref: &str, part_cid: &str) -> bool {
+    let request = trimmed_id(request_ref);
+    let part = trimmed_id(part_cid);
+    if request.is_empty() || part.is_empty() {
+        return false;
+    }
+    if request == part {
+        return true;
+    }
+    let decoded_request = percent_decode(request);
+    let decoded_part = percent_decode(part);
+    if decoded_request == decoded_part {
+        return true;
+    }
+    // Local-part fallback: a reference that drops the host of a full
+    // msg-id (`cid:logo123` for `<logo123@host.example>`, or
+    // `cid:image001.png@01D8E9B3` for `<image001.png@01D8E9B3.host>` - a
+    // pattern senders do emit) still resolves the part.
+    local_part(&decoded_request) == local_part(&decoded_part)
+}
+
+/// Strips surrounding whitespace and the angle brackets of the RFC 2392
+/// msg-id form (`<id@host>`).
+fn trimmed_id(s: &str) -> &str {
+    s.trim().trim_matches(|c| c == '<' || c == '>')
+}
+
+/// The local part of a Content-ID (everything before the first `@`), or the
+/// whole reference when it has none.
+fn local_part(s: &str) -> &str {
+    s.split('@').next().unwrap_or(s)
+}
+
+/// RFC 3986 percent-decoding: `%XX` hex escapes become their byte. Enough
+/// for `cid:` references, where only `@`, `/`, and a few punctuation
+/// characters are ever encoded; anything malformed is passed through.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let high = (bytes[i + 1] as char).to_digit(16);
+            let low = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                out.push((high << 4 | low) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SpfResult {
     Pass,
@@ -306,5 +374,49 @@ mod tests {
         for c in "(){%*\"\\".chars() {
             assert!(!sanitize_tag_key(&format!("x{c}y")).contains(c));
         }
+    }
+
+    #[test]
+    fn cid_matches_exact_references() {
+        // The common case: the HTML references the Content-ID verbatim.
+        assert!(cid_matches("logo123", "logo123"));
+        assert!(cid_matches("logo123@host.example", "logo123@host.example"));
+        // Angle brackets from the RFC 2392 msg-id form are trimmed away.
+        assert!(cid_matches("logo123", "<logo123>"));
+        assert!(cid_matches("<logo123@host.example>", "logo123@host.example"));
+        // Whitespace padding is ignored.
+        assert!(cid_matches(" logo123 ", "logo123"));
+    }
+
+    #[test]
+    fn cid_matches_percent_encoded_references() {
+        // `@` in the HTML reference can arrive percent-encoded, either side
+        // of the comparison.
+        assert!(cid_matches("logo%40123", "logo@123"));
+        assert!(cid_matches("logo@123", "logo%40123"));
+        assert!(cid_matches("logo%40123", "<logo@123>"));
+    }
+
+    #[test]
+    fn cid_matches_local_part_of_a_hosted_id() {
+        // HTML referencing just the local part resolves the full msg-id.
+        assert!(cid_matches("logo123", "logo123@host.example"));
+        // The same leniency when the reference keeps a prefix of the host.
+        assert!(cid_matches("image001.png@01D8E9B3", "image001.png@01D8E9B3.host"));
+        // Percent-encoded `@` decodes before the local parts are compared.
+        assert!(cid_matches("logo%40123", "logo@123@host.example"));
+    }
+
+    #[test]
+    fn cid_matches_rejects_unrelated_ids() {
+        assert!(!cid_matches("logo123", "logo124"));
+        assert!(!cid_matches("logo1", "logo12@host"));
+        // A different local part never matches, whatever the host.
+        assert!(!cid_matches("logo12@a", "logo123@b"));
+        assert!(!cid_matches("image001@x", "image002@y"));
+        // Empty on either side never matches.
+        assert!(!cid_matches("", "logo123"));
+        assert!(!cid_matches("logo123", ""));
+        assert!(!cid_matches("<>", "<>"));
     }
 }

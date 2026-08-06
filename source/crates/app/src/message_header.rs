@@ -71,7 +71,12 @@ pub fn build() -> MessageHeader {
         .css_classes(["message-header-meta"])
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
-    let sender_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).hexpand(true).valign(gtk::Align::Center).build();
+    let sender_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
     sender_box.append(&sender_name_label);
     sender_box.append(&sender_email_label);
 
@@ -125,7 +130,12 @@ pub fn build() -> MessageHeader {
     let bottom_forward_button = action_button("mail-forward-symbolic", "Forward");
     bottom_forward_button.set_tooltip_text(Some("Forward"));
 
-    let action_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).halign(gtk::Align::Start).css_classes(["message-action-bar"]).build();
+    let action_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Start)
+        .css_classes(["message-action-bar"])
+        .build();
     action_bar.append(&bottom_reply_button);
     action_bar.append(&bottom_forward_button);
 

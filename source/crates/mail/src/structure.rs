@@ -80,13 +80,15 @@ fn leaf(common: &BodyContentCommon, other: &BodyContentSinglePart, path: &[u32],
     // A text/plain or text/html leaf is the body, never an attachment - even
     // when it declares `Content-Disposition: attachment` (a quirk some
     // servers emit for the plain-text half of an alternative). An attachment
-    // is any other non-text leaf that either declares `Content-Disposition:
-    // attachment` or carries a filename (the same "named non-text part"
-    // heuristic mail_parser's attachment list uses). Inline images inside
-    // `multipart/related` without a name stay non-attachments. An embedded
-    // `message/rfc822` is always an attachment.
+    // is any other non-text leaf that declares `Content-Disposition:
+    // attachment`, or carries a filename without an explicit `inline`
+    // disposition. Inline `cid:` images inside `multipart/related` stay
+    // non-attachments even when they carry a filename (senders commonly
+    // attach `filename=` to an inline image), so they never surface in the
+    // attachment strip. An embedded `message/rfc822` is always an attachment.
     let is_text_leaf = ty.eq_ignore_ascii_case("text") && (subtype.eq_ignore_ascii_case("plain") || subtype.eq_ignore_ascii_case("html"));
-    let is_attachment = embedded_message || !is_text_leaf && (matches!(&common.disposition, Some(d) if d.ty.eq_ignore_ascii_case("attachment")) || filename.is_some());
+    let disposition_is = |ty: &str| matches!(&common.disposition, Some(d) if d.ty.eq_ignore_ascii_case(ty));
+    let is_attachment = embedded_message || !is_text_leaf && (disposition_is("attachment") || filename.is_some() && !disposition_is("inline"));
 
     BodyPart {
         part_number: path.iter().map(u32::to_string).collect::<Vec<_>>().join("."),
@@ -266,6 +268,55 @@ mod tests {
         assert_eq!(parts[1].cid.as_deref(), Some("logo123@lookout.test"));
         assert!(!parts[1].is_attachment);
         assert!(!has_attachments(&parts));
+    }
+
+    #[test]
+    fn inline_image_with_a_filename_is_not_an_attachment() {
+        // Senders routinely attach `filename=` to an inline image; the
+        // disposition - not the filename - decides whether it belongs in the
+        // attachment strip.
+        let bs = BodyStructure::Multipart {
+            common: common("multipart", "related", None, None),
+            bodies: vec![
+                BodyStructure::Text {
+                    common: common("text", "html", None, Some(vec![("charset", "utf-8")])),
+                    other: single(None, ContentEncoding::SevenBit, 300),
+                    lines: 6,
+                    extension: None,
+                },
+                BodyStructure::Basic {
+                    common: common("image", "png", Some(("inline", Some(vec![("filename", "logo.png")]))), None),
+                    other: single(Some("logo123"), ContentEncoding::Base64, 1024),
+                    extension: None,
+                },
+            ],
+            extension: None,
+        };
+        let parts = parts_from_bodystructure(&bs);
+        assert_eq!(parts[1].filename.as_deref(), Some("logo.png"));
+        assert!(!parts[1].is_attachment);
+        assert!(!has_attachments(&parts));
+    }
+
+    #[test]
+    fn filename_without_a_disposition_is_an_attachment() {
+        // A named part with no disposition at all is still an attachment.
+        let bs = BodyStructure::Multipart {
+            common: common("multipart", "mixed", None, None),
+            bodies: vec![
+                text_plain(),
+                BodyStructure::Basic {
+                    common: common("application", "pdf", None, Some(vec![("name", "report.pdf")])),
+                    other: single(None, ContentEncoding::Base64, 4096),
+                    extension: None,
+                },
+            ],
+            extension: None,
+        };
+        let parts = parts_from_bodystructure(&bs);
+        assert_eq!(parts[1].filename.as_deref(), Some("report.pdf"));
+        assert!(parts[1].is_attachment);
+        assert!(has_attachments(&parts));
     }
 
     #[test]

@@ -33,6 +33,14 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
                     None => ct.ctype().to_string(),
                 })
                 .unwrap_or_else(|| "application/octet-stream".to_string());
+            // Same heuristic as the BODYSTRUCTURE path (`structure.rs`): a
+            // part is an attachment when it declares `Content-Disposition:
+            // attachment`, or when it carries a filename without an explicit
+            // `inline` disposition. An inline `cid:` image - even one with a
+            // filename, as senders commonly emit - stays in the HTML body and
+            // must not surface in the attachment strip.
+            let disposition = part.content_disposition();
+            let is_attachment = disposition.as_ref().is_some_and(|d| d.is_attachment()) || part.attachment_name().is_some() && disposition.as_ref().is_none_or(|d| !d.is_inline());
             Some(BodyPart {
                 part_number,
                 content_type,
@@ -41,7 +49,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
                 filename: part.attachment_name().map(|s| s.to_string()),
                 cid: part.content_id().map(|s| s.to_string()),
                 size: part.contents().len() as u32,
-                is_attachment: true,
+                is_attachment,
             })
         })
         .collect();
@@ -54,6 +62,51 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         headers,
         auth_results: None,
     })
+}
+
+/// Dev-only helper for the debug ".eml viewer": rewrites every `cid:` image
+/// reference in `html` to a `data:` URI carrying the referenced part's
+/// already-transfer-decoded bytes from `raw`. The debug viewer has no
+/// account session behind it, so the reading pane's scheme handler (which
+/// fetches cid parts over IMAP) can't serve these - this lets a fixture be
+/// verified in-app without a server. Compiled out of release builds.
+#[cfg(debug_assertions)]
+pub fn rewrite_cid_refs_to_data_uris(html: &str, raw: &[u8]) -> String {
+    use mail_parser::MimeHeaders;
+    let Some(message) = MessageParser::default().parse(raw) else { return html.to_string() };
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find("cid:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 4..];
+        // The reference runs until whitespace or an HTML delimiter - enough
+        // for a dev-only helper (a robust parser would be overkill here).
+        let end = after.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '>').unwrap_or(after.len());
+        let reference = &after[..end];
+        let resolved = message
+            .attachments()
+            .find(|p| p.content_id().is_some_and(|cid| lookout_core::cid_matches(reference, cid)))
+            .map(|part| {
+                let content_type = part
+                    .content_type()
+                    .map(|ct| match ct.subtype() {
+                        Some(sub) => format!("{}/{sub}", ct.ctype()),
+                        None => ct.ctype().to_string(),
+                    })
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let data = base64::engine::general_purpose::STANDARD.encode(part.contents());
+                format!("data:{content_type};base64,{data}")
+            });
+        match resolved {
+            Some(data_uri) => out.push_str(&data_uri),
+            // Unresolvable reference: leave the original `cid:` text in
+            // place, the way the sandboxed viewer renders a missing image.
+            None => out.push_str(&rest[start..start + 4 + end]),
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Computes every MIME part's RFC 3501 section path - the `BODY[<n>]` number
@@ -322,6 +375,10 @@ fn normalize_preview(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn has_attachment(parts: &[BodyPart]) -> bool {
+        parts.iter().any(|p| p.is_attachment)
+    }
+
     fn fixture(name: &str) -> Vec<u8> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/").to_string() + name;
         std::fs::read(&path).unwrap_or_else(|e| panic!("reading fixture {path}: {e}"))
@@ -348,14 +405,19 @@ mod tests {
     }
 
     #[test]
-    fn html_cid_image_fixture_parses_without_panicking() {
+    fn html_cid_image_fixture_lists_the_inline_image_part_with_its_cid() {
         let body = parse_body(Uid(0), &fixture("html-cid-image.eml")).expect("parses");
-        assert!(body.html_body.expect("has html body").contains("cid:logo123"));
-        // Documents current behavior for the still-open "inline cid: image
-        // resolution" TODO item, rather than asserting a specific outcome:
-        // mail_parser's `attachments()` may or may not surface a
-        // multipart/related inline part as a `BodyPart` with `cid` set.
-        let _ = body.parts.iter().find(|p| p.cid.as_deref() == Some("logo123"));
+        let html = body.html_body.expect("has html body");
+        assert!(html.contains("cid:logo123"));
+        // The inline image is a part with its Content-ID and a real IMAP
+        // section number, so the on-demand `FetchAttachment` path can target
+        // it - and it carries no filename, so it must not count as an
+        // attachment (the strip is attachments-only).
+        let image = body.parts.iter().find(|p| p.cid.as_deref() == Some("logo123")).expect("inline image listed with its cid");
+        assert_eq!(image.part_number, "2");
+        assert_eq!(image.content_type, "image/png");
+        assert!(!image.is_attachment);
+        assert!(!has_attachment(&body.parts));
     }
 
     #[test]
@@ -412,6 +474,46 @@ mod tests {
         let fax = body.parts.iter().find(|p| p.filename.as_deref() == Some("fax.pdf")).expect("fax attachment listed");
         assert_eq!(fax.part_number, "1");
         assert_eq!(fax.content_type, "application/pdf");
+    }
+
+    #[test]
+    fn html_cid_hosted_fixture_keeps_the_full_content_id() {
+        let body = parse_body(Uid(0), &fixture("html-cid-hosted.eml")).expect("parses");
+        let image = body.parts.iter().find(|p| p.content_type == "image/png").expect("inline image listed");
+        // The Content-ID is a full msg-id (`<logo123@host.example>`, angle
+        // brackets stripped by the parser); the HTML references it verbatim.
+        assert_eq!(image.cid.as_deref(), Some("logo123@host.example"));
+        assert_eq!(image.part_number, "2");
+        assert!(!image.is_attachment);
+    }
+
+    #[test]
+    fn html_cid_encoded_fixture_parses_without_panicking() {
+        let body = parse_body(Uid(0), &fixture("html-cid-encoded.eml")).expect("parses");
+        assert!(body.html_body.expect("has html body").contains("cid:logo%40123"));
+        let image = body.parts.iter().find(|p| p.cid.as_deref() == Some("logo@123")).expect("inline image listed");
+        assert_eq!(image.part_number, "2");
+        assert!(!image.is_attachment);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn cid_refs_rewrite_to_data_uris_from_the_raw_message() {
+        let raw = fixture("html-cid-image.eml");
+        let html = parse_body(Uid(0), &raw).expect("parses").html_body.expect("has html body");
+        let rewritten = rewrite_cid_refs_to_data_uris(&html, &raw);
+        // The reference is replaced by a data: URI carrying the decoded PNG.
+        assert!(!rewritten.contains("cid:logo123"));
+        assert!(rewritten.contains("data:image/png;base64,iVBORw0KGgo"), "rewritten: {rewritten}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn cid_refs_that_resolve_nowhere_survive_verbatim() {
+        let raw = fixture("html-cid-image.eml");
+        let html = "<img src=\"cid:missing123\">";
+        let rewritten = rewrite_cid_refs_to_data_uris(html, &raw);
+        assert_eq!(rewritten, html);
     }
 
     #[test]

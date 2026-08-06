@@ -253,6 +253,38 @@ struct PendingAttachment {
     button: gtk::MenuButton,
 }
 
+/// Marks a value as `Send` so it can cross from WebKit's scheme-handler
+/// thread to the main loop. `webkit::URISchemeRequest` is a ref-counted
+/// GObject whose `finish`/`finish_error` are documented thread-safe; the
+/// wrapper exists only because the gtk-rs bindings don't declare it `Send`.
+/// The request is only ever *touched* on the main thread after arrival -
+/// the same pattern as the credential providers' `SendWrapper` in
+/// `build_window`, where the justification is spelled out in full.
+struct SendWrapper<T>(T);
+unsafe impl<T> Send for SendWrapper<T> {}
+
+/// A `cid:` image request forwarded from WebKit's scheme-handler thread to
+/// the main loop: `cid` is the reference as it appeared in the message's
+/// HTML, and `request` is the WebKit request that must be finished with the
+/// part's bytes (or an error) once the main loop has resolved it.
+struct CidSchemeRequest {
+    request: SendWrapper<webkit::URISchemeRequest>,
+    cid: String,
+}
+
+/// One inline `cid:` image fetch in flight for the message on the reading
+/// pane, tracked in `UiState::pending_cid` and keyed by the `BodyPart`'s
+/// part number. Answered with the part's bytes (`AccountEvent::PartFetched`)
+/// or an error (`PartFetchFailed`, a timeout, or the user moving to another
+/// message); `request` is the WebKit URI-scheme request the answer is
+/// finished into. The part itself isn't kept - the response arms re-read it
+/// from the event.
+struct PendingCid {
+    mailbox: MailboxId,
+    uid: Uid,
+    request: webkit::URISchemeRequest,
+}
+
 /// A small bounded LRU of recently-viewed message bodies, keyed by
 /// `(mailbox, uid)`, front = most recently used. See `BODY_CACHE_IN_MEMORY`.
 struct BodyCache {
@@ -343,6 +375,19 @@ struct UiState {
     /// user navigates away first). One at a time; the strip's buttons ignore
     /// a click while one is outstanding. See `PendingAttachment`.
     pending_attachment: Option<PendingAttachment>,
+    /// Inline `cid:` image fetches in flight for the message on the reading
+    /// pane, keyed by `BodyPart::part_number`. A message can embed several
+    /// images, so - unlike `pending_attachment` - this is a map. Each entry
+    /// holds the WebKit `URISchemeRequest` that must be finished with the
+    /// fetched bytes (`AccountEvent::PartFetched`) or an error
+    /// (`PartFetchFailed`, a timeout, or the user moving on). See
+    /// `PendingCid`.
+    pending_cid: HashMap<String, PendingCid>,
+    /// The `cid:`-bearing parts of the message currently on the reading pane
+    /// (a subset of the last rendered `EmailBody::parts`), used to resolve
+    /// the `cid:` references WebKit's scheme handler forwards. Stale the
+    /// moment the user navigates away; `render_body` re-stashes it.
+    rendered_inline_parts: Vec<BodyPart>,
     /// Temporary files written for the row's "Open" action - attachments
     /// materialized on disk so the system's default handler can open them.
     /// Deleted when Lookout exits (`app.connect_shutdown` in `build_window`),
@@ -922,6 +967,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         unified_snapshots: HashMap::new(),
         pending_body_request: None,
         pending_attachment: None,
+        pending_cid: HashMap::new(),
+        rendered_inline_parts: Vec::new(),
         temp_attachment_files: HashSet::new(),
         toast_overlay: Some(toast_overlay.clone()),
         pending_html_reveal: false,
@@ -1840,6 +1887,41 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     webkit_settings.set_enable_javascript(false);
     webkit_settings.set_enable_developer_extras(false);
     let web_view = webkit::WebView::builder().settings(&webkit_settings).hexpand(true).vexpand(true).build();
+    // Inline `cid:` image resolution: register a custom URI scheme so WebKit
+    // asks us for the bytes behind `<img src="cid:...">` references instead
+    // of failing the load. The handler callback fires on a WebKit worker
+    // thread, so it must not touch `UiState` - it only forwards the request
+    // to the main loop, which matches it against the rendered message's
+    // inline parts and fetches the bytes on demand (`FetchAttachment`, served
+    // from the flat-file cache on repeat visits). Marking the scheme local
+    // makes it behave like `file://` for the page's subresource loads
+    // (defensive; image loads are CORS-free anyway).
+    let (cid_tx, cid_rx) = async_channel::unbounded();
+    if let Some(context) = web_view.context() {
+        if let Some(security_manager) = context.security_manager() {
+            security_manager.register_uri_scheme_as_local("cid");
+        }
+        context.register_uri_scheme("cid", move |request| {
+            let Some(cid) = request.path() else { return };
+            let _ = cid_tx.send_blocking(CidSchemeRequest {
+                request: SendWrapper(request.clone()),
+                cid: cid.to_string(),
+            });
+        });
+    }
+    // The scheme handler's main-loop half: resolve each forwarded `cid:`
+    // reference against the message currently on the reading pane and fetch
+    // the matching part's bytes. This task outlives any single message, so
+    // the resolution is always validated against `rendered_message`/`pending_cid`
+    // at the moment the request lands.
+    {
+        let state_for_cid = state.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(request) = cid_rx.recv().await {
+                dispatch_cid_request(&state_for_cid, &request.cid, request.request.0);
+            }
+        });
+    }
     // Block navigation *away* from the loaded message body (e.g. clicking a
     // link) - but NOT the initial programmatic `load_html()` call itself,
     // which also fires a NavigationAction decision. Distinguish the two via
@@ -3250,6 +3332,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let Some(path) = file.path() else { return };
                 let Ok(raw) = std::fs::read(&path) else { return };
                 if let Some(body) = lookout_mail::body::parse_body(lookout_core::Uid(0), &raw) {
+                    // The debug viewer has no IMAP session behind it, so the
+                    // reading pane's cid: scheme handler can't fetch inline
+                    // images - rewrite them to `data:` URIs straight from the
+                    // raw message so fixtures render in full.
+                    let body = if let Some(html) = body.html_body.as_deref() {
+                        lookout_core::EmailBody {
+                            html_body: Some(lookout_mail::body::rewrite_cid_refs_to_data_uris(html, &raw)),
+                            ..body
+                        }
+                    } else {
+                        body
+                    };
                     render_body(&state, &reading_stack, &message_header, MailboxId("debug:eml".into()), body.uid, body);
                 }
             });
@@ -3343,6 +3437,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.pending_attachment = None;
                     st.rendered_message = None;
                     drop(st);
+                    drop_pending_cid(&state);
                     reading_multi_label.set_label(&format!("{} messages selected", summaries.len()));
                     reading_stack.set_visible_child_name("multi");
                     return;
@@ -3356,6 +3451,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.pending_attachment = None;
                     st.rendered_message = None;
                     drop(st);
+                    drop_pending_cid(&state);
                     reading_stack.set_visible_child_name("empty");
                     return;
                 }
@@ -4717,6 +4813,26 @@ fn connect_account(
                     }
                 }
                 AccountEvent::PartFetched { mailbox, uid, part, bytes } => {
+                    // An inline `cid:` image request for this part (separate
+                    // from the strip's one-at-a-time row actions): finish the
+                    // WebKit request with the bytes. Keyed by part number and
+                    // dropped on every message change, so a hit is
+                    // authoritative - a stale part for the same number can't
+                    // linger because the map only ever holds the current
+                    // message's requests. Runs first so the strip closures
+                    // below can move `part`/`bytes` into their futures.
+                    let cid_request = {
+                        let mut st = state.borrow_mut();
+                        match st.pending_cid.get(&part.part_number) {
+                            Some(p) if p.mailbox == mailbox && p.uid == uid => Some(st.pending_cid.remove(&part.part_number).expect("present").request),
+                            _ => None,
+                        }
+                    };
+                    if let Some(cid_request) = cid_request {
+                        tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, bytes = bytes.len(), "cid: image bytes arrived; finishing WebKit request");
+                        let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
+                        cid_request.finish(&stream, bytes.len() as i64, Some(&part.content_type));
+                    }
                     // An attachment part's bytes arrived. Only act if they
                     // belong to the message currently on the reading pane and
                     // to the outstanding row action - a response that lands
@@ -4794,6 +4910,20 @@ fn connect_account(
                         } else {
                             state.borrow_mut().pending_attachment = Some(p);
                         }
+                    }
+                    // The same failure for an inline `cid:` image request:
+                    // finish the WebKit request with an error so the browser
+                    // draws a broken image rather than waiting forever.
+                    let cid_request = {
+                        let mut st = state.borrow_mut();
+                        match st.pending_cid.get(&part_number) {
+                            Some(p) if p.mailbox == mailbox && p.uid == uid => Some(st.pending_cid.remove(&part_number).expect("present").request),
+                            _ => None,
+                        }
+                    };
+                    if let Some(cid_request) = cid_request {
+                        tracing::warn!(?mailbox, uid = uid.0, part = %part_number, "cid: inline image fetch failed: {message}");
+                        finish_cid_request_error(&cid_request, "the inline image could not be fetched");
                     }
                 }
                 AccountEvent::SendCompleted => {
@@ -6356,6 +6486,85 @@ fn body_request_matches(mailbox: &MailboxId, uid: &Uid, pending_request: Option<
     pending_request.is_some_and(|(pending_mailbox, pending_uid)| pending_mailbox == mailbox && pending_uid == uid)
 }
 
+/// Finishes a WebKit URI-scheme request with an error, so the browser renders
+/// a broken image instead of hanging the page's load on the subresource.
+fn finish_cid_request_error(request: &webkit::URISchemeRequest, message: &str) {
+    request.finish_error(&mut glib::Error::new(gio::IOErrorEnum::Failed, message));
+}
+
+/// Finishes every in-flight inline `cid:` request with an error - called
+/// whenever the reading pane moves off the message those requests belong to
+/// (new selection, new render, account teardown), so WebKit never waits on
+/// subresources of a message the user has left.
+fn drop_pending_cid(state: &Rc<RefCell<UiState>>) {
+    let pending = std::mem::take(&mut state.borrow_mut().pending_cid);
+    for (part_number, pending) in pending {
+        tracing::debug!(part = %part_number, "cid: dropping pending inline-image request");
+        finish_cid_request_error(&pending.request, "the message changed before the inline image arrived");
+    }
+}
+
+/// Resolves a `cid:` reference requested by the reading pane's WebKit view
+/// to the matching inline part of the currently-rendered message, and asks
+/// that account's session for the part's bytes (`FetchAttachment`). Runs on
+/// the main loop (the scheme handler itself only forwards the request here,
+/// because it fires on a WebKit worker thread). A reference that matches no
+/// part of the current message is answered with an error immediately, so an
+/// unknown id can't wedge the pane; so is a reference arriving while no
+/// message is on screen. Each dispatched request is tracked in
+/// `UiState::pending_cid` until `PartFetched`/`PartFetchFailed` (or the
+/// timeout) lands.
+fn dispatch_cid_request(state: &Rc<RefCell<UiState>>, cid: &str, request: webkit::URISchemeRequest) {
+    let target = (|| {
+        let st = state.borrow();
+        let (mailbox, uid) = st.rendered_message.clone()?;
+        let part = st
+            .rendered_inline_parts
+            .iter()
+            .find(|p| p.cid.as_deref().is_some_and(|c| lookout_core::cid_matches(cid, c)))?
+            .clone();
+        let cmd_tx = mailbox_account_id(&mailbox).and_then(|id| st.accounts.get(&id)).map(|h| h.cmd_tx.clone())?;
+        Some((mailbox, uid, part, cmd_tx))
+    })();
+    let Some((mailbox, uid, part, cmd_tx)) = target else {
+        finish_cid_request_error(&request, "this message has no matching inline image");
+        return;
+    };
+    let part_number = part.part_number.clone();
+    state.borrow_mut().pending_cid.insert(
+        part_number.clone(),
+        PendingCid {
+            mailbox: mailbox.clone(),
+            uid,
+            request,
+        },
+    );
+    tracing::debug!(?mailbox, uid = uid.0, cid, part = %part_number, "cid: inline image request dispatched to account actor");
+    let _ = cmd_tx.send_blocking(AccountCommand::FetchAttachment { mailbox, uid, part });
+    arm_cid_timeout(state, part_number);
+}
+
+/// Backstop for a `cid:` image fetch whose answer is lost (e.g. the session
+/// dies mid-fetch and the command disappears into the reconnect): finish the
+/// WebKit request with an error after a generous grace period instead of
+/// letting the page hang on it. Only fires if this exact request is still
+/// the outstanding one.
+fn arm_cid_timeout(state: &Rc<RefCell<UiState>>, part_number: String) {
+    let state_for_timeout = state.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+        let request = {
+            let mut st = state_for_timeout.borrow_mut();
+            match st.pending_cid.get(&part_number) {
+                Some(_) => st.pending_cid.remove(&part_number).expect("present").request,
+                None => return glib::ControlFlow::Break,
+            }
+        };
+        tracing::warn!(part = %part_number, "cid: inline image fetch timed out");
+        finish_cid_request_error(&request, "the inline image could not be fetched");
+        glib::ControlFlow::Break
+    });
+}
+
 /// Reveals the reading pane's "message" page (switching `content_stack` to
 /// `content_page` and the reading stack to "message"). If the stack is
 /// mid-transition - e.g. a message → "empty" fade-out still settling after a
@@ -6835,6 +7044,13 @@ fn render_body(
     // message (see the selection handler's `already_shown` guard) can be
     // recognized as a no-op instead of another crossfade.
     state.borrow_mut().rendered_message = Some((mailbox.clone(), uid));
+    // The pane is about to show a new message: any inline `cid:` image
+    // requests still in flight belong to the one being replaced, so finish
+    // them with an error (WebKit re-requests if the same images come up
+    // again, and the cache serves those). Then stash the new message's
+    // `cid:`-bearing parts for the scheme handler to resolve against.
+    drop_pending_cid(state);
+    state.borrow_mut().rendered_inline_parts = body.parts.iter().filter(|p| p.cid.is_some()).cloned().collect();
     // Apply the header for the message being rendered now. The selection
     // handler stores the summary here instead of updating the header
     // immediately, so the previous message's header stays on screen through
@@ -7217,6 +7433,8 @@ mod tests {
             unified_snapshots: HashMap::new(),
             pending_body_request: None,
             pending_attachment: None,
+            pending_cid: HashMap::new(),
+            rendered_inline_parts: Vec::new(),
             temp_attachment_files: HashSet::new(),
             toast_overlay: None,
             pending_html_reveal: false,

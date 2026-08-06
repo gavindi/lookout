@@ -256,6 +256,74 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     // The wire bytes were base64; the actor must have decoded them.
     assert_eq!(bytes, attachment_bytes, "attachment bytes must be transfer-decoded");
 
+    // --- Inline `cid:` image part fetch. A multipart/related message whose
+    // second part is a base64 PNG carrying a Content-ID - the shape the
+    // reading pane's cid: scheme handler resolves to this fetch. The part
+    // must surface in the message's BODYSTRUCTURE-derived list with its cid
+    // and a fetchable part number, and the fetch must return the
+    // transfer-decoded PNG bytes.
+    let png_wire = b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    let raw_cid_message = concat!(
+        "From: sender@example.com\r\n",
+        "To: testuser@localhost\r\n",
+        "Subject: inline cid image\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/related; boundary=\"c1d\"\r\n",
+        "\r\n",
+        "--c1d\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: 7bit\r\n",
+        "\r\n",
+        "<html><body><img src=\"cid:logo123\"></body></html>\r\n",
+        "--c1d\r\n",
+        "Content-Type: image/png; name=\"logo.png\"\r\n",
+        "Content-Disposition: inline; filename=\"logo.png\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "Content-ID: <logo123>\r\n",
+        "\r\n",
+    );
+    let mut raw_cid_message = raw_cid_message.as_bytes().to_vec();
+    raw_cid_message.extend_from_slice(png_wire);
+    raw_cid_message.extend_from_slice(b"\r\n--c1d--\r\n");
+    append_raw(&host, imap_plain_port, &raw_cid_message).await;
+
+    let _ = cmd_tx.send(AccountCommand::Refresh).await;
+    let listed = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::MessagesUpdated { mailbox, .. } if *mailbox == inbox_id)).await;
+    let AccountEvent::MessagesUpdated { messages, .. } = listed else { unreachable!() };
+    let cid_message = messages
+        .iter()
+        .find(|m| m.subject.as_deref() == Some("inline cid image"))
+        .unwrap_or_else(|| panic!("APPENDed cid message not synced: {messages:?}"));
+    let structure = cid_message
+        .structure
+        .as_ref()
+        .unwrap_or_else(|| panic!("cid message has no BODYSTRUCTURE: {cid_message:?}"));
+    let image_part = structure
+        .iter()
+        .find(|p| p.cid.as_deref() == Some("logo123"))
+        .unwrap_or_else(|| panic!("inline image part not in structure: {structure:?}"));
+    assert_eq!(image_part.part_number, "2");
+    assert_eq!(image_part.content_type, "image/png");
+    // Inline, not an attachment: the strip must not list it.
+    assert!(!image_part.is_attachment);
+    assert!(
+        structure.iter().all(|p| !p.is_attachment),
+        "no parts of the related body may count as attachments: {structure:?}"
+    );
+
+    let _ = cmd_tx
+        .send(AccountCommand::FetchAttachment {
+            mailbox: inbox_id.clone(),
+            uid: cid_message.uid,
+            part: image_part.clone(),
+        })
+        .await;
+    let fetched = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::PartFetched { .. })).await;
+    let AccountEvent::PartFetched { bytes, .. } = fetched else { unreachable!() };
+    // A PNG's magic header, proving the base64 wire bytes were decoded.
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "cid image bytes must be transfer-decoded");
+    assert!(bytes.len() > 8);
+
     let _ = cmd_tx.send(AccountCommand::Shutdown).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
