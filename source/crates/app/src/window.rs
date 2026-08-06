@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -214,10 +215,26 @@ const MAX_TAG_DOTS: usize = 3;
 /// attachments over slow connections legitimately take a while.
 const ATTACHMENT_FETCH_TIMEOUT_MS: u64 = 60_000;
 
-/// One attachment save in flight for the reading pane, tracked in
-/// `UiState::pending_attachment`. `button` is the strip row's Save button,
-/// disabled and relabelled while the fetch is outstanding so the user can see
-/// which attachment is preparing; it's restored on completion.
+/// Which of an attachment row's actions a `PendingAttachment` fetch was for -
+/// decides what happens to the bytes once `AccountEvent::PartFetched` lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAttachmentAction {
+    /// Open the bytes with the MIME type's *default* application, resolved via
+    /// GIO and launched directly (no chooser), from a temporary file deleted
+    /// when Lookout exits. Falls back to the XDG portal when there's no
+    /// default app for the type (or the direct launch fails, e.g. sandboxed).
+    Open,
+    /// Ask the user which application to open the file with, via the XDG
+    /// desktop portal's `org.freedesktop.portal.OpenURI` (the `ask` option).
+    OpenWith,
+    /// Offer a save-location dialog and write the bytes there.
+    Save,
+}
+
+/// One attachment action in flight for the reading pane, tracked in
+/// `UiState::pending_attachment`. `button` is the strip row's menu button,
+/// disabled while the fetch is outstanding so the user can see which row is
+/// preparing; it's restored on completion.
 struct PendingAttachment {
     mailbox: MailboxId,
     uid: Uid,
@@ -225,8 +242,10 @@ struct PendingAttachment {
     /// `PartFetched` so a response meant for a different part (or a different
     /// message) can't re-enable the wrong row.
     part_number: String,
-    /// The row's Save button, to re-enable/relabel once the bytes land.
-    button: gtk::Button,
+    /// What to do with the bytes once they arrive.
+    action: PendingAttachmentAction,
+    /// The row's menu button, to re-enable once the fetch lands.
+    button: gtk::MenuButton,
 }
 
 /// A small bounded LRU of recently-viewed message bodies, keyed by
@@ -314,12 +333,16 @@ struct UiState {
     /// different message.
     pending_body_request: Option<(MailboxId, Uid)>,
     /// An attachment-part fetch currently in flight for the reading pane's
-    /// Save button - the row's button is disabled and relabelled while its
-    /// bytes are coming, and re-enabled when `AccountEvent::PartFetched`
-    /// lands (or discarded if the user navigates away first). One at a time;
-    /// the strip's Save buttons ignore a click while one is outstanding.
-    /// See `PendingAttachment`.
+    /// row - its menu button is disabled while the bytes are coming, and
+    /// re-enabled when `AccountEvent::PartFetched` lands (or discarded if the
+    /// user navigates away first). One at a time; the strip's buttons ignore
+    /// a click while one is outstanding. See `PendingAttachment`.
     pending_attachment: Option<PendingAttachment>,
+    /// Temporary files written for the row's "Open" action - attachments
+    /// materialized on disk so the system's default handler can open them.
+    /// Deleted when Lookout exits (`app.connect_shutdown` in `build_window`),
+    /// so a viewer process is never left holding a file that's already gone.
+    temp_attachment_files: HashSet<PathBuf>,
     /// The window's toast overlay, kept so the attachment Save flow (which
     /// runs from widget callbacks, not the account event loop) can surface
     /// fetch-timeout feedback. `None` only in tests, where no window exists.
@@ -886,6 +909,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         unified_snapshots: HashMap::new(),
         pending_body_request: None,
         pending_attachment: None,
+        temp_attachment_files: HashSet::new(),
         toast_overlay: Some(toast_overlay.clone()),
         pending_html_reveal: false,
         pending_header: None,
@@ -908,6 +932,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         search_results: Vec::new(),
         search_pending: HashSet::new(),
     }));
+    // Clean up the temporary files materialized for the attachment strip's
+    // "Open" action when the app exits - the viewer process may still be
+    // running, but Lookout must not leak temp files. (On Flatpak the portal
+    // makes its own copy for the viewer, so removing ours is always safe.)
+    let state_for_shutdown = state.clone();
+    app.connect_shutdown(move |_| {
+        let paths: Vec<PathBuf> = state_for_shutdown.borrow().temp_attachment_files.iter().cloned().collect();
+        for path in paths {
+            let _ = std::fs::remove_file(&path);
+        }
+    });
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
     let state_clone2 = state.clone();
@@ -2329,24 +2364,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // image shows straight through it. Four views today (Mail/Calendar/
     // Contacts/Config), joined into one toggle group for mutual-exclusive
     // selection.
-    let mail_icon_bytes = include_bytes!("../../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg");
-    let mail_icon_texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(mail_icon_bytes)).expect("bundled app icon should decode");
-    let mail_icon_image = gtk::Image::from_paintable(Some(&mail_icon_texture));
-    mail_icon_image.set_pixel_size(28);
+    let mail_icon_image = nav_rail_image(include_bytes!("../../../Assets/icons/email-1.svg"));
     let mail_view_button = gtk::ToggleButton::builder()
         .child(&mail_icon_image)
         .css_classes(["flat"])
         .tooltip_text("Mail")
         .active(true)
         .build();
+    let calendar_icon_image = nav_rail_image(include_bytes!("../../../Assets/icons/calendar-1.svg"));
     let calendar_view_button = gtk::ToggleButton::builder()
-        .icon_name("x-office-calendar-symbolic")
+        .child(&calendar_icon_image)
         .css_classes(["flat"])
         .tooltip_text("Calendar")
         .build();
     calendar_view_button.set_group(Some(&mail_view_button));
+    let contacts_icon_image = nav_rail_image(include_bytes!("../../../Assets/icons/contact-1.svg"));
     let contacts_view_button = gtk::ToggleButton::builder()
-        .icon_name("avatar-default-symbolic")
+        .child(&contacts_icon_image)
         .css_classes(["flat"])
         .tooltip_text("People")
         .build();
@@ -4546,7 +4580,7 @@ fn connect_account(
                 AccountEvent::PartFetched { mailbox, uid, part, bytes } => {
                     // An attachment part's bytes arrived. Only act if they
                     // belong to the message currently on the reading pane and
-                    // to the outstanding Save request - a response that lands
+                    // to the outstanding row action - a response that lands
                     // after the user moved on (or for a different part of the
                     // same message) is stale and dropped with its in-flight
                     // bookkeeping.
@@ -4563,12 +4597,30 @@ fn connect_account(
                     if let Some(p) = pending {
                         if p.mailbox == mailbox && p.uid == uid && p.part_number == part.part_number {
                             p.button.set_sensitive(true);
-                            p.button.set_label("Save");
-                            let window_for_save = window.clone();
-                            let toast_for_save = toast_overlay.clone();
-                            glib::spawn_future_local(async move {
-                                save_attachment_to_disk(&window_for_save, toast_for_save, &part, &bytes).await;
-                            });
+                            match p.action {
+                                PendingAttachmentAction::Open => {
+                                    let window_for_open = window.clone();
+                                    let state_for_open = state.clone();
+                                    let toast_for_open = toast_overlay.clone();
+                                    glib::spawn_future_local(async move {
+                                        open_attachment_temp(&window_for_open, &state_for_open, toast_for_open, &part, &bytes).await;
+                                    });
+                                }
+                                PendingAttachmentAction::OpenWith => {
+                                    let state_for_open_with = state.clone();
+                                    let toast_for_open_with = toast_overlay.clone();
+                                    glib::spawn_future_local(async move {
+                                        open_attachment_with(&state_for_open_with, toast_for_open_with, &part, &bytes).await;
+                                    });
+                                }
+                                PendingAttachmentAction::Save => {
+                                    let window_for_save = window.clone();
+                                    let toast_for_save = toast_overlay.clone();
+                                    glib::spawn_future_local(async move {
+                                        save_attachment_to_disk(&window_for_save, toast_for_save, &part, &bytes).await;
+                                    });
+                                }
+                            }
                         } else {
                             // Mismatched request (shouldn't happen with the
                             // one-at-a-time guard, but be safe).
@@ -4583,9 +4635,9 @@ fn connect_account(
                     message,
                 } => {
                     // The session couldn't produce this attachment's bytes.
-                    // Restore the Save button if this is still the outstanding
+                    // Restore the row's button if this is still the outstanding
                     // request and tell the user what went wrong - never leave
-                    // the button stuck on "Fetching…".
+                    // it stuck.
                     let pending = {
                         let mut st = state.borrow_mut();
                         let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
@@ -4599,7 +4651,6 @@ fn connect_account(
                     if let Some(p) = pending {
                         if p.mailbox == mailbox && p.uid == uid && p.part_number == part_number {
                             p.button.set_sensitive(true);
-                            p.button.set_label("Save");
                             toast_overlay.add_toast(adw::Toast::new(&message));
                         } else {
                             state.borrow_mut().pending_attachment = Some(p);
@@ -5113,6 +5164,16 @@ fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHeader) {
     header.favorite_button.set_active(starred);
     apply_favorite_visual(&header.favorite_button, starred);
     header.favorite_suppress.set(false);
+}
+
+/// Decodes a bundled SVG (embedded via `include_bytes!`) into a fixed-size
+/// `gtk::Image` for the nav-rail view buttons, which use full-colour artwork
+/// rather than theme icon names.
+fn nav_rail_image(bytes: &'static [u8]) -> gtk::Image {
+    let texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(bytes)).expect("bundled nav-rail SVG should decode");
+    let image = gtk::Image::from_paintable(Some(&texture));
+    image.set_pixel_size(28);
+    image
 }
 
 /// Keeps the favorite star's icon and tooltip in step with its pressed state.
@@ -6234,13 +6295,16 @@ fn attachment_display_name(part: &BodyPart) -> String {
 /// Rebuilds the reading pane's attachment strip for the message about to be
 /// rendered: clears whatever's there, then one row per attachment `BodyPart`
 /// (`is_attachment` only - inline `cid:` images stay in the HTML body). Each
-/// row shows the attachment's name and size plus a Save button that asks the
+/// row shows the attachment's name and size plus a menu button whose popover
+/// offers **Open** (the MIME type's default handler, via a temporary file
+/// deleted when Lookout exits), **Open With…** (a chooser dialog for the
+/// handler), and **Save…** (a save-location dialog) - all three ask the
 /// account session for that part's bytes on demand (`FetchAttachment`). The
-/// strip is hidden when the message has no attachments. Tracked as the single
-/// in-flight `UiState::pending_attachment` while a button is loading.
+/// strip is hidden when the message has no attachments. One action is in
+/// flight at a time, tracked as the single `UiState::pending_attachment`.
 fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, mailbox: &MailboxId, uid: Uid, parts: &[BodyPart]) {
     let Some(strip) = find_attachment_strip(reading_stack) else { return };
-    // A previous render's in-flight save belongs to the message being
+    // A previous render's in-flight action belongs to the message being
     // replaced; any late `PartFetched` for it is discarded as stale.
     state.borrow_mut().pending_attachment = None;
     while let Some(child) = strip.first_child() {
@@ -6258,74 +6322,124 @@ fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::S
         let label = gtk::Label::new(Some(&format!("{name}  ·  {}", human_size(part.size))));
         label.set_xalign(0.0);
         label.set_hexpand(true);
-        let button = gtk::Button::with_label("Save");
-        button.add_css_class("suggested-action");
+        let menu_button = gtk::MenuButton::new();
+        menu_button.set_icon_name("open-menu-symbolic");
+        menu_button.add_css_class("flat");
+        menu_button.set_tooltip_text(Some("Save or open attachment"));
+        let popover = gtk::Popover::new();
+        let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        items.set_margin_top(6);
+        items.set_margin_bottom(6);
+        items.set_margin_start(6);
+        items.set_margin_end(6);
+        let open_item = gtk::Button::with_label("Open");
+        open_item.add_css_class("flat");
+        open_item.set_halign(gtk::Align::Start);
+        let open_with_item = gtk::Button::with_label("Open With…");
+        open_with_item.add_css_class("flat");
+        open_with_item.set_halign(gtk::Align::Start);
+        let save_item = gtk::Button::with_label("Save…");
+        save_item.add_css_class("flat");
+        save_item.set_halign(gtk::Align::Start);
+        items.append(&open_item);
+        items.append(&open_with_item);
+        items.append(&save_item);
+        popover.set_child(Some(&items));
+        menu_button.set_popover(Some(&popover));
         row.append(&icon);
         row.append(&label);
-        row.append(&button);
+        row.append(&menu_button);
 
-        let mailbox_for_click = mailbox.clone();
-        let state_for_click = state.clone();
-        let button_for_click = button.clone();
-        let part_for_click = part.clone();
-        button.connect_clicked(move |_| {
-            // One in-flight fetch at a time; ignore a click while one is
-            // outstanding.
-            if state_for_click.borrow().pending_attachment.is_some() {
-                return;
-            }
-            let cmd_tx = match mailbox_account_id(&mailbox_for_click) {
-                Some(id) => {
-                    let st = state_for_click.borrow();
-                    st.accounts.get(&id).map(|h| h.cmd_tx.clone())
-                }
-                None => None,
-            };
-            let Some(cmd_tx) = cmd_tx else { return };
-            state_for_click.borrow_mut().pending_attachment = Some(PendingAttachment {
-                mailbox: mailbox_for_click.clone(),
+        let button_for_open = menu_button.clone();
+        let state_for_open = state.clone();
+        let mailbox_for_open = mailbox.clone();
+        let part_for_open = part.clone();
+        open_item.connect_clicked(move |_| {
+            start_attachment_fetch(&state_for_open, &mailbox_for_open, uid, &part_for_open, &button_for_open, PendingAttachmentAction::Open);
+        });
+        let button_for_open_with = menu_button.clone();
+        let state_for_open_with = state.clone();
+        let mailbox_for_open_with = mailbox.clone();
+        let part_for_open_with = part.clone();
+        open_with_item.connect_clicked(move |_| {
+            start_attachment_fetch(
+                &state_for_open_with,
+                &mailbox_for_open_with,
                 uid,
-                part_number: part_for_click.part_number.clone(),
-                button: button_for_click.clone(),
-            });
-            button_for_click.set_sensitive(false);
-            button_for_click.set_label("Fetching…");
-            tracing::debug!(?mailbox_for_click, uid = uid.0, part = %part_for_click.part_number, "Save attachment: dispatching to account actor");
-            let _ = cmd_tx.send_blocking(AccountCommand::FetchAttachment {
-                mailbox: mailbox_for_click.clone(),
-                uid,
-                part: part_for_click.clone(),
-            });
-            // Backstop: if the session dies mid-fetch (the command is lost to
-            // the reconnect) no event will ever answer this request - restore
-            // the button after a generous grace period instead of leaving it
-            // stuck. Only fires if this exact request is still the outstanding
-            // one; a resolved or superseded request leaves it alone.
-            let timeout_mailbox = mailbox_for_click.clone();
-            let timeout_part = part_for_click.part_number.clone();
-            let timeout_button = button_for_click.clone();
-            let timeout_state = state_for_click.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
-                let still_pending = match &timeout_state.borrow().pending_attachment {
-                    Some(p) => p.mailbox == timeout_mailbox && p.uid == uid && p.part_number == timeout_part,
-                    None => false,
-                };
-                if still_pending {
-                    let mut st = timeout_state.borrow_mut();
-                    st.pending_attachment = None;
-                    drop(st);
-                    timeout_button.set_sensitive(true);
-                    timeout_button.set_label("Save");
-                    if let Some(toast_overlay) = &timeout_state.borrow().toast_overlay {
-                        toast_overlay.add_toast(adw::Toast::new("Attachment fetch timed out"));
-                    }
-                }
-                glib::ControlFlow::Break
-            });
+                &part_for_open_with,
+                &button_for_open_with,
+                PendingAttachmentAction::OpenWith,
+            );
+        });
+        let button_for_save = menu_button.clone();
+        let state_for_save = state.clone();
+        let mailbox_for_save = mailbox.clone();
+        let part_for_save = part.clone();
+        save_item.connect_clicked(move |_| {
+            start_attachment_fetch(&state_for_save, &mailbox_for_save, uid, &part_for_save, &button_for_save, PendingAttachmentAction::Save);
         });
 
         strip.append(&row);
     }
+}
+
+/// Starts an attachment action (Save or Open) for one strip row: records it
+/// as the single in-flight `UiState::pending_attachment`, disables the row's
+/// menu button, and asks the account session for the part's bytes
+/// (`AccountCommand::FetchAttachment`). Also arms the 60-second backstop that
+/// restores the button if no answer ever arrives (the session dying mid-fetch
+/// loses the command to the reconnect) - a resolved or superseded request is
+/// left alone.
+fn start_attachment_fetch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, part: &BodyPart, button: &gtk::MenuButton, action: PendingAttachmentAction) {
+    // One in-flight fetch at a time; ignore a click while one is outstanding.
+    if state.borrow().pending_attachment.is_some() {
+        return;
+    }
+    let cmd_tx = match mailbox_account_id(mailbox) {
+        Some(id) => {
+            let st = state.borrow();
+            st.accounts.get(&id).map(|h| h.cmd_tx.clone())
+        }
+        None => None,
+    };
+    let Some(cmd_tx) = cmd_tx else { return };
+    state.borrow_mut().pending_attachment = Some(PendingAttachment {
+        mailbox: mailbox.clone(),
+        uid,
+        part_number: part.part_number.clone(),
+        action,
+        button: button.clone(),
+    });
+    button.set_sensitive(false);
+    tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, action = ?action, "attachment action: dispatching to account actor");
+    let _ = cmd_tx.send_blocking(AccountCommand::FetchAttachment {
+        mailbox: mailbox.clone(),
+        uid,
+        part: part.clone(),
+    });
+    // Backstop: restore the button after a generous grace period instead of
+    // leaving it stuck. Only fires if this exact request is still the
+    // outstanding one.
+    let timeout_mailbox = mailbox.clone();
+    let timeout_part = part.part_number.clone();
+    let timeout_button = button.clone();
+    let timeout_state = state.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+        let still_pending = match &timeout_state.borrow().pending_attachment {
+            Some(p) => p.mailbox == timeout_mailbox && p.uid == uid && p.part_number == timeout_part,
+            None => false,
+        };
+        if still_pending {
+            let mut st = timeout_state.borrow_mut();
+            st.pending_attachment = None;
+            drop(st);
+            timeout_button.set_sensitive(true);
+            if let Some(toast_overlay) = &timeout_state.borrow().toast_overlay {
+                toast_overlay.add_toast(adw::Toast::new("Attachment fetch timed out"));
+            }
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 /// Prompts for a save location (via the platform save dialog - a GTK
@@ -6341,6 +6455,208 @@ async fn save_attachment_to_disk(window: &adw::ApplicationWindow, toast_overlay:
     match result {
         Ok(_) => toast_overlay.add_toast(adw::Toast::new("Attachment saved")),
         Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't save attachment: {e}"))),
+    }
+}
+
+/// A safe file extension for an attachment's temporary copy, so the system's
+/// default handler can recognize the file type: the filename's own extension
+/// when it's a clean alphanumeric token (≤ 8 chars), else a content-type map,
+/// else a `bin` fallback (or the subtype when it's a single clean token, e.g.
+/// `application/vnd.foo` → `vnd` is rejected for containing `-`, so it falls
+/// through to `bin`).
+fn attachment_extension(part: &BodyPart) -> String {
+    let from_filename = part
+        .filename
+        .as_deref()
+        .and_then(|f| std::path::Path::new(f).extension())
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|ext| !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()));
+    if let Some(ext) = from_filename {
+        return ext;
+    }
+    let subtype = part.content_type.split('/').nth(1).unwrap_or("");
+    match part.content_type.as_str() {
+        "application/pdf" => "pdf",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        "application/vnd.oasis.opendocument.text" => "odt",
+        "application/zip" => "zip",
+        "application/gzip" => "gz",
+        "application/x-7z-compressed" => "7z",
+        "application/json" => "json",
+        "application/xml" => "xml",
+        "application/octet-stream" => "bin",
+        "text/plain" => "txt",
+        "text/html" => "html",
+        "text/csv" => "csv",
+        "message/rfc822" => "eml",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/wav" => "wav",
+        // Unknown type: the subtype alone when it's a single clean token
+        // ("octet-stream" contains a hyphen and correctly lands on `bin`).
+        _ if !subtype.is_empty() && subtype.len() <= 8 && subtype.chars().all(|c| c.is_ascii_alphanumeric()) => subtype,
+        _ => "bin",
+    }
+    .to_string()
+}
+
+/// The unique temp-file path an "Open" action materializes an attachment at:
+/// `$TMPDIR/lookout-<uuid>.<ext>`, where the extension comes from
+/// `attachment_extension` so the system's default handler recognizes the
+/// type. A fresh uuid per call means concurrent opens never collide.
+fn temp_attachment_path(part: &BodyPart) -> PathBuf {
+    std::env::temp_dir().join(format!("lookout-{}.{}", uuid::Uuid::new_v4().simple(), attachment_extension(part)))
+}
+
+/// Writes the fetched attachment bytes to a unique temporary file and
+/// registers it for deletion when Lookout exits. The caller keeps ownership
+/// of the path for its own launch step; on a launch failure it should call
+/// `discard_temp_attachment` so the file doesn't linger until exit.
+fn materialize_temp_attachment(state: &Rc<RefCell<UiState>>, part: &BodyPart, bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = temp_attachment_path(part);
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    state.borrow_mut().temp_attachment_files.insert(path.clone());
+    Ok(path)
+}
+
+/// Unregisters and deletes a temp file that will never be opened - a launch
+/// failure or an "Open With" dialog dismissed without a choice.
+fn discard_temp_attachment(state: &Rc<RefCell<UiState>>, path: &PathBuf) {
+    state.borrow_mut().temp_attachment_files.remove(path);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Opens the fetched attachment bytes with the MIME type's *default*
+/// application, from a temporary file. The default app is resolved directly
+/// through GIO (`AppInfo::default_for_type`) and launched with
+/// `AppInfo::launch` - a plain activation, no chooser, no portal - so a file
+/// whose type has a registered default opens in exactly that app. Only when
+/// there is no default app for the type (or the direct launch fails, e.g.
+/// running sandboxed, where host apps can't be spawned from inside the
+/// sandbox) does it fall back to `GtkFileLauncher`, which routes through the
+/// XDG portal and lets the portal decide. The temp file is registered in
+/// `UiState::temp_attachment_files` and deleted when Lookout exits; a write
+/// or launch failure toasts and cleans up immediately.
+async fn open_attachment_temp(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: adw::ToastOverlay, part: &BodyPart, bytes: &[u8]) {
+    let path = match materialize_temp_attachment(state, part, bytes) {
+        Ok(path) => path,
+        Err(e) => {
+            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't open attachment: {e}")));
+            return;
+        }
+    };
+    let file = gio::File::for_path(&path);
+    // The default application for the part's MIME type, if one is registered.
+    let default_app = gio::content_type_from_mime_type(&part.content_type).and_then(|ct| gio::AppInfo::default_for_type(&ct, false));
+    if let Some(app) = default_app {
+        match app.launch(std::slice::from_ref(&file), None::<&gio::AppLaunchContext>) {
+            Ok(()) => return,
+            Err(e) => tracing::warn!("default app {:?} failed to launch attachment: {e}", app.name()),
+        }
+    }
+    // No default app, or it couldn't be launched directly: let the portal
+    // take it (it launches the default app, or asks the user when there is
+    // none).
+    let launcher = gtk::FileLauncher::new(Some(&file));
+    if let Err(e) = launcher.launch_future(Some(window)).await {
+        discard_temp_attachment(state, &path);
+        toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't open attachment: {e}")));
+    }
+}
+
+/// Opens the fetched attachment bytes with a user-chosen application, from a
+/// temporary file. Asks through the XDG desktop portal's
+/// `org.freedesktop.portal.OpenURI` with the `ask` option set - the portal
+/// presents its own "Open With" application chooser (the same dialog the
+/// portal shows when no default app exists) and launches the picked app on
+/// the host, which is what makes this work from inside a sandbox. The temp
+/// file is registered in `UiState::temp_attachment_files` and deleted when
+/// Lookout exits; a write failure or a portal that isn't reachable toasts and
+/// cleans up immediately. The portal's own response (cancelled vs. launched)
+/// is deliberately not tracked - the file is simply kept until exit either
+/// way, matching the rest of the Open actions.
+async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::ToastOverlay, part: &BodyPart, bytes: &[u8]) {
+    let path = match materialize_temp_attachment(state, part, bytes) {
+        Ok(path) => path,
+        Err(e) => {
+            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't open attachment: {e}")));
+            return;
+        }
+    };
+
+    // The portal's OpenURI method explicitly does not accept `file://` URIs -
+    // local files go through OpenFile, which takes the file descriptor. Pass
+    // the temp file's fd over the bus with the `ask` option set, so the
+    // portal shows its own application chooser and launches the picked app
+    // on the host (which is what makes this work from inside a sandbox).
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) => {
+            discard_temp_attachment(state, &path);
+            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't ask which app to open with: {e}")));
+            return;
+        }
+    };
+    let fd_list = gio::UnixFDList::new();
+    let fd_index = match gio::prelude::UnixFDListExtManual::append(&fd_list, &file) {
+        Ok(index) => index,
+        Err(e) => {
+            discard_temp_attachment(state, &path);
+            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't ask which app to open with: {e}")));
+            return;
+        }
+    };
+
+    // org.freedesktop.portal.OpenURI.OpenFile(parent_window, fd, options):
+    // `ask: true` makes the portal present its application chooser instead
+    // of silently using the default; `handle_token` names the request (the
+    // response signal is deliberately ignored - the temp file is kept until
+    // Lookout exits either way). `parent_window` is left empty - a proper
+    // surface handle would need XDG foreign-export plumbing per display
+    // server, and portals accept an empty one.
+    let options = glib::VariantDict::new(None);
+    options.insert_value("handle_token", &glib::Variant::from(uuid::Uuid::new_v4().simple().to_string()));
+    options.insert_value("ask", &glib::Variant::from(true));
+    let options = options.end();
+    let args = glib::Variant::tuple_from_iter([glib::Variant::from(""), glib::Variant::from(glib::variant::Handle(fd_index)), options]);
+
+    let proxy = match gio::DBusProxy::for_bus_future(
+        gio::BusType::Session,
+        gio::DBusProxyFlags::NONE,
+        None,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.OpenURI",
+    )
+    .await
+    {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            discard_temp_attachment(state, &path);
+            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't ask which app to open with: {e}")));
+            return;
+        }
+    };
+    if let Err(e) = proxy
+        .call_with_unix_fd_list_future("OpenFile", Some(&args), gio::DBusCallFlags::NONE, -1, Some(&fd_list))
+        .await
+    {
+        discard_temp_attachment(state, &path);
+        toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't ask which app to open with: {e}")));
     }
 }
 
@@ -6597,6 +6913,68 @@ mod tests {
         assert_eq!(attachment_display_name(&attachment("1.3", None)), "attachment-1.3");
     }
 
+    fn attachment_with_type(part_number: &str, filename: Option<&str>, content_type: &str) -> BodyPart {
+        BodyPart {
+            part_number: part_number.to_string(),
+            content_type: content_type.to_string(),
+            charset: None,
+            transfer_encoding: Some("base64".to_string()),
+            filename: filename.map(str::to_string),
+            cid: None,
+            size: 0,
+            is_attachment: true,
+        }
+    }
+
+    /// The temp-file copy's extension decides which handler opens it, so the
+    /// filename's own extension wins when clean, and content-type mappings
+    /// cover the no-name and hostile-name cases.
+    #[test]
+    fn attachment_extension_prefers_clean_filename_extensions() {
+        assert_eq!(attachment_extension(&attachment_with_type("2", Some("report.pdf"), "application/pdf")), "pdf");
+        // Lowercased - handlers expect conventional extensions.
+        assert_eq!(attachment_extension(&attachment_with_type("2", Some("Photo.PNG"), "image/png")), "png");
+        // A hostile or degenerate filename's extension is ignored, and the
+        // content type answers instead.
+        assert_eq!(attachment_extension(&attachment_with_type("2", Some("report.<script>"), "application/pdf")), "pdf");
+        assert_eq!(attachment_extension(&attachment_with_type("2", Some("report."), "application/pdf")), "pdf");
+        assert_eq!(attachment_extension(&attachment_with_type("2", Some("noext"), "application/pdf")), "pdf");
+    }
+
+    #[test]
+    fn attachment_extension_falls_back_through_content_type_to_bin() {
+        assert_eq!(attachment_extension(&attachment_with_type("2", None, "application/pdf")), "pdf");
+        assert_eq!(attachment_extension(&attachment_with_type("2", None, "image/jpeg")), "jpg");
+        assert_eq!(attachment_extension(&attachment_with_type("2", None, "message/rfc822")), "eml");
+        assert_eq!(attachment_extension(&attachment_with_type("2", None, "text/csv")), "csv");
+        assert_eq!(
+            attachment_extension(&attachment_with_type("2", None, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+            "docx"
+        );
+        // Unknown types: a single clean subtype token is kept, anything with
+        // punctuation or over-length falls back to `bin`.
+        assert_eq!(attachment_extension(&attachment_with_type("2", None, "application/xfoobar")), "xfoobar");
+        assert_eq!(attachment_extension(&attachment_with_type("2", None, "application/octet-stream")), "bin");
+        assert_eq!(attachment_extension(&attachment_with_type("2", None, "application/vnd.example-thing")), "bin");
+    }
+
+    /// The temp-file name must be unique per call, carry the attachment's
+    /// extension (so the handler recognizes it), and never smuggle path
+    /// separators into the file name.
+    #[test]
+    fn temp_attachment_path_is_unique_named_and_sanitized() {
+        let part = attachment_with_type("2", Some("report.pdf"), "application/pdf");
+        let a = temp_attachment_path(&part);
+        let b = temp_attachment_path(&part);
+        assert_ne!(a, b, "each open materializes its own copy");
+        assert_eq!(a.parent(), std::env::temp_dir().as_path().into());
+        let name = a.file_name().and_then(|n| n.to_str()).expect("utf-8 temp name");
+        assert!(name.starts_with("lookout-"), "identifiable as Lookout's: {name}");
+        assert!(name.ends_with(".pdf"), "the handler's extension must survive: {name}");
+        assert_eq!(name.matches('.').count(), 1, "uuid + ext, nothing else: {name}");
+        assert!(!name.contains('/') && !name.contains('\\'));
+    }
+
     #[test]
     fn folder_tree_signature_ignores_fields_the_tree_never_draws() {
         // A STATUS pass rewrites uidnext/uidvalidity on every folder every
@@ -6696,6 +7074,7 @@ mod tests {
             unified_snapshots: HashMap::new(),
             pending_body_request: None,
             pending_attachment: None,
+            temp_attachment_files: HashSet::new(),
             toast_overlay: None,
             pending_html_reveal: false,
             pending_header: None,

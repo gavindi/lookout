@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.50 (2026-08-07)
+
+### Added
+
+- **Mail**: the attachment strip's Save button is now a menu with three actions - **Open**, **Open With…**, and **Save…** - all three sharing the same on-demand part fetch. **Open** resolves the MIME type's *default* application through GIO (`AppInfo::default_for_type`) and launches it directly (`AppInfo::launch`) - a plain activation with no chooser and no portal - so a file whose type has a registered default opens in exactly that app; only when no default exists for the type (or the direct launch fails, e.g. running sandboxed) does it fall back to `GtkFileLauncher` and the XDG portal. **Open With…** asks which application to use through the freedesktop portal itself - a direct `org.freedesktop.portal.OpenURI.OpenFile` call (the portal's `OpenURI` method explicitly rejects `file://` URIs, so the temp file is passed as a file descriptor) with the `ask` option set - presenting the portal's own application chooser, which is what makes the choice work from inside a sandbox. Both open from a unique temporary file (`$TMPDIR/lookout-<uuid>.<ext>`, the extension chosen from the filename or a content-type map so the handler recognizes the type); temp files are registered in `UiState::temp_attachment_files` as soon as they're written and deleted when Lookout exits (`app.connect_shutdown`) - the viewer never outlives its file - and any write or launch failure cleans up immediately with an error toast. **Save…** is the existing save-location dialog. One action is in flight at a time, tracked by the same `PendingAttachment`/`PartFetched` machinery as Save, with the same 60-second backstop so the row's button can never be stuck.
+
+### Changed
+
+- **UI**: the left nav rail's Mail/Calendar/People buttons now use bundled full-colour SVG artwork (`source/Assets/icons/email-1.svg`, `calendar-1.svg`, `contact-1.svg`), decoded from the binary through a new `nav_rail_image` helper, instead of the machine's icon theme (`x-office-calendar-symbolic`/`avatar-default-symbolic`, and the bundled app icon for Mail) - so the rail renders identically on every machine regardless of the installed icon theme.
+
 ## 0.6.49 (2026-08-07)
 
 ### Added

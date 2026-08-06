@@ -122,6 +122,17 @@ fn install_calendar_css() {
         .mini-calendar-compact label {
             font-size: 0.8em;
         }
+        /* The Calendar sidebar's mini month grid keeps its normal font and
+           width, but sheds the theme's default button chrome so the cells
+           aren't bloated to ~36px each (16px min-width + 10px padding per
+           side, the same Adwaita default `.mini-calendar-compact` exists to
+           fight) - without a floor, seven cells would push the grid well past
+           the sidebar's 240px width request. */
+        .mini-calendar-sidebar button {
+            min-width: 0;
+            min-height: 0;
+            padding: 4px 6px;
+        }
         .mini-calendar-today {
             color: @accent_bg_color;
         }
@@ -1864,6 +1875,7 @@ pub struct CalendarSidebar {
 
 pub fn build_sidebar() -> CalendarSidebar {
     let mini_calendar = build_mini();
+    mini_calendar.root.add_css_class("mini-calendar-sidebar");
 
     let add_calendar_button = gtk::Button::builder()
         .label("Add calendar")
