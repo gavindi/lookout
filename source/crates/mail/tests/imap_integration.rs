@@ -3,7 +3,9 @@
 //! `run_account_session` actor - not a hand-rolled test harness - covering
 //! LOGIN, folder discovery, envelope sync, draft save/replace/delete
 //! (`CREATE` + `APPEND` + `UID SEARCH HEADER Message-Id` + `EXPUNGE`),
-//! SMTP send, and `APPEND` to Sent.
+//! SMTP send, `APPEND` to Sent, and on-demand attachment part fetch
+//! (`UID FETCH BODY.PEEK[<part>]` + transfer-decoding) against a message the
+//! test itself APPENDs over a raw plain-TCP IMAP session.
 //!
 //! Requires Docker (or Podman with the Docker-compatible socket) and is
 //! gated behind the `test-utils` feature (enabled automatically for this
@@ -13,7 +15,9 @@
 //! included in its default `-Dgreenmail.setup.test.all` setup) with the
 //! `test-utils`-gated insecure certificate verifier (see
 //! `connection::connect_tls_insecure_for_tests`) to accept its self-signed
-//! cert - `LOOKOUT_INSECURE_TLS_FOR_TESTS` opts into that path.
+//! cert - `LOOKOUT_INSECURE_TLS_FOR_TESTS` opts into that path. The raw
+//! APPEND (below) uses GreenMail's plain IMAP port (3143) over plain TCP
+//! instead - the same container, no TLS needed.
 //!
 //! NOTE: written carefully against documented GreenMail/testcontainers
 //! behavior, but **not run in the environment that wrote it** (no Docker
@@ -57,6 +61,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         .with_wait_for(WaitFor::message_on_stdout("Starting GreenMail standalone"))
         .with_exposed_port(3993.tcp())
         .with_exposed_port(3465.tcp())
+        .with_exposed_port(3143.tcp())
         .start()
         .await
         .expect("failed to start GreenMail container - is Docker running?");
@@ -64,6 +69,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let host = container.get_host().await.unwrap().to_string();
     let imaps_port = container.get_host_port_ipv4(3993).await.unwrap();
     let smtps_port = container.get_host_port_ipv4(3465).await.unwrap();
+    let imap_plain_port = container.get_host_port_ipv4(3143).await.unwrap();
 
     // GreenMail's default setup runs with `-Dgreenmail.auth.disabled`: any
     // username/password authenticates and the mailbox is auto-created, so
@@ -79,7 +85,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
             username: "testuser".to_string(),
         },
         smtp: EndpointConfig {
-            host,
+            host: host.clone(),
             port: smtps_port,
             use_tls: true,
             username: "testuser".to_string(),
@@ -177,8 +183,91 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let _ = cmd_tx.send(AccountCommand::SendMessage(msg)).await;
     wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::SendCompleted)).await;
 
+    // --- On-demand attachment fetch. The session API can't APPEND an
+    // arbitrary message, so seed one through a raw plain-TCP IMAP session:
+    // a multipart/mixed message whose second part is a base64 attachment.
+    let attachment_wire = b"JVBERi0xLjQKJWZha2UgcGRmIGJ5dGVzCg==".to_vec(); // base64 of "%PDF-1.4\n%fake pdf bytes\n"
+    let attachment_bytes: &[u8] = b"%PDF-1.4\n%fake pdf bytes\n";
+    let raw_message = concat!(
+        "From: sender@example.com\r\n",
+        "To: testuser@localhost\r\n",
+        "Subject: with attachment\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/mixed; boundary=\"b0un7\"\r\n",
+        "\r\n",
+        "--b0un7\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: 7bit\r\n",
+        "\r\n",
+        "Body text here\r\n",
+        "--b0un7\r\n",
+        "Content-Type: application/pdf; name=\"doc.pdf\"\r\n",
+        "Content-Disposition: attachment; filename=\"doc.pdf\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+    );
+    let mut raw_message = raw_message.as_bytes().to_vec();
+    raw_message.extend_from_slice(&attachment_wire);
+    raw_message.extend_from_slice(b"\r\n--b0un7--\r\n");
+    append_raw(&host, imap_plain_port, &raw_message).await;
+
+    // A bare SyncMailbox would be answered from the envelope cache; Refresh
+    // forces a live resync of the open mailbox (INBOX) so the new message
+    // shows up.
+    let _ = cmd_tx.send(AccountCommand::Refresh).await;
+    let inbox_id = MailboxId::new(&AccountId("test-account".to_string()), "INBOX");
+    let listed = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::MessagesUpdated { mailbox, .. } if *mailbox == inbox_id)).await;
+    let AccountEvent::MessagesUpdated { messages, .. } = listed else { unreachable!() };
+    let with_attachment = messages
+        .iter()
+        .find(|m| m.subject.as_deref() == Some("with attachment"))
+        .unwrap_or_else(|| panic!("APPENDed message not synced: {messages:?}"));
+    let structure = with_attachment
+        .structure
+        .as_ref()
+        .unwrap_or_else(|| panic!("synced message has no BODYSTRUCTURE: {with_attachment:?}"));
+    let part = structure
+        .iter()
+        .find(|p| p.filename.as_deref() == Some("doc.pdf"))
+        .unwrap_or_else(|| panic!("attachment part not in structure: {structure:?}"));
+    assert_eq!(part.part_number, "2");
+    assert_eq!(part.content_type, "application/pdf");
+
+    let _ = cmd_tx
+        .send(AccountCommand::FetchAttachment {
+            mailbox: inbox_id.clone(),
+            uid: with_attachment.uid,
+            part: part.clone(),
+        })
+        .await;
+    let fetched = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::PartFetched { .. })).await;
+    let AccountEvent::PartFetched {
+        mailbox,
+        uid,
+        part: fetched_part,
+        bytes,
+    } = fetched
+    else {
+        unreachable!()
+    };
+    assert_eq!(mailbox, inbox_id);
+    assert_eq!(uid, with_attachment.uid);
+    assert_eq!(fetched_part.part_number, "2");
+    // The wire bytes were base64; the actor must have decoded them.
+    assert_eq!(bytes, attachment_bytes, "attachment bytes must be transfer-decoded");
+
     let _ = cmd_tx.send(AccountCommand::Shutdown).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+/// Opens a plain-TCP IMAP session to GreenMail (auth is disabled in its test
+/// setup, so any credentials authenticate) and `APPEND`s `raw` to INBOX.
+async fn append_raw(host: &str, port: u16, raw: &[u8]) {
+    let tcp = tokio::net::TcpStream::connect((host, port)).await.expect("plain IMAP connect");
+    let client = async_imap::Client::new(tcp);
+    let mut session = client.login("testuser", "testpass").await.map_err(|e| e.0).expect("plain IMAP login");
+    session.append("INBOX", None, None, raw).await.expect("APPEND to INBOX");
+    session.logout().await.expect("plain IMAP logout");
 }
 
 /// Drains events until one matches `pred` (discarding the rest), panicking

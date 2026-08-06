@@ -6,8 +6,8 @@ use adw::prelude::*;
 use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::{
-    AccountId, CalendarEvent, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole,
-    SystemFlagBit, Uid, VCard,
+    AccountId, BodyPart, CalendarEvent, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId,
+    MailboxRole, SystemFlagBit, Uid, VCard,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::{CalendarAccountConfig, CardDavAccountConfig, Credential, DavClient};
@@ -205,6 +205,30 @@ const SEARCH_RESULT_LIMIT: usize = 300;
 /// to the Categorize menu, so a heavily-tagged row doesn't crowd out the date.
 const MAX_TAG_DOTS: usize = 3;
 
+/// How long a Save-button attachment fetch may take before the UI gives up
+/// and restores the button. The session answers every `FetchAttachment`
+/// (with `PartFetched` or `PartFetchFailed`) except when the connection dies
+/// mid-fetch and the command is lost to the reconnect; this timeout is the
+/// backstop that guarantees the button can never be stuck on "Fetching…"
+/// forever. Generous: the fetch is a single IMAP literal, and multi-megabyte
+/// attachments over slow connections legitimately take a while.
+const ATTACHMENT_FETCH_TIMEOUT_MS: u64 = 60_000;
+
+/// One attachment save in flight for the reading pane, tracked in
+/// `UiState::pending_attachment`. `button` is the strip row's Save button,
+/// disabled and relabelled while the fetch is outstanding so the user can see
+/// which attachment is preparing; it's restored on completion.
+struct PendingAttachment {
+    mailbox: MailboxId,
+    uid: Uid,
+    /// The `BodyPart::part_number` being fetched - matched against a late
+    /// `PartFetched` so a response meant for a different part (or a different
+    /// message) can't re-enable the wrong row.
+    part_number: String,
+    /// The row's Save button, to re-enable/relabel once the bytes land.
+    button: gtk::Button,
+}
+
 /// A small bounded LRU of recently-viewed message bodies, keyed by
 /// `(mailbox, uid)`, front = most recently used. See `BODY_CACHE_IN_MEMORY`.
 struct BodyCache {
@@ -289,6 +313,17 @@ struct UiState {
     /// `BodyFetched` updates that arrive after the user has moved on to a
     /// different message.
     pending_body_request: Option<(MailboxId, Uid)>,
+    /// An attachment-part fetch currently in flight for the reading pane's
+    /// Save button - the row's button is disabled and relabelled while its
+    /// bytes are coming, and re-enabled when `AccountEvent::PartFetched`
+    /// lands (or discarded if the user navigates away first). One at a time;
+    /// the strip's Save buttons ignore a click while one is outstanding.
+    /// See `PendingAttachment`.
+    pending_attachment: Option<PendingAttachment>,
+    /// The window's toast overlay, kept so the attachment Save flow (which
+    /// runs from widget callbacks, not the account event loop) can surface
+    /// fetch-timeout feedback. `None` only in tests, where no window exists.
+    toast_overlay: Option<adw::ToastOverlay>,
     /// A body is currently loading into the reading pane's WebView and
     /// should be revealed when its load finishes. Cleared on every selection
     /// change so a load started for a message the user has already navigated
@@ -850,6 +885,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mail_view: MailView::Single,
         unified_snapshots: HashMap::new(),
         pending_body_request: None,
+        pending_attachment: None,
+        toast_overlay: Some(toast_overlay.clone()),
         pending_html_reveal: false,
         pending_header: None,
         body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),
@@ -1866,6 +1903,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     content_stack.add_named(&text_scroller, Some("text"));
     let message_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_page.append(&message_header.widget);
+    // The attachment strip lives between the header and the body so that
+    // `content_stack` stays the message page's *last* child - `render_body`
+    // locates the body stack via `last_child()`. The strip is a named child so
+    // `render_body` can find it by walk; it's hidden (and emptied) when the
+    // message has no attachments.
+    let attachment_strip = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    attachment_strip.set_widget_name("attachments");
+    attachment_strip.set_margin_start(12);
+    attachment_strip.set_margin_end(12);
+    attachment_strip.set_margin_top(8);
+    attachment_strip.set_margin_bottom(4);
+    attachment_strip.set_visible(false);
+    message_page.append(&attachment_strip);
     message_page.append(&content_stack);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -3117,6 +3167,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.pending_html_reveal = false;
                     st.reveal_generation += 1;
                     st.pending_header = None;
+                    st.pending_attachment = None;
                     st.rendered_message = None;
                     drop(st);
                     reading_multi_label.set_label(&format!("{} messages selected", summaries.len()));
@@ -3129,6 +3180,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.pending_html_reveal = false;
                     st.reveal_generation += 1;
                     st.pending_header = None;
+                    st.pending_attachment = None;
                     st.rendered_message = None;
                     drop(st);
                     reading_stack.set_visible_child_name("empty");
@@ -3466,6 +3518,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         state.clone(),
         root_stack.clone(),
         toast_overlay.clone(),
+        window.clone(),
         folder_selection,
         message_list,
         message_header,
@@ -4211,6 +4264,7 @@ fn spawn_account_discovery(
     state: Rc<RefCell<UiState>>,
     root_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
+    window: adw::ApplicationWindow,
     folder_selection: gtk::SingleSelection,
     message_list: MessageListModel,
     message_header: crate::message_header::MessageHeader,
@@ -4256,6 +4310,7 @@ fn spawn_account_discovery(
                         message_header.clone(),
                         reading_stack.clone(),
                         toast_overlay.clone(),
+                        window.clone(),
                         client.clone(),
                         list_header.clone(),
                         account,
@@ -4283,6 +4338,7 @@ fn connect_account(
     message_header: crate::message_header::MessageHeader,
     reading_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
+    window: adw::ApplicationWindow,
     goa_client: GoaClient,
     list_header: ListHeader,
     account: lookout_goa::GoaMailAccount,
@@ -4485,6 +4541,69 @@ fn connect_account(
                     if should_render {
                         tracing::debug!(?mailbox, uid = uid.0, "FetchBody: body arrived on UI thread");
                         render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
+                    }
+                }
+                AccountEvent::PartFetched { mailbox, uid, part, bytes } => {
+                    // An attachment part's bytes arrived. Only act if they
+                    // belong to the message currently on the reading pane and
+                    // to the outstanding Save request - a response that lands
+                    // after the user moved on (or for a different part of the
+                    // same message) is stale and dropped with its in-flight
+                    // bookkeeping.
+                    let pending = {
+                        let mut st = state.borrow_mut();
+                        let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
+                        if !on_screen {
+                            st.pending_attachment = None;
+                            None
+                        } else {
+                            st.pending_attachment.take()
+                        }
+                    };
+                    if let Some(p) = pending {
+                        if p.mailbox == mailbox && p.uid == uid && p.part_number == part.part_number {
+                            p.button.set_sensitive(true);
+                            p.button.set_label("Save");
+                            let window_for_save = window.clone();
+                            let toast_for_save = toast_overlay.clone();
+                            glib::spawn_future_local(async move {
+                                save_attachment_to_disk(&window_for_save, toast_for_save, &part, &bytes).await;
+                            });
+                        } else {
+                            // Mismatched request (shouldn't happen with the
+                            // one-at-a-time guard, but be safe).
+                            state.borrow_mut().pending_attachment = Some(p);
+                        }
+                    }
+                }
+                AccountEvent::PartFetchFailed {
+                    mailbox,
+                    uid,
+                    part_number,
+                    message,
+                } => {
+                    // The session couldn't produce this attachment's bytes.
+                    // Restore the Save button if this is still the outstanding
+                    // request and tell the user what went wrong - never leave
+                    // the button stuck on "Fetching…".
+                    let pending = {
+                        let mut st = state.borrow_mut();
+                        let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
+                        if !on_screen {
+                            st.pending_attachment = None;
+                            None
+                        } else {
+                            st.pending_attachment.take()
+                        }
+                    };
+                    if let Some(p) = pending {
+                        if p.mailbox == mailbox && p.uid == uid && p.part_number == part_number {
+                            p.button.set_sensitive(true);
+                            p.button.set_label("Save");
+                            toast_overlay.add_toast(adw::Toast::new(&message));
+                        } else {
+                            state.borrow_mut().pending_attachment = Some(p);
+                        }
                     }
                 }
                 AccountEvent::SendCompleted => {
@@ -6065,6 +6184,166 @@ fn reveal_message_page(reading_stack: &gtk::Stack, content_stack: &gtk::Stack, c
     }
 }
 
+/// Locates the reading pane's attachment strip - the named `gtk::Box`
+/// (`"attachments"`) that `build_window` inserted between the message header
+/// and the body `content_stack`.
+fn find_attachment_strip(reading_stack: &gtk::Stack) -> Option<gtk::Box> {
+    let page = reading_stack.child_by_name("message").and_downcast::<gtk::Box>()?;
+    let mut child = page.first_child();
+    while let Some(c) = child {
+        if c.widget_name() == "attachments" {
+            return c.downcast::<gtk::Box>().ok();
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// Renders an attachment's size as a human-readable string (e.g. `"12.3 KB"`),
+/// matching the binary-unit convention everyone expects for file sizes.
+fn human_size(bytes: u32) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// A safe save-suggested name for an attachment without one: falls back to a
+/// part-number-based placeholder (the raw wire could be anything, and a
+/// filename containing `/` from a hostile header must not be fed to the save
+/// dialog as a path). `filename` is trusted when present - it's just the
+/// initial name in the dialog, which the user can change.
+fn attachment_display_name(part: &BodyPart) -> String {
+    part.filename
+        .as_deref()
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty() && !f.contains('/') && !f.contains('\\'))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("attachment-{}", part.part_number))
+}
+
+/// Rebuilds the reading pane's attachment strip for the message about to be
+/// rendered: clears whatever's there, then one row per attachment `BodyPart`
+/// (`is_attachment` only - inline `cid:` images stay in the HTML body). Each
+/// row shows the attachment's name and size plus a Save button that asks the
+/// account session for that part's bytes on demand (`FetchAttachment`). The
+/// strip is hidden when the message has no attachments. Tracked as the single
+/// in-flight `UiState::pending_attachment` while a button is loading.
+fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, mailbox: &MailboxId, uid: Uid, parts: &[BodyPart]) {
+    let Some(strip) = find_attachment_strip(reading_stack) else { return };
+    // A previous render's in-flight save belongs to the message being
+    // replaced; any late `PartFetched` for it is discarded as stale.
+    state.borrow_mut().pending_attachment = None;
+    while let Some(child) = strip.first_child() {
+        strip.remove(&child);
+    }
+
+    let attachments: Vec<&BodyPart> = parts.iter().filter(|p| p.is_attachment).collect();
+    strip.set_visible(!attachments.is_empty());
+    for part in attachments {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.add_css_class("attachment-row");
+        let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
+        icon.add_css_class("dim-label");
+        let name = attachment_display_name(part);
+        let label = gtk::Label::new(Some(&format!("{name}  ·  {}", human_size(part.size))));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        let button = gtk::Button::with_label("Save");
+        button.add_css_class("suggested-action");
+        row.append(&icon);
+        row.append(&label);
+        row.append(&button);
+
+        let mailbox_for_click = mailbox.clone();
+        let state_for_click = state.clone();
+        let button_for_click = button.clone();
+        let part_for_click = part.clone();
+        button.connect_clicked(move |_| {
+            // One in-flight fetch at a time; ignore a click while one is
+            // outstanding.
+            if state_for_click.borrow().pending_attachment.is_some() {
+                return;
+            }
+            let cmd_tx = match mailbox_account_id(&mailbox_for_click) {
+                Some(id) => {
+                    let st = state_for_click.borrow();
+                    st.accounts.get(&id).map(|h| h.cmd_tx.clone())
+                }
+                None => None,
+            };
+            let Some(cmd_tx) = cmd_tx else { return };
+            state_for_click.borrow_mut().pending_attachment = Some(PendingAttachment {
+                mailbox: mailbox_for_click.clone(),
+                uid,
+                part_number: part_for_click.part_number.clone(),
+                button: button_for_click.clone(),
+            });
+            button_for_click.set_sensitive(false);
+            button_for_click.set_label("Fetching…");
+            tracing::debug!(?mailbox_for_click, uid = uid.0, part = %part_for_click.part_number, "Save attachment: dispatching to account actor");
+            let _ = cmd_tx.send_blocking(AccountCommand::FetchAttachment {
+                mailbox: mailbox_for_click.clone(),
+                uid,
+                part: part_for_click.clone(),
+            });
+            // Backstop: if the session dies mid-fetch (the command is lost to
+            // the reconnect) no event will ever answer this request - restore
+            // the button after a generous grace period instead of leaving it
+            // stuck. Only fires if this exact request is still the outstanding
+            // one; a resolved or superseded request leaves it alone.
+            let timeout_mailbox = mailbox_for_click.clone();
+            let timeout_part = part_for_click.part_number.clone();
+            let timeout_button = button_for_click.clone();
+            let timeout_state = state_for_click.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+                let still_pending = match &timeout_state.borrow().pending_attachment {
+                    Some(p) => p.mailbox == timeout_mailbox && p.uid == uid && p.part_number == timeout_part,
+                    None => false,
+                };
+                if still_pending {
+                    let mut st = timeout_state.borrow_mut();
+                    st.pending_attachment = None;
+                    drop(st);
+                    timeout_button.set_sensitive(true);
+                    timeout_button.set_label("Save");
+                    if let Some(toast_overlay) = &timeout_state.borrow().toast_overlay {
+                        toast_overlay.add_toast(adw::Toast::new("Attachment fetch timed out"));
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        });
+
+        strip.append(&row);
+    }
+}
+
+/// Prompts for a save location (via the platform save dialog - a GTK
+/// `FileDialog`, which goes through the XDG portal in sandboxed runs) and
+/// writes the fetched attachment bytes there. The dialog is cancellable by
+/// design; a write failure surfaces as a toast.
+async fn save_attachment_to_disk(window: &adw::ApplicationWindow, toast_overlay: adw::ToastOverlay, part: &BodyPart, bytes: &[u8]) {
+    let dialog = gtk::FileDialog::builder().title("Save attachment").initial_name(attachment_display_name(part)).build();
+    let Ok(file) = dialog.save_future(Some(window)).await else { return };
+    let result = file
+        .replace_contents_bytes_future(&glib::Bytes::from(bytes), None, false, gio::FileCreateFlags::REPLACE_DESTINATION)
+        .await;
+    match result {
+        Ok(_) => toast_overlay.add_toast(adw::Toast::new("Attachment saved")),
+        Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't save attachment: {e}"))),
+    }
+}
+
 fn render_body(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
@@ -6073,6 +6352,7 @@ fn render_body(
     uid: Uid,
     body: lookout_core::EmailBody,
 ) {
+    // Defense-in-depth for the direct `BodyFetched` caller: if this exact
     // Defense-in-depth for the direct `BodyFetched` caller: if this exact
     // message is already on screen, a duplicate body event must not route the
     // pane through "empty" and crossfade the same email again. The selection
@@ -6099,6 +6379,9 @@ fn render_body(
     if let Some(summary) = state.borrow_mut().pending_header.take() {
         message_header.update(&summary);
     }
+    // Rebuild the attachment strip from the body's part list; the body is
+    // available regardless of which text path (html/text/none) renders below.
+    rebuild_attachment_strip(state, reading_stack, &mailbox, uid, &body.parts);
     // Config → Appearance → "Animate transitions" can switch the stack's
     // transition type to `None`; when it's off, skip the fade-specific paths
     // below (routing through "empty", waiting for the WebView to paint) and
@@ -6280,6 +6563,40 @@ mod tests {
         assert_ne!(before, after, "a changed count must rebuild the tree - it's what the row draws");
     }
 
+    fn attachment(part_number: &str, filename: Option<&str>) -> BodyPart {
+        BodyPart {
+            part_number: part_number.to_string(),
+            content_type: "application/pdf".to_string(),
+            charset: None,
+            transfer_encoding: Some("base64".to_string()),
+            filename: filename.map(str::to_string),
+            cid: None,
+            size: 0,
+            is_attachment: true,
+        }
+    }
+
+    #[test]
+    fn human_size_uses_binary_units_and_degrades_to_bytes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(12 * 1024 + 512), "12.5 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+        assert_eq!(human_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
+
+    #[test]
+    fn attachment_display_name_prefers_filename_and_sanitizes_placeholders() {
+        assert_eq!(attachment_display_name(&attachment("2", Some("report.pdf"))), "report.pdf");
+        // A filename that could smuggle a path separator must not reach the
+        // save dialog as a path - fall back to the part-number placeholder.
+        assert_eq!(attachment_display_name(&attachment("2", Some("../etc/passwd"))), "attachment-2");
+        assert_eq!(attachment_display_name(&attachment("2", Some(""))), "attachment-2");
+        assert_eq!(attachment_display_name(&attachment("2", None)), "attachment-2");
+        assert_eq!(attachment_display_name(&attachment("1.3", None)), "attachment-1.3");
+    }
+
     #[test]
     fn folder_tree_signature_ignores_fields_the_tree_never_draws() {
         // A STATUS pass rewrites uidnext/uidvalidity on every folder every
@@ -6378,6 +6695,8 @@ mod tests {
             mail_view: MailView::Single,
             unified_snapshots: HashMap::new(),
             pending_body_request: None,
+            pending_attachment: None,
+            toast_overlay: None,
             pending_html_reveal: false,
             pending_header: None,
             body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),

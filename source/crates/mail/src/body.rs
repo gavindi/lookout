@@ -1,5 +1,7 @@
+use base64::Engine;
 use lookout_core::{BodyPart, EmailBody, Uid};
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::{Message, MessageParser, MimeHeaders, PartType};
+use std::collections::HashMap;
 
 /// Parses a raw RFC 5322 message (as returned by `UID FETCH ... BODY.PEEK[]`)
 /// into an [`EmailBody`]. This is the *fallback* body path, used when a
@@ -14,10 +16,16 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
 
     let headers = message.headers_raw().map(|(name, value)| (name.to_string(), value.trim().to_string())).collect();
 
+    // mail-parser numbers its parts by flat index, not by IMAP section path;
+    // compute the `BODY[<n>]` path for every part so `EmailBody::parts`
+    // carries numbers an on-demand `FetchAttachment` can actually fetch with.
+    let paths = part_paths(&message);
     let parts = message
-        .attachments()
-        .enumerate()
-        .map(|(i, part)| {
+        .attachments
+        .iter()
+        .filter_map(|id| {
+            let part = message.parts.get(*id as usize)?;
+            let part_number = paths.get(id)?.clone();
             let content_type = part
                 .content_type()
                 .map(|ct| match ct.subtype() {
@@ -25,8 +33,8 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
                     None => ct.ctype().to_string(),
                 })
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            BodyPart {
-                part_number: i.to_string(),
+            Some(BodyPart {
+                part_number,
                 content_type,
                 charset: part.content_type().and_then(|ct| ct.attribute("charset")).map(str::to_string),
                 transfer_encoding: part.content_transfer_encoding().map(str::to_string),
@@ -34,7 +42,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
                 cid: part.content_id().map(|s| s.to_string()),
                 size: part.contents().len() as u32,
                 is_attachment: true,
-            }
+            })
         })
         .collect();
 
@@ -46,6 +54,47 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         headers,
         auth_results: None,
     })
+}
+
+/// Computes every MIME part's RFC 3501 section path - the `BODY[<n>]` number
+/// a partial fetch must target - by walking the parsed message's part tree the
+/// same way `structure.rs` flattens a `BODYSTRUCTURE` response:
+///
+/// - A root single part is section `1`.
+/// - A multipart's children are numbered `1..N` in document order; the
+///   multipart wrapper itself is never a fetchable section.
+/// - A `message/rfc822` part is a leaf (an attached email is fetched whole,
+///   never descended into).
+///
+/// Returns a map from mail-parser's flat part index to the dotted path, e.g.
+/// `"2"` or `"1.3"`.
+//
+#[allow(dead_code)]
+fn part_paths(message: &Message<'_>) -> HashMap<u32, String> {
+    fn walk(message: &Message<'_>, part_id: u32, prefix: &mut Vec<u32>, out: &mut HashMap<u32, String>) {
+        let Some(part) = message.parts.get(part_id as usize) else { return };
+        if let PartType::Multipart(children) = &part.body {
+            for (i, child) in children.iter().enumerate() {
+                prefix.push(i as u32 + 1);
+                walk(message, *child, prefix, out);
+                // The child's own number must be popped again before the next
+                // sibling - `truncate`-style cleanup here would also pop the
+                // *parent's* number for this branch.
+                prefix.pop();
+            }
+        } else {
+            // A leaf (text, binary, or an embedded message - never descended
+            // into). A root single part is section "1".
+            if prefix.is_empty() {
+                prefix.push(1);
+            }
+            out.insert(part_id, prefix.iter().map(u32::to_string).collect::<Vec<_>>().join("."));
+            prefix.pop();
+        }
+    }
+    let mut out = HashMap::new();
+    walk(message, 0, &mut Vec::new(), &mut out);
+    out
 }
 
 /// Parses the raw bytes of a `BODY.PEEK[HEADER]` section into the
@@ -133,6 +182,75 @@ fn decode_text_part(part: &BodyPart, bytes: &[u8]) -> (Option<String>, Option<St
     raw.extend_from_slice(bytes);
     let Some(message) = MessageParser::default().parse(&raw) else { return (None, None) };
     (message.body_text(0).map(|c| c.into_owned()), message.body_html(0).map(|c| c.into_owned()))
+}
+
+/// Decodes a fetched MIME part's *wire* bytes (as returned by
+/// `BODY.PEEK[<part>]`) into the content bytes, undoing the part's declared
+/// transfer encoding (`BodyPart::transfer_encoding`, learned from
+/// `BODYSTRUCTURE`): `base64` and `quoted-printable` are decoded, while
+/// `7bit`/`8bit`/`binary` (and anything unrecognized) are content already.
+///
+/// This is the attachment counterpart of `decode_text_part`: text parts are
+/// decoded by wrapping them in a single-part message and re-parsing with
+/// `mail_parser` (so their charset conversion reuses the battle-tested path),
+/// but attachment bytes must come out as *bytes*, not text - and a wrapping
+/// re-parse would mis-handle `message/rfc822` attachments (whose inner
+/// message would be descended into instead of saved whole). Decoding the
+/// transfer encoding directly keeps the original content intact regardless of
+/// content type.
+pub fn transfer_part_bytes(part: &BodyPart, bytes: &[u8]) -> Vec<u8> {
+    match part.transfer_encoding.as_deref().unwrap_or("7bit") {
+        "base64" => {
+            // IMAP servers may fold base64 across CRLF line breaks; strip all
+            // ASCII whitespace before decoding, per RFC 2045 §6.8.
+            let clean: Vec<u8> = bytes.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+            match base64::engine::general_purpose::STANDARD.decode(&clean) {
+                Ok(decoded) => decoded,
+                // A server that lied about the encoding (or a truncated
+                // fetch) must degrade to the raw bytes, never panic.
+                Err(_) => bytes.to_vec(),
+            }
+        }
+        "quoted-printable" => decode_quoted_printable(bytes),
+        // 7bit, 8bit, binary, or an unrecognized encoding name: the bytes
+        // are the content itself.
+        _ => bytes.to_vec(),
+    }
+}
+
+/// RFC 2045 quoted-printable decoder: `=XX` hex escapes become a byte, and a
+/// trailing `=` before a line break is a *soft* break that encodes nothing
+/// (it exists only to keep encoded lines short and is dropped). Anything that
+/// isn't a well-formed escape is passed through literally.
+fn decode_quoted_printable(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'=' {
+            // Soft line break: "=\r\n" or "=\n" collapses to nothing.
+            if i + 1 < input.len() && (input[i + 1] == b'\r' || input[i + 1] == b'\n') {
+                i += if input[i + 1] == b'\r' && i + 2 < input.len() && input[i + 2] == b'\n' { 3 } else { 2 };
+                continue;
+            }
+            // `=XX` hex escape.
+            if i + 2 < input.len() {
+                let high = (input[i + 1] as char).to_digit(16);
+                let low = (input[i + 2] as char).to_digit(16);
+                if let (Some(high), Some(low)) = (high, low) {
+                    out.push((high << 4 | low) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            // A lone `=` that isn't part of a valid escape is passed through.
+            out.push(b'=');
+            i += 1;
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// The longest snippet kept for a list row.
@@ -250,6 +368,50 @@ mod tests {
     fn malformed_html_fixture_does_not_panic() {
         let body = parse_body(Uid(0), &fixture("html-malformed.eml")).expect("parses");
         assert!(body.html_body.is_some());
+    }
+
+    /// The whole-message fallback path must produce *real* IMAP section paths,
+    /// not enumeration counters: an on-demand `FetchAttachment` fetches by
+    /// `BODY.PEEK[<part_number>]`, and "0" was never a valid section - the
+    /// server would error (or return nothing) and the Save button would hang.
+    /// A multipart/mixed [text/plain, pdf] message numbers the pdf `2`.
+    #[test]
+    fn fallback_parts_carry_real_section_numbers_for_a_mixed_message() {
+        let body = parse_body(Uid(0), &fixture("with-attachment.eml")).expect("parses");
+        assert!(body.text_body.is_some());
+        let pdf = body.parts.iter().find(|p| p.filename.as_deref() == Some("doc.pdf")).expect("pdf attachment listed");
+        assert_eq!(pdf.part_number, "2");
+        assert_eq!(pdf.content_type, "application/pdf");
+        assert_eq!(pdf.size, b"%PDF-1.4\n%fake pdf bytes\n".len() as u32);
+        assert!(pdf.is_attachment);
+    }
+
+    /// A multipart/alternative nested inside multipart/mixed numbers the
+    /// alternative's children `1.1`/`1.2` and the trailing attachment `2` -
+    /// the same paths the server's `BODYSTRUCTURE` would report.
+    #[test]
+    fn fallback_parts_number_nested_structures_like_bodystructure() {
+        let body = parse_body(Uid(0), &fixture("nested-parts.eml")).expect("parses");
+        let blob = body.parts.iter().find(|p| p.filename.as_deref() == Some("blob.bin")).expect("blob attachment listed");
+        assert_eq!(blob.part_number, "2");
+        assert_eq!(blob.content_type, "application/octet-stream");
+        // Only the octet-stream is an attachment here - the alternative's two
+        // halves are the message body, not attachments.
+        assert_eq!(body.parts.len(), 1, "nested alternative halves must not surface as attachments");
+    }
+
+    /// An attachments-only message (no text part at all - the case that sent
+    /// the viewer down the whole-message fallback in the first place, because
+    /// the partial-fetch path has nothing to fetch) is a root single part and
+    /// its attachment is section `1`.
+    #[test]
+    fn fallback_parts_number_a_single_part_attachment_as_one() {
+        let body = parse_body(Uid(0), &fixture("attachment-only.eml")).expect("parses");
+        assert!(body.text_body.is_none());
+        assert!(body.html_body.is_none());
+        let fax = body.parts.iter().find(|p| p.filename.as_deref() == Some("fax.pdf")).expect("fax attachment listed");
+        assert_eq!(fax.part_number, "1");
+        assert_eq!(fax.content_type, "application/pdf");
     }
 
     #[test]
@@ -421,6 +583,66 @@ mod tests {
                 ("X-Custom".to_string(), "padded".to_string())
             ]
         );
+    }
+
+    fn attachment_part(part_number: &str, file_type: &str, transfer_encoding: &str) -> BodyPart {
+        BodyPart {
+            part_number: part_number.to_string(),
+            content_type: file_type.to_string(),
+            charset: None,
+            transfer_encoding: Some(transfer_encoding.to_string()),
+            filename: Some("doc.bin".to_string()),
+            cid: None,
+            size: 0,
+            is_attachment: true,
+        }
+    }
+
+    /// `BODY.PEEK[<part>]` returns the part still in its transfer encoding, so
+    /// the decoder must undo base64 - including base64 folded across CRLF, as
+    /// servers emit for long lines - to reveal the content bytes.
+    #[test]
+    fn transfer_part_bytes_decodes_base64() {
+        let payload: &[u8] = b"PNG\x00\x01\x02\x03binary content";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let folded = encoded.as_bytes().chunks(8).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("\r\n");
+        let part = attachment_part("2", "image/png", "base64");
+        assert_eq!(transfer_part_bytes(&part, folded.as_bytes()), payload);
+    }
+
+    /// A base64 part whose bytes aren't valid base64 (truncated fetch, or a
+    /// server that lied about the encoding) must fall back to the raw bytes
+    /// rather than panic or vanish.
+    #[test]
+    fn transfer_part_bytes_base64_failure_falls_back_to_raw() {
+        let part = attachment_part("2", "application/pdf", "base64");
+        assert_eq!(transfer_part_bytes(&part, b"%%%not-base64%%%"), b"%%%not-base64%%%");
+    }
+
+    /// Quoted-printable: `=XX` hex escapes and CRLF soft breaks must decode to
+    /// the original bytes.
+    #[test]
+    fn transfer_part_bytes_decodes_quoted_printable() {
+        let part = attachment_part("2", "text/plain", "quoted-printable");
+        // "front=3Dline" across a soft break -> "front=line"; "caf=E9" -> "café".
+        // Quoted-printable is byte-oriented: `=E9` is the Latin-1 byte 0xE9,
+        // which the transfer decoder passes through untouched (charset
+        // conversion is the text-part path's job, not this decoder's).
+        let qp = b"caf=E9 =3D equals =\r\ncontinued";
+        assert_eq!(transfer_part_bytes(&part, qp), b"caf\xe9 = equals continued");
+    }
+
+    #[test]
+    fn transfer_part_bytes_passes_7bit_through_unmodified() {
+        let part = attachment_part("2", "message/rfc822", "7bit");
+        let raw = b"From: a@b.c\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(transfer_part_bytes(&part, raw), raw);
+    }
+
+    #[test]
+    fn transfer_part_bytes_with_no_encoding_is_passthrough() {
+        let part = attachment_part("2", "application/octet-stream", "binary");
+        assert_eq!(transfer_part_bytes(&part, b"\x00\x01\xff"), b"\x00\x01\xff");
     }
 
     #[test]

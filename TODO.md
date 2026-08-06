@@ -13,7 +13,8 @@ Derived from the implementation plan (`webmail/` → Lookout port). Phase 1 is t
 - [x] Wire account discovery into startup → folder tree for the default account
 - [x] `lookout-mail`: `AccountSession` actor — LOGIN/XOAUTH2, LIST (SPECIAL-USE), SELECT, whole-folder envelope fetch, IDLE loop with instant command interruption
 - [x] Format-versioned SQLite cache for mailboxes/messages (fast first paint before live fetch)
-  - [ ] Flat-file `.eml`/attachment cache (body text is cached; attachment bytes are never fetched yet - the reading pane renders text parts only, and `BodyPart` metadata rides on every summary so a later on-demand part fetch can target the right part number)
+  - [x] Flat-file `.eml`/attachment cache — attachment bytes are fetched on demand (`UID FETCH BODY.PEEK[<part>]` + transfer-decoding), cached as flat files keyed by `(mailbox, uidvalidity, uid, part)` under `$XDG_CACHE_HOME/lookout/mail/attachments/`, and saveable from an attachment strip in the reading pane (`Gtk.FileDialog` save; XDG-portal friendly). `EmailBody::parts` metadata rides on every summary so the on-demand fetch can target the right part number
+  - [ ] Whole-message `.eml` export/cache (the partial-fetch path never assembles a raw message; a full `BODY.PEEK[]` fetch + "Save as .eml" is still open)
 - [x] Folder tree UI wired to live data (`Gtk.TreeListModel`)
 - [x] Message list UI (`message_list.rs`): Outlook-style rows, collapsible date sections, pane header with sync/sort-key/sort-direction/favorite controls
   - [x] Body previews: second `BODY.PEEK[]<0.16384>` pass, snippets carried across resyncs

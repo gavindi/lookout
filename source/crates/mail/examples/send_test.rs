@@ -139,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::DraftSaved { .. } => {}
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed => {}
                     AccountEvent::SearchResults { .. } => {}
+                    AccountEvent::PartFetched { .. } => {}
+                    AccountEvent::PartFetchFailed { .. } => {}
                     AccountEvent::Error(e) => {
                         println!("ERROR: {e}");
                         break;

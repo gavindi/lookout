@@ -160,7 +160,11 @@ impl VCard {
         Ok(card)
     }
 
-    pub fn to_string(&self) -> String {
+    /// Renders this vCard as RFC 6350 text - the writer half of the parser
+    /// above. (Named `serialize` rather than `to_string` so the inherent
+    /// method doesn't shadow the `Display`-derived one clippy would otherwise
+    /// flag as redundant.)
+    pub fn serialize(&self) -> String {
         let mut lines = vec!["BEGIN:VCARD".to_string(), format!("VERSION:{}", self.version)];
 
         if let Some(kind) = &self.kind {
@@ -337,9 +341,9 @@ fn split_param_values(value: &str) -> Vec<String> {
 }
 
 fn parse_name(value: &str) -> Name {
-    let parts: Vec<String> = value.split(';').map(|s| s.to_string()).collect();
+    let parts: Vec<String> = value.split(';').map(str::to_string).collect();
     Name {
-        family: parts.get(0).cloned().unwrap_or_default(),
+        family: parts.first().cloned().unwrap_or_default(),
         given: parts.get(1).cloned().unwrap_or_default(),
         additional: parts.get(2).cloned().unwrap_or_default(),
         prefix: parts.get(3).cloned().unwrap_or_default(),
@@ -362,11 +366,11 @@ fn parse_telephone_field(params: &[Parameter], value: &str) -> TelephoneField {
 }
 
 fn parse_address_field(params: &[Parameter], value: &str) -> Result<AddressField, VCardError> {
-    let parts: Vec<String> = value.split(';').map(|s| unescape_value(s)).collect();
+    let parts: Vec<String> = value.split(';').map(unescape_value).collect();
     let label = param_values(params, "LABEL").first().cloned();
     Ok(AddressField {
         types: param_values(params, "TYPE"),
-        po_box: parts.get(0).cloned().unwrap_or_default(),
+        po_box: parts.first().cloned().unwrap_or_default(),
         extended: parts.get(1).cloned().unwrap_or_default(),
         street: parts.get(2).cloned().unwrap_or_default(),
         locality: parts.get(3).cloned().unwrap_or_default(),
@@ -511,7 +515,7 @@ mod tests {
             categories: vec!["friend".to_string(), "colleague".to_string()],
             other: vec![],
         };
-        let text = card.to_string();
+        let text = card.serialize();
         let parsed = VCard::parse(&text).unwrap();
         assert_eq!(parsed.full_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(parsed.organization.as_ref().unwrap()[0], "Example Corp");

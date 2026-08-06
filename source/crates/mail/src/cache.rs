@@ -1,4 +1,7 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -31,6 +34,13 @@ use crate::error::Result;
 /// uncontended in practice.
 pub struct Cache {
     conn: Mutex<Connection>,
+    /// Per-account directory holding fetched attachment bytes as flat files
+    /// (see `load_attachment`/`store_attachment`). Kept separate from the
+    /// SQLite database because attachment payloads are arbitrary binary blobs
+    /// that can be megabytes and don't need indexing - a deterministic file
+    /// path serves both on-demand read-back and the (out-of-scope) cache
+    /// pruning, and `clear_all_caches` wipes them along with the databases.
+    attachments_dir: std::path::PathBuf,
 }
 
 fn cache_dir() -> std::path::PathBuf {
@@ -335,7 +345,13 @@ impl Cache {
         // caches' raw rows can't be served and are wiped once. Envelope rows
         // survive; their `structure` stays `None` until the next sync, which
         // is exactly the fallback path's cue.
-        const BODY_CACHE_VERSION: i64 = 2;
+        const BODY_CACHE_VERSION: i64 = 3;
+        // Version 3: the whole-message fallback path (`parse_body`) used to
+        // number attachment parts by enumerate counter ("0", "1", ...) instead
+        // of their IMAP section paths, so cached bodies from those builds
+        // carry part numbers no `UID FETCH BODY.PEEK[<n>]` can satisfy - a
+        // save would silently hang. Wipe bodies once so the fixed builds
+        // re-assemble them with real section paths. Envelope rows survive.
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         if stored < ENVELOPE_CACHE_VERSION {
             conn.execute("DELETE FROM messages", [])?;
@@ -355,7 +371,11 @@ impl Cache {
         // worker thread instead (see session.rs), and `replace_messages`
         // keeps the index populated for everything synced under this build.
 
-        Ok(Cache { conn: Mutex::new(conn) })
+        let attachments_dir = cache_dir().join("attachments").join(sanitize_filename(account_id));
+        Ok(Cache {
+            conn: Mutex::new(conn),
+            attachments_dir,
+        })
     }
 
     /// One-time FTS backfill: populates an empty `search_fts` from the
@@ -548,6 +568,46 @@ impl Cache {
         let mut stmt = conn.prepare("SELECT 1 FROM bodies WHERE mailbox_id = ?1 AND uid = ?2 AND uidvalidity = ?3")?;
         let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0], |_| Ok(()))?;
         Ok(rows.next().is_some())
+    }
+
+    /// The per-account flat-file path an attachment's *decoded* bytes are
+    /// stored at. Deterministic - derived only from the mailbox identity (via
+    /// a fixed-seed hash, so two mailbox paths can never collide into one
+    /// filename) and `uidvalidity`/`uid`/`part_number` - so `load_attachment`
+    /// can re-find what `store_attachment` wrote without any index. `uidvalidity`
+    /// joins the key so a recycled uid after a mailbox re-create (RFC 3501
+    /// §2.3.1.1) can never resolve to a stale attachment, matching
+    /// `load_body`'s guard.
+    fn attachment_path(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, part_number: &str) -> PathBuf {
+        let mut hasher = DefaultHasher::new();
+        mailbox_id.0.hash(&mut hasher);
+        let mailbox_hash = hasher.finish();
+        self.attachments_dir.join(format!("{mailbox_hash:016x}-{}-{}-{part_number}.bin", uidvalidity.0, uid.0))
+    }
+
+    /// Returns the previously-fetched bytes of one attachment part, or `None`
+    /// if they aren't cached. Served straight from a flat file - no round trip
+    /// through the database, since attachment payloads are opaque binary blobs.
+    pub fn load_attachment(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, part_number: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.attachment_path(mailbox_id, uid, uidvalidity, part_number);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persists the *decoded* bytes of one attachment part to its flat file so
+    /// a re-open (or a later session) can serve them without re-fetching. The
+    /// bytes are expected to already be transfer-decoded; the encoding is a
+    /// `BodyPart::transfer_encoding` concern that belongs to the fetch path.
+    pub fn store_attachment(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, part_number: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.attachment_path(mailbox_id, uid, uidvalidity, part_number);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, bytes)?;
+        Ok(())
     }
 
     /// The list-row snippets already cached for `mailbox_id`, keyed by uid.
@@ -914,6 +974,57 @@ mod tests {
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The on-demand attachment fetch depends on this: bytes stored once come
+    /// back verbatim, distinct parts (and distinct messages) never collide,
+    /// and a part the cache doesn't know reports a clean miss.
+    #[test]
+    fn round_trips_attachment_bytes_through_the_flat_file_cache() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let pdf = b"%PDF-1.4 fake pdf bytes".to_vec();
+        let png: Vec<u8> = (0u8..255).collect();
+        cache.store_attachment(&mailbox_id, Uid(1), UidValidity(1), "2", &pdf).unwrap();
+        cache.store_attachment(&mailbox_id, Uid(1), UidValidity(1), "3", &png).unwrap();
+        cache.store_attachment(&mailbox_id, Uid(2), UidValidity(1), "2", b"other message").unwrap();
+
+        assert_eq!(cache.load_attachment(&mailbox_id, Uid(1), UidValidity(1), "2").unwrap(), Some(pdf.clone()));
+        assert_eq!(cache.load_attachment(&mailbox_id, Uid(1), UidValidity(1), "3").unwrap(), Some(png.clone()));
+        assert_eq!(cache.load_attachment(&mailbox_id, Uid(2), UidValidity(1), "2").unwrap(), Some(b"other message".to_vec()));
+        assert_eq!(cache.load_attachment(&mailbox_id, Uid(1), UidValidity(1), "9").unwrap(), None);
+
+        // A second cache handle on the same account (e.g. the app's read-side
+        // one) derives the same path and sees the same bytes.
+        let reopened = Cache::open(&account_id).unwrap();
+        assert_eq!(reopened.load_attachment(&mailbox_id, Uid(1), UidValidity(1), "2").unwrap(), Some(pdf));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(cache_dir().join("attachments").join(sanitize_filename(&account_id)));
+    }
+
+    /// `uidvalidity` guards the attachment cache the same way it guards
+    /// `bodies`: after a mailbox is re-created, a recycled uid must be a miss,
+    /// not another message's attachment.
+    #[test]
+    fn attachment_cache_respects_uidvalidity() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache.store_attachment(&mailbox_id, Uid(7), UidValidity(1), "2", b"under uidvalidity 1").unwrap();
+        assert_eq!(cache.load_attachment(&mailbox_id, Uid(7), UidValidity(2), "2").unwrap(), None);
+        assert_eq!(
+            cache.load_attachment(&mailbox_id, Uid(7), UidValidity(1), "2").unwrap(),
+            Some(b"under uidvalidity 1".to_vec())
+        );
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(cache_dir().join("attachments").join(sanitize_filename(&account_id)));
     }
 
     /// The one-time upgrades that make the cache-hit path safe again: a cache
@@ -1328,14 +1439,14 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         // Create a database with envelopes + a body but no search index at all,
-        // exactly what a pre-search build left on disk (user_version 2: the
+        // exactly what a pre-search build left on disk (user_version 3: the
         // envelope and body-format migrations done, the FTS index absent).
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 "
-                PRAGMA user_version = 2;
+                PRAGMA user_version = 3;
                 CREATE TABLE messages (
                     mailbox_id TEXT NOT NULL,
                     uid INTEGER NOT NULL,

@@ -1,0 +1,29 @@
+From: a@example.com
+To: b@example.com
+Subject: Nested structure
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer"
+
+--outer
+Content-Type: multipart/alternative; boundary="inner"
+
+--inner
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+plain body
+
+--inner
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<p>html body</p>
+
+--inner--
+--outer
+Content-Type: application/octet-stream; name="blob.bin"
+Content-Disposition: attachment; filename="blob.bin"
+Content-Transfer-Encoding: base64
+
+YWJjZGVmZ2g=
+--outer--

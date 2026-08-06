@@ -1,0 +1,9 @@
+From: fax@example.com
+To: recipient@example.com
+Subject: Incoming fax
+MIME-Version: 1.0
+Content-Type: application/pdf; name="fax.pdf"
+Content-Disposition: attachment; filename="fax.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJWZha2UgZmF4IHBhZ2VzCg==

@@ -1,0 +1,19 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: A document for you
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="b0un7"
+
+--b0un7
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Please find the document attached.
+
+--b0un7
+Content-Type: application/pdf; name="doc.pdf"
+Content-Disposition: attachment; filename="doc.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJWZha2UgcGRmIGJ5dGVzCg==
+--b0un7--

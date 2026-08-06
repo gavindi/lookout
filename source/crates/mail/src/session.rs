@@ -136,6 +136,20 @@ pub enum AccountCommand {
         mailbox: MailboxId,
         uid: Uid,
     },
+    /// Fetch one attachment part's *decoded* bytes on demand - the other half
+    /// of `FetchBody`, which deliberately never downloads attachments. `part`
+    /// is the `BodyPart` (part number + transfer encoding) the viewer's
+    /// reading pane already knows from the message's `BODYSTRUCTURE`; the
+    /// session SELECTs `mailbox` on demand (same contract as `StoreFlags`),
+    /// fetches `BODY.PEEK[<part.part_number>]`, decodes the wire bytes, stores
+    /// them in the flat-file attachment cache, and answers with
+    /// `AccountEvent::PartFetched`. A previously-fetched part is served from
+    /// the cache with no network round trip.
+    FetchAttachment {
+        mailbox: MailboxId,
+        uid: Uid,
+        part: BodyPart,
+    },
     /// Force a folder-list + current-mailbox resync outside of IDLE's own cadence.
     Refresh,
     /// Send a composed message over SMTP, then `APPEND` it to the account's
@@ -273,6 +287,29 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         uid: Uid,
         body: EmailBody,
+    },
+    /// The answer to an `AccountCommand::FetchAttachment`: `bytes` are the
+    /// part's transfer-decoded content bytes, `part` echoes the request (so
+    /// the UI can match it to the strip row it came from and name the saved
+    /// file from `BodyPart::filename`). Emitted on both the cache-hit and the
+    /// live-fetch path, mirroring `BodyFetched`.
+    PartFetched {
+        mailbox: MailboxId,
+        uid: Uid,
+        part: BodyPart,
+        bytes: Vec<u8>,
+    },
+    /// The answer to an `AccountCommand::FetchAttachment` when the part's
+    /// bytes couldn't be produced: the server didn't return the section, or
+    /// the fetch failed. Unlike a connection failure (which is the session's
+    /// problem to recover from), this is a per-request outcome - the UI uses
+    /// it to restore the Save button and tell the user, instead of leaving it
+    /// stuck on "Fetching…" forever.
+    PartFetchFailed {
+        mailbox: MailboxId,
+        uid: Uid,
+        part_number: String,
+        message: String,
     },
     SendCompleted,
     /// A `SaveDraft` request landed server-side; `message_id` is the draft's
@@ -638,6 +675,82 @@ async fn connect_and_run(
                     tracing::debug!(?mailbox, uid = uid.0, elapsed_ms = started.elapsed().as_millis(), "FetchBody: body ready");
                     if let Some(body) = body {
                         let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
+                    }
+                }
+                AccountCommand::FetchAttachment { mailbox, uid, part } => {
+                    // Same on-demand-SELECT contract as `FetchBody` and
+                    // `StoreFlags`: the attachment lives wherever the message
+                    // does, and the top of the loop puts the session back on
+                    // the user's folder before the next IDLE wait.
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    // The mailbox's uidvalidity guards the flat-file cache the
+                    // same way it guards the body cache - a recycled uid after
+                    // a mailbox re-create must not resolve to a stale part
+                    // (see `Cache::load_attachment`). `UidValidity(0)` is the
+                    // deliberate cache-miss sentinel used by `FetchBody`.
+                    let uidvalidity = folders.iter().find(|m| m.id == mailbox).map(|m| m.uidvalidity).unwrap_or(UidValidity(0));
+                    let started = std::time::Instant::now();
+                    // A failed part fetch must answer the UI with
+                    // `PartFetchFailed` rather than kill the whole session via
+                    // `?` - one bad section shouldn't cost the connection.
+                    let fetched = match cache {
+                        Some(c) => match c.load_attachment(&mailbox, uid, uidvalidity, &part.part_number) {
+                            Ok(Some(bytes)) => {
+                                tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: served from disk cache");
+                                Ok(Some(bytes))
+                            }
+                            Ok(None) => fetch_attachment_part(&mut session, uid, &part).await,
+                            Err(e) => {
+                                tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "failed to read cached attachment: {e}");
+                                fetch_attachment_part(&mut session, uid, &part).await
+                            }
+                        },
+                        None => fetch_attachment_part(&mut session, uid, &part).await,
+                    };
+                    let bytes = match fetched {
+                        Ok(Some(bytes)) => Some(bytes),
+                        // `None` means the server didn't return the requested
+                        // section - a part number that doesn't match the
+                        // server's view of the message.
+                        Ok(None) => {
+                            tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: server returned no such section");
+                            let _ = events
+                                .send(AccountEvent::PartFetchFailed {
+                                    mailbox: mailbox.clone(),
+                                    uid,
+                                    part_number: part.part_number.clone(),
+                                    message: "the server didn't return this attachment's part - it may no longer exist".to_string(),
+                                })
+                                .await;
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: fetch failed: {e}");
+                            let _ = events
+                                .send(AccountEvent::PartFetchFailed {
+                                    mailbox: mailbox.clone(),
+                                    uid,
+                                    part_number: part.part_number.clone(),
+                                    message: format!("couldn't fetch this attachment: {e}"),
+                                })
+                                .await;
+                            None
+                        }
+                    };
+                    if let Some(bytes) = bytes {
+                        if let Some(cache) = cache {
+                            if let Err(e) = cache.store_attachment(&mailbox, uid, uidvalidity, &part.part_number, &bytes) {
+                                tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "failed to cache attachment bytes: {e}");
+                            }
+                        }
+                        tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, bytes = bytes.len(), elapsed_ms = started.elapsed().as_millis(), "FetchAttachment: part ready");
+                        let _ = events.send(AccountEvent::PartFetched { mailbox, uid, part, bytes }).await;
                     }
                 }
                 AccountCommand::SearchMailbox { mailbox, query } => {
@@ -1822,6 +1935,27 @@ async fn fetch_body_partial(session: &mut Session<ImapStream>, uid: Uid, parts: 
     }
 
     Ok(Some(crate::body::assemble_body_from_parts(uid, headers, parts, &fetched)))
+}
+
+/// Fetches one attachment part's wire bytes for the on-demand
+/// `AccountCommand::FetchAttachment`, keyed by its BODYSTRUCTURE-derived part
+/// number, and returns them *transfer-decoded* (base64/quoted-printable undone
+/// via `transfer_part_bytes`). An embedded `message/rfc822` attachment is
+/// returned whole, not re-parsed. Returns `None` if the server didn't return
+/// the section (rather than erroring), so the caller can no-op gracefully.
+async fn fetch_attachment_part(session: &mut Session<ImapStream>, uid: Uid, part: &BodyPart) -> Result<Option<Vec<u8>>> {
+    // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part` the
+    // server's response carries, exactly as `fetch_body_partial` relies on.
+    let path = async_imap::imap_proto::types::SectionPath::Part(part.part_number.split('.').filter_map(|n| n.parse().ok()).collect(), None);
+    let query = format!("(BODY.PEEK[{}])", part.part_number);
+    let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), &query).await?.try_collect().await?;
+    let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {
+        return Ok(None);
+    };
+    let Some(bytes) = fetch.section(&path) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::body::transfer_part_bytes(part, bytes)))
 }
 
 /// Resolves the body of `uid` in the currently SELECTed mailbox, serving a

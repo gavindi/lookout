@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.49 (2026-08-07)
+
+### Added
+
+- **Mail**: attachments can now be saved to disk. The reading pane renders an attachment strip between the message header and the body - one row per attachment (`BodyPart` metadata only, never bytes): an icon, the filename (with a part-number fallback for unnamed parts), a human-readable size, and a Save button. Saving is fully on demand: a new `AccountCommand::FetchAttachment` asks the session for that one part's bytes (`UID FETCH BODY.PEEK[<part_number>]`), the wire bytes are transfer-decoded (`base64` with CRLF folding, `quoted-printable` hex escapes and soft line breaks - new `transfer_part_bytes` in `lookout-mail`), and the decoded content lands in a per-account flat-file cache under `$XDG_CACHE_HOME/lookout/mail/attachments/`, keyed by hashed mailbox + `uidvalidity` + `uid` + part number (deterministic, collision-free, and guarded against recycled uids like the body cache), so a re-save is instant and survives restarts. The session answers with `AccountEvent::PartFetched`; the UI re-enables the row and opens a `Gtk.FileDialog` save dialog (which routes through the XDG portal in sandboxed runs) with the attachment's own filename suggested, toasting "Attachment saved" on success and an error toast on a write failure. One fetch is in flight at a time; a Save click while one is outstanding is ignored.
+
+### Fixed
+
+- **Mail**: saving an attachment could leave the Save button stuck on "Fetching…" forever. The on-demand fetch targets a part by its IMAP section path (`BODY.PEEK[<n>]`), and the whole-message fallback body path (`parse_body`, used whenever a message's summary carries no BODYSTRUCTURE-derived structure) numbered attachment parts by enumerate counter - "0", "1", "2" - rather than by their real section paths. That matters most for messages with no text parts at all (a pure-attachment mail, e.g. a fax or a document notification): the partial-fetch path has nothing to fetch and always falls back to the whole message, so its attachments were always numbered "0", "1", … and `BODY.PEEK[0]` is not a valid section - the server errored or returned nothing, and with no answer the button never recovered. `parse_body` now computes every part's real RFC 3501 section path by walking the parsed MIME tree (root single part is "1"; multipart children number 1..N in order; an embedded `message/rfc822` is a leaf), so the fallback path's part numbers match the server's exactly. The body cache's on-disk format version is bumped (2 → 3) to wipe once any bodies cached with the old bogus numbers, so a re-open re-assembles them with correct paths instead of serving the broken ones forever.
+- **Mail**: an attachment fetch that failed no longer takes the whole account session down with it. A fetch error propagated via `?` out of the command handler and killed the session - which reconnected with backoff and lost the command, leaving the Save button stuck with no explanation - and a missing section was silently dropped the same way. The session now answers every `FetchAttachment` with either `PartFetched` or a new `PartFetchFailed { mailbox, uid, part_number, message }` event, so the UI restores the Save button and toasts the specific failure without costing the connection. As a last-resort backstop, the Save button also gives up after 60 seconds if no answer at all arrives (the only remaining case: the connection dying mid-fetch and the command being lost to the reconnect), restoring itself with a "timed out" toast.
+
+### Changed
+
+- **Build**: `lookout-core`'s vCard writer is renamed `VCard::serialize` (was `to_string`) and the module's `get(0)`/redundant-closure spots are cleaned up - pure clippy hygiene under the current stable toolchain, whose newer lints had pushed the workspace past CI's `-D warnings` gate.
+
+### Testing
+
+- New fixtures cover the fallback path's part numbering: `with-attachment.eml` (multipart/mixed - the pdf is section "2"), `nested-parts.eml` (a multipart/alternative inside multipart/mixed - the attachment is "2", the alternative's halves are "1.1"/"1.2" and not attachments), and `attachment-only.eml` (a single-part binary message - its attachment is section "1"). `transfer_part_bytes` gains base64-with-CRLF, quoted-printable, 7bit/binary-passthrough, and decode-failure fallback tests; the attachment cache gains store/load round-trip and uidvalidity-guard tests. The GreenMail integration test now APPENDs a base64-attachment message over a raw plain-TCP IMAP session and asserts the session returns the transfer-decoded bytes.
+
 ## 0.6.48 (2026-08-06)
 
 ### Added
