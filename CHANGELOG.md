@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.51 (2026-08-07)
+
+### Changed
+
+- **Mail**: the folder pane and message list pane remember their widths, as a percentage of the application window's width, in GSettings (`pane-folder-width-percent`, `pane-message-list-width-percent`). A drag's new width is stored once it settles (150 ms after the last `position` change), and when the window itself is resized - interactively, maximized, tiled, or restored, detected through the window surface's `width` rather than `GtkWindow.default-width`, which GTK only updates for plain resizes of resizable windows - each stored percentage is reapplied against the new window width. The reapplied width is clamped to the same bounds the drag abides by: the start child's minimum width and the space the end child needs, so a stored proportion from a wide window can never push a pane past the reading pane's own floor on a narrow one. A pane that isn't on screen (the Mail tab hidden behind another module) is skipped, so a clamp can't be applied to it and silently overwrite the stored percentage with the clamped value. The stored values survive restarts through the existing GSettings schema (the in-memory fallback gets the same keys and defaults, and a never-set percentage, `-1`, leaves the pane at its built-in position).
+- **Mail**: the folder pane is now bounded on both sides: its minimum width goes from 150px to 200px, and it gains a 320px maximum. The floor is the pane's `size_request` (which is also what the drag and the resize-reapply clamp to), and the ceiling is enforced in the paned's `position` handler - GTK only limits the drag to the pane's natural bounds, which grow with the window, so any overshoot past 320px is snapped back and the separator stops there no matter how wide the window gets. On a window too narrow to give the pane 320px, the natural end-child floor wins.
+
 ## 0.6.50 (2026-08-07)
 
 ### Added

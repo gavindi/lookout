@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.51" date="2026-08-07">
+      <description>
+        <p>The folder and message list panes now remember how wide you made them, and keep their proportions when the window is resized. The folder pane is bounded on both sides: it can't shrink below 200px or grow past 320px.</p>
+      </description>
+    </release>
     <release version="0.6.50" date="2026-08-07">
       <description>
         <p>Each attachment's action is now a menu: open it with the default application for its type, pick another app with "Open With" (via the desktop portal's chooser), or save it to disk - opening uses a temporary copy that's cleaned up when Lookout closes.</p>

@@ -34,6 +34,8 @@ pub const WINDOW_BACKGROUND_PATH: &str = "window-background-path";
 pub const LAYOUT_FOLDER_PANE: &str = "layout-folder-pane";
 pub const LAYOUT_READING_PANE: &str = "layout-reading-pane";
 pub const LAYOUT_CALENDAR_OVERVIEW: &str = "layout-calendar-overview";
+pub const PANE_FOLDER_WIDTH_PCT: &str = "pane-folder-width-percent";
+pub const PANE_MESSAGE_LIST_WIDTH_PCT: &str = "pane-message-list-width-percent";
 pub const SORT_KEY: &str = "sort-key";
 pub const SORT_DESCENDING: &str = "sort-descending";
 pub const MAIL_FAVORITES: &str = "mail-favorites";
@@ -43,11 +45,12 @@ pub const LAST_VIEW_UNIFIED: &str = "last-view-unified";
 pub const LAST_VIEW_MAILBOX: &str = "last-view-mailbox";
 
 /// One stored value, mirroring the GSettings key types the app uses: booleans,
-/// strings, and string arrays (favorites).
+/// strings, doubles (pane-width percentages), and string arrays (favorites).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Value {
     Bool(bool),
     String(String),
+    Double(f64),
     Strv(Vec<String>),
 }
 
@@ -104,6 +107,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(LAYOUT_FOLDER_PANE, Value::Bool(true));
     map.insert(LAYOUT_READING_PANE, Value::Bool(true));
     map.insert(LAYOUT_CALENDAR_OVERVIEW, Value::Bool(true));
+    map.insert(PANE_FOLDER_WIDTH_PCT, Value::Double(-1.0));
+    map.insert(PANE_MESSAGE_LIST_WIDTH_PCT, Value::Double(-1.0));
     map.insert(SORT_KEY, Value::String("date".into()));
     map.insert(SORT_DESCENDING, Value::Bool(true));
     map.insert(MAIL_FAVORITES, Value::Strv(Vec::new()));
@@ -161,6 +166,29 @@ impl SettingsStore {
         }
     }
 
+    pub fn get_double(&self, key: &'static str) -> f64 {
+        match self {
+            SettingsStore::Gio(settings) => settings.double(key),
+            SettingsStore::Memory(map) => match map.borrow().get(key) {
+                Some(Value::Double(value)) => *value,
+                _ => -1.0,
+            },
+        }
+    }
+
+    pub fn set_double(&self, key: &'static str, value: f64) {
+        match self {
+            SettingsStore::Gio(settings) => {
+                if let Err(e) = settings.set_double(key, value) {
+                    tracing::warn!(key, "could not write setting: {e}");
+                }
+            }
+            SettingsStore::Memory(map) => {
+                map.borrow_mut().insert(key, Value::Double(value));
+            }
+        }
+    }
+
     pub fn get_strv(&self, key: &'static str) -> Vec<String> {
         match self {
             SettingsStore::Gio(settings) => settings.strv(key).iter().map(|s| s.to_string()).collect(),
@@ -214,6 +242,16 @@ mod tests {
         assert_eq!(store.get_strv(MAIL_FAVORITES), vec!["a:Inbox", "b:Projects"]);
         store.set_strv(MAIL_FAVORITES, Vec::new());
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());
+    }
+
+    #[test]
+    fn double_round_trip() {
+        let store = resolve();
+        assert_eq!(store.get_double(PANE_FOLDER_WIDTH_PCT), -1.0);
+        store.set_double(PANE_FOLDER_WIDTH_PCT, 13.75);
+        assert_eq!(store.get_double(PANE_FOLDER_WIDTH_PCT), 13.75);
+        store.set_double(PANE_MESSAGE_LIST_WIDTH_PCT, 30.0);
+        assert_eq!(store.get_double(PANE_MESSAGE_LIST_WIDTH_PCT), 30.0);
     }
 
     #[test]

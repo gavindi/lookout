@@ -187,7 +187,12 @@ const CONTACTS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from
 /// width of its own, so without this the separator can be dragged until the
 /// folder names are a sliver. Applied to `folder_card`, not the scroller -
 /// see the call site.
-const FOLDER_PANE_MIN_WIDTH: i32 = 150;
+const FOLDER_PANE_MIN_WIDTH: i32 = 200;
+
+/// How wide the mail screen's folder pane may be, in pixels. The separator
+/// stops here no matter how wide the window grows, so the pane never becomes
+/// an unreadably wide column.
+const FOLDER_PANE_MAX_WIDTH: i32 = 320;
 
 /// How long after the last keystroke before a search query is committed. Long
 /// enough that a burst of typing runs one search, not one per keypress - the
@@ -2636,6 +2641,128 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // item is activated, so registering it here is in time.
     window.add_action(&sort_key_action);
     window.add_action(&list_filter_action);
+
+    // --- Pane widths: persist and reapply. Each paned's `position` change
+    // (a horizontal drag) cancels the pending settle and reschedules it, so
+    // 150 ms after the drag stops the pane's width as a percentage of the
+    // window width is stored in GSettings.
+    // When the window itself is resized, the stored percentages are applied
+    // back to the panes (clamped to each pane's min/max widths, which is what
+    // the drag itself abides by). ---
+    let apply_stored_pane_widths = {
+        let main_paned = main_paned.clone();
+        let messages_reading_paned = messages_reading_paned.clone();
+        let state = state.clone();
+        move |window_width: i32| {
+            if window_width <= 0 {
+                return;
+            }
+            let settings = state.borrow().settings.clone();
+            let folder_pct = settings.get_double(crate::settings::PANE_FOLDER_WIDTH_PCT);
+            if folder_pct > 0.0 && main_paned.is_mapped() {
+                let start_min = main_paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let end_min = main_paned.end_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let min = start_min;
+                let max = main_paned.width().saturating_sub(end_min).max(min).min(FOLDER_PANE_MAX_WIDTH);
+                let target = (folder_pct / 100.0 * window_width as f64) as i32;
+                main_paned.set_position(target.clamp(min, max));
+            }
+            let list_pct = settings.get_double(crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT);
+            if list_pct > 0.0 && messages_reading_paned.is_mapped() {
+                let start_min = messages_reading_paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let end_min = messages_reading_paned.end_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let min = start_min;
+                let max = messages_reading_paned.width().saturating_sub(end_min).max(min);
+                let target = (list_pct / 100.0 * window_width as f64) as i32;
+                messages_reading_paned.set_position(target.clamp(min, max));
+            }
+        }
+    };
+    {
+        let window_for_debug = window.clone();
+        let state_for_save = state.clone();
+        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        main_paned.connect_notify_local(Some("position"), move |paned, _| {
+            // Cap the folder pane's width: the drag itself is only bounded
+            // by the paned's natural minimums, so snap any overshoot here.
+            // Returning lets the re-entrant notify (from `set_position`)
+            // run the settle/save logic with the capped value.
+            if paned.position() > FOLDER_PANE_MAX_WIDTH {
+                paned.set_position(FOLDER_PANE_MAX_WIDTH);
+                return;
+            }
+            if let Some(id) = debounce.take() {
+                id.remove();
+            }
+            let width = paned.position();
+            let window_width = window_for_debug.width();
+            let state_for_timeout = state_for_save.clone();
+            let debounce_for_timeout = debounce.clone();
+            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                debounce_for_timeout.set(None);
+                if window_width > 0 {
+                    let pct = width as f64 * 100.0 / window_width as f64;
+                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_FOLDER_WIDTH_PCT, pct);
+                }
+            })));
+        });
+        let window_for_debug = window.clone();
+        let state_for_save = state.clone();
+        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        messages_reading_paned.connect_notify_local(Some("position"), move |paned, _| {
+            if let Some(id) = debounce.take() {
+                id.remove();
+            }
+            let width = paned.position();
+            let window_width = window_for_debug.width();
+            let state_for_timeout = state_for_save.clone();
+            let debounce_for_timeout = debounce.clone();
+            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                debounce_for_timeout.set(None);
+                if window_width > 0 {
+                    let pct = width as f64 * 100.0 / window_width as f64;
+                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT, pct);
+                }
+            })));
+        });
+    }
+    // GTK4 only updates `default-width` when the window is resized while
+    // resizable and not maximized/tiled/fullscreen (see `should_remember_size`
+    // in gtkwindow.c), so instead we listen on the window's GdkSurface
+    // `width`, which is updated on every surface resize in every state. The
+    // surface only exists once the window is realized, so it's wired from the
+    // window's `map` signal (guarded so re-maps don't stack handlers). The
+    // width is read at timeout time - by then the new allocation has settled,
+    // so the applied percentages are against the final window size. Debounced
+    // so the stored percentages are applied once the window stops resizing.
+    {
+        let apply_stored_pane_widths = apply_stored_pane_widths.clone();
+        let wired: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        window.connect_map(move |window| {
+            let Some(surface) = window.surface() else {
+                return;
+            };
+            if wired.get() {
+                return;
+            }
+            wired.set(true);
+            let apply_for_notify = apply_stored_pane_widths.clone();
+            let window_for_width = window.clone();
+            let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+            surface.connect_width_notify(move |_| {
+                if let Some(id) = debounce.take() {
+                    id.remove();
+                }
+                let window_for_timeout = window_for_width.clone();
+                let apply_for_timeout = apply_for_notify.clone();
+                let debounce_for_timeout = debounce.clone();
+                debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                    debounce_for_timeout.set(None);
+                    apply_for_timeout(window_for_timeout.width());
+                })));
+            });
+        });
+    }
 
     // --- Ctrl+F reveals the search bar and focuses its entry, from anywhere
     // in the window. A `ShortcutController` on the window itself (rather than
