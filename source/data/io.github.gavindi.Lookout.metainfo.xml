@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.7.9" date="2026-08-08">
+      <description>
+        <p>Contacts become fully editable: create, edit, and delete contacts from the People tab, with changes written back to your CardDAV address books. The new Manage groups dialog renames or removes contact groups (your vCard categories) across every account, and contacts can be imported from or exported to .vcf files - importing updates existing contacts by their UID and skips duplicates by email.</p>
+      </description>
+    </release>
     <release version="0.7.8" date="2026-08-08">
       <description>
         <p>Nextcloud (and any CalDAV/CardDAV account whose login differs from its display name) can now connect: DAV requests authenticate with the account's login instead of its display name, GOA's stored URLs are cleaned up (embedded usernames stripped, missing trailing slash restored), and server error pages are sanitized before they reach toasts and status labels.</p>

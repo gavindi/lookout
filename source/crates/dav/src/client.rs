@@ -128,6 +128,17 @@ impl AddressBookInfo {
     }
 }
 
+/// A contact as stored in an address book: the parsed [`VCard`] plus the
+/// collection-relative `href` and current `getetag` of its server-side
+/// object. The write path needs both - a card fetched without them can't be
+/// PUT/DELETEd back with the `If-Match` precondition guard.
+#[derive(Debug, Clone)]
+pub struct ContactRecord {
+    pub href: String,
+    pub etag: Option<String>,
+    pub card: VCard,
+}
+
 impl DavClient {
     pub async fn discover_addressbook_home(&self, credential: &Credential) -> Result<String> {
         let principal = self
@@ -200,21 +211,32 @@ impl DavClient {
     }
 
     pub async fn fetch_addressbook_vcards(&self, addressbook: &AddressBookInfo, credential: &Credential) -> Result<Vec<VCard>> {
+        Ok(self
+            .fetch_addressbook_contacts_with_meta(addressbook, credential)
+            .await?
+            .into_iter()
+            .map(|record| record.card)
+            .collect())
+    }
+
+    /// [`Self::fetch_addressbook_vcards`] with the server-side object metadata
+    /// kept: each card's `href` and current `getetag`, so the caller can PUT
+    /// or DELETE it back with the `If-Match` precondition guard. One
+    /// malformed/unsupported card is skipped (logged) like the plain-fetch
+    /// path, never fatal.
+    pub async fn fetch_addressbook_contacts_with_meta(&self, addressbook: &AddressBookInfo, credential: &Credential) -> Result<Vec<ContactRecord>> {
         let responses = self.fetch_addressbook_contacts(addressbook, credential).await?;
-        let mut vcards = Vec::new();
+        let mut records = Vec::new();
         for response in responses {
             let Some(data) = response.prop(NS_CARDDAV, "address-data") else { continue };
-            // One malformed/unsupported card (a version this parser doesn't
-            // handle, a server-specific quirk, ...) used to abort the whole
-            // batch via `?` - discarding every other card the response also
-            // contained. Skip just that one instead; the rest of the account
-            // shouldn't go blank over a single bad card.
+            let href = response.href.clone();
+            let etag = response.prop(NS_DAV, "getetag").map(str::to_string);
             match VCard::parse(data) {
-                Ok(card) => vcards.push(card),
-                Err(e) => tracing::warn!("skipping unparseable vCard at {:?}: {e}", response.href),
+                Ok(card) => records.push(ContactRecord { href, etag, card }),
+                Err(e) => tracing::warn!("skipping unparseable vCard at {href:?}: {e}"),
             }
         }
-        Ok(vcards)
+        Ok(records)
     }
 }
 
@@ -318,19 +340,7 @@ impl DavClient {
     /// sends `If-None-Match: *`, refusing to overwrite an existing resource.
     /// Returns the server's new etag (the `ETag` response header), if any.
     pub async fn put_calendar_object(&self, href: &str, ics: &str, credential: &Credential, etag: Option<&str>) -> Result<Option<String>> {
-        let url = self.resolve(href)?;
-        let request_url = url.clone();
-        let mut headers = vec![("Content-Type", "text/calendar; charset=utf-8".to_string())];
-        match etag {
-            Some(etag) => headers.push(("If-Match", format!("\"{}\"", etag.trim_matches('"')))),
-            None => headers.push(("If-None-Match", "*".to_string())),
-        }
-        let response = self.send_request("PUT", url, credential, Some(ics.to_string()), &headers).await?;
-        tracing::debug!("DAV PUT {request_url} -> {}", response.status());
-        let new_etag = response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_string);
-        // Drain the body so the connection can be reused.
-        drop(response.text().await?);
-        Ok(new_etag)
+        self.put_object(href, ics, "text/calendar; charset=utf-8", credential, etag).await
     }
 
     /// Deletes the calendar object at `href` via `DELETE` (RFC 4791 §5.3.4).
@@ -338,6 +348,56 @@ impl DavClient {
     /// has changed since it was fetched fails loudly instead of silently
     /// removing a concurrent edit.
     pub async fn delete_calendar_object(&self, href: &str, credential: &Credential, etag: Option<&str>) -> Result<()> {
+        self.delete_object(href, credential, etag).await
+    }
+
+    /// Stores `card` as a vCard object at `href` via `PUT` (RFC 6352 §8.2).
+    /// The same `If-Match`/`If-None-Match` precondition semantics as
+    /// [`Self::put_calendar_object`]: `etag` guards an update against
+    /// clobbering a concurrent change (HTTP 412), `None` creates the object
+    /// without overwriting an existing one. Returns the server's new etag.
+    pub async fn put_contact_vcard(&self, href: &str, card: &VCard, credential: &Credential, etag: Option<&str>) -> Result<Option<String>> {
+        self.put_object(href, &card.serialize(), "text/vcard; charset=utf-8", credential, etag).await
+    }
+
+    /// Deletes the vCard object at `href` via `DELETE` (RFC 6352 §8.3). An
+    /// optional `etag` is sent as `If-Match` so deleting a card that has
+    /// changed since it was fetched fails loudly instead of silently removing
+    /// a concurrent edit.
+    pub async fn delete_contact_vcard(&self, href: &str, credential: &Credential, etag: Option<&str>) -> Result<()> {
+        self.delete_object(href, credential, etag).await
+    }
+
+    /// Stores `body` as an object at `href` via `PUT` with a `Content-Type`
+    /// of `content_type` - the shared write verb behind the calendar and
+    /// vCard wrappers (both are "put a text document at a collection-relative
+    /// href with a precondition guard" under the same error convention).
+    /// `etag` is the resource's current `getetag` for an update - sent as
+    /// `If-Match`, so a write based on a stale copy fails with HTTP 412 rather
+    /// than silently clobbering a concurrent change. `None` marks a create and
+    /// sends `If-None-Match: *`, refusing to overwrite an existing resource.
+    /// Returns the server's new etag (the `ETag` response header), if any.
+    pub async fn put_object(&self, href: &str, body: &str, content_type: &str, credential: &Credential, etag: Option<&str>) -> Result<Option<String>> {
+        let url = self.resolve(href)?;
+        let request_url = url.clone();
+        let mut headers = vec![("Content-Type", content_type.to_string())];
+        match etag {
+            Some(etag) => headers.push(("If-Match", format!("\"{}\"", etag.trim_matches('"')))),
+            None => headers.push(("If-None-Match", "*".to_string())),
+        }
+        let response = self.send_request("PUT", url, credential, Some(body.to_string()), &headers).await?;
+        tracing::debug!("DAV PUT {request_url} -> {}", response.status());
+        let new_etag = response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_string);
+        // Drain the body so the connection can be reused.
+        drop(response.text().await?);
+        Ok(new_etag)
+    }
+
+    /// Deletes the object at `href` via `DELETE` - the shared write verb
+    /// behind the calendar and vCard wrappers. An optional `etag` is sent as
+    /// `If-Match` so deleting a resource that has changed since it was
+    /// fetched fails loudly instead of silently removing a concurrent edit.
+    pub async fn delete_object(&self, href: &str, credential: &Credential, etag: Option<&str>) -> Result<()> {
         let url = self.resolve(href)?;
         let request_url = url.clone();
         let mut headers: Vec<(&str, String)> = Vec::new();
@@ -707,6 +767,111 @@ mod tests {
         let credential = Credential::Password("secret".to_string());
 
         client.delete_calendar_object("/cal/events/evt.ics", &credential, Some("\"etag-del\"")).await.unwrap();
+    }
+
+    fn sample_card() -> VCard {
+        VCard {
+            version: "4.0".to_string(),
+            kind: None,
+            uid: Some("c1@example.com".to_string()),
+            full_name: Some("Jane Doe".to_string()),
+            name: None,
+            organization: None,
+            title: None,
+            emails: vec![lookout_core::EmailField {
+                types: vec!["work".to_string()],
+                address: "jane@example.com".to_string(),
+            }],
+            telephones: Vec::new(),
+            addresses: Vec::new(),
+            urls: Vec::new(),
+            note: None,
+            birthday: None,
+            categories: Vec::new(),
+            other: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_contact_vcard_creates_with_if_none_match_and_vcard_content_type() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/books/alice/jane.vcf"))
+            .and(wiremock::matchers::header("If-None-Match", "*"))
+            .and(wiremock::matchers::header("Content-Type", "text/vcard; charset=utf-8"))
+            .and(wiremock::matchers::body_string_contains("FN:Jane Doe"))
+            .respond_with(ResponseTemplate::new(201).insert_header("ETag", "\"etag-new\""))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        let etag = client.put_contact_vcard("/books/alice/jane.vcf", &sample_card(), &credential, None).await.unwrap();
+        assert_eq!(etag.as_deref(), Some("\"etag-new\""));
+    }
+
+    #[tokio::test]
+    async fn put_contact_vcard_updates_with_if_match() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/books/alice/jane.vcf"))
+            .and(wiremock::matchers::header("If-Match", "\"old-etag\""))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        // An unquoted etag is normalized to the quoted form `If-Match` wants.
+        client
+            .put_contact_vcard("/books/alice/jane.vcf", &sample_card(), &credential, Some("old-etag"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_contact_vcard_412_surfaces_the_server_body_snippet() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(412).set_body_string("Precondition Failed: stale etag"))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        let err = client
+            .put_contact_vcard("/books/alice/jane.vcf", &sample_card(), &credential, Some("stale-etag"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("412"), "error should surface the HTTP status: {err}");
+        assert!(err.to_string().contains("stale etag"), "error should include the server's explanation: {err}");
+    }
+
+    #[tokio::test]
+    async fn delete_contact_vcard_sends_if_match_and_succeeds() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/books/alice/jane.vcf"))
+            .and(wiremock::matchers::header("If-Match", "\"etag-del\""))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        client.delete_contact_vcard("/books/alice/jane.vcf", &credential, Some("\"etag-del\"")).await.unwrap();
     }
 
     #[test]

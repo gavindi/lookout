@@ -633,6 +633,9 @@ mod tests {
     fn empty_or_unparseable_uri_passes_through() {
         assert_eq!(normalize_dav_base_url(String::new(), Some("owncloud")), "");
         assert_eq!(normalize_dav_base_url("not a url".to_string(), Some("owncloud")), "not a url");
-        assert_eq!(normalize_dav_base_url("webcal://feeds.example.com/cal.ics".to_string(), Some("owncloud")), "webcal://feeds.example.com/cal.ics");
+        assert_eq!(
+            normalize_dav_base_url("webcal://feeds.example.com/cal.ics".to_string(), Some("owncloud")),
+            "webcal://feeds.example.com/cal.ics"
+        );
     }
 }

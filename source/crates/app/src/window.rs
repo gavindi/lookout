@@ -57,13 +57,18 @@ struct AccountHandle {
 #[derive(Clone)]
 struct ContactsAccountSnapshot {
     display_name: String,
+    /// The address books discovered for this account - the write path's
+    /// targets: creating a contact PUTs it under a book's href, and the
+    /// contact editor's create mode offers the books as a picker.
+    books: Vec<lookout_dav::AddressBookInfo>,
     /// Every vCard from every CardDAV address book discovered for this
     /// account, flattened - the People screen buckets these by fixed
     /// criteria (all/favourites/lists/deleted) and by vCard `CATEGORIES`
     /// rather than by which address book they came from (see
     /// `refresh_contacts_category_ui`), so which book a card came from
-    /// doesn't need tracking here.
-    contacts: Vec<VCard>,
+    /// doesn't need tracking here. Each record carries the server-side
+    /// `href`/`getetag` the write path needs to PUT/DELETE it back.
+    contacts: Vec<lookout_dav::ContactRecord>,
     suggestions: Vec<EmailAddress>,
 }
 
@@ -96,7 +101,7 @@ fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
 #[derive(Clone)]
 struct ContactsCategoryChoice {
     kind: ContactsBucketKind,
-    contacts: Vec<(AccountId, String, VCard)>,
+    contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)>,
 }
 
 #[derive(Clone)]
@@ -105,6 +110,41 @@ struct ContactsListEntry {
     account_label: String,
     category_label: String,
     card: VCard,
+    /// The server-side object metadata for `card`, needed by the editor to
+    /// PUT/DELETE the contact back (`If-Match` guards against clobbering).
+    /// `href` is empty for entries that only ever display a card (the
+    /// in-memory Deleted bucket), where no write is possible.
+    href: String,
+    etag: Option<String>,
+}
+
+/// A write command for one account's CardDAV session, sent by the People
+/// screen's editor/import/manage-groups flows and executed by the account's
+/// poll loop in `sync_contacts_account`. Each command carries a one-shot
+/// `reply` channel the UI awaits for the result (a toast or a dialog close),
+/// so success/failure can't be conflated with the sync polling's `tx`.
+enum ContactCommand {
+    /// PUT a brand-new card under `book_href` as `<uid>.vcf` with
+    /// `If-None-Match: *`.
+    Create {
+        book_href: String,
+        card: VCard,
+        reply: async_channel::Sender<Result<(), String>>,
+    },
+    /// PUT an edited card to its own `href` with `etag` as `If-Match`
+    /// (a stale etag fails with HTTP 412 instead of clobbering).
+    Update {
+        href: String,
+        etag: Option<String>,
+        card: VCard,
+        reply: async_channel::Sender<Result<(), String>>,
+    },
+    /// DELETE the card at `href` with `etag` as `If-Match`.
+    Delete {
+        href: String,
+        etag: Option<String>,
+        reply: async_channel::Sender<Result<(), String>>,
+    },
 }
 
 /// What the message list is currently showing - either a single mailbox (the
@@ -364,6 +404,11 @@ struct UiState {
     /// CardDAV sync-collection deletion tracking isn't implemented - see
     /// `sync_contacts_account`. In-memory only; cleared on restart.
     deleted_contacts: HashMap<AccountId, Vec<VCard>>,
+    /// Per-account command channel into the CardDAV poll loop
+    /// (`sync_contacts_account`) - the write path for the People screen's
+    /// create/edit/delete/import flows. Keyed by account, inserted as each
+    /// account's session starts in `spawn_contacts_discovery`.
+    contact_cmd_tx: HashMap<AccountId, async_channel::Sender<ContactCommand>>,
     /// Which account owns the currently-open mailbox - drives command
     /// routing (FetchBody, compose "From") and which account's
     /// `MessagesUpdated` events are allowed to update the message list (a
@@ -1045,6 +1090,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         settings: settings.clone(),
         app_config: Rc::new(RefCell::new(crate::app_config::load())),
         deleted_contacts: HashMap::new(),
+        contact_cmd_tx: HashMap::new(),
         current_account: None,
         current_mailbox: None,
         mail_view: MailView::Single,
@@ -2580,6 +2626,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let contacts_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     let contacts_toolbar_label = gtk::Label::builder().label("People").xalign(0.0).css_classes(["dim-label"]).build();
     contacts_command_toolbar.append(&contacts_toolbar_label);
+    let new_contact_button = gtk::Button::with_label("New contact");
+    contacts_command_toolbar.append(&new_contact_button);
+    let import_contacts_button = gtk::Button::with_label("Import…");
+    contacts_command_toolbar.append(&import_contacts_button);
+    let export_contacts_button = gtk::Button::with_label("Export…");
+    contacts_command_toolbar.append(&export_contacts_button);
+    let manage_groups_button = gtk::Button::with_label("Manage groups…");
+    contacts_command_toolbar.append(&manage_groups_button);
     view_toolbar_stack.add_named(&contacts_command_toolbar, Some("contacts"));
 
     // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
@@ -3249,12 +3303,53 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     refresh_contacts_ui(None);
     {
         let window = window.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
         let contacts_entries = contacts_entries.clone();
         contacts_list.connect_row_activated(move |_list, row| {
             let Some(entry) = contacts_entries.borrow().get(row.index() as usize).cloned() else {
                 return;
             };
-            show_contact_details_dialog(&window, &entry);
+            if entry.href.is_empty() {
+                // Deleted-bucket cards are display-only (their server
+                // metadata is gone with the card) - keep the read-only
+                // details dialog for them.
+                show_contact_details_dialog(&window, &entry);
+            } else {
+                show_contact_editor_for(&window, &state, &toast_overlay, &entry);
+            }
+        });
+    }
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        new_contact_button.connect_clicked(move |_| {
+            show_new_contact_editor(&window, &state, &toast_overlay);
+        });
+    }
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        manage_groups_button.connect_clicked(move |_| {
+            show_manage_groups_dialog(&window, &state, &toast_overlay);
+        });
+    }
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        import_contacts_button.connect_clicked(move |_| {
+            show_contacts_import_dialog(&window, &state, &toast_overlay);
+        });
+    }
+    {
+        let window = window.clone();
+        let contacts_entries = contacts_entries.clone();
+        let toast_overlay = toast_overlay.clone();
+        export_contacts_button.connect_clicked(move |_| {
+            export_current_contacts(&window, &contacts_entries, &toast_overlay);
         });
     }
 
@@ -4403,6 +4498,404 @@ fn show_contact_details_dialog(window: &adw::ApplicationWindow, entry: &Contacts
     dialog.present();
 }
 
+/// Sends one [`ContactCommand`] to an account's CardDAV session, returning
+/// the one-shot reply channel the outcome arrives on. `None` when the
+/// account has no session (or it's dead) - the caller decides how to
+/// surface that (a toast, or a silent skip in a batched write).
+fn dispatch_contact_command(
+    state: &Rc<RefCell<UiState>>,
+    account_id: &AccountId,
+    build: impl FnOnce(async_channel::Sender<Result<(), String>>) -> ContactCommand,
+) -> Option<async_channel::Receiver<Result<(), String>>> {
+    let tx = state.borrow().contact_cmd_tx.get(account_id).cloned()?;
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+    if tx.send_blocking(build(reply_tx)).is_err() {
+        return None;
+    }
+    Some(reply_rx)
+}
+
+/// Sends one [`ContactCommand`] to an account's CardDAV session and toasts
+/// its outcome. The command is built by `build` so the one-shot reply
+/// channel pairs with the awaited result; a missing account or a dead
+/// session answers with a toast instead of silently dropping the write.
+fn send_contact_command(
+    state: &Rc<RefCell<UiState>>,
+    account_id: &AccountId,
+    toast_overlay: &adw::ToastOverlay,
+    success: &'static str,
+    failure_prefix: &'static str,
+    build: impl FnOnce(async_channel::Sender<Result<(), String>>) -> ContactCommand,
+) {
+    let Some(reply_rx) = dispatch_contact_command(state, account_id, build) else {
+        toast_overlay.add_toast(adw::Toast::new("The contacts session isn't running."));
+        return;
+    };
+    let toast_overlay = toast_overlay.clone();
+    glib::spawn_future_local(async move {
+        match reply_rx.recv().await {
+            Ok(Ok(())) => toast_overlay.add_toast(adw::Toast::new(success)),
+            Ok(Err(message)) => toast_overlay.add_toast(adw::Toast::new(&format!("{failure_prefix}: {message}"))),
+            // The session died mid-write; its error handling owns the toast.
+            Err(_) => {}
+        }
+    });
+}
+
+/// Routes a created contact to its account's session: a `Create` command
+/// PUTs `<uid>.vcf` under `book_href` with `If-None-Match: *`.
+fn route_contact_create(state: &Rc<RefCell<UiState>>, account_id: AccountId, book_href: String, card: VCard, toast_overlay: &adw::ToastOverlay) {
+    if book_href.is_empty() {
+        toast_overlay.add_toast(adw::Toast::new("Choose an address book to create the contact in."));
+        return;
+    }
+    send_contact_command(state, &account_id, toast_overlay, "Contact created", "Couldn't create contact", move |reply| {
+        ContactCommand::Create { book_href, card, reply }
+    });
+}
+
+/// Routes an edited contact to its account's session: an `Update` command
+/// PUTs it to its own href with its etag as `If-Match`.
+fn route_contact_update(state: &Rc<RefCell<UiState>>, account_id: AccountId, href: String, etag: Option<String>, card: VCard, toast_overlay: &adw::ToastOverlay) {
+    send_contact_command(state, &account_id, toast_overlay, "Contact saved", "Couldn't save contact", move |reply| {
+        ContactCommand::Update { href, etag, card, reply }
+    });
+}
+
+/// Routes a deleted contact to its account's session (`Delete` with the
+/// etag as `If-Match`). The session's post-write resync lands the card in
+/// the Deleted bucket via the usual diff.
+fn route_contact_delete(state: &Rc<RefCell<UiState>>, account_id: AccountId, href: String, etag: Option<String>, toast_overlay: &adw::ToastOverlay) {
+    send_contact_command(state, &account_id, toast_overlay, "Contact deleted", "Couldn't delete contact", move |reply| {
+        ContactCommand::Delete { href, etag, reply }
+    });
+}
+
+/// Opens the contact editor for an existing, writable contact - the write
+/// target (account, address books, href/etag) is taken from the entry's
+/// account snapshot.
+fn show_contact_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, entry: &ContactsListEntry) {
+    let account_id = entry.account_id.clone();
+    let Some(snapshot) = state.borrow().contacts_by_account.get(&account_id).cloned() else {
+        toast_overlay.add_toast(adw::Toast::new("Contact account isn't available."));
+        return;
+    };
+    let books: Vec<(String, String)> = snapshot.books.iter().map(|book| (book.display_name.clone(), book.href.clone())).collect();
+    let state = state.clone();
+    let toast_overlay = toast_overlay.clone();
+    crate::contacts_editor::show_contact_editor(
+        window,
+        crate::contacts_editor::ContactEditorPrefill {
+            books: &books,
+            existing: Some(&entry.card),
+            href: &entry.href,
+            etag: entry.etag.as_deref(),
+        },
+        // A create callback for an edit is unreachable; the dialog only
+        // fires it on the blank form.
+        move |_book_href, _card| {},
+        {
+            let state = state.clone();
+            let account_id = account_id.clone();
+            let toast_overlay = toast_overlay.clone();
+            move |href, etag, card| route_contact_update(&state, account_id.clone(), href, etag, card, &toast_overlay)
+        },
+        {
+            let state = state.clone();
+            let account_id = account_id.clone();
+            let toast_overlay = toast_overlay.clone();
+            move |href, etag| route_contact_delete(&state, account_id.clone(), href, etag, &toast_overlay)
+        },
+    );
+}
+
+/// Opens the blank "new contact" editor, routed to the first account that
+/// has a writable address book (the picker inside the dialog lists that
+/// account's books; the People screen's buckets are per-account, so a
+/// global New Contact button has to pick a home up front).
+fn show_new_contact_editor(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay) {
+    let st = state.borrow();
+    let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
+    accounts.sort_by_key(|(_, snapshot)| snapshot.display_name.to_lowercase());
+    let Some((account_id, snapshot)) = accounts.into_iter().find(|(_, snapshot)| !snapshot.books.is_empty()) else {
+        drop(st);
+        toast_overlay.add_toast(adw::Toast::new("Connect a contacts account to create contacts."));
+        return;
+    };
+    let account_id = account_id.clone();
+    let books: Vec<(String, String)> = snapshot.books.iter().map(|book| (book.display_name.clone(), book.href.clone())).collect();
+    drop(st);
+    let state = state.clone();
+    let toast_overlay = toast_overlay.clone();
+    crate::contacts_editor::show_contact_editor(
+        window,
+        crate::contacts_editor::ContactEditorPrefill {
+            books: &books,
+            existing: None,
+            href: "",
+            etag: None,
+        },
+        {
+            let state = state.clone();
+            let account_id = account_id.clone();
+            let toast_overlay = toast_overlay.clone();
+            move |book_href, card| route_contact_create(&state, account_id.clone(), book_href, card, &toast_overlay)
+        },
+        // Unreachable on the blank form; update/delete only fire for an edit.
+        move |_href, _etag, _card| {},
+        move |_href, _etag| {},
+    );
+}
+
+/// "Import…" for the People screen: pick a `.vcf` file, then route every
+/// card in it to a chosen address book. Deduplication is per the accepted
+/// policy: a card whose `UID` matches an existing contact in the target
+/// *account* updates that contact in place (its server href/etag are kept,
+/// so the write is guarded like an edit); a card without a matching UID but
+/// with an email the account already has is skipped and counted; anything
+/// else is created. One summary toast reports the three counts when every
+/// write has answered.
+fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay) {
+    // Target books: every writable address book across every connected
+    // account, labelled "account · book" like the event editor's calendar
+    // picker (book names alone repeat across accounts).
+    let mut books: Vec<(AccountId, String, String)> = Vec::new();
+    {
+        let st = state.borrow();
+        let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
+        accounts.sort_by_key(|(_, snapshot)| snapshot.display_name.to_lowercase());
+        for (account_id, snapshot) in accounts {
+            for book in &snapshot.books {
+                books.push((account_id.clone(), book.href.clone(), format!("{} · {}", snapshot.display_name, book.display_name)));
+            }
+        }
+    }
+    if books.is_empty() {
+        toast_overlay.add_toast(adw::Toast::new("Connect a contacts account to import into."));
+        return;
+    }
+
+    let dialog = gtk::Window::builder().transient_for(window).modal(true).title("Import contacts").default_width(480).build();
+
+    let choose_button = gtk::Button::with_label("Choose file…");
+    let file_label = gtk::Label::builder().label("No file chosen").xalign(0.0).css_classes(["dim-label"]).build();
+    let chosen_vcf: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    let file_group = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .margin_top(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    file_group.append(&choose_button);
+    file_group.append(&file_label);
+
+    let labels: Vec<String> = books.iter().map(|(_, _, label)| label.clone()).collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let string_list = gtk::StringList::new(&label_refs);
+    let book_dropdown = gtk::DropDown::builder().model(&string_list).build();
+    let target_group = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .margin_top(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let target_label = gtk::Label::builder().label("Import into").xalign(0.0).build();
+    target_group.append(&target_label);
+    target_group.append(&book_dropdown);
+
+    let import_button = gtk::Button::with_label("Import");
+    import_button.add_css_class("suggested-action");
+    import_button.set_sensitive(false);
+    let close_button = gtk::Button::with_label("Close");
+
+    {
+        let window = window.clone();
+        let chosen_vcf = chosen_vcf.clone();
+        let file_label = file_label.clone();
+        let import_button = import_button.clone();
+        choose_button.connect_clicked(move |_| {
+            let window = window.clone();
+            let chosen_vcf = chosen_vcf.clone();
+            let file_label = file_label.clone();
+            let import_button = import_button.clone();
+            glib::spawn_future_local(async move {
+                let filter = gtk::FileFilter::new();
+                filter.add_suffix("vcf");
+                filter.add_suffix("vcard");
+                filter.set_name(Some("vCard files (*.vcf, *.vcard)"));
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                let picker = gtk::FileDialog::builder().title("Choose a vCard file").filters(&filters).build();
+                let Ok(file) = picker.open_future(Some(&window)).await else { return };
+                let Some(path) = file.path() else { return };
+                let Ok(raw) = std::fs::read(&path) else { return };
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                if lookout_core::VCard::parse_all(&text).is_empty() {
+                    file_label.set_label("No vCards found in this file.");
+                    return;
+                }
+                *chosen_vcf.borrow_mut() = Some(text);
+                file_label.set_label(&path.display().to_string());
+                import_button.set_sensitive(true);
+            });
+        });
+    }
+
+    {
+        let dialog = dialog.clone();
+        close_button.connect_clicked(move |_| dialog.close());
+    }
+
+    {
+        let dialog = dialog.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let chosen_vcf = chosen_vcf.clone();
+        let books = books.clone();
+        let book_dropdown = book_dropdown.clone();
+        import_button.connect_clicked(move |_| {
+            let Some(text) = chosen_vcf.borrow().clone() else { return };
+            let Some((account_id, book_href, _)) = books.get(book_dropdown.selected() as usize).cloned() else {
+                return;
+            };
+
+            // Existing UIDs and emails of the target *account*: the
+            // dedupe keys. Owned copies - the state borrow must end before
+            // the dispatch loop below borrows it again.
+            let existing_by_uid: HashMap<String, (String, Option<String>)> = {
+                let st = state.borrow();
+                st.contacts_by_account
+                    .get(&account_id)
+                    .into_iter()
+                    .flat_map(|snapshot| &snapshot.contacts)
+                    .filter_map(|record| record.card.uid.as_deref().map(|uid| (uid.to_string(), (record.href.clone(), record.etag.clone()))))
+                    .collect()
+            };
+            let existing_emails: HashSet<String> = {
+                let st = state.borrow();
+                st.contacts_by_account
+                    .get(&account_id)
+                    .into_iter()
+                    .flat_map(|snapshot| &snapshot.contacts)
+                    .flat_map(|record| record.card.emails.iter())
+                    .map(|email| email.address.trim().to_lowercase())
+                    .filter(|key| !key.is_empty())
+                    .collect()
+            };
+
+            let mut created = 0usize;
+            let mut updated = 0usize;
+            let mut skipped = 0usize;
+            let mut replies = Vec::new();
+            for result in lookout_core::VCard::parse_all(&text) {
+                let Ok(mut card) = result else {
+                    skipped += 1;
+                    continue;
+                };
+                let uid = card.uid.clone().unwrap_or_default();
+                if let Some((href, etag)) = existing_by_uid.get(&uid) {
+                    // Same UID: update in place, keeping the server metadata
+                    // so the write is an If-Match-guarded edit.
+                    let href = href.clone();
+                    let etag = etag.clone();
+                    if let Some(rx) = dispatch_contact_command(&state, &account_id, move |reply| ContactCommand::Update { href, etag, card, reply }) {
+                        replies.push(rx);
+                    }
+                    updated += 1;
+                } else if card.emails.iter().any(|email| existing_emails.contains(&email.address.trim().to_lowercase())) {
+                    skipped += 1;
+                } else {
+                    // A file card without a UID gets one before the PUT so
+                    // two such cards can't collide on the same `<uid>.vcf`
+                    // href.
+                    if card.uid.is_none() {
+                        card.uid = Some(uuid::Uuid::new_v4().to_string());
+                    }
+                    let book_href = book_href.clone();
+                    if let Some(rx) = dispatch_contact_command(&state, &account_id, move |reply| ContactCommand::Create { book_href, card, reply }) {
+                        replies.push(rx);
+                    }
+                    created += 1;
+                }
+            }
+
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                let mut failures = 0;
+                for reply in replies {
+                    if !matches!(reply.recv().await, Ok(Ok(()))) {
+                        failures += 1;
+                    }
+                }
+                let summary = match (created, updated, skipped) {
+                    (0, 0, _) => format!("{skipped} contact(s) already exist - nothing imported"),
+                    _ => format!("Imported {created}, updated {updated}, skipped {skipped} duplicate(s)"),
+                };
+                if failures > 0 {
+                    toast_overlay.add_toast(adw::Toast::new(&format!("{summary} ({failures} failed)")));
+                } else {
+                    toast_overlay.add_toast(adw::Toast::new(&summary));
+                }
+            });
+            dialog.close();
+        });
+    }
+
+    let button_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    button_row.set_halign(gtk::Align::End);
+    button_row.append(&close_button);
+    button_row.append(&import_button);
+
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    content.append(&file_group);
+    content.append(&target_group);
+    content.append(&button_row);
+    dialog.set_child(Some(&content));
+    dialog.present();
+}
+
+/// "Export…" for the People screen: saves every contact in the currently
+/// selected bucket as one multi-card `.vcf` file (the same file shape
+/// `parse_all` imports).
+fn export_current_contacts(window: &adw::ApplicationWindow, entries: &Rc<RefCell<Vec<ContactsListEntry>>>, toast_overlay: &adw::ToastOverlay) {
+    let cards: Vec<VCard> = entries.borrow().iter().map(|entry| entry.card.clone()).collect();
+    if cards.is_empty() {
+        toast_overlay.add_toast(adw::Toast::new("Nothing to export in this category."));
+        return;
+    }
+    let window = window.clone();
+    let toast_overlay = toast_overlay.clone();
+    glib::spawn_future_local(async move {
+        let filter = gtk::FileFilter::new();
+        filter.add_suffix("vcf");
+        filter.set_name(Some("vCard files (*.vcf)"));
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::builder().title("Export contacts").filters(&filters).initial_name("contacts.vcf").build();
+        let Ok(file) = dialog.save_future(Some(&window)).await else { return };
+        let Some(path) = file.path() else { return };
+        let mut body = String::new();
+        for card in &cards {
+            body.push_str(&card.serialize());
+            body.push_str("\r\n");
+        }
+        match std::fs::write(&path, body) {
+            Ok(()) => toast_overlay.add_toast(adw::Toast::new(&format!("Exported {} contact(s)", cards.len()))),
+            Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't export contacts: {e}"))),
+        }
+    });
+}
+
 fn dedupe_addresses(addresses: Vec<EmailAddress>, limit: usize) -> Vec<EmailAddress> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -4526,33 +5019,49 @@ fn refresh_contacts_category_ui(
         // Every distinct CATEGORIES tag across every account, so the same
         // tag used by contacts in two different address books still gets
         // one combined row rather than one per account.
-        let mut category_members: HashMap<String, Vec<(AccountId, String, VCard)>> = HashMap::new();
+        let mut category_members: HashMap<String, Vec<(AccountId, String, lookout_dav::ContactRecord)>> = HashMap::new();
 
         for (account_id, account) in accounts {
-            let all_contacts: Vec<(AccountId, String, VCard)> = account
+            let all_contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)> = account
                 .contacts
                 .iter()
-                .map(|card| (account_id.clone(), account.display_name.clone(), card.clone()))
+                .map(|record| (account_id.clone(), account.display_name.clone(), record.clone()))
                 .collect();
 
-            for (_, _, card) in &all_contacts {
-                for tag in &card.categories {
+            for (_, _, record) in &all_contacts {
+                for tag in &record.card.categories {
                     category_members
                         .entry(tag.clone())
                         .or_default()
-                        .push((account_id.clone(), account.display_name.clone(), card.clone()));
+                        .push((account_id.clone(), account.display_name.clone(), record.clone()));
                 }
             }
 
             // vCard v4's KIND:group cards represent a named contact list
             // rather than a person.
-            let contact_lists: Vec<(AccountId, String, VCard)> = all_contacts.iter().filter(|(_, _, card)| card.kind.as_deref() == Some("group")).cloned().collect();
-            let deleted: Vec<(AccountId, String, VCard)> = st
+            let contact_lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> =
+                all_contacts.iter().filter(|(_, _, record)| record.card.kind.as_deref() == Some("group")).cloned().collect();
+            let deleted: Vec<(AccountId, String, lookout_dav::ContactRecord)> = st
                 .deleted_contacts
                 .get(account_id)
                 .into_iter()
                 .flatten()
-                .map(|card| (account_id.clone(), account.display_name.clone(), card.clone()))
+                .map(|card| {
+                    (
+                        account_id.clone(),
+                        account.display_name.clone(),
+                        lookout_dav::ContactRecord {
+                            // Deleted-bucket cards are display-only (the diff
+                            // against a poll only kept the card, not its
+                            // server metadata): an empty href marks them as
+                            // not writable, and the editor's Delete is
+                            // disabled for them.
+                            href: String::new(),
+                            etag: None,
+                            card: card.clone(),
+                        },
+                    )
+                })
                 .collect();
 
             row_widgets.push((append_contacts_header_row(category_list, &account.display_name), None));
@@ -4663,12 +5172,14 @@ fn rebuild_contacts_list_ui(
         choice
             .contacts
             .into_iter()
-            .filter(|(account_id, _, card)| !favourites_only || st.starred_contacts.contains(&(account_id.clone(), contact_identity(card))))
-            .map(|(account_id, account_label, card)| ContactsListEntry {
+            .filter(|(account_id, _, record)| !favourites_only || st.starred_contacts.contains(&(account_id.clone(), contact_identity(&record.card))))
+            .map(|(account_id, account_label, record)| ContactsListEntry {
                 account_id,
                 account_label,
                 category_label: category_label.clone(),
-                card,
+                card: record.card,
+                href: record.href,
+                etag: record.etag,
             })
             .collect()
     };
@@ -4783,7 +5294,20 @@ fn spawn_contacts_discovery(
             Ok((client, accounts)) if !accounts.is_empty() => {
                 show_page("contacts");
                 for account in accounts {
-                    sync_contacts_account(worker.clone(), state.clone(), toast_overlay.clone(), client.clone(), account, refresh_contacts_ui.clone());
+                    // Each account's session gets its own command channel,
+                    // stored so the People screen's editor/import/group flows
+                    // can route writes to the right account.
+                    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+                    state.borrow_mut().contact_cmd_tx.insert(account.account_id.clone(), cmd_tx);
+                    sync_contacts_account(
+                        worker.clone(),
+                        state.clone(),
+                        toast_overlay.clone(),
+                        client.clone(),
+                        account,
+                        cmd_rx,
+                        refresh_contacts_ui.clone(),
+                    );
                 }
             }
             Ok(_) => show_page("contacts-empty"),
@@ -4801,6 +5325,7 @@ fn sync_contacts_account(
     toast_overlay: adw::ToastOverlay,
     goa_client: GoaClient,
     account: GoaContactsAccount,
+    cmd_rx: async_channel::Receiver<ContactCommand>,
     refresh_contacts_ui: Rc<dyn Fn(Option<i32>)>,
 ) {
     let account_id = account.account_id.clone();
@@ -4809,12 +5334,60 @@ fn sync_contacts_account(
     worker.spawn(async move {
         let mut first = true;
         loop {
+            // Interleave the poll cadence with write commands: a poll tick
+            // wakes a fetch, a command is executed with a fresh credential
+            // right away (the same pattern as `run_calendar_session`'s
+            // select), and a successful write forces an immediate resync so
+            // the change renders before the next poll.
+            let wake = if first {
+                None
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(CONTACTS_REFRESH_INTERVAL) => None,
+                    cmd = cmd_rx.recv() => match cmd {
+                        Ok(cmd) => Some(cmd),
+                        Err(_) => break,
+                    },
+                }
+            };
+
+            let mut resync = wake.is_none();
+            // Process the command that woke us (if any), then drain any
+            // further commands queued while we were mid-fetch.
+            for command in wake.into_iter().chain(std::iter::from_fn(|| cmd_rx.try_recv().ok())) {
+                match command {
+                    ContactCommand::Create { book_href, card, reply } => {
+                        let result = put_contact(goa_client.clone(), account.clone(), new_contact_href(&book_href, &card), &card, None).await;
+                        let _ = reply.send(result.clone()).await;
+                        if result.is_ok() {
+                            resync = true;
+                        }
+                    }
+                    ContactCommand::Update { href, etag, card, reply } => {
+                        let result = put_contact(goa_client.clone(), account.clone(), href, &card, etag).await;
+                        let _ = reply.send(result.clone()).await;
+                        if result.is_ok() {
+                            resync = true;
+                        }
+                    }
+                    ContactCommand::Delete { href, etag, reply } => {
+                        let result = delete_contact(goa_client.clone(), account.clone(), href, etag).await;
+                        let _ = reply.send(result.clone()).await;
+                        if result.is_ok() {
+                            resync = true;
+                        }
+                    }
+                }
+            }
+
+            if !resync {
+                continue;
+            }
             let result = fetch_carddav_contacts(goa_client.clone(), account.clone()).await;
             if tx.send((first, result)).await.is_err() {
                 break;
             }
             first = false;
-            tokio::time::sleep(CONTACTS_REFRESH_INTERVAL).await;
         }
     });
 
@@ -4829,10 +5402,13 @@ fn sync_contacts_account(
                     // poll and the next is the only signal this app has that
                     // it was deleted upstream - diff against what the
                     // previous poll saw and stash anything missing in
-                    // `deleted_contacts` before it's overwritten below.
+                    // `deleted_contacts` before it's overwritten below. A
+                    // write's post-command resync lands here too - which is
+                    // how a locally-deleted contact reaches this bucket
+                    // without waiting for the next poll.
                     if let Some(previous) = st.contacts_by_account.get(&account_id) {
-                        let previously_seen: HashMap<String, VCard> = previous.contacts.iter().map(|card| (contact_identity(card), card.clone())).collect();
-                        let still_present: HashSet<String> = contacts.contacts.iter().map(contact_identity).collect();
+                        let previously_seen: HashMap<String, VCard> = previous.contacts.iter().map(|record| (contact_identity(&record.card), record.card.clone())).collect();
+                        let still_present: HashSet<String> = contacts.contacts.iter().map(|record| contact_identity(&record.card)).collect();
                         let deleted_bucket = st.deleted_contacts.entry(account_id.clone()).or_default();
                         let already_tracked: HashSet<String> = deleted_bucket.iter().map(contact_identity).collect();
                         for (identity, card) in previously_seen {
@@ -4858,15 +5434,18 @@ fn sync_contacts_account(
     });
 }
 
-async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccount) -> Result<ContactsAccountSnapshot, String> {
-    goa_client.ensure_credentials_contacts(&account).await.map_err(|e| e.to_string())?;
+/// Builds the authenticated DAV client + fresh credential for one CardDAV
+/// account - shared by the poll fetch and the write path, so a command
+/// executed between polls authenticates exactly like a poll would.
+async fn carddav_connection(goa_client: &GoaClient, account: &GoaContactsAccount) -> Result<(DavClient, Credential), String> {
+    goa_client.ensure_credentials_contacts(account).await.map_err(|e| e.to_string())?;
     let credential = match &account.auth {
         ContactsAuthMethod::OAuth2 => {
-            let (token, _expires_in) = goa_client.get_access_token_contacts(&account).await.map_err(|e| e.to_string())?;
+            let (token, _expires_in) = goa_client.get_access_token_contacts(account).await.map_err(|e| e.to_string())?;
             Credential::OAuth2AccessToken(token)
         }
         ContactsAuthMethod::Password { .. } => {
-            let password = goa_client.get_contacts_password(&account).await.map_err(|e| e.to_string())?;
+            let password = goa_client.get_contacts_password(account).await.map_err(|e| e.to_string())?;
             Credential::Password(password)
         }
     };
@@ -4879,23 +5458,74 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
         // `Account.Identity` is the login username the DAV server expects
         // (e.g. the Nextcloud user id); the display name is only a fallback
         // for providers that don't advertise an Identity.
-        username: if account.identity.is_empty() { account.display_name.clone() } else { account.identity.clone() },
+        username: if account.identity.is_empty() {
+            account.display_name.clone()
+        } else {
+            account.identity.clone()
+        },
     };
     let client = DavClient::new(&config.base_url, config.accept_ssl_errors, config.username.clone()).map_err(|e| e.to_string())?;
+    Ok((client, credential))
+}
+
+/// The PUT half of a contact write: `etag` guards an update (`If-Match`), so
+/// an edit based on a stale copy fails with HTTP 412 instead of clobbering a
+/// concurrent change; `None` marks a create (`If-None-Match: *`).
+async fn put_contact(goa_client: GoaClient, account: GoaContactsAccount, href: String, card: &VCard, etag: Option<String>) -> Result<(), String> {
+    let (client, credential) = carddav_connection(&goa_client, &account).await?;
+    client
+        .put_contact_vcard(&href, card, &credential, etag.as_deref())
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The DELETE half of a contact write, with the same `If-Match` guard.
+async fn delete_contact(goa_client: GoaClient, account: GoaContactsAccount, href: String, etag: Option<String>) -> Result<(), String> {
+    let (client, credential) = carddav_connection(&goa_client, &account).await?;
+    client.delete_contact_vcard(&href, &credential, etag.as_deref()).await.map_err(|e| e.to_string())
+}
+
+/// The collection-relative href for a brand-new contact: `<uid>.vcf` under
+/// the book's href, the same client-generated-name convention as the
+/// calendar write path's `<uid>.ics`. The UID is made URL-safe so an
+/// email-style UID (`c1@example.com`) can't smuggle a path separator into
+/// the href - the server never parses the UID back out of it.
+fn new_contact_href(book_href: &str, card: &VCard) -> String {
+    let base = book_href.trim_end_matches('/');
+    let uid = card.uid.as_deref().unwrap_or("");
+    let mut safe = String::with_capacity(uid.len());
+    let mut kept_alnum = false;
+    for c in uid.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            kept_alnum |= c.is_ascii_alphanumeric();
+            safe.push(c);
+        } else {
+            safe.push('_');
+        }
+    }
+    if !kept_alnum {
+        safe = "contact".to_string();
+    }
+    format!("{base}/{safe}.vcf")
+}
+
+async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccount) -> Result<ContactsAccountSnapshot, String> {
+    let (client, credential) = carddav_connection(&goa_client, &account).await?;
     let home = client.discover_addressbook_home(&credential).await.map_err(|e| e.to_string())?;
-    let books = client.list_addressbooks(&home, &config.account_id, &credential).await.map_err(|e| e.to_string())?;
+    let books = client.list_addressbooks(&home, &account.account_id, &credential).await.map_err(|e| e.to_string())?;
     tracing::debug!("CardDAV discovery for {}: home={home:?}, {} addressbook(s) found", account.display_name, books.len());
 
     let mut addresses = Vec::new();
     let mut contacts = Vec::new();
     for book in &books {
-        match client.fetch_addressbook_vcards(book, &credential).await {
-            Ok(vcards) => {
-                tracing::debug!("CardDAV addressbook {:?} (href {:?}) returned {} vcard(s)", book.display_name, book.href, vcards.len());
-                for card in &vcards {
-                    addresses.extend(card.email_addresses());
+        match client.fetch_addressbook_contacts_with_meta(book, &credential).await {
+            Ok(records) => {
+                tracing::debug!("CardDAV addressbook {:?} (href {:?}) returned {} vcard(s)", book.display_name, book.href, records.len());
+                for record in &records {
+                    addresses.extend(record.card.email_addresses());
                 }
-                contacts.extend(vcards);
+                contacts.extend(records);
             }
             Err(e) => {
                 tracing::warn!("CardDAV addressbook fetch failed for {:?}: {e}", book.display_name);
@@ -4906,6 +5536,7 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
 
     Ok(ContactsAccountSnapshot {
         display_name: account.display_name,
+        books,
         contacts,
         suggestions: dedupe_addresses(addresses, usize::MAX),
     })
@@ -7102,6 +7733,191 @@ fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::T
     message_list.refresh();
 }
 
+/// "Manage groups…" for the People screen. A group is a vCard `CATEGORIES`
+/// tag shared by several contacts, so a group only exists on the server as
+/// the tags its member cards carry - the dialog therefore edits *members*:
+/// renaming a group re-tags every member card across every connected
+/// account, deleting a group strips the tag from them. New groups can't be
+/// "created" here for the same reason (an empty group has nothing to persist
+/// on the server) - they come into being by typing a new name in a contact's
+/// Groups field in the editor.
+fn show_manage_groups_dialog(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay) {
+    let dialog = gtk::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Manage groups")
+        .default_width(460)
+        .default_height(480)
+        .build();
+
+    let list = gtk::ListBox::builder().css_classes(["boxed-list"]).build();
+    let scroller = gtk::ScrolledWindow::builder().child(&list).vexpand(true).build();
+
+    // The batched rename/delete path: every member card of the affected
+    // group gets an `Update` command against its own account, and one
+    // summary toast lands when all replies are in.
+    let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
+    let rebuild_handle = rebuild.clone();
+    {
+        let list = list.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        *rebuild.borrow_mut() = Box::new(move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+
+            // Group -> member cards (account, href, etag, card), across
+            // every connected account.
+            let mut members: HashMap<String, Vec<(AccountId, lookout_dav::ContactRecord)>> = HashMap::new();
+            let st = state.borrow();
+            for (account_id, snapshot) in &st.contacts_by_account {
+                for record in &snapshot.contacts {
+                    for tag in &record.card.categories {
+                        members.entry(tag.clone()).or_default().push((account_id.clone(), record.clone()));
+                    }
+                }
+            }
+            drop(st);
+
+            if members.is_empty() {
+                let hint = gtk::Label::builder()
+                    .label("No groups yet - type a name in a contact's Groups field to start one.")
+                    .wrap(true)
+                    .halign(gtk::Align::Start)
+                    .css_classes(["dim-label"])
+                    .margin_top(12)
+                    .margin_bottom(12)
+                    .build();
+                list.append(&hint);
+                return;
+            }
+
+            let mut names: Vec<String> = members.keys().cloned().collect();
+            names.sort_by_key(|name| name.to_lowercase());
+            for name in names {
+                let member_list = members.remove(&name).unwrap_or_default();
+                let row = gtk::ListBoxRow::new();
+                let row_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(10)
+                    .margin_top(6)
+                    .margin_bottom(6)
+                    .margin_start(10)
+                    .margin_end(10)
+                    .build();
+
+                let name_entry = gtk::Entry::builder().text(&name).build();
+                name_entry.set_hexpand(true);
+
+                let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+                delete.set_tooltip_text(Some("Remove from all contacts"));
+                delete.add_css_class("flat");
+
+                row_box.append(&name_entry);
+                row_box.append(&delete);
+                row.set_child(Some(&row_box));
+                list.append(&row);
+
+                // Rename: re-tag every member card.
+                let state_rename = state.clone();
+                let toast_rename = toast_overlay.clone();
+                let rebuild = rebuild_handle.clone();
+                let name_rename = name.clone();
+                let member_list_rename = member_list.clone();
+                name_entry.connect_activate(move |entry| {
+                    let new_name = entry.text().trim().to_string();
+                    if new_name.is_empty() || new_name == name_rename {
+                        entry.set_text(&name_rename);
+                        return;
+                    }
+                    let mut replies = Vec::new();
+                    for (account_id, record) in &member_list_rename {
+                        let mut card = record.card.clone();
+                        card.categories = card.categories.iter().map(|tag| if tag == &name_rename { new_name.clone() } else { tag.clone() }).collect();
+                        if let Some(rx) = dispatch_contact_command(&state_rename, account_id, move |reply| ContactCommand::Update {
+                            href: record.href.clone(),
+                            etag: record.etag.clone(),
+                            card: card.clone(),
+                            reply,
+                        }) {
+                            replies.push(rx);
+                        }
+                    }
+                    toast_contact_batch(toast_rename.clone(), replies, "Group renamed");
+                    (rebuild.borrow())();
+                });
+
+                // Delete: strip the tag from every member card.
+                let state_delete = state.clone();
+                let toast_delete = toast_overlay.clone();
+                let rebuild = rebuild_handle.clone();
+                let name_delete = name.clone();
+                let member_list_delete = member_list.clone();
+                delete.connect_clicked(move |_| {
+                    let mut replies = Vec::new();
+                    for (account_id, record) in &member_list_delete {
+                        let mut card = record.card.clone();
+                        card.categories.retain(|tag| tag != &name_delete);
+                        if let Some(rx) = dispatch_contact_command(&state_delete, account_id, move |reply| ContactCommand::Update {
+                            href: record.href.clone(),
+                            etag: record.etag.clone(),
+                            card: card.clone(),
+                            reply,
+                        }) {
+                            replies.push(rx);
+                        }
+                    }
+                    toast_contact_batch(toast_delete.clone(), replies, "Group removed from contacts");
+                    (rebuild.borrow())();
+                });
+            }
+        });
+    }
+    (rebuild.borrow())();
+
+    let close_button = gtk::Button::with_label("Close");
+    {
+        let dialog = dialog.clone();
+        close_button.connect_clicked(move |_| dialog.close());
+    }
+    close_button.set_halign(gtk::Align::End);
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(12)
+        .margin_bottom(12)
+        .build();
+    content.append(&scroller);
+    content.append(&close_button);
+    dialog.set_child(Some(&content));
+    dialog.present();
+}
+
+/// Awaits a batch of contact-write replies and shows one summary toast -
+/// the batched counterpart of `send_contact_command`'s per-write toast.
+fn toast_contact_batch(toast_overlay: adw::ToastOverlay, replies: Vec<async_channel::Receiver<Result<(), String>>>, success: &'static str) {
+    glib::spawn_future_local(async move {
+        let mut failures = 0;
+        let mut skipped = 0;
+        for reply in replies {
+            match reply.recv().await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => failures += 1,
+                Err(_) => skipped += 1,
+            }
+        }
+        if failures > 0 {
+            toast_overlay.add_toast(adw::Toast::new(&format!("{failures} change(s) couldn't be saved")));
+        } else if skipped > 0 {
+            toast_overlay.add_toast(adw::Toast::new("Some changes couldn't be saved"));
+        } else {
+            toast_overlay.add_toast(adw::Toast::new(success));
+        }
+    });
+}
+
 /// `#rrggbb` -> `gdk::RGBA`. Any malformed input degrades to a mid-grey
 /// rather than failing, matching the "colors are cosmetic" spirit of
 /// `calendar_colors::resolve_color`.
@@ -8972,6 +9788,7 @@ mod tests {
             settings: Rc::new(crate::settings::resolve()),
             app_config: Rc::new(RefCell::new(crate::app_config::AppConfig::default())),
             deleted_contacts: HashMap::new(),
+            contact_cmd_tx: HashMap::new(),
             current_account: None,
             current_mailbox: None,
             mail_view: MailView::Single,

@@ -100,7 +100,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
   - [x] Right pane contact rows (name, primary email, avatar/org); Favourites star persisted in the UI-state database
   - [x] Contact details dialog (emails, phones, addresses, org/title, notes)
   - [x] Deleted bucket (in-memory diff of CardDAV polls)
-- [ ] Address book CRUD, groups, vCard import/export with duplicate detection
+- [x] Address book CRUD (contact editor: create/edit/delete with `If-Match`-guarded PUT/DELETE), groups (CATEGORIES-based "Manage groups…" rename/delete re-tagging member cards across accounts), vCard import/export with duplicate detection (`.vcf` file import: upsert by UID, skip+count by email, target-book picker; export of the current bucket as one multi-card `.vcf`)
 - [ ] Shared `ContactsProvider` trait consumed by mail composer, calendar attendees, and the contacts app
   - [x] Mail composer consumes `ContactsProvider`
   - [x] Calendar attendees consume it too - autocomplete merges mail-history + CardDAV suggestions across every connected account (not scoped to one, since an invitee isn't tied to the event's own calendar account)

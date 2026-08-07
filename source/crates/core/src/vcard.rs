@@ -160,6 +160,36 @@ impl VCard {
         Ok(card)
     }
 
+    /// Parses a document containing one or more vCards - the shape of the
+    /// `.vcf` files an export or import moves around - into one card per
+    /// `BEGIN:VCARD`/`END:VCARD` pair. Stray text between cards (blank
+    /// lines, an export preamble, ...) is ignored. Each block is parsed by
+    /// [`Self::parse`] individually, so one malformed card reports its own
+    /// `Err` without aborting the rest of the file - the import flow can
+    /// skip and count it the way `lookout-dav` skips unparseable cards from
+    /// a multiget. A trailing `BEGIN:VCARD` with no matching `END` surfaces
+    /// as an `Err` too, rather than being silently dropped.
+    pub fn parse_all(source: &str) -> Vec<Result<VCard, VCardError>> {
+        let mut cards = Vec::new();
+        let mut current: Option<String> = None;
+        for line in source.replace("\r\n", "\n").lines() {
+            if line.eq_ignore_ascii_case("BEGIN:VCARD") {
+                current = Some(line.to_string());
+            } else if let Some(block) = current.as_mut() {
+                block.push('\n');
+                block.push_str(line);
+                if line.eq_ignore_ascii_case("END:VCARD") {
+                    let block = current.take().expect("set just above");
+                    cards.push(Self::parse(&block));
+                }
+            }
+        }
+        if let Some(block) = current {
+            cards.push(Self::parse(&block));
+        }
+        cards
+    }
+
     /// Renders this vCard as RFC 6350 text - the writer half of the parser
     /// above. (Named `serialize` rather than `to_string` so the inherent
     /// method doesn't shadow the `Display`-derived one clippy would otherwise
@@ -527,6 +557,40 @@ mod tests {
         let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:John \r\n Doe\r\nN:Doe;John;;;\r\nEND:VCARD\r\n";
         let card = VCard::parse(text).unwrap();
         assert_eq!(card.full_name.as_deref(), Some("John Doe"));
+    }
+
+    #[test]
+    fn parse_all_splits_multiple_cards_and_ignores_stray_text() {
+        let text = "an export preamble\nexported-by: alice\n\nBEGIN:VCARD\r\nVERSION:4.0\r\nFN:Jane Doe\r\nUID:jane@example.com\r\nEND:VCARD\r\n\r\n\r\nBEGIN:VCARD\r\nVERSION:4.0\r\nFN:John Roe\r\nUID:john@example.com\r\nEND:VCARD\r\n";
+        let cards: Vec<VCard> = VCard::parse_all(text).into_iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].full_name.as_deref(), Some("Jane Doe"));
+        assert_eq!(cards[1].uid.as_deref(), Some("john@example.com"));
+    }
+
+    #[test]
+    fn parse_all_reports_one_bad_card_without_dropping_the_rest() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Good\r\nEND:VCARD\r\nBEGIN:VCARD\r\nVERSION:9.9\r\nEND:VCARD\r\nBEGIN:VCARD\r\nVERSION:4.0\r\nFN:Also Good\r\nEND:VCARD\r\n";
+        let results = VCard::parse_all(text);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(matches!(results[1], Err(VCardError::UnsupportedVersion(_))), "{:?}", results[1]);
+        assert!(results[2].is_ok());
+    }
+
+    #[test]
+    fn parse_all_treats_an_unterminated_trailing_card_as_an_error() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Fine\r\nEND:VCARD\r\nBEGIN:VCARD\r\nVERSION:4.0\r\nFN:Cut off\r\n";
+        let results = VCard::parse_all(text);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(matches!(results[1], Err(VCardError::MissingEnd)), "{:?}", results[1]);
+    }
+
+    #[test]
+    fn parse_all_of_an_empty_or_cardless_document_is_empty() {
+        assert!(VCard::parse_all("").is_empty());
+        assert!(VCard::parse_all("no cards here\njust text\n").is_empty());
     }
 
     #[test]
