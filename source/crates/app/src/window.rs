@@ -671,6 +671,7 @@ fn install_paned_css() {
             padding-right: 6px;
         }
         .folder-pane listview,
+        .folder-pane list,
         .folder-pane scrolledwindow {
             background-color: transparent;
         }

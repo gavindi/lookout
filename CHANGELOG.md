@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.5 (2026-08-08)
+
+### Fixed
+
+- **People**: the People screen's left category pane now shares the calendar and mail panes' styling. The `.folder-pane` transparency rule - what lets the window background image show through the translucent left cards - covered `listview` and `scrolledwindow`, but the contacts category tree is a `GtkListBox`, whose CSS node is `list` (not `listbox`), and libadwaita paints `list` with an opaque view background. The contacts card rendered as a solid panel over its translucent `rgba(0,0,0,0.5)` fill instead of matching its calendar/mail counterparts. The rule now also covers `.folder-pane list`, so the category tree's background is transparent like the folder and calendar lists.
+
 ## 0.8.4 (2026-08-08)
 
 ### Added
