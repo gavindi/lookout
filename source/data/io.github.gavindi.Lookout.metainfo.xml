@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.7.7" date="2026-08-08">
+      <description>
+        <p>Calendar feeds and file import: the Add calendar button now opens a dialog to subscribe to a webcal (https://…ics) feed - events appear read-only, refreshing automatically - to import an .ics file into one of your calendars (re-importing updates, not duplicates), or to manage existing subscriptions.</p>
+      </description>
+    </release>
     <release version="0.7.6" date="2026-08-07">
       <description>
         <p>Calendar events can now remind you: when an event with a reminder comes due, a notification appears with Open, Snooze 5 minutes, and Dismiss actions - opening the event straight in the editor. Reminders that came due while the app was closed appear on launch (until the event starts), each alert fires only once, and a new Config → Calendar → Event alerts switch controls them all.</p>

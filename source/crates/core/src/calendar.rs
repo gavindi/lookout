@@ -32,6 +32,21 @@ pub enum AttendeeStatus {
     Tentative,
 }
 
+/// A user-subscribed webcal (`.ics` feed) calendar: fetch-only by design -
+/// feeds can't be written back to, so these never appear as event-editor
+/// targets. Persisted in `settings.json` (`AppConfig`), keyed by `id` so the
+/// subscription URL can change without churning its cache/colors.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WebcalSubscription {
+    /// Stable opaque id (a UUID), the identity used everywhere outside this
+    /// struct: `CalendarId("webcal:<id>")`, cache filename, color map key.
+    pub id: String,
+    pub display_name: String,
+    /// The raw feed URL as the user typed it; `webcal://`/`webcals://`
+    /// schemes are normalized to http(s) at fetch time, never rewritten here.
+    pub url: String,
+}
+
 /// RFC 5545 `CLASS`: who else can see this event's details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum EventSensitivity {

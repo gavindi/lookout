@@ -8,9 +8,10 @@ use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::{
     AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence,
-    EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, VCard,
+    EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, VCard, WebcalSubscription,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
+use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
 use lookout_dav::{CalendarAccountConfig, CardDavAccountConfig, Credential, DavClient};
 use lookout_goa::{ContactsAuthMethod, GoaCalendarAccount, GoaClient, GoaContactsAccount};
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
@@ -582,6 +583,27 @@ struct CalendarAccountHandle {
     last_synced_month: Option<chrono::NaiveDate>,
 }
 
+/// Per-subscription state for one webcal feed - the fetch-only cousin of
+/// `CalendarAccountHandle`. One handle per configured subscription, aligned
+/// with `CalendarUiState::webcal_subscriptions` by subscription id; events
+/// carry the synthetic calendar id `"webcal:<id>"` so the shared
+/// calendar-id machinery (checklist toggles, checked set, colors, view
+/// merge) works unchanged.
+struct WebcalHandle {
+    /// The synthetic calendar id its events carry (`"webcal:<id>"`) - how
+    /// the handle's occurrences are filtered/colored/keyed everywhere.
+    calendar_id: CalendarId,
+    display_name: String,
+    /// Latest occurrences for whatever month last synced - keyed the same
+    /// "only apply if it matches what's on screen" way as
+    /// `CalendarAccountHandle::last_occurrences`.
+    last_occurrences: Vec<EventOccurrence>,
+    last_synced_month: Option<chrono::NaiveDate>,
+    /// The feed's latest fetch error, if any - the UI toasts on the
+    /// transition into error, not on every 5-minute poll.
+    error: Option<String>,
+}
+
 struct CalendarUiState {
     accounts: HashMap<AccountId, CalendarAccountHandle>,
     displayed_month: chrono::NaiveDate,
@@ -595,6 +617,18 @@ struct CalendarUiState {
     /// checklist can colour its checkboxes; new calendars are assigned here in
     /// `refresh_calendar_checklist`.
     calendar_colors: calendar_colors::CalendarColorMap,
+    /// Command channel to the single webcal feed session (all subscriptions
+    /// are polled by one actor), or `None` before `spawn_webcal_session` runs.
+    /// Subscriptions are added/removed by sending the session the full new
+    /// list via `SubscriptionCommand::Reload`.
+    webcal_cmd_tx: Option<async_channel::Sender<SubscriptionCommand>>,
+    /// Working copy of `AppConfig::webcal_subscriptions`, kept here so the
+    /// checklist (and the session) can be driven without reaching into the
+    /// config store on every event. Mutated only by the add/manage dialog,
+    /// which persists the authoritative list back to `settings.json`.
+    webcal_subscriptions: Vec<WebcalSubscription>,
+    /// Per-subscription feed state, keyed by subscription id.
+    webcal_handles: HashMap<String, WebcalHandle>,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -3041,6 +3075,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         displayed_month: current_month_start(),
         checked_calendar_ids: HashSet::new(),
         calendar_colors: calendar_colors::load(),
+        webcal_cmd_tx: None,
+        webcal_subscriptions: Vec::new(),
+        webcal_handles: HashMap::new(),
     }));
 
     // --- Calendar event reminders. The engine accumulates every occurrence
@@ -3441,6 +3478,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     smtp: format!("{}:{}", h.smtp_host, h.smtp_port),
                 })
                 .collect();
+            let webcal_list = st.app_config.borrow().webcal_subscriptions.clone();
             drop(st);
             mail.sort_by_key(|a| a.email.to_lowercase());
             let mut calendar: Vec<crate::config_view::CalendarAccountInfo> = calendar_state
@@ -3453,6 +3491,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 })
                 .collect();
             calendar.sort_by_key(|a| a.display_name.to_lowercase());
+            let mut webcal: Vec<crate::config_view::WebcalSubscriptionInfo> = webcal_list
+                .iter()
+                .map(|sub| crate::config_view::WebcalSubscriptionInfo {
+                    display_name: sub.display_name.clone(),
+                    url: sub.url.clone(),
+                })
+                .collect();
+            webcal.sort_by_key(|a| a.display_name.to_lowercase());
 
             let (mail_cache_dir, mail_files) = lookout_mail::cache_info();
             let mail_cache_files: Vec<crate::config_view::CacheFile> = mail_files
@@ -3485,6 +3531,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &config_view,
                 &mail,
                 &calendar,
+                &webcal,
                 &mail_cache_dir,
                 &mail_cache_files,
                 &calendar_cache_dir,
@@ -4022,6 +4069,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             for handle in calendar_state.borrow().accounts.values() {
                 let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
             }
+            let webcal_cmd = calendar_state.borrow().webcal_cmd_tx.clone();
+            if let Some(cmd) = webcal_cmd {
+                let _ = cmd.send_blocking(SubscriptionCommand::SyncMonth(month));
+            }
         });
     }
 
@@ -4119,6 +4170,49 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start, None);
         });
     }
+
+    // --- Calendar sidebar "Add calendar" -> the subscribe/import/manage
+    // dialog (webcal feeds + .ics import). Feeds are read-only, so the dialog
+    // is also where they get removed again.
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        let toast_overlay = toast_overlay.clone();
+        calendar_sidebar.add_calendar_button.connect_clicked(move |_| {
+            show_calendar_dialog(
+                &window,
+                &state,
+                &calendar_state,
+                &calendar_main,
+                &calendar_list_box,
+                &mini_calendar,
+                &mail_overview_day,
+                &mail_overview_day_list,
+                &toast_overlay,
+            );
+        });
+    }
+
+    // --- Webcal feed session: one poller for every configured subscription,
+    // started independently of GOA discovery (feeds aren't GOA accounts), so
+    // subscriptions load and refresh even with no CalDAV account connected.
+    spawn_webcal_session(
+        worker.clone(),
+        calendar_state.clone(),
+        state.borrow().app_config.clone(),
+        calendar_main.clone(),
+        calendar_sidebar.calendar_list_box.clone(),
+        calendar_sidebar.mini_calendar.clone(),
+        mail_overview_day.clone(),
+        mail_overview_day_list.clone(),
+        toast_overlay.clone(),
+    );
 
     spawn_account_discovery(
         worker.clone(),
@@ -4828,6 +4922,10 @@ fn show_anchor(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &Ca
     for handle in st.accounts.values() {
         let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
     }
+    let webcal_cmd = st.webcal_cmd_tx.clone();
+    if let Some(cmd) = webcal_cmd {
+        let _ = cmd.send_blocking(SubscriptionCommand::SyncMonth(month));
+    }
 }
 
 /// The local dates within `month` that have at least one occurrence from a
@@ -4840,11 +4938,16 @@ fn calendar_event_days(calendar_state: &Rc<RefCell<CalendarUiState>>, month: chr
     let mut days = HashSet::new();
     let month_start = first_of_month(month);
     let month_end = last_of_month(month);
-    for handle in st.accounts.values() {
-        if handle.last_synced_month != Some(month) {
+    for (synced, occurrences) in st
+        .accounts
+        .values()
+        .map(|h| (h.last_synced_month, h.last_occurrences.iter()))
+        .chain(st.webcal_handles.values().map(|h| (h.last_synced_month, h.last_occurrences.iter())))
+    {
+        if synced != Some(month) {
             continue;
         }
-        for occ in &handle.last_occurrences {
+        for occ in occurrences {
             if st.checked_calendar_ids.contains(&occ.calendar_id) {
                 days.extend(calendar_view::covered_local_dates(occ, month_start, month_end));
             }
@@ -5482,6 +5585,28 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
             status: calendar_view::calendar_account_status_text(&h.connection_state, !h.calendars.is_empty()),
         })
         .collect();
+    // Subscriptions render as one synthetic "Webcal subscriptions" group so
+    // they inherit the checklist's toggle/color machinery unchanged.
+    {
+        let st = calendar_state.borrow();
+        if !st.webcal_subscriptions.is_empty() {
+            groups.push(calendar_view::CalendarAccountGroup {
+                display_name: "Webcal subscriptions".to_string(),
+                calendars: st
+                    .webcal_subscriptions
+                    .iter()
+                    .map(|sub| CalendarInfo {
+                        id: webcal_calendar_id(&sub.id),
+                        account_id: AccountId(format!("webcal:{}", sub.id)),
+                        display_name: sub.display_name.clone(),
+                        color: None,
+                        href: sub.url.clone(),
+                    })
+                    .collect(),
+                status: None,
+            });
+        }
+    }
     groups.sort_by_key(|g| g.display_name.to_lowercase());
     let all_calendars: Vec<CalendarInfo> = groups.iter().flat_map(|g| g.calendars.iter().cloned()).collect();
     {
@@ -5526,6 +5651,12 @@ fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>
         .values()
         .filter(|h| h.last_synced_month == Some(month))
         .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned())
+        .chain(
+            st.webcal_handles
+                .values()
+                .filter(|h| h.last_synced_month == Some(month))
+                .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned()),
+        )
         .collect();
     drop(st);
     calendar_view::set_occurrences(calendar_main, &merged);
@@ -5548,6 +5679,7 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
         .accounts
         .values()
         .flat_map(|h| h.last_occurrences.iter())
+        .chain(st.webcal_handles.values().flat_map(|h| h.last_occurrences.iter()))
         .filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id))
         .filter(|occ| !calendar_view::covered_local_dates(occ, day, day).is_empty())
         .collect();
@@ -5693,6 +5825,86 @@ fn connect_calendar_account(
     });
 }
 
+/// The synthetic calendar id a subscription's events carry
+/// (`"webcal:<subscription id>"`) - mirrors the `lookout-dav` session's
+/// construction, so the two never drift.
+fn webcal_calendar_id(subscription_id: &str) -> CalendarId {
+    CalendarId(format!("webcal:{subscription_id}"))
+}
+
+/// Starts the single webcal feed session: loads the configured subscriptions
+/// into `calendar_state`, spawns the polling actor on the worker, and routes
+/// its `SubscriptionsUpdated` events into the same funnel as CalDAV
+/// `OccurrencesUpdated` (checklist, main view merge, mail-overview day list,
+/// mini-calendar event days). Runs at startup regardless of GOA - feeds are
+/// not GOA accounts, and one session polls all of them.
+#[allow(clippy::too_many_arguments)]
+fn spawn_webcal_session(
+    worker: Rc<Worker>,
+    calendar_state: Rc<RefCell<CalendarUiState>>,
+    app_config: Rc<RefCell<crate::app_config::AppConfig>>,
+    calendar_main: Rc<CalendarMain>,
+    calendar_list_box: gtk::Box,
+    mini_calendar: calendar_view::MiniCalendar,
+    mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
+    mail_overview_day_list: gtk::Box,
+    toast_overlay: adw::ToastOverlay,
+) {
+    let subscriptions = app_config.borrow().webcal_subscriptions.clone();
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    {
+        let mut st = calendar_state.borrow_mut();
+        st.webcal_cmd_tx = Some(cmd_tx);
+        st.webcal_subscriptions = subscriptions.clone();
+        for sub in &subscriptions {
+            st.webcal_handles.insert(
+                sub.id.clone(),
+                WebcalHandle {
+                    calendar_id: webcal_calendar_id(&sub.id),
+                    display_name: sub.display_name.clone(),
+                    last_occurrences: Vec::new(),
+                    last_synced_month: None,
+                    error: None,
+                },
+            );
+        }
+    }
+
+    worker.spawn(lookout_dav::subscription::run_subscription_session(subscriptions, cmd_rx, evt_tx));
+
+    glib::spawn_future_local(async move {
+        while let Ok(event) = evt_rx.recv().await {
+            let SubscriptionSessionEvent::SubscriptionsUpdated { month, feeds } = event;
+            let mut error_toasts: Vec<String> = Vec::new();
+            {
+                let mut st = calendar_state.borrow_mut();
+                for feed in feeds {
+                    let Some(handle) = st.webcal_handles.get_mut(&feed.subscription_id) else { continue };
+                    handle.last_occurrences = feed.occurrences;
+                    handle.last_synced_month = Some(month);
+                    // Toast on the *transition* into an error (or the first
+                    // error for a fresh handle), not on every 5-minute poll.
+                    if handle.error.is_none() && feed.error.is_some() {
+                        error_toasts.push(handle.display_name.clone());
+                    }
+                    handle.error = feed.error;
+                }
+            }
+            for name in error_toasts {
+                toast_overlay.add_toast(adw::Toast::new(&format!("Calendar feed \"{name}\" could not be fetched")));
+            }
+            refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
+            refresh_displayed_calendar_view(&calendar_state, &calendar_main);
+            refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+            if calendar_view::mini_month(&mini_calendar) == month {
+                let event_days = calendar_event_days(&calendar_state, month);
+                calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+            }
+        }
+    });
+}
+
 fn calendar_account_label(state: &Rc<RefCell<CalendarUiState>>, account_id: &AccountId) -> String {
     state
         .borrow()
@@ -5768,6 +5980,7 @@ fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anch
         st.accounts
             .values()
             .flat_map(|h| h.last_occurrences.iter())
+            .chain(st.webcal_handles.values().flat_map(|h| h.last_occurrences.iter()))
             .filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id))
             .cloned()
             .collect()
@@ -5785,15 +5998,24 @@ fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anch
 /// clicking an event chip in the calendar grids and the notification
 /// reminder's Open action (the engine hands the full occurrence back, so the
 /// editor works even when the month it belongs to isn't the one on screen).
+///
+/// An occurrence from a webcal subscription opens the editor in read-only
+/// mode (feeds have no write-back path) - every input is disabled and the
+/// save/delete actions are hidden.
 fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, occ: &EventOccurrence) {
+    let read_only = calendar_state.borrow().webcal_handles.values().any(|h| h.calendar_id == occ.calendar_id);
     let calendars = pickable_calendars(calendar_state);
-    if calendars.is_empty() {
-        return;
-    }
-    let default_calendar = if calendars.iter().any(|(_, id)| *id == occ.calendar_id) {
+    let default_calendar = if read_only {
         occ.calendar_id.clone()
     } else {
-        default_pickable_calendar(calendar_state).unwrap_or_else(|| CalendarId(String::new()))
+        if calendars.is_empty() {
+            return;
+        }
+        if calendars.iter().any(|(_, id)| *id == occ.calendar_id) {
+            occ.calendar_id.clone()
+        } else {
+            default_pickable_calendar(calendar_state).unwrap_or_else(|| CalendarId(String::new()))
+        }
     };
     let preview = event_editor_preview_data(calendar_state, occ.start.with_timezone(&chrono::Local).date_naive());
     let owner_email = calendar_owner_email(calendar_state, &occ.calendar_id);
@@ -5809,6 +6031,7 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
             month_event_days: &preview.month_event_days,
             calendar_colors: &preview.colors,
             owner_email,
+            read_only,
         },
         calendar_attendee_suggestions(state),
         {
@@ -5854,6 +6077,7 @@ fn show_new_event_editor(
             month_event_days: &preview.month_event_days,
             calendar_colors: &preview.colors,
             owner_email,
+            read_only: false,
         },
         calendar_attendee_suggestions(state),
         {
@@ -6036,6 +6260,393 @@ fn remove_cancelled_imip_event(calendar_state: &Rc<RefCell<CalendarUiState>>, to
             toast_overlay.add_toast(adw::Toast::new("This event wasn't in your calendar."));
         }
     }
+}
+
+/// The stored occurrence matching `uid` inside `calendar_id` specifically.
+/// (The iMIP upsert searches every calendar; an `.ics` import is scoped to
+/// its target instead, since re-importing a file must update what the file
+/// previously added, not touch a coincidental same-UID event elsewhere.)
+fn find_occurrence_in_calendar(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId, uid: &EventUid) -> Option<EventOccurrence> {
+    calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .flat_map(|handle| handle.last_occurrences.iter())
+        .find(|occurrence| occurrence.uid == *uid && occurrence.calendar_id == *calendar_id)
+        .cloned()
+}
+
+/// The "Add calendar" dialog - the sidebar button's one-stop entry point for
+/// the whole subscription/import story:
+///
+/// * **Subscribe** - a webcal/`https://…ics` feed URL (+ optional name) is
+///   validated, persisted to `settings.json`, and handed to the webcal
+///   session as a full `Reload` list (the session never learns of partial
+///   changes - the list here is always authoritative).
+/// * **Import** - a picked `.ics` file's events are routed into a chosen
+///   CalDAV calendar through the existing session write path, upserting by
+///   UID so re-importing the same file updates rather than duplicates.
+/// * **Manage** - the current subscriptions, each with a Remove action, plus
+///   a manual "Refresh now" for feeds that shouldn't wait for the poll.
+///
+/// Subscriptions are fetch-only, so import targets only ever list CalDAV
+/// calendars (`pickable_calendars`), and removing a subscription also drops
+/// its feed cache, its checked flag, and its colour assignment.
+#[allow(clippy::too_many_arguments)]
+/// The manage-list rebuild slot used by [`show_calendar_dialog`]: a closure
+/// `Option` behind a `RefCell`, since the rebuild closure and the remove
+/// handler are mutually referential (the slot breaks the cycle).
+type ManageRebuild = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+#[allow(clippy::too_many_arguments)]
+fn show_calendar_dialog(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    calendar_main: &Rc<CalendarMain>,
+    calendar_list_box: &gtk::Box,
+    mini_calendar: &calendar_view::MiniCalendar,
+    mail_overview_day: &Rc<Cell<chrono::NaiveDate>>,
+    mail_overview_day_list: &gtk::Box,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    let app_config = state.borrow().app_config.clone();
+
+    let dialog = adw::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Add calendar")
+        .default_width(460)
+        .default_height(560)
+        .build();
+
+    // --- Subscribe section: URL (+ optional name) -> validated, persisted,
+    // handed to the session.
+    let url_entry = adw::EntryRow::builder().title("Feed URL").build();
+    let name_entry = adw::EntryRow::builder().title("Name").build();
+    let subscribe_button = gtk::Button::with_label("Subscribe");
+    subscribe_button.add_css_class("suggested-action");
+    subscribe_button.set_halign(gtk::Align::End);
+    let subscribe_group = adw::PreferencesGroup::builder().title("Subscribe to a calendar").build();
+    subscribe_group.add(&url_entry);
+    subscribe_group.add(&name_entry);
+    subscribe_group.add(&subscribe_button);
+
+    // --- Import section: chosen .ics file -> parsed -> routed into the
+    // picked CalDAV calendar (upsert by UID).
+    let import_file_button = gtk::Button::with_label("Choose .ics file…");
+    import_file_button.set_halign(gtk::Align::Start);
+    let import_file_label = gtk::Label::builder()
+        .label("No file chosen")
+        .css_classes(["dim-label", "caption"])
+        .xalign(0.0)
+        .wrap(true)
+        .hexpand(true)
+        .build();
+    let chosen_ics: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let pickable = pickable_calendars(calendar_state);
+    let import_calendar_labels: Vec<String> = pickable.iter().map(|(label, _)| label.clone()).collect();
+    let import_calendar_ids: Vec<CalendarId> = pickable.iter().map(|(_, id)| id.clone()).collect();
+    let import_target_dropdown = gtk::DropDown::builder().build();
+    if import_calendar_ids.is_empty() {
+        import_target_dropdown.set_sensitive(false);
+    } else {
+        let label_refs: Vec<&str> = import_calendar_labels.iter().map(String::as_str).collect();
+        import_target_dropdown.set_model(Some(&gtk::StringList::new(&label_refs)));
+        import_target_dropdown.set_selected(0);
+    }
+    import_target_dropdown.set_tooltip_text(Some("Import into this calendar"));
+    let import_button = gtk::Button::with_label("Import");
+    import_button.add_css_class("suggested-action");
+    import_button.set_sensitive(false);
+    import_button.set_halign(gtk::Align::End);
+    let import_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    import_row.append(&import_file_button);
+    import_row.append(&import_file_label);
+    let import_row2 = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    import_row2.append(&import_target_dropdown);
+    import_row2.append(&import_button);
+    let import_group = adw::PreferencesGroup::builder().title("Import from file").build();
+    import_group.add(&import_row);
+    import_group.add(&import_row2);
+
+    // --- Manage section: one row per subscription (name + Remove), and a
+    // manual refresh for feeds that shouldn't wait for the 5-minute poll.
+    let manage_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let refresh_now_button = gtk::Button::with_label("Refresh now");
+    refresh_now_button.add_css_class("flat");
+    refresh_now_button.set_halign(gtk::Align::Start);
+    let manage_group = adw::PreferencesGroup::builder().title("Manage subscriptions").build();
+    manage_group.add(&manage_box);
+    manage_group.add(&refresh_now_button);
+
+    // After any change: repaint the checklist/view/mini-calendar from the
+    // current state (the session's own `SubscriptionsUpdated` also lands,
+    // but this makes the change feel immediate - the removed handle is
+    // already gone from state, so its events vanish right away).
+    let refresh_ui: Rc<dyn Fn()> = Rc::new({
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let calendar_list_box = calendar_list_box.clone();
+        let mini_calendar = mini_calendar.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        move || {
+            refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
+            refresh_displayed_calendar_view(&calendar_state, &calendar_main);
+            refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+            let month = calendar_state.borrow().displayed_month;
+            let event_days = calendar_event_days(&calendar_state, month);
+            calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+        }
+    });
+
+    // Pushes the authoritative subscription list (from `settings.json`) to
+    // the webcal session, which adopts it and re-syncs every feed.
+    let reload_session: Rc<dyn Fn()> = Rc::new({
+        let calendar_state = calendar_state.clone();
+        let app_config = app_config.clone();
+        move || {
+            let subscriptions = app_config.borrow().webcal_subscriptions.clone();
+            let cmd = calendar_state.borrow().webcal_cmd_tx.clone();
+            if let Some(cmd) = cmd {
+                let _ = cmd.send_blocking(SubscriptionCommand::Reload { subscriptions });
+            }
+        }
+    });
+
+    // Re-renders the manage list from current state (called at open and
+    // after every subscribe/remove). The two closures are mutually
+    // referential - `rebuild_manage` creates rows whose Remove buttons call
+    // `remove_subscription`, which re-renders via `rebuild_manage` - so the
+    // rebuild is stashed in a slot the remove handler fills in afterwards.
+    let rebuild_manage: ManageRebuild = Rc::new(RefCell::new(None));
+    let remove_subscription: Rc<dyn Fn(String)> = Rc::new({
+        let app_config = app_config.clone();
+        let calendar_state = calendar_state.clone();
+        let reload_session = reload_session.clone();
+        let refresh_ui = refresh_ui.clone();
+        let rebuild_manage = rebuild_manage.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |id: String| {
+            {
+                let mut config = app_config.borrow_mut();
+                config.webcal_subscriptions.retain(|s| s.id != id);
+                crate::app_config::save(&config);
+            }
+            {
+                let mut st = calendar_state.borrow_mut();
+                st.webcal_subscriptions.retain(|s| s.id != id);
+                st.webcal_handles.remove(&id);
+                st.checked_calendar_ids.remove(&webcal_calendar_id(&id));
+                st.calendar_colors.remove(&webcal_calendar_id(&id));
+            }
+            calendar_colors::save(&calendar_state.borrow().calendar_colors);
+            let _ = lookout_dav::remove_subscription_cache(&id);
+            reload_session();
+            refresh_ui();
+            if let Some(rebuild) = rebuild_manage.borrow().clone() {
+                rebuild();
+            }
+            toast_overlay.add_toast(adw::Toast::new("Subscription removed"));
+        }
+    });
+    *rebuild_manage.borrow_mut() = Some(Rc::new({
+        let manage_box = manage_box.clone();
+        let calendar_state = calendar_state.clone();
+        let remove_subscription = remove_subscription.clone();
+        move || {
+            while let Some(child) = manage_box.first_child() {
+                manage_box.remove(&child);
+            }
+            let subs = calendar_state.borrow().webcal_subscriptions.clone();
+            if subs.is_empty() {
+                let label = gtk::Label::builder()
+                    .label("No subscriptions yet")
+                    .css_classes(["dim-label", "caption"])
+                    .xalign(0.0)
+                    .build();
+                manage_box.append(&label);
+            }
+            for sub in subs {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                let text = gtk::Label::builder()
+                    .label(&sub.display_name)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .hexpand(true)
+                    .xalign(0.0)
+                    .build();
+                text.set_tooltip_text(Some(&sub.url));
+                let remove = gtk::Button::from_icon_name(themed_icon_name(&["user-trash-symbolic", "edit-delete-symbolic"]));
+                remove.add_css_class("flat");
+                remove.set_tooltip_text(Some("Remove subscription"));
+                let id = sub.id.clone();
+                let remove_subscription = remove_subscription.clone();
+                remove.connect_clicked(move |_| remove_subscription(id.clone()));
+                row.append(&text);
+                row.append(&remove);
+                manage_box.append(&row);
+            }
+        }
+    }));
+
+    subscribe_button.connect_clicked({
+        let url_entry = url_entry.clone();
+        let name_entry = name_entry.clone();
+        let app_config = app_config.clone();
+        let calendar_state = calendar_state.clone();
+        let reload_session = reload_session.clone();
+        let refresh_ui = refresh_ui.clone();
+        let rebuild_manage = rebuild_manage.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            let url_text = url_entry.text().trim().to_string();
+            let Ok(url) = lookout_dav::normalize_webcal_url(&url_text) else {
+                toast_overlay.add_toast(adw::Toast::new("That doesn't look like a calendar feed URL."));
+                return;
+            };
+            let name = {
+                let typed = name_entry.text().trim().to_string();
+                if typed.is_empty() {
+                    url.host_str().unwrap_or(&url_text).to_string()
+                } else {
+                    typed
+                }
+            };
+            let subscription = WebcalSubscription {
+                id: uuid::Uuid::new_v4().to_string(),
+                display_name: name,
+                url: url_text,
+            };
+            {
+                let mut config = app_config.borrow_mut();
+                config.webcal_subscriptions.push(subscription.clone());
+                crate::app_config::save(&config);
+            }
+            {
+                let mut st = calendar_state.borrow_mut();
+                st.webcal_subscriptions.push(subscription.clone());
+                st.webcal_handles.insert(
+                    subscription.id.clone(),
+                    WebcalHandle {
+                        calendar_id: webcal_calendar_id(&subscription.id),
+                        display_name: subscription.display_name.clone(),
+                        last_occurrences: Vec::new(),
+                        last_synced_month: None,
+                        error: None,
+                    },
+                );
+            }
+            reload_session();
+            refresh_ui();
+            if let Some(rebuild) = rebuild_manage.borrow().clone() {
+                rebuild();
+            }
+            url_entry.set_text("");
+            name_entry.set_text("");
+            toast_overlay.add_toast(adw::Toast::new("Subscribed - fetching events…"));
+        }
+    });
+
+    import_file_button.connect_clicked({
+        let window = window.clone();
+        let import_file_label = import_file_label.clone();
+        let chosen_ics = chosen_ics.clone();
+        let import_button = import_button.clone();
+        move |_| {
+            let window = window.clone();
+            let import_file_label = import_file_label.clone();
+            let chosen_ics = chosen_ics.clone();
+            let import_button = import_button.clone();
+            glib::spawn_future_local(async move {
+                let filter = gtk::FileFilter::new();
+                filter.add_suffix("ics");
+                filter.set_name(Some("iCalendar files (*.ics)"));
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                let dialog = gtk::FileDialog::builder().title("Choose a calendar file").filters(&filters).build();
+                let Ok(file) = dialog.open_future(Some(&window)).await else { return };
+                let Some(path) = file.path() else { return };
+                let Ok(raw) = std::fs::read(&path) else { return };
+                *chosen_ics.borrow_mut() = Some(String::from_utf8_lossy(&raw).into_owned());
+                import_file_label.set_label(&path.display().to_string());
+                import_button.set_sensitive(true);
+            });
+        }
+    });
+
+    import_button.connect_clicked({
+        let dialog = dialog.clone();
+        let chosen_ics = chosen_ics.clone();
+        let import_target_dropdown = import_target_dropdown.clone();
+        let import_calendar_ids = import_calendar_ids.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            let Some(ics) = chosen_ics.borrow().clone() else { return };
+            let Some(calendar_id) = import_calendar_ids.get(import_target_dropdown.selected() as usize).cloned() else {
+                toast_overlay.add_toast(adw::Toast::new("Choose a calendar to import into."));
+                return;
+            };
+            let events = lookout_dav::parse_vevents(&CalendarId("import".to_string()), &ics);
+            if events.is_empty() {
+                toast_overlay.add_toast(adw::Toast::new("No events found in this file."));
+                return;
+            }
+            let mut created = 0;
+            let mut updated = 0;
+            for mut event in events {
+                event.calendar_id = calendar_id.clone();
+                match find_occurrence_in_calendar(&calendar_state, &calendar_id, &event.uid) {
+                    Some(existing) => {
+                        event.href = existing.href;
+                        event.etag = existing.etag;
+                        updated += 1;
+                    }
+                    None => {
+                        event.href = None;
+                        event.etag = None;
+                        created += 1;
+                    }
+                }
+                route_calendar_save(&calendar_state, calendar_id.clone(), event);
+            }
+            let summary = if updated > 0 {
+                format!("Imported {created} event(s), updated {updated} existing")
+            } else {
+                format!("Imported {created} event(s)")
+            };
+            toast_overlay.add_toast(adw::Toast::new(&summary));
+            dialog.close();
+        }
+    });
+
+    refresh_now_button.connect_clicked({
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            let cmd = calendar_state.borrow().webcal_cmd_tx.clone();
+            if let Some(cmd) = cmd {
+                let _ = cmd.send_blocking(SubscriptionCommand::Refresh);
+                toast_overlay.add_toast(adw::Toast::new("Refreshing calendar feeds…"));
+            }
+        }
+    });
+
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    content.append(&subscribe_group);
+    content.append(&import_group);
+    content.append(&manage_group);
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&content)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    dialog.set_content(Some(&scroller));
+    if let Some(rebuild) = rebuild_manage.borrow().clone() {
+        rebuild();
+    }
+    dialog.present();
 }
 
 fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {

@@ -681,4 +681,25 @@ mod tests {
         assert_eq!(parse_imip_invitation(ics), None);
         assert_eq!(parse_imip_invitation("not an icalendar document"), None);
     }
+
+    /// The shared `test-fixtures/holidays.ics`: a multi-VEVENT document with
+    /// an all-day event, a recurring event, and a VTODO that must be ignored -
+    /// the shape a webcal feed or an imported `.ics` file takes. Exercises
+    /// the exact path the subscription session and import dialog feed into.
+    #[test]
+    fn parses_the_multi_vevent_fixture_ignoring_todos() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/holidays.ics");
+        let ics = std::fs::read_to_string(path).expect("fixture exists");
+        let events = parse_vevents(&cal_id(), &ics);
+        assert_eq!(events.len(), 2, "the VTODO must be ignored, only VEVENTs parsed");
+        assert_eq!(events[0].uid.0, "holiday-1@example.com");
+        assert!(events[0].all_day, "VALUE=DATE start must mark the event all-day");
+        assert_eq!(events[0].start, "2026-08-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(events[1].uid.0, "weekly-2@example.com");
+        assert_eq!(events[1].rrule.as_deref(), Some("FREQ=WEEKLY;COUNT=4"));
+        assert!(!events[1].all_day);
+        // Fixture events must carry no write metadata - they're create-only
+        // until an import/upsert stamps them.
+        assert!(events.iter().all(|e| e.href.is_none() && e.etag.is_none()));
+    }
 }

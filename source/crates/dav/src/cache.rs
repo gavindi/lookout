@@ -70,6 +70,18 @@ pub fn clear_all_caches() -> Result<()> {
     Ok(())
 }
 
+/// Removes one subscription's cache database (on unsubscribe). A missing file
+/// is not an error - the feed may never have synced. Same "safe while the
+/// session is live" reasoning as [`clear_all_caches`].
+pub fn remove_subscription_cache(subscription_id: &str) -> Result<()> {
+    let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&AccountId(format!("webcal-{subscription_id}")))));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// GOA account ids are D-Bus object paths (e.g.
 /// `/org/gnome/OnlineAccounts/Accounts/account_1234`); sanitize into a bare
 /// filename.

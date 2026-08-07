@@ -13,6 +13,62 @@ const NS_APPLE_ICAL: &[u8] = b"http://apple.com/ns/ical/";
 
 const ADDRESSBOOK_PROPS: [&str; 2] = ["D:displayname", "D:resourcetype"];
 
+/// The maximum size of a downloaded webcal feed body. Feeds are untrusted
+/// URLs (a misconfigured subscription can point at anything), so a body over
+/// this is rejected rather than buffered.
+pub const MAX_FEED_BYTES: usize = 5 * 1024 * 1024;
+
+/// Normalizes a user-supplied calendar feed URL for fetching: the
+/// `webcal://`/`webcals://` schemes (RFC 5545's `calconnect` aliases for
+/// `http`/`https`, the only scheme an actual webcal feed can be served on)
+/// are rewritten to their real equivalents; anything else is passed through
+/// and must already be `http`/`https`.
+pub fn normalize_webcal_url(raw: &str) -> Result<reqwest::Url> {
+    let raw = raw.trim();
+    let rewritten = match raw.find("://") {
+        Some(end) => match raw[..end].to_ascii_lowercase().as_str() {
+            "webcal" => format!("http{}", &raw[end..]),
+            "webcals" => format!("https{}", &raw[end..]),
+            _ => raw.to_string(),
+        },
+        None => raw.to_string(),
+    };
+    let url = reqwest::Url::parse(&rewritten).map_err(|e| Error::Discovery(format!("invalid calendar feed URL {raw:?}: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::Discovery(format!(
+            "unsupported scheme {:?} - calendar feeds must be http(s) (webcal:// is accepted)",
+            url.scheme()
+        )));
+    }
+    Ok(url)
+}
+
+/// Fetches a public `.ics` document (a webcal feed, or an import source) over
+/// plain HTTP/HTTPS with no credentials - webcal feeds are public by nature,
+/// and auth-protected feeds are deliberately out of scope. `url` should come
+/// from [`normalize_webcal_url`] (the scheme rewrite is not re-applied here).
+/// Rejects responses advertising a body larger than [`MAX_FEED_BYTES`] before
+/// buffering, and post-checks the actual size for servers that lie about
+/// `Content-Length`.
+pub async fn fetch_webcal_ics(http: &reqwest::Client, url: &reqwest::Url) -> Result<String> {
+    let request_url = url.clone();
+    let response = http.get(url.clone()).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await?;
+        let snippet: String = text.chars().take(500).collect();
+        return Err(Error::Discovery(format!("HTTP {status} for {request_url}: {snippet}")));
+    }
+    if response.content_length().is_some_and(|len| len > MAX_FEED_BYTES as u64) {
+        return Err(Error::Discovery(format!("feed {request_url} exceeds the {MAX_FEED_BYTES}-byte size limit")));
+    }
+    let body = response.bytes().await?;
+    if body.len() > MAX_FEED_BYTES {
+        return Err(Error::Discovery(format!("feed {request_url} exceeds the {MAX_FEED_BYTES}-byte size limit")));
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 #[derive(Debug, Clone)]
 pub struct AddressBookInfo {
     pub account_id: AccountId,
@@ -339,6 +395,71 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn normalize_webcal_url_rewrites_webcal_schemes_and_keeps_http_https() {
+        assert_eq!(normalize_webcal_url("webcal://example.com/feed.ics").unwrap().as_str(), "http://example.com/feed.ics");
+        assert_eq!(normalize_webcal_url("webcals://example.com/feed.ics").unwrap().as_str(), "https://example.com/feed.ics");
+        // Scheme matching is case-insensitive; https passes through untouched.
+        assert_eq!(normalize_webcal_url("WEBCAL://example.com/feed.ics").unwrap().as_str(), "http://example.com/feed.ics");
+        assert_eq!(normalize_webcal_url("https://example.com/feed.ics").unwrap().as_str(), "https://example.com/feed.ics");
+        // Surrounding whitespace is tolerated (users paste URLs).
+        assert_eq!(normalize_webcal_url("  http://example.com/x.ics  ").unwrap().as_str(), "http://example.com/x.ics");
+    }
+
+    #[test]
+    fn normalize_webcal_url_rejects_garbage_and_unsupported_schemes() {
+        assert!(normalize_webcal_url("not a url").is_err());
+        assert!(normalize_webcal_url("").is_err());
+        let err = normalize_webcal_url("ftp://example.com/feed.ics").unwrap_err();
+        assert!(err.to_string().contains("unsupported scheme"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_webcal_ics_returns_the_feed_body() {
+        let server = MockServer::start().await;
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n";
+        Mock::given(method("GET"))
+            .and(path("/feed.ics"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ics))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let url = format!("{}/feed.ics", server.uri()).parse().unwrap();
+        assert_eq!(fetch_webcal_ics(&http, &url).await.unwrap(), ics);
+    }
+
+    #[tokio::test]
+    async fn fetch_webcal_ics_surfaces_http_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/missing.ics"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not here"))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let url = format!("{}/missing.ics", server.uri()).parse().unwrap();
+        let err = fetch_webcal_ics(&http, &url).await.unwrap_err();
+        assert!(err.to_string().contains("404"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_webcal_ics_rejects_bodies_over_the_size_limit() {
+        let server = MockServer::start().await;
+        let huge = "x".repeat(MAX_FEED_BYTES + 1);
+        Mock::given(method("GET"))
+            .and(path("/huge.ics"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&huge))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let url = format!("{}/huge.ics", server.uri()).parse().unwrap();
+        let err = fetch_webcal_ics(&http, &url).await.unwrap_err();
+        assert!(err.to_string().contains("size limit"), "{err}");
+    }
 
     #[tokio::test]
     async fn discovers_home_lists_calendars_and_fetches_events_end_to_end() {

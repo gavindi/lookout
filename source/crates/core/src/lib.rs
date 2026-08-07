@@ -11,7 +11,7 @@ pub mod mailbox;
 pub mod thread;
 pub mod vcard;
 
-pub use calendar::{Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, EventOccurrence, EventSensitivity, EventTransparency};
+pub use calendar::{Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, EventOccurrence, EventSensitivity, EventTransparency, WebcalSubscription};
 pub use email::{
     cid_matches, header_value, parse_imip_method, parse_list_unsubscribe, sanitize_tag_key, tag_key_from_keyword, tag_keyword, AuthenticationResults, BodyPart, ContactsProvider,
     DkimResult, DmarcResult, EmailAddress, EmailBody, EmailSummary, ImipInvitation, ImipMethod, ListUnsubscribe, SpfResult, SystemFlagBit, TAG_KEYWORD_PREFIX,

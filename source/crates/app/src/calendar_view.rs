@@ -2218,27 +2218,27 @@ fn calendar_color_css(color: &str) -> String {
     )
 }
 
-/// The calendar view's left sidebar: a mini month-picker, a disabled "Add
-/// calendar" placeholder (no calendar-subscription support yet), and a "My
-/// calendars" checklist (populated later by the caller via
+/// The calendar view's left sidebar: a mini month-picker, an "Add calendar"
+/// button (opening the subscribe/import/manage dialog - the caller wires it),
+/// and a "My calendars" checklist (populated later by the caller via
 /// `rebuild_calendar_checklist`, once accounts have actually reported which
 /// calendars exist).
 pub struct CalendarSidebar {
     pub root: gtk::Widget,
     pub mini_calendar: MiniCalendar,
     pub calendar_list_box: gtk::Box,
+    /// The sidebar's "Add calendar" entry point; `build_sidebar` creates it
+    /// enabled but unwired - the caller connects `clicked` to the subscribe/
+    /// import/manage dialog, which needs the session plumbing this module
+    /// deliberately doesn't have.
+    pub add_calendar_button: gtk::Button,
 }
 
 pub fn build_sidebar() -> CalendarSidebar {
     let mini_calendar = build_mini();
     mini_calendar.root.add_css_class("mini-calendar-sidebar");
 
-    let add_calendar_button = gtk::Button::builder()
-        .label("Add calendar")
-        .css_classes(["flat"])
-        .halign(gtk::Align::Start)
-        .sensitive(false)
-        .build();
+    let add_calendar_button = gtk::Button::builder().label("Add calendar").css_classes(["flat"]).halign(gtk::Align::Start).build();
 
     let my_calendars_label = gtk::Label::builder().label("My calendars").css_classes(["heading"]).xalign(0.0).margin_top(12).build();
     let calendar_list_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
@@ -2267,6 +2267,7 @@ pub fn build_sidebar() -> CalendarSidebar {
         root: root_box.upcast(),
         mini_calendar,
         calendar_list_box,
+        add_calendar_button,
     }
 }
 

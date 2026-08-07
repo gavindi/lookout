@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.7 (2026-08-08)
+
+### Added
+
+- **Calendar**: webcal (`.ics` feed) subscriptions. The sidebar's long-disabled "Add calendar" button now opens a management dialog with three sections: *Subscribe* (a `webcal://`/`webcals://`/`https://…ics` URL, normalized and validated by the new `lookout_dav::normalize_webcal_url`, plus an optional name defaulting to the feed's host), *Import* (a picked `.ics` file parsed through the existing iCalendar path and routed into a chosen CalDAV calendar, upserting by UID so re-importing the same file updates existing events instead of duplicating - a file chooser pattern shared with the `.eml` debug action), and *Manage* (every subscription with a Remove action plus a manual "Refresh now"). Subscriptions persist in `settings.json` (`AppConfig::webcal_subscriptions`), and a new `lookout-dav` session actor (`subscription.rs`) polls all feeds on the CalDAV session's 5-minute cadence, parsing each through `parse_vevents` + the shared recurrence expansion and caching per-feed occurrences in the existing month-keyed `CalendarCache` (keyed `webcal-<id>`); a failing feed reports its own error - toasting once on the transition into error, never on every poll - while its last-good occurrences stay visible. The feed session starts independently of GOA (feeds aren't GOA accounts) and re-syncs the displayed month alongside the CalDAV accounts. Subscriptions render as a synthetic "Webcal subscriptions" group in the sidebar checklist (toggle + colour assignment flow through the existing machinery) and their events merge into every view, the mail-screen overview, and the mini-calendar; because feeds are fetch-only, subscription events open the event editor in a new read-only mode (inputs disabled, Save/Delete hidden, a dim note explaining why) and never appear as editor targets. The Config view gains a read-only "Webcal subscriptions" group; unsubscribing also drops the feed's cache file, checked flag, and colour. `test-fixtures/holidays.ics` is the shared multi-VEVENT fixture (all-day + recurring events plus an ignored VTODO).
+
+### Testing
+
+- `lookout-dav`: URL-normalization unit tests (webcal/webcals rewrite, case-insensitive schemes, garbage and `ftp://` rejected); `fetch_webcal_ics` against wiremock (body returned, HTTP errors surfaced with the server snippet, bodies over the 5 MB cap rejected); a `run_subscription_session` integration test against a wiremock feed (fast-paint → live fetch → expand into the current month window → refresh re-fetch → shutdown, per-feed error on HTTP 500 without stopping the session); and a fixture parse test (`holidays.ics` yields exactly its two VEVENTs, VTODO ignored, all-day and RRULE fields preserved, no write metadata).
+
 ## 0.7.6 (2026-08-07)
 
 ### Added

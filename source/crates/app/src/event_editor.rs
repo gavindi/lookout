@@ -67,6 +67,10 @@ pub struct EventEditorPrefill<'a> {
     /// couldn't be derived - `ATTENDEE`s are still written without an
     /// `ORGANIZER` in that case (a documented non-conformance, not a blocker).
     pub owner_email: Option<String>,
+    /// View-only mode for events from webcal subscriptions (feeds have no
+    /// write-back path): every input is disabled, the save/delete actions
+    /// are hidden, and a dim note explains why. Requires `existing`.
+    pub read_only: bool,
 }
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
@@ -89,11 +93,18 @@ pub fn show_event_editor(
 
     let existing: Option<EventOccurrence> = prefill.existing.cloned();
     let has_existing = existing.is_some();
+    let read_only = prefill.read_only;
 
     let dialog = adw::Window::builder()
         .transient_for(window)
         .modal(true)
-        .title(if has_existing { "Edit event" } else { "New event" })
+        .title(if read_only {
+            "Event"
+        } else if has_existing {
+            "Edit event"
+        } else {
+            "New event"
+        })
         .default_width(920)
         .default_height(640)
         .build();
@@ -287,6 +298,14 @@ pub fn show_event_editor(
         .halign(gtk::Align::Start)
         .build();
     recurring_note.set_visible(existing.as_ref().is_some_and(|occ| occ.rrule.is_some()));
+    let read_only_note = gtk::Label::builder()
+        .label("This calendar is a read-only subscription - changes can't be saved back to the feed.")
+        .css_classes(["dim-label", "caption"])
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    read_only_note.set_visible(read_only);
     let error_label = gtk::Label::builder().wrap(true).xalign(0.0).halign(gtk::Align::Start).css_classes(["error"]).build();
     error_label.set_visible(false);
 
@@ -313,6 +332,7 @@ pub fn show_event_editor(
         .build();
     form_box.append(&fields_group);
     form_box.append(&datetime_row);
+    form_box.append(&read_only_note);
     form_box.append(&recurring_note);
     form_box.append(&error_label);
     form_box.append(&notes_label);
@@ -539,6 +559,7 @@ pub fn show_event_editor(
     // from the edited occurrence; a fresh event gets a new UUID. `rrule`
     // comes from the Series control (or, for a rule this builder couldn't
     // parse, the original raw string untouched).
+    let series = Rc::new(series);
     let existing_meta: Option<EventMeta> = existing.as_ref().map(|occ| (occ.uid.clone(), occ.href.clone(), occ.etag.clone()));
     let existing_attendees: Vec<Attendee> = existing.as_ref().map(|occ| occ.attendees.clone()).unwrap_or_default();
     let owner_email = prefill.owner_email.clone();
@@ -565,7 +586,7 @@ pub fn show_event_editor(
         let busy_dropdown = busy_dropdown.clone();
         let sensitivity_dropdown = sensitivity_dropdown.clone();
         let reminder_dropdown = reminder_dropdown.clone();
-        let series = Rc::new(series);
+        let series = series.clone();
         let existing_meta = existing_meta.clone();
         let existing_attendees = existing_attendees.clone();
         let on_save = on_save;
@@ -653,6 +674,40 @@ pub fn show_event_editor(
                 dialog.close();
             }
         });
+    }
+
+    // Read-only (webcal subscription) mode: lock every input and hide the
+    // actions - there's no write path for feeds, so Save/Delete are not just
+    // insensitive but hidden to avoid implying they could work.
+    if read_only {
+        for widget in [
+            title_row.upcast_ref::<gtk::Widget>(),
+            attendees_field.widget().upcast_ref::<gtk::Widget>(),
+            location_row.upcast_ref::<gtk::Widget>(),
+            all_day_switch.upcast_ref::<gtk::Widget>(),
+            start_calendar.upcast_ref::<gtk::Widget>(),
+            end_calendar.upcast_ref::<gtk::Widget>(),
+            start_hour.upcast_ref::<gtk::Widget>(),
+            start_minute.upcast_ref::<gtk::Widget>(),
+            end_hour.upcast_ref::<gtk::Widget>(),
+            end_minute.upcast_ref::<gtk::Widget>(),
+            video_toggle.upcast_ref::<gtk::Widget>(),
+            video_url_row.upcast_ref::<gtk::Widget>(),
+            description_view.upcast_ref::<gtk::Widget>(),
+        ] {
+            widget.set_sensitive(false);
+        }
+        for widget in [
+            series.button.upcast_ref::<gtk::Widget>(),
+            busy_dropdown.upcast_ref::<gtk::Widget>(),
+            categorize_button.upcast_ref::<gtk::Widget>(),
+            reminder_dropdown.upcast_ref::<gtk::Widget>(),
+            sensitivity_dropdown.upcast_ref::<gtk::Widget>(),
+            save_button.upcast_ref::<gtk::Widget>(),
+        ] {
+            widget.set_sensitive(false);
+        }
+        delete_button.set_visible(false);
     }
 
     dialog.present();

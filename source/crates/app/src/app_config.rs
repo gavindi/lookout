@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use lookout_core::{AccountId, Identity, MailboxRole};
+use lookout_core::{AccountId, Identity, MailboxRole, WebcalSubscription};
 use serde::{Deserialize, Serialize};
 
 /// A user override of a mailbox's special-use role (e.g. "this folder is my
@@ -29,6 +29,7 @@ pub struct FolderRoleOverride {
 pub struct AppConfig {
     pub identities: Vec<Identity>,
     pub folder_role_overrides: Vec<FolderRoleOverride>,
+    pub webcal_subscriptions: Vec<WebcalSubscription>,
 }
 
 impl AppConfig {
@@ -137,6 +138,11 @@ mod tests {
                 mailbox: "account_1:Archive 2024".into(),
                 role: MailboxRole::Archive,
             }],
+            webcal_subscriptions: vec![WebcalSubscription {
+                id: "sub-1".into(),
+                display_name: "Holidays".into(),
+                url: "https://example.com/holidays.ics".into(),
+            }],
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -160,6 +166,7 @@ mod tests {
                 Identity::new(account.clone(), "The Account Itself", "ME@example.com"),
             ],
             folder_role_overrides: Vec::new(),
+            webcal_subscriptions: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");

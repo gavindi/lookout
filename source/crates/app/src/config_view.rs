@@ -42,6 +42,13 @@ pub struct CalendarAccountInfo {
     pub uri: String,
 }
 
+/// Plain display data for one webcal subscription feed.
+pub struct WebcalSubscriptionInfo {
+    pub display_name: String,
+    /// The feed URL as the user configured it.
+    pub url: String,
+}
+
 /// One cached database file to display in the Advanced section.
 pub struct CacheFile {
     pub name: String,
@@ -86,8 +93,10 @@ pub struct ConfigView {
     pub calendar_alerts_row: adw::SwitchRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
+    webcal_group: adw::PreferencesGroup,
     mail_rows: RefCell<Vec<adw::ActionRow>>,
     calendar_rows: RefCell<Vec<adw::ActionRow>>,
+    webcal_rows: RefCell<Vec<adw::ActionRow>>,
     /// The per-account "Identities" rows, rebuilt alongside `mail_rows`.
     identity_rows: RefCell<Vec<adw::ActionRow>>,
     mail_cache_group: adw::PreferencesGroup,
@@ -123,6 +132,9 @@ pub fn build() -> ConfigView {
 
     let calendar_group = adw::PreferencesGroup::builder().title("Calendar accounts").build();
     page.add(&calendar_group);
+
+    let webcal_group = adw::PreferencesGroup::builder().title("Webcal subscriptions").build();
+    page.add(&webcal_group);
 
     let appearance_group = adw::PreferencesGroup::builder().title("Appearance").build();
     let animations_row = adw::SwitchRow::builder()
@@ -223,8 +235,10 @@ pub fn build() -> ConfigView {
         calendar_alerts_row,
         mail_group,
         calendar_group,
+        webcal_group,
         mail_rows: RefCell::new(Vec::new()),
         calendar_rows: RefCell::new(Vec::new()),
+        webcal_rows: RefCell::new(Vec::new()),
         identity_rows: RefCell::new(Vec::new()),
         mail_cache_group,
         calendar_cache_group,
@@ -244,6 +258,7 @@ pub fn refresh(
     view: &ConfigView,
     mail: &[MailAccountInfo],
     calendar: &[CalendarAccountInfo],
+    webcal: &[WebcalSubscriptionInfo],
     mail_cache_dir: &std::path::Path,
     mail_cache_files: &[CacheFile],
     calendar_cache_dir: &std::path::Path,
@@ -258,6 +273,9 @@ pub fn refresh(
     }
     for row in view.calendar_rows.borrow_mut().drain(..) {
         view.calendar_group.remove(&row);
+    }
+    for row in view.webcal_rows.borrow_mut().drain(..) {
+        view.webcal_group.remove(&row);
     }
 
     if mail.is_empty() {
@@ -288,6 +306,17 @@ pub fn refresh(
     } else {
         for info in calendar {
             push_row(&view.calendar_group, &view.calendar_rows, account_row(&info.display_name, &info.uri));
+        }
+    }
+
+    // Feed subscriptions are managed from the calendar sidebar's "Add
+    // calendar" dialog; this group is a read-only mirror (rows are not
+    // activatable, matching the account rows above).
+    if webcal.is_empty() {
+        push_row(&view.webcal_group, &view.webcal_rows, empty_row("No webcal subscriptions"));
+    } else {
+        for info in webcal {
+            push_row(&view.webcal_group, &view.webcal_rows, account_row(&info.display_name, &info.url));
         }
     }
 

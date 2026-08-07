@@ -79,7 +79,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Click-and-drag range selection in the Day/Week grids — dragging across hours and day columns highlights a whole range (interior columns fill as full days); clicking it opens the editor spanning exactly the selection (a `suggested_end` prefill, so a 9:00–11:00 drag is a two-hour event)
 - [ ] Drag-reschedule; recurring edit scopes (this / this-and-following / all)
 - [x] iMIP invitation banners in the mail viewer — `text/calendar` parts fetched with the body, `METHOD:REQUEST` (Accept/Maybe/Decline → RFC 6047 `METHOD:REPLY` + calendar upsert), `METHOD:CANCEL` (remove-from-calendar), `METHOD:REPLY` (informational)
-- [ ] `.ics` import / webcal subscription
+- [x] `.ics` import / webcal subscription — sidebar "Add calendar" dialog (subscribe/import/manage), `lookout-dav` feed session (5-min poll, per-feed cache + error isolation), read-only event viewer for feed events, Config-view subscription list
 - [x] Mini-calendar sidebar widget (240px sidebar + compact copy docked on the Mail screen)
 - [ ] VTODO tasks
 - [ ] Birthday calendar synthesized from Contacts
