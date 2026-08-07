@@ -3844,7 +3844,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // --- Calendar event editor: the "New Event" toolbar button opens a blank
-    // form prefilled for the displayed date; clicking an event in any calendar
+    // form prefilled for the displayed date (and the Day/Week grids' empty
+    // time slots open one prefilled for the clicked slot - see the
+    // `connect_slot_activated` block below); clicking an event in any calendar
     // view opens it for editing/deleting. Both save and delete hand the
     // result to the owning account's session (`route_calendar_save`/`_delete`),
     // which PUTs/DELETEs it and resyncs the month - the UI repaints through the
@@ -3856,11 +3858,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_main = calendar_main.clone();
         let toast_overlay = toast_overlay.clone();
         new_event_button.connect_clicked(move |_| {
-            let calendars = pickable_calendars(&calendar_state);
-            let Some(default_calendar) = default_pickable_calendar(&calendar_state) else {
-                toast_overlay.add_toast(adw::Toast::new("Connect a calendar account to create events."));
-                return;
-            };
             let anchor = calendar_view::anchor(&calendar_main);
             let suggested_start = {
                 let now = chrono::Local::now();
@@ -3874,30 +3871,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     anchor.and_hms_opt(9, 0, 0).unwrap()
                 }
             };
-            let preview = event_editor_preview_data(&calendar_state, anchor);
-            let owner_email = calendar_owner_email(&calendar_state, &default_calendar);
-            crate::event_editor::show_event_editor(
-                &window,
-                crate::event_editor::EventEditorPrefill {
-                    calendars: &calendars,
-                    default_calendar,
-                    existing: None,
-                    suggested_start: Some(suggested_start),
-                    month_occurrences: &preview.occurrences,
-                    month_event_days: &preview.month_event_days,
-                    calendar_colors: &preview.colors,
-                    owner_email,
-                },
-                calendar_attendee_suggestions(&state),
-                {
-                    let calendar_state = calendar_state.clone();
-                    move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
-                },
-                {
-                    let calendar_state = calendar_state.clone();
-                    move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
-                },
-            );
+            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, suggested_start);
         });
     }
     {
@@ -3938,6 +3912,50 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
                 },
             );
+        });
+    }
+    // --- Calendar main grid interactions: the first click on an empty time
+    // slot in the Day/Week grids (or on a month-grid day cell) selects and
+    // highlights it; a second click on the highlighted slot/day opens the
+    // new-event editor prefilled for that exact time. Clicking a day cell in
+    // the Month/Split grid re-anchors every view to it as it selects - the
+    // large grid's counterpart of the sidebar mini-calendar's day buttons.
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        calendar_view::connect_slot_activated(&calendar_main, move |date, minutes| {
+            let Some(start) = date.and_hms_opt((minutes / 60) as u32, (minutes % 60) as u32, 0) else {
+                return;
+            };
+            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start);
+        });
+    }
+    {
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
+        calendar_view::connect_main_day_selected(&calendar_main, {
+            let calendar_main = calendar_main.clone();
+            move |date| {
+                calendar_view::set_anchor(&calendar_main, date);
+                show_anchor(&calendar_state, &calendar_main, &mini_calendar);
+            }
+        });
+    }
+    // Clicking a month-grid day cell a second time (it's already highlighted)
+    // opens the new-event editor prefilled for 9am of that day.
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        calendar_view::connect_main_day_activated(&calendar_main, move |date| {
+            let Some(start) = date.and_hms_opt(9, 0, 0) else {
+                return;
+            };
+            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start);
         });
     }
 
@@ -5572,6 +5590,48 @@ fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anch
     let month_event_days = calendar_event_days(calendar_state, first_of_month(anchor));
     let colors = calendar_state.borrow().calendar_colors.clone();
     EventEditorPreviewData { occurrences, month_event_days, colors }
+}
+
+/// Opens the "New event" editor prefilled for `suggested_start`, shared by
+/// the Calendar toolbar's New Event button and the Day/Week grids' empty
+/// time-slot clicks so both entry points behave identically (a connect-a-
+/// calendar toast when nothing writable exists, the editor otherwise).
+fn show_new_event_editor(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    suggested_start: chrono::NaiveDateTime,
+) {
+    let calendars = pickable_calendars(calendar_state);
+    let Some(default_calendar) = default_pickable_calendar(calendar_state) else {
+        toast_overlay.add_toast(adw::Toast::new("Connect a calendar account to create events."));
+        return;
+    };
+    let preview = event_editor_preview_data(calendar_state, suggested_start.date());
+    let owner_email = calendar_owner_email(calendar_state, &default_calendar);
+    crate::event_editor::show_event_editor(
+        window,
+        crate::event_editor::EventEditorPrefill {
+            calendars: &calendars,
+            default_calendar,
+            existing: None,
+            suggested_start: Some(suggested_start),
+            month_occurrences: &preview.occurrences,
+            month_event_days: &preview.month_event_days,
+            calendar_colors: &preview.colors,
+            owner_email,
+        },
+        calendar_attendee_suggestions(state),
+        {
+            let calendar_state = calendar_state.clone();
+            move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
+        },
+        {
+            let calendar_state = calendar_state.clone();
+            move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
+        },
+    );
 }
 
 /// The account session that owns `calendar_id`, so its command channel can

@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.7.2" date="2026-08-07">
+      <description>
+        <p>The Calendar's main grid is now clickable: click a day or an empty time slot to highlight it, and click it again to open the New Event editor prefilled for that moment - a month grid day opens one for 9am, a Day or Week grid slot for the exact time you clicked.</p>
+      </description>
+    </release>
     <release version="0.7.1" date="2026-08-07">
       <description>
         <p>The New Event dialog's attendee field now offers autocomplete from your mail history and address books. The header bar's search field also picked up a darker background so it stands out from the surrounding bar.</p>

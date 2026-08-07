@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.2 (2026-08-07)
+
+### Added
+
+- **Calendar**: the large Month grid's day cells are now clickable with a select-then-edit interaction: the first click selects the day (highlighting the cell with a new `.calendar-selected-cell` border) and re-anchors every view to it - the same action as the sidebar mini-calendar's day buttons, wired through a new `calendar_view::connect_main_day_selected` that forwards to both the Month and Split-view grids - and a second click on the already-highlighted day opens the New Event editor prefilled for 9am of that day (new `calendar_view::connect_main_day_activated`). Clicks landing on an event chip are left to the chip's own button, so opening an event's editor never also moves the anchor.
+- **Calendar**: empty time slots in the Day/Week/Work week grids follow the same select-then-edit pattern: the first click highlights the slot (a translucent band drawn over its column), and a second click on the highlighted slot opens the New Event editor prefilled for that exact time. The slot is snapped to the nearest half hour (a pure `slot_from_point` hit-test, unit-tested, clamped so the editor's one-hour default span stays inside the day); the wiring is a new `calendar_view::connect_slot_activated` consumed by the grids' click handler when no chip is hit. The editor-invocation code shared with the toolbar's New Event button was extracted into `window::show_new_event_editor`.
+
+### Testing
+
+- New `calendar_view` unit tests for `slot_from_point`: gutter clicks map to no slot, column mapping across the canvas, half-hour snapping (up and down), and clamping at the day's bottom edge.
+
 ## 0.7.1 (2026-08-07)
 
 ### Added

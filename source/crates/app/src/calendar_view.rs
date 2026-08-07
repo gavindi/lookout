@@ -65,6 +65,25 @@ type ActivateEvent = Rc<dyn Fn(EventOccurrence)>;
 /// widget's click handling.
 type PendingActivate = Rc<RefCell<Option<ActivateEvent>>>;
 
+/// A callback fired when the user clicks an empty time slot in a Day/Week
+/// time grid, so the caller can open a new-event editor at that exact time.
+/// Receives the clicked local date and the snapped minutes since local
+/// midnight (a whole half-hour).
+type SlotActivate = Rc<dyn Fn(NaiveDate, i64)>;
+
+/// One entry in a widget's pending slot-activation callback: set by the
+/// current render pass from `CalendarMain::connect_slot_activated`, consumed
+/// by the canvas's click handling.
+type PendingSlotActivate = Rc<RefCell<Option<SlotActivate>>>;
+
+/// A callback fired when the user clicks an already-selected day cell in a
+/// month grid, so the caller can open a new-event editor for that day.
+type DayActivate = Rc<dyn Fn(NaiveDate)>;
+
+/// One entry in a month grid's pending day-activation callback, set once at
+/// registration time from `CalendarMain::connect_main_day_activated`.
+type PendingDayActivate = Rc<RefCell<Option<DayActivate>>>;
+
 struct DayCell {
     container: gtk::Box,
     date_label: gtk::Label,
@@ -86,6 +105,9 @@ fn install_calendar_css() {
         }
         .calendar-today-cell {
             border: 2px solid @accent_bg_color;
+        }
+        .calendar-selected-cell {
+            border: 2px solid alpha(currentColor, 0.35);
         }
         .calendar-main-background {
             background-color: #2e2e32;
@@ -168,6 +190,16 @@ pub struct MonthGrid {
     day_cells: Vec<DayCell>,
     anchor_month: Rc<RefCell<NaiveDate>>,
     on_activate: PendingActivate,
+    /// Day-selection callbacks, fired when a day cell is clicked (see
+    /// [`connect_main_day_selected`]). Registered once at build time via
+    /// `CalendarMain::connect_main_day_selected`, which forwards to the main
+    /// and Split-view grids alike.
+    on_day_selected: DaySelectedCallbacks,
+    /// The day cell currently highlighted by a first click - a second click
+    /// on it fires `on_day_activate` instead of re-selecting (see
+    /// [`connect_main_day_activated`]).
+    selected_day: Rc<RefCell<Option<NaiveDate>>>,
+    on_day_activate: PendingDayActivate,
 }
 
 fn build_month_grid() -> MonthGrid {
@@ -186,20 +218,61 @@ fn build_month_grid() -> MonthGrid {
     }
 
     let mut day_cells = Vec::with_capacity(42);
-    for row in 0..6 {
-        for col in 0..7 {
-            let date_label = gtk::Label::builder().xalign(0.0).margin_start(4).margin_top(2).css_classes(["caption"]).build();
-            let events_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).vexpand(true).build();
-            let container = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["calendar-day-cell"]).build();
-            container.append(&date_label);
-            container.append(&events_box);
-            grid.attach(&container, col, row + 1, 1, 1);
-            day_cells.push(DayCell {
-                container,
-                date_label,
-                events_box,
+    let anchor_month = Rc::new(RefCell::new(first_of_month(chrono::Utc::now().date_naive())));
+    let on_day_selected: DaySelectedCallbacks = Rc::new(RefCell::new(Vec::new()));
+    let selected_day: Rc<RefCell<Option<NaiveDate>>> = Rc::new(RefCell::new(None));
+    let on_day_activate: PendingDayActivate = Rc::new(RefCell::new(None));
+    for index in 0..42usize {
+        let row = index / 7;
+        let col = index % 7;
+        let date_label = gtk::Label::builder().xalign(0.0).margin_start(4).margin_top(2).css_classes(["caption"]).build();
+        let events_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).vexpand(true).build();
+        let container = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["calendar-day-cell"]).build();
+        container.append(&date_label);
+        container.append(&events_box);
+        grid.attach(&container, col as i32, row as i32 + 1, 1, 1);
+        // Clicking a day cell selects it and re-anchors every view to that
+        // date (the same action the sidebar mini-calendar's day buttons take);
+        // clicking the already-selected cell again opens a new-event editor
+        // for that day. Clicks landing on an event chip are ignored here -
+        // the chip's own button handles them, so opening an editor never also
+        // jumps the anchor.
+        {
+            let click_target = container.clone();
+            let anchor_month = anchor_month.clone();
+            let on_day_selected = on_day_selected.clone();
+            let selected_day = selected_day.clone();
+            let on_day_activate = on_day_activate.clone();
+            let gesture = gtk::GestureClick::new();
+            gesture.connect_pressed(move |_, _, x, y| {
+                let mut widget = click_target.pick(x, y, gtk::PickFlags::DEFAULT);
+                while let Some(current) = widget {
+                    if current.is::<gtk::Button>() {
+                        return;
+                    }
+                    widget = current.parent();
+                }
+                let date = first_grid_day(*anchor_month.borrow()) + chrono::Duration::days(index as i64);
+                if *selected_day.borrow() == Some(date) {
+                    *selected_day.borrow_mut() = None;
+                    click_target.remove_css_class("calendar-selected-cell");
+                    if let Some(callback) = on_day_activate.borrow().as_ref() {
+                        callback(date);
+                    }
+                } else {
+                    *selected_day.borrow_mut() = Some(date);
+                    for callback in on_day_selected.borrow().iter() {
+                        callback(date);
+                    }
+                }
             });
+            container.add_controller(gesture);
         }
+        day_cells.push(DayCell {
+            container,
+            date_label,
+            events_box,
+        });
     }
 
     let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
@@ -208,8 +281,11 @@ fn build_month_grid() -> MonthGrid {
     MonthGrid {
         root: root_box.upcast(),
         day_cells,
-        anchor_month: Rc::new(RefCell::new(first_of_month(chrono::Utc::now().date_naive()))),
+        anchor_month,
         on_activate: Rc::new(RefCell::new(None)),
+        on_day_selected,
+        selected_day,
+        on_day_activate,
     }
 }
 
@@ -221,6 +297,7 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
     *mg.anchor_month.borrow_mut() = month;
 
     let today = chrono::Utc::now().date_naive();
+    let selected_day = *mg.selected_day.borrow();
     let grid_start = first_grid_day(month);
 
     for (i, cell) in mg.day_cells.iter().enumerate() {
@@ -241,6 +318,11 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
             cell.date_label.remove_css_class("accent");
             cell.date_label.remove_css_class("heading");
             cell.container.remove_css_class("calendar-today-cell");
+        }
+        if selected_day == Some(date) {
+            cell.container.add_css_class("calendar-selected-cell");
+        } else {
+            cell.container.remove_css_class("calendar-selected-cell");
         }
     }
 }
@@ -414,6 +496,9 @@ pub struct TimeGrid {
     data: TimeGridData,
     /// The click-to-edit callback, set by each `set_time_grid` render pass.
     on_activate: PendingActivate,
+    /// The click-a-time-slot-to-create callback, set by each `set_time_grid`
+    /// render pass (see [`SlotActivate`]).
+    on_slot_activate: PendingSlotActivate,
 }
 
 /// The per-grid render state shared with the draw/hover closures.
@@ -424,6 +509,11 @@ struct TimeGridData {
     /// The consecutive local dates currently displayed, one per column.
     dates: Rc<RefCell<Vec<NaiveDate>>>,
     chips: Rc<RefCell<Vec<TimeChip>>>,
+    /// The time slot currently highlighted by a first click: the local date
+    /// and snapped minutes since midnight. A second click on the same slot
+    /// fires the slot-activation callback instead of re-selecting; cleared by
+    /// every `set_time_grid` render pass.
+    selected_slot: Rc<RefCell<Option<(NaiveDate, i64)>>>,
 }
 
 pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
@@ -443,9 +533,11 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         colors: Rc::new(RefCell::new(HashMap::new())),
         dates: Rc::new(RefCell::new(Vec::new())),
         chips: Rc::new(RefCell::new(Vec::new())),
+        selected_slot: Rc::new(RefCell::new(None)),
     };
     let hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let on_activate: PendingActivate = Rc::new(RefCell::new(None));
+    let on_slot_activate: PendingSlotActivate = Rc::new(RefCell::new(None));
 
     {
         let data = data.clone();
@@ -464,8 +556,8 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
 
     attach_hover(&band, true, &data, &hover);
     attach_hover(&canvas, false, &data, &hover);
-    attach_click(&band, true, &data, &on_activate);
-    attach_click(&canvas, false, &data, &on_activate);
+    attach_click(&band, true, &data, &on_activate, &on_slot_activate);
+    attach_click(&canvas, false, &data, &on_activate, &on_slot_activate);
 
     let mut headers = Vec::new();
     let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
@@ -502,6 +594,7 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         day_view,
         data,
         on_activate,
+        on_slot_activate,
     }
 }
 
@@ -544,35 +637,77 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
 }
 
 /// Wires a click handler onto a time-grid canvas so clicking a chip opens its
-/// editor. `band` selects the split half (all-day chips vs timed chips), the
-/// same convention as [`attach_hover`]; the hit-test is the shared
-/// [`hovered_chip`]. The callback comes from `on_activate`, set by the latest
-/// `set_time_grid` render pass.
-fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_activate: &PendingActivate) {
+/// editor, and clicking an empty time slot on the timeline selects it: the
+/// first click on a slot highlights it (drawn by `paint_time_grid`), a second
+/// click on the already-highlighted slot fires `on_slot_activate` with the
+/// snapped slot's date + time (a new-event entry point for the caller).
+/// `band` selects the split half (all-day chips vs timed chips), the same
+/// convention as [`attach_hover`]; the hit-test is the shared
+/// [`hovered_chip`]. The callbacks come from `on_activate` and
+/// `on_slot_activate`, set by the latest `set_time_grid` render pass.
+fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_activate: &PendingActivate, on_slot_activate: &PendingSlotActivate) {
     let gesture = gtk::GestureClick::new();
     {
         let canvas_widget = canvas.clone();
         let data = data.clone();
         let on_activate = on_activate.clone();
+        let on_slot_activate = on_slot_activate.clone();
         gesture.connect_pressed(move |_, _, x, y| {
-            let hit = {
+            let (hit, slot) = {
                 let dates_guard = data.dates.borrow();
                 let chips_guard = data.chips.borrow();
-                hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band)
+                let hit = hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band);
+                let slot = if hit.is_some() || band {
+                    None
+                } else {
+                    slot_from_point(x, y, canvas_widget.width() as f64, dates_guard.len()).map(|(col, minutes)| (dates_guard[col], minutes))
+                };
+                (hit, slot)
             };
-            let Some(hit) = hit else { return };
-            let occ = {
-                let chips_guard = data.chips.borrow();
-                let occurrence_index = chips_guard[hit].occurrence;
-                data.occurrences.borrow().get(occurrence_index).cloned()
-            };
-            let Some(occ) = occ else { return };
-            if let Some(callback) = on_activate.borrow().as_ref() {
-                callback(occ);
+            if let Some(hit) = hit {
+                *data.selected_slot.borrow_mut() = None;
+                canvas_widget.queue_draw();
+                let occ = {
+                    let chips_guard = data.chips.borrow();
+                    let occurrence_index = chips_guard[hit].occurrence;
+                    data.occurrences.borrow().get(occurrence_index).cloned()
+                };
+                let Some(occ) = occ else { return };
+                if let Some(callback) = on_activate.borrow().as_ref() {
+                    callback(occ);
+                }
+                return;
+            }
+            let Some((date, minutes)) = slot else { return };
+            if *data.selected_slot.borrow() == Some((date, minutes)) {
+                *data.selected_slot.borrow_mut() = None;
+                canvas_widget.queue_draw();
+                if let Some(callback) = on_slot_activate.borrow().as_ref() {
+                    callback(date, minutes);
+                }
+            } else {
+                *data.selected_slot.borrow_mut() = Some((date, minutes));
+                canvas_widget.queue_draw();
             }
         });
     }
     canvas.add_controller(gesture);
+}
+
+/// The day column and snapped start-minute of the time slot under `(x, y)` on
+/// a grid `width` wide with `n_cols` day columns, or `None` for clicks in the
+/// hour gutter or outside the columns. Minutes are rounded to the nearest half
+/// hour and clamped so the slot never starts in the final 30 minutes of the
+/// day (a one-hour default span must stay within the day).
+fn slot_from_point(x: f64, y: f64, width: f64, n_cols: usize) -> Option<(usize, i64)> {
+    if n_cols == 0 || x < HOUR_GUTTER_WIDTH {
+        return None;
+    }
+    let col_width = ((width - HOUR_GUTTER_WIDTH).max(0.0)) / n_cols as f64;
+    let col = (((x - HOUR_GUTTER_WIDTH) / col_width) as usize).min(n_cols - 1);
+    let minutes = (y / TIME_SLOT_HEIGHT * 60.0) as i64;
+    let snapped = (((minutes + 15) / 30) * 30).clamp(0, 1440 - 30);
+    Some((col, snapped))
 }
 
 /// The index of the chip under `(x, y)` among the chips of one split half
@@ -599,12 +734,26 @@ fn hovered_chip(chips: &[TimeChip], canvas_width: f64, n_cols: usize, x: f64, y:
 /// Re-points the grid at `anchor` (the week containing it for Week/Work week,
 /// the date itself for Day) and re-renders it with the given occurrences,
 /// replacing the old `set_week`/`set_week_occurrences`/`set_day`/
-/// `set_day_occurrences` calls.
-pub fn set_time_grid(t: &TimeGrid, anchor: NaiveDate, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>, on_activate: Option<ActivateEvent>) {
+/// `set_day_occurrences` calls. `on_activate` fires when an event chip is
+/// clicked; `on_slot_activate` when an already-selected time slot is clicked
+/// again (see [`SlotActivate`]).
+pub fn set_time_grid(
+    t: &TimeGrid,
+    anchor: NaiveDate,
+    occurrences: &[EventOccurrence],
+    colors: &HashMap<CalendarId, String>,
+    on_activate: Option<ActivateEvent>,
+    on_slot_activate: Option<SlotActivate>,
+) {
     *t.on_activate.borrow_mut() = on_activate;
+    *t.on_slot_activate.borrow_mut() = on_slot_activate;
     *t.anchor.borrow_mut() = anchor;
     *t.data.occurrences.borrow_mut() = occurrences.to_vec();
     *t.data.colors.borrow_mut() = colors.clone();
+
+    // A new render pass repaints the whole grid: the previously highlighted
+    // time slot no longer corresponds to a visible position.
+    *t.data.selected_slot.borrow_mut() = None;
 
     let dates = grid_dates(t);
     let chips = compute_time_grid_chips(&dates, occurrences);
@@ -970,6 +1119,22 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
         paint_right_text(cr, &hour_gutter_text(hh), HOUR_GUTTER_WIDTH - 5.0, y, 10.0, GRID_DIM_TEXT_RGBA, FontWeight::Normal);
     }
 
+    // The first-click-selected time slot: a translucent highlight band across
+    // its column (chips draw over it, so selected slots are always empty).
+    if let Some((date, minutes)) = *data.selected_slot.borrow() {
+        if let Some(col) = dates.iter().position(|d| *d == date) {
+            let slot_top = minutes as f64 * TIME_SLOT_HEIGHT / 60.0;
+            let slot_height = TIME_SLOT_HEIGHT / 2.0;
+            cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 1.0, slot_top + 1.0, col_width - 2.0, slot_height - 2.0);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
+            let _ = cr.fill();
+            cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 0.5, slot_top + 0.5, col_width - 1.0, slot_height - 1.0);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.3);
+            cr.set_line_width(1.0);
+            let _ = cr.stroke();
+        }
+    }
+
     for (i, chip) in chips.iter().enumerate() {
         if !chip.all_day {
             paint_chip(cr, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover);
@@ -1263,6 +1428,9 @@ pub struct CalendarMain {
     /// The click-to-edit callback, handed to every sub-view by each render
     /// pass (see [`connect_event_activated`]).
     on_activate: PendingActivate,
+    /// The click-a-time-slot-to-create callback, handed to every time grid by
+    /// each render pass (see [`connect_slot_activated`]).
+    on_slot_activate: PendingSlotActivate,
 }
 
 pub fn build_main() -> CalendarMain {
@@ -1344,6 +1512,7 @@ pub fn build_main() -> CalendarMain {
         colors: Rc::new(RefCell::new(HashMap::new())),
         check_colors,
         on_activate: Rc::new(RefCell::new(None)),
+        on_slot_activate: Rc::new(RefCell::new(None)),
     };
     // Extracted into a local first (rather than inlined into the call
     // below) so the `Ref` temporary from `.borrow()` is dropped before
@@ -1414,6 +1583,35 @@ pub fn connect_event_activated(c: &CalendarMain, f: impl Fn(EventOccurrence) + '
     *c.on_activate.borrow_mut() = Some(Rc::new(f));
 }
 
+/// Registers `f` to run when the user clicks an empty time slot in the Day or
+/// Week grids, receiving the slot's local date and snapped start minute so the
+/// caller can open a new-event editor prefilled for that exact time. One
+/// subscriber is expected (the window); a later registration replaces it.
+pub fn connect_slot_activated(c: &CalendarMain, f: impl Fn(NaiveDate, i64) + 'static) {
+    *c.on_slot_activate.borrow_mut() = Some(Rc::new(f));
+}
+
+/// Registers `f` to run when the user clicks a day cell in the Month grid
+/// (both the Month and Split views), receiving the clicked local date so the
+/// caller can re-anchor the whole panel to it - the large grid's equivalent
+/// of the sidebar mini-calendar's day buttons (whose own registration keeps
+/// the name `connect_day_selected`, hence this one's `_main` suffix).
+pub fn connect_main_day_selected(c: &CalendarMain, f: impl Fn(NaiveDate) + 'static) {
+    let callback = Rc::new(f);
+    c.month.on_day_selected.borrow_mut().push(callback.clone());
+    c.split.month.on_day_selected.borrow_mut().push(callback);
+}
+
+/// Registers `f` to run when the user clicks an already-selected (highlighted)
+/// day cell in the Month or Split grid, receiving the clicked local date so
+/// the caller can open a new-event editor for that day - the second click of
+/// the grid's select-then-edit interaction.
+pub fn connect_main_day_activated(c: &CalendarMain, f: impl Fn(NaiveDate) + 'static) {
+    let callback = Rc::new(f);
+    *c.month.on_day_activate.borrow_mut() = Some(callback.clone());
+    *c.split.month.on_day_activate.borrow_mut() = Some(callback);
+}
+
 /// Moves the anchor by `by` steps in the active view's natural unit: a day
 /// for Day/Agenda, a week for Week/Work week, a month for Month/Split.
 pub fn step(c: &CalendarMain, by: i64) {
@@ -1438,15 +1636,16 @@ fn refresh(c: &CalendarMain) {
     let occurrences = c.occurrences.borrow();
     let colors = c.colors.borrow();
     let on_activate = c.on_activate.borrow().clone();
+    let on_slot_activate = c.on_slot_activate.borrow().clone();
 
     set_month(&c.month, anchor);
     set_month_occurrences(&c.month, &occurrences, &colors, on_activate.clone());
     set_month(&c.split.month, anchor);
     set_month_occurrences(&c.split.month, &occurrences, &colors, on_activate.clone());
 
-    set_time_grid(&c.workweek, anchor, &occurrences, &colors, on_activate.clone());
-    set_time_grid(&c.week, anchor, &occurrences, &colors, on_activate.clone());
-    set_time_grid(&c.day, anchor, &occurrences, &colors, on_activate.clone());
+    set_time_grid(&c.workweek, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone());
+    set_time_grid(&c.week, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone());
+    set_time_grid(&c.day, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate);
 
     set_agenda(&c.agenda, anchor, &occurrences, &colors, on_activate.clone());
     set_agenda(&c.split.agenda, anchor, &occurrences, &colors, on_activate);
@@ -2471,5 +2670,53 @@ mod tests {
             retryable: true,
         };
         assert_eq!(calendar_account_status_text(&state, false).as_deref(), Some("login failed"));
+    }
+
+    #[test]
+    fn slot_from_point_ignores_the_hour_gutter() {
+        // Any y inside the gutter column maps to no slot at all.
+        assert!(slot_from_point(HOUR_GUTTER_WIDTH - 1.0, 300.0, 752.0, 7).is_none());
+        assert!(slot_from_point(0.0, 0.0, 752.0, 7).is_none());
+    }
+
+    #[test]
+    fn slot_from_point_maps_columns_across_the_canvas() {
+        // 700px of columns over 7 days = 100px per column; column 0 starts at
+        // the gutter edge, column 4 at x = 52 + 4*100.
+        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH + 1.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
+        assert_eq!(col, 0);
+        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH + 100.0 * 4.0 + 50.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
+        assert_eq!(col, 4);
+        // A click past the last column's midpoint still lands in the last one.
+        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH + 700.0 - 1.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
+        assert_eq!(col, 6);
+    }
+
+    #[test]
+    fn slot_from_point_snaps_minutes_to_the_half_hour() {
+        // 48px/hour means 0.8px per minute: 9:12am is 552 minutes in, snapped
+        // to the nearest half hour → 9:00 (9:30 is further).
+        let y_912 = (9 * 60 + 12) as f64 * TIME_SLOT_HEIGHT / 60.0;
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, y_912, 752.0, 7).unwrap();
+        assert_eq!(minutes, 9 * 60);
+        // 9:18am snaps up to 9:30.
+        let y_918 = (9 * 60 + 18) as f64 * TIME_SLOT_HEIGHT / 60.0;
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, y_918, 752.0, 7).unwrap();
+        assert_eq!(minutes, 9 * 60 + 30);
+        // 9:00am on the dot snaps to itself.
+        let y_9am = 9.0 * TIME_SLOT_HEIGHT;
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, y_9am, 752.0, 7).unwrap();
+        assert_eq!(minutes, 9 * 60);
+    }
+
+    #[test]
+    fn slot_from_point_clamps_to_the_last_startable_slot() {
+        // The bottom edge is minute 1440 of the day; the final 30 minutes are
+        // never offered as a start so the one-hour default span stays inside
+        // the day.
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, 24.0 * TIME_SLOT_HEIGHT, 752.0, 7).unwrap();
+        assert_eq!(minutes, 1440 - 30);
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, 23.9 * TIME_SLOT_HEIGHT, 752.0, 7).unwrap();
+        assert_eq!(minutes, 1440 - 30);
     }
 }

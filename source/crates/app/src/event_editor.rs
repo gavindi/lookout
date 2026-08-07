@@ -420,7 +420,7 @@ pub fn show_event_editor(
             let mut occs: Vec<EventOccurrence> = month_occurrences.iter().filter(|o| !crate::calendar_view::covered_local_dates(o, day, day).is_empty()).cloned().collect();
             occs.push(synthetic);
             crate::calendar_view::set_mini_month(&preview_mini, day, &month_event_days);
-            crate::calendar_view::set_time_grid(&preview_day_strip, day, &occs, &calendar_colors, None);
+            crate::calendar_view::set_time_grid(&preview_day_strip, day, &occs, &calendar_colors, None, None);
             crate::calendar_view::scroll_time_grid_to_minutes(&preview_day_strip, start_local.hour() as i64 * 60 + start_local.minute() as i64);
         })
     };
