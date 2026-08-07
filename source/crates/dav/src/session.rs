@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, NaiveTime};
-use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, EventOccurrence};
+use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EventOccurrence};
 
 use crate::cache::CalendarCache;
 use crate::client::DavClient;
@@ -54,6 +54,27 @@ pub enum CalendarCommand {
         href: String,
         etag: Option<String>,
     },
+    /// Force a resync of every task in every calendar, outside the poll
+    /// cadence (e.g. right after a task edit lands).
+    SyncTasks,
+    /// Store a brand-new task: PUT the serialized VTODO as a new calendar
+    /// object under `task.calendar_id`'s collection (a client-generated
+    /// `<uid>.ics` href, `If-None-Match: *`). Resyncs tasks on success.
+    CreateTask {
+        task: Box<CalendarTask>,
+    },
+    /// Store an edited task in place: PUT to `task.href` with `task.etag`
+    /// as `If-Match`. Resyncs tasks on success.
+    UpdateTask {
+        task: Box<CalendarTask>,
+    },
+    /// Delete the calendar object at `href` (with an optional `etag` as
+    /// `If-Match`). Resyncs tasks on success.
+    DeleteTask {
+        calendar_id: CalendarId,
+        href: String,
+        etag: Option<String>,
+    },
     Shutdown,
 }
 
@@ -65,6 +86,7 @@ pub enum CalendarSessionEvent {
     ConnectionStateChanged(ConnectionState),
     CalendarsUpdated(Vec<CalendarInfo>),
     OccurrencesUpdated { month: NaiveDate, occurrences: Vec<EventOccurrence> },
+    TasksUpdated(Vec<CalendarTask>),
     Error(String),
 }
 
@@ -162,6 +184,15 @@ pub async fn run_calendar_session(
                     Ok(CalendarCommand::DeleteEvent { .. }) => {
                         let _ = events.send(CalendarSessionEvent::Error("not connected - the event was not deleted".to_string())).await;
                     }
+                    Ok(CalendarCommand::CreateTask { task }) => {
+                        let _ = events.send(CalendarSessionEvent::Error(format!("not connected - \"{}\" was not saved", task.uid))).await;
+                    }
+                    Ok(CalendarCommand::UpdateTask { task }) => {
+                        let _ = events.send(CalendarSessionEvent::Error(format!("not connected - changes to \"{}\" were not saved", task.uid))).await;
+                    }
+                    Ok(CalendarCommand::DeleteTask { .. }) => {
+                        let _ = events.send(CalendarSessionEvent::Error("not connected - the task was not deleted".to_string())).await;
+                    }
                     Ok(_) => {}
                     Err(_) => {}
                 }
@@ -191,6 +222,7 @@ async fn connect_and_run(
 
     let mut current_month = first_of_month(chrono::Utc::now().date_naive());
     sync_month(&client, &calendars, &credential, current_month, events, cache).await;
+    sync_tasks(&client, &calendars, &credential, events, cache).await;
 
     loop {
         let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
@@ -212,7 +244,10 @@ async fn connect_and_run(
 
         let mut woke_on_command = None;
         match wake {
-            Wake::Poll => sync_month(&client, &calendars, &credential, current_month, events, cache).await,
+            Wake::Poll => {
+                sync_month(&client, &calendars, &credential, current_month, events, cache).await;
+                sync_tasks(&client, &calendars, &credential, events, cache).await;
+            }
             Wake::Command(cmd) => woke_on_command = Some(cmd),
             Wake::ChannelClosed => return Ok(ShutdownReason::Requested),
         }
@@ -237,6 +272,19 @@ async fn connect_and_run(
                     Ok(()) => sync_month(&client, &calendars, &credential, current_month, events, cache).await,
                     Err(e) => {
                         let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete event: {e}"))).await;
+                    }
+                },
+                CalendarCommand::SyncTasks => sync_tasks(&client, &calendars, &credential, events, cache).await,
+                CalendarCommand::CreateTask { task } => {
+                    write_task(&client, &calendars, &credential, &task, events, cache).await;
+                }
+                CalendarCommand::UpdateTask { task } => {
+                    write_task(&client, &calendars, &credential, &task, events, cache).await;
+                }
+                CalendarCommand::DeleteTask { calendar_id: _, href, etag } => match client.delete_calendar_object(&href, &credential, etag.as_deref()).await {
+                    Ok(()) => sync_tasks(&client, &calendars, &credential, events, cache).await,
+                    Err(e) => {
+                        let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete task: {e}"))).await;
                     }
                 },
                 // Already connected - nothing to reconnect. Only useful
@@ -355,6 +403,68 @@ async fn write_event(
         }
         Err(e) => {
             let _ = events.send(CalendarSessionEvent::Error(format!("failed to save event \"{}\": {e}", event.uid))).await;
+        }
+    }
+}
+
+/// Fetches every task across every calendar and emits the merged result.
+/// Unlike [`sync_month`] there's no month window - tasks have no guaranteed
+/// temporal span, so the whole set is always refetched (they're small).
+/// Same cache-first fast-paint and per-collection failure isolation as
+/// `sync_month`.
+async fn sync_tasks(client: &DavClient, calendars: &[CalendarInfo], credential: &Credential, events: &async_channel::Sender<CalendarSessionEvent>, cache: Option<&CalendarCache>) {
+    if let Some(cache) = cache {
+        if let Ok(Some(tasks)) = cache.load_tasks() {
+            let _ = events.send(CalendarSessionEvent::TasksUpdated(tasks)).await;
+        }
+    }
+
+    let mut tasks = Vec::new();
+    for calendar in calendars {
+        match client.fetch_tasks(calendar, credential).await {
+            Ok(calendar_tasks) => tasks.extend(calendar_tasks),
+            Err(e) => {
+                tracing::warn!("failed to fetch tasks for calendar {:?}: {e}", calendar.display_name);
+            }
+        }
+    }
+
+    let _ = events.send(CalendarSessionEvent::TasksUpdated(tasks.clone())).await;
+    if let Some(cache) = cache {
+        if let Err(e) = cache.store_tasks(&tasks) {
+            tracing::warn!("failed to cache tasks: {e}");
+        }
+    }
+}
+
+/// Creates or updates `task` on the server - the `write_event` counterpart,
+/// sharing its create/update-by-metadata convention: a fresh task has no
+/// `href` (client-generated `<uid>.ics` href + `If-None-Match: *`), an edit
+/// keeps its `href`/`etag` (`If-Match` against clobbering). Resyncs tasks on
+/// success so the change renders immediately.
+async fn write_task(
+    client: &DavClient,
+    calendars: &[CalendarInfo],
+    credential: &Credential,
+    task: &CalendarTask,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+    cache: Option<&CalendarCache>,
+) {
+    let Some(calendar) = calendars.iter().find(|c| c.id == task.calendar_id) else {
+        let _ = events.send(CalendarSessionEvent::Error(format!("calendar for task \"{}\" not found", task.uid))).await;
+        return;
+    };
+
+    let ics = crate::ical::build_vtodo_calendar(task);
+    let href = match &task.href {
+        Some(href) => href.clone(),
+        None => format!("{}{}.ics", calendar.href, url_safe_uid(&task.uid.0)),
+    };
+
+    match client.put_calendar_object(&href, &ics, credential, task.etag.as_deref()).await {
+        Ok(_new_etag) => sync_tasks(client, calendars, credential, events, cache).await,
+        Err(e) => {
+            let _ = events.send(CalendarSessionEvent::Error(format!("failed to save task \"{}\": {e}", task.uid))).await;
         }
     }
 }

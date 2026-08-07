@@ -7,8 +7,8 @@ use adw::prelude::*;
 use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::{
-    AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence,
-    EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, VCard, WebcalSubscription,
+    AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody, EmailSummary,
+    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, VCard, WebcalSubscription,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
@@ -545,6 +545,9 @@ struct CalendarAccountHandle {
     /// `MessagesUpdated` handling.
     last_occurrences: Vec<EventOccurrence>,
     last_synced_month: Option<chrono::NaiveDate>,
+    /// Latest full task list from the account's last `TasksUpdated` - tasks
+    /// have no month window, so a whole-set snapshot is the natural unit.
+    last_tasks: Vec<CalendarTask>,
 }
 
 /// Per-subscription state for one webcal feed - the fetch-only cousin of
@@ -2279,6 +2282,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     root_stack.add_named(&calendar_status_page, Some("calendar-empty"));
     root_stack.add_named(&calendar_paned, Some("calendar"));
 
+    // --- Tasks view: a single card holding the grouped task list. Tasks come
+    // from the same CalDAV accounts as the calendar (a `VTODO` per resource),
+    // so "no calendar accounts" shows a status page like the calendar's.
+    let tasks_status_page = adw::StatusPage::builder()
+        .icon_name("view-task-symbolic")
+        .title("No Calendar Accounts")
+        .description("Add an account with Calendar enabled in GNOME Online Accounts to see tasks here.")
+        .build();
+    let tasks_view = Rc::new(crate::tasks_view::build_tasks_view());
+    let tasks_card = card_section(&tasks_view.root);
+    tasks_card.add_css_class("folder-pane");
+    root_stack.add_named(&tasks_status_page, Some("tasks-empty"));
+    root_stack.add_named(&tasks_card, Some("tasks"));
+
     let contacts_status_page = adw::StatusPage::builder()
         .icon_name("avatar-default-symbolic")
         .title("No Contact Accounts")
@@ -2516,6 +2533,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     calendar_command_toolbar.append(&share_button);
     calendar_command_toolbar.append(&print_button);
 
+    // --- Tasks' own command toolbar row, swapped in when the Tasks nav-rail
+    // button is active. New task opens the task editor (wired later, once
+    // `calendar_state` exists).
+    let new_task_button = gtk::Button::from_icon_name(themed_icon_name(&["view-task-symbolic", "appointment-soon-symbolic"]));
+    new_task_button.set_tooltip_text(Some("New Task"));
+
+    let tasks_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
+    tasks_command_toolbar.append(&new_task_button);
+
     // --- View tab's ribbon content (Mail module): a "Layout" group of
     // pane-visibility toggles - Folder pane / Reading pane / Calendar
     // overview. All three default on; their click handlers live in a later
@@ -2541,6 +2567,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     view_toolbar_stack.add_named(&command_toolbar, Some("mail-home"));
     view_toolbar_stack.add_named(&view_toolbar, Some("mail-view"));
     view_toolbar_stack.add_named(&calendar_command_toolbar, Some("calendar"));
+    view_toolbar_stack.add_named(&tasks_command_toolbar, Some("tasks"));
 
     let contacts_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     let contacts_toolbar_label = gtk::Label::builder().label("People").xalign(0.0).css_classes(["dim-label"]).build();
@@ -2589,6 +2616,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .tooltip_text("People")
         .build();
     contacts_view_button.set_group(Some(&calendar_view_button));
+    let tasks_icon_image = nav_rail_image("/io/github/gavindi/Lookout/icons/task-1.svg", include_bytes!("../../../data/resources/icons/task-1.svg"));
+    let tasks_view_button = gtk::ToggleButton::builder().child(&tasks_icon_image).css_classes(["flat"]).tooltip_text("Tasks").build();
+    tasks_view_button.set_group(Some(&contacts_view_button));
 
     // `vexpand(true)` so the rail stretches the window's full height (it
     // sits beside `outer_toolbar_view` - header bar, menu bar, and command
@@ -2604,6 +2634,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     nav_rail.append(&mail_view_button);
     nav_rail.append(&calendar_view_button);
     nav_rail.append(&contacts_view_button);
+    nav_rail.append(&tasks_view_button);
 
     // --- Mail-screen calendar overview pane: a mini month-picker + a list
     // of the clicked day's events, docked to the far right of the window,
@@ -2701,6 +2732,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let current_mail_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("empty"));
     let current_calendar_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("calendar-empty"));
     let current_contacts_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("contacts-empty"));
+    let current_tasks_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("tasks-empty"));
     // The standalone People window, when the People screen is popped out of
     // the main window (see the "Open in new window" contacts-toolbar button).
     // `None` while the paned lives in `root_stack`; `Some` while it lives in
@@ -2781,6 +2813,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 if let Some(win) = contacts_window.borrow().as_ref() {
                     win.present();
                 }
+            }
+        });
+    }
+    {
+        let root_stack = root_stack.clone();
+        let current_tasks_page = current_tasks_page.clone();
+        let view_toolbar_stack = view_toolbar_stack.clone();
+        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let current_module = current_module.clone();
+        let home_button = home_button.clone();
+        let view_button = view_button.clone();
+        tasks_view_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                current_module.set("tasks");
+                root_stack.set_visible_child_name(current_tasks_page.get());
+                view_toolbar_stack.set_visible_child_name("tasks");
+                mail_calendar_overview_card.set_visible(false);
+                home_button.set_sensitive(false);
+                view_button.set_sensitive(false);
             }
         });
     }
@@ -4239,6 +4290,41 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, suggested_start, None);
         });
     }
+    // --- Task editor + list wiring: the "New Task" toolbar button opens a
+    // blank form, clicking a task row opens it for editing, and the row
+    // checkbox flips completion (the modified task goes through the same
+    // session route as a Save). Opening the Tasks view pulls a fresh task
+    // list from every account so the view isn't stale between polls.
+    {
+        let window = window.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        new_task_button.connect_clicked(move |_| {
+            show_new_task_editor(&window, &calendar_state, &toast_overlay);
+        });
+    }
+    {
+        let window = window.clone();
+        let calendar_state = calendar_state.clone();
+        let calendar_state_for_activate = calendar_state.clone();
+        crate::tasks_view::set_handlers(
+            &tasks_view,
+            Rc::new(move |task, completed| route_task_toggle(&calendar_state, task, completed)),
+            Rc::new(move |task| open_task_editor_for(&window, &calendar_state_for_activate, &task)),
+        );
+    }
+    {
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        tasks_view_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                refresh_tasks_view(&calendar_state, &tasks_view);
+                for handle in calendar_state.borrow().accounts.values() {
+                    let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncTasks);
+                }
+            }
+        });
+    }
     {
         let window = window.clone();
         let state = state.clone();
@@ -4382,6 +4468,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mail_overview_day_list,
         current_calendar_page,
         calendar_view_button,
+        current_tasks_page,
+        tasks_view_button,
+        tasks_view,
         reminders_engine,
         refresh_config,
     );
@@ -4468,6 +4557,7 @@ fn ribbon_stack_name(module: &str, tab: &str) -> &'static str {
         ("mail", "view") => "mail-view",
         ("mail", _) => "mail-home",
         ("calendar", _) => "calendar",
+        ("tasks", _) => "tasks",
         ("contacts", _) => "contacts",
         ("config", _) => "config",
         _ => "mail-home",
@@ -4991,6 +5081,9 @@ fn spawn_calendar_discovery(
     mail_overview_day_list: gtk::Box,
     current_calendar_page: Rc<Cell<&'static str>>,
     calendar_view_button: gtk::ToggleButton,
+    current_tasks_page: Rc<Cell<&'static str>>,
+    tasks_view_button: gtk::ToggleButton,
+    tasks_view: Rc<crate::tasks_view::TasksView>,
     reminders_engine: Rc<RefCell<crate::reminders::ReminderEngine>>,
     refresh_config: Rc<dyn Fn()>,
 ) {
@@ -5013,9 +5106,16 @@ fn spawn_calendar_discovery(
                 root_stack.set_visible_child_name(name);
             }
         };
+        let show_tasks_page = |name: &'static str| {
+            current_tasks_page.set(name);
+            if tasks_view_button.is_active() {
+                root_stack.set_visible_child_name(name);
+            }
+        };
         match result {
             Ok((client, accounts)) if !accounts.is_empty() => {
                 show_page("calendar");
+                show_tasks_page("tasks");
                 for account in accounts {
                     connect_calendar_account(
                         worker.clone(),
@@ -5029,15 +5129,18 @@ fn spawn_calendar_discovery(
                         toast_overlay.clone(),
                         client.clone(),
                         account,
+                        tasks_view.clone(),
                     );
                 }
                 refresh_config();
             }
             Ok(_) => {
                 show_page("calendar-empty");
+                show_tasks_page("tasks-empty");
             }
             Err(e) => {
                 show_page("calendar-empty");
+                show_tasks_page("tasks-empty");
                 toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't reach GNOME Online Accounts: {e}")));
             }
         }
@@ -5204,6 +5307,7 @@ fn connect_calendar_account(
     toast_overlay: adw::ToastOverlay,
     goa_client: GoaClient,
     account: GoaCalendarAccount,
+    tasks_view: Rc<crate::tasks_view::TasksView>,
 ) {
     let account_id = account.account_id.clone();
     let display_name = account.display_name.clone();
@@ -5245,6 +5349,7 @@ fn connect_calendar_account(
             connection_state: CalConnectionState::Connecting,
             last_occurrences: Vec::new(),
             last_synced_month: None,
+            last_tasks: Vec::new(),
         },
     );
 
@@ -5303,6 +5408,12 @@ fn connect_calendar_account(
                 }
                 CalendarSessionEvent::Error(message) => {
                     toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
+                }
+                CalendarSessionEvent::TasksUpdated(tasks) => {
+                    if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                        handle.last_tasks = tasks;
+                    }
+                    refresh_tasks_view(&calendar_state, &tasks_view);
                 }
             }
         }
@@ -5614,6 +5725,110 @@ fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar
         return;
     };
     let _ = handle.send_blocking(CalendarCommand::DeleteEvent { calendar_id, href, etag });
+}
+
+/// The account session that owns `calendar_id`, for task writes - the
+/// `calendar_handle_for_id` equivalent (same "calendar collection belongs to
+/// its account's handle" lookup).
+fn task_handle_for_id(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> Option<async_channel::Sender<CalendarCommand>> {
+    calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .find(|handle| handle.calendars.iter().any(|c| c.id == *calendar_id))
+        .map(|handle| handle.cmd_tx.clone())
+}
+
+/// Unions every connected account's latest task list - tasks have no month
+/// window, so the full set is always the merge unit. Feeds can't carry tasks
+/// (webcal is fetch-only, and `VTODO` isn't an event), so accounts only.
+fn merged_tasks(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<CalendarTask> {
+    calendar_state.borrow().accounts.values().flat_map(|handle| handle.last_tasks.iter().cloned()).collect()
+}
+
+/// Repaints the Tasks view from every account's latest task snapshot.
+fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>) {
+    let colors = calendar_state.borrow().calendar_colors.clone();
+    let tasks = merged_tasks(calendar_state);
+    crate::tasks_view::set_tasks(tasks_view, &tasks, &colors);
+}
+
+/// Routes a completion-toggle (list checkbox) to the task's session: the
+/// checkbox already rewrote the task's status/completed/percent fields, so
+/// this is a plain update-in-place (tasks only ever exist on the server once
+/// created, so there's no create path here).
+fn route_task_toggle(calendar_state: &Rc<RefCell<CalendarUiState>>, task: CalendarTask, _completed: bool) {
+    let Some(handle) = task_handle_for_id(calendar_state, &task.calendar_id) else {
+        tracing::warn!("tried to toggle a task in an unknown calendar {}", task.calendar_id);
+        return;
+    };
+    let _ = handle.send_blocking(CalendarCommand::UpdateTask { task: Box::new(task) });
+}
+
+/// Opens the task editor for a brand-new task, prefilled for the default
+/// calendar. A missing writable calendar is a toast, not a blocked open.
+fn show_new_task_editor(window: &adw::ApplicationWindow, calendar_state: &Rc<RefCell<CalendarUiState>>, toast_overlay: &adw::ToastOverlay) {
+    let calendars = pickable_calendars(calendar_state);
+    let Some(default_calendar) = default_pickable_calendar(calendar_state) else {
+        toast_overlay.add_toast(adw::Toast::new("Connect a calendar account to create tasks."));
+        return;
+    };
+    let calendar_state = calendar_state.clone();
+    crate::task_editor::show_task_editor(
+        window,
+        crate::task_editor::TaskEditorPrefill {
+            calendars: &calendars,
+            default_calendar,
+            existing: None,
+        },
+        move |calendar_id, task| route_task_save(&calendar_state, calendar_id, task),
+        move |_calendar_id, _href, _etag| {},
+    );
+}
+
+/// Opens the editor for an existing task.
+fn open_task_editor_for(window: &adw::ApplicationWindow, calendar_state: &Rc<RefCell<CalendarUiState>>, task: &CalendarTask) {
+    let calendars = pickable_calendars(calendar_state);
+    let calendar_state = calendar_state.clone();
+    let calendar_state_for_delete = calendar_state.clone();
+    crate::task_editor::show_task_editor(
+        window,
+        crate::task_editor::TaskEditorPrefill {
+            calendars: &calendars,
+            default_calendar: task.calendar_id.clone(),
+            existing: Some(task),
+        },
+        move |calendar_id, task| route_task_save(&calendar_state, calendar_id, task),
+        move |calendar_id, href, etag| route_task_delete(&calendar_state_for_delete, calendar_id, href, etag),
+    );
+}
+
+/// Routes a saved (created or edited) task to its account's session - the
+/// `route_calendar_save` counterpart: `href` present is an in-place
+/// `UpdateTask` (etag-guarded), absent is a fresh `CreateTask`.
+fn route_task_save(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, task: CalendarTask) {
+    let Some(handle) = task_handle_for_id(calendar_state, &calendar_id) else {
+        tracing::warn!("tried to save a task into an unknown calendar {calendar_id}");
+        return;
+    };
+    if task.href.is_some() {
+        let _ = handle.send_blocking(CalendarCommand::UpdateTask { task: Box::new(task) });
+    } else {
+        let _ = handle.send_blocking(CalendarCommand::CreateTask { task: Box::new(task) });
+    }
+}
+
+/// Routes a task deletion to its account's session.
+fn route_task_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, href: Option<String>, etag: Option<String>) {
+    let Some(handle) = task_handle_for_id(calendar_state, &calendar_id) else {
+        tracing::warn!("tried to delete a task from an unknown calendar {calendar_id}");
+        return;
+    };
+    let Some(href) = href else {
+        tracing::warn!("tried to delete a task without a server href");
+        return;
+    };
+    let _ = handle.send_blocking(CalendarCommand::DeleteTask { calendar_id, href, etag });
 }
 
 /// The calendar object already stored under `event.uid`, if any - the iMIP

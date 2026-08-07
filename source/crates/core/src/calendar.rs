@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::email::EmailAddress;
-use crate::ids::{AccountId, CalendarId, EventUid};
+use crate::ids::{AccountId, CalendarId, EventUid, TaskUid};
 
 /// One invitee on an event. Structured (not a raw `ATTENDEE` string) since
 /// the editor needs each address individually to render/edit attendee chips,
@@ -190,4 +190,68 @@ pub struct EventOccurrence {
     pub reminder_minutes_before: Option<i64>,
     #[serde(default)]
     pub conference_url: Option<String>,
+}
+
+/// RFC 5545 §3.8.1.11 `STATUS` on a VTODO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum TaskStatus {
+    #[default]
+    NeedsAction,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+/// RFC 5545 §3.8.1.9 `PRIORITY` on a VTODO, interpreted per the RFC's own
+/// scale: 1-4 high, 5 medium, 6-9 low. Modeled as the raw integer (0 = no
+/// priority set, the RFC's default) so a round-trip preserves what the server
+/// stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct TaskPriority(pub u8);
+
+/// One VTODO as it exists on the server. The CalDAV mirror of
+/// [`CalendarEvent`], carrying the same href/etag write metadata; unlike an
+/// event a task has no start/end span - `due` (or, rarely, `start` +
+/// `duration`) is its only temporal anchor, so recurrence is left unmodeled
+/// (RFC 5545 allows `RRULE` on VTODO but `icalendar`'s `Todo::repeats` is
+/// unimplemented, and per-occurrence task expansion is out of scope).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CalendarTask {
+    pub uid: TaskUid,
+    pub calendar_id: CalendarId,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    /// RFC 5545 §3.8.2.3: when the task is due. Absent for a task with only
+    /// a start/duration anchor (or none at all). Server round-trip is
+    /// lossless: `DUE` is written back as `DUE`, a task that came in with
+    /// `DTSTART`+`DURATION` keeps its computed due time.
+    #[serde(default)]
+    pub due: Option<DateTime<Utc>>,
+    /// RFC 5545 §3.8.2.2: when the task starts. Only meaningful when a task
+    /// has a `DURATION` instead of a `DUE` - the editor always writes `DUE`.
+    #[serde(default)]
+    pub start: Option<DateTime<Utc>>,
+    /// RFC 5545 §3.8.2.1: UTC timestamp of when the task was completed. Set
+    /// alongside `status == Completed`; cleared on reopen.
+    #[serde(default)]
+    pub completed: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub status: TaskStatus,
+    #[serde(default)]
+    pub priority: TaskPriority,
+    /// RFC 5545 §3.8.1.8: 0-100. `None` when the server didn't store it
+    /// (the RFC default is 0).
+    #[serde(default)]
+    pub percent_complete: Option<u8>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// The resource's URL within its calendar collection, if known - the
+    /// target for an update or delete (`PUT`/`DELETE`). `None` for a task
+    /// that hasn't been stored yet (a fresh create). See [`CalendarEvent`]
+    /// for the full semantics.
+    #[serde(default)]
+    pub href: Option<String>,
+    /// The calendar object's `getetag` as reported by the server, if known.
+    #[serde(default)]
+    pub etag: Option<String>,
 }

@@ -82,7 +82,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] iMIP invitation banners in the mail viewer — `text/calendar` parts fetched with the body, `METHOD:REQUEST` (Accept/Maybe/Decline → RFC 6047 `METHOD:REPLY` + calendar upsert), `METHOD:CANCEL` (remove-from-calendar), `METHOD:REPLY` (informational)
 - [x] `.ics` import / webcal subscription — sidebar "Add calendar" dialog (subscribe/import/manage), `lookout-dav` feed session (5-min poll, per-feed cache + error isolation), read-only event viewer for feed events, Config-view subscription list
 - [x] Mini-calendar sidebar widget (240px sidebar + compact copy docked on the Mail screen)
-- [ ] VTODO tasks
+- [x] VTODO tasks — `lookout-core` `CalendarTask` model, `lookout-dav` `todo-query` REPORT + VTODO parse/serialize + session commands (`SyncTasks`/`CreateTask`/`UpdateTask`/`DeleteTask`) + cache table, `tasks_view.rs` grouped list (Overdue/Today/This week/Later/Completed, checkbox completion toggle, calendar color dots), `task_editor.rs` dialog (summary/notes/due/priority/percent), Tasks nav-rail view + toolbar
 - [ ] Birthday calendar synthesized from Contacts
 - [x] `Gio.Notification` event alerts
 - [x] Event create/edit ("New Event" toolbar button)

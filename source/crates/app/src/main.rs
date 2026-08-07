@@ -24,6 +24,8 @@ mod reminders;
 mod resources;
 mod settings;
 mod tags;
+mod task_editor;
+mod tasks_view;
 mod ui_state_db;
 mod window;
 mod worker;

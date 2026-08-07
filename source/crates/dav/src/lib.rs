@@ -18,4 +18,4 @@ pub use cache::{cache_info, clear_all_caches, contacts_cache_info, remove_subscr
 pub use client::{fetch_webcal_ics, normalize_webcal_url, AddressBookInfo, ContactRecord, DavClient, MAX_FEED_BYTES};
 pub use config::{CalendarAccountConfig, CardDavAccountConfig, Credential};
 pub use error::{Error, Result};
-pub use ical::{build_imip_vcalendar, build_vcalendar, parse_imip_invitation, parse_vevents, parse_vevents_with_meta};
+pub use ical::{build_imip_vcalendar, build_vcalendar, build_vtodo_calendar, parse_imip_invitation, parse_vevents, parse_vevents_with_meta, parse_vtodos, parse_vtodos_with_meta};

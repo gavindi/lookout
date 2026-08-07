@@ -1,6 +1,11 @@
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
-use icalendar::{Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, PartStat, Property, Role, Trigger};
-use lookout_core::{Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventSensitivity, EventTransparency, EventUid, ImipInvitation, ImipMethod};
+use icalendar::{
+    Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, PartStat, Property, Role, TodoStatus, Trigger,
+};
+use lookout_core::{
+    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventTransparency, EventUid, ImipInvitation, ImipMethod,
+    TaskPriority, TaskStatus, TaskUid,
+};
 
 /// Parses every VEVENT out of a raw iCalendar document (as returned by a
 /// CalDAV `calendar-data` property) into [`CalendarEvent`]s, attaching no
@@ -141,9 +146,9 @@ fn parse_organizer(event: &icalendar::Event) -> Option<EmailAddress> {
 /// `multi_properties`, not the single-valued `properties()` map -
 /// `property_value("CATEGORIES")` always returns `None`. Each occurrence's
 /// value may itself be a comma-separated list, so every one is split.
-fn parse_categories(event: &icalendar::Event) -> Vec<String> {
-    event
-        .multi_properties()
+/// Generic over `Component` because both `VEVENT` and `VTODO` carry it.
+fn parse_categories(c: &impl Component) -> Vec<String> {
+    c.multi_properties()
         .get("CATEGORIES")
         .map(|props| {
             props
@@ -272,6 +277,151 @@ pub fn build_imip_vcalendar(event: &CalendarEvent, method: ImipMethod) -> String
     calendar.append_property(icalendar::Property::new("METHOD", method));
     calendar.push(build_vevent(event).done());
     format!("{calendar}")
+}
+
+/// Parses every VTODO out of a raw iCalendar document into [`CalendarTask`]s,
+/// with no href/etag metadata (those live in the enclosing `multistatus`
+/// response). Prefer [`parse_vtodos_with_meta`] when the caller has the
+/// response's `<href>`/`getetag` at hand. VEVENTs (and any other component)
+/// in the same document are ignored - one CalDAV resource holds one task.
+///
+/// Known, accepted simplifications for this pass:
+/// - A `DATE`-valued `DUE` (an all-day-style task) normalizes to UTC
+///   midnight; the all-day-ness is not modeled, so a round-trip writes the
+///   due time back as a UTC `DATE-TIME`. Tasks are typically timed, and this
+///   mirrors how the event side treats `VALUE=DATE` starts elsewhere.
+/// - `DURATION`-based tasks (no `DUE`) get their due time computed from
+///   `DTSTART` + `DURATION`; a `DURATION` with no `DTSTART` (relative to the
+///   creation date per RFC 5545 §3.6.2) can't be anchored and is dropped.
+/// - Task `RRULE` (recurrence) is not modeled - see [`CalendarTask`].
+pub fn parse_vtodos(calendar_id: &CalendarId, ics: &str) -> Vec<CalendarTask> {
+    parse_vtodos_with_meta(calendar_id, ics, None, None)
+}
+
+/// Like [`parse_vtodos`], but stamps every parsed task with the resource
+/// href/etag from the enclosing CalDAV `multistatus` response, which the
+/// write path needs to PUT/DELETE the resource back.
+pub fn parse_vtodos_with_meta(calendar_id: &CalendarId, ics: &str, href: Option<&str>, etag: Option<&str>) -> Vec<CalendarTask> {
+    let calendar: Calendar = match ics.parse() {
+        Ok(cal) => cal,
+        Err(e) => {
+            tracing::warn!("failed to parse iCalendar data: {e}");
+            return Vec::new();
+        }
+    };
+
+    calendar
+        .components
+        .iter()
+        .filter_map(|c| match c {
+            CalendarComponent::Todo(todo) => convert_todo(calendar_id, todo),
+            _ => None,
+        })
+        .map(|mut task| {
+            task.href = href.map(str::to_string);
+            task.etag = etag.map(str::to_string);
+            task
+        })
+        .collect()
+}
+
+fn convert_todo(calendar_id: &CalendarId, todo: &icalendar::Todo) -> Option<CalendarTask> {
+    let uid = todo.get_uid()?.to_string();
+
+    // `DUE` is the task's only unambiguous temporal anchor. A
+    // `DURATION`-only task is anchored relative to `DTSTART` when that's
+    // present (the RFC's effective-duration reading); a floating `DURATION`
+    // has no computable due time, so the task keeps just its start.
+    let start = todo.get_start().and_then(|dpt| to_utc(&dpt).map(|(utc, _)| utc));
+    let due = todo.get_due().and_then(|dpt| to_utc(&dpt).map(|(utc, _)| utc)).or_else(|| {
+        let duration = todo.property_value("DURATION").map(parse_ical_duration)?;
+        Some(start? + duration)
+    });
+
+    Some(CalendarTask {
+        uid: TaskUid(uid),
+        calendar_id: calendar_id.clone(),
+        summary: todo.get_summary().map(str::to_string),
+        description: todo.get_description().map(str::to_string),
+        due,
+        start,
+        completed: todo.get_completed(),
+        status: match todo.get_status() {
+            Some(TodoStatus::NeedsAction) | None => TaskStatus::NeedsAction,
+            Some(TodoStatus::InProcess) => TaskStatus::InProgress,
+            Some(TodoStatus::Completed) => TaskStatus::Completed,
+            Some(TodoStatus::Cancelled) => TaskStatus::Cancelled,
+        },
+        priority: TaskPriority(todo.property_value("PRIORITY").and_then(|p| p.parse().ok()).unwrap_or(0)),
+        percent_complete: todo.get_percent_complete(),
+        categories: parse_categories(todo),
+        // The parse side has no href/etag (those come from the enclosing
+        // `multistatus` `<href>`/`getetag`, not the `calendar-data`) - the
+        // caller fills them in after the fact via
+        // [`parse_vtodos_with_meta`].
+        href: None,
+        etag: None,
+    })
+}
+
+/// Serializes a [`CalendarTask`] into a single-VTODO iCalendar document
+/// suitable for a CalDAV `PUT` (the create/update body). Round-trips through
+/// [`parse_vtodos`]: UID/SUMMARY/DESCRIPTION/DUE/STATUS/PRIORITY/
+/// PERCENT-COMPLETE/COMPLETED are preserved; a task with no due time writes
+/// no `DUE` line. The `icalendar` builder emits RFC 5545-correct CRLF line
+/// folding and escaping for us; `DTSTAMP` is generated fresh on every build.
+pub fn build_vtodo_calendar(task: &CalendarTask) -> String {
+    let mut calendar = icalendar::Calendar::new();
+    calendar.push(build_vtodo(task).done());
+    format!("{calendar}")
+}
+
+fn build_vtodo(task: &CalendarTask) -> icalendar::Todo {
+    let mut vtodo = icalendar::Todo::new();
+
+    vtodo.uid(&task.uid.0);
+    if let Some(summary) = &task.summary {
+        vtodo.summary(summary);
+    }
+    if let Some(description) = &task.description {
+        vtodo.description(description);
+    }
+    // RFC 5545 §3.6.2 forbids `DUE` and `DURATION` together; the model only
+    // carries a due time, so a `DURATION`-based task that was parsed with a
+    // computed due writes it back as an explicit `DUE` - equivalent, since
+    // `DTSTART` is written too.
+    if let Some(due) = task.due {
+        vtodo.due(due);
+    }
+    if let Some(start) = task.start {
+        vtodo.starts(start);
+    }
+    match task.status {
+        TaskStatus::NeedsAction => {}
+        TaskStatus::InProgress => {
+            vtodo.status(TodoStatus::InProcess);
+        }
+        TaskStatus::Completed => {
+            vtodo.status(TodoStatus::Completed);
+        }
+        TaskStatus::Cancelled => {
+            vtodo.status(TodoStatus::Cancelled);
+        }
+    }
+    if let Some(completed) = task.completed {
+        vtodo.completed(completed);
+    }
+    if task.priority.0 != 0 {
+        vtodo.priority(u32::from(task.priority.0));
+    }
+    if let Some(percent) = task.percent_complete {
+        vtodo.percent_complete(percent);
+    }
+    if !task.categories.is_empty() {
+        vtodo.append_multi_property(Property::new("CATEGORIES", task.categories.join(",")));
+    }
+
+    vtodo
 }
 
 /// Parses a message's `text/calendar` payload into the [`ImipInvitation`] the
@@ -701,5 +851,162 @@ mod tests {
         // Fixture events must carry no write metadata - they're create-only
         // until an import/upsert stamps them.
         assert!(events.iter().all(|e| e.href.is_none() && e.etag.is_none()));
+    }
+
+    #[test]
+    fn parses_plain_vtodo_with_due_and_start() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nUID:todo-1@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T090000Z\r\nDUE:20260715T170000Z\r\nSUMMARY:File the report\r\nDESCRIPTION:Quarterly report\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let tasks = parse_vtodos(&cal_id(), ics);
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert_eq!(task.uid.0, "todo-1@example.com");
+        assert_eq!(task.summary.as_deref(), Some("File the report"));
+        assert_eq!(task.description.as_deref(), Some("Quarterly report"));
+        assert_eq!(task.due, Some("2026-07-15T17:00:00Z".parse().unwrap()));
+        assert_eq!(task.start, Some("2026-07-15T09:00:00Z".parse().unwrap()));
+        assert_eq!(task.status, TaskStatus::NeedsAction);
+        assert_eq!(task.priority, TaskPriority(0));
+        assert_eq!(task.percent_complete, None);
+        assert_eq!(task.completed, None);
+    }
+
+    #[test]
+    fn parses_completed_todo_with_status_priority_and_percent() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nUID:done-1@example.com\r\nDTSTAMP:20260101T000000Z\r\nDUE:20260714T170000Z\r\nSUMMARY:Send invoice\r\nSTATUS:COMPLETED\r\nCOMPLETED:20260713T110000Z\r\nPRIORITY:5\r\nPERCENT-COMPLETE:100\r\nCATEGORIES:Work,Billing\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let tasks = parse_vtodos(&cal_id(), ics);
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.completed, Some("2026-07-13T11:00:00Z".parse().unwrap()));
+        assert_eq!(task.priority, TaskPriority(5));
+        assert_eq!(task.percent_complete, Some(100));
+        assert_eq!(task.categories, vec!["Work".to_string(), "Billing".to_string()]);
+    }
+
+    #[test]
+    fn maps_in_progress_and_unknown_statuses() {
+        let in_progress = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:wip@example.com\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:WIP\r\nSTATUS:IN-PROCESS\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let tasks = parse_vtodos(&cal_id(), in_progress);
+        assert_eq!(tasks[0].status, TaskStatus::InProgress);
+
+        // A server-emitted status we don't model falls back to NeedsAction.
+        let cancelled =
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:cx@example.com\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:CX\r\nSTATUS:CANCELLED\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let tasks = parse_vtodos(&cal_id(), cancelled);
+        assert_eq!(tasks[0].status, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn duration_based_todo_computes_due_from_start() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nUID:dur-todo@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T090000Z\r\nDURATION:PT4H\r\nSUMMARY:Half-day task\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let tasks = parse_vtodos(&cal_id(), ics);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].due, Some("2026-07-15T13:00:00Z".parse().unwrap()));
+        assert_eq!(tasks[0].start, Some("2026-07-15T09:00:00Z".parse().unwrap()));
+    }
+
+    #[test]
+    fn todo_with_no_temporal_anchor_parses_without_due() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nUID:anchorless@example.com\r\nDTSTAMP:20260101T000000Z\r\nSUMMARY:No date\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let tasks = parse_vtodos(&cal_id(), ics);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].due, None);
+        assert_eq!(tasks[0].start, None);
+    }
+
+    #[test]
+    fn malformed_calendar_data_yields_no_tasks_rather_than_panicking() {
+        let tasks = parse_vtodos(&cal_id(), "this is not iCalendar data at all");
+        assert!(tasks.is_empty());
+    }
+
+    fn full_task() -> CalendarTask {
+        CalendarTask {
+            uid: TaskUid("task-1@example.com".to_string()),
+            calendar_id: cal_id(),
+            summary: Some("Book the venue".to_string()),
+            description: Some("Call and confirm".to_string()),
+            due: Some("2026-07-20T17:00:00Z".parse().unwrap()),
+            start: Some("2026-07-15T09:00:00Z".parse().unwrap()),
+            completed: None,
+            status: TaskStatus::NeedsAction,
+            priority: TaskPriority(3),
+            percent_complete: Some(40),
+            categories: vec!["Work".to_string()],
+            href: None,
+            etag: None,
+        }
+    }
+
+    #[test]
+    fn build_vtodo_calendar_round_trips_a_task() {
+        let ics = build_vtodo_calendar(&full_task());
+        assert!(ics.starts_with("BEGIN:VCALENDAR\r\n"), "should be CRLF line endings, got: {ics}");
+        assert!(ics.contains("BEGIN:VTODO"), "should contain a VTODO component: {ics}");
+        let tasks = parse_vtodos(&cal_id(), &ics);
+        assert_eq!(tasks.len(), 1);
+        let round = &tasks[0];
+        assert_eq!(round.uid, full_task().uid);
+        assert_eq!(round.summary, full_task().summary);
+        assert_eq!(round.description, full_task().description);
+        assert_eq!(round.due, full_task().due);
+        assert_eq!(round.start, full_task().start);
+        assert_eq!(round.priority, full_task().priority);
+        assert_eq!(round.percent_complete, full_task().percent_complete);
+        assert_eq!(round.categories, full_task().categories);
+        assert_eq!(round.status, TaskStatus::NeedsAction);
+    }
+
+    #[test]
+    fn build_vtodo_calendar_round_trips_completed_status_and_timestamp() {
+        let mut task = full_task();
+        task.status = TaskStatus::Completed;
+        task.completed = Some("2026-07-19T10:00:00Z".parse().unwrap());
+        task.percent_complete = Some(100);
+        let ics = build_vtodo_calendar(&task);
+        assert!(ics.contains("STATUS:COMPLETED"), "status must be written: {ics}");
+        let tasks = parse_vtodos(&cal_id(), &ics);
+        assert_eq!(tasks[0].status, TaskStatus::Completed);
+        assert_eq!(tasks[0].completed, task.completed);
+    }
+
+    #[test]
+    fn build_vtodo_calendar_omits_unset_fields() {
+        let mut task = full_task();
+        task.due = None;
+        task.start = None;
+        task.priority = TaskPriority(0);
+        task.percent_complete = None;
+        let ics = build_vtodo_calendar(&task);
+        assert!(!ics.contains("DUE"), "no DUE line expected: {ics}");
+        assert!(!ics.contains("DTSTART"), "no DTSTART line expected: {ics}");
+        assert!(!ics.contains("PRIORITY"), "default priority must be omitted: {ics}");
+        assert!(!ics.contains("PERCENT-COMPLETE"), "unset percent must be omitted: {ics}");
+        assert!(!ics.contains("STATUS"), "NeedsAction is the RFC default, no STATUS line expected: {ics}");
+        assert!(!ics.contains("COMPLETED"), "no COMPLETED line expected: {ics}");
+        let tasks = parse_vtodos(&cal_id(), &ics);
+        assert_eq!(tasks[0].due, None);
+        assert_eq!(tasks[0].status, TaskStatus::NeedsAction);
+    }
+
+    #[test]
+    fn build_vtodo_calendar_stamps_meta_from_parse_with_meta() {
+        let ics = build_vtodo_calendar(&full_task());
+        let tasks = parse_vtodos_with_meta(&cal_id(), &ics, Some("/cal/tasks/task-1.ics"), Some("\"etag1\""));
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].href.as_deref(), Some("/cal/tasks/task-1.ics"));
+        assert_eq!(tasks[0].etag.as_deref(), Some("\"etag1\""));
+    }
+
+    #[test]
+    fn parses_the_multi_vevent_fixture_todo() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/holidays.ics");
+        let ics = std::fs::read_to_string(path).expect("fixture exists");
+        let tasks = parse_vtodos(&cal_id(), &ics);
+        assert_eq!(tasks.len(), 1, "only the VTODO is a task - the VEVENTs are ignored");
+        assert_eq!(tasks[0].uid.0, "todo-1@example.com");
+        assert_eq!(tasks[0].summary.as_deref(), Some("Ignored todo"));
+        assert_eq!(tasks[0].due, None);
+        assert!(tasks[0].href.is_none() && tasks[0].etag.is_none());
     }
 }

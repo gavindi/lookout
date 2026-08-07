@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.1 (2026-08-08)
+
+### Added
+
+- **Tasks**: a new Tasks rail view backed by CalDAV `VTODO` resources, closing the last read-only gap in the Calendar module. `lookout-core` gains a `CalendarTask` model (due/start/completed timestamps, `STATUS`, `PRIORITY`, `PERCENT-COMPLETE`, categories, server href/etag); `lookout-dav` gains a `todo-query` REPORT (RFC 4791 §7.10, deliberately unfiltered - tasks have no guaranteed temporal span, so the whole set is always fetched), VTODO parse/serialize (`parse_vtodos_with_meta`/`build_vtodo_calendar`, round-tripping `DUE`/`DTSTART`+`DURATION`-computed dues, statuses, priorities, percent, and completion timestamps), session commands/events (`SyncTasks`/`CreateTask`/`UpdateTask`/`DeleteTask` + `TasksUpdated`), and a cached tasks table in the existing per-account calendar SQLite. The UI is a new `tasks_view.rs` (grouped list - Overdue / Today / This week / Later / Completed - with cairo-painted calendar colour dots, overdue highlighting, a completion checkbox that flips `STATUS`/`COMPLETED`/`PERCENT-COMPLETE` through the session, and a click-to-edit row) plus a `task_editor.rs` dialog (summary, notes, due date/time with a "Due" switch, calendar picker, priority dropdown, %-complete spinner, guarded delete). The Tasks rail button pulls a fresh task list on open; every write resyncs through the session's existing machinery. VTODO recurrence and task iMIP invitations remain explicitly out of scope.
+
+### Testing
+
+- `lookout-dav`: new VTODO tests - `parse_vtodos`/`parse_vtodos_with_meta` (plain due/start tasks, completed tasks with status/priority/percent/categories, `IN-PROCESS` and `CANCELLED` statuses, `DTSTART`+`DURATION`-computed dues, anchorless tasks, malformed data yielding no tasks), `build_vtodo_calendar` round-trips (completed status + `COMPLETED` timestamp, unset fields omitted, href/etag stamping), the `todo-query` REPORT body (well-formed XML, `VTODO` filter, no time-range), and the cache's tasks-table round-trip. `lookout-app`: `tasks_view` unit tests for due-window/completion bucketing, render-order grouping, and within-bucket sorting (due first, then priority, undated last).
+
 ## 0.8.0 (2026-08-08)
 
 ### Added

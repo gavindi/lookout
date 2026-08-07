@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.8.1" date="2026-08-08">
+      <description>
+        <p>Tasks arrive: a new Tasks tab backed by CalDAV to-do items (VTODO) shows your tasks grouped by Overdue / Today / This week / Later / Completed, with one-click completion and a full editor for summary, notes, due date, priority, and progress. Tasks sync from every connected calendar account on a schedule and are cached locally for instant startup paint.</p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-08-08">
       <description>
         <p>People gets an offline-friendly overhaul: contacts are cached locally per account (the People tab paints instantly at startup and the Deleted list survives restarts), and contact sync now uses incremental server deltas instead of full refetches. The whole People screen can be popped out into its own window with a Back to main window button, and contact autocomplete in the composer and event invites now runs through one shared CardDAV-backed provider.</p>

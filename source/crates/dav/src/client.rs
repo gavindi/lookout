@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, CalendarEvent, CalendarId, CalendarInfo, VCard};
+use lookout_core::{AccountId, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, VCard};
 use reqwest::Method;
 
 use crate::config::Credential;
@@ -368,6 +368,27 @@ impl DavClient {
                 Some((href, etag, data))
             })
             .flat_map(|(href, etag, ics)| ical::parse_vevents_with_meta(&calendar.id, &ics, Some(&href), etag.as_deref()))
+            .collect())
+    }
+
+    /// `todo-query` REPORT scoped to one calendar collection, requesting
+    /// every `VTODO` in it - the `fetch_events_in_range` counterpart for
+    /// tasks (see [`xml::build_todo_query_body`] for why there's no
+    /// time-range filter).
+    pub async fn fetch_tasks(&self, calendar: &CalendarInfo, credential: &Credential) -> Result<Vec<CalendarTask>> {
+        let cal_url = self.resolve(&calendar.href)?;
+        let body = xml::build_todo_query_body();
+        let responses = self.report(cal_url, 1, credential, body).await?;
+
+        Ok(responses
+            .into_iter()
+            .filter_map(|r| {
+                let href = r.href.clone();
+                let etag = r.prop(NS_DAV, "getetag").map(str::to_string);
+                let data = r.prop(NS_CALDAV, "calendar-data")?.to_string();
+                Some((href, etag, data))
+            })
+            .flat_map(|(href, etag, ics)| ical::parse_vtodos_with_meta(&calendar.id, &ics, Some(&href), etag.as_deref()))
             .collect())
     }
 

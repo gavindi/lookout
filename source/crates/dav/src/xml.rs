@@ -355,6 +355,28 @@ pub fn build_calendar_query_body(start: DateTime<Utc>, end: DateTime<Utc>) -> St
     )
 }
 
+/// Builds a `todo-query` REPORT body (RFC 4791 §7.10) requesting every
+/// `VTODO` in the collection. Unlike the event query there's deliberately no
+/// `time-range` filter: tasks carry no required temporal span (a task may
+/// have only a `DUE`, only a `DTSTART`, or neither), so a windowed fetch
+/// could silently miss them - they're small, and the whole set is re-fetched
+/// per poll.
+pub fn build_todo_query_body() -> String {
+    "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n\
+     <C:todo-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
+     \x20 <D:prop>\n\
+     \x20   <D:getetag/>\n\
+     \x20   <C:calendar-data/>\n\
+     \x20 </D:prop>\n\
+     \x20 <C:filter>\n\
+     \x20   <C:comp-filter name=\"VCALENDAR\">\n\
+     \x20     <C:comp-filter name=\"VTODO\"/>\n\
+     \x20   </C:comp-filter>\n\
+     \x20 </C:filter>\n\
+     </C:todo-query>"
+        .to_string()
+}
+
 /// Builds an `addressbook-multiget` REPORT body (RFC 6352 §8.7) requesting
 /// the given, already-known member hrefs of a CardDAV collection. Used for
 /// a full fetch after a `PROPFIND` (Depth: 1) enumerates the collection's
@@ -620,6 +642,23 @@ mod tests {
         }
         assert!(query.contains("20260701T000000Z"));
         assert!(query.contains("20260801T000000Z"));
+    }
+
+    #[test]
+    fn todo_query_body_is_well_formed_xml_and_filters_on_vtodo() {
+        let body = build_todo_query_body();
+        assert!(body.contains("<C:todo-query"), "must use RFC 4791 §7.10 todo-query: {body}");
+        assert!(body.contains("<C:comp-filter name=\"VTODO\"/>"), "must filter on VTODO: {body}");
+        assert!(!body.contains("time-range"), "tasks must not be windowed: {body}");
+
+        let mut reader = NsReader::from_str(&body);
+        loop {
+            match reader.read_resolved_event() {
+                Ok((_, Event::Eof)) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("build_todo_query_body produced malformed XML: {e}"),
+            }
+        }
     }
 
     #[test]

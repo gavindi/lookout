@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use chrono::{Datelike, NaiveDate};
-use lookout_core::{AccountId, EventOccurrence, VCard};
+use lookout_core::{AccountId, CalendarTask, EventOccurrence, VCard};
 use rusqlite::Connection;
 
 use crate::{ContactRecord, Result};
@@ -116,6 +116,9 @@ impl CalendarCache {
                 month TEXT PRIMARY KEY,
                 data TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS tasks (
+                data TEXT NOT NULL
+            );
             ",
         )?;
         Ok(CalendarCache { conn: Mutex::new(conn) })
@@ -143,6 +146,31 @@ impl CalendarCache {
             "INSERT OR REPLACE INTO occurrences (month, data) VALUES (?1, ?2)",
             rusqlite::params![month_key(first_of_month(month)), data],
         )?;
+        Ok(())
+    }
+
+    /// The cached tasks from the last successful sync, or `None` if this
+    /// account has never synced them. Like `load_month`, this is only a
+    /// fast-paint hint - every `TasksUpdated` event from the live session
+    /// supersedes it.
+    pub fn load_tasks(&self) -> Result<Option<Vec<CalendarTask>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT data FROM tasks")?;
+        let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(row) => Ok(Some(serde_json::from_str(&row?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Replaces the cached task list with the freshly-fetched one (a single
+    /// row holding the whole JSON array - tasks are few and small, and the
+    /// table never grows).
+    pub fn store_tasks(&self, tasks: &[CalendarTask]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let data = serde_json::to_string(tasks)?;
+        conn.execute("DELETE FROM tasks", [])?;
+        conn.execute("INSERT INTO tasks (data) VALUES (?1)", [data])?;
         Ok(())
     }
 }
@@ -535,5 +563,41 @@ mod tests {
         let sanitized = sanitize_filename(&id);
         assert!(!sanitized.contains('/'));
         assert_eq!(sanitized, "_org_gnome_OnlineAccounts_Accounts_account_1234");
+    }
+
+    #[test]
+    fn round_trips_tasks_through_the_cache() {
+        let account_id = temp_account_id();
+        let cache = CalendarCache::open(&account_id).unwrap();
+        assert!(cache.load_tasks().unwrap().is_none());
+
+        let task = |uid: &str, summary: &str| CalendarTask {
+            uid: lookout_core::TaskUid(uid.to_string()),
+            calendar_id: CalendarId("cal-1".to_string()),
+            summary: Some(summary.to_string()),
+            description: None,
+            due: None,
+            start: None,
+            completed: None,
+            status: lookout_core::TaskStatus::default(),
+            priority: lookout_core::TaskPriority::default(),
+            percent_complete: None,
+            categories: Vec::new(),
+            href: None,
+            etag: None,
+        };
+        cache.store_tasks(&[task("t-1", "First"), task("t-2", "Second")]).unwrap();
+
+        let loaded = cache.load_tasks().unwrap().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|t| t.summary.as_deref() == Some("First")));
+
+        // Storing again replaces rather than accumulates.
+        cache.store_tasks(&[task("t-3", "Third")]).unwrap();
+        assert_eq!(cache.load_tasks().unwrap().unwrap().len(), 1);
+        assert_eq!(cache.load_tasks().unwrap().unwrap()[0].summary.as_deref(), Some("Third"));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
     }
 }

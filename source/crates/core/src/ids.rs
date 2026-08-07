@@ -65,3 +65,14 @@ impl fmt::Display for EventUid {
         write!(f, "{}", self.0)
     }
 }
+
+/// A VTODO task's `UID` (RFC 5545 §3.8.4.7) - same scoping rules as
+/// [`EventUid`]: only unique within a given `CalendarId`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct TaskUid(pub String);
+
+impl fmt::Display for TaskUid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
