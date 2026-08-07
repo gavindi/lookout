@@ -188,6 +188,7 @@ mod tests {
             display_name: id.to_string(),
             color: color.map(|c| c.to_string()),
             href: format!("/{id}"),
+            supports_tasks: false,
         }
     }
 

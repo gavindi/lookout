@@ -8,7 +8,7 @@ use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::{
     AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody, EmailSummary,
-    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, VCard, WebcalSubscription,
+    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskUid, Uid, VCard, WebcalSubscription,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
@@ -28,9 +28,11 @@ use crate::contacts_view::{
 use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
+use crate::google_tasks::{self, GoogleTasksCommand, GoogleTasksEvent, TaskList};
 use crate::last_view::{self, LastSelection};
 use crate::message_list::{format_row_date, ListFilter, MessageItem, MessageListModel, SelectionKind, SortKey};
 use crate::microsoft_oauth::MicrosoftCredentialProvider;
+use crate::ui_state_db::UiStateDb;
 use crate::worker::Worker;
 
 /// Per-account state the UI needs once an `AccountSession` actor is running:
@@ -571,6 +573,23 @@ struct WebcalHandle {
     error: Option<String>,
 }
 
+/// Per-Google-account state for the Google Tasks integration (keyed by the
+/// account's email). One `run_google_tasks_session` actor per connected
+/// account; its task lists map to synthetic `googletasks:<list id>`
+/// calendar ids so the Tasks view's colour/merge machinery treats them like
+/// calendars.
+struct GoogleTasksHandle {
+    cmd_tx: async_channel::Sender<GoogleTasksCommand>,
+    email: String,
+    /// The account's task lists, from the last `ListsUpdated` - the task
+    /// editor's picker entries and the save-routing lookup.
+    task_lists: Vec<TaskList>,
+    /// Latest full task snapshot from the account's last `TasksUpdated`.
+    last_tasks: Vec<CalendarTask>,
+    /// The latest reported error, if any (revoked token, failed write, ...).
+    error: Option<String>,
+}
+
 struct CalendarUiState {
     accounts: HashMap<AccountId, CalendarAccountHandle>,
     displayed_month: chrono::NaiveDate,
@@ -596,6 +615,18 @@ struct CalendarUiState {
     webcal_subscriptions: Vec<WebcalSubscription>,
     /// Per-subscription feed state, keyed by subscription id.
     webcal_handles: HashMap<String, WebcalHandle>,
+    /// Connected Google Tasks accounts, keyed by email.
+    google_tasks: HashMap<String, GoogleTasksHandle>,
+    /// Every Google GOA account's email, discovered at startup - the
+    /// "Connect Google Tasks" toolbar button's targets.
+    google_account_emails: Vec<String>,
+    /// Locally-stored tasks (`CalendarId("local")`) - the fallback store
+    /// used when no connected source supports tasks. Survives "Clear all
+    /// caches" (it lives in the UI-state database, not a cache).
+    local_tasks: Vec<CalendarTask>,
+    /// Best-effort handle on the UI-state database for local-task writes;
+    /// `None` when it couldn't open (local tasks then live in memory only).
+    local_tasks_db: Option<Rc<RefCell<UiStateDb>>>,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -2535,12 +2566,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Tasks' own command toolbar row, swapped in when the Tasks nav-rail
     // button is active. New task opens the task editor (wired later, once
-    // `calendar_state` exists).
+    // `calendar_state` exists); Connect Google Tasks runs the interactive
+    // OAuth flow for the account's Google GOA account.
     let new_task_button = gtk::Button::from_icon_name(themed_icon_name(&["view-task-symbolic", "appointment-soon-symbolic"]));
     new_task_button.set_tooltip_text(Some("New Task"));
+    let connect_google_tasks_button = gtk::Button::with_label("Connect Google Tasks");
+    connect_google_tasks_button.set_tooltip_text(Some("Sign in to Google Tasks (the Tasks API, separate from Google's event-only CalDAV)"));
 
     let tasks_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     tasks_command_toolbar.append(&new_task_button);
+    tasks_command_toolbar.append(&connect_google_tasks_button);
 
     // --- View tab's ribbon content (Mail module): a "Layout" group of
     // pane-visibility toggles - Folder pane / Reading pane / Calendar
@@ -3199,6 +3234,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     let state = state.clone();
+    // The UI-state database also holds local-only tasks - best-effort, like
+    // the contacts code's handle: a failed open means local tasks live in
+    // memory for this session only.
+    let local_tasks_db = UiStateDb::open()
+        .map(|db| Rc::new(RefCell::new(db)))
+        .inspect_err(|e| tracing::warn!("local tasks won't persist: {e}"))
+        .ok();
+    let local_tasks = local_tasks_db.as_ref().and_then(|db| db.borrow().load_local_tasks().ok()).unwrap_or_default();
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
         accounts: HashMap::new(),
         displayed_month: current_month_start(),
@@ -3207,6 +3250,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         webcal_cmd_tx: None,
         webcal_subscriptions: Vec::new(),
         webcal_handles: HashMap::new(),
+        google_tasks: HashMap::new(),
+        google_account_emails: Vec::new(),
+        local_tasks,
+        local_tasks_db,
     }));
 
     // --- Calendar event reminders. The engine accumulates every occurrence
@@ -3783,6 +3830,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // --- Config → Google Tasks → OAuth client id: shows the configured id
+    // (or its absence) and opens a small entry dialog to set/clear it - the
+    // GUI-friendly way to provide the client id Google requires, instead of
+    // an environment variable.
+    {
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        let google_tasks_client_row = config_view.google_tasks_client_row.clone();
+        crate::config_view::refresh_google_tasks_client_row(&google_tasks_client_row);
+        let row_for_dialog = google_tasks_client_row.clone();
+        google_tasks_client_row.connect_activated(move |_| {
+            show_google_tasks_client_id_dialog(&window, &toast_overlay, &row_for_dialog);
+        });
+    }
+
     // --- Compose button -> new-message composer in the reading pane,
     // "From" = the account owning the selected message (falling back to the
     // currently-open mailbox's account, then any connected account) ---
@@ -4294,23 +4356,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // blank form, clicking a task row opens it for editing, and the row
     // checkbox flips completion (the modified task goes through the same
     // session route as a Save). Opening the Tasks view pulls a fresh task
-    // list from every account so the view isn't stale between polls.
+    // list from every source so the view isn't stale between polls.
     {
         let window = window.clone();
         let calendar_state = calendar_state.clone();
-        let toast_overlay = toast_overlay.clone();
+        let tasks_view = tasks_view.clone();
         new_task_button.connect_clicked(move |_| {
-            show_new_task_editor(&window, &calendar_state, &toast_overlay);
+            show_new_task_editor(&window, &calendar_state, &tasks_view);
         });
     }
     {
         let window = window.clone();
         let calendar_state = calendar_state.clone();
         let calendar_state_for_activate = calendar_state.clone();
+        let tasks_view_for_toggle = tasks_view.clone();
+        let tasks_view_for_activate = tasks_view.clone();
         crate::tasks_view::set_handlers(
             &tasks_view,
-            Rc::new(move |task, completed| route_task_toggle(&calendar_state, task, completed)),
-            Rc::new(move |task| open_task_editor_for(&window, &calendar_state_for_activate, &task)),
+            Rc::new(move |task, completed| route_task_toggle(&calendar_state, &tasks_view_for_toggle, task, completed)),
+            Rc::new(move |task| open_task_editor_for(&window, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
         );
     }
     {
@@ -4322,7 +4386,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 for handle in calendar_state.borrow().accounts.values() {
                     let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncTasks);
                 }
+                for handle in calendar_state.borrow().google_tasks.values() {
+                    let _ = handle.cmd_tx.send_blocking(GoogleTasksCommand::Refresh);
+                }
             }
+        });
+    }
+    {
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        let toast_overlay = toast_overlay.clone();
+        connect_google_tasks_button.connect_clicked(move |_| {
+            connect_google_tasks(&worker, &calendar_state, &tasks_view, &toast_overlay);
         });
     }
     {
@@ -4456,6 +4532,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contacts_view_button,
         refresh_contacts_ui,
     );
+    spawn_google_tasks_discovery(worker.clone(), calendar_state.clone(), tasks_view.clone(), toast_overlay.clone());
     spawn_calendar_discovery(
         worker,
         calendar_state,
@@ -5153,6 +5230,158 @@ fn ensure_checked_calendars(checked: &mut HashSet<CalendarId>, calendars: &[Cale
     }
 }
 
+/// Starts the Google Tasks integration: lists every Google GOA calendar
+/// account (the provider that can't store CalDAV tasks), remembers their
+/// emails for the "Connect Google Tasks" button, and auto-connects those
+/// with a stored refresh token - the non-interactive path, since a stored
+/// token means the user authorized once already.
+fn spawn_google_tasks_discovery(worker: Rc<Worker>, calendar_state: Rc<RefCell<CalendarUiState>>, tasks_view: Rc<crate::tasks_view::TasksView>, toast_overlay: adw::ToastOverlay) {
+    let (goa_tx, goa_rx) = async_channel::bounded(1);
+    worker.spawn(async move {
+        let result = async {
+            let client = GoaClient::connect().await?;
+            let accounts = client.list_calendar_accounts().await?;
+            Ok::<_, lookout_goa::Error>(accounts)
+        }
+        .await;
+        let _ = goa_tx.send(result).await;
+    });
+
+    glib::spawn_future_local(async move {
+        let Ok(result) = goa_rx.recv().await else { return };
+        match result {
+            Ok(accounts) => {
+                let emails: Vec<String> = accounts
+                    .iter()
+                    .filter(|a| a.provider_type.as_deref() == Some("google"))
+                    .map(|a| a.display_name.clone())
+                    .collect();
+                {
+                    let mut st = calendar_state.borrow_mut();
+                    st.google_account_emails = emails.clone();
+                }
+                for email in emails {
+                    if google_tasks::has_stored_token(&email) && !calendar_state.borrow().google_tasks.contains_key(&email) {
+                        connect_google_tasks_account(worker.clone(), calendar_state.clone(), tasks_view.clone(), toast_overlay.clone(), email);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("couldn't discover Google Tasks accounts: {e}");
+            }
+        }
+    });
+}
+
+/// The interactive "Connect Google Tasks" action: runs the OAuth
+/// authorization-code flow (opening a browser) for the account's first
+/// Google GOA account, then spawns the sync session. Rejects politely when
+/// there's no Google account or it's already connected.
+fn connect_google_tasks(worker: &Rc<Worker>, calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>, toast_overlay: &adw::ToastOverlay) {
+    let email = {
+        let st = calendar_state.borrow();
+        let Some(email) = st.google_account_emails.first().cloned() else {
+            toast_overlay.add_toast(adw::Toast::new("Add a Google account in GNOME Online Accounts first."));
+            return;
+        };
+        if st.google_tasks.contains_key(&email) {
+            toast_overlay.add_toast(adw::Toast::new("Google Tasks is already connected."));
+            return;
+        }
+        email
+    };
+
+    let worker = worker.clone();
+    let calendar_state = calendar_state.clone();
+    let tasks_view = tasks_view.clone();
+    let toast_overlay = toast_overlay.clone();
+    let (tx, rx) = async_channel::bounded(1);
+    let email_for_auth = email.clone();
+    worker.spawn(async move {
+        let oauth = google_tasks::GoogleTasksOAuth::new(&email_for_auth);
+        let _ = tx.send(oauth.access_token().await).await;
+    });
+    glib::spawn_future_local(async move {
+        match rx.recv().await {
+            Ok(Ok(_token)) => {
+                toast_overlay.add_toast(adw::Toast::new(&format!("Google Tasks connected for {email}")));
+                connect_google_tasks_account(worker, calendar_state, tasks_view, toast_overlay, email);
+            }
+            Ok(Err(e)) => {
+                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't connect Google Tasks: {e}")));
+            }
+            Err(_) => {}
+        }
+    });
+}
+
+/// Spawns one Google account's Tasks session and routes its events into the
+/// Tasks view: lists become picker entries (with calendar colours), task
+/// snapshots merge into the view, and errors toast.
+fn connect_google_tasks_account(
+    worker: Rc<Worker>,
+    calendar_state: Rc<RefCell<CalendarUiState>>,
+    tasks_view: Rc<crate::tasks_view::TasksView>,
+    toast_overlay: adw::ToastOverlay,
+    email: String,
+) {
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    calendar_state.borrow_mut().google_tasks.insert(
+        email.clone(),
+        GoogleTasksHandle {
+            cmd_tx,
+            email: email.clone(),
+            task_lists: Vec::new(),
+            last_tasks: Vec::new(),
+            error: None,
+        },
+    );
+    worker.spawn(google_tasks::run_google_tasks_session(email.clone(), cmd_rx, evt_tx));
+
+    glib::spawn_future_local(async move {
+        while let Ok(event) = evt_rx.recv().await {
+            match event {
+                GoogleTasksEvent::ListsUpdated(lists) => {
+                    {
+                        let mut st = calendar_state.borrow_mut();
+                        if let Some(handle) = st.google_tasks.get_mut(&email) {
+                            handle.task_lists = lists.clone();
+                            handle.error = None;
+                        }
+                        let infos: Vec<CalendarInfo> = lists
+                            .iter()
+                            .map(|list| CalendarInfo {
+                                id: google_tasks::google_task_calendar_id(&list.id),
+                                account_id: AccountId(format!("googletasks:{email}")),
+                                display_name: list.title.clone(),
+                                color: None,
+                                href: String::new(),
+                                supports_tasks: true,
+                            })
+                            .collect();
+                        calendar_colors::assign_missing(&mut st.calendar_colors, &infos);
+                    }
+                    refresh_tasks_view(&calendar_state, &tasks_view);
+                }
+                GoogleTasksEvent::TasksUpdated(tasks) => {
+                    if let Some(handle) = calendar_state.borrow_mut().google_tasks.get_mut(&email) {
+                        handle.last_tasks = tasks;
+                        handle.error = None;
+                    }
+                    refresh_tasks_view(&calendar_state, &tasks_view);
+                }
+                GoogleTasksEvent::Error(message) => {
+                    if let Some(handle) = calendar_state.borrow_mut().google_tasks.get_mut(&email) {
+                        handle.error = Some(message.clone());
+                    }
+                    toast_overlay.add_toast(adw::Toast::new(&message));
+                }
+            }
+        }
+    });
+}
+
 /// Recomputes which calendars actually exist across every connected account,
 /// defaults any newly-seen id to checked (shown), and re-renders the
 /// sidebar's "My calendars" checklist against that - the checklist's own
@@ -5185,6 +5414,8 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
                         display_name: sub.display_name.clone(),
                         color: None,
                         href: sub.url.clone(),
+                        // Feeds are events-only - never a task target.
+                        supports_tasks: false,
                     })
                     .collect(),
                 status: None,
@@ -5525,6 +5756,52 @@ fn pickable_calendars(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<(Str
     out
 }
 
+/// The `(label, id)` list the task editor's calendar picker shows: like
+/// [`pickable_calendars`], but restricted to sources that can actually hold
+/// tasks - CalDAV calendars whose server advertises `VTODO` support
+/// (Google's CalDAV is `VEVENT`-only and rejects task PUTs with HTTP 403),
+/// plus every connected Google Tasks list ("<email> · <list>").
+fn pickable_task_calendars(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<(String, CalendarId)> {
+    let st = calendar_state.borrow();
+    let mut handles: Vec<&CalendarAccountHandle> = st.accounts.values().collect();
+    handles.sort_by_key(|h| h.display_name.to_lowercase());
+    let mut out = Vec::new();
+    for handle in handles {
+        for calendar in &handle.calendars {
+            if calendar.supports_tasks {
+                out.push((format!("{} · {}", handle.display_name, calendar.display_name), calendar.id.clone()));
+            }
+        }
+    }
+    for handle in st.google_tasks.values() {
+        for list in &handle.task_lists {
+            out.push((format!("{} · {}", handle.email, list.title), google_tasks::google_task_calendar_id(&list.id)));
+        }
+    }
+    out
+}
+
+/// The task editor's default target: the first checked CalDAV calendar that
+/// supports tasks, else any task-capable CalDAV calendar, else the first
+/// Google Tasks list.
+fn default_pickable_task_calendar(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Option<CalendarId> {
+    let st = calendar_state.borrow();
+    let task_capable = |calendar: &CalendarInfo| calendar.supports_tasks;
+    for handle in st.accounts.values() {
+        for calendar in &handle.calendars {
+            if task_capable(calendar) && st.checked_calendar_ids.contains(&calendar.id) {
+                return Some(calendar.id.clone());
+            }
+        }
+    }
+    if let Some(calendar) = st.accounts.values().find_map(|handle| handle.calendars.iter().find(|c| task_capable(c))) {
+        return Some(calendar.id.clone());
+    }
+    st.google_tasks
+        .values()
+        .find_map(|handle| handle.task_lists.first().map(|l| google_tasks::google_task_calendar_id(&l.id)))
+}
+
 /// The editor's default calendar for a new event: the first checked calendar
 /// (the one whose events are actually on screen), or any calendar if nothing
 /// is checked.
@@ -5739,41 +6016,70 @@ fn task_handle_for_id(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id
         .map(|handle| handle.cmd_tx.clone())
 }
 
-/// Unions every connected account's latest task list - tasks have no month
-/// window, so the full set is always the merge unit. Feeds can't carry tasks
-/// (webcal is fetch-only, and `VTODO` isn't an event), so accounts only.
-fn merged_tasks(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<CalendarTask> {
-    calendar_state.borrow().accounts.values().flat_map(|handle| handle.last_tasks.iter().cloned()).collect()
+/// The synthetic calendar id of the on-device-only task store (plan C: the
+/// fallback when no connected source supports tasks). Tasks with this id
+/// live in the UI-state database and never sync anywhere.
+fn local_tasks_calendar_id() -> CalendarId {
+    CalendarId("local".to_string())
 }
 
-/// Repaints the Tasks view from every account's latest task snapshot.
+/// The Google Tasks session owning a `googletasks:<list id>` calendar, if
+/// any - the task-write routing lookup.
+fn google_tasks_handle_for_calendar<'a>(state: &'a CalendarUiState, calendar_id: &CalendarId) -> Option<&'a GoogleTasksHandle> {
+    let list_id = google_tasks::google_task_list_id(calendar_id)?;
+    state.google_tasks.values().find(|handle| handle.task_lists.iter().any(|l| l.id == list_id))
+}
+
+/// Unions every connected task source's latest snapshot: CalDAV accounts'
+/// tasks, Google Tasks accounts' tasks, and the local on-device store.
+/// Tasks have no month window, so the full set is always the merge unit.
+fn merged_tasks(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<CalendarTask> {
+    let st = calendar_state.borrow();
+    st.accounts
+        .values()
+        .flat_map(|handle| handle.last_tasks.iter().cloned())
+        .chain(st.google_tasks.values().flat_map(|handle| handle.last_tasks.iter().cloned()))
+        .chain(st.local_tasks.iter().cloned())
+        .collect()
+}
+
+/// Repaints the Tasks view from every source's latest snapshot, setting the
+/// empty-state message to match what task sources exist (B: "you have no
+/// tasks" vs "you have nowhere to put tasks").
 fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>) {
     let colors = calendar_state.borrow().calendar_colors.clone();
     let tasks = merged_tasks(calendar_state);
+    let st = calendar_state.borrow();
+    let has_caldav_tasks = st.accounts.values().flat_map(|h| h.calendars.iter()).any(|c| c.supports_tasks);
+    let has_google_tasks = !st.google_tasks.is_empty();
+    drop(st);
+    let message = if has_caldav_tasks || has_google_tasks {
+        "No tasks yet - use New task to create one.".to_string()
+    } else {
+        "No connected calendar supports tasks, so new tasks are saved on this device only. To sync tasks, use Connect Google Tasks or connect a calendar that supports them (Nextcloud, iCloud).".to_string()
+    };
+    crate::tasks_view::set_empty_message(tasks_view, &message);
     crate::tasks_view::set_tasks(tasks_view, &tasks, &colors);
 }
 
-/// Routes a completion-toggle (list checkbox) to the task's session: the
-/// checkbox already rewrote the task's status/completed/percent fields, so
-/// this is a plain update-in-place (tasks only ever exist on the server once
-/// created, so there's no create path here).
-fn route_task_toggle(calendar_state: &Rc<RefCell<CalendarUiState>>, task: CalendarTask, _completed: bool) {
-    let Some(handle) = task_handle_for_id(calendar_state, &task.calendar_id) else {
-        tracing::warn!("tried to toggle a task in an unknown calendar {}", task.calendar_id);
-        return;
-    };
-    let _ = handle.send_blocking(CalendarCommand::UpdateTask { task: Box::new(task) });
+/// Routes a completion-toggle (list checkbox) to the task's store: the
+/// checkbox already rewrote the status/completed/percent fields, so this is
+/// a plain update-in-place.
+fn route_task_toggle(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>, task: CalendarTask, _completed: bool) {
+    route_task_save(calendar_state, tasks_view, task.calendar_id.clone(), task);
 }
 
-/// Opens the task editor for a brand-new task, prefilled for the default
-/// calendar. A missing writable calendar is a toast, not a blocked open.
-fn show_new_task_editor(window: &adw::ApplicationWindow, calendar_state: &Rc<RefCell<CalendarUiState>>, toast_overlay: &adw::ToastOverlay) {
-    let calendars = pickable_calendars(calendar_state);
-    let Some(default_calendar) = default_pickable_calendar(calendar_state) else {
-        toast_overlay.add_toast(adw::Toast::new("Connect a calendar account to create tasks."));
-        return;
-    };
+/// Opens the task editor for a brand-new task. The picker lists every
+/// task-capable source; when none exists it falls back to a single "Local
+/// (this device)" entry, so New Task always has somewhere to go.
+fn show_new_task_editor(window: &adw::ApplicationWindow, calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>) {
+    let mut calendars = pickable_task_calendars(calendar_state);
+    if calendars.is_empty() {
+        calendars.push(("Local (this device)".to_string(), local_tasks_calendar_id()));
+    }
+    let default_calendar = default_pickable_task_calendar(calendar_state).unwrap_or_else(local_tasks_calendar_id);
     let calendar_state = calendar_state.clone();
+    let tasks_view = tasks_view.clone();
     crate::task_editor::show_task_editor(
         window,
         crate::task_editor::TaskEditorPrefill {
@@ -5781,16 +6087,42 @@ fn show_new_task_editor(window: &adw::ApplicationWindow, calendar_state: &Rc<Ref
             default_calendar,
             existing: None,
         },
-        move |calendar_id, task| route_task_save(&calendar_state, calendar_id, task),
-        move |_calendar_id, _href, _etag| {},
+        move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
+        move |_calendar_id, _uid, _href, _etag| {},
     );
 }
 
 /// Opens the editor for an existing task.
-fn open_task_editor_for(window: &adw::ApplicationWindow, calendar_state: &Rc<RefCell<CalendarUiState>>, task: &CalendarTask) {
-    let calendars = pickable_calendars(calendar_state);
+fn open_task_editor_for(window: &adw::ApplicationWindow, calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>, task: &CalendarTask) {
+    // The picker lists every task-capable source. The task's own store is
+    // appended unconditionally too: the save handler stamps the form's
+    // selected calendar onto the task, so an edit whose source fell out of
+    // the filtered list must still resolve back to it, not silently re-home
+    // the task into the first picker entry.
+    let mut calendars = pickable_task_calendars(calendar_state);
+    if !calendars.iter().any(|(_, id)| *id == task.calendar_id) {
+        if task.calendar_id == local_tasks_calendar_id() {
+            calendars.push(("Local (this device)".to_string(), task.calendar_id.clone()));
+        } else if let Some((handle, info)) = calendar_state
+            .borrow()
+            .accounts
+            .values()
+            .find_map(|h| h.calendars.iter().find(|c| c.id == task.calendar_id).map(|c| (h, c)))
+        {
+            calendars.push((format!("{} · {}", handle.display_name, info.display_name), task.calendar_id.clone()));
+        } else if let Some(list) = calendar_state.borrow().google_tasks.values().find_map(|h| {
+            h.task_lists
+                .iter()
+                .find(|l| google_tasks::google_task_calendar_id(&l.id) == task.calendar_id)
+                .map(|l| (h, l))
+        }) {
+            calendars.push((format!("{} · {}", list.0.email, list.1.title), task.calendar_id.clone()));
+        }
+    }
     let calendar_state = calendar_state.clone();
     let calendar_state_for_delete = calendar_state.clone();
+    let tasks_view = tasks_view.clone();
+    let tasks_view_for_delete = tasks_view.clone();
     crate::task_editor::show_task_editor(
         window,
         crate::task_editor::TaskEditorPrefill {
@@ -5798,15 +6130,51 @@ fn open_task_editor_for(window: &adw::ApplicationWindow, calendar_state: &Rc<Ref
             default_calendar: task.calendar_id.clone(),
             existing: Some(task),
         },
-        move |calendar_id, task| route_task_save(&calendar_state, calendar_id, task),
-        move |calendar_id, href, etag| route_task_delete(&calendar_state_for_delete, calendar_id, href, etag),
+        move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
+        move |calendar_id, uid, href, etag| route_task_delete(&calendar_state_for_delete, &tasks_view_for_delete, calendar_id, uid, href, etag),
     );
 }
 
-/// Routes a saved (created or edited) task to its account's session - the
-/// `route_calendar_save` counterpart: `href` present is an in-place
-/// `UpdateTask` (etag-guarded), absent is a fresh `CreateTask`.
-fn route_task_save(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, task: CalendarTask) {
+/// Routes a saved (created or edited) task to its store - one of: the local
+/// on-device store, the owning Google Tasks session, or the owning CalDAV
+/// account's session (the `route_calendar_save` counterpart).
+fn route_task_save(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>, calendar_id: CalendarId, task: CalendarTask) {
+    if calendar_id == local_tasks_calendar_id() {
+        let mut st = calendar_state.borrow_mut();
+        match st.local_tasks.iter_mut().find(|t| t.uid == task.uid) {
+            Some(existing) => *existing = task.clone(),
+            None => st.local_tasks.push(task.clone()),
+        }
+        if let Some(db) = &st.local_tasks_db {
+            let _ = db.borrow().save_local_task(&task);
+        }
+        drop(st);
+        refresh_tasks_view(calendar_state, tasks_view);
+        return;
+    }
+    if let Some(list_id) = google_tasks::google_task_list_id(&calendar_id) {
+        let (handle, is_new) = {
+            let st = calendar_state.borrow();
+            let Some(handle) = google_tasks_handle_for_calendar(&st, &calendar_id) else {
+                tracing::warn!("tried to save a task into an unknown Google task list {calendar_id}");
+                return;
+            };
+            (handle.cmd_tx.clone(), !handle.last_tasks.iter().any(|t| t.uid == task.uid))
+        };
+        let cmd = if is_new {
+            GoogleTasksCommand::CreateTask {
+                list_id: list_id.to_string(),
+                task: Box::new(task),
+            }
+        } else {
+            GoogleTasksCommand::UpdateTask {
+                list_id: list_id.to_string(),
+                task: Box::new(task),
+            }
+        };
+        let _ = handle.send_blocking(cmd);
+        return;
+    }
     let Some(handle) = task_handle_for_id(calendar_state, &calendar_id) else {
         tracing::warn!("tried to save a task into an unknown calendar {calendar_id}");
         return;
@@ -5818,8 +6186,39 @@ fn route_task_save(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: C
     }
 }
 
-/// Routes a task deletion to its account's session.
-fn route_task_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, href: Option<String>, etag: Option<String>) {
+/// Routes a task deletion to its store. `uid` is the store's own key for
+/// local/Google tasks; `href`/`etag` identify the CalDAV resource.
+fn route_task_delete(
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+    calendar_id: CalendarId,
+    uid: TaskUid,
+    href: Option<String>,
+    etag: Option<String>,
+) {
+    if calendar_id == local_tasks_calendar_id() {
+        let mut st = calendar_state.borrow_mut();
+        if let Some(db) = &st.local_tasks_db {
+            let _ = db.borrow().delete_local_task(&uid.0);
+        }
+        st.local_tasks.retain(|t| t.uid != uid);
+        drop(st);
+        refresh_tasks_view(calendar_state, tasks_view);
+        return;
+    }
+    if let Some(list_id) = google_tasks::google_task_list_id(&calendar_id) {
+        let st = calendar_state.borrow();
+        let Some(handle) = google_tasks_handle_for_calendar(&st, &calendar_id) else {
+            tracing::warn!("tried to delete a task from an unknown Google task list {calendar_id}");
+            return;
+        };
+        // A Google task's uid is its API task id.
+        let _ = handle.cmd_tx.send_blocking(GoogleTasksCommand::DeleteTask {
+            list_id: list_id.to_string(),
+            task_id: uid.0,
+        });
+        return;
+    }
     let Some(handle) = task_handle_for_id(calendar_state, &calendar_id) else {
         tracing::warn!("tried to delete a task from an unknown calendar {calendar_id}");
         return;
@@ -7477,6 +7876,80 @@ fn card_section(content: &impl IsA<gtk::Widget>) -> gtk::Box {
         .build();
     card.append(content);
     card
+}
+
+/// Config → Google Tasks → "OAuth client id": a small modal dialog with an
+/// entry prefilled from the current configuration. Saving writes the config
+/// file (an environment variable still takes precedence at runtime, but the
+/// file is what a GUI app can actually manage); clearing removes the file.
+fn show_google_tasks_client_id_dialog(window: &adw::ApplicationWindow, toast_overlay: &adw::ToastOverlay, row: &adw::ActionRow) {
+    let dialog = adw::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Google Tasks OAuth client id")
+        .default_width(600)
+        .build();
+
+    let help = gtk::Label::builder()
+        .label(
+            "Register a Desktop OAuth client in Google Cloud (console.cloud.google.com → APIs & Services → Credentials) \
+             and paste its client id here. The sign-in step needs the client's redirect to http://localhost.",
+        )
+        .css_classes(["dim-label", "caption"])
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    let entry = gtk::Entry::builder().placeholder_text("e.g. 1234567890-abc.apps.googleusercontent.com").build();
+    entry.set_text(&google_tasks::configured_client_id());
+
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let save_button = gtk::Button::with_label("Save");
+    save_button.add_css_class("suggested-action");
+    let top_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
+    top_bar.append(&cancel_button);
+    top_bar.append(&save_button);
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    content.append(&help);
+    content.append(&entry);
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&top_bar);
+    toolbar_view.set_content(Some(&content));
+    dialog.set_content(Some(&toolbar_view));
+
+    {
+        let dialog = dialog.clone();
+        cancel_button.connect_clicked(move |_| dialog.close());
+    }
+    {
+        let dialog = dialog.clone();
+        let row = row.clone();
+        let toast_overlay = toast_overlay.clone();
+        save_button.connect_clicked(move |_| {
+            let id = entry.text().trim().to_string();
+            if id.is_empty() {
+                let _ = std::fs::remove_file(google_tasks::client_id_file_path());
+                toast_overlay.add_toast(adw::Toast::new("Google Tasks client id cleared"));
+            } else if let Err(e) = google_tasks::set_client_id(&id) {
+                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't save client id: {e}")));
+                return;
+            } else {
+                toast_overlay.add_toast(adw::Toast::new("Google Tasks client id saved"));
+            }
+            crate::config_view::refresh_google_tasks_client_row(&row);
+            dialog.close();
+        });
+    }
+
+    dialog.present();
 }
 
 /// Maps a mailbox's special-use role to a folder-row icon name, mirroring the

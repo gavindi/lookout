@@ -77,6 +77,15 @@ pub struct CalendarInfo {
     /// The calendar collection's href, needed to build later REPORT requests
     /// against this specific calendar.
     pub href: String,
+    /// Whether the server's `supported-calendar-component-set` (RFC 4791
+    /// §5.2.3) lists `VTODO`, i.e. whether tasks can be stored here. Some
+    /// servers (Google Calendar) only support `VEVENT` and reject `VTODO`
+    /// PUTs with HTTP 403. `true` when the server advertises `VTODO`, or when
+    /// it omits the property entirely (a non-compliant server is assumed to
+    /// take tasks rather than refused - the sync then fails loudly per
+    /// collection instead of silently hiding the calendar's tasks).
+    #[serde(default)]
+    pub supports_tasks: bool,
 }
 
 /// One VEVENT as it exists on the server: for a recurring event this is the

@@ -421,6 +421,10 @@ async fn sync_tasks(client: &DavClient, calendars: &[CalendarInfo], credential: 
 
     let mut tasks = Vec::new();
     for calendar in calendars {
+        if !calendar.supports_tasks {
+            tracing::debug!("skipping task sync for calendar {:?}: server advertises no VTODO support", calendar.display_name);
+            continue;
+        }
         match client.fetch_tasks(calendar, credential).await {
             Ok(calendar_tasks) => tasks.extend(calendar_tasks),
             Err(e) => {
@@ -454,6 +458,18 @@ async fn write_task(
         let _ = events.send(CalendarSessionEvent::Error(format!("calendar for task \"{}\" not found", task.uid))).await;
         return;
     };
+    if !calendar.supports_tasks {
+        // A server that advertises no VTODO support (e.g. Google's CalDAV,
+        // which answers a task PUT with a bare 403) can never store this
+        // task - surface a clear message instead of the raw server error.
+        let _ = events
+            .send(CalendarSessionEvent::Error(format!(
+                "task \"{}\" was not saved - calendar \"{}\" does not support tasks",
+                task.uid, calendar.display_name
+            )))
+            .await;
+        return;
+    }
 
     let ics = crate::ical::build_vtodo_calendar(task);
     let href = match &task.href {

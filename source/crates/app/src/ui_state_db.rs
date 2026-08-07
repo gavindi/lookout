@@ -1,6 +1,6 @@
 //! SQLite persistence for app-level UI state that isn't mail or calendar
-//! data: today, the People screen's starred contacts and the calendar's
-//! event-reminder state.
+//! data: today, the People screen's starred contacts, the calendar's
+//! event-reminder state, and local-only tasks.
 //!
 //! Starred contacts are `(account, contact-identity)` pairs the user marked
 //! as favourites. They're stored in their own database
@@ -17,6 +17,12 @@
 //! reminder fires - and it must survive both the "Clear all caches" action
 //! and a `user_version` bump, so it is keyed by the event's own identity
 //! (`calendar_id`, `uid`, `start_utc`) and re-created fresh on every open.
+//!
+//! Local-only tasks are the same "UI concern, must survive cache wipes" case:
+//! when no connected calendar supports tasks, the task editor falls back to a
+//! `CalendarId("local")` store that lives only on this device. They're the
+//! full serialized `CalendarTask` JSON, keyed by their (client-generated,
+//! UUID) uid.
 //!
 //! Best-effort like the rest of the config modules: an unreadable or
 //! unwritable database just means favourites don't persist and reminders can
@@ -92,6 +98,10 @@ impl UiStateDb {
                 state TEXT NOT NULL,
                 snooze_until_utc TEXT,
                 PRIMARY KEY (calendar_id, uid, start_utc)
+            );
+            CREATE TABLE IF NOT EXISTS local_tasks (
+                uid TEXT PRIMARY KEY,
+                data TEXT NOT NULL
             );
             ",
         )?;
@@ -173,6 +183,37 @@ impl UiStateDb {
             "DELETE FROM reminder_state WHERE calendar_id = ?1 AND uid = ?2 AND start_utc = ?3",
             rusqlite::params![calendar_id, uid, start_utc],
         )?;
+        Ok(())
+    }
+
+    /// Every locally-stored task (the `CalendarId("local")` fallback store),
+    /// ordered by uid. Unparseable rows (a schema/format change mid-flight)
+    /// are skipped with a warning rather than failing the whole load.
+    pub fn load_local_tasks(&self) -> rusqlite::Result<Vec<lookout_core::CalendarTask>> {
+        let mut stmt = self.conn.prepare("SELECT data FROM local_tasks ORDER BY uid")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let data: String = row?;
+            match serde_json::from_str(&data) {
+                Ok(task) => out.push(task),
+                Err(e) => tracing::warn!("skipping unparseable local task row: {e}"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stores (replacing any same-uid row) one local task.
+    pub fn save_local_task(&self, task: &lookout_core::CalendarTask) -> rusqlite::Result<()> {
+        let data = serde_json::to_string(task).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.conn
+            .execute("INSERT OR REPLACE INTO local_tasks (uid, data) VALUES (?1, ?2)", rusqlite::params![task.uid.0, data])?;
+        Ok(())
+    }
+
+    /// Removes one local task by its uid. A missing row is not an error.
+    pub fn delete_local_task(&self, uid: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM local_tasks WHERE uid = ?1", [uid])?;
         Ok(())
     }
 }
@@ -313,6 +354,61 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].uid, "event-1");
         assert_eq!(loaded[0].state, "fired");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_tasks_round_trip_reopen_and_wipe_survival() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
+        let dir = dir.join("local-tasks");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_local_tasks().unwrap().is_empty());
+
+        let task = |uid: &str, summary: &str| lookout_core::CalendarTask {
+            uid: lookout_core::TaskUid(uid.to_string()),
+            calendar_id: lookout_core::CalendarId("local".to_string()),
+            summary: Some(summary.to_string()),
+            description: None,
+            due: None,
+            start: None,
+            completed: None,
+            status: lookout_core::TaskStatus::default(),
+            priority: lookout_core::TaskPriority::default(),
+            percent_complete: None,
+            categories: Vec::new(),
+            href: None,
+            etag: None,
+        };
+        db.save_local_task(&task("t-1", "First")).unwrap();
+        db.save_local_task(&task("t-2", "Second")).unwrap();
+        // Same uid replaces rather than duplicates.
+        db.save_local_task(&task("t-1", "First edited")).unwrap();
+
+        let loaded = db.load_local_tasks().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|t| t.summary.as_deref() == Some("First edited")));
+
+        // Deletion removes only that row; a missing row is not an error.
+        db.delete_local_task("t-1").unwrap();
+        db.delete_local_task("t-1").unwrap();
+        let loaded = db.load_local_tasks().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].summary.as_deref(), Some("Second"));
+
+        // Local tasks live in the UI-state database, so a version wipe (the
+        // "Clear all caches"-adjacent convention) must NOT touch them.
+        let reopened = UiStateDb::open().unwrap();
+        reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
+        drop(reopened);
+        let upgraded = UiStateDb::open().unwrap();
+        let loaded = upgraded.load_local_tasks().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].summary.as_deref(), Some("Second"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

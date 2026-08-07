@@ -22,8 +22,10 @@ pub struct TaskEditorPrefill<'a> {
     pub existing: Option<&'a CalendarTask>,
 }
 
-/// The delete callback's target: the calendar plus the resource to remove.
-type DeleteCallback = Rc<dyn Fn(CalendarId, Option<String>, Option<String>)>;
+/// The delete callback's target: the calendar plus the task's identity and
+/// resource (uid, href, etag) - the local store keys by uid, the CalDAV
+/// session by href.
+type DeleteCallback = Rc<dyn Fn(CalendarId, TaskUid, Option<String>, Option<String>)>;
 
 /// Opens the task editor as a modal dialog. `on_save` fires with the chosen
 /// calendar and the finished task (new or edited); `on_delete` fires with
@@ -34,7 +36,7 @@ pub fn show_task_editor(
     window: &adw::ApplicationWindow,
     prefill: TaskEditorPrefill,
     on_save: impl Fn(CalendarId, CalendarTask) + 'static,
-    on_delete: impl Fn(CalendarId, Option<String>, Option<String>) + 'static,
+    on_delete: impl Fn(CalendarId, TaskUid, Option<String>, Option<String>) + 'static,
 ) {
     let on_save: Rc<dyn Fn(CalendarId, CalendarTask)> = Rc::new(on_save);
     let on_delete: DeleteCallback = Rc::new(on_delete);
@@ -343,8 +345,8 @@ pub fn show_task_editor(
                 error_label.set_visible(true);
                 return;
             };
-            if let Some((_uid, href, etag)) = &existing_meta {
-                on_delete(calendar_id, href.clone(), etag.clone());
+            if let Some((uid, href, etag)) = &existing_meta {
+                on_delete(calendar_id, uid.clone(), href.clone(), etag.clone());
                 dialog.close();
             }
         });

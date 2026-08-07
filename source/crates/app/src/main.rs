@@ -12,6 +12,7 @@ mod event_editor;
 mod folder_tree;
 mod goa_calendar_credentials;
 mod goa_credentials;
+mod google_tasks;
 mod identities;
 mod last_view;
 mod message_header;

@@ -28,6 +28,11 @@ pub struct DavResponse {
     /// inside each `<propstat>` instead.
     pub status: Option<String>,
     props: HashMap<(Vec<u8>, String), String>,
+    /// The `name` attribute values of `<comp>` children of each prop element,
+    /// keyed like `props` - a `supported-calendar-component-set`'s
+    /// `VEVENT`/`VTODO`/... list. Empty for every prop without `<comp>`
+    /// children (resourcetype and the rest are unaffected).
+    comp_sets: HashMap<(Vec<u8>, String), Vec<String>>,
 }
 
 impl DavResponse {
@@ -41,6 +46,22 @@ impl DavResponse {
     pub fn prop(&self, ns: &[u8], local_name: &str) -> Option<&str> {
         self.props.get(&(ns.to_vec(), local_name.to_string())).map(|s| s.as_str())
     }
+
+    /// The `name` attribute values of a prop's `<comp>` children (e.g. a
+    /// `supported-calendar-component-set`'s component list). Empty when the
+    /// prop is absent or has no `<comp>` children - callers that need to
+    /// distinguish "server didn't advertise" from "advertised, empty" must
+    /// treat absence via [`Self::prop`].
+    pub fn prop_comps(&self, ns: &[u8], local_name: &str) -> &[String] {
+        self.comp_sets.get(&(ns.to_vec(), local_name.to_string())).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Whether the prop declared `<comp name="…"/>` among its children -
+    /// e.g. a calendar's `supported-calendar-component-set` containing
+    /// `VTODO`.
+    pub fn supports_component(&self, ns: &[u8], local_name: &str, comp: &str) -> bool {
+        self.prop_comps(ns, local_name).iter().any(|c| c == comp)
+    }
 }
 
 fn ns_bytes(ns: &ResolveResult) -> Vec<u8> {
@@ -48,6 +69,20 @@ fn ns_bytes(ns: &ResolveResult) -> Vec<u8> {
         ResolveResult::Bound(Namespace(b)) => b.to_vec(),
         _ => Vec::new(),
     }
+}
+
+/// The element's attributes as `(local name, value)` pairs - only the local
+/// name matters here (`comp`'s `name` attribute is unqualified in RFC 4791).
+fn start_attrs(e: &quick_xml::events::BytesStart) -> Vec<(String, String)> {
+    e.attributes()
+        .filter_map(|a| a.ok())
+        .map(|a| {
+            (
+                String::from_utf8_lossy(a.key.local_name().as_ref()).to_string(),
+                String::from_utf8_lossy(&a.value).to_string(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -75,10 +110,13 @@ struct ParseState {
     prop_key: Option<(Vec<u8>, String)>,
     prop_text: String,
     prop_child_names: Vec<String>,
+    /// `name` attribute values of `<comp>` child elements of the current
+    /// prop - the `supported-calendar-component-set`'s component list.
+    prop_comp_attrs: Vec<String>,
 }
 
 impl ParseState {
-    fn on_open(&mut self, depth: u32, ns: &ResolveResult, local: &str) {
+    fn on_open(&mut self, depth: u32, ns: &ResolveResult, local: &str, attrs: &[(String, String)]) {
         if local == "response" {
             self.response_depth = Some(depth);
             self.current = Some(DavResponse::default());
@@ -112,8 +150,14 @@ impl ParseState {
                 self.prop_key = Some((ns_bytes(ns), local.to_string()));
                 self.prop_text.clear();
                 self.prop_child_names.clear();
+                self.prop_comp_attrs.clear();
             } else if depth > pd + 1 {
                 self.prop_child_names.push(local.to_string());
+                if local == "comp" {
+                    if let Some((_, value)) = attrs.iter().find(|(key, _)| key == "name") {
+                        self.prop_comp_attrs.push(value.clone());
+                    }
+                }
             }
         }
     }
@@ -178,7 +222,10 @@ impl ParseState {
                     } else {
                         self.prop_text.trim().to_string()
                     };
-                    resp.props.insert(key, value);
+                    resp.props.insert(key.clone(), value);
+                    if !self.prop_comp_attrs.is_empty() {
+                        resp.comp_sets.insert(key, std::mem::take(&mut self.prop_comp_attrs));
+                    }
                 }
             } else if depth == pd {
                 self.prop_depth = None;
@@ -214,12 +261,12 @@ pub fn parse_multistatus(xml: &str) -> Result<Vec<DavResponse>> {
             Event::Start(e) => {
                 depth += 1;
                 let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                state.on_open(depth, &ns, &local);
+                state.on_open(depth, &ns, &local, &start_attrs(&e));
             }
             Event::Empty(e) => {
                 depth += 1;
                 let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                state.on_open(depth, &ns, &local);
+                state.on_open(depth, &ns, &local, &start_attrs(&e));
                 state.on_close(depth);
                 depth -= 1;
             }
@@ -274,12 +321,12 @@ pub fn parse_multistatus_with_token(xml: &str) -> Result<(Vec<DavResponse>, Opti
             Event::Start(e) => {
                 depth += 1;
                 let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                state.on_open(depth, &ns, &local);
+                state.on_open(depth, &ns, &local, &start_attrs(&e));
             }
             Event::Empty(e) => {
                 depth += 1;
                 let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                state.on_open(depth, &ns, &local);
+                state.on_open(depth, &ns, &local, &start_attrs(&e));
                 state.on_close(depth);
                 depth -= 1;
             }
@@ -542,6 +589,56 @@ mod tests {
         let ical = responses[0].prop(CALDAV, "calendar-data").unwrap();
         assert!(ical.contains("UID:evt-1@example.com"));
         assert!(ical.contains("SUMMARY:Team sync"));
+    }
+
+    #[test]
+    fn parses_supported_calendar_component_set_comp_names() {
+        // A Nextcloud-style calendar: VEVENT + VTODO.
+        let both = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+            <D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
+              <D:response>\n\
+                <D:href>/cal/</D:href>\n\
+                <D:propstat>\n\
+                  <D:prop>\n\
+                    <C:supported-calendar-component-set>\n\
+                      <C:comp name=\"VEVENT\"/>\n\
+                      <C:comp name=\"VTODO\"/>\n\
+                    </C:supported-calendar-component-set>\n\
+                  </D:prop>\n\
+                  <D:status>HTTP/1.1 200 OK</D:status>\n\
+                </D:propstat>\n\
+              </D:response>\n\
+            </D:multistatus>";
+        let responses = parse_multistatus(both).unwrap();
+        assert_eq!(
+            responses[0].prop_comps(CALDAV, "supported-calendar-component-set"),
+            ["VEVENT".to_string(), "VTODO".to_string()]
+        );
+        assert!(responses[0].supports_component(CALDAV, "supported-calendar-component-set", "VTODO"));
+        assert!(responses[0].supports_component(CALDAV, "supported-calendar-component-set", "VEVENT"));
+
+        // A Google-style calendar: VEVENT only.
+        let events_only = both.replace("<C:comp name=\"VTODO\"/>\n", "");
+        let responses = parse_multistatus(&events_only).unwrap();
+        assert!(responses[0].supports_component(CALDAV, "supported-calendar-component-set", "VEVENT"));
+        assert!(!responses[0].supports_component(CALDAV, "supported-calendar-component-set", "VTODO"));
+
+        // A non-compliant server that omits the property entirely.
+        let absent = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+            <D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
+              <D:response>\n\
+                <D:href>/cal/</D:href>\n\
+                <D:propstat>\n\
+                  <D:prop>\n\
+                    <D:displayname>Personal</D:displayname>\n\
+                  </D:prop>\n\
+                  <D:status>HTTP/1.1 200 OK</D:status>\n\
+                </D:propstat>\n\
+              </D:response>\n\
+            </D:multistatus>";
+        let responses = parse_multistatus(absent).unwrap();
+        assert!(responses[0].prop_comps(CALDAV, "supported-calendar-component-set").is_empty());
+        assert!(!responses[0].supports_component(CALDAV, "supported-calendar-component-set", "VTODO"));
     }
 
     // Real servers pretty-print their multistatus XML - Google in particular

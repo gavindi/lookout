@@ -335,19 +335,40 @@ impl DavClient {
 
     /// PROPFIND (Depth: 1) the calendar-home-set collection, keeping only
     /// child resources whose `resourcetype` includes a `calendar` marker.
+    /// `CalendarInfo::supports_tasks` comes from the collection's
+    /// `supported-calendar-component-set` (RFC 4791 §5.2.3) - a server that
+    /// doesn't advertise `VTODO` (Google's CalDAV is `VEVENT`-only) can't
+    /// store tasks, so the task picker and sync skip it rather than PUTing
+    /// into a 403.
     pub async fn list_calendars(&self, home_set_href: &str, account_id: &AccountId, credential: &Credential) -> Result<Vec<CalendarInfo>> {
         let home_url = self.resolve(home_set_href)?;
-        let responses = self.propfind(home_url, 1, credential, &["D:displayname", "D:resourcetype", "IC:calendar-color"]).await?;
+        let responses = self
+            .propfind(
+                home_url,
+                1,
+                credential,
+                &["D:displayname", "D:resourcetype", "IC:calendar-color", "C:supported-calendar-component-set"],
+            )
+            .await?;
 
         Ok(responses
             .into_iter()
             .filter(|r| r.prop(NS_DAV, "resourcetype").unwrap_or("").contains("calendar"))
-            .map(|r| CalendarInfo {
-                id: CalendarId::new(account_id, &r.href),
-                account_id: account_id.clone(),
-                display_name: r.prop(NS_DAV, "displayname").unwrap_or("").to_string(),
-                color: r.prop(NS_APPLE_ICAL, "calendar-color").map(str::to_string),
-                href: r.href.clone(),
+            .map(|r| {
+                // Absent property (a non-compliant server) means "don't know" -
+                // assume tasks are accepted rather than hiding a calendar that
+                // could hold them; an explicit component list without VTODO
+                // (Google) is a definitive no.
+                let advertised = r.prop(NS_CALDAV, "supported-calendar-component-set");
+                let supports_tasks = advertised.is_none() || r.supports_component(NS_CALDAV, "supported-calendar-component-set", "VTODO");
+                CalendarInfo {
+                    id: CalendarId::new(account_id, &r.href),
+                    account_id: account_id.clone(),
+                    display_name: r.prop(NS_DAV, "displayname").unwrap_or("").to_string(),
+                    color: r.prop(NS_APPLE_ICAL, "calendar-color").map(str::to_string),
+                    href: r.href.clone(),
+                    supports_tasks,
+                }
             })
             .collect())
     }
@@ -723,6 +744,39 @@ mod tests {
           <D:collection/>
           <C:calendar/>
         </D:resourcetype>
+        <C:supported-calendar-component-set>
+          <C:comp name="VEVENT"/>
+          <C:comp name="VTODO"/>
+        </C:supported-calendar-component-set>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/calendars/alice/home/holidays/</D:href>
+    <D:propstat>
+      <D:status>HTTP/1.1 200 OK</D:status>
+      <D:prop>
+        <D:displayname>Holidays (read-only)</D:displayname>
+        <D:resourcetype>
+          <D:collection/>
+          <C:calendar/>
+        </D:resourcetype>
+        <C:supported-calendar-component-set>
+          <C:comp name="VEVENT"/>
+        </C:supported-calendar-component-set>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/calendars/alice/home/no-advert/</D:href>
+    <D:propstat>
+      <D:status>HTTP/1.1 200 OK</D:status>
+      <D:prop>
+        <D:displayname>No advert</D:displayname>
+        <D:resourcetype>
+          <D:collection/>
+          <C:calendar/>
+        </D:resourcetype>
       </D:prop>
     </D:propstat>
   </D:response>
@@ -750,9 +804,17 @@ mod tests {
 
         let account_id = AccountId("test-account".to_string());
         let calendars = client.list_calendars(&home_href, &account_id, &credential).await.unwrap();
-        assert_eq!(calendars.len(), 1, "the home collection itself must not be mistaken for a calendar");
+        assert_eq!(calendars.len(), 3, "the home collection itself must not be mistaken for a calendar");
         assert_eq!(calendars[0].display_name, "Personal");
         assert_eq!(calendars[0].href, "/calendars/alice/home/personal/");
+        assert!(calendars[0].supports_tasks, "a VEVENT+VTODO component set advertises task support");
+        assert!(!calendars[1].supports_tasks, "a VEVENT-only component set (Google-style) must not offer tasks");
+        assert!(calendars[2].supports_tasks, "a missing component set is assumed to support tasks, not refused");
+
+        // The task fetch only runs against task-capable calendars.
+        let personal = calendars.iter().find(|c| c.href.ends_with("/personal/")).unwrap();
+        let tasks = client.fetch_tasks(personal, &credential).await.unwrap();
+        assert!(tasks.is_empty(), "the personal fixture has no VTODO resources");
 
         let start = "2026-07-01T00:00:00Z".parse().unwrap();
         let end = "2026-08-01T00:00:00Z".parse().unwrap();

@@ -109,6 +109,10 @@ pub struct TasksView {
     list: gtk::Box,
     toggle: RefCell<Option<ToggleHandler>>,
     activate: RefCell<Option<ActivateHandler>>,
+    /// The message shown when the list is empty - the caller sets it to
+    /// reflect what task sources exist (see `window::refresh_tasks_view`),
+    /// defaulting to a plain "no tasks yet" hint.
+    empty_message: RefCell<String>,
 }
 
 /// One task row's checkbox flip: the caller should send the task (with
@@ -135,7 +139,22 @@ pub fn build_tasks_view() -> TasksView {
         list,
         toggle: RefCell::new(None),
         activate: RefCell::new(None),
+        empty_message: RefCell::new("No tasks yet - use New task to create one.".to_string()),
     }
+}
+
+/// Stores the row-action callbacks. Called once at startup; every later
+/// `set_tasks` repaint reuses them.
+pub fn set_handlers(view: &TasksView, toggle: ToggleHandler, activate: ActivateHandler) {
+    *view.toggle.borrow_mut() = Some(toggle);
+    *view.activate.borrow_mut() = Some(activate);
+}
+
+/// Sets the message the empty state shows when there are no tasks at all -
+/// lets the caller distinguish "you have no tasks" from "you have nowhere to
+/// put tasks". Has no effect while tasks exist.
+pub fn set_empty_message(view: &TasksView, message: &str) {
+    *view.empty_message.borrow_mut() = message.to_string();
 }
 
 /// The tasks list's handful of display-level CSS rules, installed once per
@@ -160,13 +179,6 @@ fn install_tasks_css() {
     });
 }
 
-/// Stores the row-action callbacks. Called once at startup; every later
-/// `set_tasks` repaint reuses them.
-pub fn set_handlers(view: &TasksView, toggle: ToggleHandler, activate: ActivateHandler) {
-    *view.toggle.borrow_mut() = Some(toggle);
-    *view.activate.borrow_mut() = Some(activate);
-}
-
 /// Repaints the whole list from `tasks`, grouped by due-date bucket, with a
 /// colour dot per calendar. Rebuilds rows from scratch on every call - the
 /// same repaint-from-scratch convention as the calendar checklist.
@@ -179,10 +191,12 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
     }
 
     if tasks.is_empty() {
+        let message = view.empty_message.borrow().clone();
         let placeholder = gtk::Label::builder()
-            .label("No tasks yet - use New task to create one.")
+            .label(&message)
             .css_classes(["dim-label", "caption"])
             .xalign(0.0)
+            .wrap(true)
             .margin_top(16)
             .build();
         view.list.append(&placeholder);

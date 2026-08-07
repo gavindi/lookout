@@ -91,6 +91,10 @@ pub struct ConfigView {
     /// wire its `active` state into the `Gio::Notification` reminder
     /// scheduling.
     pub calendar_alerts_row: adw::SwitchRow,
+    /// "OAuth client id" row (Config → Google Tasks), exposed so the caller
+    /// can wire its `activated` signal to the client-id dialog (and update
+    /// the subtitle after a save).
+    pub google_tasks_client_row: adw::ActionRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     webcal_group: adw::PreferencesGroup,
@@ -115,7 +119,6 @@ pub struct ConfigView {
 /// (the remote-images/rich-text toggles and the event-alerts toggle) the
 /// loop's `Mail` and `Calendar` entries hand off to.
 const PLACEHOLDER_SECTIONS: [&str; 6] = ["General", "Layout", "Mail", "Calendar", "Privacy", "Apps"];
-
 pub fn build() -> ConfigView {
     let page = adw::PreferencesPage::new();
     page.set_vexpand(true);
@@ -188,6 +191,17 @@ pub fn build() -> ConfigView {
         .build();
     calendar_settings_group.add(&calendar_alerts_row);
 
+    // The real "Google Tasks" group (in the "Apps" section's place): the
+    // OAuth client id the Tasks integration needs - Google has no public
+    // client id, so the user's own registered id is configured here.
+    let google_tasks_group = adw::PreferencesGroup::builder().title("Google Tasks").build();
+    let google_tasks_client_row = adw::ActionRow::builder()
+        .title("OAuth client id")
+        .subtitle("Needed to connect Google Tasks - register a Desktop OAuth client in Google Cloud")
+        .activatable(true)
+        .build();
+    google_tasks_group.add(&google_tasks_client_row);
+
     for section in PLACEHOLDER_SECTIONS {
         // "Mail" is a live group (see `mail_settings_group` above), not a
         // placeholder - add it in this section's place so the taxonomy order
@@ -200,6 +214,11 @@ pub fn build() -> ConfigView {
         // above), not a placeholder.
         if section == "Calendar" {
             page.add(&calendar_settings_group);
+            continue;
+        }
+        // "Apps" is a live group too - it holds the Google Tasks client id.
+        if section == "Apps" {
+            page.add(&google_tasks_group);
             continue;
         }
         let group = adw::PreferencesGroup::builder().title(section).build();
@@ -238,6 +257,7 @@ pub fn build() -> ConfigView {
         remote_images_row,
         rich_text_row,
         calendar_alerts_row,
+        google_tasks_client_row,
         mail_group,
         calendar_group,
         webcal_group,
@@ -398,4 +418,17 @@ pub fn format_size(bytes: u64) -> String {
         b if b < 1024 * 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
         b => format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0)),
     }
+}
+
+/// Refreshes the Config → Google Tasks client-id row's subtitle to reflect
+/// the currently-configured id (or its absence). Called at build time and
+/// after a save.
+pub fn refresh_google_tasks_client_row(row: &adw::ActionRow) {
+    let id = crate::google_tasks::configured_client_id();
+    let subtitle = if id.is_empty() {
+        "Not configured - needed to connect Google Tasks; register a Desktop OAuth client in Google Cloud".to_string()
+    } else {
+        format!("Configured: {id}")
+    };
+    row.set_subtitle(&subtitle);
 }
