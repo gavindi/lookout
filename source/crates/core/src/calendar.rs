@@ -1,6 +1,53 @@
 use chrono::{DateTime, Utc};
 
+use crate::email::EmailAddress;
 use crate::ids::{AccountId, CalendarId, EventUid};
+
+/// One invitee on an event. Structured (not a raw `ATTENDEE` string) since
+/// the editor needs each address individually to render/edit attendee chips,
+/// unlike `rrule`, which stays an opaque round-tripped string because it's
+/// edited through a dedicated series builder instead of field-by-field.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Attendee {
+    pub address: EmailAddress,
+    #[serde(default)]
+    pub role: AttendeeRole,
+    #[serde(default)]
+    pub status: AttendeeStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum AttendeeRole {
+    #[default]
+    Required,
+    Optional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum AttendeeStatus {
+    #[default]
+    NeedsAction,
+    Accepted,
+    Declined,
+    Tentative,
+}
+
+/// RFC 5545 `CLASS`: who else can see this event's details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum EventSensitivity {
+    #[default]
+    Public,
+    Private,
+    Confidential,
+}
+
+/// RFC 5545 `TRANSP`: whether this event blocks other bookings at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum EventTransparency {
+    #[default]
+    Busy,
+    Free,
+}
 
 /// A CalDAV calendar collection discovered under an account's calendar-home-set.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -45,6 +92,30 @@ pub struct CalendarEvent {
     /// (HTTP 412) instead of silently clobbering a concurrent change.
     #[serde(default)]
     pub etag: Option<String>,
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
+    /// The event's organizer, emitted as `ORGANIZER` only when `attendees`
+    /// is non-empty (RFC 5545 requires an organizer whenever there are
+    /// attendees). `None` when the owning account's own address couldn't be
+    /// determined - a documented non-conformance rather than a blocker.
+    #[serde(default)]
+    pub organizer: Option<EmailAddress>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub sensitivity: EventSensitivity,
+    #[serde(default)]
+    pub transparency: EventTransparency,
+    /// Minutes before `start` a `VALARM` (DISPLAY) should fire. `None` means
+    /// no reminder. Only a single alarm is modeled - multiple/repeating
+    /// `VALARM`s are out of scope for this pass.
+    #[serde(default)]
+    pub reminder_minutes_before: Option<i64>,
+    /// A join-this-meeting URL (RFC 7986 `CONFERENCE`, falling back to a bare
+    /// `URL` on read for interop) - the generic stand-in for
+    /// provider-specific "Teams meeting" integration this app doesn't have.
+    #[serde(default)]
+    pub conference_url: Option<String>,
 }
 
 /// One instance to actually render on a calendar view - either a
@@ -90,4 +161,18 @@ pub struct EventOccurrence {
     pub href: Option<String>,
     #[serde(default)]
     pub etag: Option<String>,
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
+    #[serde(default)]
+    pub organizer: Option<EmailAddress>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub sensitivity: EventSensitivity,
+    #[serde(default)]
+    pub transparency: EventTransparency,
+    #[serde(default)]
+    pub reminder_minutes_before: Option<i64>,
+    #[serde(default)]
+    pub conference_url: Option<String>,
 }

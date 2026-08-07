@@ -47,6 +47,13 @@ pub fn expand_occurrences(event: &CalendarEvent, window_start: DateTime<Utc>, wi
                         master_end: Some(event.end),
                         href: event.href.clone(),
                         etag: event.etag.clone(),
+                        attendees: event.attendees.clone(),
+                        organizer: event.organizer.clone(),
+                        categories: event.categories.clone(),
+                        sensitivity: event.sensitivity,
+                        transparency: event.transparency,
+                        reminder_minutes_before: event.reminder_minutes_before,
+                        conference_url: event.conference_url.clone(),
                     }
                 })
                 .collect()
@@ -81,6 +88,13 @@ fn single_occurrence_if_overlapping(event: &CalendarEvent, window_start: DateTim
             master_end: Some(event.end),
             href: event.href.clone(),
             etag: event.etag.clone(),
+            attendees: event.attendees.clone(),
+            organizer: event.organizer.clone(),
+            categories: event.categories.clone(),
+            sensitivity: event.sensitivity,
+            transparency: event.transparency,
+            reminder_minutes_before: event.reminder_minutes_before,
+            conference_url: event.conference_url.clone(),
         }]
     } else {
         Vec::new()
@@ -105,6 +119,13 @@ mod tests {
             rrule: rrule.map(str::to_string),
             href: None,
             etag: None,
+            attendees: Vec::new(),
+            organizer: None,
+            categories: Vec::new(),
+            sensitivity: lookout_core::EventSensitivity::default(),
+            transparency: lookout_core::EventTransparency::default(),
+            reminder_minutes_before: None,
+            conference_url: None,
         }
     }
 

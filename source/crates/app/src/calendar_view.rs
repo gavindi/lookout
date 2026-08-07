@@ -399,6 +399,10 @@ pub struct TimeGrid {
     /// The fixed all-day band (never scrolls away) - see the struct doc.
     band: gtk::DrawingArea,
     canvas: gtk::DrawingArea,
+    /// The `canvas`'s scroller, retained so callers outside this module (the
+    /// event editor's reused Day-view preview) can scroll it to an arbitrary
+    /// time via [`scroll_time_grid_to_minutes`], not just "now".
+    scroller: gtk::ScrolledWindow,
     /// Weekday/date header labels above the day columns (Week/Work week only;
     /// the Day view's date lives in [`CalendarMain`]'s shared header).
     headers: Vec<gtk::Label>,
@@ -422,7 +426,7 @@ struct TimeGridData {
     chips: Rc<RefCell<Vec<TimeChip>>>,
 }
 
-fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
+pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
     // Two stacked DrawingAreas: the all-day band (fixed, above the scroller)
     // and the 24-hour timeline (scrollable). Both share one `TimeGridData` so
     // they stay in sync, and their column separators align because both are
@@ -491,6 +495,7 @@ fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
         root: root_box.upcast(),
         band,
         canvas,
+        scroller,
         headers,
         anchor: Rc::new(RefCell::new(chrono::Utc::now().date_naive())),
         weekdays: weekdays.to_vec(),
@@ -628,12 +633,25 @@ pub fn set_time_grid(t: &TimeGrid, anchor: NaiveDate, occurrences: &[EventOccurr
 /// time-grid view jumps to "now" every time it becomes visible (stack pages
 /// are created once but only the active one is mapped).
 fn scroll_time_grid_to_now(scroller: &gtk::ScrolledWindow) {
+    let now = chrono::Local::now();
+    scroll_scroller_to_minutes(scroller, now.hour() as i64 * 60 + now.minute() as i64);
+}
+
+/// Scrolls `t`'s timeline so `minutes` (minutes since local midnight) sits
+/// ~100px from the top - the same placement [`scroll_time_grid_to_now`] uses
+/// for "now". Lets a caller outside this module (the event editor's reused
+/// Day-view preview) follow an arbitrary picked time rather than only ever
+/// jumping to the current moment.
+pub(crate) fn scroll_time_grid_to_minutes(t: &TimeGrid, minutes: i64) {
+    scroll_scroller_to_minutes(&t.scroller, minutes);
+}
+
+fn scroll_scroller_to_minutes(scroller: &gtk::ScrolledWindow, minutes: i64) {
     let scroller = scroller.clone();
     gtk::glib::idle_add_local_once(move || {
-        let now = chrono::Local::now();
-        let minutes = now.hour() as i64 * 60 + now.minute() as i64;
         // The all-day band is fixed above the scroller, so only the hour
-        // timeline scrolls: place "now" ~100px from the top of that timeline.
+        // timeline scrolls: place the target time ~100px from the top of
+        // that timeline.
         let target = (minutes as f64 * TIME_SLOT_HEIGHT / 60.0 - 100.0).max(0.0);
         let adj = scroller.vadjustment();
         let max = (adj.upper() - adj.page_size()).max(0.0);
@@ -2034,6 +2052,13 @@ mod tests {
             master_end: None,
             href: None,
             etag: None,
+            attendees: Vec::new(),
+            organizer: None,
+            categories: Vec::new(),
+            sensitivity: lookout_core::EventSensitivity::default(),
+            transparency: lookout_core::EventTransparency::default(),
+            reminder_minutes_before: None,
+            conference_url: None,
         }
     }
 

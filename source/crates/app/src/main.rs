@@ -20,6 +20,7 @@ mod message_list;
 mod microsoft_oauth;
 mod online_accounts;
 mod recipient_entry;
+mod recurrence;
 mod resources;
 mod settings;
 mod tags;

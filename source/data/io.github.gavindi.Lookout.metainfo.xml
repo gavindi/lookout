@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.7.0" date="2026-08-07">
+      <description>
+        <p>The Calendar's New Event dialog is rebuilt with a fuller feature set: invite attendees, set up a recurring series, add a video call link, and set categories, sensitivity, and a reminder - all from a new toolbar, alongside a live mini-calendar and day preview showing where the event lands.</p>
+      </description>
+    </release>
     <release version="0.6.57" date="2026-08-07">
       <description>
         <p>Messages can be exported as .eml files - a new "More" menu on the ribbon fetches the whole raw message on demand and caches it locally, so re-exports are instant and offline. The reading pane also shows a List-Unsubscribe banner when a mailing list advertises one, with one-click unsubscribing (RFC 8058) and a mailto fallback that opens the composer pre-filled.</p>

@@ -3856,8 +3856,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 toast_overlay.add_toast(adw::Toast::new("Connect a calendar account to create events."));
                 return;
             };
+            let anchor = calendar_view::anchor(&calendar_main);
             let suggested_start = {
-                let anchor = calendar_view::anchor(&calendar_main);
                 let now = chrono::Local::now();
                 if now.date_naive() == anchor {
                     if now.hour() == 23 {
@@ -3869,6 +3869,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     anchor.and_hms_opt(9, 0, 0).unwrap()
                 }
             };
+            let preview = event_editor_preview_data(&calendar_state, anchor);
+            let owner_email = calendar_owner_email(&calendar_state, &default_calendar);
             crate::event_editor::show_event_editor(
                 &window,
                 crate::event_editor::EventEditorPrefill {
@@ -3876,6 +3878,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     default_calendar,
                     existing: None,
                     suggested_start: Some(suggested_start),
+                    month_occurrences: &preview.occurrences,
+                    month_event_days: &preview.month_event_days,
+                    calendar_colors: &preview.colors,
+                    owner_email,
                 },
                 {
                     let calendar_state = calendar_state.clone();
@@ -3901,6 +3907,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             } else {
                 default_pickable_calendar(&calendar_state).unwrap_or_else(|| CalendarId(String::new()))
             };
+            let preview = event_editor_preview_data(&calendar_state, occ.start.with_timezone(&chrono::Local).date_naive());
+            let owner_email = calendar_owner_email(&calendar_state, &occ.calendar_id);
             crate::event_editor::show_event_editor(
                 &window,
                 crate::event_editor::EventEditorPrefill {
@@ -3908,6 +3916,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     default_calendar,
                     existing: Some(&occ),
                     suggested_start: None,
+                    month_occurrences: &preview.occurrences,
+                    month_event_days: &preview.month_event_days,
+                    calendar_colors: &preview.colors,
+                    owner_email,
                 },
                 {
                     let calendar_state = calendar_state.clone();
@@ -5499,6 +5511,40 @@ fn default_pickable_calendar(calendar_state: &Rc<RefCell<CalendarUiState>>) -> O
         }
     }
     st.accounts.values().find_map(|handle| handle.calendars.first().map(|c| c.id.clone()))
+}
+
+/// Best-effort address for the account owning `calendar_id`, used as
+/// `ORGANIZER` when an event ends up with attendees. GOA calendar accounts
+/// carry no dedicated email field, but their display name is commonly *is*
+/// the account's email address (Google/Nextcloud/Fastmail all populate it
+/// that way) - accepted only when it actually looks like one, else `None`
+/// (a documented non-conformance the event editor already tolerates).
+fn calendar_owner_email(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> Option<String> {
+    let st = calendar_state.borrow();
+    let display_name = st.accounts.values().find(|handle| handle.calendars.iter().any(|c| c.id == *calendar_id))?.display_name.clone();
+    crate::recipient_entry::is_plausible_address(&display_name).then_some(display_name)
+}
+
+/// A read-only snapshot for the event editor's right-hand preview panel:
+/// every occurrence from checked calendars in the month containing `anchor`,
+/// which local dates in that month have events, and the calendar-color map -
+/// the same filtering `calendar_event_days`/`refresh_mail_overview_day_list`
+/// already do for the sidebar's own mini-calendar. The editor never fetches
+/// anything itself, so this is exactly what it can show.
+struct EventEditorPreviewData {
+    occurrences: Vec<EventOccurrence>,
+    month_event_days: HashSet<chrono::NaiveDate>,
+    colors: calendar_colors::CalendarColorMap,
+}
+
+fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anchor: chrono::NaiveDate) -> EventEditorPreviewData {
+    let occurrences: Vec<EventOccurrence> = {
+        let st = calendar_state.borrow();
+        st.accounts.values().flat_map(|h| h.last_occurrences.iter()).filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned().collect()
+    };
+    let month_event_days = calendar_event_days(calendar_state, first_of_month(anchor));
+    let colors = calendar_state.borrow().calendar_colors.clone();
+    EventEditorPreviewData { occurrences, month_event_days, colors }
 }
 
 /// The account session that owns `calendar_id`, so its command channel can
