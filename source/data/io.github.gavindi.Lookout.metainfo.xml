@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.7.5" date="2026-08-07">
+      <description>
+        <p>Accounts can now send as multiple identities: the composer has a From selector, identities carry a display name (which now actually appears in the From header), Reply-To and blind-copy addresses, and a Manage identities dialog - reachable from the composer and from Config - stores them per account.</p>
+      </description>
+    </release>
     <release version="0.7.4" date="2026-08-07">
       <description>
         <p>The reading pane now recognizes iMIP invitations: a banner appears for calendar emails, letting you accept, tentatively accept, or decline - sending an RFC 6047 reply back to the organizer and saving the event into your calendar - or remove a cancelled event.</p>

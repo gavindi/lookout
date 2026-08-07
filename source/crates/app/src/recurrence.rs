@@ -146,17 +146,15 @@ fn parse_until_date(value: &str) -> Option<NaiveDate> {
 /// The inverse of [`parse_rrule_string`], e.g.
 /// `FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=10`.
 pub fn to_rrule_string(rule: &RecurrenceRule) -> String {
-    let mut parts = vec![
-        format!(
-            "FREQ={}",
-            match rule.freq {
-                Frequency::Daily => "DAILY",
-                Frequency::Weekly => "WEEKLY",
-                Frequency::Monthly => "MONTHLY",
-                Frequency::Yearly => "YEARLY",
-            }
-        ),
-    ];
+    let mut parts = vec![format!(
+        "FREQ={}",
+        match rule.freq {
+            Frequency::Daily => "DAILY",
+            Frequency::Weekly => "WEEKLY",
+            Frequency::Monthly => "MONTHLY",
+            Frequency::Yearly => "YEARLY",
+        }
+    )];
     if rule.interval > 1 {
         parts.push(format!("INTERVAL={}", rule.interval));
     }
@@ -248,7 +246,14 @@ pub fn build_series_control(initial_raw: Option<&str>) -> SeriesControl {
     update_button_label(&button, current.borrow().as_ref(), unrepresentable_raw.as_deref());
 
     let popover = gtk::Popover::new();
-    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
 
     let freq_model = gtk::StringList::new(&["Does not repeat", "Daily", "Weekly", "Monthly", "Yearly"]);
     let freq_dropdown = gtk::DropDown::builder().model(&freq_model).build();
@@ -382,7 +387,11 @@ pub fn build_series_control(initial_raw: Option<&str>) -> SeriesControl {
         });
     }
 
-    SeriesControl { button, current, unrepresentable_raw }
+    SeriesControl {
+        button,
+        current,
+        unrepresentable_raw,
+    }
 }
 
 fn update_button_label(button: &gtk::MenuButton, rule: Option<&RecurrenceRule>, unrepresentable_raw: Option<&str>) {
@@ -436,10 +445,31 @@ mod tests {
     #[test]
     fn describe_produces_readable_summaries() {
         assert_eq!(
-            describe(&RecurrenceRule { freq: Frequency::Weekly, interval: 1, by_weekday: vec![Weekday::Mon, Weekday::Wed], end: RecurrenceEnd::After(10) }),
+            describe(&RecurrenceRule {
+                freq: Frequency::Weekly,
+                interval: 1,
+                by_weekday: vec![Weekday::Mon, Weekday::Wed],
+                end: RecurrenceEnd::After(10)
+            }),
             "Weekly on Mon, Wed, 10 times"
         );
-        assert_eq!(describe(&RecurrenceRule { freq: Frequency::Daily, interval: 1, by_weekday: vec![], end: RecurrenceEnd::Never }), "Daily");
-        assert_eq!(describe(&RecurrenceRule { freq: Frequency::Monthly, interval: 3, by_weekday: vec![], end: RecurrenceEnd::Never }), "Every 3 months");
+        assert_eq!(
+            describe(&RecurrenceRule {
+                freq: Frequency::Daily,
+                interval: 1,
+                by_weekday: vec![],
+                end: RecurrenceEnd::Never
+            }),
+            "Daily"
+        );
+        assert_eq!(
+            describe(&RecurrenceRule {
+                freq: Frequency::Monthly,
+                interval: 3,
+                by_weekday: vec![],
+                end: RecurrenceEnd::Never
+            }),
+            "Every 3 months"
+        );
     }
 }

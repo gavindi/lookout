@@ -2,26 +2,16 @@
 //!
 //! GSettings (see `settings.rs`) holds the scalar preferences; this file is
 //! for relational data with no natural GSettings key: sending identities and
-//! folder-role overrides. Nothing populates it yet - the multi-identity and
-//! role-override features are still roadmap items - so the structs here are
-//! the on-disk contract those features will fill in, written now so the file
-//! gets a home and a tested shape. Best-effort like `last_view.rs`: a missing
-//! or broken file reads back as defaults, never an error.
+//! folder-role overrides. Identities are populated by the multi-identity
+//! feature (composer From selector + manage dialog); the role-override
+//! feature is still a roadmap item, but the structs are the on-disk contract
+//! it will fill in. Best-effort like `last_view.rs`: a missing or broken file
+//! reads back as defaults, never an error.
 
 use std::path::PathBuf;
 
-use lookout_core::MailboxRole;
+use lookout_core::{AccountId, Identity, MailboxRole};
 use serde::{Deserialize, Serialize};
-
-/// One sending identity: a name/address pair the composer can send as.
-/// `account_id` pins the identity to a GOA account; an empty list means the
-/// composer keeps sending as the account's own address.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Identity {
-    pub name: String,
-    pub email: String,
-    pub account_id: Option<String>,
-}
 
 /// A user override of a mailbox's special-use role (e.g. "this folder is my
 /// Archive"), winning over the server's `LIST (SPECIAL-USE)` attributes and
@@ -39,6 +29,31 @@ pub struct FolderRoleOverride {
 pub struct AppConfig {
     pub identities: Vec<Identity>,
     pub folder_role_overrides: Vec<FolderRoleOverride>,
+}
+
+impl AppConfig {
+    /// The persisted sending identities pinned to `account_id`, in file
+    /// order. The account's own address is *not* in this list - it's always
+    /// available implicitly (see `identities_for_account`), and a user-added
+    /// identity duplicating it is treated as redundant.
+    pub fn identities_for(&self, account_id: &AccountId) -> Vec<Identity> {
+        self.identities.iter().filter(|i| &i.account_id == account_id).cloned().collect()
+    }
+
+    /// Every identity the composer can send as for one account: the
+    /// persisted identities plus - always first - the account's own default
+    /// identity (its GOA name/address). Persisted identities whose email
+    /// duplicates the account's own are dropped so the default never
+    /// appears twice.
+    pub fn identities_for_account(&self, account_id: &AccountId, default_name: &str, default_email: &str) -> Vec<Identity> {
+        let mut identities: Vec<Identity> = self
+            .identities_for(account_id)
+            .into_iter()
+            .filter(|i| !i.email.eq_ignore_ascii_case(default_email))
+            .collect();
+        identities.insert(0, Identity::new(account_id.clone(), default_name, default_email));
+        identities
+    }
 }
 
 fn config_dir() -> PathBuf {
@@ -111,12 +126,12 @@ mod tests {
         // Missing file -> default config.
         assert_eq!(load_at(&path), AppConfig::default());
 
+        let account_id = AccountId("account_1".into());
+        let mut identity = Identity::new(account_id.clone(), "Ada", "ada@example.com");
+        identity.reply_to = vec![lookout_core::EmailAddress::new("replies@example.com")];
+        identity.bcc = vec![lookout_core::EmailAddress::new("archive@example.com")];
         let config = AppConfig {
-            identities: vec![Identity {
-                name: "Ada".into(),
-                email: "ada@example.com".into(),
-                account_id: Some("account_1".into()),
-            }],
+            identities: vec![identity],
             folder_role_overrides: vec![FolderRoleOverride {
                 account_id: "account_1".into(),
                 mailbox: "account_1:Archive 2024".into(),
@@ -131,5 +146,30 @@ mod tests {
         assert_eq!(load_at(&path), AppConfig::default());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identities_for_account_prepends_the_default_and_drops_duplicates() {
+        let account = AccountId("account_1".into());
+        let other = AccountId("account_2".into());
+        let config = AppConfig {
+            identities: vec![
+                Identity::new(other.clone(), "Other Account", "other@example.com"),
+                Identity::new(account.clone(), "Work", "work@example.com"),
+                // Duplicates the account's own address - must be dropped.
+                Identity::new(account.clone(), "The Account Itself", "ME@example.com"),
+            ],
+            folder_role_overrides: Vec::new(),
+        };
+
+        let identities = config.identities_for_account(&account, "My Name", "me@example.com");
+        assert_eq!(identities.len(), 2);
+        // The synthesized default always comes first.
+        assert_eq!(identities[0].email, "me@example.com");
+        assert_eq!(identities[0].name, "My Name");
+        assert_eq!(identities[1].email, "work@example.com");
+
+        // Other accounts' identities are never mixed in.
+        assert!(config.identities_for(&other).iter().all(|i| i.email == "other@example.com"));
     }
 }

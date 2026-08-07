@@ -96,9 +96,11 @@ async fn main() -> anyhow::Result<()> {
                         if !sent_command {
                             let msg = ComposedMessage {
                                 from: self_address.clone(),
+                                display_name: None,
                                 to: vec![self_address.clone()],
                                 cc: vec![],
                                 bcc: vec![],
+                                reply_to: vec![],
                                 subject: marker.clone(),
                                 text_body: "This is an automated self-test from Lookout's send_test example.".into(),
                                 html_body: None,

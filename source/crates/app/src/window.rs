@@ -354,6 +354,10 @@ struct UiState {
     /// The GSettings-backed preference store (see `settings`), resolved once
     /// in `build_window` and written through on every preference change.
     settings: Rc<crate::settings::SettingsStore>,
+    /// The relational-data config (`settings.json`): sending identities and
+    /// folder-role overrides. Loaded at startup, written through by the
+    /// manage-identities dialog. See `app_config`.
+    app_config: Rc<RefCell<crate::app_config::AppConfig>>,
     /// Contacts that were present in a previous CardDAV sync for an account
     /// but are missing from the latest one, accumulated client-side since
     /// CardDAV sync-collection deletion tracking isn't implemented - see
@@ -1005,6 +1009,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         starred_contacts,
         ui_db,
         settings: settings.clone(),
+        app_config: Rc::new(RefCell::new(crate::app_config::load())),
         deleted_contacts: HashMap::new(),
         current_account: None,
         current_mailbox: None,
@@ -1395,17 +1400,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // composer inline: that's what replaces any composer already
                 // in the pane (so its autosave loop stops), restores the
                 // previous page on close, and owns the `draft_saved_tx` slot.
-                if let Some((from_email, cmd_tx, prefill, rich_text_default)) = opened {
-                    show_composer_in_reading_pane(
-                        &state,
-                        &reading_stack,
-                        "Reply",
-                        from_email,
-                        cmd_tx,
-                        prefill,
-                        rich_text_default,
-                        mailbox_account_id(&summary.mailbox),
-                    );
+                if let Some((_from_email, cmd_tx, prefill, rich_text_default)) = opened {
+                    show_composer_in_reading_pane(&state, &reading_stack, "Reply", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
                 }
             });
         }
@@ -2107,7 +2103,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let reading_stack = reading_stack.clone();
         unsubscribe_banner.connect_button_clicked(move |banner| {
-            let (mailbox, uid, list, from_email, cmd_tx) = {
+            let (mailbox, uid, list, cmd_tx) = {
                 let st = state.borrow();
                 let (mailbox, uid) = match &st.rendered_message {
                     Some(rendered) => rendered.clone(),
@@ -2116,7 +2112,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let Some(list) = st.unsubscribe_info.clone() else { return };
                 let Some(account_id) = mailbox_account_id(&mailbox) else { return };
                 let Some(handle) = st.accounts.get(&account_id) else { return };
-                (mailbox, uid, list, handle.email.clone(), handle.cmd_tx.clone())
+                (mailbox, uid, list, handle.cmd_tx.clone())
             };
             let dismiss = |state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid| {
                 state.borrow_mut().unsubscribe_dismissed = Some((mailbox.clone(), uid));
@@ -2150,7 +2146,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 if let Some(mailto) = list.mailto.clone() {
                                     dismiss(&state_for_post, &mailbox, uid);
                                     banner_for_post.set_revealed(false);
-                                    open_mailto_unsubscribe(&state_for_post, &reading_stack_for_post, mailto, from_email, cmd_tx, mailbox_account_id(&mailbox));
+                                    open_mailto_unsubscribe(&state_for_post, &reading_stack_for_post, mailto, cmd_tx, mailbox_account_id(&mailbox));
                                 }
                             }
                         }
@@ -2161,7 +2157,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some(mailto) = list.mailto.clone() {
                 dismiss(&state, &mailbox, uid);
                 banner.set_revealed(false);
-                open_mailto_unsubscribe(&state, &reading_stack, mailto, from_email, cmd_tx, mailbox_account_id(&mailbox));
+                open_mailto_unsubscribe(&state, &reading_stack, mailto, cmd_tx, mailbox_account_id(&mailbox));
             }
         });
     } // WebKit paints asynchronously - revealing the HTML page while a fresh
@@ -3059,7 +3055,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
         imip_banner.connect_button_clicked(move |banner| {
-            let (mailbox, uid, invitation, from_email, cmd_tx) = {
+            let (mailbox, uid, invitation, from_email, display_name, cmd_tx) = {
                 let st = state.borrow();
                 let (mailbox, uid) = match &st.rendered_message {
                     Some(rendered) => rendered.clone(),
@@ -3068,7 +3064,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let Some(invitation) = st.imip.clone() else { return };
                 let Some(account_id) = mailbox_account_id(&mailbox) else { return };
                 let Some(handle) = st.accounts.get(&account_id) else { return };
-                (mailbox, uid, invitation, handle.email.clone(), handle.cmd_tx.clone())
+                (mailbox, uid, invitation, handle.email.clone(), handle.display_name.clone(), handle.cmd_tx.clone())
             };
             let dismiss = |state: &Rc<RefCell<UiState>>, banner: &adw::Banner, mailbox: &MailboxId, uid: Uid| {
                 state.borrow_mut().imip_dismissed = Some((mailbox.clone(), uid));
@@ -3097,6 +3093,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let toast_overlay_for_dialog = toast_overlay.clone();
                     let cmd_tx_for_dialog = cmd_tx.clone();
                     let from_email_for_dialog = from_email.clone();
+                    let display_name_for_dialog = display_name.clone();
                     let invitation_for_dialog = invitation.clone();
                     let mailbox_for_dialog = mailbox.clone();
                     let banner_for_dialog = banner.clone();
@@ -3113,6 +3110,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             &toast_overlay_for_dialog,
                             &invitation_for_dialog,
                             &from_email_for_dialog,
+                            Some(display_name_for_dialog.as_str()),
                             &cmd_tx_for_dialog,
                             status,
                         );
@@ -3375,22 +3373,37 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     nav_rail.append(&nav_rail_spacer);
     nav_rail.append(&config_view_button);
 
+    // The config view's manage-identities dialog refreshes through this
+    // slot: it's filled with `refresh_config` right after that closure is
+    // built below (a dialog's `on_changed` can't capture the closure that
+    // built its anchor row - that would be a self-reference).
+    let refresh_hook: Rc<RefCell<Rc<dyn Fn()>>> = Rc::new(RefCell::new(Rc::new(|| {})));
     let refresh_config: Rc<dyn Fn()> = Rc::new({
+        let refresh_hook = refresh_hook.clone();
         let state = state.clone();
         let calendar_state = calendar_state.clone();
         let config_view = config_view.clone();
         move || {
-            let mut mail: Vec<crate::config_view::MailAccountInfo> = state
-                .borrow()
+            let st = state.borrow();
+            let mut mail: Vec<crate::config_view::MailAccountInfo> = st
                 .accounts
-                .values()
-                .map(|h| crate::config_view::MailAccountInfo {
+                .iter()
+                .map(|(account_id, h)| crate::config_view::MailAccountInfo {
                     display_name: h.display_name.clone(),
                     email: h.email.clone(),
+                    account_id: account_id.0.clone(),
+                    identity_labels: st
+                        .app_config
+                        .borrow()
+                        .identities_for_account(account_id, &h.display_name, &h.email)
+                        .iter()
+                        .map(|i| i.label())
+                        .collect(),
                     imap: format!("{}:{}", h.imap_host, h.imap_port),
                     smtp: format!("{}:{}", h.smtp_host, h.smtp_port),
                 })
                 .collect();
+            drop(st);
             mail.sort_by_key(|a| a.email.to_lowercase());
             let mut calendar: Vec<crate::config_view::CalendarAccountInfo> = calendar_state
                 .borrow()
@@ -3420,6 +3433,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 })
                 .collect();
 
+            let manage_identities: crate::config_view::ManageIdentities = {
+                let state = state.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |anchor, account_id| {
+                    let account_id = AccountId(account_id.to_string());
+                    let app_config = state.borrow().app_config.clone();
+                    let on_changed = refresh_hook.borrow().clone();
+                    crate::identities::show_manage_dialog(anchor, app_config, account_id, on_changed);
+                })
+            };
             crate::config_view::refresh(
                 &config_view,
                 &mail,
@@ -3428,9 +3451,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &mail_cache_files,
                 &calendar_cache_dir,
                 &calendar_cache_files,
+                &manage_identities,
             );
         }
     });
+    // From here on, the manage-identities dialog's `on_changed` re-runs this
+    // closure, keeping the Config view's rows current after an edit. (The
+    // `Rc` cycle this creates lives for the window's lifetime, like the
+    // other closure cycles this file already accepts.)
+    *refresh_hook.borrow_mut() = refresh_config.clone();
     // Populate the placeholder rows now (both groups are empty at startup).
     refresh_config();
 
@@ -3504,14 +3533,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .or_else(|| st.accounts.keys().next().cloned());
             let Some(handle) = account_id.clone().and_then(|id| st.accounts.get(&id)) else { return };
             let cmd_tx = handle.cmd_tx.clone();
-            let from_email = handle.email.clone();
             let rich_text_default = state.borrow().rich_text_default;
             drop(st);
             show_composer_in_reading_pane(
                 &state,
                 &reading_stack,
                 "New Message",
-                from_email,
                 cmd_tx,
                 crate::compose::ComposePrefill::default(),
                 rich_text_default,
@@ -3541,16 +3568,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(
-                    &state,
-                    &reading_stack,
-                    title,
-                    from_email,
-                    cmd_tx,
-                    prefill,
-                    rich_text_default,
-                    mailbox_account_id(&summary.mailbox),
-                );
+                show_composer_in_reading_pane(&state, &reading_stack, title, cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
             }
         });
     }
@@ -3559,19 +3577,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let reading_stack = reading_stack.clone();
         button.connect_clicked(move |_| {
-            if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
+            if let Some((summary, body, _from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(
-                    &state,
-                    &reading_stack,
-                    "Forward",
-                    from_email,
-                    cmd_tx,
-                    prefill,
-                    rich_text_default,
-                    mailbox_account_id(&summary.mailbox),
-                );
+                show_composer_in_reading_pane(&state, &reading_stack, "Forward", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
             }
         });
     }
@@ -4329,7 +4338,12 @@ fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>) -> crate::recipie
     Rc::new(move |prefix: &str| {
         let prefix = prefix.trim();
         let st = state.borrow();
-        let mail_history: Vec<EmailAddress> = st.accounts.values().filter_map(|h| h.address_cache.as_ref()).flat_map(|cache| cache.search_contacts(prefix, 8)).collect();
+        let mail_history: Vec<EmailAddress> = st
+            .accounts
+            .values()
+            .filter_map(|h| h.address_cache.as_ref())
+            .flat_map(|cache| cache.search_contacts(prefix, 8))
+            .collect();
         let carddav: Vec<EmailAddress> = st.contacts_by_account.values().flat_map(|snapshot| snapshot.suggestions.clone()).collect();
         drop(st);
         merge_contact_suggestions(mail_history, &carddav, prefix, 8)
@@ -5713,7 +5727,12 @@ fn default_pickable_calendar(calendar_state: &Rc<RefCell<CalendarUiState>>) -> O
 /// (a documented non-conformance the event editor already tolerates).
 fn calendar_owner_email(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> Option<String> {
     let st = calendar_state.borrow();
-    let display_name = st.accounts.values().find(|handle| handle.calendars.iter().any(|c| c.id == *calendar_id))?.display_name.clone();
+    let display_name = st
+        .accounts
+        .values()
+        .find(|handle| handle.calendars.iter().any(|c| c.id == *calendar_id))?
+        .display_name
+        .clone();
     crate::recipient_entry::is_plausible_address(&display_name).then_some(display_name)
 }
 
@@ -5732,11 +5751,20 @@ struct EventEditorPreviewData {
 fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anchor: chrono::NaiveDate) -> EventEditorPreviewData {
     let occurrences: Vec<EventOccurrence> = {
         let st = calendar_state.borrow();
-        st.accounts.values().flat_map(|h| h.last_occurrences.iter()).filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned().collect()
+        st.accounts
+            .values()
+            .flat_map(|h| h.last_occurrences.iter())
+            .filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id))
+            .cloned()
+            .collect()
     };
     let month_event_days = calendar_event_days(calendar_state, first_of_month(anchor));
     let colors = calendar_state.borrow().calendar_colors.clone();
-    EventEditorPreviewData { occurrences, month_event_days, colors }
+    EventEditorPreviewData {
+        occurrences,
+        month_event_days,
+        colors,
+    }
 }
 
 /// Opens the "New event" editor prefilled for `suggested_start` (and
@@ -5848,6 +5876,7 @@ fn respond_to_imip_invitation(
     toast_overlay: &adw::ToastOverlay,
     invitation: &lookout_core::ImipInvitation,
     from_email: &str,
+    display_name: Option<&str>,
     cmd_tx: &async_channel::Sender<AccountCommand>,
     status: AttendeeStatus,
 ) {
@@ -5883,9 +5912,11 @@ fn respond_to_imip_invitation(
     };
     let message = lookout_mail::ComposedMessage {
         from: from_email.to_string(),
+        display_name: display_name.map(str::to_string).filter(|n| !n.trim().is_empty()),
         to: vec![organizer.address.clone()],
         cc: vec![],
         bcc: vec![],
+        reply_to: vec![],
         subject,
         text_body: format!("{subject_prefix}."),
         html_body: None,
@@ -7553,7 +7584,6 @@ fn open_mailto_unsubscribe(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
     address: String,
-    from_email: String,
     cmd_tx: async_channel::Sender<AccountCommand>,
     account_id: Option<AccountId>,
 ) {
@@ -7563,7 +7593,7 @@ fn open_mailto_unsubscribe(
         ..Default::default()
     };
     let rich_text_default = state.borrow().rich_text_default;
-    show_composer_in_reading_pane(state, reading_stack, "Unsubscribe", from_email, cmd_tx, prefill, rich_text_default, account_id);
+    show_composer_in_reading_pane(state, reading_stack, "Unsubscribe", cmd_tx, prefill, rich_text_default, account_id);
 }
 
 /// A safe file extension for an attachment's temporary copy, so the system's
@@ -7953,15 +7983,11 @@ fn render_body(
 /// visible beforehand once `on_done` fires (Cancel or Send) - so Reply's
 /// Cancel lands back on the same message, and New Message's Cancel lands
 /// back on the empty placeholder.
-// Cohesive arguments (they all describe one composer to open), so they stay
-// positional rather than being bundled into a single-use struct - same call
-// this file already makes for `spawn_calendar_discovery`.
 #[allow(clippy::too_many_arguments)]
 fn show_composer_in_reading_pane(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
     title: &str,
-    from_email: String,
     cmd_tx: async_channel::Sender<AccountCommand>,
     prefill: crate::compose::ComposePrefill,
     rich_text_default: bool,
@@ -7997,7 +8023,35 @@ fn show_composer_in_reading_pane(
             .unwrap_or_default();
         merge_contact_suggestions(mail_history, &carddav, prefix.trim(), 8)
     });
-    let (composer, draft_tx) = crate::compose::build_compose_view(title, from_email, cmd_tx, prefill, on_done, rich_text_default, suggestions);
+    let (composer, draft_tx) = crate::compose::build_compose_view(
+        title,
+        // The composer's From dropdown re-fetches from here whenever the
+        // manage-identities dialog fires `on_changed`, so edits made while a
+        // composer is open are live. Falls back to the first connected
+        // account when no explicit account was resolved.
+        {
+            let state = state.clone();
+            let account_id = account_id.clone();
+            Rc::new(move || {
+                let st = state.borrow();
+                let resolved = account_id.clone().or_else(|| st.accounts.keys().next().cloned());
+                match resolved {
+                    Some(id) => match st.accounts.get(&id) {
+                        Some(handle) => st.app_config.borrow().identities_for_account(&id, &handle.display_name, &handle.email),
+                        None => Vec::new(),
+                    },
+                    None => Vec::new(),
+                }
+            })
+        },
+        state.borrow().app_config.clone(),
+        account_id,
+        cmd_tx,
+        prefill,
+        on_done,
+        rich_text_default,
+        suggestions,
+    );
     // Replacing any previous composer's relay (dropped sender = its consumer
     // exits).
     state.borrow_mut().draft_saved_tx = Some(draft_tx);
@@ -8244,6 +8298,7 @@ mod tests {
             starred_contacts: HashSet::new(),
             ui_db: None,
             settings: Rc::new(crate::settings::resolve()),
+            app_config: Rc::new(RefCell::new(crate::app_config::AppConfig::default())),
             deleted_contacts: HashMap::new(),
             current_account: None,
             current_mailbox: None,

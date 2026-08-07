@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
-use lookout_core::{header_value, EmailBody, EmailSummary};
+use lookout_core::{header_value, AccountId, EmailBody, EmailSummary, Identity};
 use lookout_mail::session::AccountCommand;
 use lookout_mail::{new_message_id, ComposedMessage};
 use webkit::prelude::*;
@@ -321,6 +321,9 @@ fn parse_recipients(field: &str) -> Vec<String> {
 /// rendering).
 #[derive(Clone, PartialEq)]
 struct DraftSnapshot {
+    /// The selected sending identity's address - a From change must re-save
+    /// the draft like any other edit.
+    from: String,
     to: String,
     cc: String,
     bcc: String,
@@ -328,6 +331,17 @@ struct DraftSnapshot {
     rich: bool,
     body: String,
     body_text: String,
+}
+
+/// The identity the composer is currently set to send as: the dropdown's
+/// selection, falling back to the first entry (the account's own default
+/// identity), and ultimately to a blank placeholder - the send will be
+/// rejected by the SMTP envelope check long before anything goes out.
+fn selected_identity(identities: &Rc<RefCell<Vec<Identity>>>, from_dropdown: &gtk::DropDown) -> Identity {
+    let list = identities.borrow();
+    list.get(from_dropdown.selected() as usize)
+        .cloned()
+        .unwrap_or_else(|| list.first().cloned().unwrap_or_else(|| Identity::new(AccountId(String::new()), "", "")))
 }
 
 /// Everything the draft autosave touches, in one clonable bundle. This exists
@@ -362,7 +376,11 @@ struct AutosaveCtx {
     /// the Drafts folder only ever holds one copy of this draft.
     draft_message_id: Rc<String>,
     cmd_tx: async_channel::Sender<AccountCommand>,
-    from_email: String,
+    /// The account's selectable identities (default first) and the From
+    /// dropdown that selects among them. Shared with the send handler, so
+    /// whatever the dropdown shows is exactly what drafts and sends use.
+    identities: Rc<RefCell<Vec<Identity>>>,
+    from_dropdown: gtk::DropDown,
     in_reply_to: Option<String>,
     references: Vec<String>,
     status_label: gtk::Label,
@@ -381,6 +399,7 @@ impl AutosaveCtx {
             (text.clone(), text)
         };
         Some(DraftSnapshot {
+            from: selected_identity(&self.identities, &self.from_dropdown).email,
             to: self.to_row.text_value(),
             cc: self.cc_row.text_value(),
             bcc: self.bcc_row.text_value(),
@@ -418,11 +437,16 @@ impl AutosaveCtx {
         let replace = self.draft_queued.get();
         *self.last_saved.borrow_mut() = Some(snap.clone());
         self.draft_queued.set(true);
+        let identity = selected_identity(&self.identities, &self.from_dropdown);
+        let mut bcc = parse_recipients(&snap.bcc);
+        bcc.extend(identity.bcc.iter().map(|a| a.address.clone()));
         let msg = ComposedMessage {
-            from: self.from_email.clone(),
+            from: identity.email,
+            display_name: (!identity.name.trim().is_empty()).then(|| identity.name.clone()),
             to: parse_recipients(&snap.to),
             cc: parse_recipients(&snap.cc),
-            bcc: parse_recipients(&snap.bcc),
+            bcc,
+            reply_to: identity.reply_to.iter().map(|a| a.address.clone()).collect(),
             subject: snap.subject.clone(),
             text_body: snap.body_text.clone(),
             html_body: snap.rich.then(|| snap.body.clone()),
@@ -593,9 +617,14 @@ fn build_rich_editor(initial_html: String) -> (gtk::Box, Rc<webkit::WebView>) {
 /// this composer (which flips the status label from "Saving draft…" to
 /// "Draft saved"); dropping it lets the composer's confirmation consumer
 /// exit.
+/// Cohesive arguments (they all describe one composer to open), so they stay
+/// positional rather than being bundled into a single-use struct.
+#[allow(clippy::too_many_arguments)]
 pub fn build_compose_view(
     title: &str,
-    from_email: String,
+    identities_source: Rc<dyn Fn() -> Vec<Identity>>,
+    app_config: Rc<RefCell<crate::app_config::AppConfig>>,
+    account_id: Option<AccountId>,
     cmd_tx: async_channel::Sender<AccountCommand>,
     prefill: ComposePrefill,
     on_done: Rc<dyn Fn()>,
@@ -623,11 +652,50 @@ pub fn build_compose_view(
 
     let rich_toggle = adw::SwitchRow::builder().title("Rich text").subtitle("Formatting (bold, lists, links, ...)").build();
 
+    // --- From selector: a dropdown of the account's identities (its own
+    // address first), re-fetched from `identities_source` whenever the
+    // manage dialog changes them. Same ActionRow + `gtk::DropDown` pattern
+    // as the event editor's calendar picker.
+    let identities = Rc::new(RefCell::new(identities_source()));
+    let from_row = adw::ActionRow::builder().title("From").build();
+    let from_dropdown = gtk::DropDown::builder().selected(0).build();
+    from_row.add_suffix(&from_dropdown);
+    let refresh_from_dropdown: Rc<dyn Fn()> = {
+        let identities = identities.clone();
+        let from_dropdown = from_dropdown.clone();
+        Rc::new(move || {
+            let list = identities_source();
+            let labels: Vec<String> = list.iter().map(|i| i.label()).collect();
+            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let model = gtk::StringList::new(&label_refs);
+            from_dropdown.set_model(Some(&model));
+            *identities.borrow_mut() = list;
+            if !labels.is_empty() && from_dropdown.selected() as usize >= labels.len() {
+                from_dropdown.set_selected(0);
+            }
+        })
+    };
+    refresh_from_dropdown();
+    let manage_row = adw::ActionRow::builder()
+        .title("Manage identities…")
+        .subtitle("Add, edit or remove the addresses you can send as")
+        .activatable(account_id.is_some())
+        .build();
+    if let Some(account_id) = account_id {
+        let app_config = app_config.clone();
+        let refresh = refresh_from_dropdown.clone();
+        manage_row.connect_activated(move |row| {
+            crate::identities::show_manage_dialog(row.upcast_ref::<gtk::Widget>(), app_config.clone(), account_id.clone(), refresh.clone());
+        });
+    }
+
     let fields_group = adw::PreferencesGroup::new();
     fields_group.add(to_row.widget());
     fields_group.add(cc_row.widget());
     fields_group.add(bcc_row.widget());
     fields_group.add(&subject_row);
+    fields_group.add(&from_row);
+    fields_group.add(&manage_row);
     fields_group.add(&rich_toggle);
 
     let body_view = gtk::TextView::builder()
@@ -686,7 +754,8 @@ pub fn build_compose_view(
         in_flight: Rc::new(Cell::new(false)),
         draft_message_id: draft_message_id.clone(),
         cmd_tx: cmd_tx.clone(),
-        from_email: from_email.clone(),
+        identities: identities.clone(),
+        from_dropdown: from_dropdown.clone(),
         in_reply_to: prefill.in_reply_to.clone(),
         references: prefill.references.clone(),
         status_label: status_label.clone(),
@@ -806,7 +875,8 @@ pub fn build_compose_view(
             let autosave = autosave.clone();
             let draft_message_id = draft_message_id.clone();
             let cmd_tx = cmd_tx.clone();
-            let from_email = from_email.clone();
+            let identities = identities.clone();
+            let from_dropdown = from_dropdown.clone();
             let in_reply_to = in_reply_to.clone();
             let references = references.clone();
             let closed = closed.clone();
@@ -843,11 +913,16 @@ pub fn build_compose_view(
                         message_id: (*draft_message_id).clone(),
                     });
                 }
+                let identity = selected_identity(&identities, &from_dropdown);
+                let mut bcc = bcc.clone();
+                bcc.extend(identity.bcc.iter().map(|a| a.address.clone()));
                 let msg = ComposedMessage {
-                    from: from_email,
+                    from: identity.email,
+                    display_name: (!identity.name.trim().is_empty()).then(|| identity.name.clone()),
                     to,
                     cc,
                     bcc,
+                    reply_to: identity.reply_to.iter().map(|a| a.address.clone()).collect(),
                     subject,
                     text_body,
                     html_body,
@@ -1056,6 +1131,7 @@ mod tests {
 
     fn snapshot(to: &str, subject: &str, body_text: &str) -> DraftSnapshot {
         DraftSnapshot {
+            from: "me@example.com".to_string(),
             to: to.to_string(),
             cc: String::new(),
             bcc: String::new(),
@@ -1089,6 +1165,7 @@ mod tests {
         // The rich editor's untouched document renders to whitespace-only
         // text even though its HTML is non-empty.
         let snap = DraftSnapshot {
+            from: String::new(),
             to: String::new(),
             cc: String::new(),
             bcc: String::new(),

@@ -114,9 +114,11 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
 
     let draft = |subject: &str| ComposedMessage {
         from: "testuser@localhost".to_string(),
+        display_name: None,
         to: vec!["testuser@localhost".to_string()],
         cc: vec![],
         bcc: vec![],
+        reply_to: vec![],
         subject: subject.to_string(),
         text_body: "draft body".to_string(),
         html_body: None,
@@ -171,9 +173,11 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     // --- Send over SMTP + APPEND to Sent, as before.
     let msg = ComposedMessage {
         from: "testuser@localhost".to_string(),
+        display_name: None,
         to: vec!["testuser@localhost".to_string()],
         cc: vec![],
         bcc: vec![],
+        reply_to: vec![],
         subject: "integration test".to_string(),
         text_body: "hello from imap_integration.rs".to_string(),
         html_body: None,

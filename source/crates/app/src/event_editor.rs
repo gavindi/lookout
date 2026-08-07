@@ -18,9 +18,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
-use lookout_core::{
-    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventTransparency, EventUid,
-};
+use lookout_core::{Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventTransparency, EventUid};
 
 use crate::calendar_colors::CalendarColorMap;
 use crate::recipient_entry::{address_of, RecipientEntry, SuggestionSource};
@@ -179,7 +177,11 @@ pub fn show_event_editor(
             }
             (occ.start.with_timezone(&chrono::Local).naive_local(), occ.end.with_timezone(&chrono::Local).naive_local())
         })
-        .or_else(|| prefill.suggested_start.map(|start| (start, prefill.suggested_end.unwrap_or(start + chrono::Duration::hours(1)))))
+        .or_else(|| {
+            prefill
+                .suggested_start
+                .map(|start| (start, prefill.suggested_end.unwrap_or(start + chrono::Duration::hours(1))))
+        })
         .unwrap_or_else(default_event_times);
     // The form's all-day end is the *last* day (inclusive, Outlook/Gmail
     // convention); the model stores the exclusive day after, so show one less.
@@ -228,11 +230,22 @@ pub fn show_event_editor(
         });
     }
 
-    let datetime_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).margin_top(6).margin_bottom(6).build();
+    let datetime_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
     datetime_row.append(&time_cluster("Starts", &start_calendar, &start_hour, &start_minute));
     datetime_row.append(&gtk::Label::builder().label("to").css_classes(["dim-label"]).build());
     datetime_row.append(&time_cluster("Ends", &end_calendar, &end_hour, &end_minute));
-    let all_day_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).halign(gtk::Align::End).hexpand(true).valign(gtk::Align::Start).build();
+    let all_day_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::End)
+        .hexpand(true)
+        .valign(gtk::Align::Start)
+        .build();
     all_day_box.append(&gtk::Label::new(Some("All day")));
     all_day_box.append(&all_day_switch);
     datetime_row.append(&all_day_box);
@@ -248,7 +261,13 @@ pub fn show_event_editor(
     }
 
     let description_buffer = gtk::TextBuffer::new(None);
-    let description_view = gtk::TextView::builder().buffer(&description_buffer).wrap_mode(gtk::WrapMode::WordChar).top_margin(6).left_margin(6).right_margin(6).build();
+    let description_view = gtk::TextView::builder()
+        .buffer(&description_buffer)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(6)
+        .left_margin(6)
+        .right_margin(6)
+        .build();
 
     // --- Form layout: a preferences-style group for the row-shaped fields,
     // the compact date/time row, and the notes body filling the rest.
@@ -271,24 +290,53 @@ pub fn show_event_editor(
     let error_label = gtk::Label::builder().wrap(true).xalign(0.0).halign(gtk::Align::Start).css_classes(["error"]).build();
     error_label.set_visible(false);
 
-    let notes_label = gtk::Label::builder().label("Notes").css_classes(["dim-label", "caption"]).xalign(0.0).halign(gtk::Align::Start).build();
-    let notes_scroller = gtk::ScrolledWindow::builder().child(&description_view).vexpand(true).min_content_height(120).css_classes(["card"]).build();
+    let notes_label = gtk::Label::builder()
+        .label("Notes")
+        .css_classes(["dim-label", "caption"])
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .build();
+    let notes_scroller = gtk::ScrolledWindow::builder()
+        .child(&description_view)
+        .vexpand(true)
+        .min_content_height(120)
+        .css_classes(["card"])
+        .build();
 
-    let form_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build();
+    let form_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
     form_box.append(&fields_group);
     form_box.append(&datetime_row);
     form_box.append(&recurring_note);
     form_box.append(&error_label);
     form_box.append(&notes_label);
     form_box.append(&notes_scroller);
-    let form_scroller = gtk::ScrolledWindow::builder().child(&form_box).hscrollbar_policy(gtk::PolicyType::Never).hexpand(true).vexpand(true).build();
+    let form_scroller = gtk::ScrolledWindow::builder()
+        .child(&form_box)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
 
     // --- Right-hand preview: a mini month calendar above a single-day
     // schedule strip, reusing the widgets the main Calendar tab already
     // builds for itself (`calendar_view::build_mini`/`build_time_grid`).
     let preview_mini = crate::calendar_view::build_mini();
     let preview_day_strip = Rc::new(crate::calendar_view::build_time_grid(&[chrono::Weekday::Mon], true));
-    let preview_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).width_request(280).margin_top(12).margin_bottom(12).margin_end(12).build();
+    let preview_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .width_request(280)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_end(12)
+        .build();
     preview_box.append(&preview_mini.root);
     preview_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     preview_box.append(&preview_day_strip.root);
@@ -328,13 +376,28 @@ pub fn show_event_editor(
         }
     }
     let categorize_popover = gtk::Popover::builder().child(&categorize_entry).build();
-    let categorize_button = gtk::MenuButton::builder().icon_name(themed_icon("tag-symbolic", &["mail-mark-important-symbolic"])).tooltip_text("Categorize").popover(&categorize_popover).build();
+    let categorize_button = gtk::MenuButton::builder()
+        .icon_name(themed_icon("tag-symbolic", &["mail-mark-important-symbolic"]))
+        .tooltip_text("Categorize")
+        .popover(&categorize_popover)
+        .build();
 
-    let reminder_choices: &[(&str, Option<i64>)] =
-        &[("No reminder", None), ("At time of event", Some(0)), ("5 minutes before", Some(5)), ("10 minutes before", Some(10)), ("15 minutes before", Some(15)), ("30 minutes before", Some(30)), ("1 hour before", Some(60)), ("1 day before", Some(1440))];
+    let reminder_choices: &[(&str, Option<i64>)] = &[
+        ("No reminder", None),
+        ("At time of event", Some(0)),
+        ("5 minutes before", Some(5)),
+        ("10 minutes before", Some(10)),
+        ("15 minutes before", Some(15)),
+        ("30 minutes before", Some(30)),
+        ("1 hour before", Some(60)),
+        ("1 day before", Some(1440)),
+    ];
     let reminder_model = gtk::StringList::new(&reminder_choices.iter().map(|(label, _)| *label).collect::<Vec<_>>());
     let reminder_dropdown = gtk::DropDown::builder().model(&reminder_model).tooltip_text("Reminder").build();
-    let reminder_index = existing.as_ref().and_then(|occ| reminder_choices.iter().position(|(_, minutes)| *minutes == occ.reminder_minutes_before)).unwrap_or(0);
+    let reminder_index = existing
+        .as_ref()
+        .and_then(|occ| reminder_choices.iter().position(|(_, minutes)| *minutes == occ.reminder_minutes_before))
+        .unwrap_or(0);
     reminder_dropdown.set_selected(reminder_index as u32);
 
     let sensitivity_model = gtk::StringList::new(&["Public", "Private", "Confidential"]);
@@ -421,7 +484,11 @@ pub fn show_event_editor(
             let selected = calendar_dropdown.selected() as usize;
             let calendar_id = calendar_ids.get(selected).cloned().unwrap_or_else(|| CalendarId(String::new()));
             let synthetic = synthetic_occurrence(calendar_id, &title_row.text(), local_to_utc(start_local), local_to_utc(model_end), all_day);
-            let mut occs: Vec<EventOccurrence> = month_occurrences.iter().filter(|o| !crate::calendar_view::covered_local_dates(o, day, day).is_empty()).cloned().collect();
+            let mut occs: Vec<EventOccurrence> = month_occurrences
+                .iter()
+                .filter(|o| !crate::calendar_view::covered_local_dates(o, day, day).is_empty())
+                .cloned()
+                .collect();
             occs.push(synthetic);
             crate::calendar_view::set_mini_month(&preview_mini, day, &month_event_days);
             crate::calendar_view::set_time_grid(&preview_day_strip, day, &occs, &calendar_colors, None, None);
@@ -533,7 +600,11 @@ pub fn show_event_editor(
                     2 => EventSensitivity::Confidential,
                     _ => EventSensitivity::Public,
                 },
-                transparency: if busy_dropdown.selected() == 1 { EventTransparency::Free } else { EventTransparency::Busy },
+                transparency: if busy_dropdown.selected() == 1 {
+                    EventTransparency::Free
+                } else {
+                    EventTransparency::Busy
+                },
                 reminder_minutes_before: reminder_choices.get(reminder_dropdown.selected() as usize).and_then(|(_, m)| *m),
                 video_enabled: video_toggle.is_active(),
                 conference_url_text: video_url_row.text().to_string(),

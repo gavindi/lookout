@@ -7,8 +7,13 @@
 //! session state and feeds plain display structs into `refresh`.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use adw::prelude::*;
+
+/// The caller's hook for opening the manage-identities dialog: takes the
+/// anchoring widget and the account id (opaque string).
+pub type ManageIdentities = Rc<dyn Fn(&gtk::Widget, &str)>;
 
 /// Plain display data for one mail account, decoupled from window.rs's
 /// private `AccountHandle` so this module has no dependency on the session
@@ -16,6 +21,12 @@ use adw::prelude::*;
 pub struct MailAccountInfo {
     pub display_name: String,
     pub email: String,
+    /// The account's id, as an opaque string - handed back to the caller's
+    /// manage-identities callback so it can route edits to the right
+    /// account.
+    pub account_id: String,
+    /// Every identity this account can send as, display-ready.
+    pub identity_labels: Vec<String>,
     /// Preformatted `host:port`.
     pub imap: String,
     /// Preformatted `host:port`.
@@ -71,6 +82,8 @@ pub struct ConfigView {
     calendar_group: adw::PreferencesGroup,
     mail_rows: RefCell<Vec<adw::ActionRow>>,
     calendar_rows: RefCell<Vec<adw::ActionRow>>,
+    /// The per-account "Identities" rows, rebuilt alongside `mail_rows`.
+    identity_rows: RefCell<Vec<adw::ActionRow>>,
     mail_cache_group: adw::PreferencesGroup,
     calendar_cache_group: adw::PreferencesGroup,
     mail_cache_rows: RefCell<Vec<adw::ActionRow>>,
@@ -187,6 +200,7 @@ pub fn build() -> ConfigView {
         calendar_group,
         mail_rows: RefCell::new(Vec::new()),
         calendar_rows: RefCell::new(Vec::new()),
+        identity_rows: RefCell::new(Vec::new()),
         mail_cache_group,
         calendar_cache_group,
         mail_cache_rows: RefCell::new(Vec::new()),
@@ -196,7 +210,11 @@ pub fn build() -> ConfigView {
 
 /// Rebuilds the two account groups and cache-info groups from the caller's
 /// latest state. Clears any rows added by a previous refresh first, and shows
-/// a dim placeholder row per group while it has no entries.
+/// a dim placeholder row per group while it has no entries. Each mail account
+/// gets an "Identities" row whose activation invokes `manage_identities`
+/// with the row's widget (as anchor) and the account's id - the caller owns
+/// the actual dialog.
+#[allow(clippy::too_many_arguments)]
 pub fn refresh(
     view: &ConfigView,
     mail: &[MailAccountInfo],
@@ -205,8 +223,12 @@ pub fn refresh(
     mail_cache_files: &[CacheFile],
     calendar_cache_dir: &std::path::Path,
     calendar_cache_files: &[CacheFile],
+    manage_identities: &ManageIdentities,
 ) {
     for row in view.mail_rows.borrow_mut().drain(..) {
+        view.mail_group.remove(&row);
+    }
+    for row in view.identity_rows.borrow_mut().drain(..) {
         view.mail_group.remove(&row);
     }
     for row in view.calendar_rows.borrow_mut().drain(..) {
@@ -219,6 +241,20 @@ pub fn refresh(
         for info in mail {
             let subtitle = format!("{} · IMAP {} · SMTP {}", info.email, info.imap, info.smtp);
             push_row(&view.mail_group, &view.mail_rows, account_row(&info.display_name, &subtitle));
+            let identities_subtitle = if info.identity_labels.is_empty() {
+                "Send as this account's own address".to_string()
+            } else {
+                info.identity_labels.join(" · ")
+            };
+            let identity_row = adw::ActionRow::builder()
+                .title("Sending identities")
+                .subtitle(&identities_subtitle)
+                .activatable(true)
+                .build();
+            let account_id = info.account_id.clone();
+            let manage = manage_identities.clone();
+            identity_row.connect_activated(move |row| manage(row.upcast_ref::<gtk::Widget>(), &account_id));
+            push_row(&view.mail_group, &view.identity_rows, identity_row);
         }
     }
 

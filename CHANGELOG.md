@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.5 (2026-08-07)
+
+### Added
+
+- **Mail**: accounts can now send as multiple identities - the composer's long-missing From selector. The identity model is unified onto `lookout_core::Identity` (the previously unused struct from `core/src/identity.rs`, now deriving `PartialEq`/`Eq` and carrying a display-ready `label()`), replacing the flat placeholder in `app_config.rs`; `AppConfig::identities_for` / `identities_for_account` resolve the composer's list: the account's own GOA name/address always first as an implicit default, persisted identities pinned to that account after it, with any persisted identity duplicating the account's own address dropped so the default can never appear twice. `settings.json` is now actually populated (its "multi-identity is a roadmap item" doc is retired): `UiState` loads `AppConfig` at startup and the composer opens with a **From** row - an `adw::ActionRow` with a `gtk::DropDown` suffix, the same pattern as the event editor's calendar picker - listing every selectable identity for the account (default selected). The chosen identity drives both send paths: draft autosave (`DraftSnapshot` gained a `from` field, so switching identities re-saves the draft like any other edit) and Send, which merge the identity's `bcc` list into the typed one.
+- **Mail**: per-identity metadata reaches the wire. `ComposedMessage` gains `display_name` and `reply_to`; `build_raw_message` now writes `From: Name <address>` - the account's display name was previously never sent in the From header, even for the account's own identity - and emits `Reply-To:` when the identity carries one, while `Bcc:` stays envelope-only as before. SMTP transport, credentials, and the `MAIL FROM` envelope address remain per-account, so an identity is purely a From/Reply-To/Bcc override, exactly as `AccountId`-pinned identities are scoped.
+- **Mail**: a "Manage identities…" row (under the From dropdown, disabled when no account resolves) opens a new modal manage dialog (`identities.rs`): every extra identity for the account as an editable name/email/Reply-To/Bcc row plus delete, an add row with inline validation (plausible address, no duplicate email within the account, error label otherwise), all write-through to `settings.json` on every change with the Manage-tags dialog's rebuild pattern. The same dialog is reachable from Config → Mail accounts, where each account now lists a "Sending identities" row whose subtitle shows the identity labels and whose activation opens the manager; edits re-run the Config refresh through a hook slot (the dialog's `on_changed` can't capture the closure that built its anchor row - a self-reference), and the composer's dropdown re-fetches from `UiState` live, so an identity added while a composer is open shows up in its From list immediately. iMIP replies pick up the display-name fix too: `respond_to_imip_invitation` threads the account's display name into the RFC 6047 `METHOD:REPLY`'s From header.
+
+### Changed
+
+- **Mail**: the composer no longer takes a bare `from_email: String`. `show_composer_in_reading_pane` and `build_compose_view` now take the account id and an `identities_source` closure re-read from `UiState` whenever the manage dialog fires, falling back to the first connected account; `open_mailto_unsubscribe` drops its now-redundant `from_email` parameter.
+
+### Testing
+
+- New unit tests: `build_raw_message` headers (display name quoted into the From header, bare address without one, `Reply-To:` emitted when set and absent when empty, `Bcc:` reaching only the SMTP envelope); `AppConfig` round-trip against the unified identity shape plus `identities_for_account` prepending the synthesized default and dropping a duplicate of the account's own address while never mixing in another account's identities; and the manage dialog's `parse_addresses` (display-name tokens reduced to their addr-spec, garbage fields dropped). The `ComposedMessage` literals in the GreenMail integration test, the send-test example, and the iMIP reply path all construct the two new fields.
+
 ## 0.7.4 (2026-08-07)
 
 ### Added

@@ -4,7 +4,7 @@ use crate::ids::AccountId;
 /// Purely local sending-identity configuration tied to an SMTP `MAIL FROM`
 /// override — unlike Bulwark's JMAP `Identity`, there is no server-stored
 /// object to sync, since IMAP/SMTP have no such concept.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Identity {
     pub id: uuid::Uuid,
     pub account_id: AccountId,
@@ -27,6 +27,17 @@ impl Identity {
             bcc: Vec::new(),
             text_signature: None,
             html_signature: None,
+        }
+    }
+
+    /// A dropdown label: `Name <email>` when a display name is set, the bare
+    /// address otherwise.
+    pub fn label(&self) -> String {
+        let name = self.name.trim();
+        if name.is_empty() {
+            self.email.clone()
+        } else {
+            format!("{name} <{}>", self.email)
         }
     }
 }

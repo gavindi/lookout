@@ -27,7 +27,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Rich-text/contenteditable WebView body — `multipart/alternative` send, default mode under Config → Mail
 - [x] Recipient chip widget with autocomplete (local address book + CardDAV suggestions)
 - [x] Autosave drafts (5s tick, in-place `APPEND` to Drafts, saved on Cancel, deleted on Send)
-- [ ] Multiple sending identities
+- [x] Multiple sending identities — per-account From dropdown in the composer (default = account's own address), display name in `From:`, per-identity Reply-To/Bcc, manage dialog (`settings.json`) from the composer and Config → Accounts
 - [x] Connection lifecycle: state machine, backoff reconnect, pre-timeout IDLE re-issue, `Gio.NetworkMonitor`-driven reconnect
 - [x] `Adw.ToastOverlay` for connection/send errors
 - [x] Flatpak manifest spike with GOA `--talk-name` permission

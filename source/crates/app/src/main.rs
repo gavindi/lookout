@@ -1,9 +1,5 @@
 //! GTK4/libadwaita application entry point.
 
-// The relational-data config skeleton: nothing populates it yet (multi-
-// identity and folder-role overrides are still roadmap items), so it's
-// allowed to be unused until its first consumer lands.
-#[allow(dead_code)]
 mod app_config;
 mod background_image;
 mod calendar_colors;
@@ -14,6 +10,7 @@ mod event_editor;
 mod folder_tree;
 mod goa_calendar_credentials;
 mod goa_credentials;
+mod identities;
 mod last_view;
 mod message_header;
 mod message_list;

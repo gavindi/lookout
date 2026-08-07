@@ -10,17 +10,24 @@ use crate::config::{Credential, EndpointConfig};
 use crate::error::{Error, Result};
 
 /// A message the user has composed, ready to be built into a raw RFC 5322
-/// document and sent. Deliberately simple for Phase 1: a single `From`
-/// address (the account's own address - no sending-identity selection yet).
-/// `text_body` is always set (the plain-text fallback); `html_body`, when
-/// present, is emitted alongside it as a `multipart/alternative` so
-/// HTML-capable clients get the rich version and everything else the text.
+/// document and sent. `from` is the sending identity's address (an account
+/// can send as several identities); `display_name`, when set, goes into the
+/// `From:` header alongside it. `text_body` is always set (the plain-text
+/// fallback); `html_body`, when present, is emitted alongside it as a
+/// `multipart/alternative` so HTML-capable clients get the rich version and
+/// everything else the text.
 #[derive(Debug)]
 pub struct ComposedMessage {
     pub from: String,
+    /// The sending identity's display name, if any. Never sent bare: the
+    /// `From:` header is `Name <address>` when set, plain `<address>`
+    /// otherwise.
+    pub display_name: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
+    /// RFC 5322 `Reply-To` addresses, from the sending identity.
+    pub reply_to: Vec<String>,
     pub subject: String,
     pub text_body: String,
     /// Optional HTML rendering of the same body. Both parts are sent when
@@ -62,7 +69,7 @@ pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>
 
     let mut builder = MessageBuilder::new()
         .message_id(message_id.clone())
-        .from(BuilderAddress::new_address(None::<String>, msg.from.clone()))
+        .from(BuilderAddress::new_address(msg.display_name.clone(), msg.from.clone()))
         .subject(msg.subject.clone());
     if let Some(ics) = msg.calendar_part.as_deref().filter(|ics| !ics.is_empty()) {
         // iMIP payload: `multipart/alternative` [text/plain, text/calendar]
@@ -99,6 +106,11 @@ pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>
     if !msg.cc.is_empty() {
         builder = builder.cc(BuilderAddress::new_list(
             msg.cc.iter().map(|a| BuilderAddress::new_address(None::<String>, a.clone())).collect(),
+        ));
+    }
+    if !msg.reply_to.is_empty() {
+        builder = builder.reply_to(BuilderAddress::new_list(
+            msg.reply_to.iter().map(|a| BuilderAddress::new_address(None::<String>, a.clone())).collect(),
         ));
     }
     // Bcc is deliberately not added as a header (that would leak it to
@@ -160,9 +172,11 @@ mod tests {
     fn sample_message(html: Option<String>) -> ComposedMessage {
         ComposedMessage {
             from: "me@example.com".to_string(),
+            display_name: None,
             to: vec!["you@example.com".to_string()],
             cc: vec![],
             bcc: vec![],
+            reply_to: vec![],
             subject: "test".to_string(),
             text_body: "plain part".to_string(),
             html_body: html,
@@ -257,5 +271,41 @@ mod tests {
         };
         let raw = raw_to_string(&msg);
         assert!(!raw.to_lowercase().contains("text/calendar"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn display_name_goes_into_the_from_header() {
+        let mut msg = sample_message(None);
+        msg.display_name = Some("Ada Lovelace".to_string());
+        let raw = raw_to_string(&msg);
+        // `mail_builder` RFC 2047-quotes display names containing spaces.
+        assert!(raw.contains("From: \"Ada Lovelace\" <me@example.com>"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn without_a_display_name_the_from_header_is_the_bare_address() {
+        let raw = raw_to_string(&sample_message(None));
+        assert!(raw.contains("From: <me@example.com>"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn reply_to_is_emitted_when_set_and_skipped_when_empty() {
+        let mut msg = sample_message(None);
+        msg.reply_to = vec!["replies@example.com".to_string(), "alt@example.com".to_string()];
+        let raw = raw_to_string(&msg);
+        assert!(raw.contains("Reply-To: <replies@example.com>, <alt@example.com>"), "raw:\n{raw}");
+
+        let raw = raw_to_string(&sample_message(None));
+        assert!(!raw.to_lowercase().contains("reply-to"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn bcc_still_reaches_only_the_envelope() {
+        let mut msg = sample_message(None);
+        msg.bcc = vec!["hidden@example.com".to_string()];
+        let (_, _, recipients) = build_raw_message(&msg);
+        assert!(recipients.contains(&"hidden@example.com".to_string()));
+        let raw = raw_to_string(&msg);
+        assert!(!raw.to_lowercase().contains("bcc"), "bcc leaked into headers:\n{raw}");
     }
 }
