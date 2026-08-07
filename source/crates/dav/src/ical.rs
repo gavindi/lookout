@@ -429,7 +429,9 @@ fn build_vtodo(task: &CalendarTask) -> icalendar::Todo {
 /// parseable VEVENT (a `text/calendar` part that is somehow not an event -
 /// e.g. a bare VTODO or a VALARM-only document - is not an invitation).
 /// The method comes from the raw document via [`lookout_core::parse_imip_method`];
-/// the event's summary and organizer come from the parsed VEVENT.
+/// the event's summary, organizer and the details the reading pane's invite
+/// card shows (start/end/all-day/location/description/recurrence) come from
+/// the parsed VEVENT.
 pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
     let method = lookout_core::parse_imip_method(ics);
     // The CalendarId is purely the parsed event's ownership stamp and never
@@ -443,6 +445,12 @@ pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
         summary: event.summary,
         organizer: event.organizer,
         in_reply_to: None,
+        start: event.start,
+        end: event.end,
+        all_day: event.all_day,
+        location: event.location,
+        description: event.description,
+        rrule: event.rrule,
     })
 }
 
@@ -815,6 +823,24 @@ mod tests {
         assert_eq!(invitation.summary.as_deref(), Some("Planning"));
         assert_eq!(invitation.organizer.as_ref().map(|o| o.address.as_str()), Some("ada@example.com"));
         assert_eq!(invitation.in_reply_to, None, "the message's own Message-ID is the reading pane's job");
+        assert_eq!(invitation.start, "2026-07-15T14:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(invitation.end, "2026-07-15T15:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert!(!invitation.all_day);
+        assert_eq!(invitation.location, None);
+        assert_eq!(invitation.description, None);
+        assert_eq!(invitation.rrule, None);
+    }
+
+    #[test]
+    fn parse_imip_invitation_carries_location_description_and_recurrence() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:inv-2@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART;VALUE=DATE:20260810\r\nDTEND;VALUE=DATE:20260811\r\nSUMMARY:All-hands\r\nLOCATION:Room 7, Building C\r\nDESCRIPTION:Quarterly review with the whole team.\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let invitation = parse_imip_invitation(ics).expect("parses");
+        assert!(invitation.all_day, "VALUE=DATE start must mark the event all-day");
+        assert_eq!(invitation.start, "2026-08-10T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(invitation.end, "2026-08-11T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(invitation.location.as_deref(), Some("Room 7, Building C"));
+        assert_eq!(invitation.description.as_deref(), Some("Quarterly review with the whole team."));
+        assert_eq!(invitation.rrule.as_deref(), Some("FREQ=WEEKLY;COUNT=4"));
     }
 
     #[test]

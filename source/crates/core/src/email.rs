@@ -446,6 +446,22 @@ pub struct ImipInvitation {
     /// `In-Reply-To`/`References`. Filled in by the reading pane, which has
     /// the message's headers where the parser only has the iCalendar part.
     pub in_reply_to: Option<String>,
+    /// The invited event's start, in UTC - the first instance's `DTSTART`
+    /// (for a recurring invitation this is the master's start, not an
+    /// occurrence's).
+    pub start: chrono::DateTime<chrono::Utc>,
+    /// The invited event's end, in UTC - `DTEND`, exclusive like `DTSTART`.
+    pub end: chrono::DateTime<chrono::Utc>,
+    /// Whether the event is an all-day entry (`DTSTART;VALUE=DATE`), which
+    /// the details card renders as a date instead of a time range.
+    pub all_day: bool,
+    /// The event's `LOCATION`, if any.
+    pub location: Option<String>,
+    /// The event's `DESCRIPTION`, if any.
+    pub description: Option<String>,
+    /// The raw `RRULE` value (RFC 5545 `RECUR`) when the invitation is for a
+    /// recurring event - the details card shows a "recurring" hint for it.
+    pub rrule: Option<String>,
 }
 
 #[cfg(test)]

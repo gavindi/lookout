@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.6 (2026-08-08)
+
+### Added
+
+- **Mail**: emails with calendar invitations now show the event's actual details. The reading pane's iMIP accept/deny bar (`Adw.Banner`, at the bottom of the message page) only fits a title and a button, so it never said anything beyond the summary - no day, no time, no place. A new invite-details card sits between the attachments and the body for exactly those messages, complementing the banner: a **When** row (start/end in local time, e.g. `Mon 10 Aug 2026 · 9:30 AM – 10:30 AM`, shown as dates for all-day events with `DTEND`'s exclusivity undone for the last day, plus a `· Recurring` hint when the master carries an `RRULE`), a **Where** row (the event's `LOCATION`), an **Organizer** row (display name alongside the address), and a **Description** row - each row hidden when the payload lacks that property, all repopulated per message and hidden with the banner once dismissed or on navigation. `lookout_core::ImipInvitation` gains the fields the card renders (`start`, `end`, `all_day`, `location`, `description`, `rrule`), which `lookout-dav::parse_imip_invitation` now carries through from the parsed VEVENT instead of discarding, and the card is built once as a named child of the message page with the attachment strip's rebuild-on-render lifecycle.
+
+### Testing
+
+- `lookout-dav`: `parse_imip_invitation` tests now assert the extracted start/end timestamps alongside method/summary/organizer, and a new test covers a `VALUE=DATE` all-day invitation with `LOCATION`, `DESCRIPTION`, and `RRULE` all surviving the parse.
+
 ## 0.8.5 (2026-08-08)
 
 ### Fixed

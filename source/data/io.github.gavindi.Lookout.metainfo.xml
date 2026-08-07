@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.8.6" date="2026-08-08">
+      <description>
+        <p>Emails with calendar invitations now show the event's details: a card above the message body displays when the event is (local time, or the date for all-day events, with a recurring hint), where it is, who organized it, and any description - alongside the usual accept/deny bar.</p>
+      </description>
+    </release>
     <release version="0.8.5" date="2026-08-08">
       <description>
         <p>The People tab's left pane now matches the calendar and mail panes: its category list is transparent, so the window background image shows through the translucent card the same way the other modules' sidebars do.</p>

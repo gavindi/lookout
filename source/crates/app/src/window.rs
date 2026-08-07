@@ -2085,6 +2085,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     attachment_strip.set_margin_bottom(4);
     attachment_strip.set_visible(false);
     message_page.append(&attachment_strip);
+    // The iMIP invite-details card, between the attachments and the body.
+    // The `adw::Banner` at the bottom of the page only fits a title and a
+    // button, so this card carries what the invitation actually says - when,
+    // where, who's organizing, and any description - with one row per detail
+    // (`render_invite_card` shows/hides rows as the payload provides them).
+    // Built once here as a named child; `render_body` repopulates it per
+    // message, mirroring the attachment strip's lifecycle.
+    let imip_invite_card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .css_classes(["card"])
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(8)
+        .margin_bottom(4)
+        .build();
+    imip_invite_card.set_widget_name("imip-invite-card");
+    imip_invite_card.set_visible(false);
+    imip_invite_card.append(&invite_detail_row("imip-when-row", "imip-when", "When"));
+    imip_invite_card.append(&invite_detail_row("imip-where-row", "imip-where", "Where"));
+    imip_invite_card.append(&invite_detail_row("imip-organizer-row", "imip-organizer", "Organizer"));
+    imip_invite_card.append(&invite_detail_row("imip-description-row", "imip-description", "Description"));
+    message_page.append(&imip_invite_card);
     message_page.append(&content_stack);
     message_page.append(&message_header.action_bar);
     // The List-Unsubscribe banner, between the header and the body: revealed
@@ -8172,6 +8195,112 @@ fn find_attachment_strip(reading_stack: &gtk::Stack) -> Option<gtk::Box> {
     find_named_child(reading_stack, "attachments")?.downcast::<gtk::Box>().ok()
 }
 
+/// Returns the first direct child of `root` whose `widget_name()` is `name`.
+/// The invite card's fixed row structure is looked up this way (rather than
+/// holding widget references across `render_body` calls) so `render_invite_card`
+/// can repopulate the card the same way `rebuild_attachment_strip` finds the
+/// strip.
+fn named_child_of(root: &gtk::Box, name: &str) -> Option<gtk::Widget> {
+    let mut child = root.first_child();
+    while let Some(c) = child {
+        if c.widget_name() == name {
+            return Some(c);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// One row of the reading pane's invite-details card: a dim caption above a
+/// wrapping value label. Both the row and its value label get `widget_name`s
+/// (`row_name`/`value_name`) so `render_invite_card` can find them and hide a
+/// row wholesale when the invitation lacks that property.
+fn invite_detail_row(row_name: &str, value_name: &str, caption: &str) -> gtk::Box {
+    let row = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).build();
+    row.set_widget_name(row_name);
+    let caption_label = gtk::Label::new(Some(caption));
+    caption_label.add_css_class("dim-label");
+    caption_label.add_css_class("caption");
+    caption_label.set_xalign(0.0);
+    let value = gtk::Label::new(None);
+    value.set_widget_name(value_name);
+    value.set_xalign(0.0);
+    value.set_wrap(true);
+    value.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    row.append(&caption_label);
+    row.append(&value);
+    row
+}
+
+/// Sets one invite-card row's value label, hiding the row when the invitation
+/// has nothing for it. `text == None` hides the row; `Some("")` is not
+/// expected but would show an empty value (callers only pass `Some` for
+/// payloads that actually carry the property).
+fn set_invite_row(card: &gtk::Box, row_name: &str, value_name: &str, text: Option<String>) {
+    let Some(row) = named_child_of(card, row_name).and_then(|r| r.downcast::<gtk::Box>().ok()) else {
+        return;
+    };
+    row.set_visible(text.is_some());
+    if let Some(label) = named_child_of(&row, value_name).and_then(|l| l.downcast::<gtk::Label>().ok()) {
+        label.set_label(text.as_deref().unwrap_or(""));
+    }
+}
+
+/// Renders the invite card's "When" line: the event's start/end in local time
+/// (all-day entries as dates, with `DTEND`'s exclusivity undone for the last
+/// shown day), plus a recurring hint when the master carries an `RRULE`.
+/// Follows the 12-hour style the calendar views and the message header use.
+fn format_imip_when(invitation: &lookout_core::ImipInvitation) -> String {
+    let recurring = if invitation.rrule.is_some() { " · Recurring" } else { "" };
+    let start = invitation.start.with_timezone(&chrono::Local);
+    let end = invitation.end.with_timezone(&chrono::Local);
+    if invitation.all_day {
+        if end.date_naive() == start.date_naive() {
+            return format!("All day · {}{}", start.format("%a %d %b %Y"), recurring);
+        }
+        // DTEND is exclusive: the last day shown is the one before it.
+        let last_day = end.date_naive() - chrono::Duration::days(1);
+        return format!("All day · {} – {}{}", start.format("%a %d %b %Y"), last_day.format("%a %d %b %Y"), recurring);
+    }
+    if end.date_naive() == start.date_naive() {
+        format!("{} · {} – {}{}", start.format("%a %d %b %Y"), start.format("%I:%M %p"), end.format("%I:%M %p"), recurring)
+    } else {
+        format!(
+            "{} {} – {} {}{}",
+            start.format("%a %d %b %Y"),
+            start.format("%I:%M %p"),
+            end.format("%a %d %b %Y"),
+            end.format("%I:%M %p"),
+            recurring
+        )
+    }
+}
+
+/// The invite card's "Organizer" line: the display name (when the payload
+/// carries one) alongside the address, so the reply's recipient is unambiguous.
+fn format_imip_organizer(organizer: &lookout_core::EmailAddress) -> String {
+    match &organizer.name {
+        Some(name) if !name.trim().is_empty() => format!("{} <{}>", name, organizer.address),
+        _ => organizer.address.clone(),
+    }
+}
+
+/// Repopulates the reading pane's invite-details card for the invitation
+/// being rendered, hiding it when the message carries none (or the user
+/// dismissed it). Complements the `adw::Banner` at the bottom of the page,
+/// which only fits a title and a button.
+fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<&lookout_core::ImipInvitation>) {
+    let Some(card) = find_named_child(reading_stack, "imip-invite-card").and_then(|c| c.downcast::<gtk::Box>().ok()) else {
+        return;
+    };
+    card.set_visible(invitation.is_some());
+    let Some(invitation) = invitation else { return };
+    set_invite_row(&card, "imip-when-row", "imip-when", Some(format_imip_when(invitation)));
+    set_invite_row(&card, "imip-where-row", "imip-where", invitation.location.clone());
+    set_invite_row(&card, "imip-organizer-row", "imip-organizer", invitation.organizer.as_ref().map(format_imip_organizer));
+    set_invite_row(&card, "imip-description-row", "imip-description", invitation.description.clone());
+}
+
 /// Renders an attachment's size as a human-readable string (e.g. `"12.3 KB"`),
 /// matching the binary-unit convention everyone expects for file sizes.
 fn human_size(bytes: u32) -> String {
@@ -8794,6 +8923,11 @@ fn render_body(
             banner.set_title(&title);
             banner.set_button_label(Some(&button));
             banner.set_revealed(!dismissed && st.imip.is_some());
+            // The invite-details card mirrors the banner's visibility: shown
+            // for the same payload, hidden once the user dismisses it (or
+            // when the message carries no invitation at all - `st.imip` was
+            // set from this message's `text/calendar` part above).
+            render_invite_card(reading_stack, st.imip.as_ref().filter(|_| !dismissed));
         }
     }
     // Config → Appearance → "Animate transitions" can switch the stack's
