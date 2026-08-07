@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.4 (2026-08-08)
+
+### Added
+
+- **Settings**: Config → Appearance gains a **Background dimming** slider that dims a user-picked window background from 100% (no darkening) down to 0% (darkened to black). It sits between the "Window background" and "Restore default background" rows and only becomes active while a custom image is set - the bundled artwork always shows in full - and the chosen dim value is persisted in a new `background-brightness` GSettings key (range 0-1, default 1.0, meaning no dimming when no value is stored) and reapplied on launch. Every freshly-picked background image starts at 50% brightness, and "Restore default background" resets the stored value back to 1.0. The dim itself is an opaque-black click-through overlay between the background image and the app content, whose opacity (1 - brightness) follows the slider live.
+
+### Changed
+
+- **UI**: the black horizontal menu bar now has rounded corners. The shared black background behind the menu bar and command toolbars gets an 8px border radius, 6px margins on every side so the corners show against the window background, and hidden overflow so the rows clip to the rounded shape - the same floating rounded-panel treatment as the icon toolbar and folder card.
+
+### Testing
+
+- `lookout-app`: the `settings` tests now cover the new `background-brightness` key - its round-trip through the store and its 1.0 default (no dimming) alongside the untouched-keys assertions.
+
 ## 0.8.3 (2026-08-08)
 
 ### Added

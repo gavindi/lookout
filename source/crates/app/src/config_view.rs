@@ -1,6 +1,6 @@
 //! Config view: a read-only overview of the Mail/Calendar accounts Lookout
 //! is connected to, a live Appearance section (the smooth-transitions
-//! preference and the window-background image picker), live Mail and Calendar
+//! preference, the window-background image picker and its dimming slider), live Mail and Calendar
 //! preference groups (the remote-images/rich-text toggles and the event-alerts
 //! toggle), disabled placeholder
 //! sections mirroring the rest of the Phase 5 settings taxonomy (General/Layout/Mail/Privacy/Apps) and a live
@@ -76,6 +76,14 @@ pub struct ConfigView {
     /// signal to a file chooser and update its subtitle to reflect the image
     /// currently in use.
     pub background_image_row: adw::ActionRow,
+    /// "Background dimming" row, exposed so the caller can arm it (and its
+    /// slider below) whenever a custom background is set and disarm it on
+    /// restore.
+    pub background_brightness_row: adw::ActionRow,
+    /// The brightness slider sitting inside `background_brightness_row`,
+    /// exposed so the caller can wire its `value-changed` signal into the
+    /// window background's brightness and seed it with the stored value.
+    pub background_brightness_scale: gtk::Scale,
     /// "Restore default background" row, exposed so the caller can wire its
     /// `activated` signal back to the bundled artwork (and re-enable it only
     /// when a custom image is actually set).
@@ -154,6 +162,19 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     appearance_group.add(&background_image_row);
+    // The brightness slider only matters for a user-picked image (the bundled
+    // artwork is always shown in full), so it starts disabled and the caller
+    // arms it when a custom background is applied.
+    let background_brightness_row = adw::ActionRow::builder()
+        .title("Background dimming")
+        .subtitle("Reduce the background toward black")
+        .sensitive(false)
+        .build();
+    let background_brightness_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+    background_brightness_scale.set_value(1.0);
+    background_brightness_scale.set_draw_value(false);
+    background_brightness_row.set_child(Some(&background_brightness_scale));
+    appearance_group.add(&background_brightness_row);
     let restore_background_row = adw::ActionRow::builder()
         .title("Restore default background")
         .subtitle("Use the bundled artwork again")
@@ -253,6 +274,8 @@ pub fn build() -> ConfigView {
         clear_cache_row,
         animations_row,
         background_image_row,
+        background_brightness_row,
+        background_brightness_scale,
         restore_background_row,
         remote_images_row,
         rich_text_row,

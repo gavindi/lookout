@@ -31,6 +31,7 @@ pub const SCHEMA_ID: &str = "io.github.gavindi.Lookout";
 
 pub const ANIMATE_TRANSITIONS: &str = "animate-transitions";
 pub const WINDOW_BACKGROUND_PATH: &str = "window-background-path";
+pub const BACKGROUND_BRIGHTNESS: &str = "background-brightness";
 pub const LAYOUT_FOLDER_PANE: &str = "layout-folder-pane";
 pub const LAYOUT_READING_PANE: &str = "layout-reading-pane";
 pub const LAYOUT_CALENDAR_OVERVIEW: &str = "layout-calendar-overview";
@@ -105,6 +106,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     let mut map = HashMap::new();
     map.insert(ANIMATE_TRANSITIONS, Value::Bool(true));
     map.insert(WINDOW_BACKGROUND_PATH, Value::String(String::new()));
+    map.insert(BACKGROUND_BRIGHTNESS, Value::Double(1.0));
     map.insert(LAYOUT_FOLDER_PANE, Value::Bool(true));
     map.insert(LAYOUT_READING_PANE, Value::Bool(true));
     map.insert(LAYOUT_CALENDAR_OVERVIEW, Value::Bool(true));
@@ -254,6 +256,8 @@ mod tests {
         assert_eq!(store.get_double(PANE_FOLDER_WIDTH_PCT), 13.75);
         store.set_double(PANE_MESSAGE_LIST_WIDTH_PCT, 30.0);
         assert_eq!(store.get_double(PANE_MESSAGE_LIST_WIDTH_PCT), 30.0);
+        store.set_double(BACKGROUND_BRIGHTNESS, 0.4);
+        assert_eq!(store.get_double(BACKGROUND_BRIGHTNESS), 0.4);
     }
 
     #[test]
@@ -264,6 +268,7 @@ mod tests {
         assert!(store.get_bool(CALENDAR_ALERTS_ENABLED));
         assert_eq!(store.get_string(LAST_VIEW_MAILBOX), "");
         assert_eq!(store.get_string(SORT_KEY), "date");
+        assert_eq!(store.get_double(BACKGROUND_BRIGHTNESS), 1.0);
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());
     }
 }

@@ -651,6 +651,13 @@ fn install_paned_css() {
         .folder-pane {
             background-color: rgba(0, 0, 0, 0.5);
         }
+        /* The black widget overlaid on the window background image while the
+           user dims it (Config → Appearance → 'Background dimming'): its
+           opacity, set from the widget, controls how much the image darkens
+           toward black. */
+        .window-background-dim {
+            background-color: black;
+        }
         /* The folder rows' trailing unread count. Bold and accent-blue to
            match the message list's unread rows. Tabular figures ('tnum') so
            the digits are the same width in every row - without them the
@@ -684,6 +691,7 @@ fn install_paned_css() {
         }
         .window-toolbars-background {
             background-color: black;
+            border-radius: 8px;
         }
         .window-icon-toolbar-background {
             background-color: #2e2e32;
@@ -3036,9 +3044,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // Menu bar + icon toolbar grouped onto their own shared black
     // background, rather than each row painting (or not painting) its own.
+    // Rounded like the icon toolbar's grey subgroup, and margined so the
+    // corners show against the window background image.
     let toolbars_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .css_classes(["window-toolbars-background"])
+        .overflow(gtk::Overflow::Hidden)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(6)
+        .margin_bottom(6)
         .build();
     toolbars_box.append(&menu_bar);
     toolbars_box.append(&icon_toolbar_box);
@@ -3077,6 +3092,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let window_overlay = gtk::Overlay::new();
     window_overlay.set_child(Some(&background));
+    // The dimming layer between the background image and the app content:
+    // an opaque-black widget whose opacity (1 - brightness) darkens a
+    // user-picked background toward black per Config → Appearance →
+    // "Background dimming". `can_target(false)` keeps it click-through.
+    // It starts fully transparent: brightness only ever comes from a stored
+    // GSettings value applied below when a custom background is in use, so
+    // the bundled artwork (and no stored value) always shows undimmed.
+    let background_dim = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    background_dim.set_can_target(false);
+    background_dim.set_css_classes(&["window-background-dim"]);
+    background_dim.set_opacity(0.0);
+    window_overlay.add_overlay(&background_dim);
     window_overlay.add_overlay(&toast_overlay);
 
     let window = adw::ApplicationWindow::builder()
@@ -3579,16 +3606,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // Config → Appearance → "Window background": reflect a stored custom
-    // background (if one applied at startup) in the row subtitle and arm the
-    // restore row; then wire the picker to a file chooser and "Restore
-    // default background" back to the bundled artwork.
+    // background (if one applied at startup) in the row subtitle, arm the
+    // restore row and the dimming slider (seeded with the stored brightness),
+    // then wire the picker to a file chooser, the dimming slider into the
+    // background's brightness, and "Restore default background" back to the
+    // bundled artwork (which also resets dimming). The slider only applies
+    // while a custom image is set: the bundled artwork always shows in full.
+    let apply_background_brightness = {
+        let background_dim = background_dim.clone();
+        move |brightness: f64| background_dim.set_opacity(1.0 - brightness.clamp(0.0, 1.0))
+    };
     if let Some(name) = &custom_background_name {
         config_view.background_image_row.set_subtitle(name);
         config_view.restore_background_row.set_sensitive(true);
+        let brightness = settings.get_double(crate::settings::BACKGROUND_BRIGHTNESS);
+        config_view.background_brightness_scale.set_value(brightness);
+        config_view.background_brightness_row.set_sensitive(true);
+        apply_background_brightness(brightness);
     }
     {
         let background_image_row = config_view.background_image_row.clone();
         let restore_background_row = config_view.restore_background_row.clone();
+        let background_brightness_row = config_view.background_brightness_row.clone();
+        let background_brightness_scale = config_view.background_brightness_scale.clone();
         let background = background.clone();
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
@@ -3599,6 +3639,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let background = background.clone();
             let toast_overlay = toast_overlay.clone();
             let restore_background_row = restore_background_row.clone();
+            let background_brightness_row = background_brightness_row.clone();
+            let background_brightness_scale = background_brightness_scale.clone();
             let settings = settings.clone();
             glib::spawn_future_local(async move {
                 let filter = gtk::FileFilter::new();
@@ -3617,6 +3659,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
                         row.set_subtitle(&name);
                         restore_background_row.set_sensitive(true);
+                        // Every freshly-picked image starts at 50% brightness
+                        // (the `value-changed` handler persists it and applies
+                        // it to the overlay).
+                        background_brightness_scale.set_value(0.5);
+                        background_brightness_row.set_sensitive(true);
                     }
                     Err(e) => {
                         toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't load background image: {e}")));
@@ -3626,14 +3673,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     {
+        let background_brightness_scale = config_view.background_brightness_scale.clone();
+        let settings = settings.clone();
+        let apply_background_brightness = apply_background_brightness.clone();
+        background_brightness_scale.connect_value_changed(move |scale| {
+            let brightness = scale.value();
+            settings.set_double(crate::settings::BACKGROUND_BRIGHTNESS, brightness);
+            apply_background_brightness(brightness);
+        });
+    }
+    {
         let restore_background_row = config_view.restore_background_row.clone();
         let background_image_row = config_view.background_image_row.clone();
+        let background_brightness_row = config_view.background_brightness_row.clone();
+        let background_brightness_scale = config_view.background_brightness_scale.clone();
         let background = background.clone();
         let settings = settings.clone();
+        let apply_background_brightness = apply_background_brightness.clone();
         restore_background_row.connect_activated(move |row| {
             crate::background_image::clear(&settings);
             background.set_paintable(Some(&default_bg_texture));
             background_image_row.set_subtitle("Default Lookout artwork");
+            // The bundled artwork always shows at full brightness: reset the
+            // stored dim value so the slider (and the next custom image)
+            // start at 100%.
+            settings.set_double(crate::settings::BACKGROUND_BRIGHTNESS, 1.0);
+            background_brightness_scale.set_value(1.0);
+            background_brightness_row.set_sensitive(false);
+            apply_background_brightness(1.0);
             row.set_sensitive(false);
         });
     }

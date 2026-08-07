@@ -19,6 +19,12 @@
       <summary>Custom window background image</summary>
       <description>Path to a user-picked image used as the window background; empty means the bundled artwork.</description>
     </key>
+    <key name="background-brightness" type="d">
+      <range min="0" max="1"/>
+      <default>1.0</default>
+      <summary>Window background brightness</summary>
+      <description>How bright the user-picked window background image is shown: 1.0 means no darkening, 0.0 means darkened to black. Only applies while a custom background is set.</description>
+    </key>
 
     <!-- View → Layout -->
     <key name="layout-folder-pane" type="b">
