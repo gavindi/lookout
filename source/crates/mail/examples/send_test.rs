@@ -102,11 +102,12 @@ async fn main() -> anyhow::Result<()> {
                                 subject: marker.clone(),
                                 text_body: "This is an automated self-test from Lookout's send_test example.".into(),
                                 html_body: None,
+                                calendar_part: None,
                                 in_reply_to: None,
                                 references: vec![],
                                 message_id: None,
                             };
-                            let _ = cmd_tx.send(AccountCommand::SendMessage(msg)).await;
+                            let _ = cmd_tx.send(AccountCommand::SendMessage(Box::new(msg))).await;
                             sent_command = true;
                         }
                         sent_mailbox_id = folders

@@ -188,6 +188,14 @@ impl BodyPart {
     pub fn is_text(&self) -> bool {
         matches!(self.content_type.as_str(), "text/plain" | "text/html")
     }
+
+    /// Whether this part carries an iCalendar document (`text/calendar`, RFC
+    /// 5545 §3.2). The iMIP path fetches these parts alongside the text parts
+    /// and surfaces the invitation through the reading pane's banner rather
+    /// than rendering the raw ICS as body text.
+    pub fn is_calendar(&self) -> bool {
+        self.content_type.eq_ignore_ascii_case("text/calendar")
+    }
 }
 
 /// Matches a `cid:` reference from a message's HTML against a MIME part's
@@ -308,6 +316,11 @@ pub struct EmailBody {
     pub uid: Uid,
     pub text_body: Option<String>,
     pub html_body: Option<String>,
+    /// The decoded contents of the message's `text/calendar` part (if any) -
+    /// the iMIP invitation payload the reading pane's banner acts on. Never
+    /// fetched for display; `None` for the vast majority of messages.
+    #[serde(default)]
+    pub calendar_ics: Option<String>,
     pub parts: Vec<BodyPart>,
     pub headers: Vec<(String, String)>,
     pub auth_results: Option<AuthenticationResults>,
@@ -368,6 +381,71 @@ pub fn parse_list_unsubscribe(headers: &[(String, String)]) -> Option<ListUnsubs
     }
     let one_click = header_value(headers, "list-unsubscribe-post").is_some_and(|v| v.to_ascii_lowercase().contains("one-click"));
     Some(ListUnsubscribe { mailto, http, one_click })
+}
+
+/// The iMIP `METHOD` property (RFC 5546 §3.2): what an email carrying a
+/// `text/calendar` part asks the recipient to do. `REQUEST` is an invitation
+/// (or re-invitation), `REPLY` carries an attendee's RSVP back to the
+/// organizer, and `CANCEL` withdraws an event. The banner and its reply
+/// actions are keyed on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ImipMethod {
+    Request,
+    Reply,
+    Cancel,
+}
+
+/// Reads the `METHOD` property off an iCalendar document as
+/// [`ImipMethod`]. Per RFC 5546 §4.3, an email invitation with no `METHOD`
+/// at all is a REQUEST, so anything missing or unrecognized resolves there
+/// rather than failing. The scan only matches at the calendar level - a
+/// `METHOD` property can never legally appear inside a `VEVENT`, but a
+/// defensively-written scanner shouldn't pick one up from a nested component
+/// either. iCalendar lines are short enough that `METHOD` never participates
+/// in RFC 5545 line folding, so a plain line scan is sufficient.
+pub fn parse_imip_method(ics: &str) -> ImipMethod {
+    let mut depth = 0usize;
+    for line in ics.lines() {
+        let upper = line.trim().to_ascii_uppercase();
+        if let Some(rest) = upper.strip_prefix("BEGIN:") {
+            depth += usize::from(rest != "VCALENDAR");
+            continue;
+        }
+        if let Some(_rest) = upper.strip_prefix("END:") {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth == 0 {
+            if let Some(value) = upper.strip_prefix("METHOD:").map(str::trim) {
+                return match value {
+                    "REPLY" => ImipMethod::Reply,
+                    "CANCEL" => ImipMethod::Cancel,
+                    _ => ImipMethod::Request,
+                };
+            }
+        }
+    }
+    ImipMethod::Request
+}
+
+/// An iMIP invitation (or related message) carried by a message's
+/// `text/calendar` part, as surfaced to the reading pane's banner. The raw
+/// `ics` is kept so the reply/removal flows can re-serialize the event with
+/// the recipient's updated `PARTSTAT` (see `lookout-dav`'s
+/// `build_imip_vcalendar`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImipInvitation {
+    pub method: ImipMethod,
+    /// The decoded iCalendar document from the message's `text/calendar` part.
+    pub ics: String,
+    /// The invited event's summary, for the banner's label.
+    pub summary: Option<String>,
+    /// The organizer's address (from `ORGANIZER`) - the reply's recipient.
+    pub organizer: Option<EmailAddress>,
+    /// The message's own `Message-ID`, threaded onto the reply's
+    /// `In-Reply-To`/`References`. Filled in by the reading pane, which has
+    /// the message's headers where the parser only has the iCalendar part.
+    pub in_reply_to: Option<String>,
 }
 
 #[cfg(test)]
@@ -534,5 +612,62 @@ mod tests {
         // An empty value.
         let empty = vec![("list-unsubscribe".to_string(), "".to_string())];
         assert_eq!(parse_list_unsubscribe(&empty), None);
+    }
+
+    #[test]
+    fn parse_imip_method_reads_the_calendar_level_method() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:x@y\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nSUMMARY:Hi\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_imip_method(ics), ImipMethod::Request);
+
+        let reply = ics.replace("METHOD:REQUEST", "METHOD:REPLY");
+        assert_eq!(parse_imip_method(&reply), ImipMethod::Reply);
+
+        let cancel = ics.replace("METHOD:REQUEST", "METHOD:CANCEL");
+        assert_eq!(parse_imip_method(&cancel), ImipMethod::Cancel);
+    }
+
+    #[test]
+    fn parse_imip_method_defaults_to_request_without_a_method() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:x@y\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_imip_method(ics), ImipMethod::Request);
+    }
+
+    #[test]
+    fn parse_imip_method_is_case_insensitive() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nmethod:reply\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_imip_method(ics), ImipMethod::Reply);
+    }
+
+    #[test]
+    fn parse_imip_method_ignores_methods_inside_nested_components() {
+        // A METHOD property nested inside a VEVENT is illegal RFC 5545, but a
+        // defensive scan must not pick it up over the calendar-level one.
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nMETHOD:CANCEL\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_imip_method(ics), ImipMethod::Request);
+    }
+
+    #[test]
+    fn parse_imip_method_tolerates_windows_line_endings() {
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\n";
+        assert_eq!(parse_imip_method(ics), ImipMethod::Reply);
+    }
+
+    #[test]
+    fn body_part_calendar_detection_is_case_insensitive() {
+        let mut part = BodyPart {
+            part_number: "2".to_string(),
+            content_type: "text/calendar".to_string(),
+            charset: None,
+            transfer_encoding: None,
+            filename: None,
+            cid: None,
+            size: 0,
+            is_attachment: false,
+        };
+        assert!(part.is_calendar());
+        part.content_type = "Text/Calendar".to_string();
+        assert!(part.is_calendar());
+        part.content_type = "text/plain".to_string();
+        assert!(!part.is_calendar());
     }
 }

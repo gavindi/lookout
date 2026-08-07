@@ -13,8 +13,8 @@ pub mod vcard;
 
 pub use calendar::{Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, EventOccurrence, EventSensitivity, EventTransparency};
 pub use email::{
-    cid_matches, header_value, parse_list_unsubscribe, sanitize_tag_key, tag_key_from_keyword, tag_keyword, AuthenticationResults, BodyPart, ContactsProvider, DkimResult,
-    DmarcResult, EmailAddress, EmailBody, EmailSummary, ListUnsubscribe, SpfResult, SystemFlagBit, TAG_KEYWORD_PREFIX,
+    cid_matches, header_value, parse_imip_method, parse_list_unsubscribe, sanitize_tag_key, tag_key_from_keyword, tag_keyword, AuthenticationResults, BodyPart, ContactsProvider,
+    DkimResult, DmarcResult, EmailAddress, EmailBody, EmailSummary, ImipInvitation, ImipMethod, ListUnsubscribe, SpfResult, SystemFlagBit, TAG_KEYWORD_PREFIX,
 };
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, Uid, UidValidity};

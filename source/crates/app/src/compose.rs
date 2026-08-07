@@ -426,11 +426,12 @@ impl AutosaveCtx {
             subject: snap.subject.clone(),
             text_body: snap.body_text.clone(),
             html_body: snap.rich.then(|| snap.body.clone()),
+            calendar_part: None,
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             message_id: Some((*self.draft_message_id).clone()),
         };
-        let _ = self.cmd_tx.send_blocking(AccountCommand::SaveDraft { msg, replace });
+        let _ = self.cmd_tx.send_blocking(AccountCommand::SaveDraft { msg: Box::new(msg), replace });
         self.status_label.set_label("Saving draft…");
     }
 }
@@ -850,11 +851,12 @@ pub fn build_compose_view(
                     subject,
                     text_body,
                     html_body,
+                    calendar_part: None,
                     in_reply_to,
                     references,
                     message_id: None,
                 };
-                let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(msg));
+                let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(Box::new(msg)));
                 closed.set(true);
                 on_done();
             });
@@ -927,6 +929,7 @@ mod tests {
             uid: Uid(1),
             text_body: text_body.map(str::to_string),
             html_body: None,
+            calendar_ics: None,
             parts: Vec::<BodyPart>::new(),
             headers,
             auth_results: None,

@@ -167,7 +167,10 @@ pub enum AccountCommand {
     /// Sent mailbox (two explicit steps - IMAP has no JMAP-style implicit
     /// filing on submit). If no Sent mailbox can be identified, the message
     /// is still sent; only the archival copy is skipped (logged as a warning).
-    SendMessage(ComposedMessage),
+    /// Boxed: the message can be large (an iMIP reply carries a whole
+    /// iCalendar document), and commands are passed one at a time through an
+    /// mpsc channel - the heap indirection keeps the command enum compact.
+    SendMessage(Box<ComposedMessage>),
     /// A hint that it's worth retrying the connection now rather than
     /// waiting out the current backoff delay - e.g. the app crate's
     /// `Gio.NetworkMonitor` reporting connectivity just came back. A no-op
@@ -261,7 +264,7 @@ pub enum AccountCommand {
     /// warning-level and silent in the UI (a draft is housekeeping, not a
     /// user action - same convention as the Sent `APPEND` after sending).
     SaveDraft {
-        msg: ComposedMessage,
+        msg: Box<ComposedMessage>,
         replace: bool,
     },
     /// The IMAP `SEARCH` fallback for full-text search: run `UID SEARCH TEXT
@@ -864,7 +867,7 @@ async fn connect_and_run(
                     };
                     let _ = events.send(AccountEvent::SearchResults { mailbox, query, messages }).await;
                 }
-                AccountCommand::SendMessage(msg) => match send_message(config, credentials, &mut session, &folders, msg).await {
+                AccountCommand::SendMessage(msg) => match send_message(config, credentials, &mut session, &folders, *msg).await {
                     Ok(()) => {
                         let _ = events.send(AccountEvent::SendCompleted).await;
                     }
@@ -874,7 +877,7 @@ async fn connect_and_run(
                 },
                 AccountCommand::SaveDraft { msg, replace } => {
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
-                    match save_draft(&mut session, &folders, &account_id, msg, replace).await {
+                    match save_draft(&mut session, &folders, &account_id, *msg, replace).await {
                         Ok(message_id) => {
                             let _ = events.send(AccountEvent::DraftSaved { message_id }).await;
                         }
@@ -2011,16 +2014,17 @@ async fn fetch_raw_message_cached(
 
 /// Fetches just the parts a message viewer needs: the full header block and
 /// the bytes of every `text/plain`/`text/html` part, each by its
-/// `BODYSTRUCTURE`-derived section path. Attachment parts (images, documents,
-/// ...) are *never* downloaded - `EmailBody::parts` carries their metadata
-/// for a later on-demand fetch. One `UID FETCH` round trip covers the header
-/// and all text parts.
+/// `BODYSTRUCTURE`-derived section path, plus the `text/calendar` part (the
+/// iMIP payload the reading pane's banner acts on). Attachment parts (images,
+/// documents, ...) are *never* downloaded - `EmailBody::parts` carries their
+/// metadata for a later on-demand fetch. One `UID FETCH` round trip covers
+/// the header and all fetched parts.
 ///
 /// Returns `None` (rather than an error) when the message has no text parts
 /// to fetch or the server didn't return the requested sections; the caller
 /// falls back to a whole-message fetch rather than showing an empty pane.
 async fn fetch_body_partial(session: &mut Session<ImapStream>, uid: Uid, parts: &[BodyPart]) -> Result<Option<EmailBody>> {
-    let text_parts: Vec<&BodyPart> = parts.iter().filter(|p| p.is_text()).collect();
+    let text_parts: Vec<&BodyPart> = parts.iter().filter(|p| p.is_text() || p.is_calendar()).collect();
     if text_parts.is_empty() {
         return Ok(None);
     }

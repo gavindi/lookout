@@ -14,6 +14,17 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
     let text_body = message.body_text(0).map(|c| c.into_owned());
     let html_body = message.body_html(0).map(|c| c.into_owned());
 
+    // The iMIP payload: the first `text/calendar` leaf in the part tree
+    // (invitations carry exactly one). `part.contents()` is already
+    // transfer-decoded by mail_parser, so the document is captured as-is.
+    let calendar_ics = message.parts.iter().find_map(|part| {
+        let is_calendar = part
+            .content_type()
+            .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("")).eq_ignore_ascii_case("text/calendar"))
+            .unwrap_or(false);
+        is_calendar.then(|| String::from_utf8_lossy(part.contents()).into_owned())
+    });
+
     let headers = message.headers_raw().map(|(name, value)| (name.to_string(), value.trim().to_string())).collect();
 
     // mail-parser numbers its parts by flat index, not by IMAP section path;
@@ -33,6 +44,12 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
                     None => ct.ctype().to_string(),
                 })
                 .unwrap_or_else(|| "application/octet-stream".to_string());
+            // The iMIP payload is body content, not an attachment: it never
+            // surfaces in the strip's metadata list (matching the
+            // partial-fetch assembly path's filter below).
+            if content_type.eq_ignore_ascii_case("text/calendar") {
+                return None;
+            }
             // Same heuristic as the BODYSTRUCTURE path (`structure.rs`): a
             // part is an attachment when it declares `Content-Disposition:
             // attachment`, or when it carries a filename without an explicit
@@ -58,6 +75,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         uid,
         text_body,
         html_body,
+        calendar_ics,
         parts,
         headers,
         auth_results: None,
@@ -178,10 +196,18 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
     // same as the whole-message path); a text/html part yields both too (the
     // text half is its converted-to-text rendering).
     let mut decoded: Vec<(bool, Option<String>, Option<String>)> = Vec::new();
+    // The message's iMIP payload (at most one `text/calendar` part). Its bytes
+    // are transfer-decoded with the same decoder the attachment path uses and
+    // kept as-is - iCalendar is already text, so no charset conversion.
+    let mut calendar_ics: Option<String> = None;
     for (part_number, bytes) in fetched {
         let Some(part) = all_parts.iter().find(|p| p.part_number == *part_number) else {
             continue;
         };
+        if part.is_calendar() {
+            calendar_ics = Some(String::from_utf8_lossy(&transfer_part_bytes(part, bytes)).into_owned());
+            continue;
+        }
         if !part.is_text() {
             continue;
         }
@@ -207,7 +233,11 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         uid,
         text_body,
         html_body,
-        parts: all_parts.iter().filter(|p| !p.is_text()).cloned().collect(),
+        calendar_ics,
+        // The calendar part is body content, not an attachment - it must not
+        // surface in the strip's metadata list alongside the actual
+        // attachments (same treatment as the text leaves).
+        parts: all_parts.iter().filter(|p| !p.is_text() && !p.is_calendar()).cloned().collect(),
         headers,
         auth_results: None,
     }
@@ -514,6 +544,81 @@ mod tests {
         let html = "<img src=\"cid:missing123\">";
         let rewritten = rewrite_cid_refs_to_data_uris(html, &raw);
         assert_eq!(rewritten, html);
+    }
+
+    /// The iMIP invitation fixture: `parse_body` must surface the
+    /// `text/calendar` part's decoded contents as `calendar_ics`, and the
+    /// calendar part must not appear in the attachment metadata (it's body
+    /// content, not an attachment).
+    #[test]
+    fn imip_request_fixture_carries_the_calendar_payload() {
+        let body = parse_body(Uid(0), &fixture("imip-request.eml")).expect("parses");
+        let ics = body.calendar_ics.expect("invitation has a calendar payload");
+        assert!(ics.contains("METHOD:REQUEST"));
+        assert!(ics.contains("UID:sync-2026-08-10@example.com"));
+        assert!(ics.contains("mailto:ada@example.com"));
+        assert!(body.text_body.is_some(), "the alternative's text half still renders");
+        assert!(!has_attachment(&body.parts), "the calendar part is not an attachment");
+        assert!(!body.parts.iter().any(|p| p.content_type == "text/calendar"));
+    }
+
+    #[test]
+    fn imip_cancel_fixture_carries_the_calendar_payload() {
+        let body = parse_body(Uid(0), &fixture("imip-cancel.eml")).expect("parses");
+        let ics = body.calendar_ics.expect("cancellation has a calendar payload");
+        assert!(ics.contains("METHOD:CANCEL"));
+    }
+
+    /// The partial-fetch assembly path: a fetched base64 `text/calendar` part
+    /// is transfer-decoded into `calendar_ics`, and stays out of `parts`.
+    #[test]
+    fn assemble_body_from_parts_decodes_a_base64_calendar_part() {
+        use base64::Engine;
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:x@y\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nSUMMARY:Hi\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(ics.as_bytes());
+        let mut calendar = text_part("2", "text/calendar", Some("utf-8"), "base64");
+        calendar.is_attachment = false;
+        let parts = vec![text_part("1", "text/plain", Some("utf-8"), "7bit"), calendar];
+        let body = assemble_body_from_parts(
+            Uid(5),
+            Vec::new(),
+            &parts,
+            &[("1".to_string(), b"plain text".to_vec()), ("2".to_string(), encoded.into_bytes())],
+        );
+        assert_eq!(body.calendar_ics.as_deref(), Some(ics));
+        assert_eq!(body.text_body.as_deref(), Some("plain text"));
+        assert!(body.parts.is_empty(), "the calendar part must not surface in the attachment list");
+    }
+
+    /// An invitation-only message (calendar part, no text parts) still
+    /// carries the payload - the caller decides whether to also fall back to a
+    /// whole-message fetch for the prose.
+    #[test]
+    fn assemble_body_from_parts_captures_a_calendar_part_without_text_parts() {
+        let mut calendar = text_part("1", "text/calendar", None, "7bit");
+        calendar.is_attachment = false;
+        let body = assemble_body_from_parts(
+            Uid(6),
+            Vec::new(),
+            &[calendar],
+            &[("1".to_string(), b"BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n".to_vec())],
+        );
+        assert!(body.calendar_ics.is_some());
+        assert!(body.text_body.is_none());
+        assert!(body.html_body.is_none());
+    }
+
+    /// Assembling a message with no calendar part leaves `calendar_ics` unset
+    /// - the ordinary case.
+    #[test]
+    fn assemble_body_from_parts_without_a_calendar_part_leaves_it_unset() {
+        let body = assemble_body_from_parts(
+            Uid(7),
+            Vec::new(),
+            &[text_part("1", "text/plain", Some("utf-8"), "7bit")],
+            &[("1".to_string(), b"hi".to_vec())],
+        );
+        assert_eq!(body.calendar_ics, None);
     }
 
     #[test]

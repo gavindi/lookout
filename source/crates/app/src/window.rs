@@ -7,8 +7,8 @@ use adw::prelude::*;
 use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::{
-    AccountId, BodyPart, CalendarEvent, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId,
-    MailboxRole, SystemFlagBit, Uid, VCard,
+    AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, ContactsProvider, EmailAddress, EmailBody, EmailSummary, EventOccurrence,
+    EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid, VCard,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::{CalendarAccountConfig, CardDavAccountConfig, Credential, DavClient};
@@ -472,6 +472,18 @@ struct UiState {
     /// the banner must not come back. Cleared on every navigation, so
     /// returning to the message later shows the banner again.
     unsubscribe_dismissed: Option<(MailboxId, Uid)>,
+    /// The parsed iMIP invitation (or cancellation / RSVP reply) carried by
+    /// the message currently on the reading pane's `text/calendar` part,
+    /// re-derived by `render_body` and read by the banner's button handler
+    /// when it fires. `None` when the pane shows nothing or the message
+    /// carries no iMIP payload.
+    imip: Option<lookout_core::ImipInvitation>,
+    /// The `(mailbox, uid)` of the message whose iMIP banner the user acted
+    /// on (chose a response, removed the event, or dismissed the notice);
+    /// while that message stays on screen the banner must not come back.
+    /// Cleared on every navigation, so returning to the message later shows
+    /// the banner again.
+    imip_dismissed: Option<(MailboxId, Uid)>,
     /// Mailboxes with a `SyncMailbox` request outstanding - sent but not yet
     /// answered by a `MessagesUpdated`. The startup burst (the session's
     /// cache replay plus the app's on-demand syncs) would otherwise queue
@@ -1003,6 +1015,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         pending_raw_message: None,
         unsubscribe_info: None,
         unsubscribe_dismissed: None,
+        imip: None,
+        imip_dismissed: None,
         pending_cid: HashMap::new(),
         rendered_inline_parts: Vec::new(),
         temp_attachment_files: HashSet::new(),
@@ -2044,6 +2058,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     unsubscribe_banner.set_button_label(Some("Unsubscribe"));
     unsubscribe_banner.set_revealed(false);
     message_page.append(&unsubscribe_banner);
+    // The iMIP banner (invitations / cancellations / RSVP replies carried as
+    // `text/calendar` parts), between the header and the body like the
+    // unsubscribe banner: revealed by `render_body` when the message carries
+    // an iMIP payload the user hasn't dismissed, hidden otherwise. Its button
+    // opens the per-method action dialog (REQUEST: Accept/Maybe/Decline,
+    // CANCEL: remove-from-calendar confirm, REPLY: plain dismiss) - see the
+    // handler registered once `calendar_state` exists below.
+    let imip_banner = adw::Banner::new("Invitation");
+    imip_banner.set_widget_name("imip-banner");
+    imip_banner.set_button_label(Some("Respond…"));
+    imip_banner.set_revealed(false);
+    message_page.append(&imip_banner);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
@@ -3020,6 +3046,111 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         checked_calendar_ids: HashSet::new(),
         calendar_colors: calendar_colors::load(),
     }));
+    // --- iMIP banner actions. The banner's button acts on the invitation
+    // stashed in `UiState::imip` by `render_body`; the calendar half of the
+    // response (saving an accepted event, removing a cancelled one) needs
+    // `calendar_state`, which is why this handler is registered here rather
+    // than alongside the banner widget's construction. REQUEST opens a
+    // three-way response dialog, CANCEL a remove-from-calendar confirmation,
+    // and REPLY is informational (the button just dismisses). Acting on the
+    // banner hides it for that message, like the unsubscribe banner.
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        imip_banner.connect_button_clicked(move |banner| {
+            let (mailbox, uid, invitation, from_email, cmd_tx) = {
+                let st = state.borrow();
+                let (mailbox, uid) = match &st.rendered_message {
+                    Some(rendered) => rendered.clone(),
+                    None => return,
+                };
+                let Some(invitation) = st.imip.clone() else { return };
+                let Some(account_id) = mailbox_account_id(&mailbox) else { return };
+                let Some(handle) = st.accounts.get(&account_id) else { return };
+                (mailbox, uid, invitation, handle.email.clone(), handle.cmd_tx.clone())
+            };
+            let dismiss = |state: &Rc<RefCell<UiState>>, banner: &adw::Banner, mailbox: &MailboxId, uid: Uid| {
+                state.borrow_mut().imip_dismissed = Some((mailbox.clone(), uid));
+                banner.set_revealed(false);
+            };
+            match invitation.method {
+                lookout_core::ImipMethod::Request => {
+                    let dialog = adw::AlertDialog::builder()
+                        .heading(format!("Invitation: {}", invitation.summary.as_deref().unwrap_or("an event")))
+                        .body(if let Some(organizer) = &invitation.organizer {
+                            format!("Responding will send your answer to {}.", organizer.display_label())
+                        } else {
+                            "Responding will send your answer to the organizer.".to_string()
+                        })
+                        .default_response("accept")
+                        .close_response("cancel")
+                        .build();
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("decline", "Decline");
+                    dialog.add_response("tentative", "Maybe");
+                    dialog.add_response("accept", "Accept");
+                    dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
+                    dialog.set_response_appearance("decline", adw::ResponseAppearance::Destructive);
+                    let state_for_dialog = state.clone();
+                    let calendar_state_for_dialog = calendar_state.clone();
+                    let toast_overlay_for_dialog = toast_overlay.clone();
+                    let cmd_tx_for_dialog = cmd_tx.clone();
+                    let from_email_for_dialog = from_email.clone();
+                    let invitation_for_dialog = invitation.clone();
+                    let mailbox_for_dialog = mailbox.clone();
+                    let banner_for_dialog = banner.clone();
+                    dialog.connect_response(None, move |_dialog, response| {
+                        let status = match response {
+                            "accept" => Some(lookout_core::AttendeeStatus::Accepted),
+                            "tentative" => Some(lookout_core::AttendeeStatus::Tentative),
+                            "decline" => Some(lookout_core::AttendeeStatus::Declined),
+                            _ => None,
+                        };
+                        let Some(status) = status else { return };
+                        respond_to_imip_invitation(
+                            &calendar_state_for_dialog,
+                            &toast_overlay_for_dialog,
+                            &invitation_for_dialog,
+                            &from_email_for_dialog,
+                            &cmd_tx_for_dialog,
+                            status,
+                        );
+                        state_for_dialog.borrow_mut().imip_dismissed = Some((mailbox_for_dialog.clone(), uid));
+                        banner_for_dialog.set_revealed(false);
+                    });
+                    dialog.present(Some(banner));
+                }
+                lookout_core::ImipMethod::Cancel => {
+                    let dialog = adw::AlertDialog::builder()
+                        .heading(format!("Cancelled: {}", invitation.summary.as_deref().unwrap_or("an event")))
+                        .body("The organizer cancelled this event. Remove it from your calendar?")
+                        .default_response("keep")
+                        .close_response("keep")
+                        .build();
+                    dialog.add_response("keep", "Keep");
+                    dialog.add_response("remove", "Remove from calendar");
+                    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+                    let state_for_dialog = state.clone();
+                    let calendar_state_for_dialog = calendar_state.clone();
+                    let toast_overlay_for_dialog = toast_overlay.clone();
+                    let invitation_for_dialog = invitation.clone();
+                    let mailbox_for_dialog = mailbox.clone();
+                    let banner_for_dialog = banner.clone();
+                    dialog.connect_response(None, move |_dialog, response| {
+                        dismiss(&state_for_dialog, &banner_for_dialog, &mailbox_for_dialog, uid);
+                        if response == "remove" {
+                            remove_cancelled_imip_event(&calendar_state_for_dialog, &toast_overlay_for_dialog, &invitation_for_dialog);
+                        }
+                    });
+                    dialog.present(Some(banner));
+                }
+                lookout_core::ImipMethod::Reply => {
+                    dismiss(&state, banner, &mailbox, uid);
+                }
+            }
+        });
+    }
     // Which single day the Mail-screen overview pane's event list is
     // currently showing - separate from `calendar_state.displayed_month`
     // (that's the main Calendar view's own concern).
@@ -3575,6 +3706,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.pending_raw_message = None;
                     st.unsubscribe_info = None;
                     st.unsubscribe_dismissed = None;
+                    st.imip = None;
+                    st.imip_dismissed = None;
                     st.rendered_message = None;
                     drop(st);
                     drop_pending_cid(&state);
@@ -3592,6 +3725,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.pending_raw_message = None;
                     st.unsubscribe_info = None;
                     st.unsubscribe_dismissed = None;
+                    st.imip = None;
+                    st.imip_dismissed = None;
                     st.rendered_message = None;
                     drop(st);
                     drop_pending_cid(&state);
@@ -5690,6 +5825,133 @@ fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar
     let _ = handle.send_blocking(CalendarCommand::DeleteEvent { calendar_id, href, etag });
 }
 
+/// The calendar object already stored under `event.uid`, if any - the iMIP
+/// reply flows upsert against it instead of creating a duplicate.
+fn find_calendar_occurrence(calendar_state: &Rc<RefCell<CalendarUiState>>, uid: &EventUid) -> Option<EventOccurrence> {
+    calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .flat_map(|handle| handle.last_occurrences.iter())
+        .find(|occurrence| occurrence.uid == *uid)
+        .cloned()
+}
+
+/// The user's answer to an iMIP invitation (REQUEST): sends the RFC 6047
+/// `METHOD:REPLY` email back to the organizer with the chosen `PARTSTAT`, and
+/// best-effort saves the event into the account's default calendar, upserting
+/// by UID so accepting a re-invitation updates the existing booking rather
+/// than duplicating it. The reply is the primary action: a missing or busy
+/// calendar setup is a toast, not a blocked send.
+fn respond_to_imip_invitation(
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    invitation: &lookout_core::ImipInvitation,
+    from_email: &str,
+    cmd_tx: &async_channel::Sender<AccountCommand>,
+    status: AttendeeStatus,
+) {
+    let Some(organizer) = &invitation.organizer else {
+        toast_overlay.add_toast(adw::Toast::new("This invitation names no organizer - can't send a reply."));
+        return;
+    };
+    let Some(mut event) = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), &invitation.ics).into_iter().next() else {
+        toast_overlay.add_toast(adw::Toast::new("Couldn't parse this invitation's calendar data."));
+        return;
+    };
+    // Stamp the user's own PARTSTAT onto their ATTENDEE line (the organizer's
+    // client reads the reply from exactly this); a self-signed invitation
+    // that omitted the recipient entirely gets an ATTENDEE added.
+    match event.attendees.iter_mut().find(|attendee| attendee.address.address.eq_ignore_ascii_case(from_email)) {
+        Some(attendee) => attendee.status = status,
+        None => event.attendees.push(Attendee {
+            address: EmailAddress::new(from_email.to_string()),
+            role: AttendeeRole::Required,
+            status,
+        }),
+    }
+    let reply_ics = lookout_dav::build_imip_vcalendar(&event, lookout_core::ImipMethod::Reply);
+    let (subject_prefix, toast) = match status {
+        AttendeeStatus::Accepted => ("Accepted", "Invitation accepted"),
+        AttendeeStatus::Tentative => ("Tentatively accepted", "Marked as tentative"),
+        AttendeeStatus::Declined => ("Declined", "Invitation declined"),
+        AttendeeStatus::NeedsAction => ("Replied", "Reply sent"),
+    };
+    let subject = match &invitation.summary {
+        Some(summary) => format!("{subject_prefix}: {summary}"),
+        None => subject_prefix.to_string(),
+    };
+    let message = lookout_mail::ComposedMessage {
+        from: from_email.to_string(),
+        to: vec![organizer.address.clone()],
+        cc: vec![],
+        bcc: vec![],
+        subject,
+        text_body: format!("{subject_prefix}."),
+        html_body: None,
+        calendar_part: Some(reply_ics),
+        in_reply_to: invitation.in_reply_to.clone(),
+        references: vec![],
+        message_id: None,
+    };
+    let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(Box::new(message)));
+    toast_overlay.add_toast(adw::Toast::new(toast));
+
+    // Best-effort calendar write: the reply already went out, so a missing
+    // calendar (or a failed save) is a warning, never a blocker.
+    let Some(default_calendar) = default_pickable_calendar(calendar_state) else {
+        toast_overlay.add_toast(adw::Toast::new("Connect a calendar account to save the event."));
+        return;
+    };
+    match find_calendar_occurrence(calendar_state, &event.uid) {
+        // A re-invitation updating an event already in the calendar: write
+        // over the stored object in place.
+        Some(existing) => {
+            event.calendar_id = existing.calendar_id.clone();
+            event.href = existing.href;
+            event.etag = existing.etag;
+            let handle = calendar_handle_for_id(calendar_state, &event.calendar_id);
+            let _ = handle.map(|handle| handle.send_blocking(CalendarCommand::UpdateEvent { event: Box::new(event) }));
+        }
+        None => {
+            event.calendar_id = default_calendar;
+            route_calendar_save(calendar_state, event.calendar_id.clone(), event);
+        }
+    }
+}
+
+/// The organizer cancelled an event (iMIP `METHOD:CANCEL`): removes the
+/// stored calendar object when one exists under the same UID, otherwise just
+/// acknowledges. The banner was already dismissed by the caller.
+fn remove_cancelled_imip_event(calendar_state: &Rc<RefCell<CalendarUiState>>, toast_overlay: &adw::ToastOverlay, invitation: &lookout_core::ImipInvitation) {
+    let Some(mut event) = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), &invitation.ics).into_iter().next() else {
+        toast_overlay.add_toast(adw::Toast::new("Couldn't parse this cancellation's calendar data."));
+        return;
+    };
+    match find_calendar_occurrence(calendar_state, &event.uid) {
+        Some(existing) => {
+            event.calendar_id = existing.calendar_id.clone();
+            event.href = existing.href;
+            event.etag = existing.etag;
+            if let Some(handle) = calendar_handle_for_id(calendar_state, &event.calendar_id) {
+                if let Some(href) = event.href.clone() {
+                    let _ = handle.send_blocking(CalendarCommand::DeleteEvent {
+                        calendar_id: event.calendar_id.clone(),
+                        href,
+                        etag: event.etag.clone(),
+                    });
+                    toast_overlay.add_toast(adw::Toast::new("Event removed from calendar"));
+                    return;
+                }
+            }
+            toast_overlay.add_toast(adw::Toast::new("Couldn't remove the event from your calendar."));
+        }
+        None => {
+            toast_overlay.add_toast(adw::Toast::new("This event wasn't in your calendar."));
+        }
+    }
+}
+
 fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
     mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
 }
@@ -7565,6 +7827,39 @@ fn render_body(
             banner.set_revealed(!dismissed && st.unsubscribe_info.is_some());
         }
     }
+    // iMIP banner: parse the rendered message's `text/calendar` payload (if
+    // any) into the invitation the banner's button handler acts on, and
+    // reveal the banner when there's one the user hasn't dismissed for this
+    // message. The per-method button label/title is set here too - it varies
+    // with what the payload asks of the user. Hidden otherwise - and on every
+    // navigation, since the selection handler clears `imip_dismissed`.
+    {
+        let mut st = state.borrow_mut();
+        st.imip = body.calendar_ics.as_deref().and_then(lookout_dav::parse_imip_invitation);
+        if let Some(invitation) = st.imip.as_mut() {
+            // The reply's In-Reply-To is the invitation message's own
+            // Message-ID, which lives in the message headers rather than the
+            // iCalendar document.
+            invitation.in_reply_to = lookout_core::header_value(&body.headers, "message-id").map(str::to_string);
+        }
+        let dismissed = st.imip_dismissed.as_ref() == Some(&(mailbox.clone(), uid));
+        if let Some(banner) = find_named_child(reading_stack, "imip-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+            let (title, button) = match (&st.imip, dismissed) {
+                (Some(invitation), false) => match invitation.method {
+                    lookout_core::ImipMethod::Request => (format!("Invitation: {}", invitation.summary.as_deref().unwrap_or("an event")), "Respond…".to_string()),
+                    lookout_core::ImipMethod::Cancel => (
+                        format!("Cancelled: {}", invitation.summary.as_deref().unwrap_or("an event")),
+                        "Remove from calendar".to_string(),
+                    ),
+                    lookout_core::ImipMethod::Reply => (format!("RSVP update: {}", invitation.summary.as_deref().unwrap_or("an event")), "Dismiss".to_string()),
+                },
+                _ => (String::new(), String::new()),
+            };
+            banner.set_title(&title);
+            banner.set_button_label(Some(&button));
+            banner.set_revealed(!dismissed && st.imip.is_some());
+        }
+    }
     // Config → Appearance → "Animate transitions" can switch the stack's
     // transition type to `None`; when it's off, skip the fade-specific paths
     // below (routing through "empty", waiting for the WebView to paint) and
@@ -7959,6 +8254,8 @@ mod tests {
             pending_raw_message: None,
             unsubscribe_info: None,
             unsubscribe_dismissed: None,
+            imip: None,
+            imip_dismissed: None,
             pending_cid: HashMap::new(),
             rendered_inline_parts: Vec::new(),
             temp_attachment_files: HashSet::new(),

@@ -21,9 +21,9 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
-    <release version="0.7.3" date="2026-08-07">
+    <release version="0.7.4" date="2026-08-07">
       <description>
-        <p>In the Day and Week views you can now click and drag across the time grid to highlight a whole range - across hours and multiple days - and clicking the highlighted range opens the New Event editor spanning exactly what you selected.</p>
+        <p>The reading pane now recognizes iMIP invitations: a banner appears for calendar emails, letting you accept, tentatively accept, or decline - sending an RFC 6047 reply back to the organizer and saving the event into your calendar - or remove a cancelled event.</p>
       </description>
     </release>
     <release version="0.7.2" date="2026-08-07">

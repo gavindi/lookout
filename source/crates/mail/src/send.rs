@@ -2,6 +2,8 @@ use lettre::address::Envelope;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Address as SmtpAddress, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use mail_builder::headers::address::Address as BuilderAddress;
+use mail_builder::headers::content_type::ContentType;
+use mail_builder::mime::{BodyPart as MimeBodyPart, MimePart};
 use mail_builder::MessageBuilder;
 
 use crate::config::{Credential, EndpointConfig};
@@ -24,6 +26,12 @@ pub struct ComposedMessage {
     /// Optional HTML rendering of the same body. Both parts are sent when
     /// set; recipients that only handle plain text fall back to `text_body`.
     pub html_body: Option<String>,
+    /// An RFC 6047 iMIP payload: the raw iCalendar document (which itself
+    /// carries its `METHOD` - see `lookout-dav`'s `build_imip_vcalendar`).
+    /// When set, the message is built as `multipart/alternative`
+    /// [text/plain, text/calendar; method=...] instead of the text/html
+    /// form - a calendar reply has nothing to gain from an HTML rendering.
+    pub calendar_part: Option<String>,
     /// RFC 5322 `In-Reply-To`, when replying to a message.
     pub in_reply_to: Option<String>,
     /// RFC 5322 `References`, when replying to a message.
@@ -55,13 +63,32 @@ pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>
     let mut builder = MessageBuilder::new()
         .message_id(message_id.clone())
         .from(BuilderAddress::new_address(None::<String>, msg.from.clone()))
-        .subject(msg.subject.clone())
-        .text_body(msg.text_body.clone());
-    // `mail_builder` turns a message with both text and html bodies into a
-    // `multipart/alternative` (text/plain first, text/html second), so the
-    // HTML body is strictly an enhancement over the plain text part.
-    if let Some(html) = msg.html_body.as_deref().filter(|h| !h.is_empty()) {
-        builder = builder.html_body(html.to_string());
+        .subject(msg.subject.clone());
+    if let Some(ics) = msg.calendar_part.as_deref().filter(|ics| !ics.is_empty()) {
+        // iMIP payload: `multipart/alternative` [text/plain, text/calendar]
+        // per RFC 6047 §3.3. The `method=` Content-Type parameter tells the
+        // recipient's calendar client how to treat the payload; it is derived
+        // from the document's own `METHOD` property, which the
+        // `build_imip_vcalendar` caller has already set.
+        let method = match lookout_core::parse_imip_method(ics) {
+            lookout_core::ImipMethod::Request => "REQUEST",
+            lookout_core::ImipMethod::Reply => "REPLY",
+            lookout_core::ImipMethod::Cancel => "CANCEL",
+        };
+        let calendar_type = ContentType::new("text/calendar").attribute("method", method);
+        let text_part = MimePart::new("text/plain", MimeBodyPart::Text(msg.text_body.clone().into()));
+        let calendar_part = MimePart::new(calendar_type, MimeBodyPart::Text(ics.to_string().into()));
+        // `body()` replaces the builder's own text/html auto-assembly
+        // (see `write_body`), which is exactly what we want here.
+        builder = builder.body(MimePart::new("multipart/alternative", vec![text_part, calendar_part]));
+    } else {
+        // `mail_builder` turns a message with both text and html bodies into a
+        // `multipart/alternative` (text/plain first, text/html second), so the
+        // HTML body is strictly an enhancement over the plain text part.
+        builder = builder.text_body(msg.text_body.clone());
+        if let Some(html) = msg.html_body.as_deref().filter(|h| !h.is_empty()) {
+            builder = builder.html_body(html.to_string());
+        }
     }
 
     if !msg.to.is_empty() {
@@ -139,6 +166,7 @@ mod tests {
             subject: "test".to_string(),
             text_body: "plain part".to_string(),
             html_body: html,
+            calendar_part: None,
             in_reply_to: None,
             references: vec![],
             message_id: None,
@@ -189,5 +217,45 @@ mod tests {
     #[test]
     fn generated_message_ids_are_unique() {
         assert_ne!(new_message_id(), new_message_id());
+    }
+
+    fn imip_ics(method: &str) -> String {
+        format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nMETHOD:{method}\r\nBEGIN:VEVENT\r\nUID:x@y\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Hi\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+    }
+
+    /// An iMIP reply must be a `multipart/alternative` carrying the plain-text
+    /// part first and the `text/calendar` part second, with the method echoed
+    /// into the part's Content-Type parameter.
+    #[test]
+    fn calendar_part_produces_an_alternative_with_method_parameter() {
+        let mut msg = sample_message(None);
+        msg.calendar_part = Some(imip_ics("REPLY"));
+        let raw = raw_to_string(&msg);
+        let lower = raw.to_lowercase();
+        assert!(lower.contains("multipart/alternative"), "expected alternative in:\n{raw}");
+        // mail_builder writes Content-Type attributes with RFC 2047 quoting.
+        assert!(lower.contains("text/calendar; method=\"reply\""), "raw:\n{raw}");
+        assert!(raw.contains("plain part"));
+        assert!(raw.contains("METHOD:REPLY"));
+        // The HTML auto-assembly must not happen for iMIP payloads.
+        assert!(!lower.contains("text/html"));
+    }
+
+    #[test]
+    fn calendar_part_method_is_derived_from_the_document() {
+        let mut msg = sample_message(None);
+        msg.calendar_part = Some(imip_ics("REQUEST"));
+        let raw = raw_to_string(&msg);
+        assert!(raw.to_lowercase().contains("method=\"request\""), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn empty_calendar_part_is_skipped() {
+        let msg = ComposedMessage {
+            calendar_part: Some(String::new()),
+            ..sample_message(None)
+        };
+        let raw = raw_to_string(&msg);
+        assert!(!raw.to_lowercase().contains("text/calendar"), "raw:\n{raw}");
     }
 }

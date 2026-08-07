@@ -1,11 +1,6 @@
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
-use icalendar::{
-    Alarm, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, PartStat, Property, Role, Trigger,
-    Attendee as IcalAttendee,
-};
-use lookout_core::{
-    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventSensitivity, EventTransparency, EventUid,
-};
+use icalendar::{Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, PartStat, Property, Role, Trigger};
+use lookout_core::{Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventSensitivity, EventTransparency, EventUid, ImipInvitation, ImipMethod};
 
 /// Parses every VEVENT out of a raw iCalendar document (as returned by a
 /// CalDAV `calendar-data` property) into [`CalendarEvent`]s, attaching no
@@ -256,6 +251,52 @@ fn parse_ical_duration(raw: &str) -> Duration {
 /// intentionally never edits it).
 pub fn build_vcalendar(event: &CalendarEvent) -> String {
     let mut calendar = icalendar::Calendar::new();
+    calendar.push(build_vevent(event).done());
+    format!("{calendar}")
+}
+
+/// Serializes a [`CalendarEvent`] into an iMIP message payload (RFC 6047):
+/// the same single-VEVENT document [`build_vcalendar`] produces, plus the
+/// calendar-level `METHOD` property that tells the recipient how to treat it
+/// (`REQUEST` an invitation, `REPLY` an attendee's RSVP, `CANCEL` a
+/// withdrawal). `METHOD` is *never* emitted by [`build_vcalendar`] - a CalDAV
+/// `PUT` body must not carry it - which is why this is a separate entry point
+/// rather than a parameter on the shared builder.
+pub fn build_imip_vcalendar(event: &CalendarEvent, method: ImipMethod) -> String {
+    let mut calendar = icalendar::Calendar::new();
+    let method = match method {
+        ImipMethod::Request => "REQUEST",
+        ImipMethod::Reply => "REPLY",
+        ImipMethod::Cancel => "CANCEL",
+    };
+    calendar.append_property(icalendar::Property::new("METHOD", method));
+    calendar.push(build_vevent(event).done());
+    format!("{calendar}")
+}
+
+/// Parses a message's `text/calendar` payload into the [`ImipInvitation`] the
+/// reading pane's banner acts on. Returns `None` when the document carries no
+/// parseable VEVENT (a `text/calendar` part that is somehow not an event -
+/// e.g. a bare VTODO or a VALARM-only document - is not an invitation).
+/// The method comes from the raw document via [`lookout_core::parse_imip_method`];
+/// the event's summary and organizer come from the parsed VEVENT.
+pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
+    let method = lookout_core::parse_imip_method(ics);
+    // The CalendarId is purely the parsed event's ownership stamp and never
+    // escapes this function - the app re-stamps the event onto the calendar
+    // it saves into.
+    let events = parse_vevents(&CalendarId("iMIP".to_string()), ics);
+    let event = events.into_iter().next()?;
+    Some(ImipInvitation {
+        method,
+        ics: ics.to_string(),
+        summary: event.summary,
+        organizer: event.organizer,
+        in_reply_to: None,
+    })
+}
+
+fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     let mut vevent = icalendar::Event::new();
 
     vevent.uid(&event.uid.0);
@@ -317,8 +358,7 @@ pub fn build_vcalendar(event: &CalendarEvent) -> String {
         vevent.alarm(Alarm::display("Reminder", Trigger::before_start(Duration::minutes(minutes))));
     }
 
-    calendar.push(vevent.done());
-    format!("{calendar}")
+    vevent
 }
 
 fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee]) {
@@ -344,6 +384,7 @@ fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lookout_core::parse_imip_method;
 
     fn cal_id() -> CalendarId {
         CalendarId("test-account:test-calendar".to_string())
@@ -593,5 +634,51 @@ mod tests {
         let ics = build_vcalendar(&full_event());
         assert!(!ics.contains("CLASS"), "default Public sensitivity shouldn't add a CLASS line: {ics}");
         assert!(!ics.contains("TRANSP"), "default Busy transparency shouldn't add a TRANSP line: {ics}");
+    }
+
+    /// The CalDAV PUT body must never carry `METHOD` (it's an iMIP-only
+    /// property), while the iMIP payload must - and the event content must
+    /// round-trip identically between the two.
+    #[test]
+    fn imip_serialization_adds_method_only_in_the_email_form() {
+        let event = full_event();
+        let stored = build_vcalendar(&event);
+        assert!(!stored.to_uppercase().contains("METHOD:"), "CalDAV body must not carry METHOD: {stored}");
+
+        for (method, expected) in [(ImipMethod::Request, "REQUEST"), (ImipMethod::Reply, "REPLY"), (ImipMethod::Cancel, "CANCEL")] {
+            let ics = build_imip_vcalendar(&event, method);
+            assert!(ics.contains(&format!("METHOD:{expected}")), "expected METHOD:{expected} in:\n{ics}");
+            assert_eq!(parse_imip_method(&ics), method);
+            let events = parse_vevents(&cal_id(), &ics);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].uid.0, event.uid.0);
+            assert_eq!(events[0].start, event.start);
+        }
+    }
+
+    #[test]
+    fn parse_imip_invitation_extracts_method_summary_and_organizer() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:inv-1@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Planning\r\nORGANIZER;CN=Ada:mailto:ada@example.com\r\nATTENDEE;CN=Bob;PARTSTAT=NEEDS-ACTION:mailto:bob@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let invitation = parse_imip_invitation(ics).expect("parses");
+        assert_eq!(invitation.method, ImipMethod::Request);
+        assert_eq!(invitation.ics, ics);
+        assert_eq!(invitation.summary.as_deref(), Some("Planning"));
+        assert_eq!(invitation.organizer.as_ref().map(|o| o.address.as_str()), Some("ada@example.com"));
+        assert_eq!(invitation.in_reply_to, None, "the message's own Message-ID is the reading pane's job");
+    }
+
+    #[test]
+    fn parse_imip_invitation_reports_reply_and_cancel_methods() {
+        let cancel = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:CANCEL\r\nBEGIN:VEVENT\r\nUID:inv-1@example.com\r\nDTSTAMP:20260102T090000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Planning\r\nORGANIZER:mailto:ada@example.com\r\nATTENDEE:mailto:bob@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let invitation = parse_imip_invitation(cancel).expect("parses");
+        assert_eq!(invitation.method, ImipMethod::Cancel);
+        assert_eq!(invitation.summary.as_deref(), Some("Planning"));
+    }
+
+    #[test]
+    fn parse_imip_invitation_returns_none_for_a_document_without_a_vevent() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_imip_invitation(ics), None);
+        assert_eq!(parse_imip_invitation("not an icalendar document"), None);
     }
 }

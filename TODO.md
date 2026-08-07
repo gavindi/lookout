@@ -31,9 +31,9 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Connection lifecycle: state machine, backoff reconnect, pre-timeout IDLE re-issue, `Gio.NetworkMonitor`-driven reconnect
 - [x] `Adw.ToastOverlay` for connection/send errors
 - [x] Flatpak manifest spike with GOA `--talk-name` permission
-- [ ] Generate `cargo-sources.json` via `flatpak-cargo-generator.py`
-- [ ] Install `flatpak-builder` + `org.gnome.Sdk//49` + rust-stable SDK extension; real build+run
-- [ ] Fix "Open Online Accounts Settings" for sandboxed runs — `org.gnome.ControlCenter` D-Bus activation instead of shelling out
+- [x] Generate `cargo-sources.json` via `flatpak-cargo-generator.py` (CI `build.yaml` flatpak job)
+- [x] Install `flatpak-builder` + `org.gnome.Sdk//49` + rust-stable SDK extension; real build+run (CI flatpak job builds the bundle)
+- [x] Fix "Open Online Accounts Settings" for sandboxed runs — `online_accounts.rs` D-Bus activation (`org.freedesktop.Application.ActivateAction` on `org.gnome.Settings`, `ControlCenter.ActivatePanel` fallback, shell fallback)
 
 ### Testing/verification (Phase 1)
 
@@ -75,8 +75,10 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] GOA `Calendar` interface for endpoint + credentials
 - [x] Custom-drawn month view (Sunday-first grid, mini-calendar sidebar + "My calendars" checklist filter)
 - [x] Week/Day/agenda view + split view: all-day band, auto-scroll-to-now, tooltips
+- [x] Select-then-edit in the main grids: clicking a Month-grid day (highlight + re-anchor every view) or a Day/Week time slot (highlight) selects it; clicking the selection again opens the New Event editor prefilled for that day (9am) or time
+- [x] Click-and-drag range selection in the Day/Week grids — dragging across hours and day columns highlights a whole range (interior columns fill as full days); clicking it opens the editor spanning exactly the selection (a `suggested_end` prefill, so a 9:00–11:00 drag is a two-hour event)
 - [ ] Drag-reschedule; recurring edit scopes (this / this-and-following / all)
-- [ ] iMIP invitation banners in the mail viewer
+- [x] iMIP invitation banners in the mail viewer — `text/calendar` parts fetched with the body, `METHOD:REQUEST` (Accept/Maybe/Decline → RFC 6047 `METHOD:REPLY` + calendar upsert), `METHOD:CANCEL` (remove-from-calendar), `METHOD:REPLY` (informational)
 - [ ] `.ics` import / webcal subscription
 - [x] Mini-calendar sidebar widget (240px sidebar + compact copy docked on the Mail screen)
 - [ ] VTODO tasks

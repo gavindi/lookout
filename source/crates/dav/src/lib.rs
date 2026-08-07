@@ -17,4 +17,4 @@ pub use cache::{cache_info, clear_all_caches};
 pub use client::{AddressBookInfo, DavClient};
 pub use config::{CalendarAccountConfig, CardDavAccountConfig, Credential};
 pub use error::{Error, Result};
-pub use ical::{build_vcalendar, parse_vevents, parse_vevents_with_meta};
+pub use ical::{build_imip_vcalendar, build_vcalendar, parse_imip_invitation, parse_vevents, parse_vevents_with_meta};

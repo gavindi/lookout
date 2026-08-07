@@ -120,6 +120,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         subject: subject.to_string(),
         text_body: "draft body".to_string(),
         html_body: None,
+        calendar_part: None,
         in_reply_to: None,
         references: vec![],
         message_id: Some(draft_msg_id.clone()),
@@ -128,7 +129,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     // First save: no Drafts mailbox exists yet, so the session CREATEs one.
     let _ = cmd_tx
         .send(AccountCommand::SaveDraft {
-            msg: draft("draft v1"),
+            msg: Box::new(draft("draft v1")),
             replace: false,
         })
         .await;
@@ -148,7 +149,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     // from the envelope cache and could mask a failed replace).
     let _ = cmd_tx
         .send(AccountCommand::SaveDraft {
-            msg: draft("draft v2"),
+            msg: Box::new(draft("draft v2")),
             replace: true,
         })
         .await;
@@ -176,11 +177,12 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         subject: "integration test".to_string(),
         text_body: "hello from imap_integration.rs".to_string(),
         html_body: None,
+        calendar_part: None,
         in_reply_to: None,
         references: vec![],
         message_id: None,
     };
-    let _ = cmd_tx.send(AccountCommand::SendMessage(msg)).await;
+    let _ = cmd_tx.send(AccountCommand::SendMessage(Box::new(msg))).await;
     wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::SendCompleted)).await;
 
     // --- On-demand attachment fetch. The session API can't APPEND an

@@ -350,13 +350,19 @@ impl Cache {
         // caches' raw rows can't be served and are wiped once. Envelope rows
         // survive; their `structure` stays `None` until the next sync, which
         // is exactly the fallback path's cue.
-        const BODY_CACHE_VERSION: i64 = 3;
+        const BODY_CACHE_VERSION: i64 = 4;
         // Version 3: the whole-message fallback path (`parse_body`) used to
         // number attachment parts by enumerate counter ("0", "1", ...) instead
         // of their IMAP section paths, so cached bodies from those builds
         // carry part numbers no `UID FETCH BODY.PEEK[<n>]` can satisfy - a
         // save would silently hang. Wipe bodies once so the fixed builds
         // re-assemble them with real section paths. Envelope rows survive.
+        // Version 4: `EmailBody` grew the `calendar_ics` field (the iMIP
+        // `text/calendar` payload). Serde would deserialize old rows with
+        // `calendar_ics: None`, but those rows were fetched *before* the
+        // calendar part was requested - a cached invitation would never show
+        // its banner. Wipe bodies once so every message is re-fetched with
+        // the calendar part included.
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         if stored < ENVELOPE_CACHE_VERSION {
             conn.execute("DELETE FROM messages", [])?;
@@ -1198,6 +1204,7 @@ mod tests {
             uid: Uid(0),
             text_body: Some(text.to_string()),
             html_body: None,
+            calendar_ics: None,
             parts: Vec::new(),
             headers: Vec::new(),
             auth_results: None,
@@ -1529,14 +1536,14 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         // Create a database with envelopes + a body but no search index at all,
-        // exactly what a pre-search build left on disk (user_version 3: the
-        // envelope and body-format migrations done, the FTS index absent).
+        // exactly what a pre-search build left on disk (user_version 4: the
+        // envelope/body-format migrations done, the FTS index absent).
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 "
-                PRAGMA user_version = 3;
+                PRAGMA user_version = 4;
                 CREATE TABLE messages (
                     mailbox_id TEXT NOT NULL,
                     uid INTEGER NOT NULL,

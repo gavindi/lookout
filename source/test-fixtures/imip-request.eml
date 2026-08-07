@@ -1,0 +1,32 @@
+From: Ada Lovelace <ada@example.com>
+To: b@example.com
+Subject: Project sync meeting
+Message-ID: <invite-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="invite"
+
+--invite
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+You are invited to Project sync meeting on Monday, 10 Aug 2026 14:00-15:00 UTC.
+--invite
+Content-Type: text/calendar; charset=utf-8; method=REQUEST
+Content-Transfer-Encoding: 7bit
+
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//example//test//EN
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:sync-2026-08-10@example.com
+DTSTAMP:20260801T120000Z
+DTSTART:20260810T140000Z
+DTEND:20260810T150000Z
+SUMMARY:Project sync meeting
+LOCATION:Room 1
+ORGANIZER;CN=Ada Lovelace:mailto:ada@example.com
+ATTENDEE;CN=Bob Example;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT:mailto:bob@example.com
+END:VEVENT
+END:VCALENDAR
+--invite--
