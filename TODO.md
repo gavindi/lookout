@@ -73,7 +73,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] `lookout-dav`: thin CalDAV/WebDAV layer over `reqwest` — RFC 4791 discovery + `calendar-query` REPORT (5-minute polling)
 - [x] iCalendar modeling + recurrence expansion (`icalendar` + `rrule`, `TZID`→UTC via `chrono-tz`)
 - [x] GOA `Calendar` interface for endpoint + credentials
-- [ ] Nextcloud/ownCloud DAV accounts (CalDAV + CardDAV) — GOA `Account.Identity` as the Basic-auth username, DAV base-URL normalization (userinfo stripped, Nextcloud `remote.php/dav` trailing slash), server error-body sanitization (in progress)
+- [x] Nextcloud/ownCloud DAV accounts (CalDAV + CardDAV) — GOA `Account.Identity` as the Basic-auth username, DAV base-URL normalization (userinfo stripped, Nextcloud `remote.php/dav` trailing slash), server error-body sanitization
 - [x] Custom-drawn month view (Sunday-first grid, mini-calendar sidebar + "My calendars" checklist filter)
 - [x] Week/Day/agenda view + split view: all-day band, auto-scroll-to-now, tooltips
 - [x] Select-then-edit in the main grids: clicking a Month-grid day (highlight + re-anchor every view) or a Day/Week time slot (highlight) selects it; clicking the selection again opens the New Event editor prefilled for that day (9am) or time
