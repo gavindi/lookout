@@ -49,6 +49,10 @@ pub struct EventEditorPrefill<'a> {
     /// date the caller's view is anchored on, rounded to a whole hour. `None`
     /// falls back to the editor's own "next whole hour" default.
     pub suggested_start: Option<NaiveDateTime>,
+    /// For a new event, the suggested end (local naive time) - the tail of a
+    /// highlighted time range the user selected in the main grid. `None`
+    /// defaults to one hour after `suggested_start`.
+    pub suggested_end: Option<NaiveDateTime>,
     /// Every currently-cached occurrence (from checked calendars) for
     /// whatever month the caller had loaded - used only to populate the
     /// read-only preview panel, re-sliced by day locally as the user
@@ -175,7 +179,7 @@ pub fn show_event_editor(
             }
             (occ.start.with_timezone(&chrono::Local).naive_local(), occ.end.with_timezone(&chrono::Local).naive_local())
         })
-        .or_else(|| prefill.suggested_start.map(|start| (start, start + chrono::Duration::hours(1))))
+        .or_else(|| prefill.suggested_start.map(|start| (start, prefill.suggested_end.unwrap_or(start + chrono::Duration::hours(1)))))
         .unwrap_or_else(default_event_times);
     // The form's all-day end is the *last* day (inclusive, Outlook/Gmail
     // convention); the model stores the exclusive day after, so show one less.

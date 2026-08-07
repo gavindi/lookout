@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.3 (2026-08-07)
+
+### Added
+
+- **Calendar**: empty time slots in the Day/Week/Work week grids can now be click-and-dragged to select a whole range of time. A press on an empty slot starts the selection and a drag extends the highlight live - in either direction, across hours and day columns, with interior columns filling as full days (a new `SlotRange` model, normalized so `(start_date, start_minutes) <= (end_date, end_minutes)` regardless of which way the mouse moved; dragging out of an already-highlighted range starts a fresh one from the press point). Releasing keeps the range highlighted, and clicking the highlighted range opens the New Event editor spanning exactly what was selected - a 9:00-11:00 drag is a two-hour event (the end fills out the last highlighted slot), a multi-day drag spans its days, and a range ending at 23:30 rolls over to midnight. A single-slot click still passes no end, keeping the editor's usual one-hour default. The event editor's prefill gains a `suggested_end` so the dragged range lands in the form as-is; the slot activation callback (`calendar_view::connect_slot_activated`) now carries the full normalized range rather than a single slot. Drag tracking uses the click gesture's `update` signal, so a jittery click on a selected range still just activates it.
+
+### Testing
+
+- New `calendar_view` unit tests for `SlotRange`: drag-direction normalization (a downward drag equals the forward drag), boundary-inclusive containment (including rejecting the half-hour outside each end), and single-slot ranges.
+
 ## 0.7.2 (2026-08-07)
 
 ### Added

@@ -21,9 +21,14 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.7.3" date="2026-08-07">
+      <description>
+        <p>In the Day and Week views you can now click and drag across the time grid to highlight a whole range - across hours and multiple days - and clicking the highlighted range opens the New Event editor spanning exactly what you selected.</p>
+      </description>
+    </release>
     <release version="0.7.2" date="2026-08-07">
       <description>
-        <p>The Calendar's main grid is now clickable: click a day or an empty time slot to highlight it, and click it again to open the New Event editor prefilled for that moment - a month grid day opens one for 9am, a Day or Week grid slot for the exact time you clicked.</p>
+        <p>The Calendar's main grid is now clickable: click a day or an empty time slot to highlight it, and click it again to open the New Event editor prefilled for that moment - a month grid day opens one for 9am, a Day or Week grid slot for the exact time you clicked. You can also click and drag across the Day or Week grid to highlight a whole range of time, and clicking the range opens the editor spanning exactly what you selected.</p>
       </description>
     </release>
     <release version="0.7.1" date="2026-08-07">

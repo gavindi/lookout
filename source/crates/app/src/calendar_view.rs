@@ -65,11 +65,13 @@ type ActivateEvent = Rc<dyn Fn(EventOccurrence)>;
 /// widget's click handling.
 type PendingActivate = Rc<RefCell<Option<ActivateEvent>>>;
 
-/// A callback fired when the user clicks an empty time slot in a Day/Week
-/// time grid, so the caller can open a new-event editor at that exact time.
-/// Receives the clicked local date and the snapped minutes since local
-/// midnight (a whole half-hour).
-type SlotActivate = Rc<dyn Fn(NaiveDate, i64)>;
+/// A callback fired when the user activates a highlighted slot range in a
+/// Day/Week time grid (a click inside the selection), so the caller can open
+/// a new-event editor spanning that exact time. Receives the normalized range
+/// as `(start_date, start_minutes, end_date, end_minutes)` - minutes since
+/// local midnight, snapped to half hours, end inclusive (an end of 11:00
+/// means the highlight runs through the 11:00-11:30 slot).
+type SlotActivate = Rc<dyn Fn(NaiveDate, i64, NaiveDate, i64)>;
 
 /// One entry in a widget's pending slot-activation callback: set by the
 /// current render pass from `CalendarMain::connect_slot_activated`, consumed
@@ -502,6 +504,50 @@ pub struct TimeGrid {
 }
 
 /// The per-grid render state shared with the draw/hover closures.
+/// A selected span of time-grid slots: from `start` to `end` inclusive, with
+/// `minutes` being the snapped half-hour start of each boundary slot (an end
+/// of `11:00` means the highlight runs through the 11:00-11:30 slot). Always
+/// normalized so `(start_date, start_minutes) <= (end_date, end_minutes)`,
+/// so multi-column ranges paint left-to-right regardless of drag direction.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct SlotRange {
+    start_date: NaiveDate,
+    start_minutes: i64,
+    end_date: NaiveDate,
+    end_minutes: i64,
+}
+
+impl SlotRange {
+    /// The normalized range covering the single slot `(date, minutes)`.
+    fn single(date: NaiveDate, minutes: i64) -> Self {
+        SlotRange {
+            start_date: date,
+            start_minutes: minutes,
+            end_date: date,
+            end_minutes: minutes,
+        }
+    }
+
+    /// The normalized range spanning the slots `(a_date, a_minutes)` through
+    /// `(b_date, b_minutes)`, in either drag direction.
+    fn spanning(a_date: NaiveDate, a_minutes: i64, b_date: NaiveDate, b_minutes: i64) -> Self {
+        let a = (a_date, a_minutes);
+        let b = (b_date, b_minutes);
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        SlotRange {
+            start_date: start.0,
+            start_minutes: start.1,
+            end_date: end.0,
+            end_minutes: end.1,
+        }
+    }
+
+    /// Whether the snapped slot `(date, minutes)` falls inside the range.
+    fn contains(&self, date: NaiveDate, minutes: i64) -> bool {
+        (self.start_date, self.start_minutes) <= (date, minutes) && (date, minutes) <= (self.end_date, self.end_minutes)
+    }
+}
+
 #[derive(Clone)]
 struct TimeGridData {
     occurrences: Rc<RefCell<Vec<EventOccurrence>>>,
@@ -509,11 +555,15 @@ struct TimeGridData {
     /// The consecutive local dates currently displayed, one per column.
     dates: Rc<RefCell<Vec<NaiveDate>>>,
     chips: Rc<RefCell<Vec<TimeChip>>>,
-    /// The time slot currently highlighted by a first click: the local date
-    /// and snapped minutes since midnight. A second click on the same slot
-    /// fires the slot-activation callback instead of re-selecting; cleared by
-    /// every `set_time_grid` render pass.
-    selected_slot: Rc<RefCell<Option<(NaiveDate, i64)>>>,
+    /// The slot range currently highlighted (by a click, or by a click-and-
+    /// drag). A click inside the highlighted range fires the slot-activation
+    /// callback; cleared by every `set_time_grid` render pass.
+    selection: Rc<RefCell<Option<SlotRange>>>,
+    /// True while the pointer button is held after pressing on an empty slot.
+    drag_active: Rc<Cell<bool>>,
+    /// The slot the drag started from, used to distinguish a jittery click
+    /// from a real drag and to anchor the range while dragging.
+    drag_anchor: Rc<RefCell<Option<(NaiveDate, i64)>>>,
 }
 
 pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
@@ -533,7 +583,9 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         colors: Rc::new(RefCell::new(HashMap::new())),
         dates: Rc::new(RefCell::new(Vec::new())),
         chips: Rc::new(RefCell::new(Vec::new())),
-        selected_slot: Rc::new(RefCell::new(None)),
+        selection: Rc::new(RefCell::new(None)),
+        drag_active: Rc::new(Cell::new(false)),
+        drag_anchor: Rc::new(RefCell::new(None)),
     };
     let hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let on_activate: PendingActivate = Rc::new(RefCell::new(None));
@@ -637,14 +689,17 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
 }
 
 /// Wires a click handler onto a time-grid canvas so clicking a chip opens its
-/// editor, and clicking an empty time slot on the timeline selects it: the
-/// first click on a slot highlights it (drawn by `paint_time_grid`), a second
-/// click on the already-highlighted slot fires `on_slot_activate` with the
-/// snapped slot's date + time (a new-event entry point for the caller).
-/// `band` selects the split half (all-day chips vs timed chips), the same
-/// convention as [`attach_hover`]; the hit-test is the shared
-/// [`hovered_chip`]. The callbacks come from `on_activate` and
-/// `on_slot_activate`, set by the latest `set_time_grid` render pass.
+/// editor, and empty time slots on the timeline support select-then-edit:
+/// a click highlights the slot, a click-and-drag extends the highlight over
+/// a whole range (across hours and day columns, drawn by `paint_time_grid`),
+/// and a click inside the highlighted range fires `on_slot_activate` with the
+/// snapped start/end slots (a new-event entry point for the caller). Dragging
+/// tracks pointer motion via the gesture's `update` signal, so a jittery
+/// click on a selected range still just activates it. `band` selects the
+/// split half (all-day chips vs timed chips), the same convention as
+/// [`attach_hover`]; the hit-test is the shared [`hovered_chip`]. The
+/// callbacks come from `on_activate` and `on_slot_activate`, set by the
+/// latest `set_time_grid` render pass.
 fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_activate: &PendingActivate, on_slot_activate: &PendingSlotActivate) {
     let gesture = gtk::GestureClick::new();
     {
@@ -652,25 +707,47 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
         let data = data.clone();
         let on_activate = on_activate.clone();
         let on_slot_activate = on_slot_activate.clone();
-        gesture.connect_pressed(move |_, _, x, y| {
-            let (hit, slot) = {
+        // The snapped slot under `(x, y)` (timeline only - the band has no
+        // slots), or `None` for gutter/band/chip hits.
+        let slot_at = {
+            let data = data.clone();
+            let canvas_widget = canvas_widget.clone();
+            move |x: f64, y: f64| -> Option<(NaiveDate, i64)> {
                 let dates_guard = data.dates.borrow();
                 let chips_guard = data.chips.borrow();
-                let hit = hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band);
-                let slot = if hit.is_some() || band {
-                    None
-                } else {
-                    slot_from_point(x, y, canvas_widget.width() as f64, dates_guard.len()).map(|(col, minutes)| (dates_guard[col], minutes))
-                };
-                (hit, slot)
-            };
-            if let Some(hit) = hit {
-                *data.selected_slot.borrow_mut() = None;
-                canvas_widget.queue_draw();
+                if band || hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band).is_some() {
+                    return None;
+                }
+                slot_from_point(x, y, canvas_widget.width() as f64, dates_guard.len()).map(|(col, minutes)| (dates_guard[col], minutes))
+            }
+        };
+        // The index of the chip under `(x, y)` (timeline only; band chips are
+        // activated by the same gesture through `band`).
+        let chip_at = {
+            let data = data.clone();
+            let canvas_widget = canvas_widget.clone();
+            move |x: f64, y: f64| -> Option<usize> {
+                let dates_guard = data.dates.borrow();
+                let chips_guard = data.chips.borrow();
+                hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band)
+            }
+        };
+        let slot_at_update = slot_at.clone();
+        let slot_at_release = slot_at.clone();
+        let pressed_data = data.clone();
+        let pressed_canvas = canvas_widget.clone();
+        let update_data = data.clone();
+        let update_canvas = canvas_widget.clone();
+        let release_data = data.clone();
+        let release_canvas = canvas_widget.clone();
+        gesture.connect_pressed(move |_, _, x, y| {
+            if let Some(hit) = chip_at(x, y) {
+                *pressed_data.selection.borrow_mut() = None;
+                pressed_canvas.queue_draw();
                 let occ = {
-                    let chips_guard = data.chips.borrow();
+                    let chips_guard = pressed_data.chips.borrow();
                     let occurrence_index = chips_guard[hit].occurrence;
-                    data.occurrences.borrow().get(occurrence_index).cloned()
+                    pressed_data.occurrences.borrow().get(occurrence_index).cloned()
                 };
                 let Some(occ) = occ else { return };
                 if let Some(callback) = on_activate.borrow().as_ref() {
@@ -678,16 +755,59 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
                 }
                 return;
             }
-            let Some((date, minutes)) = slot else { return };
-            if *data.selected_slot.borrow() == Some((date, minutes)) {
-                *data.selected_slot.borrow_mut() = None;
-                canvas_widget.queue_draw();
-                if let Some(callback) = on_slot_activate.borrow().as_ref() {
-                    callback(date, minutes);
+            let Some(slot) = slot_at(x, y) else { return };
+            // A press inside the highlighted range is a "click the selection
+            // to activate" candidate; it only opens the editor if the pointer
+            // is released without dragging it into a new range.
+            if pressed_data.selection.borrow().is_some_and(|range| range.contains(slot.0, slot.1)) {
+                *pressed_data.drag_anchor.borrow_mut() = Some(slot);
+                return;
+            }
+            // Otherwise begin a new selection at the pressed slot; dragging
+            // extends it (see `connect_update`), releasing keeps it.
+            *pressed_data.selection.borrow_mut() = Some(SlotRange::single(slot.0, slot.1));
+            *pressed_data.drag_anchor.borrow_mut() = Some(slot);
+            pressed_data.drag_active.set(true);
+            pressed_canvas.queue_draw();
+        });
+        gesture.connect_update(move |gesture, sequence| {
+            let Some((x, y)) = gesture.point(sequence) else { return };
+            let Some(slot) = slot_at_update(x, y) else { return };
+            let Some(anchor) = *update_data.drag_anchor.borrow() else { return };
+            if (slot.0, slot.1) == anchor {
+                return;
+            }
+            // First movement after pressing inside an existing selection
+            // turns the gesture into a drag of a brand-new range from that
+            // press point (a click with no movement still activates on
+            // release); a press on an empty slot already set this flag.
+            if !update_data.drag_active.get() {
+                update_data.drag_active.set(true);
+            }
+            *update_data.selection.borrow_mut() = Some(SlotRange::spanning(anchor.0, anchor.1, slot.0, slot.1));
+            update_canvas.queue_draw();
+        });
+        gesture.connect_released(move |_, _, x, y| {
+            let was_dragging = release_data.drag_active.replace(false);
+            let Some(anchor) = *release_data.drag_anchor.borrow() else { return };
+            let Some(release_slot) = slot_at_release(x, y) else { return };
+            if was_dragging {
+                // A real drag: keep the range highlighted for a later click.
+                if (release_slot.0, release_slot.1) != anchor {
+                    *release_data.selection.borrow_mut() = Some(SlotRange::spanning(anchor.0, anchor.1, release_slot.0, release_slot.1));
+                    release_canvas.queue_draw();
                 }
-            } else {
-                *data.selected_slot.borrow_mut() = Some((date, minutes));
-                canvas_widget.queue_draw();
+                return;
+            }
+            // A plain click that started inside the selection: activate it.
+            if (release_slot.0, release_slot.1) == anchor {
+                let range = release_data.selection.borrow_mut().take();
+                release_canvas.queue_draw();
+                if let Some(range) = range {
+                    if let Some(callback) = on_slot_activate.borrow().as_ref() {
+                        callback(range.start_date, range.start_minutes, range.end_date, range.end_minutes);
+                    }
+                }
             }
         });
     }
@@ -752,8 +872,10 @@ pub fn set_time_grid(
     *t.data.colors.borrow_mut() = colors.clone();
 
     // A new render pass repaints the whole grid: the previously highlighted
-    // time slot no longer corresponds to a visible position.
-    *t.data.selected_slot.borrow_mut() = None;
+    // range no longer corresponds to visible positions.
+    *t.data.selection.borrow_mut() = None;
+    t.data.drag_active.set(false);
+    *t.data.drag_anchor.borrow_mut() = None;
 
     let dates = grid_dates(t);
     let chips = compute_time_grid_chips(&dates, occurrences);
@@ -1119,16 +1241,32 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
         paint_right_text(cr, &hour_gutter_text(hh), HOUR_GUTTER_WIDTH - 5.0, y, 10.0, GRID_DIM_TEXT_RGBA, FontWeight::Normal);
     }
 
-    // The first-click-selected time slot: a translucent highlight band across
-    // its column (chips draw over it, so selected slots are always empty).
-    if let Some((date, minutes)) = *data.selected_slot.borrow() {
-        if let Some(col) = dates.iter().position(|d| *d == date) {
-            let slot_top = minutes as f64 * TIME_SLOT_HEIGHT / 60.0;
-            let slot_height = TIME_SLOT_HEIGHT / 2.0;
-            cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 1.0, slot_top + 1.0, col_width - 2.0, slot_height - 2.0);
+    // The highlighted slot range (from a click, or a click-and-drag): a
+    // translucent band across every covered column - full-day on the interior
+    // columns, and the partial start/end segments on the boundary ones.
+    if let Some(range) = *data.selection.borrow() {
+        for (col, date) in dates.iter().enumerate() {
+            if *date < range.start_date || *date > range.end_date {
+                continue;
+            }
+            let top = if *date == range.start_date {
+                range.start_minutes as f64 * TIME_SLOT_HEIGHT / 60.0
+            } else {
+                0.0
+            };
+            let bottom = if *date == range.end_date {
+                (range.end_minutes + 30) as f64 * TIME_SLOT_HEIGHT / 60.0
+            } else {
+                HOURS_PER_DAY as f64 * TIME_SLOT_HEIGHT
+            };
+            let height = bottom - top;
+            if height <= 0.0 {
+                continue;
+            }
+            cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 1.0, top + 1.0, col_width - 2.0, height - 2.0);
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
             let _ = cr.fill();
-            cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 0.5, slot_top + 0.5, col_width - 1.0, slot_height - 1.0);
+            cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 0.5, top + 0.5, col_width - 1.0, height - 1.0);
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.3);
             cr.set_line_width(1.0);
             let _ = cr.stroke();
@@ -1583,11 +1721,12 @@ pub fn connect_event_activated(c: &CalendarMain, f: impl Fn(EventOccurrence) + '
     *c.on_activate.borrow_mut() = Some(Rc::new(f));
 }
 
-/// Registers `f` to run when the user clicks an empty time slot in the Day or
-/// Week grids, receiving the slot's local date and snapped start minute so the
-/// caller can open a new-event editor prefilled for that exact time. One
+/// Registers `f` to run when the user clicks a highlighted slot range in the
+/// Day or Week grids (selected by a click, or a click-and-drag), receiving
+/// the range as `(start_date, start_minutes, end_date, end_minutes)` so the
+/// caller can open a new-event editor spanning that exact time. One
 /// subscriber is expected (the window); a later registration replaces it.
-pub fn connect_slot_activated(c: &CalendarMain, f: impl Fn(NaiveDate, i64) + 'static) {
+pub fn connect_slot_activated(c: &CalendarMain, f: impl Fn(NaiveDate, i64, NaiveDate, i64) + 'static) {
     *c.on_slot_activate.borrow_mut() = Some(Rc::new(f));
 }
 
@@ -2516,6 +2655,48 @@ mod tests {
             Some(false)
         );
         assert!(hovered_chip(&chips, canvas_width, 7, timed_centre.0, timed_centre.1, true).is_none());
+    }
+
+    #[test]
+    fn slot_range_spanning_normalizes_the_drag_direction() {
+        let mon = NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 8, 4).unwrap();
+        // Dragged downward in time (Tue 11:00 back to Mon 9:00) still yields
+        // the same normalized range as dragging forward.
+        let down = SlotRange::spanning(tue, 11 * 60, mon, 9 * 60);
+        let up = SlotRange::spanning(mon, 9 * 60, tue, 11 * 60);
+        assert_eq!(down, up);
+        assert_eq!(down.start_date, mon);
+        assert_eq!(down.start_minutes, 9 * 60);
+        assert_eq!(down.end_date, tue);
+        assert_eq!(down.end_minutes, 11 * 60);
+    }
+
+    #[test]
+    fn slot_range_contains_includes_the_boundaries_and_skips_outside() {
+        let mon = NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 8, 4).unwrap();
+        let range = SlotRange::spanning(mon, 9 * 60, tue, 11 * 60);
+        assert!(range.contains(mon, 9 * 60));
+        assert!(range.contains(mon, 13 * 60));
+        assert!(range.contains(tue, 11 * 60));
+        assert!(range.contains(tue, 0));
+        assert!(!range.contains(mon, 8 * 60 + 30));
+        assert!(!range.contains(tue, 11 * 60 + 30));
+        assert!(!range.contains(NaiveDate::from_ymd_opt(2026, 8, 5).unwrap(), 0));
+    }
+
+    #[test]
+    fn slot_range_single_covers_exactly_one_slot() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        let range = SlotRange::single(day, 9 * 60);
+        assert_eq!(range.start_date, day);
+        assert_eq!(range.end_date, day);
+        assert_eq!(range.start_minutes, 9 * 60);
+        assert_eq!(range.end_minutes, 9 * 60);
+        assert!(range.contains(day, 9 * 60));
+        assert!(!range.contains(day, 9 * 60 + 30));
+        assert!(!range.contains(day, 8 * 60 + 30));
     }
 
     #[test]

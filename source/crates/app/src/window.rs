@@ -3871,7 +3871,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     anchor.and_hms_opt(9, 0, 0).unwrap()
                 }
             };
-            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, suggested_start);
+            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, suggested_start, None);
         });
     }
     {
@@ -3897,6 +3897,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     default_calendar,
                     existing: Some(&occ),
                     suggested_start: None,
+                    suggested_end: None,
                     month_occurrences: &preview.occurrences,
                     month_event_days: &preview.month_event_days,
                     calendar_colors: &preview.colors,
@@ -3925,11 +3926,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
-        calendar_view::connect_slot_activated(&calendar_main, move |date, minutes| {
-            let Some(start) = date.and_hms_opt((minutes / 60) as u32, (minutes % 60) as u32, 0) else {
+        calendar_view::connect_slot_activated(&calendar_main, move |start_date, start_minutes, end_date, end_minutes| {
+            let Some(start) = start_date.and_hms_opt((start_minutes / 60) as u32, (start_minutes % 60) as u32, 0) else {
                 return;
             };
-            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start);
+            // The selection covers through the end of its last slot: a
+            // 9:00-11:00 drag is a 2h event ending 11:30 (the last 30 minutes
+            // fill out the highlighted slot). A single-slot click passes no
+            // end, so the editor's usual one-hour default applies.
+            let end = if end_date == start_date && end_minutes == start_minutes {
+                None
+            } else if end_minutes + 30 >= 1440 {
+                (end_date + chrono::Duration::days(1)).and_hms_opt(0, 0, 0)
+            } else {
+                end_date.and_hms_opt(((end_minutes + 30) / 60) as u32, ((end_minutes + 30) % 60) as u32, 0)
+            };
+            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start, end);
         });
     }
     {
@@ -3955,7 +3967,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let Some(start) = date.and_hms_opt(9, 0, 0) else {
                 return;
             };
-            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start);
+            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start, None);
         });
     }
 
@@ -5592,16 +5604,18 @@ fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anch
     EventEditorPreviewData { occurrences, month_event_days, colors }
 }
 
-/// Opens the "New event" editor prefilled for `suggested_start`, shared by
-/// the Calendar toolbar's New Event button and the Day/Week grids' empty
-/// time-slot clicks so both entry points behave identically (a connect-a-
-/// calendar toast when nothing writable exists, the editor otherwise).
+/// Opens the "New event" editor prefilled for `suggested_start` (and
+/// optionally `suggested_end`), shared by the Calendar toolbar's New Event
+/// button, the Day/Week grids' highlighted slot ranges, and month-grid day
+/// activation so every entry point behaves identically (a connect-a-calendar
+/// toast when nothing writable exists, the editor otherwise).
 fn show_new_event_editor(
     window: &adw::ApplicationWindow,
     state: &Rc<RefCell<UiState>>,
     calendar_state: &Rc<RefCell<CalendarUiState>>,
     toast_overlay: &adw::ToastOverlay,
     suggested_start: chrono::NaiveDateTime,
+    suggested_end: Option<chrono::NaiveDateTime>,
 ) {
     let calendars = pickable_calendars(calendar_state);
     let Some(default_calendar) = default_pickable_calendar(calendar_state) else {
@@ -5617,6 +5631,7 @@ fn show_new_event_editor(
             default_calendar,
             existing: None,
             suggested_start: Some(suggested_start),
+            suggested_end,
             month_occurrences: &preview.occurrences,
             month_event_days: &preview.month_event_days,
             calendar_colors: &preview.colors,
