@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.7 (2026-08-08)
+
+### Changed
+
+- **Calendar / People**: the left sidebars' widths are now remembered between sessions like the mail folder pane's. Dragging the calendar sidebar or the people category tree stores its width as a percentage of the window width in two new GSettings keys - `pane-calendar-sidebar-width-percent` and `pane-contacts-sidebar-width-percent` (default -1, meaning never set), written 150 ms after the drag stops on the same debounced schedule as the mail panes. Both stored percentages are reapplied (clamped to each pane's min/max, exactly as the mail panes are) whenever the window is resized - and, since those panes live in the tab stack and are only mapped while their tab is visible, also every time the Calendar or People tab becomes the visible one, so a resize made on another tab no longer leaves the sidebar at a stale position when you switch back. The People pop-out window's paned keeps saving through the same path while detached.
+
 ## 0.8.6 (2026-08-08)
 
 ### Added

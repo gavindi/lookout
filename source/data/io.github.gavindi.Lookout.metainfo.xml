@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.8.7" date="2026-08-08">
+      <description>
+        <p>The Calendar and People sidebars now remember their widths between sessions: drag them to size and the split comes back exactly as you left it, on restart and when the window is resized.</p>
+      </description>
+    </release>
     <release version="0.8.6" date="2026-08-08">
       <description>
         <p>Emails with calendar invitations now show the event's details: a card above the message body displays when the event is (local time, or the date for all-day events, with a recurring hint), where it is, who organized it, and any description - alongside the usual accept/deny bar.</p>

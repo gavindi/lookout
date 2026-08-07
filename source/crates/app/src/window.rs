@@ -3153,6 +3153,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let apply_stored_pane_widths = {
         let main_paned = main_paned.clone();
         let messages_reading_paned = messages_reading_paned.clone();
+        let calendar_paned = calendar_paned.clone();
+        let contacts_paned = contacts_paned.clone();
         let state = state.clone();
         move |window_width: i32| {
             if window_width <= 0 {
@@ -3176,6 +3178,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let max = messages_reading_paned.width().saturating_sub(end_min).max(min);
                 let target = (list_pct / 100.0 * window_width as f64) as i32;
                 messages_reading_paned.set_position(target.clamp(min, max));
+            }
+            let calendar_pct = settings.get_double(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT);
+            if calendar_pct > 0.0 && calendar_paned.is_mapped() {
+                let start_min = calendar_paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let end_min = calendar_paned.end_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let min = start_min;
+                let max = calendar_paned.width().saturating_sub(end_min).max(min);
+                let target = (calendar_pct / 100.0 * window_width as f64) as i32;
+                calendar_paned.set_position(target.clamp(min, max));
+            }
+            let contacts_pct = settings.get_double(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT);
+            if contacts_pct > 0.0 && contacts_paned.is_mapped() {
+                let start_min = contacts_paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let end_min = contacts_paned.end_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let min = start_min;
+                let max = contacts_paned.width().saturating_sub(end_min).max(min);
+                let target = (contacts_pct / 100.0 * window_width as f64) as i32;
+                contacts_paned.set_position(target.clamp(min, max));
             }
         }
     };
@@ -3226,6 +3246,44 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
             })));
         });
+        let window_for_debug = window.clone();
+        let state_for_save = state.clone();
+        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        calendar_paned.connect_notify_local(Some("position"), move |paned, _| {
+            if let Some(id) = debounce.take() {
+                id.remove();
+            }
+            let width = paned.position();
+            let window_width = window_for_debug.width();
+            let state_for_timeout = state_for_save.clone();
+            let debounce_for_timeout = debounce.clone();
+            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                debounce_for_timeout.set(None);
+                if window_width > 0 {
+                    let pct = width as f64 * 100.0 / window_width as f64;
+                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT, pct);
+                }
+            })));
+        });
+        let window_for_debug = window.clone();
+        let state_for_save = state.clone();
+        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        contacts_paned.connect_notify_local(Some("position"), move |paned, _| {
+            if let Some(id) = debounce.take() {
+                id.remove();
+            }
+            let width = paned.position();
+            let window_width = window_for_debug.width();
+            let state_for_timeout = state_for_save.clone();
+            let debounce_for_timeout = debounce.clone();
+            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                debounce_for_timeout.set(None);
+                if window_width > 0 {
+                    let pct = width as f64 * 100.0 / window_width as f64;
+                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT, pct);
+                }
+            })));
+        });
     }
     // GTK4 only updates `default-width` when the window is resized while
     // resizable and not maximized/tiled/fullscreen (see `should_remember_size`
@@ -3262,6 +3320,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     apply_for_timeout(window_for_timeout.width());
                 })));
             });
+        });
+    }
+    // The calendar and people panes live in `root_stack`, so they're only
+    // mapped while their tab is the visible one. The window-resize handler
+    // above therefore skips them whenever the window is resized on another
+    // tab, so the stored percentages are also reapplied each time the stack
+    // switches to a page holding a paned split. Debounced like the resize
+    // handler so the panes' allocations have settled before the positions
+    // are computed.
+    {
+        let root_stack = root_stack.clone();
+        let apply_stored_pane_widths = apply_stored_pane_widths.clone();
+        let window_for_timeout = window.clone();
+        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        root_stack.connect_notify_local(Some("visible-child-name"), move |_, _| {
+            if let Some(id) = debounce.take() {
+                id.remove();
+            }
+            let window_for_timeout = window_for_timeout.clone();
+            let apply_for_timeout = apply_stored_pane_widths.clone();
+            let debounce_for_timeout = debounce.clone();
+            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                debounce_for_timeout.set(None);
+                apply_for_timeout(window_for_timeout.width());
+            })));
         });
     }
 

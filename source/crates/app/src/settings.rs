@@ -37,6 +37,8 @@ pub const LAYOUT_READING_PANE: &str = "layout-reading-pane";
 pub const LAYOUT_CALENDAR_OVERVIEW: &str = "layout-calendar-overview";
 pub const PANE_FOLDER_WIDTH_PCT: &str = "pane-folder-width-percent";
 pub const PANE_MESSAGE_LIST_WIDTH_PCT: &str = "pane-message-list-width-percent";
+pub const PANE_CALENDAR_SIDEBAR_WIDTH_PCT: &str = "pane-calendar-sidebar-width-percent";
+pub const PANE_CONTACTS_SIDEBAR_WIDTH_PCT: &str = "pane-contacts-sidebar-width-percent";
 pub const SORT_KEY: &str = "sort-key";
 pub const SORT_DESCENDING: &str = "sort-descending";
 pub const MAIL_FAVORITES: &str = "mail-favorites";
@@ -112,6 +114,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(LAYOUT_CALENDAR_OVERVIEW, Value::Bool(true));
     map.insert(PANE_FOLDER_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_MESSAGE_LIST_WIDTH_PCT, Value::Double(-1.0));
+    map.insert(PANE_CALENDAR_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
+    map.insert(PANE_CONTACTS_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(SORT_KEY, Value::String("date".into()));
     map.insert(SORT_DESCENDING, Value::Bool(true));
     map.insert(MAIL_FAVORITES, Value::Strv(Vec::new()));
