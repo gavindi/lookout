@@ -41,6 +41,11 @@ pub struct Cache {
     /// path serves both on-demand read-back and the (out-of-scope) cache
     /// pruning, and `clear_all_caches` wipes them along with the databases.
     attachments_dir: std::path::PathBuf,
+    /// Per-account directory holding whole raw RFC 5322 messages as `.eml`
+    /// flat files (see `load_raw_message`/`store_raw_message`). Same rationale
+    /// as `attachments_dir`: raw messages are opaque bytes served only for
+    /// export, so a deterministic path is the whole index.
+    messages_dir: std::path::PathBuf,
 }
 
 fn cache_dir() -> std::path::PathBuf {
@@ -372,9 +377,11 @@ impl Cache {
         // keeps the index populated for everything synced under this build.
 
         let attachments_dir = cache_dir().join("attachments").join(sanitize_filename(account_id));
+        let messages_dir = cache_dir().join("messages").join(sanitize_filename(account_id));
         Ok(Cache {
             conn: Mutex::new(conn),
             attachments_dir,
+            messages_dir,
         })
     }
 
@@ -603,6 +610,42 @@ impl Cache {
     /// `BodyPart::transfer_encoding` concern that belongs to the fetch path.
     pub fn store_attachment(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, part_number: &str, bytes: &[u8]) -> Result<()> {
         let path = self.attachment_path(mailbox_id, uid, uidvalidity, part_number);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, bytes)?;
+        Ok(())
+    }
+
+    /// The per-account flat-file path a whole raw RFC 5322 message's bytes are
+    /// stored at, keyed exactly like `attachment_path` (mailbox identity via
+    /// fixed-seed hash + `uidvalidity`/`uid`) but with an `.eml` extension.
+    fn raw_message_path(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> PathBuf {
+        let mut hasher = DefaultHasher::new();
+        mailbox_id.0.hash(&mut hasher);
+        let mailbox_hash = hasher.finish();
+        self.messages_dir.join(format!("{mailbox_hash:016x}-{}-{}.eml", uidvalidity.0, uid.0))
+    }
+
+    /// Returns the previously-fetched whole raw message bytes (a valid RFC
+    /// 5322 message, exactly what `BODY.PEEK[]` returned), or `None` if they
+    /// aren't cached. Served straight from a flat file so an .eml export can
+    /// be instant and offline after the first fetch.
+    pub fn load_raw_message(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<Option<Vec<u8>>> {
+        let path = self.raw_message_path(mailbox_id, uid, uidvalidity);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persists a whole raw RFC 5322 message (as fetched with `BODY.PEEK[]`,
+    /// unmodified) to its flat file. Callers may store bytes they already
+    /// downloaded for another purpose (e.g. the whole-message body fallback
+    /// path) at near-zero cost, or fetch on demand for an export.
+    pub fn store_raw_message(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, bytes: &[u8]) -> Result<()> {
+        let path = self.raw_message_path(mailbox_id, uid, uidvalidity);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -1025,6 +1068,53 @@ mod tests {
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(cache_dir().join("attachments").join(sanitize_filename(&account_id)));
+    }
+
+    /// The .eml export cache: bytes stored once come back verbatim, distinct
+    /// messages never collide, an unknown message reports a clean miss, and a
+    /// second cache handle on the same account derives the same path.
+    #[test]
+    fn round_trips_raw_messages_through_the_flat_file_cache() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let one = b"Subject: one\r\n\r\nbody one".to_vec();
+        let two = b"Subject: two\r\n\r\nbody two".to_vec();
+        cache.store_raw_message(&mailbox_id, Uid(1), UidValidity(1), &one).unwrap();
+        cache.store_raw_message(&mailbox_id, Uid(2), UidValidity(1), &two).unwrap();
+
+        assert_eq!(cache.load_raw_message(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), Some(one.clone()));
+        assert_eq!(cache.load_raw_message(&mailbox_id, Uid(2), UidValidity(1)).unwrap(), Some(two));
+        assert_eq!(cache.load_raw_message(&mailbox_id, Uid(3), UidValidity(1)).unwrap(), None);
+
+        let reopened = Cache::open(&account_id).unwrap();
+        assert_eq!(reopened.load_raw_message(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), Some(one));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(cache_dir().join("messages").join(sanitize_filename(&account_id)));
+    }
+
+    /// `uidvalidity` guards the raw-message cache the same way it guards
+    /// `bodies` and attachments: after a mailbox re-create, a recycled uid
+    /// must be a miss, not another message's .eml.
+    #[test]
+    fn raw_message_cache_respects_uidvalidity() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache.store_raw_message(&mailbox_id, Uid(7), UidValidity(1), b"Subject: old\r\n\r\nx").unwrap();
+        assert_eq!(cache.load_raw_message(&mailbox_id, Uid(7), UidValidity(2)).unwrap(), None);
+        assert_eq!(
+            cache.load_raw_message(&mailbox_id, Uid(7), UidValidity(1)).unwrap(),
+            Some(b"Subject: old\r\n\r\nx".to_vec())
+        );
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(cache_dir().join("messages").join(sanitize_filename(&account_id)));
     }
 
     /// The one-time upgrades that make the cache-hit path safe again: a cache

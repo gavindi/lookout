@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
-use lookout_core::{EmailBody, EmailSummary};
+use lookout_core::{header_value, EmailBody, EmailSummary};
 use lookout_mail::session::AccountCommand;
 use lookout_mail::{new_message_id, ComposedMessage};
 use webkit::prelude::*;
@@ -42,14 +42,6 @@ pub struct ComposePrefill {
 pub enum ReplyMode {
     Reply,
     ReplyAll,
-}
-
-/// Case-insensitive lookup against `EmailBody::headers` (raw RFC 5322
-/// headers, verbatim - see that field's doc comment). IMAP's `ENVELOPE`
-/// doesn't carry `References`, so this is the only place that header is
-/// available at all; `Message-Id` is looked up the same way for consistency.
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
 /// Strips one layer of RFC 5322 `<...>` angle brackets from a Message-Id

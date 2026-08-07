@@ -313,6 +313,63 @@ pub struct EmailBody {
     pub auth_results: Option<AuthenticationResults>,
 }
 
+/// The unsubscribe actions a message offers, parsed from its
+/// `List-Unsubscribe` (RFC 2369) and `List-Unsubscribe-Post` (RFC 8058)
+/// headers. At most one `mailto:` address and at most one `http(s)` URL are
+/// kept - the first of each kind in header order, matching the RFC's
+/// "alternate methods" intent. `one_click` is true when the message also
+/// carries `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, which
+/// signals the `http` URL accepts a one-click POST of
+/// `List-Unsubscribe=One-Click` (no email round trip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListUnsubscribe {
+    /// The `mailto:` target with scheme stripped and percent-encoding
+    /// undone (the part before any `?subject=...` parameters).
+    pub mailto: Option<String>,
+    /// The `http(s)://` URL, verbatim.
+    pub http: Option<String>,
+    pub one_click: bool,
+}
+
+/// Case-insensitive lookup of one header field in the raw `(name, value)`
+/// pairs `EmailBody::headers` carries. Header names are case-insensitive per
+/// RFC 5322, and the pairs come straight off the wire, so lookups must not
+/// assume casing.
+pub fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+/// Parses a message's unsubscribe headers into the actions its banner can
+/// offer. Returns `None` when there's no `List-Unsubscribe` header at all,
+/// or when it names no `mailto:`/`http(s)` action (e.g. only a
+/// non-one-click-able scheme). A `mailto:` action is also kept when the
+/// http(s) URL is present, so a failing POST can degrade to it.
+pub fn parse_list_unsubscribe(headers: &[(String, String)]) -> Option<ListUnsubscribe> {
+    let raw = header_value(headers, "list-unsubscribe")?;
+    let mut mailto = None;
+    let mut http = None;
+    // RFC 2369: a comma-separated list of actions, each a `mailto:` or
+    // `http(s):` URL in angle brackets (angle brackets optional in the wild).
+    for item in raw.split(',') {
+        let item = item.trim();
+        let target = item.strip_prefix('<').and_then(|r| r.strip_suffix('>')).unwrap_or(item).trim();
+        if let Some(addr) = target.strip_prefix("mailto:") {
+            let addr = addr.split('?').next().unwrap_or("").trim();
+            let addr = percent_decode(addr);
+            if !addr.is_empty() && mailto.is_none() {
+                mailto = Some(addr);
+            }
+        } else if (target.starts_with("https://") || target.starts_with("http://")) && http.is_none() {
+            http = Some(target.to_string());
+        }
+    }
+    if mailto.is_none() && http.is_none() {
+        return None;
+    }
+    let one_click = header_value(headers, "list-unsubscribe-post").is_some_and(|v| v.to_ascii_lowercase().contains("one-click"));
+    Some(ListUnsubscribe { mailto, http, one_click })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +475,64 @@ mod tests {
         assert!(!cid_matches("", "logo123"));
         assert!(!cid_matches("logo123", ""));
         assert!(!cid_matches("<>", "<>"));
+    }
+
+    #[test]
+    fn header_value_is_case_insensitive() {
+        let headers = vec![("Subject".to_string(), "Hi".to_string()), ("LIST-UNSUBSCRIBE".to_string(), "<https://e.com/u>".to_string())];
+        assert_eq!(header_value(&headers, "subject"), Some("Hi"));
+        assert_eq!(header_value(&headers, "List-Unsubscribe"), Some("<https://e.com/u>"));
+        assert_eq!(header_value(&headers, "list-unsubscribe-post"), None);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_extracts_mailto_and_http_actions() {
+        // Both actions, first of each kind kept.
+        let headers = vec![("List-Unsubscribe".to_string(), "<mailto:unsub@list.example>, <https://list.example/unsub?id=7>".to_string())];
+        let parsed = parse_list_unsubscribe(&headers).expect("both actions should parse");
+        assert_eq!(parsed.mailto.as_deref(), Some("unsub@list.example"));
+        assert_eq!(parsed.http.as_deref(), Some("https://list.example/unsub?id=7"));
+        assert!(!parsed.one_click);
+
+        // One-click POST capability comes from List-Unsubscribe-Post.
+        let mut headers = headers;
+        headers.push(("List-Unsubscribe-Post".to_string(), "List-Unsubscribe=One-Click".to_string()));
+        assert!(parse_list_unsubscribe(&headers).expect("parses").one_click);
+
+        // Percent-encoded mailto address is decoded (RFC 8058 sends these).
+        let encoded = vec![("List-Unsubscribe".to_string(), "<mailto:user%40list.example?subject=unsubscribe>".to_string())];
+        let parsed = parse_list_unsubscribe(&encoded).expect("mailto should parse");
+        assert_eq!(parsed.mailto.as_deref(), Some("user@list.example"));
+        assert_eq!(parsed.http, None);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_is_lenient_about_formatting() {
+        // Angle brackets optional, whitespace tolerated.
+        let bare = vec![("list-unsubscribe".to_string(), "mailto:a@b.example, https://b.example/u".to_string())];
+        let parsed = parse_list_unsubscribe(&bare).expect("bare form should parse");
+        assert_eq!(parsed.mailto.as_deref(), Some("a@b.example"));
+        assert_eq!(parsed.http.as_deref(), Some("https://b.example/u"));
+
+        // Malformed escapes and unknown schemes pass through harmlessly.
+        let weird = vec![(
+            "list-unsubscribe".to_string(),
+            "<mailto:100%%25ok@x.example>, <ftp://x.example>, <mailto:bad%zz@x.example>".to_string(),
+        )];
+        let parsed = parse_list_unsubscribe(&weird).expect("first valid mailto should parse");
+        assert_eq!(parsed.mailto.as_deref(), Some("100%%ok@x.example"));
+        assert_eq!(parsed.http, None);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_returns_none_without_usable_actions() {
+        // No header at all.
+        assert_eq!(parse_list_unsubscribe(&[]), None);
+        // A header naming only schemes we can't act on.
+        let ftp = vec![("list-unsubscribe".to_string(), "<ftp://x.example/unsub>".to_string())];
+        assert_eq!(parse_list_unsubscribe(&ftp), None);
+        // An empty value.
+        let empty = vec![("list-unsubscribe".to_string(), "".to_string())];
+        assert_eq!(parse_list_unsubscribe(&empty), None);
     }
 }

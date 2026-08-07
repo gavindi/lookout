@@ -1,0 +1,15 @@
+From: Mailing List <news@list.example>
+To: Bob Example <bob@example.com>
+Subject: Mailto-only unsubscribe fixture
+Date: Tue, 28 Jul 2026 11:00:00 +0000
+Message-ID: <mailto-fixture@list.example>
+List-Unsubscribe: <mailto:leave-list@list.example?subject=unsubscribe>
+Content-Type: text/plain; charset=utf-8
+
+Hello Bob,
+
+This message's only unsubscribe action is a mailto: link (RFC 2369), so
+clicking "Unsubscribe" in the reading pane's banner should open the
+composer pre-filled to leave-list@list.example with subject "unsubscribe".
+
+- The List

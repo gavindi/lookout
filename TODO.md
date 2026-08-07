@@ -14,7 +14,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] `lookout-mail`: `AccountSession` actor — LOGIN/XOAUTH2, LIST (SPECIAL-USE), SELECT, whole-folder envelope fetch, IDLE loop with instant command interruption
 - [x] Format-versioned SQLite cache for mailboxes/messages
 - [x] Flat-file attachment cache — on-demand `UID FETCH BODY.PEEK[<part>]` + transfer-decoding, keyed `(mailbox, uidvalidity, uid, part)`, saveable from the reading pane's attachment strip
-- [ ] Whole-message `.eml` export/cache
+- [x] Whole-message `.eml` export/cache — on-demand `BODY.PEEK[]` → flat-file raw-message cache (keyed `(mailbox, uidvalidity, uid)`), "Save as .eml…" in the ribbon More menu, whole-message body-fallback bytes reused
 - [x] Folder tree UI wired to live data (`Gtk.TreeListModel`)
 - [x] Message list UI (`message_list.rs`): Outlook-style rows, collapsible date sections, pane header with sync/sort/favorite controls
 - [x] Body previews: second `BODY.PEEK[]<0.16384>` pass, snippets carried across resyncs
@@ -64,7 +64,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Hover quick-actions
 - [ ] Physical-keycode global keyboard shortcuts
 - [ ] Print support
-- [ ] List-Unsubscribe banner
+- [x] List-Unsubscribe banner — `Adw.Banner` in the reading pane, RFC 8058 one-click POST with mailto fallback into the composer
 - [ ] External-content trust-sender flow
 - [ ] RFC 8098 read-receipt (MDN) generation
 

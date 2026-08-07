@@ -253,6 +253,16 @@ struct PendingAttachment {
     button: gtk::MenuButton,
 }
 
+/// One .eml export in flight for the reading pane's "More" menu, tracked in
+/// `UiState::pending_raw_message`. `initial_name` is the save dialog's
+/// suggested filename (built from the message's subject at request time, so
+/// it survives even if the selection changes before the bytes arrive).
+struct PendingRawMessage {
+    mailbox: MailboxId,
+    uid: Uid,
+    initial_name: String,
+}
+
 /// Marks a value as `Send` so it can cross from WebKit's scheme-handler
 /// thread to the main loop. `webkit::URISchemeRequest` is a ref-counted
 /// GObject whose `finish`/`finish_error` are documented thread-safe; the
@@ -375,6 +385,12 @@ struct UiState {
     /// user navigates away first). One at a time; the strip's buttons ignore
     /// a click while one is outstanding. See `PendingAttachment`.
     pending_attachment: Option<PendingAttachment>,
+    /// A whole-message .eml export currently in flight for the "More" menu -
+    /// one at a time, cleared when `AccountEvent::RawMessageFetched`/
+    /// `RawMessageFetchFailed` lands (or discarded if the user navigates
+    /// away first, in which case the late response is dropped as stale). See
+    /// `PendingRawMessage`.
+    pending_raw_message: Option<PendingRawMessage>,
     /// Inline `cid:` image fetches in flight for the message on the reading
     /// pane, keyed by `BodyPart::part_number`. A message can embed several
     /// images, so - unlike `pending_attachment` - this is a map. Each entry
@@ -444,6 +460,18 @@ struct UiState {
     /// doesn't route the pane through "empty" and crossfade the same email
     /// again. `None` while the pane shows nothing.
     rendered_message: Option<(MailboxId, Uid)>,
+    /// The parsed List-Unsubscribe actions of the message currently on the
+    /// reading pane, re-derived by `render_body` from the rendered body's
+    /// headers and read by the banner's button handler when it fires. `None`
+    /// when the pane shows nothing or the message offers no unsubscribe
+    /// action.
+    unsubscribe_info: Option<lookout_core::ListUnsubscribe>,
+    /// The `(mailbox, uid)` of the message whose unsubscribe banner the user
+    /// acted on (clicked "Unsubscribe" - the banner's only affordance;
+    /// Adw.Banner has no close button); while that message stays on screen
+    /// the banner must not come back. Cleared on every navigation, so
+    /// returning to the message later shows the banner again.
+    unsubscribe_dismissed: Option<(MailboxId, Uid)>,
     /// Mailboxes with a `SyncMailbox` request outstanding - sent but not yet
     /// answered by a `MessagesUpdated`. The startup burst (the session's
     /// cache replay plus the app's on-demand syncs) would otherwise queue
@@ -969,6 +997,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         unified_snapshots: HashMap::new(),
         pending_body_request: None,
         pending_attachment: None,
+        pending_raw_message: None,
+        unsubscribe_info: None,
+        unsubscribe_dismissed: None,
         pending_cid: HashMap::new(),
         rendered_inline_parts: Vec::new(),
         temp_attachment_files: HashSet::new(),
@@ -2000,6 +2031,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_page.append(&attachment_strip);
     message_page.append(&content_stack);
     message_page.append(&message_header.action_bar);
+    // The List-Unsubscribe banner, between the header and the body: revealed
+    // by `render_body` when the message's headers offer an unsubscribe
+    // action (RFC 2369 / one-click RFC 8058), hidden otherwise and once the
+    // user dismisses it. A named child so `render_body` can find it.
+    let unsubscribe_banner = adw::Banner::new("Unsubscribe from this mailing list?");
+    unsubscribe_banner.set_widget_name("unsubscribe-banner");
+    unsubscribe_banner.set_button_label(Some("Unsubscribe"));
+    unsubscribe_banner.set_revealed(false);
+    message_page.append(&unsubscribe_banner);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
@@ -2025,15 +2065,84 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // same-page re-render case by routing through "empty" explicitly.
     reading_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     reading_stack.set_transition_duration(100);
-    // WebKit paints asynchronously - revealing the HTML page while a fresh
-    // body is still loading would show a blank/white page before the message
-    // appears. So the body is loaded while the pane holds on "empty", and a
-    // single persistent `load-changed` handler reveals the page only once the
-    // load completes. `render_body` arms this with `pending_html_reveal`; the
-    // selection handler disarms it whenever the user moves on, so a load
-    // started for a stale message can never yank the pane back open (the
-    // older per-render one-shot handlers instead fired on *any* Finished and
-    // caused double reveals / stale emails appearing).
+    // --- List-Unsubscribe banner actions. The banner's button acts on
+    // whatever message is on the reading pane (its parsed unsubscribe info is
+    // stashed in `UiState::unsubscribe_info` by `render_body`): a one-click
+    // POST (RFC 8058) when the list advertises one, degrading to the
+    // `mailto:` action when the POST fails or no URL is offered. Acting on
+    // the offer dismisses the banner for that message (Adw.Banner has no
+    // close button of its own); a failed POST with no mailto fallback keeps
+    // it visible so the user can try again.
+    {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        unsubscribe_banner.connect_button_clicked(move |banner| {
+            let (mailbox, uid, list, from_email, cmd_tx) = {
+                let st = state.borrow();
+                let (mailbox, uid) = match &st.rendered_message {
+                    Some(rendered) => rendered.clone(),
+                    None => return,
+                };
+                let Some(list) = st.unsubscribe_info.clone() else { return };
+                let Some(account_id) = mailbox_account_id(&mailbox) else { return };
+                let Some(handle) = st.accounts.get(&account_id) else { return };
+                (mailbox, uid, list, handle.email.clone(), handle.cmd_tx.clone())
+            };
+            let dismiss = |state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid| {
+                state.borrow_mut().unsubscribe_dismissed = Some((mailbox.clone(), uid));
+            };
+            if list.one_click {
+                if let Some(url) = list.http.clone() {
+                    // One-click POST: disable the button while in flight so a
+                    // double-click can't send twice.
+                    banner.set_sensitive(false);
+                    let state_for_post = state.clone();
+                    let reading_stack_for_post = reading_stack.clone();
+                    let banner_for_post = banner.clone();
+                    glib::spawn_future_local(async move {
+                        let result = post_one_click_unsubscribe(&url).await;
+                        banner_for_post.set_sensitive(true);
+                        match result {
+                            Ok(()) => {
+                                dismiss(&state_for_post, &mailbox, uid);
+                                banner_for_post.set_revealed(false);
+                                if let Some(overlay) = &state_for_post.borrow().toast_overlay {
+                                    overlay.add_toast(adw::Toast::new("Unsubscribed"));
+                                }
+                            }
+                            Err(message) => {
+                                if let Some(overlay) = &state_for_post.borrow().toast_overlay {
+                                    overlay.add_toast(adw::Toast::new(&format!("Couldn't unsubscribe: {message}")));
+                                }
+                                // The list may still accept the RFC 2369
+                                // mailto path - degrade to it rather than
+                                // leaving the user with nothing.
+                                if let Some(mailto) = list.mailto.clone() {
+                                    dismiss(&state_for_post, &mailbox, uid);
+                                    banner_for_post.set_revealed(false);
+                                    open_mailto_unsubscribe(&state_for_post, &reading_stack_for_post, mailto, from_email, cmd_tx, mailbox_account_id(&mailbox));
+                                }
+                            }
+                        }
+                    });
+                    return;
+                }
+            }
+            if let Some(mailto) = list.mailto.clone() {
+                dismiss(&state, &mailbox, uid);
+                banner.set_revealed(false);
+                open_mailto_unsubscribe(&state, &reading_stack, mailto, from_email, cmd_tx, mailbox_account_id(&mailbox));
+            }
+        });
+    } // WebKit paints asynchronously - revealing the HTML page while a fresh
+      // body is still loading would show a blank/white page before the message
+      // appears. So the body is loaded while the pane holds on "empty", and a
+      // single persistent `load-changed` handler reveals the page only once the
+      // load completes. `render_body` arms this with `pending_html_reveal`; the
+      // selection handler disarms it whenever the user moves on, so a load
+      // started for a stale message can never yank the pane back open (the
+      // older per-render one-shot handlers instead fired on *any* Finished and
+      // caused double reveals / stale emails appearing).
     let state_for_reveal = state.clone();
     let content_stack_for_reveal = content_stack.clone();
     let reading_stack_for_reveal = reading_stack.clone();
@@ -2245,10 +2354,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Command toolbar row. `compose_button`, `reply_button`,
     // `reply_all_button`, `forward_button`, `delete_button`,
-    // `archive_button`, `report_button`, `flag_button`, and `snooze_button`
-    // are backed by real functionality; `more_button` mirrors Outlook's row
-    // visually but is disabled since Lookout doesn't implement the "More"
-    // menu yet.
+    // `archive_button`, `report_button`, `flag_button`, `snooze_button`, and
+    // `more_button` (a menu of reading-pane extras like "Save as .eml…") are
+    // backed by real functionality.
     let reply_button = gtk::Button::from_icon_name("mail-reply-sender-symbolic");
     reply_button.set_tooltip_text(Some("Reply"));
     let reply_all_button = gtk::Button::from_icon_name("mail-reply-all-symbolic");
@@ -2292,9 +2400,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     let snooze_button = gtk::Button::from_icon_name("appointment-soon-symbolic");
     snooze_button.set_tooltip_text(Some("Snooze"));
-    let more_button = gtk::Button::from_icon_name("view-more-symbolic");
+    // "More": a popover of reading-pane extras (currently "Save as .eml…").
+    // The popover's contents are rebuilt on every `show`, like
+    // `categorize_button`'s, so the enabled state can track whichever
+    // message is selected when it opens.
+    let more_button = gtk::MenuButton::builder().icon_name("view-more-symbolic").build();
     more_button.set_tooltip_text(Some("More"));
-    more_button.set_sensitive(false);
+    let more_popover = gtk::Popover::new();
+    more_button.set_popover(Some(&more_popover));
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let more_popover_for_menu = more_popover.clone();
+        more_popover.connect_show(move |popover| {
+            let has_selection = message_list.selected_summary().is_some();
+            let menu = build_more_menu(has_selection, &message_list, &state, &more_popover_for_menu);
+            popover.set_child(Some(&menu));
+        });
+    }
 
     let command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     command_toolbar.append(&compose_button);
@@ -3445,6 +3568,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.reveal_generation += 1;
                     st.pending_header = None;
                     st.pending_attachment = None;
+                    st.pending_raw_message = None;
+                    st.unsubscribe_info = None;
+                    st.unsubscribe_dismissed = None;
                     st.rendered_message = None;
                     drop(st);
                     drop_pending_cid(&state);
@@ -3459,6 +3585,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.reveal_generation += 1;
                     st.pending_header = None;
                     st.pending_attachment = None;
+                    st.pending_raw_message = None;
+                    st.unsubscribe_info = None;
+                    st.unsubscribe_dismissed = None;
                     st.rendered_message = None;
                     drop(st);
                     drop_pending_cid(&state);
@@ -4936,6 +5065,48 @@ fn connect_account(
                         finish_cid_request_error(&cid_request, "the inline image could not be fetched");
                     }
                 }
+                AccountEvent::RawMessageFetched { mailbox, uid, bytes } => {
+                    // The .eml export's whole raw message arrived. Only act if
+                    // it belongs to the outstanding export request; a response
+                    // that lands after the user selected a different message
+                    // (or triggered a newer export) is stale and dropped with
+                    // its bookkeeping.
+                    let pending = {
+                        let mut st = state.borrow_mut();
+                        match st.pending_raw_message.take() {
+                            Some(p) if p.mailbox == mailbox && p.uid == uid => Some(p),
+                            other => {
+                                st.pending_raw_message = other;
+                                None
+                            }
+                        }
+                    };
+                    if let Some(pending) = pending {
+                        let window_for_save = window.clone();
+                        let toast_for_save = toast_overlay.clone();
+                        glib::spawn_future_local(async move {
+                            save_raw_message_to_disk(&window_for_save, toast_for_save, &pending.initial_name, &bytes).await;
+                        });
+                    }
+                }
+                AccountEvent::RawMessageFetchFailed { mailbox, uid, message } => {
+                    // The session couldn't produce the raw message. Clear the
+                    // pending export (so a later click can retry) and tell the
+                    // user what went wrong - never leave it stuck.
+                    let pending = {
+                        let mut st = state.borrow_mut();
+                        match st.pending_raw_message.take() {
+                            Some(p) if p.mailbox == mailbox && p.uid == uid => Some(p),
+                            other => {
+                                st.pending_raw_message = other;
+                                None
+                            }
+                        }
+                    };
+                    if pending.is_some() {
+                        toast_overlay.add_toast(adw::Toast::new(&message));
+                    }
+                }
                 AccountEvent::SendCompleted => {
                     toast_overlay.add_toast(adw::Toast::new("Message sent"));
                 }
@@ -5512,6 +5683,35 @@ fn send_keyword_store(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, add:
         add,
         remove,
     });
+}
+
+/// Builds the "More" menu popover's contents: currently a single
+/// "Save as .eml…" item that exports the selected message's whole raw RFC
+/// 5322 bytes to a file. Rebuilt on every popover `show` (like the
+/// categorize menu) so the item's sensitivity tracks whether a message is
+/// selected when the menu opens.
+fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: &Rc<RefCell<UiState>>, popover: &gtk::Popover) -> gtk::Box {
+    let boxed = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let save_eml = gtk::Button::builder().label("Save as .eml…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    save_eml.set_sensitive(has_selection);
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        save_eml.connect_clicked(move |_| {
+            popover.popdown();
+            start_raw_message_export(&message_list, &state);
+        });
+    }
+    boxed.append(&save_eml);
+    boxed
 }
 
 /// Builds the tag menu shown by both the toolbar Categorize popover and the
@@ -6807,6 +7007,57 @@ fn start_attachment_fetch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid
     });
 }
 
+/// Starts the .eml export for the currently-selected message: records it as
+/// the single in-flight `UiState::pending_raw_message`, asks the account
+/// session for the whole raw message (`AccountCommand::FetchRawMessage`), and
+/// arms the same 60-second backstop as attachment fetches. Silent no-op when
+/// nothing is selected or the account has disconnected (same convention as
+/// the Reply handlers); the save dialog opens once the bytes arrive
+/// (`AccountEvent::RawMessageFetched`).
+fn start_raw_message_export(message_list: &MessageListModel, state: &Rc<RefCell<UiState>>) {
+    let Some(summary) = message_list.selected_summary() else { return };
+    let Some(account_id) = mailbox_account_id(&summary.mailbox) else { return };
+    let cmd_tx = {
+        let st = state.borrow();
+        st.accounts.get(&account_id).map(|h| h.cmd_tx.clone())
+    };
+    let Some(cmd_tx) = cmd_tx else { return };
+    // One export in flight at a time; ignore a click while one is outstanding.
+    if state.borrow().pending_raw_message.is_some() {
+        return;
+    }
+    state.borrow_mut().pending_raw_message = Some(PendingRawMessage {
+        mailbox: summary.mailbox.clone(),
+        uid: summary.uid,
+        initial_name: eml_suggested_name(&summary),
+    });
+    tracing::debug!(?summary.mailbox, uid = summary.uid.0, "raw message export: dispatching to account actor");
+    let _ = cmd_tx.send_blocking(AccountCommand::FetchRawMessage {
+        mailbox: summary.mailbox.clone(),
+        uid: summary.uid,
+    });
+    // Backstop: clear the pending state after a generous grace period instead
+    // of blocking future exports forever (the session dying mid-fetch loses
+    // the command to the reconnect). Only fires if this exact request is
+    // still the outstanding one.
+    let timeout_mailbox = summary.mailbox.clone();
+    let timeout_uid = summary.uid;
+    let timeout_state = state.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+        let still_pending = match &timeout_state.borrow().pending_raw_message {
+            Some(p) => p.mailbox == timeout_mailbox && p.uid == timeout_uid,
+            None => false,
+        };
+        if still_pending {
+            timeout_state.borrow_mut().pending_raw_message = None;
+            if let Some(toast_overlay) = &timeout_state.borrow().toast_overlay {
+                toast_overlay.add_toast(adw::Toast::new("Message export timed out"));
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 /// Prompts for a save location (via the platform save dialog - a GTK
 /// `FileDialog`, which goes through the XDG portal in sandboxed runs) and
 /// writes the fetched attachment bytes there. The dialog is cancellable by
@@ -6821,6 +7072,88 @@ async fn save_attachment_to_disk(window: &adw::ApplicationWindow, toast_overlay:
         Ok(_) => toast_overlay.add_toast(adw::Toast::new("Attachment saved")),
         Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't save attachment: {e}"))),
     }
+}
+
+/// Prompts for a save location and writes a whole raw message there as a
+/// `.eml` file - `bytes` are the server's `BODY.PEEK[]` response verbatim, so
+/// the file is a valid RFC 5322 message (and the session's raw-message cache
+/// makes the export instant on re-save). Mirrors `save_attachment_to_disk`,
+/// including its cancel-on-dialog-close behavior and toast feedback.
+async fn save_raw_message_to_disk(window: &adw::ApplicationWindow, toast_overlay: adw::ToastOverlay, initial_name: &str, bytes: &[u8]) {
+    let filter = gtk::FileFilter::new();
+    filter.add_suffix("eml");
+    filter.set_name(Some("Email messages (*.eml)"));
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+    let dialog = gtk::FileDialog::builder()
+        .title("Save message as .eml")
+        .initial_name(initial_name)
+        .filters(&filters)
+        .build();
+    let Ok(file) = dialog.save_future(Some(window)).await else { return };
+    let result = file
+        .replace_contents_bytes_future(&glib::Bytes::from(bytes), None, false, gio::FileCreateFlags::REPLACE_DESTINATION)
+        .await;
+    match result {
+        Ok(_) => toast_overlay.add_toast(adw::Toast::new("Message saved as .eml")),
+        Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't save message: {e}"))),
+    }
+}
+
+/// A safe suggested filename for the .eml export dialog: the message's
+/// subject plus an `.eml` suffix, or a plain placeholder when the subject is
+/// empty or contains path separators - the raw subject is untrusted header
+/// data and must not be fed to the dialog as a path (same rationale as
+/// `attachment_display_name`). Just the initial name; the user can change it
+/// in the dialog.
+fn eml_suggested_name(summary: &EmailSummary) -> String {
+    let subject = summary.subject.as_deref().unwrap_or("").trim();
+    if subject.is_empty() || subject.contains('/') || subject.contains('\\') {
+        "message.eml".to_string()
+    } else {
+        format!("{subject}.eml")
+    }
+}
+
+/// RFC 8058 one-click unsubscribe: POST `List-Unsubscribe=One-Click` to the
+/// list's URL. Success is a 2xx (reqwest follows the redirects some lists
+/// answer with); a non-2xx response or a transport failure is an error the
+/// caller surfaces as a toast (and may fall back to the mailto action).
+async fn post_one_click_unsubscribe(url: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(url)
+        .form(&[("List-Unsubscribe", "One-Click")])
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("the list answered {}", response.status()))
+    }
+}
+
+/// Opens the composer pre-filled to send the list's unsubscribe mail - the
+/// RFC 2369 `mailto:` fallback for lists without one-click POST (and the
+/// fallback when a one-click POST fails). Pre-fills only the recipient and
+/// subject, so the user reviews what goes out before anything is sent.
+fn open_mailto_unsubscribe(
+    state: &Rc<RefCell<UiState>>,
+    reading_stack: &gtk::Stack,
+    address: String,
+    from_email: String,
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    account_id: Option<AccountId>,
+) {
+    let prefill = crate::compose::ComposePrefill {
+        to: Some(address),
+        subject: Some("unsubscribe".to_string()),
+        ..Default::default()
+    };
+    let rich_text_default = state.borrow().rich_text_default;
+    show_composer_in_reading_pane(state, reading_stack, "Unsubscribe", from_email, cmd_tx, prefill, rich_text_default, account_id);
 }
 
 /// A safe file extension for an attachment's temporary copy, so the system's
@@ -7070,6 +7403,20 @@ fn render_body(
     // Rebuild the attachment strip from the body's part list; the body is
     // available regardless of which text path (html/text/none) renders below.
     rebuild_attachment_strip(state, reading_stack, &mailbox, uid, &body.parts);
+    // List-Unsubscribe banner: stash the rendered message's parsed
+    // unsubscribe actions for the banner's button handler, and reveal the
+    // banner when the message offers an action the user hasn't dismissed for
+    // this message (the close button records the dismissal). Hidden
+    // otherwise - and on every navigation, since the selection handler
+    // clears `unsubscribe_dismissed`.
+    {
+        let mut st = state.borrow_mut();
+        st.unsubscribe_info = lookout_core::parse_list_unsubscribe(&body.headers);
+        let dismissed = st.unsubscribe_dismissed.as_ref() == Some(&(mailbox.clone(), uid));
+        if let Some(banner) = find_named_child(reading_stack, "unsubscribe-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+            banner.set_revealed(!dismissed && st.unsubscribe_info.is_some());
+        }
+    }
     // Config → Appearance → "Animate transitions" can switch the stack's
     // transition type to `None`; when it's off, skip the fade-specific paths
     // below (routing through "empty", waiting for the WebView to paint) and
@@ -7280,6 +7627,26 @@ mod tests {
         assert_eq!(attachment_display_name(&attachment("1.3", None)), "attachment-1.3");
     }
 
+    /// The .eml export dialog's suggested name comes from the message's
+    /// subject, with a path-free placeholder for empty or hostile subjects -
+    /// the raw subject is untrusted header data and must not reach the dialog
+    /// as a path.
+    #[test]
+    fn eml_suggested_name_uses_subject_and_falls_back_safely() {
+        let with_subject = |subject: Option<&str>| EmailSummary {
+            subject: subject.map(str::to_string),
+            ..summary(Uid(1), "INBOX", 2026, 7, 30, 12)
+        };
+        assert_eq!(eml_suggested_name(&with_subject(Some("Quarterly report"))), "Quarterly report.eml");
+        // Whitespace-only and missing subjects fall back to the placeholder.
+        assert_eq!(eml_suggested_name(&with_subject(Some("  "))), "message.eml");
+        assert_eq!(eml_suggested_name(&with_subject(None)), "message.eml");
+        // A subject that could smuggle a path separator must not reach the
+        // save dialog as a path.
+        assert_eq!(eml_suggested_name(&with_subject(Some("../etc/passwd"))), "message.eml");
+        assert_eq!(eml_suggested_name(&with_subject(Some("a\\b"))), "message.eml");
+    }
+
     fn attachment_with_type(part_number: &str, filename: Option<&str>, content_type: &str) -> BodyPart {
         BodyPart {
             part_number: part_number.to_string(),
@@ -7441,6 +7808,9 @@ mod tests {
             unified_snapshots: HashMap::new(),
             pending_body_request: None,
             pending_attachment: None,
+            pending_raw_message: None,
+            unsubscribe_info: None,
+            unsubscribe_dismissed: None,
             pending_cid: HashMap::new(),
             rendered_inline_parts: Vec::new(),
             temp_attachment_files: HashSet::new(),

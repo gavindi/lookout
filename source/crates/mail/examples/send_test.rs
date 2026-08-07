@@ -141,6 +141,8 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::SearchResults { .. } => {}
                     AccountEvent::PartFetched { .. } => {}
                     AccountEvent::PartFetchFailed { .. } => {}
+                    AccountEvent::RawMessageFetched { .. } => {}
+                    AccountEvent::RawMessageFetchFailed { .. } => {}
                     AccountEvent::Error(e) => {
                         println!("ERROR: {e}");
                         break;

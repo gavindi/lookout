@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.6.57" date="2026-08-07">
+      <description>
+        <p>Messages can be exported as .eml files - a new "More" menu on the ribbon fetches the whole raw message on demand and caches it locally, so re-exports are instant and offline. The reading pane also shows a List-Unsubscribe banner when a mailing list advertises one, with one-click unsubscribing (RFC 8058) and a mailto fallback that opens the composer pre-filled.</p>
+      </description>
+    </release>
     <release version="0.6.56" date="2026-08-07">
       <description>
         <p>The bundled artwork - the window background, the Mail/Calendar/People rail icons, and the app icon itself - now ships inside the binary as a compiled GResource bundle, so every build renders identically whether or not the icon is installed system-wide. Builds without the resource compiler fall back to the old embedded copies automatically.</p>

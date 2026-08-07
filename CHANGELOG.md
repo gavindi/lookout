@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.57 (2026-08-07)
+
+### Added
+
+- **Mail**: whole messages can now be exported as `.eml` files, backed by a new flat-file raw-message cache. The ribbon's "More" button is no longer a disabled placeholder: it opens a popover whose **Save as .eml…** action fetches the selected message's entire raw RFC 5322 bytes (`AccountCommand::FetchRawMessage` → `BODY.PEEK[]`, so `\Seen` is never set), serves repeat requests straight from `$XDG_CACHE_HOME/lookout/mail/messages/<account>/` - deterministic filenames keyed by hashed mailbox + `uidvalidity` + `uid` (the same recycled-uid guard as the attachment cache) - and opens a save dialog with the subject-derived filename suggested (a path-free `message.eml` placeholder when the subject is empty or hostile). One export is in flight at a time with the same 60-second backstop as attachment fetches; failures answer with a new `RawMessageFetchFailed` event and a toast instead of hanging. The whole-message body-fallback path (used when a message's summary has no BODYSTRUCTURE) already downloaded the full message, so those bytes are now opportunistically persisted to the same cache at no extra cost - an export of such a message is instant.
+- **Mail**: the reading pane shows a List-Unsubscribe banner (RFC 2369, one-click per RFC 8058). `lookout-core` gains `parse_list_unsubscribe`, which reads the message's `List-Unsubscribe` and `List-Unsubscribe-Post` headers (case-insensitive lookup, via a new shared `header_value` helper) into at most one `mailto:` address - percent-decoded, query-stripped - and at most one `http(s)` URL, plus a one-click flag. When the headers offer an action, an `Adw.Banner` appears between the message header and the body; **Unsubscribe** POSTs `List-Unsubscribe=One-Click` to the list's URL when advertised (button disabled while in flight, "Unsubscribed" toast on a 2xx, degrading to the mailto path on failure), and otherwise opens the composer pre-filled with the mailto address and subject "unsubscribe" so the user reviews before anything is sent. Acting on the offer dismisses the banner for that message (Adw.Banner has no close button of its own); a failed POST with no mailto fallback keeps it visible.
+
+### Changed
+
+- **Mail**: `compose.rs`'s private case-insensitive header lookup is replaced by `lookout_core::header_value` - one shared helper for every crate that reads raw `EmailBody::headers`.
+
+### Testing
+
+- New unit tests: raw-message cache round-trip and `uidvalidity` guard (mirroring the attachment-cache tests), `parse_list_unsubscribe` (mixed actions, one-click flag, percent-encoded mailto, lenient angle-bracket/whitespace forms, no-action `None`), case-insensitive header lookup, and the .eml filename fallback. New fixtures (`list-unsubscribe-oneclick.eml`, `list-unsubscribe-mailto.eml`) verify the banner and both action paths through the dev-only ".eml viewer". The GreenMail integration test now APPENDs a message and asserts `FetchRawMessage` returns its raw bytes verbatim, with a second request served identically from the cache.
+
 ## 0.6.56 (2026-08-07)
 
 ### Changed

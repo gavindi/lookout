@@ -150,6 +150,17 @@ pub enum AccountCommand {
         uid: Uid,
         part: BodyPart,
     },
+    /// Fetch a message's whole raw RFC 5322 bytes (`BODY.PEEK[]`, so `\Seen`
+    /// is never set) for the .eml export/cache. Same contract as
+    /// `FetchAttachment`: the session SELECTs `mailbox` on demand, serves a
+    /// previously-fetched copy from the flat-file raw-message cache with no
+    /// network round trip, stores freshly-fetched bytes back into it, and
+    /// answers with `AccountEvent::RawMessageFetched` (or
+    /// `RawMessageFetchFailed`).
+    FetchRawMessage {
+        mailbox: MailboxId,
+        uid: Uid,
+    },
     /// Force a folder-list + current-mailbox resync outside of IDLE's own cadence.
     Refresh,
     /// Send a composed message over SMTP, then `APPEND` it to the account's
@@ -309,6 +320,25 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         uid: Uid,
         part_number: String,
+        message: String,
+    },
+    /// The answer to an `AccountCommand::FetchRawMessage`: `bytes` are the
+    /// whole raw RFC 5322 message exactly as `BODY.PEEK[]` returned it - a
+    /// valid `.eml` file, unmodified. Emitted on both the cache-hit and the
+    /// live-fetch path, mirroring `PartFetched`.
+    RawMessageFetched {
+        mailbox: MailboxId,
+        uid: Uid,
+        bytes: Vec<u8>,
+    },
+    /// The answer to an `AccountCommand::FetchRawMessage` when the raw message
+    /// couldn't be produced: the server didn't return it (it may have been
+    /// expunged) or the fetch failed. Mirrors `PartFetchFailed`, so the UI
+    /// restores the export action and tells the user rather than leaving it
+    /// stuck on "Exporting…".
+    RawMessageFetchFailed {
+        mailbox: MailboxId,
+        uid: Uid,
         message: String,
     },
     SendCompleted,
@@ -751,6 +781,60 @@ async fn connect_and_run(
                         }
                         tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, bytes = bytes.len(), elapsed_ms = started.elapsed().as_millis(), "FetchAttachment: part ready");
                         let _ = events.send(AccountEvent::PartFetched { mailbox, uid, part, bytes }).await;
+                    }
+                }
+                AccountCommand::FetchRawMessage { mailbox, uid } => {
+                    // Same on-demand-SELECT contract as `FetchBody`/`StoreFlags`
+                    // - the message may live in any folder - and the top of the
+                    // loop puts the session back on the user's folder before
+                    // the next IDLE wait.
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    // The mailbox's uidvalidity guards the raw-message flat-file
+                    // cache the same way it guards attachments and bodies; the
+                    // `UidValidity(0)` fallback is the same cache-miss sentinel.
+                    let uidvalidity = folders.iter().find(|m| m.id == mailbox).map(|m| m.uidvalidity).unwrap_or(UidValidity(0));
+                    let started = std::time::Instant::now();
+                    // A failure must answer the UI with `RawMessageFetchFailed`
+                    // rather than kill the whole session via `?` - one bad
+                    // message shouldn't cost the connection.
+                    let fetched = fetch_raw_message_cached(cache, &mut session, &mailbox, uid, uidvalidity).await;
+                    match fetched {
+                        Ok(Some(bytes)) => {
+                            tracing::debug!(
+                                ?mailbox,
+                                uid = uid.0,
+                                bytes = bytes.len(),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "FetchRawMessage: raw message ready"
+                            );
+                            let _ = events.send(AccountEvent::RawMessageFetched { mailbox, uid, bytes }).await;
+                        }
+                        Ok(None) => {
+                            tracing::warn!(?mailbox, uid = uid.0, "FetchRawMessage: server returned no such message");
+                            let _ = events
+                                .send(AccountEvent::RawMessageFetchFailed {
+                                    mailbox: mailbox.clone(),
+                                    uid,
+                                    message: "the server didn't return this message - it may no longer exist".to_string(),
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(?mailbox, uid = uid.0, "FetchRawMessage: fetch failed: {e}");
+                            let _ = events
+                                .send(AccountEvent::RawMessageFetchFailed {
+                                    mailbox: mailbox.clone(),
+                                    uid,
+                                    message: format!("couldn't fetch this message: {e}"),
+                                })
+                                .await;
+                        }
                     }
                 }
                 AccountCommand::SearchMailbox { mailbox, query } => {
@@ -1888,6 +1972,43 @@ async fn fetch_body(session: &mut Session<ImapStream>, uid: Uid) -> Result<Optio
     Ok(fetch.body().map(|body| body.to_vec()))
 }
 
+/// Fetches a message's whole raw RFC 5322 bytes, serving a previously-fetched
+/// copy from the flat-file raw-message cache when one exists and storing
+/// freshly-fetched bytes back into it. `uidvalidity` is passed through so a
+/// recycled uid can never resolve to another message's `.eml`.
+///
+/// Used by both `AccountCommand::FetchRawMessage` (the .eml export path) and
+/// the whole-message fallback inside `fetch_body_cached` - which already
+/// downloads the full `BODY.PEEK[]` when a partial fetch isn't possible, so
+/// persisting those bytes to the export cache costs nothing extra.
+async fn fetch_raw_message_cached(
+    cache: Option<&crate::cache::Cache>,
+    session: &mut Session<ImapStream>,
+    mailbox: &MailboxId,
+    uid: Uid,
+    uidvalidity: UidValidity,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(cache) = cache {
+        match cache.load_raw_message(mailbox, uid, uidvalidity) {
+            Ok(Some(bytes)) => {
+                tracing::debug!(?mailbox, uid = uid.0, "FetchRawMessage: served from disk cache");
+                return Ok(Some(bytes));
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(?mailbox, uid = uid.0, "failed to read cached raw message: {e}"),
+        }
+    }
+    let Some(raw) = fetch_body(session, uid).await? else {
+        return Ok(None);
+    };
+    if let Some(cache) = cache {
+        if let Err(e) = cache.store_raw_message(mailbox, uid, uidvalidity, &raw) {
+            tracing::warn!(?mailbox, uid = uid.0, "failed to cache raw message: {e}");
+        }
+    }
+    Ok(Some(raw))
+}
+
 /// Fetches just the parts a message viewer needs: the full header block and
 /// the bytes of every `text/plain`/`text/html` part, each by its
 /// `BODYSTRUCTURE`-derived section path. Attachment parts (images, documents,
@@ -2003,9 +2124,13 @@ async fn fetch_body_cached(
             // parts that didn't decode) - must degrade to the whole-message
             // fetch, not an empty reading pane.
             Ok(Some(body)) if body.text_body.is_some() || body.html_body.is_some() => Some(body),
-            _ => fetch_body(session, uid).await?.and_then(|raw| parse_body(uid, &raw)),
+            _ => fetch_raw_message_cached(cache, session, mailbox, uid, uidvalidity)
+                .await?
+                .and_then(|raw| parse_body(uid, &raw)),
         },
-        None => fetch_body(session, uid).await?.and_then(|raw| parse_body(uid, &raw)),
+        None => fetch_raw_message_cached(cache, session, mailbox, uid, uidvalidity)
+            .await?
+            .and_then(|raw| parse_body(uid, &raw)),
     };
     if let Some(cache) = cache {
         if let Some(body) = &body {

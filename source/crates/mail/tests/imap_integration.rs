@@ -324,6 +324,42 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "cid image bytes must be transfer-decoded");
     assert!(bytes.len() > 8);
 
+    // --- Whole-message .eml export: `FetchRawMessage` returns the message's
+    // raw RFC 5322 bytes verbatim (the shape an .eml export writes to disk,
+    // `\Seen` never set since the fetch is `BODY.PEEK[]`), and a second
+    // request is served from the flat-file raw-message cache with the same
+    // bytes.
+    let _ = cmd_tx
+        .send(AccountCommand::FetchRawMessage {
+            mailbox: inbox_id.clone(),
+            uid: with_attachment.uid,
+        })
+        .await;
+    let fetched_raw = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::RawMessageFetched { .. })).await;
+    let AccountEvent::RawMessageFetched {
+        mailbox: fetched_mailbox,
+        uid: fetched_uid,
+        bytes,
+    } = fetched_raw
+    else {
+        unreachable!()
+    };
+    assert_eq!(fetched_mailbox, inbox_id);
+    assert_eq!(fetched_uid, with_attachment.uid);
+    assert_eq!(bytes, raw_message, "whole-message fetch must return the raw bytes verbatim");
+
+    let _ = cmd_tx
+        .send(AccountCommand::FetchRawMessage {
+            mailbox: inbox_id.clone(),
+            uid: with_attachment.uid,
+        })
+        .await;
+    let second = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::RawMessageFetched { .. })).await;
+    let AccountEvent::RawMessageFetched { bytes: second_bytes, .. } = second else {
+        unreachable!()
+    };
+    assert_eq!(second_bytes, raw_message, "cached raw message must match the original");
+
     let _ = cmd_tx.send(AccountCommand::Shutdown).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
