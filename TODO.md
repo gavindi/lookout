@@ -83,6 +83,8 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [ ] Birthday calendar synthesized from Contacts
 - [ ] `Gio.Notification` event alerts
 - [x] Event create/edit ("New Event" toolbar button)
+  - [x] Attendee invites (`ATTENDEE`/`ORGANIZER`), a recurrence/series builder (previously read-only display only), a video-call link (`CONFERENCE`), and categories/sensitivity/busy-free/reminder (`CATEGORIES`/`CLASS`/`TRANSP`/`VALARM`) via a new toolbar
+  - [x] Live preview pane (mini-calendar + day schedule strip) reusing the main Calendar tab's own widgets
 
 ## Phase 4 — Contacts (roadmap)
 
@@ -98,7 +100,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [ ] Address book CRUD, groups, vCard import/export with duplicate detection
 - [ ] Shared `ContactsProvider` trait consumed by mail composer, calendar attendees, and the contacts app
   - [x] Mail composer consumes `ContactsProvider`
-  - [ ] Calendar attendees and dedicated contacts app still pending
+  - [ ] Calendar attendees field now exists (event editor) but has no `ContactsProvider` autocomplete yet; dedicated contacts app still pending
 
 ## Phase 5 — Settings/theming (roadmap)
 
