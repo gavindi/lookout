@@ -46,8 +46,8 @@ pub fn show_task_editor(
         .transient_for(window)
         .modal(true)
         .title(if has_existing { "Edit task" } else { "New task" })
-        .default_width(560)
-        .default_height(620)
+        .default_width(760)
+        .default_height(660)
         .build();
 
     // --- Calendar picker (same StringList + parallel id vector convention
@@ -84,19 +84,21 @@ pub fn show_task_editor(
     let notes_scroller = gtk::ScrolledWindow::builder()
         .child(&notes_view)
         .vexpand(true)
-        .min_content_height(110)
+        .min_content_height(220)
         .css_classes(["card"])
         .build();
 
     // --- Due date + time. A "Due" switch turns the whole cluster on/off -
     // an undated task (no `DUE` line at all) is the RFC-legal way to say
-    // "whenever". Date is tracked through an `Rc<Cell<NaiveDate>>` updated
-    // on `day-selected` (GtkCalendar's getters need v4_14, which this crate
-    // builds against), times are two spin buttons.
-    let due_switch = gtk::Switch::new();
-    let due_switch_row = adw::ActionRow::builder().title("Due").build();
-    due_switch_row.set_activatable_widget(Some(&due_switch));
-    due_switch_row.add_suffix(&due_switch);
+    // "whenever". The calendar lives in a popover behind a compact date
+    // button - the same pattern as the event editor's time clusters, since a
+    // `GtkCalendar` in the form flow expands to fill whatever space it's
+    // given and stretches the rows around it. Date is tracked through an
+    // `Rc<Cell<NaiveDate>>` updated on `day-selected` (GtkCalendar's getters
+    // need v4_14, which this crate builds against); times are two spin
+    // buttons, centered against the date button so they keep their natural
+    // height.
+    let due_switch_row = adw::SwitchRow::builder().title("Due").build();
 
     let due_date = Rc::new(Cell::new(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()));
     let due_calendar = gtk::Calendar::new();
@@ -113,14 +115,6 @@ pub fn show_task_editor(
             cal.set_date(Some(&dt));
         }
     }
-    fn wire_calendar(cal: &gtk::Calendar, tracked: &Rc<Cell<NaiveDate>>) {
-        let tracked = tracked.clone();
-        cal.connect_day_selected(move |cal| {
-            if let Some(date) = NaiveDate::from_ymd_opt(cal.year(), cal.month() as u32 + 1, cal.day() as u32) {
-                tracked.set(date);
-            }
-        });
-    }
 
     let default_due = (Local::now() + Duration::days(1))
         .date_naive()
@@ -128,24 +122,41 @@ pub fn show_task_editor(
     let initial_due: Option<NaiveDateTime> = existing.as_ref().and_then(|t| t.due.map(|d| d.with_timezone(&Local).naive_local())).or(Some(default_due));
     let initial_due = initial_due.unwrap_or(default_due);
     set_calendar_date(&due_calendar, &due_date, initial_due.date());
-    wire_calendar(&due_calendar, &due_date);
     due_hour.set_value(f64::from(initial_due.hour()));
     due_minute.set_value(f64::from(initial_due.minute()));
-    due_switch.set_active(existing.as_ref().is_some_and(|t| t.due.is_some()));
+    due_switch_row.set_active(existing.as_ref().is_some_and(|t| t.due.is_some()));
 
-    let datetime_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-    let time_cluster = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).css_classes(["linked"]).build();
-    time_cluster.append(&due_hour);
-    time_cluster.append(&due_minute);
-    datetime_row.append(&due_calendar);
-    datetime_row.append(&time_cluster);
-    let due_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
+    let due_date_label = gtk::Label::new(Some(&format!("{}", initial_due.date().format("%a, %b %-d"))));
+    let due_popover = gtk::Popover::builder().child(&due_calendar).build();
+    {
+        let due_date = due_date.clone();
+        let due_date_label = due_date_label.clone();
+        let due_popover = due_popover.clone();
+        due_calendar.connect_day_selected(move |cal| {
+            if let Some(date) = NaiveDate::from_ymd_opt(cal.year(), cal.month() as u32 + 1, cal.day() as u32) {
+                due_date.set(date);
+                due_date_label.set_label(&format!("{}", date.format("%a, %b %-d")));
+            }
+            due_popover.popdown();
+        });
+    }
+    let due_date_button = gtk::MenuButton::builder().popover(&due_popover).child(&due_date_label).build();
+
+    let time_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Center).build();
+    time_box.append(&due_hour);
+    time_box.append(&gtk::Label::builder().label(":").css_classes(["dim-label"]).build());
+    time_box.append(&due_minute);
+
+    let datetime_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
         .margin_start(12)
         .margin_end(12)
         .margin_bottom(8)
         .build();
+    datetime_row.append(&due_date_button);
+    datetime_row.append(&time_box);
+    let due_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
     due_box.append(&due_switch_row);
     due_box.append(&datetime_row);
 
@@ -182,6 +193,7 @@ pub fn show_task_editor(
         .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
+        .vexpand(true)
         .build();
     form_box.append(&fields_group);
     form_box.append(&due_box);
@@ -234,7 +246,7 @@ pub fn show_task_editor(
         let error_label = error_label.clone();
         let summary_row = summary_row.clone();
         let notes_view = notes_view.clone();
-        let due_switch = due_switch.clone();
+        let due_switch_row = due_switch_row.clone();
         let due_date = due_date.clone();
         let due_hour = due_hour.clone();
         let due_minute = due_minute.clone();
@@ -255,7 +267,7 @@ pub fn show_task_editor(
                 error_label.set_visible(true);
                 return;
             }
-            let due = if due_switch.is_active() {
+            let due = if due_switch_row.is_active() {
                 let naive = due_date
                     .get()
                     .and_time(NaiveTime::from_hms_opt(due_hour.value() as u32, due_minute.value() as u32, 0).unwrap_or(NaiveTime::MIN));
@@ -337,4 +349,6 @@ pub fn show_task_editor(
             }
         });
     }
+
+    dialog.present();
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2 (2026-08-08)
+
+### Fixed
+
+- **Tasks**: the New Task toolbar button (and clicking a task row) opened nothing - `show_task_editor` built the entire dialog but never called `dialog.present()`, so the window was dropped invisible the moment the callback returned. The event and contact editors both end with a `present()`; the task editor was missing it.
+- **Tasks**: the task editor's layout is corrected. The dialog was too narrow at 560 px - the always-visible `GtkCalendar` (which expands to fill whatever space it's given, inflating the rows around it) plus the ActionRow suffixes left everything cramped - so the window is now 760 px wide (660 tall), and the notes field - the form's only expanding child, with `form_box` now `vexpand` too so the whole form claims the dialog's height - absorbs the slack instead of the field rows stretching. The Due toggle was a hand-rolled `ActionRow` + suffix `gtk::Switch` that rendered over-tall; it's now an `adw::SwitchRow`. And the due-date `GtkCalendar` moves out of the form flow into a popover behind a compact date button - the same pattern as the event editor's time clusters - with the hour/minute spin buttons centered beside it, so the date controls keep their natural height instead of stretching to the calendar's.
+
 ## 0.8.1 (2026-08-08)
 
 ### Added
