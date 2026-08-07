@@ -83,7 +83,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Mini-calendar sidebar widget (240px sidebar + compact copy docked on the Mail screen)
 - [ ] VTODO tasks
 - [ ] Birthday calendar synthesized from Contacts
-- [ ] `Gio.Notification` event alerts
+- [x] `Gio.Notification` event alerts
 - [x] Event create/edit ("New Event" toolbar button)
   - [x] Attendee invites (`ATTENDEE`/`ORGANIZER`), a recurrence/series builder (previously read-only display only), a video-call link (`CONFERENCE`), and categories/sensitivity/busy-free/reminder (`CATEGORIES`/`CLASS`/`TRANSP`/`VALARM`) via a new toolbar
   - [x] Live preview pane (mini-calendar + day schedule strip) reusing the main Calendar tab's own widgets

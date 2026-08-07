@@ -70,6 +70,13 @@
       <summary>Start new messages in the formatted editor</summary>
     </key>
 
+    <!-- Calendar -->
+    <key name="calendar-alerts-enabled" type="b">
+      <default>true</default>
+      <summary>Event alerts</summary>
+      <description>Show a notification when an event reminder comes due.</description>
+    </key>
+
     <!-- Session memory -->
     <key name="last-view-unified" type="b">
       <default>false</default>

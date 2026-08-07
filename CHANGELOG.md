@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.6 (2026-08-07)
+
+### Added
+
+- **Calendar**: event reminders now fire as `Gio.Notification` alerts. A new `reminders` module (`crates/app/src/reminders.rs`) owns an in-memory index fed by every `OccurrencesUpdated` the CalDAV sessions report (`connect_calendar_account` ingests each account's occurrences on arrival) - the engine never depends on the displayed-month cache, which only holds whatever month synced last - and a UI-thread tick (every 30 s, plus one immediately at startup so an alert that came due while the app was closed still appears if its event hasn't started) computes which events with a `VALARM` (`reminder_minutes_before`) are due: alert time passed, event not started, and not already shown or snoozed. Each due alert is a notification titled with the event's summary ("Starts at HH:MM" body) carrying Open / Snooze 5 min / Dismiss actions - app-level `GSimpleAction`s (`app.open-event` / `snooze-reminder` / `dismiss-reminder`) whose target is the JSON-serialized `EventOccurrence`, so Open lands straight on the event editor (the chip-click path extracted into `window::open_event_editor_for`, presenting the window and switching to the Calendar module first) even when the occurrence's month isn't the one cached. Fire-once and snooze state persists in the UI-state database's new `reminder_state` table (keyed `calendar_id|uid|start`, best-effort like `starred_contacts`, version bump 1 → 2 wipes the old table once per convention); occurrences older than two days are pruned with their rows. The loop is gated by a new `calendar-alerts-enabled` GSettings key (default on) exposed as Config → Calendar → "Event alerts"; while it's off the tick isn't consulted, so nothing is marked shown and re-enabling re-fires what's still due. Reminders while the app is closed remain out of scope.
+
+### Testing
+
+- `ReminderEngine` unit tests: stable/distinct alert keys, due fires exactly once, future alerts skipped, started events skipped, snooze re-fires after its window, dismiss never re-fires, stale occurrences pruned (with their persisted rows). `UiStateDb` tests: reminder-state round trip, INSERT-OR-REPLACE key semantics, reopen persistence, and the version-wipe behaviour. The `XDG_CACHE_HOME`-setting tests in `ui_state_db` and `reminders` now share one lock (`ui_state_db::CACHE_HOME_LOCK`), since the process-global env var races across the two modules otherwise.
+
 ## 0.7.5 (2026-08-07)
 
 ### Added

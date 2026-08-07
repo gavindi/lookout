@@ -1,5 +1,6 @@
 //! SQLite persistence for app-level UI state that isn't mail or calendar
-//! data: today, the People screen's starred contacts.
+//! data: today, the People screen's starred contacts and the calendar's
+//! event-reminder state.
 //!
 //! Starred contacts are `(account, contact-identity)` pairs the user marked
 //! as favourites. They're stored in their own database
@@ -7,8 +8,19 @@
 //! cache file for two reasons: a CardDAV-only account never gets a mail
 //! `Cache` handle, and the Advanced section's "Clear all caches" action wipes
 //! the mail/calendar caches - favourites are a preference, not a cache, and
-//! must survive it. Best-effort like the rest of the config modules: an
-//! unreadable or unwritable database just means favourites don't persist.
+//! must survive it.
+//!
+//! Event-reminder state is the fire-once/snooze bookkeeping for calendar
+//! reminders: for each reminder that has fired, whether it is done ("fired")
+//! or deferred until a later instant ("snoozed"). It lives here because a
+//! reminder is a UI concern - the calendar data itself doesn't change when a
+//! reminder fires - and it must survive both the "Clear all caches" action
+//! and a `user_version` bump, so it is keyed by the event's own identity
+//! (`calendar_id`, `uid`, `start_utc`) and re-created fresh on every open.
+//!
+//! Best-effort like the rest of the config modules: an unreadable or
+//! unwritable database just means favourites don't persist and reminders can
+//! fire again.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -18,8 +30,11 @@ use rusqlite::Connection;
 
 /// On-disk format version. Bumping it wipes the `starred_contacts` table once,
 /// mirroring `lookout-mail`'s cache convention, so a schema change can never
-/// serve rows written by an older build.
-const UI_STATE_VERSION: i64 = 1;
+/// serve rows written by an older build. The `reminder_state` table is not
+/// wiped by this: it is keyed by the event's own identity and re-created
+/// (empty, with `CREATE TABLE IF NOT EXISTS`) on every open anyway, so there
+/// is nothing stale it could serve.
+const UI_STATE_VERSION: i64 = 2;
 
 fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
@@ -38,6 +53,15 @@ pub fn db_path() -> PathBuf {
 /// like the app's read-side mail `Cache` handle.
 pub struct UiStateDb {
     conn: Connection,
+}
+
+/// One persisted reminder-state row, the `reminder_state` table's shape.
+pub struct ReminderStateRow {
+    pub calendar_id: String,
+    pub uid: String,
+    pub start_utc: String,
+    pub state: String,
+    pub snooze_until_utc: Option<String>,
 }
 
 impl UiStateDb {
@@ -60,6 +84,14 @@ impl UiStateDb {
                 account TEXT NOT NULL,
                 identity TEXT NOT NULL,
                 PRIMARY KEY (account, identity)
+            );
+            CREATE TABLE IF NOT EXISTS reminder_state (
+                calendar_id TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                start_utc TEXT NOT NULL,
+                state TEXT NOT NULL,
+                snooze_until_utc TEXT,
+                PRIMARY KEY (calendar_id, uid, start_utc)
             );
             ",
         )?;
@@ -99,7 +131,62 @@ impl UiStateDb {
         }
         Ok(())
     }
+
+    /// Every persisted reminder-state row, ordered by the primary key so the
+    /// calendar can walk occurrences deterministically.
+    pub fn load_reminder_state(&self) -> rusqlite::Result<Vec<ReminderStateRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT calendar_id, uid, start_utc, state, snooze_until_utc
+             FROM reminder_state
+             ORDER BY calendar_id, uid, start_utc",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ReminderStateRow {
+                calendar_id: row.get(0)?,
+                uid: row.get(1)?,
+                start_utc: row.get(2)?,
+                state: row.get(3)?,
+                snooze_until_utc: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Records a reminder's fire-once/snooze state, replacing any previous row
+    /// for the same event (`calendar_id`, `uid`, `start_utc`). Idempotent:
+    /// re-recording the same state is a no-op row-wise. `state` is "fired" or
+    /// "snoozed"; `snooze_until_utc` is the RFC 3339 UTC instant the snooze
+    /// ends, meaningful only when `state` is "snoozed".
+    pub fn set_reminder_state(&self, calendar_id: &str, uid: &str, start_utc: &str, state: &str, snooze_until_utc: Option<&str>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO reminder_state (calendar_id, uid, start_utc, state, snooze_until_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![calendar_id, uid, start_utc, state, snooze_until_utc],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a reminder's persisted state. Used when a stale occurrence is
+    /// pruned so it can never resurface from a previous fire.
+    pub fn clear_reminder(&self, calendar_id: &str, uid: &str, start_utc: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM reminder_state WHERE calendar_id = ?1 AND uid = ?2 AND start_utc = ?3",
+            rusqlite::params![calendar_id, uid, start_utc],
+        )?;
+        Ok(())
+    }
 }
+
+/// `XDG_CACHE_HOME` is process-global, so every test that touches it - this
+/// module's and `reminders`'s (which opens a `UiStateDb` of its own) - must
+/// take this lock first: a unique directory per test alone doesn't stop one
+/// thread's `set_var` from redirecting another's open (or `remove_dir_all`)
+/// into the wrong tree, and SQLite then reports "database is locked" against
+/// the other test's live connection. The single-test `XDG_CONFIG_HOME`
+/// modules (`background_image`/`tags`) get away without a lock only because
+/// they have nothing to race against.
+#[cfg(test)]
+pub(crate) static CACHE_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -110,6 +197,7 @@ mod tests {
     // the `XDG_CONFIG_HOME` tests in `background_image`/`tags`).
     #[test]
     fn starred_contacts_round_trip_and_version_wipe() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
         let dir = dir.join("round-trip");
         std::env::set_var("XDG_CACHE_HOME", &dir);
@@ -142,6 +230,89 @@ mod tests {
         drop(reopened);
         let upgraded = UiStateDb::open().unwrap();
         assert!(upgraded.load_starred().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Same `XDG_CACHE_HOME` rule as above: each reminder test takes the
+    // module lock and gets its own subdirectory.
+    #[test]
+    fn reminder_state_round_trip_and_snooze() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
+        let dir = dir.join("reminders");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_reminder_state().unwrap().is_empty());
+
+        // Fired → the row is visible.
+        db.set_reminder_state("cal-1", "event-1", "2026-08-07T09:00:00Z", "fired", None).unwrap();
+        let loaded = db.load_reminder_state().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].calendar_id, "cal-1");
+        assert_eq!(loaded[0].uid, "event-1");
+        assert_eq!(loaded[0].start_utc, "2026-08-07T09:00:00Z");
+        assert_eq!(loaded[0].state, "fired");
+        assert_eq!(loaded[0].snooze_until_utc, None);
+
+        // Snoozing the same event replaces the row (INSERT OR REPLACE), and
+        // the row count stays at one.
+        db.set_reminder_state("cal-1", "event-1", "2026-08-07T09:00:00Z", "snoozed", Some("2026-08-07T09:10:00Z"))
+            .unwrap();
+        let loaded = db.load_reminder_state().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].state, "snoozed");
+        assert_eq!(loaded[0].snooze_until_utc.as_deref(), Some("2026-08-07T09:10:00Z"));
+
+        // Re-setting without a snooze deadline clears the stale one.
+        db.set_reminder_state("cal-1", "event-1", "2026-08-07T09:00:00Z", "fired", None).unwrap();
+        let loaded = db.load_reminder_state().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].state, "fired");
+        assert_eq!(loaded[0].snooze_until_utc, None);
+
+        // Clear removes exactly this row; the rest survive.
+        db.set_reminder_state("cal-1", "event-2", "2026-08-08T09:00:00Z", "fired", None).unwrap();
+        db.clear_reminder("cal-1", "event-1", "2026-08-07T09:00:00Z").unwrap();
+        let loaded = db.load_reminder_state().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].uid, "event-2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reminder_state_survives_reopen_and_version_wipe() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
+        let dir = dir.join("reminders-reopen");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        db.set_reminder_state("cal-1", "event-1", "2026-08-07T09:00:00Z", "fired", None).unwrap();
+        db.set_starred(&AccountId("account-1".into()), "ada@example.com", true).unwrap();
+
+        // A fresh session reads the same reminder rows.
+        let reopened = UiStateDb::open().expect("existing database should reopen");
+        let loaded = reopened.load_reminder_state().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].uid, "event-1");
+        assert_eq!(loaded[0].state, "fired");
+
+        // Downgrading the on-disk version wipes only `starred_contacts`;
+        // `reminder_state` is created fresh on open and never wiped, so the
+        // reminder row must survive.
+        reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
+        drop(reopened);
+        let upgraded = UiStateDb::open().unwrap();
+        assert!(upgraded.load_starred().unwrap().is_empty());
+        let loaded = upgraded.load_reminder_state().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].uid, "event-1");
+        assert_eq!(loaded[0].state, "fired");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

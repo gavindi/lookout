@@ -3042,6 +3042,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         checked_calendar_ids: HashSet::new(),
         calendar_colors: calendar_colors::load(),
     }));
+
+    // --- Calendar event reminders. The engine accumulates every occurrence
+    // the sessions report (via `connect_calendar_account`'s ingest) and the
+    // loop fires `Gio.Notification`s for due alerts, with Open / Snooze /
+    // Dismiss actions; `open_event` lands on the shared event editor. The
+    // persistence handle is a second best-effort open of the UI-state
+    // database (the one in `UiState` is owned by the contacts code) - a
+    // failed open just means fire-once state doesn't survive restarts.
+    let reminders_engine = Rc::new(RefCell::new(crate::reminders::ReminderEngine::new(
+        crate::ui_state_db::UiStateDb::open()
+            .map(|db| Rc::new(RefCell::new(db)))
+            .inspect_err(|e| tracing::warn!("reminder state won't persist: {e}"))
+            .ok(),
+    )));
+    crate::reminders::spawn_reminder_loop(app, reminders_engine.clone(), settings.clone(), {
+        let window = window.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let calendar_view_button = calendar_view_button.clone();
+        Rc::new(move |occ: EventOccurrence| {
+            window.present();
+            calendar_view_button.set_active(true);
+            open_event_editor_for(&window, &state, &calendar_state, &occ);
+        })
+    });
     // --- iMIP banner actions. The banner's button acts on the invitation
     // stashed in `UiState::imip` by `render_body`; the calendar half of the
     // response (saving an accepted event, removing a cancelled one) needs
@@ -3267,6 +3292,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             state.borrow().settings.set_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT, row.is_active());
         });
     }
+
+    // Config → Calendar → "Event alerts": gates the reminder loop. The loop
+    // (see `reminders::spawn_reminder_loop`) reads the key on every tick, so
+    // nothing needs re-arming here - disabling mid-session simply stops new
+    // notifications (and stops marking alerts as shown, so re-enabling
+    // re-fires anything still due).
+    {
+        let state = state.clone();
+        config_view.calendar_alerts_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::CALENDAR_ALERTS_ENABLED, row.is_active());
+        });
+    }
     // Phase 5: apply the persisted Config → Appearance/Mail switch states now
     // that their handlers are wired. Each `set_active` fires the notify
     // handler above, which re-derives UiState and any widget effect from the
@@ -3276,6 +3313,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.animations_row.set_active(persisted.get_bool(crate::settings::ANIMATE_TRANSITIONS));
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
+        config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
     }
 
     {
@@ -4023,40 +4061,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let calendar_state = calendar_state.clone();
         calendar_view::connect_event_activated(&calendar_main, move |occ| {
-            let calendars = pickable_calendars(&calendar_state);
-            if calendars.is_empty() {
-                return;
-            }
-            let default_calendar = if calendars.iter().any(|(_, id)| *id == occ.calendar_id) {
-                occ.calendar_id.clone()
-            } else {
-                default_pickable_calendar(&calendar_state).unwrap_or_else(|| CalendarId(String::new()))
-            };
-            let preview = event_editor_preview_data(&calendar_state, occ.start.with_timezone(&chrono::Local).date_naive());
-            let owner_email = calendar_owner_email(&calendar_state, &occ.calendar_id);
-            crate::event_editor::show_event_editor(
-                &window,
-                crate::event_editor::EventEditorPrefill {
-                    calendars: &calendars,
-                    default_calendar,
-                    existing: Some(&occ),
-                    suggested_start: None,
-                    suggested_end: None,
-                    month_occurrences: &preview.occurrences,
-                    month_event_days: &preview.month_event_days,
-                    calendar_colors: &preview.colors,
-                    owner_email,
-                },
-                calendar_attendee_suggestions(&state),
-                {
-                    let calendar_state = calendar_state.clone();
-                    move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
-                },
-                {
-                    let calendar_state = calendar_state.clone();
-                    move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
-                },
-            );
+            open_event_editor_for(&window, &state, &calendar_state, &occ);
         });
     }
     // --- Calendar main grid interactions: the first click on an empty time
@@ -4151,6 +4156,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mail_overview_day_list,
         current_calendar_page,
         calendar_view_button,
+        reminders_engine,
         refresh_config,
     );
 
@@ -5401,6 +5407,7 @@ fn spawn_calendar_discovery(
     mail_overview_day_list: gtk::Box,
     current_calendar_page: Rc<Cell<&'static str>>,
     calendar_view_button: gtk::ToggleButton,
+    reminders_engine: Rc<RefCell<crate::reminders::ReminderEngine>>,
     refresh_config: Rc<dyn Fn()>,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
@@ -5434,6 +5441,7 @@ fn spawn_calendar_discovery(
                         mini_calendar.clone(),
                         mail_overview_day.clone(),
                         mail_overview_day_list.clone(),
+                        reminders_engine.clone(),
                         toast_overlay.clone(),
                         client.clone(),
                         account,
@@ -5579,6 +5587,7 @@ fn connect_calendar_account(
     mini_calendar: calendar_view::MiniCalendar,
     mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
     mail_overview_day_list: gtk::Box,
+    reminders_engine: Rc<RefCell<crate::reminders::ReminderEngine>>,
     toast_overlay: adw::ToastOverlay,
     goa_client: GoaClient,
     account: GoaCalendarAccount,
@@ -5656,6 +5665,11 @@ fn connect_calendar_account(
                     }
                 }
                 CalendarSessionEvent::OccurrencesUpdated { month, occurrences } => {
+                    // Feed the reminder engine before `occurrences` moves into
+                    // the handle below - the engine keeps its own copy of
+                    // every month it's been shown, since `last_occurrences`
+                    // only holds whatever month synced last.
+                    reminders_engine.borrow_mut().ingest(&account_id, &occurrences);
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
                         handle.last_occurrences = occurrences;
                         handle.last_synced_month = Some(month);
@@ -5765,6 +5779,47 @@ fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anch
         month_event_days,
         colors,
     }
+}
+
+/// Opens the editor for an existing occurrence — the shared path behind
+/// clicking an event chip in the calendar grids and the notification
+/// reminder's Open action (the engine hands the full occurrence back, so the
+/// editor works even when the month it belongs to isn't the one on screen).
+fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, occ: &EventOccurrence) {
+    let calendars = pickable_calendars(calendar_state);
+    if calendars.is_empty() {
+        return;
+    }
+    let default_calendar = if calendars.iter().any(|(_, id)| *id == occ.calendar_id) {
+        occ.calendar_id.clone()
+    } else {
+        default_pickable_calendar(calendar_state).unwrap_or_else(|| CalendarId(String::new()))
+    };
+    let preview = event_editor_preview_data(calendar_state, occ.start.with_timezone(&chrono::Local).date_naive());
+    let owner_email = calendar_owner_email(calendar_state, &occ.calendar_id);
+    crate::event_editor::show_event_editor(
+        window,
+        crate::event_editor::EventEditorPrefill {
+            calendars: &calendars,
+            default_calendar,
+            existing: Some(occ),
+            suggested_start: None,
+            suggested_end: None,
+            month_occurrences: &preview.occurrences,
+            month_event_days: &preview.month_event_days,
+            calendar_colors: &preview.colors,
+            owner_email,
+        },
+        calendar_attendee_suggestions(state),
+        {
+            let calendar_state = calendar_state.clone();
+            move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
+        },
+        {
+            let calendar_state = calendar_state.clone();
+            move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
+        },
+    );
 }
 
 /// Opens the "New event" editor prefilled for `suggested_start` (and

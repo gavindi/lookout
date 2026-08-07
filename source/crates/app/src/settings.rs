@@ -41,6 +41,7 @@ pub const SORT_DESCENDING: &str = "sort-descending";
 pub const MAIL_FAVORITES: &str = "mail-favorites";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
+pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
 pub const LAST_VIEW_UNIFIED: &str = "last-view-unified";
 pub const LAST_VIEW_MAILBOX: &str = "last-view-mailbox";
 
@@ -114,6 +115,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_FAVORITES, Value::Strv(Vec::new()));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
+    map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(LAST_VIEW_UNIFIED, Value::Bool(false));
     map.insert(LAST_VIEW_MAILBOX, Value::String(String::new()));
     map
@@ -259,6 +261,7 @@ mod tests {
         let store = resolve();
         assert!(!store.get_bool(MAIL_LOAD_REMOTE_IMAGES));
         assert!(store.get_bool(ANIMATE_TRANSITIONS));
+        assert!(store.get_bool(CALENDAR_ALERTS_ENABLED));
         assert_eq!(store.get_string(LAST_VIEW_MAILBOX), "");
         assert_eq!(store.get_string(SORT_KEY), "date");
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());

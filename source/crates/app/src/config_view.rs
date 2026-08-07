@@ -1,6 +1,8 @@
 //! Config view: a read-only overview of the Mail/Calendar accounts Lookout
 //! is connected to, a live Appearance section (the smooth-transitions
-//! preference and the window-background image picker), disabled placeholder
+//! preference and the window-background image picker), live Mail and Calendar
+//! preference groups (the remote-images/rich-text toggles and the event-alerts
+//! toggle), disabled placeholder
 //! sections mirroring the rest of the Phase 5 settings taxonomy (General/Layout/Mail/Privacy/Apps) and a live
 //! Advanced section with a cache-clear action. Data-in/widget-out like
 //! `calendar_view.rs` and `folder_tree.rs`: the caller (window.rs) owns the
@@ -78,6 +80,10 @@ pub struct ConfigView {
     /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
     /// `active` state into the composer's default body mode.
     pub rich_text_row: adw::SwitchRow,
+    /// "Event alerts" switch (Config → Calendar), exposed so the caller can
+    /// wire its `active` state into the `Gio::Notification` reminder
+    /// scheduling.
+    pub calendar_alerts_row: adw::SwitchRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     mail_rows: RefCell<Vec<adw::ActionRow>>,
@@ -94,9 +100,10 @@ pub struct ConfigView {
 /// placeholder group until that work lands - same honest-disabled convention
 /// as the menu bar's Home/View ribbon tabs. "Appearance" is deliberately
 /// absent: it's a real, enabled group with the smooth-transitions preference
-/// (see `build`), as is "Advanced" below and the "Mail" group (the
-/// remote-images and rich-text toggles) the loop's `Mail` entry hands off to.
-const PLACEHOLDER_SECTIONS: [&str; 5] = ["General", "Layout", "Mail", "Privacy", "Apps"];
+/// (see `build`), as is "Advanced" below and the "Mail" and "Calendar" groups
+/// (the remote-images/rich-text toggles and the event-alerts toggle) the
+/// loop's `Mail` and `Calendar` entries hand off to.
+const PLACEHOLDER_SECTIONS: [&str; 6] = ["General", "Layout", "Mail", "Calendar", "Privacy", "Apps"];
 
 pub fn build() -> ConfigView {
     let page = adw::PreferencesPage::new();
@@ -156,12 +163,29 @@ pub fn build() -> ConfigView {
         .build();
     mail_settings_group.add(&rich_text_row);
 
+    // The real "Calendar" group, replacing that section's placeholder: the
+    // event-alerts toggle, wired by the caller into the `Gio::Notification`
+    // reminder scheduling (enabled by default, matching the schema).
+    let calendar_settings_group = adw::PreferencesGroup::builder().title("Calendar").build();
+    let calendar_alerts_row = adw::SwitchRow::builder()
+        .title("Event alerts")
+        .subtitle("Show a notification when an event reminder comes due")
+        .active(true)
+        .build();
+    calendar_settings_group.add(&calendar_alerts_row);
+
     for section in PLACEHOLDER_SECTIONS {
         // "Mail" is a live group (see `mail_settings_group` above), not a
         // placeholder - add it in this section's place so the taxonomy order
         // is preserved.
         if section == "Mail" {
             page.add(&mail_settings_group);
+            continue;
+        }
+        // "Calendar" is likewise a live group (see `calendar_settings_group`
+        // above), not a placeholder.
+        if section == "Calendar" {
+            page.add(&calendar_settings_group);
             continue;
         }
         let group = adw::PreferencesGroup::builder().title(section).build();
@@ -196,6 +220,7 @@ pub fn build() -> ConfigView {
         restore_background_row,
         remote_images_row,
         rich_text_row,
+        calendar_alerts_row,
         mail_group,
         calendar_group,
         mail_rows: RefCell::new(Vec::new()),
