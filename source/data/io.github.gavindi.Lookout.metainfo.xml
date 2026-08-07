@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.8.8" date="2026-08-08">
+      <description>
+        <p>Saving drafts works again: draft autosaves and the copy of a sent message kept in Sent were being rejected by the server as malformed, so a draft never appeared in your Drafts folder. Error messages shown as toasts (account failures, contacts import/export problems, and more) also display properly now instead of tripping a GTK markup warning when they contain addresses or angle brackets.</p>
+      </description>
+    </release>
     <release version="0.8.7" date="2026-08-08">
       <description>
         <p>The Calendar and People sidebars now remember their widths between sessions: drag them to size and the split comes back exactly as you left it, on restart and when the window is resized.</p>
