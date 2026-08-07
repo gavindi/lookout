@@ -169,15 +169,24 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
 
     // An account with no Mail interface at all (mirrors the Nextcloud
     // account observed live: only Contacts/Calendar/Files/PasswordBased).
+    // The live GOA URI for it carries the login in the URL's userinfo
+    // (`https://ggraham@cloud.wahwahhut.com/remote.php/dav`) with no
+    // trailing slash on the DAV path - the exact shape `normalize_dav_base_url`
+    // exists to fix - and its `Identity` (`ggraham`) differs from its display
+    // name (`ggraham@cloud.wahwahhut.com`), so a parsed account must carry
+    // both and the URI must come out cleaned.
     let mut no_mail_ifaces = HashMap::new();
     no_mail_ifaces.insert("org.gnome.OnlineAccounts.Account".to_string(), {
         let mut m = HashMap::new();
         m.insert("MailDisabled".to_string(), prop(false));
+        m.insert("Identity".to_string(), prop("ggraham".to_string()));
+        m.insert("PresentationIdentity".to_string(), prop("ggraham@cloud.wahwahhut.com".to_string()));
+        m.insert("ProviderType".to_string(), prop("owncloud".to_string()));
         m
     });
     no_mail_ifaces.insert("org.gnome.OnlineAccounts.PasswordBased".to_string(), HashMap::new());
-    add_calendar_iface(&mut no_mail_ifaces, "https://cloud.example.com/remote.php/dav/", false);
-    add_contacts_iface(&mut no_mail_ifaces, "https://cloud.example.com/remote.php/dav/addressbooks/users/me/", false);
+    add_calendar_iface(&mut no_mail_ifaces, "https://ggraham@cloud.wahwahhut.com/remote.php/dav", false);
+    add_contacts_iface(&mut no_mail_ifaces, "https://ggraham@cloud.wahwahhut.com/remote.php/dav/addressbooks/users/me/", false);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/no_mail_account").unwrap(), no_mail_ifaces);
 
     let connection = zbus::connection::Builder::session()
@@ -290,8 +299,16 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     assert!(matches!(cal_accounts[0].auth, CalendarAuthMethod::OAuth2));
     assert_eq!(cal_accounts[1].uri, "https://caldav.example.com/dav/password@example.com/");
     assert!(matches!(cal_accounts[1].auth, CalendarAuthMethod::Password { .. }));
-    assert_eq!(cal_accounts[2].uri, "https://cloud.example.com/remote.php/dav/");
+    // The live-shaped Nextcloud URI comes out normalized: userinfo stripped
+    // and the DAV path given its trailing slash. The `@` inside the other
+    // accounts' *paths* (e.g. `oauth@example.com`) must be untouched.
+    assert_eq!(cal_accounts[2].uri, "https://cloud.wahwahhut.com/remote.php/dav/");
     assert!(matches!(cal_accounts[2].auth, CalendarAuthMethod::Password { .. }));
+    // `Identity` (the login the CalDAV server expects over Basic auth) is a
+    // separate value from the display name for this account.
+    assert_eq!(cal_accounts[2].identity, "ggraham");
+    assert_eq!(cal_accounts[2].display_name, "ggraham@cloud.wahwahhut.com");
+    assert_eq!(cal_accounts[2].provider_type.as_deref(), Some("owncloud"));
 
     client.ensure_credentials_calendar(&cal_accounts[0]).await.unwrap();
     let (cal_token, cal_expires_in) = client.get_access_token_calendar(&cal_accounts[0]).await.unwrap();
@@ -317,8 +334,10 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     assert!(matches!(contacts_accounts[0].auth, ContactsAuthMethod::OAuth2));
     assert_eq!(contacts_accounts[1].uri, "https://carddav.example.com/dav/password@example.com/");
     assert!(matches!(contacts_accounts[1].auth, ContactsAuthMethod::Password { .. }));
-    assert_eq!(contacts_accounts[2].uri, "https://cloud.example.com/remote.php/dav/addressbooks/users/me/");
+    assert_eq!(contacts_accounts[2].uri, "https://cloud.wahwahhut.com/remote.php/dav/addressbooks/users/me/");
     assert!(matches!(contacts_accounts[2].auth, ContactsAuthMethod::Password { .. }));
+    assert_eq!(contacts_accounts[2].identity, "ggraham");
+    assert_eq!(contacts_accounts[2].provider_type.as_deref(), Some("owncloud"));
 
     client.ensure_credentials_contacts(&contacts_accounts[0]).await.unwrap();
     let (contacts_token, contacts_expires_in) = client.get_access_token_contacts(&contacts_accounts[0]).await.unwrap();

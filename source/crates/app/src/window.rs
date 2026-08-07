@@ -4876,7 +4876,10 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
         display_name: account.display_name.clone(),
         base_url: account.uri.clone(),
         accept_ssl_errors: account.accept_ssl_errors,
-        username: account.display_name.clone(),
+        // `Account.Identity` is the login username the DAV server expects
+        // (e.g. the Nextcloud user id); the display name is only a fallback
+        // for providers that don't advertise an Identity.
+        username: if account.identity.is_empty() { account.display_name.clone() } else { account.identity.clone() },
     };
     let client = DavClient::new(&config.base_url, config.accept_ssl_errors, config.username.clone()).map_err(|e| e.to_string())?;
     let home = client.discover_addressbook_home(&credential).await.map_err(|e| e.to_string())?;
@@ -5731,7 +5734,10 @@ fn connect_calendar_account(
         display_name: display_name.clone(),
         base_url: account.uri.clone(),
         accept_ssl_errors: account.accept_ssl_errors,
-        username: account.display_name.clone(),
+        // `Account.Identity` is the login username the CalDAV server expects
+        // (e.g. the Nextcloud user id); the display name is only a fallback
+        // for providers that don't advertise an Identity.
+        username: if account.identity.is_empty() { display_name.clone() } else { account.identity.clone() },
     };
     let credentials: Rc<dyn lookout_dav::session::CalendarCredentialProvider> = Rc::new(GoaCalendarCredentialProvider::new(goa_client, account));
     // Same unsafe Send/Sync wrapper pattern as `connect_account`, documented

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.8 (2026-08-08)
+
+### Fixed
+
+- **Calendar / People**: CalDAV and CardDAV accounts whose GOA login differs from their display name could never connect. Lookout authenticated every DAV request over HTTP Basic Auth with the account's `PresentationIdentity` - for a Nextcloud account that's `ggraham@cloud.wahwahhut.com` while the server expects the login `ggraham` - so the server answered 401 (reported in the sidebar and a toast as a garbled error carrying the server's HTML response body). `GoaCalendarAccount`/`GoaContactsAccount` now carry GOA's `Account.Identity` (the actual login; `Identity` vs `PresentationIdentity` are distinct values on the live Nextcloud account), and both `connect_calendar_account` and the CardDAV fetch use it as the DAV username, falling back to the display name only when a provider advertises no Identity.
+- **Calendar / People**: GOA's owncloud/Nextcloud provider records its `Calendar.Uri`/`Contacts.Uri` with the login embedded in the URL's userinfo and no trailing slash (`https://ggraham@cloud.wahwahhut.com/remote.php/dav`) - the slashless form sabre/dav (Nextcloud's DAV server) is documented to answer with HTTP 400 Bad Request on many setups, and the embedded username leaked into every error message. A new `lookout_goa::normalize_dav_base_url` sanitizes the stored URI at parse time: userinfo is stripped (the username travels in the `Authorization` header, never the URL) and a missing trailing slash is restored - but only for the `owncloud`/`nextcloud` providers, since Google's `/.well-known/carddav` (RFC 6764) and `/caldav/v2/<user>/user` endpoints must keep their slashless forms. `DavClient::new` additionally scrubs any userinfo from its base URL as a second line of defence.
+- **UI**: DAV errors no longer trip GTK's "Failed to set text" warning (or show raw HTML). `send_request` and the webcal fetch embedded the server's response body - an HTML error page full of `\r`/control characters - straight into the error string that lands in toasts and sidebar status labels, which GTK widgets reject. The embedded snippet now goes through a `sanitize_snippet` helper: HTML tags stripped, control characters dropped, whitespace collapsed, capped at 300 chars.
+
+### Testing
+
+- `lookout-goa`: unit tests for `normalize_dav_base_url` (Nextcloud userinfo+slashless restored, already-clean and bare-server-root forms, Google well-known/caldav paths untouched, unknown providers strip userinfo only, empty/garbage/webcal pass-through). The `fake_goa` D-Bus integration fixture now mirrors the live Nextcloud account's exact shape - `Identity` `ggraham`, `PresentationIdentity` `ggraham@cloud.wahwahhut.com`, ProviderType `owncloud`, slashless userinfo URIs - and asserts the parsed account carries the distinct identity and a normalized URI, while the `@` inside other accounts' *paths* stays untouched.
+- `lookout-dav`: `sanitize_snippet` tests (Nextcloud-style error page reduced to its visible text, plain server explanations pass through, control characters dropped, unclosed tags handled, 300-char cap) and a `DavClient::new` userinfo-strip test; the existing 412-snippet test still asserts the server's explanation reaches the error message.
+
 ## 0.7.7 (2026-08-08)
 
 ### Added

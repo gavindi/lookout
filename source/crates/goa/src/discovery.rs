@@ -87,12 +87,21 @@ pub struct GoaCalendarAccount {
     pub account_id: AccountId,
     pub object_path: OwnedObjectPath,
     pub display_name: String,
+    /// `Account.Identity` - the account's login username (the user id on a
+    /// Nextcloud server, the email address on Google/Microsoft). This, not
+    /// the display name, is what the DAV server expects over HTTP Basic Auth.
+    pub identity: String,
     /// `Calendar.Uri` - the CalDAV base URL GOA has configured for this
     /// account (may be a principal URL, a calendar-home-set URL, or a bare
     /// server root, depending on provider - discovery must not assume which).
+    /// Sanitized by [`normalize_dav_base_url`]: userinfo stripped, and a
+    /// Nextcloud `remote.php/dav`-style path given its trailing slash.
     pub uri: String,
     pub accept_ssl_errors: bool,
     pub auth: CalendarAuthMethod,
+    /// GOA `ProviderType` for the account (`google`, `nextcloud`/`owncloud`,
+    /// ...), when the account advertises one.
+    pub provider_type: Option<String>,
 }
 
 /// How to obtain live credentials for a [`GoaContactsAccount`]. Kept
@@ -112,11 +121,16 @@ pub struct GoaContactsAccount {
     pub account_id: AccountId,
     pub object_path: OwnedObjectPath,
     pub display_name: String,
+    /// `Account.Identity` - the account's login username (see
+    /// [`GoaCalendarAccount::identity`]).
+    pub identity: String,
     /// `Contacts.Uri` - the CardDAV base URL GOA has configured for this
-    /// account.
+    /// account. Sanitized by [`normalize_dav_base_url`].
     pub uri: String,
     pub accept_ssl_errors: bool,
     pub auth: ContactsAuthMethod,
+    /// GOA `ProviderType` for the account, when the account advertises one.
+    pub provider_type: Option<String>,
 }
 
 /// Thin wrapper over a session-bus [`Connection`] providing GOA account
@@ -327,7 +341,8 @@ impl GoaClient {
         // presence of the `Calendar` interface itself is treated as
         // authoritative for now. Revisit if a live account turns up one.
         let display_name = get_string(account_props, "PresentationIdentity").unwrap_or_default();
-        let uri = get_string(cal_props, "Uri").unwrap_or_default();
+        let identity = get_string(account_props, "Identity").unwrap_or_default();
+        let uri = normalize_dav_base_url(get_string(cal_props, "Uri").unwrap_or_default(), get_string(account_props, "ProviderType").as_deref());
         if uri.is_empty() {
             return Ok(None);
         }
@@ -347,9 +362,11 @@ impl GoaClient {
             account_id: AccountId(path.to_string()),
             object_path: path.clone(),
             display_name,
+            identity,
             uri,
             accept_ssl_errors,
             auth,
+            provider_type: get_string(account_props, "ProviderType"),
         }))
     }
 
@@ -362,7 +379,8 @@ impl GoaClient {
         };
 
         let display_name = get_string(account_props, "PresentationIdentity").unwrap_or_default();
-        let uri = get_string(contacts_props, "Uri").unwrap_or_default();
+        let identity = get_string(account_props, "Identity").unwrap_or_default();
+        let uri = normalize_dav_base_url(get_string(contacts_props, "Uri").unwrap_or_default(), get_string(account_props, "ProviderType").as_deref());
         if uri.is_empty() {
             return Ok(None);
         }
@@ -382,9 +400,11 @@ impl GoaClient {
             account_id: AccountId(path.to_string()),
             object_path: path.clone(),
             display_name,
+            identity,
             uri,
             accept_ssl_errors,
             auth,
+            provider_type: get_string(account_props, "ProviderType"),
         }))
     }
 
@@ -472,6 +492,65 @@ fn split_host_port(host: &str) -> (String, Option<u16>) {
     (host.to_string(), None)
 }
 
+/// Cleans up a GOA-stored CalDAV/CardDAV base URL for use by the client.
+///
+/// Two fixes, both aimed at the way GOA's owncloud/Nextcloud provider records
+/// its URIs (observed live as `https://user@server/remote.php/dav`):
+///
+/// * **Userinfo is stripped.** The username belongs in the `Authorization`
+///   header (Basic auth carries it as a separate, always-present field), not
+///   in the URL - a userinfo-bearing URL is at best redundant and leaks the
+///   login into every error message and log line, and strict front-ends may
+///   reject the request outright.
+/// * **A missing trailing slash is restored on Nextcloud-style endpoints.**
+///   Sabre/dav (which Nextcloud and ownCloud both use) is documented to
+///   answer the slashless `/remote.php/dav` path with HTTP 400 Bad Request on
+///   many setups; the canonical form is `/remote.php/dav/`.
+///
+/// Deliberately *not* applied to other providers: Google's CardDAV
+/// well-known endpoint is `/.well-known/carddav` (RFC 6764 forbids the
+/// trailing slash there) and its CalDAV endpoint `/caldav/v2/<user>/user`
+/// serves fine without one, so the slash fix must not be blanket.
+///
+/// Anything that isn't an `http`/`https` URL is returned unchanged - the
+/// empty string stays empty (callers treat that as "no account"), and a
+/// genuinely malformed URL is left for the DAV client to report. This is
+/// string surgery rather than a real URL parse to keep this D-Bus-only crate
+/// free of URL-parsing dependencies; the inputs are GOA-produced http(s)
+/// URIs, whose shape is well understood (no IPv6-with-userinfo corner cases
+/// in practice, but an `@` in the *path* is never mistaken for userinfo
+/// because the authority is split at the first `/`).
+fn normalize_dav_base_url(uri: String, provider_type: Option<&str>) -> String {
+    let Some(after_scheme) = uri.find("://") else {
+        return uri;
+    };
+    let scheme = &uri[..after_scheme];
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return uri;
+    }
+    // The authority ends at the first `/`, `?`, or `#` after the scheme.
+    let rest = &uri[after_scheme + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = (&rest[..authority_end], &rest[authority_end..]);
+    // Userinfo is the authority's content up to (and including) its last `@`.
+    let authority = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    let is_nextcloud = matches!(provider_type, Some("owncloud") | Some("nextcloud"));
+    if !is_nextcloud {
+        return format!("{scheme}://{authority}{tail}");
+    }
+    // Split the tail into path + query/fragment so the slash lands on the path.
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let (path, query) = (&tail[..path_end], &tail[path_end..]);
+    if path.ends_with('/') {
+        format!("{scheme}://{authority}{tail}")
+    } else {
+        format!("{scheme}://{authority}{path}/{query}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +590,49 @@ mod tests {
             assert!(!is_microsoft365_provider(&props_with_provider_type(t)), "expected {t:?} not to be treated as Microsoft 365");
         }
         assert!(!is_microsoft365_provider(&HashMap::new()), "accounts without a ProviderType must not be special-cased");
+    }
+
+    #[test]
+    fn strips_userinfo_and_restores_slash_for_nextcloud() {
+        let uri = normalize_dav_base_url("https://ggraham@cloud.wahwahhut.com/remote.php/dav".to_string(), Some("owncloud"));
+        assert_eq!(uri, "https://cloud.wahwahhut.com/remote.php/dav/");
+    }
+
+    #[test]
+    fn nextcloud_uri_already_clean_is_untouched() {
+        let uri = normalize_dav_base_url("https://cloud.wahwahhut.com/remote.php/dav/".to_string(), Some("owncloud"));
+        assert_eq!(uri, "https://cloud.wahwahhut.com/remote.php/dav/");
+    }
+
+    #[test]
+    fn nextcloud_bare_server_root_gains_root_slash() {
+        let uri = normalize_dav_base_url("https://cloud.wahwahhut.com".to_string(), Some("owncloud"));
+        assert_eq!(uri, "https://cloud.wahwahhut.com/");
+    }
+
+    #[test]
+    fn google_well_known_carddav_keeps_its_slashless_path() {
+        // RFC 6764 well-known paths must not gain a trailing slash.
+        let uri = normalize_dav_base_url("https://www.googleapis.com/.well-known/carddav".to_string(), Some("google"));
+        assert_eq!(uri, "https://www.googleapis.com/.well-known/carddav");
+    }
+
+    #[test]
+    fn google_caldav_user_endpoint_keeps_its_slashless_path() {
+        let uri = normalize_dav_base_url("https://apidata.googleusercontent.com/caldav/v2/gavindi@gmail.com/user".to_string(), Some("google"));
+        assert_eq!(uri, "https://apidata.googleusercontent.com/caldav/v2/gavindi@gmail.com/user");
+    }
+
+    #[test]
+    fn unknown_provider_still_strips_userinfo_but_keeps_path() {
+        let uri = normalize_dav_base_url("https://alice@caldav.example.com/dav/alice".to_string(), None);
+        assert_eq!(uri, "https://caldav.example.com/dav/alice");
+    }
+
+    #[test]
+    fn empty_or_unparseable_uri_passes_through() {
+        assert_eq!(normalize_dav_base_url(String::new(), Some("owncloud")), "");
+        assert_eq!(normalize_dav_base_url("not a url".to_string(), Some("owncloud")), "not a url");
+        assert_eq!(normalize_dav_base_url("webcal://feeds.example.com/cal.ics".to_string(), Some("owncloud")), "webcal://feeds.example.com/cal.ics");
     }
 }

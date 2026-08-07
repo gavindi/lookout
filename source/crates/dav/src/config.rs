@@ -11,9 +11,10 @@ pub struct CalendarAccountConfig {
     /// Username to pair with a `Credential::Password` over HTTP Basic Auth.
     /// Unlike Mail (which has a protocol-specific `ImapUserName`), GOA's
     /// `Calendar` interface has no username property of its own - this is
-    /// the account's `PresentationIdentity`, the best available generic
-    /// identifier. Unused for `Credential::OAuth2AccessToken` (Bearer auth
-    /// needs no separate username).
+    /// the account's `Identity` (the login the DAV server actually expects,
+    /// e.g. the Nextcloud user id), never the display name. Unused for
+    /// `Credential::OAuth2AccessToken` (Bearer auth needs no separate
+    /// username).
     pub username: String,
 }
 

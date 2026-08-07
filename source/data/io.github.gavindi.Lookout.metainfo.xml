@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.7.8" date="2026-08-08">
+      <description>
+        <p>Nextcloud (and any CalDAV/CardDAV account whose login differs from its display name) can now connect: DAV requests authenticate with the account's login instead of its display name, GOA's stored URLs are cleaned up (embedded usernames stripped, missing trailing slash restored), and server error pages are sanitized before they reach toasts and status labels.</p>
+      </description>
+    </release>
     <release version="0.7.7" date="2026-08-08">
       <description>
         <p>Calendar feeds and file import: the Add calendar button now opens a dialog to subscribe to a webcal (https://…ics) feed - events appear read-only, refreshing automatically - to import an .ics file into one of your calendars (re-importing updates, not duplicates), or to manage existing subscriptions.</p>

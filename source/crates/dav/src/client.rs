@@ -18,6 +18,48 @@ const ADDRESSBOOK_PROPS: [&str; 2] = ["D:displayname", "D:resourcetype"];
 /// this is rejected rather than buffered.
 pub const MAX_FEED_BYTES: usize = 5 * 1024 * 1024;
 
+/// The maximum number of characters of a server response body embedded in a
+/// user-facing error message. Servers explain their 4xxes in the body, but
+/// the whole thing (often a whole HTML error page) belongs in the log, not a
+/// toast.
+const MAX_ERROR_SNIPPET_CHARS: usize = 300;
+
+/// Reduces a server response body to a display-safe snippet for an error
+/// message. Server error pages are HTML (`<title>`s, tags, `\r\n` line
+/// endings) and GTK widgets reject control characters outright - a raw body
+/// in a toast or status label both renders as garbage and can trip a GTK
+/// "Failed to set text" warning. Tags are stripped (the title text survives),
+/// control characters other than `\n`/`\t` are dropped, whitespace runs are
+/// collapsed, and the result is capped at [`MAX_ERROR_SNIPPET_CHARS`].
+fn sanitize_snippet(body: &str) -> String {
+    let mut out = String::with_capacity(body.len().min(MAX_ERROR_SNIPPET_CHARS + 32));
+    let mut in_tag = false;
+    let mut last_was_space = false;
+    for c in body.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if in_tag => {}
+            c if c.is_control() && !matches!(c, '\n' | '\t') => {}
+            c if c.is_whitespace() => {
+                if !last_was_space {
+                    out.push(' ');
+                    last_was_space = true;
+                }
+            }
+            c => {
+                out.push(c);
+                last_was_space = false;
+            }
+        }
+        if out.len() >= MAX_ERROR_SNIPPET_CHARS {
+            break;
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
 /// Normalizes a user-supplied calendar feed URL for fetching: the
 /// `webcal://`/`webcals://` schemes (RFC 5545's `calconnect` aliases for
 /// `http`/`https`, the only scheme an actual webcal feed can be served on)
@@ -56,7 +98,7 @@ pub async fn fetch_webcal_ics(http: &reqwest::Client, url: &reqwest::Url) -> Res
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await?;
-        let snippet: String = text.chars().take(500).collect();
+        let snippet = sanitize_snippet(&text);
         return Err(Error::Discovery(format!("HTTP {status} for {request_url}: {snippet}")));
     }
     if response.content_length().is_some_and(|len| len > MAX_FEED_BYTES as u64) {
@@ -189,7 +231,11 @@ pub struct DavClient {
 
 impl DavClient {
     pub fn new(base_url: &str, accept_ssl_errors: bool, username: String) -> Result<Self> {
-        let base_url = reqwest::Url::parse(base_url).map_err(|e| Error::Discovery(format!("invalid base URL {base_url:?}: {e}")))?;
+        let mut base_url = reqwest::Url::parse(base_url).map_err(|e| Error::Discovery(format!("invalid base URL {base_url:?}: {e}")))?;
+        // The username travels in the Authorization header, never in the URL.
+        // GOA has been observed to embed it as userinfo (`https://user@host/`),
+        // which some front-ends reject; scrub it so every request goes out clean.
+        let _ = base_url.set_username("");
         let http = reqwest::Client::builder().danger_accept_invalid_certs(accept_ssl_errors).build()?;
         Ok(Self { http, base_url, username })
     }
@@ -363,8 +409,10 @@ impl DavClient {
             // and CardDAV/CalDAV servers (Google, Nextcloud, ...) routinely
             // explain exactly what they didn't like about the request in it,
             // which is far more useful for diagnosing a 4xx than a bare
-            // "400 Bad Request" with no context.
-            let snippet: String = text.chars().take(500).collect();
+            // "400 Bad Request" with no context. The body is HTML and
+            // control-character-laden, so it's sanitized before it can land
+            // in a GTK toast or label.
+            let snippet = sanitize_snippet(&text);
             return Err(Error::Discovery(format!("HTTP {status} for {request_url}: {snippet}")));
         }
         Ok(response)
@@ -659,5 +707,43 @@ mod tests {
         let credential = Credential::Password("secret".to_string());
 
         client.delete_calendar_object("/cal/events/evt.ics", &credential, Some("\"etag-del\"")).await.unwrap();
+    }
+
+    #[test]
+    fn new_strips_userinfo_from_base_url() {
+        let client = DavClient::new("https://alice@caldav.example.com/remote.php/dav/", false, "alice".to_string()).unwrap();
+        assert_eq!(client.base_url.to_string(), "https://caldav.example.com/remote.php/dav/");
+    }
+
+    #[test]
+    fn sanitize_snippet_cleans_nextcloud_style_error_page() {
+        let raw = "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body><center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx</center></body></html>\r\n";
+        let clean = sanitize_snippet(raw);
+        assert_eq!(clean, " 400 Bad Request 400 Bad Request nginx");
+    }
+
+    #[test]
+    fn sanitize_snippet_keeps_plain_server_explanations() {
+        let clean = sanitize_snippet("Precondition Failed: etag mismatch on server");
+        assert_eq!(clean, "Precondition Failed: etag mismatch on server");
+    }
+
+    #[test]
+    fn sanitize_snippet_drops_control_characters() {
+        // `\r` and other control junk are dropped; `\n`/`\t` collapse to a
+        // single space along with the rest of the whitespace.
+        let clean = sanitize_snippet("line one\r\nline\u{1b}two\u{7f}\ttab");
+        assert_eq!(clean, "line one linetwo tab");
+    }
+
+    #[test]
+    fn sanitize_snippet_handles_unclosed_tag_and_caps_length() {
+        // The space around `< b >` is consumed as part of the tag, and the
+        // trailing unclosed `<` swallows the rest without panicking.
+        assert_eq!(sanitize_snippet("a < b > c <"), "a c");
+        assert_eq!(sanitize_snippet("keep <unclosed"), "keep");
+        let long = format!("<b>{}</b>", "x".repeat(10_000));
+        let clean = sanitize_snippet(&long);
+        assert_eq!(clean, "x".repeat(MAX_ERROR_SNIPPET_CHARS), "snippet must be capped at MAX_ERROR_SNIPPET_CHARS");
     }
 }
