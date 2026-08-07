@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.1 (2026-08-07)
+
+### Added
+
+- **Calendar**: the New Event dialog's "Invite required attendees" field now offers real autocomplete instead of plain typing. A new `window::calendar_attendee_suggestions` builds a `SuggestionSource` the same way the mail composer's To/Cc/Bcc fields already do (`merge_contact_suggestions` over mail-history hits and CardDAV suggestions) - but unioned across *every* connected account rather than scoped to one, since an invitee has no natural tie to whichever account owns the calendar being edited.
+
+### Changed
+
+- **Mail**: the permanent search entry in the window header bar gets a dedicated `.header-search-entry` CSS class and a dark grey background (`#202020`) via `install_paned_css`'s stylesheet, so it reads as a distinct search field against the header bar instead of blending into it.
+
 ## 0.7.0 (2026-08-07)
 
 ### Added

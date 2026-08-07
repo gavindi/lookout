@@ -100,7 +100,8 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [ ] Address book CRUD, groups, vCard import/export with duplicate detection
 - [ ] Shared `ContactsProvider` trait consumed by mail composer, calendar attendees, and the contacts app
   - [x] Mail composer consumes `ContactsProvider`
-  - [ ] Calendar attendees field now exists (event editor) but has no `ContactsProvider` autocomplete yet; dedicated contacts app still pending
+  - [x] Calendar attendees consume it too - autocomplete merges mail-history + CardDAV suggestions across every connected account (not scoped to one, since an invitee isn't tied to the event's own calendar account)
+  - [ ] Dedicated contacts app still pending
 
 ## Phase 5 — Settings/theming (roadmap)
 

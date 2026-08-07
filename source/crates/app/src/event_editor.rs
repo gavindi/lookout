@@ -23,7 +23,7 @@ use lookout_core::{
 };
 
 use crate::calendar_colors::CalendarColorMap;
-use crate::recipient_entry::{address_of, RecipientEntry};
+use crate::recipient_entry::{address_of, RecipientEntry, SuggestionSource};
 use crate::recurrence;
 
 /// The save callback's target: the picked calendar plus the finished event.
@@ -74,6 +74,7 @@ pub struct EventEditorPrefill<'a> {
 pub fn show_event_editor(
     window: &adw::ApplicationWindow,
     prefill: EventEditorPrefill,
+    attendee_suggestions: SuggestionSource,
     on_save: impl Fn(CalendarId, CalendarEvent) + 'static,
     on_delete: impl Fn(CalendarId, EventUid, Option<String>, Option<String>) + 'static,
 ) {
@@ -119,6 +120,7 @@ pub fn show_event_editor(
     // --- Title / attendees / all-day toggle.
     let title_row = adw::EntryRow::builder().title("Title").build();
     let attendees_field = RecipientEntry::new("Invite required attendees");
+    attendees_field.set_suggestion_source(attendee_suggestions);
     let all_day_switch = gtk::Switch::new();
     all_day_switch.set_valign(gtk::Align::Center);
 

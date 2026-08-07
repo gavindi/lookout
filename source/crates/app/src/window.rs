@@ -784,6 +784,9 @@ fn install_paned_css() {
             color: #8a97a5;
             font-size: 0.85em;
             font-weight: bold;
+        }
+        entry.header-search-entry {
+            background-color: #202020;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -1723,6 +1726,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .placeholder_text("Search mail")
         .width_request(360)
         .tooltip_text("Search mail (Ctrl+F)")
+        .css_classes(["header-search-entry"])
         .build();
     // A debounce token bumped on every keystroke and captured by each
     // scheduled timeout, so a timeout whose token is stale knows the user has
@@ -3847,6 +3851,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // existing `OccurrencesUpdated` path, so there's no refresh work here.
     {
         let window = window.clone();
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
         let calendar_main = calendar_main.clone();
         let toast_overlay = toast_overlay.clone();
@@ -3883,6 +3888,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     calendar_colors: &preview.colors,
                     owner_email,
                 },
+                calendar_attendee_suggestions(&state),
                 {
                     let calendar_state = calendar_state.clone();
                     move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
@@ -3896,6 +3902,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     {
         let window = window.clone();
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
         calendar_view::connect_event_activated(&calendar_main, move |occ| {
             let calendars = pickable_calendars(&calendar_state);
@@ -3921,6 +3928,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     calendar_colors: &preview.colors,
                     owner_email,
                 },
+                calendar_attendee_suggestions(&state),
                 {
                     let calendar_state = calendar_state.clone();
                     move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
@@ -4142,6 +4150,25 @@ fn merge_contact_suggestions(mail_history: Vec<EmailAddress>, carddav: &[EmailAd
     merged.extend(mail_history);
     merged.extend(carddav.iter().filter(|c| contacts_match_prefix(c, prefix)).cloned());
     dedupe_addresses(merged, limit)
+}
+
+/// Attendee autocomplete for the event editor's "Invite required attendees"
+/// field. Unlike the composer's per-account `suggestions` (`build_composer`'s
+/// caller scopes it to the account being sent from), an invitee isn't tied
+/// to any one account - so this merges mail-history hits and CardDAV
+/// suggestions across *every* connected account (same source data as
+/// `search_cached_results`/the composer's own suggestion source, just
+/// unioned instead of scoped).
+fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>) -> crate::recipient_entry::SuggestionSource {
+    let state = state.clone();
+    Rc::new(move |prefix: &str| {
+        let prefix = prefix.trim();
+        let st = state.borrow();
+        let mail_history: Vec<EmailAddress> = st.accounts.values().filter_map(|h| h.address_cache.as_ref()).flat_map(|cache| cache.search_contacts(prefix, 8)).collect();
+        let carddav: Vec<EmailAddress> = st.contacts_by_account.values().flat_map(|snapshot| snapshot.suggestions.clone()).collect();
+        drop(st);
+        merge_contact_suggestions(mail_history, &carddav, prefix, 8)
+    })
 }
 
 /// A stable-ish key for a contact, used for UI state (`starred_contacts`,
