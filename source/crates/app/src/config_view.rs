@@ -101,8 +101,10 @@ pub struct ConfigView {
     identity_rows: RefCell<Vec<adw::ActionRow>>,
     mail_cache_group: adw::PreferencesGroup,
     calendar_cache_group: adw::PreferencesGroup,
+    contacts_cache_group: adw::PreferencesGroup,
     mail_cache_rows: RefCell<Vec<adw::ActionRow>>,
     calendar_cache_rows: RefCell<Vec<adw::ActionRow>>,
+    contacts_cache_rows: RefCell<Vec<adw::ActionRow>>,
 }
 
 /// Phase 5 roadmap's settings taxonomy, each rendered as a disabled
@@ -215,9 +217,12 @@ pub fn build() -> ConfigView {
     let calendar_cache_group = adw::PreferencesGroup::builder().title("Calendar cache").build();
     advanced_group.add(&calendar_cache_group);
 
+    let contacts_cache_group = adw::PreferencesGroup::builder().title("Contacts cache").build();
+    advanced_group.add(&contacts_cache_group);
+
     let clear_cache_row = adw::ActionRow::builder()
         .title("Clear all caches")
-        .subtitle("Delete locally-stored email and calendar data")
+        .subtitle("Delete locally-stored email, calendar and contacts data")
         .activatable(true)
         .build();
     advanced_group.add(&clear_cache_row);
@@ -242,8 +247,10 @@ pub fn build() -> ConfigView {
         identity_rows: RefCell::new(Vec::new()),
         mail_cache_group,
         calendar_cache_group,
+        contacts_cache_group,
         mail_cache_rows: RefCell::new(Vec::new()),
         calendar_cache_rows: RefCell::new(Vec::new()),
+        contacts_cache_rows: RefCell::new(Vec::new()),
     }
 }
 
@@ -263,6 +270,8 @@ pub fn refresh(
     mail_cache_files: &[CacheFile],
     calendar_cache_dir: &std::path::Path,
     calendar_cache_files: &[CacheFile],
+    contacts_cache_dir: &std::path::Path,
+    contacts_cache_files: &[CacheFile],
     manage_identities: &ManageIdentities,
 ) {
     for row in view.mail_rows.borrow_mut().drain(..) {
@@ -343,6 +352,19 @@ pub fn refresh(
     } else {
         for file in calendar_cache_files {
             push_row(&view.calendar_cache_group, &view.calendar_cache_rows, cache_file_row(&file.name, &file.size));
+        }
+    }
+
+    // -- contacts cache --
+    for row in view.contacts_cache_rows.borrow_mut().drain(..) {
+        view.contacts_cache_group.remove(&row);
+    }
+    view.contacts_cache_group.set_title(&format!("Contacts cache — {}", contacts_cache_dir.display()));
+    if contacts_cache_files.is_empty() {
+        push_row(&view.contacts_cache_group, &view.contacts_cache_rows, empty_row("No cached files"));
+    } else {
+        for file in contacts_cache_files {
+            push_row(&view.contacts_cache_group, &view.contacts_cache_rows, cache_file_row(&file.name, &file.size));
         }
     }
 }

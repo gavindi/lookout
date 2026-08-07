@@ -21,6 +21,12 @@ pub const NS_CARDDAV: &[u8] = b"urn:ietf:params:xml:ns:carddav";
 #[derive(Debug, Clone, Default)]
 pub struct DavResponse {
     pub href: String,
+    /// The response-level `<d:status>` when the server reports one as a
+    /// direct child of `<response>` (RFC 6578 `sync-collection` marks removed
+    /// members this way, e.g. `HTTP/1.1 404 Not Found`, with no `propstat`).
+    /// Absent for the common 200-with-props case where the status lives
+    /// inside each `<propstat>` instead.
+    pub status: Option<String>,
     props: HashMap<(Vec<u8>, String), String>,
 }
 
@@ -49,6 +55,16 @@ struct ParseState {
     responses: Vec<DavResponse>,
     current: Option<DavResponse>,
     response_depth: Option<u32>,
+    /// Depth at which a response-level `<status>` element opened (a direct
+    /// child of `<response>`), plus its accumulated text. Kept separate from
+    /// `prop_depth`'s props because a `propstat`-level status is *not* the
+    /// response's status.
+    status_depth: Option<u32>,
+    status_text: String,
+    /// Depth at which the top-level `<sync-token>` element opened (a direct
+    /// child of the `<multistatus>` root), plus its accumulated text.
+    sync_token_depth: Option<u32>,
+    sync_token_text: String,
     // Depth at which a <href> element opened, plus its accumulated text.
     // hrefs appear both as a direct child of <response> (the resource's own
     // href) and, for a couple of props (current-user-principal,
@@ -77,6 +93,20 @@ impl ParseState {
             self.prop_depth = Some(depth);
             return;
         }
+        // Response-level status (direct child of <response>): depth 2 for
+        // <multistatus><response><status>. Root is at depth 1.
+        if local == "status" && self.response_depth == Some(depth - 1) {
+            self.status_depth = Some(depth);
+            self.status_text.clear();
+            return;
+        }
+        // Top-level sync token (direct child of the <multistatus> root, RFC
+        // 6578): depth 2.
+        if local == "sync-token" && depth == 2 {
+            self.sync_token_depth = Some(depth);
+            self.sync_token_text.clear();
+            return;
+        }
         if let Some(pd) = self.prop_depth {
             if depth == pd + 1 {
                 self.prop_key = Some((ns_bytes(ns), local.to_string()));
@@ -91,6 +121,10 @@ impl ParseState {
     fn on_text(&mut self, depth: u32, text: &str) {
         if self.href_open_depth == Some(depth) {
             self.href_text.push_str(text);
+        } else if self.status_depth == Some(depth) {
+            self.status_text.push_str(text);
+        } else if self.sync_token_depth == Some(depth) {
+            self.sync_token_text.push_str(text);
         } else if let Some(pd) = self.prop_depth {
             if depth == pd + 1 && self.prop_key.is_some() {
                 self.prop_text.push_str(text);
@@ -99,6 +133,18 @@ impl ParseState {
     }
 
     fn on_close(&mut self, depth: u32) {
+        if self.status_depth == Some(depth) {
+            if let Some(resp) = self.current.as_mut() {
+                resp.status = Some(self.status_text.trim().to_string());
+            }
+            self.status_depth = None;
+            return;
+        }
+        if self.sync_token_depth == Some(depth) {
+            self.sync_token_text = self.sync_token_text.trim().to_string();
+            self.sync_token_depth = None;
+            return;
+        }
         if self.href_open_depth == Some(depth) {
             let href_value = self.href_text.trim().to_string();
             if self.response_depth == Some(depth - 1) {
@@ -211,6 +257,62 @@ pub fn parse_multistatus(xml: &str) -> Result<Vec<DavResponse>> {
     }
 
     Ok(state.responses)
+}
+
+/// Like [`parse_multistatus`], but also returns the top-level `<sync-token>`
+/// (RFC 6578) if the server included one - the incremental-sync cursor the
+/// caller must store and send back on the next `sync-collection` REPORT.
+pub fn parse_multistatus_with_token(xml: &str) -> Result<(Vec<DavResponse>, Option<String>)> {
+    let mut reader = NsReader::from_str(xml);
+    let mut state = ParseState::default();
+    let mut depth: u32 = 0;
+
+    loop {
+        let (ns, event) = reader.read_resolved_event()?;
+        match event {
+            Event::Eof => break,
+            Event::Start(e) => {
+                depth += 1;
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                state.on_open(depth, &ns, &local);
+            }
+            Event::Empty(e) => {
+                depth += 1;
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                state.on_open(depth, &ns, &local);
+                state.on_close(depth);
+                depth -= 1;
+            }
+            Event::Text(t) => {
+                let decoded = t.decode().map_err(quick_xml::Error::from)?;
+                state.on_text(depth, &decoded);
+            }
+            Event::GeneralRef(r) => {
+                let resolved = match r.resolve_char_ref() {
+                    Ok(Some(c)) => Some(c.to_string()),
+                    Ok(None) => r.decode().ok().and_then(|name| match name.as_ref() {
+                        "amp" => Some("&".to_string()),
+                        "lt" => Some("<".to_string()),
+                        "gt" => Some(">".to_string()),
+                        "apos" => Some("'".to_string()),
+                        "quot" => Some("\"".to_string()),
+                        _ => None,
+                    }),
+                    Err(_) => None,
+                };
+                if let Some(resolved) = resolved {
+                    state.on_text(depth, &resolved);
+                }
+            }
+            Event::End(_) => {
+                state.on_close(depth);
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok((state.responses, (!state.sync_token_text.is_empty()).then_some(state.sync_token_text)))
 }
 
 /// Builds a `PROPFIND` request body asking for the given (already-prefixed)
@@ -573,6 +675,61 @@ mod tests {
         assert!(
             !body.contains("<D:sync-token>\n"),
             "an empty element should be self-closed, not an open/close pair with nothing between"
+        );
+    }
+
+    // RFC 6578 sync-collection response: changed members carry props (with a
+    // propstat-level status), removed members are bare response-level 404s,
+    // and the whole document ends with the server's next sync-token.
+    const SYNC_COLLECTION_REPORT: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:CD="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/carddav/v1/lists/default/changed.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"new-etag"</D:getetag>
+        <CD:address-data>BEGIN:VCARD
+VERSION:4.0
+UID:changed
+END:VCARD
+</CD:address-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/carddav/v1/lists/default/removed.vcf</D:href>
+    <D:status>HTTP/1.1 404 Not Found</D:status>
+  </D:response>
+  <D:sync-token>token-42</D:sync-token>
+</D:multistatus>"#;
+
+    #[test]
+    fn sync_collection_report_surfaces_statuses_and_the_next_token() {
+        let (responses, token) = parse_multistatus_with_token(SYNC_COLLECTION_REPORT).unwrap();
+        assert_eq!(token.as_deref(), Some("token-42"));
+        assert_eq!(responses.len(), 2);
+
+        // The changed member: response-level status stays None (its status is
+        // propstat-level, which isn't the response's), props are intact.
+        assert_eq!(responses[0].href, "/carddav/v1/lists/default/changed.vcf");
+        assert_eq!(responses[0].status, None);
+        assert_eq!(responses[0].prop(DAV, "getetag"), Some("\"new-etag\""));
+        assert!(responses[0].prop(NS_CARDDAV, "address-data").unwrap().contains("UID:changed"));
+
+        // The removed member: response-level 404 with no props.
+        assert_eq!(responses[1].href, "/carddav/v1/lists/default/removed.vcf");
+        assert_eq!(responses[1].status.as_deref(), Some("HTTP/1.1 404 Not Found"));
+        assert_eq!(responses[1].prop(DAV, "getetag"), None);
+    }
+
+    #[test]
+    fn ordinary_multistatus_reports_no_status_or_token() {
+        let (responses, token) = parse_multistatus_with_token(GOOGLE_STYLE_LIST_MULTISTATUS).unwrap();
+        assert_eq!(token, None);
+        assert!(
+            responses.iter().all(|r| r.status.is_none()),
+            "propstat-level 404s must not leak into the response-level status"
         );
     }
 }

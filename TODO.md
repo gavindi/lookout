@@ -101,10 +101,10 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
   - [x] Contact details dialog (emails, phones, addresses, org/title, notes)
   - [x] Deleted bucket (in-memory diff of CardDAV polls)
 - [x] Address book CRUD (contact editor: create/edit/delete with `If-Match`-guarded PUT/DELETE), groups (CATEGORIES-based "Manage groups…" rename/delete re-tagging member cards across accounts), vCard import/export with duplicate detection (`.vcf` file import: upsert by UID, skip+count by email, target-book picker; export of the current bucket as one multi-card `.vcf`)
-- [ ] Shared `ContactsProvider` trait consumed by mail composer, calendar attendees, and the contacts app
+- [x] Shared `ContactsProvider` trait consumed by mail composer, calendar attendees, and the contacts app
   - [x] Mail composer consumes `ContactsProvider`
   - [x] Calendar attendees consume it too - autocomplete merges mail-history + CardDAV suggestions across every connected account (not scoped to one, since an invitee isn't tied to the event's own calendar account)
-  - [ ] Dedicated contacts app still pending
+  - [x] Dedicated contacts app — `contacts_view.rs` module extracted out of `window.rs` (data types, sync loops, dialogs, list rebuilds), CardDAV-backed `ContactsProvider` impl (`SnapshotContactsProvider`) that composer/attendees route through, persistent per-account `ContactsCache` in `lookout-dav` (RFC 6578 `sync-collection` delta sync with token store, fast paint from cache at startup, Deleted bucket now survives restarts, "Clear all caches" + Config storage breakdown cover it), and a pop-out People window ("Open in new window" toolbar button, re-attaches on close)
 
 ## Phase 5 — Settings/theming (roadmap)
 

@@ -1,10 +1,10 @@
 use std::sync::Mutex;
 
 use chrono::{Datelike, NaiveDate};
-use lookout_core::{AccountId, EventOccurrence};
+use lookout_core::{AccountId, EventOccurrence, VCard};
 use rusqlite::Connection;
 
-use crate::Result;
+use crate::{ContactRecord, Result};
 
 /// A per-account local SQLite cache of expanded calendar occurrences, keyed by
 /// month - the CalDAV mirror of `lookout_mail::cache::Cache`. Used for a fast
@@ -66,6 +66,10 @@ pub fn clear_all_caches() -> Result<()> {
     let dir = cache_dir();
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
+    }
+    let contacts_dir = contacts_cache_dir();
+    if contacts_dir.exists() {
+        std::fs::remove_dir_all(&contacts_dir)?;
     }
     Ok(())
 }
@@ -145,6 +149,295 @@ impl CalendarCache {
 
 fn first_of_month(date: NaiveDate) -> NaiveDate {
     date.with_day(1).unwrap_or(date)
+}
+
+// ---------------------------------------------------------------------------
+// Contacts (CardDAV) cache
+// ---------------------------------------------------------------------------
+
+/// Per-account SQLite cache of CardDAV address books and their vCards, keyed
+/// by server href. Unlike [`CalendarCache`] this is not just a fast-paint
+/// hint: it also stores each address book's RFC 6578 `sync-token` so polls
+/// can run incremental `sync-collection` REPORTs instead of refetching every
+/// vCard, and it is the baseline the Deleted bucket diffs against (a contact
+/// missing from the cache is a server-side deletion, tracked across
+/// restarts).
+///
+/// Same `Mutex`-wrapped connection reasoning as [`CalendarCache`]: one
+/// account's poll loop owns its cache, so the lock is uncontended in
+/// practice and exists only to make `&ContactsCache: Send` across `.await`.
+fn contacts_cache_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("lookout").join("contacts")
+}
+
+/// Returns the contacts cache directory and a list of `(filename, size_bytes)`
+/// for each SQLite database file in it - the CardDAV counterpart of
+/// [`cache_info`], for the config view's storage breakdown.
+pub fn contacts_cache_info() -> (std::path::PathBuf, Vec<(String, u64)>) {
+    let dir = contacts_cache_dir();
+    let entries = if dir.exists() {
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "sqlite3"))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let size = e.metadata().ok()?.len();
+                Some((name, size))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (dir, entries)
+}
+
+/// One address book as stored in the cache: its href, display name, and the
+/// last `sync-token` returned by the server, if an incremental sync has ever
+/// completed for it.
+#[derive(Debug, Clone)]
+pub struct CachedAddressBook {
+    pub href: String,
+    pub display_name: String,
+    pub sync_token: Option<String>,
+}
+
+/// One contact as stored in the cache: the server href, the address book it
+/// lives in, its last `getetag`, and the parsed vCard.
+#[derive(Debug, Clone)]
+pub struct CachedContact {
+    pub href: String,
+    pub book_href: String,
+    pub etag: Option<String>,
+    pub card: VCard,
+}
+
+pub struct ContactsCache {
+    conn: Mutex<Connection>,
+}
+
+impl ContactsCache {
+    /// Opens (creating if needed) the cache database for `account_id` under
+    /// `$XDG_CACHE_HOME/lookout/contacts/`.
+    pub fn open(account_id: &AccountId) -> Result<Self> {
+        let dir = contacts_cache_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.sqlite3", sanitize_filename(account_id)));
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS address_books (
+                href TEXT PRIMARY KEY,
+                displayname TEXT NOT NULL,
+                sync_token TEXT
+            );
+            CREATE TABLE IF NOT EXISTS contacts (
+                href TEXT PRIMARY KEY,
+                book_href TEXT NOT NULL,
+                etag TEXT,
+                card TEXT NOT NULL
+            );
+            ",
+        )?;
+        Ok(ContactsCache { conn: Mutex::new(conn) })
+    }
+
+    /// All cached address books for the account, with their stored sync
+    /// tokens (the incremental-sync cursor).
+    pub fn load_address_books(&self) -> Result<Vec<CachedAddressBook>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT href, displayname, sync_token FROM address_books")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CachedAddressBook {
+                href: row.get(0)?,
+                display_name: row.get(1)?,
+                sync_token: row.get(2)?,
+            })
+        })?;
+        let mut books = Vec::new();
+        for row in rows {
+            books.push(row?);
+        }
+        Ok(books)
+    }
+
+    /// Every cached contact for the account (across all books).
+    pub fn load_contacts(&self) -> Result<Vec<CachedContact>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT href, book_href, etag, card FROM contacts")?;
+        let rows = stmt.query_map([], |row| {
+            let href: String = row.get(0)?;
+            let book_href: String = row.get(1)?;
+            let etag: Option<String> = row.get(2)?;
+            let card_text: String = row.get(3)?;
+            match VCard::parse(&card_text) {
+                Ok(card) => Ok(Some(CachedContact { href, book_href, etag, card })),
+                Err(e) => {
+                    tracing::warn!("skipping unparseable cached vCard at {href:?}: {e}");
+                    Ok(None)
+                }
+            }
+        })?;
+        let mut contacts = Vec::new();
+        for row in rows {
+            if let Some(contact) = row? {
+                contacts.push(contact);
+            }
+        }
+        Ok(contacts)
+    }
+
+    /// Upserts the account's address-book list, preserving each book's stored
+    /// sync token across re-discoveries (only the display name is refreshed).
+    pub fn store_address_books(&self, books: &[crate::AddressBookInfo]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for book in books {
+            conn.execute(
+                "INSERT INTO address_books (href, displayname) VALUES (?1, ?2)
+                 ON CONFLICT(href) DO UPDATE SET displayname = excluded.displayname",
+                rusqlite::params![book.href, book.display_name],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The stored `sync-token` cursor for one address book, or `None` when no
+    /// incremental sync has completed for it yet (or the book is unknown).
+    pub fn sync_token(&self, book_href: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT sync_token FROM address_books WHERE href = ?1")?;
+        let mut rows = stmt.query_map([book_href], |row| row.get::<_, Option<String>>(0))?;
+        match rows.next() {
+            Some(row) => Ok(row?),
+            None => Ok(None),
+        }
+    }
+
+    /// Applies the result of one `sync-collection` poll for `book_href`:
+    /// upserts the changed records, deletes the gone hrefs, and stores the
+    /// server's next `sync_token` (or clears it when the caller fell back to
+    /// a full refetch - the token only survives a completed incremental
+    /// sync). The book row is upserted (not just updated) so the token
+    /// survives even if discovery hasn't stored the book yet.
+    pub fn apply_delta(&self, book_href: &str, new_token: Option<String>, changed: &[ContactRecord], deleted_hrefs: &[String]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for record in changed {
+            conn.execute(
+                "INSERT OR REPLACE INTO contacts (href, book_href, etag, card) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![record.href, book_href, record.etag, record.card.serialize()],
+            )?;
+        }
+        for href in deleted_hrefs {
+            conn.execute("DELETE FROM contacts WHERE href = ?1", [href])?;
+        }
+        conn.execute(
+            "INSERT INTO address_books (href, displayname, sync_token) VALUES (?1, '', ?2)
+             ON CONFLICT(href) DO UPDATE SET sync_token = excluded.sync_token",
+            rusqlite::params![book_href, new_token],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod contacts_tests {
+    use super::*;
+
+    fn temp_account_id() -> AccountId {
+        AccountId(format!("/test/contacts_cache_{}", uuid::Uuid::new_v4()))
+    }
+
+    fn sample_card(uid: &str, email: &str) -> VCard {
+        VCard::parse(&format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:{uid}\r\nFN:{uid}\r\nEMAIL:{email}\r\nEND:VCARD\r\n")).expect("sample card parses")
+    }
+
+    fn temp_path(account_id: &AccountId) -> std::path::PathBuf {
+        contacts_cache_dir().join(format!("{}.sqlite3", sanitize_filename(account_id)))
+    }
+
+    #[test]
+    fn stores_books_tokens_and_delta_round_trips() {
+        let account_id = temp_account_id();
+        let path = temp_path(&account_id);
+        let cache = ContactsCache::open(&account_id).unwrap();
+
+        assert!(cache.load_address_books().unwrap().is_empty());
+        assert!(cache.load_contacts().unwrap().is_empty());
+
+        let book = crate::AddressBookInfo {
+            account_id: account_id.clone(),
+            display_name: "Personal".to_string(),
+            href: "/addressbooks/alice/personal/".to_string(),
+        };
+        cache.store_address_books(&[book]).unwrap();
+
+        let alice = crate::ContactRecord {
+            href: "/addressbooks/alice/personal/alice.vcf".to_string(),
+            etag: Some("\"a1\"".to_string()),
+            card: sample_card("alice", "alice@example.com"),
+        };
+        let bob = crate::ContactRecord {
+            href: "/addressbooks/alice/personal/bob.vcf".to_string(),
+            etag: Some("\"b1\"".to_string()),
+            card: sample_card("bob", "bob@example.com"),
+        };
+        cache.apply_delta("/addressbooks/alice/personal/", Some("token-1".to_string()), &[alice, bob], &[]).unwrap();
+
+        let books = cache.load_address_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].sync_token.as_deref(), Some("token-1"));
+        assert_eq!(books[0].display_name, "Personal");
+
+        let contacts = cache.load_contacts().unwrap();
+        assert_eq!(contacts.len(), 2);
+        assert!(contacts.iter().any(|c| c.card.uid.as_deref() == Some("alice")));
+
+        // A later delta deletes bob and keeps alice, moving the token on.
+        cache
+            .apply_delta(
+                "/addressbooks/alice/personal/",
+                Some("token-2".to_string()),
+                &[],
+                &["/addressbooks/alice/personal/bob.vcf".to_string()],
+            )
+            .unwrap();
+        let contacts = cache.load_contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].href, "/addressbooks/alice/personal/alice.vcf");
+        assert_eq!(cache.load_address_books().unwrap()[0].sync_token.as_deref(), Some("token-2"));
+
+        // Reopening (a fresh connection, i.e. next launch) sees it all.
+        drop(cache);
+        let reopened = ContactsCache::open(&account_id).unwrap();
+        assert_eq!(reopened.load_contacts().unwrap().len(), 1);
+        assert_eq!(reopened.load_address_books().unwrap()[0].sync_token.as_deref(), Some("token-2"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn full_refetch_clears_the_stored_sync_token() {
+        let account_id = temp_account_id();
+        let path = temp_path(&account_id);
+        let cache = ContactsCache::open(&account_id).unwrap();
+        let book = crate::AddressBookInfo {
+            account_id: account_id.clone(),
+            display_name: "Personal".to_string(),
+            href: "/addressbooks/alice/personal/".to_string(),
+        };
+        cache.store_address_books(&[book]).unwrap();
+        cache.apply_delta("/addressbooks/alice/personal/", Some("token-9".to_string()), &[], &[]).unwrap();
+        // A fallback full refetch starts from "no token".
+        cache.apply_delta("/addressbooks/alice/personal/", None, &[], &[]).unwrap();
+        assert_eq!(cache.load_address_books().unwrap()[0].sync_token, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

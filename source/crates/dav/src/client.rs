@@ -187,6 +187,44 @@ impl DavClient {
         self.sync_collection(url, 1, credential, body).await
     }
 
+    /// Runs an RFC 6578 `sync-collection` REPORT for one address book,
+    /// returning `(changed records, deleted hrefs, next sync token)`. The
+    /// caller stores the token (and passes it back on the next poll) so only
+    /// the members that actually changed since the last sync are re-fetched;
+    /// a `None` token is a cold start. Removed members are reported as
+    /// response-level `404` statuses with no properties, which is exactly why
+    /// [`xml::DavResponse::status`] exists. A stored token that the server no
+    /// longer recognises surfaces as a 4xx HTTP error from
+    /// [`Self::sync_collection`] - callers fall back to a full
+    /// [`Self::fetch_addressbook_contacts_with_meta`] refetch, which resets
+    /// the token.
+    pub async fn sync_addressbook_delta(
+        &self,
+        addressbook: &AddressBookInfo,
+        credential: &Credential,
+        sync_token: Option<&str>,
+    ) -> Result<(Vec<ContactRecord>, Vec<String>, Option<String>)> {
+        let url = self.resolve(&addressbook.href)?;
+        let body = xml::build_sync_collection_body(sync_token, &["D:getetag", "CD:address-data"]);
+        let (responses, next_token) = self.send_xml_request_with_token("REPORT", url, 1, credential, body).await?;
+        let mut changed = Vec::new();
+        let mut deleted = Vec::new();
+        for response in responses {
+            if response.status.as_deref().is_some_and(|s| s.contains("404")) {
+                deleted.push(response.href);
+                continue;
+            }
+            let Some(data) = response.prop(NS_CARDDAV, "address-data") else { continue };
+            let href = response.href.clone();
+            let etag = response.prop(NS_DAV, "getetag").map(str::to_string);
+            match VCard::parse(data) {
+                Ok(card) => changed.push(ContactRecord { href, etag, card }),
+                Err(e) => tracing::warn!("skipping unparseable vCard at {href:?}: {e}"),
+            }
+        }
+        Ok((changed, deleted, next_token))
+    }
+
     /// Fetches every vCard in an address book: a `PROPFIND` (Depth: 1) to
     /// enumerate the collection's member hrefs, then an
     /// `addressbook-multiget` REPORT for their vCard bodies. Deliberately not
@@ -493,6 +531,33 @@ impl DavClient {
         let text = response.text().await?;
         tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
         xml::parse_multistatus(&text)
+    }
+
+    /// [`Self::send_xml_request`] but also returns the top-level
+    /// `<sync-token>` (RFC 6578) when the response carries one - the
+    /// incremental-sync path.
+    async fn send_xml_request_with_token(
+        &self,
+        method_name: &str,
+        url: reqwest::Url,
+        depth: u8,
+        credential: &Credential,
+        body: String,
+    ) -> Result<(Vec<DavResponse>, Option<String>)> {
+        let request_url = url.clone();
+        let response = self
+            .send_request(
+                method_name,
+                url,
+                credential,
+                Some(body),
+                &[("Depth", depth.to_string()), ("Content-Type", "application/xml; charset=utf-8".to_string())],
+            )
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
+        xml::parse_multistatus_with_token(&text)
     }
 }
 

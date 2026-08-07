@@ -7,6 +7,7 @@ mod calendar_view;
 mod compose;
 mod config_view;
 mod contacts_editor;
+mod contacts_view;
 mod event_editor;
 mod folder_tree;
 mod goa_calendar_credentials;
