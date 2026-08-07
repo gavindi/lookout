@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.8 (2026-08-08)
+
+### Fixed
+
+- **Mail**: saving a draft was stuck - the server answered every autosave (and the retries that follow, five seconds apart) with `IMAP error: bad response … "Could not parse command"`. `async-imap`'s `append` writes its `flags` argument verbatim into the wire command, and per RFC 3501 the flag-list must be parenthesized - but `save_draft` passed `\Draft \Seen` and `send_message` passed `\Seen`, so the wire looked like `APPEND "Drafts" \Draft \Seen {N}` instead of `APPEND "Drafts" (\Draft \Seen) {N}`, which Gmail rejects outright. Both APPEND sites now pass `(\Draft \Seen)` / `(\Seen)` - which also means a sent message's best-effort archive into Sent (a warning-only path, so this was failing silently before) finally works.
+- **UI**: error toasts could fail to show at all, tripping GTK's `Failed to set text … from markup` warning. `Adw.Toast` renders its title as Pango markup, so an error message embedding a recipient address such as `Gavin Graham <gavindi@gmail.com>` was parsed as a malformed tag (the `@` in `<gavindi@gmail.com>` isn't a valid markup name) and the toast was dropped. Every toast built from dynamic text - account connection, session and task errors, attachment/raw-message fetch failures, contacts import/export/GOA failures, cache-clearing errors, unsubscribe and calendar-feed errors - now runs its text through `glib::markup_escape_text`, so `<`, `>`, `&`, and friends display literally instead of being interpreted.
+
 ## 0.8.7 (2026-08-08)
 
 ### Changed

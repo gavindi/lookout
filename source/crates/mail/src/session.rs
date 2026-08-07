@@ -1468,7 +1468,7 @@ async fn send_message(config: &AccountConfig, credentials: &dyn CredentialProvid
     let Some(path) = sent.id.0.strip_prefix(&format!("{}:", config.account_id.0)) else {
         return Ok(());
     };
-    if let Err(e) = session.append(path, Some("\\Seen"), None, raw.as_slice()).await {
+    if let Err(e) = session.append(path, Some("(\\Seen)"), None, raw.as_slice()).await {
         tracing::warn!("message was sent but APPEND to Sent failed: {e}");
     }
     Ok(())
@@ -1526,7 +1526,7 @@ async fn save_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], acco
     if replace {
         purge_by_message_id(session, &message_id).await?;
     }
-    session.append(&path, Some("\\Draft \\Seen"), None, raw.as_slice()).await?;
+    session.append(&path, Some("(\\Draft \\Seen)"), None, raw.as_slice()).await?;
     Ok(message_id)
 }
 

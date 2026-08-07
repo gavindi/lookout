@@ -304,7 +304,10 @@ fn send_contact_command(
     glib::spawn_future_local(async move {
         match reply_rx.recv().await {
             Ok(Ok(())) => toast_overlay.add_toast(adw::Toast::new(success)),
-            Ok(Err(message)) => toast_overlay.add_toast(adw::Toast::new(&format!("{failure_prefix}: {message}"))),
+            Ok(Err(message)) => {
+                let text = glib::markup_escape_text(&format!("{failure_prefix}: {message}"));
+                toast_overlay.add_toast(adw::Toast::new(&text));
+            }
             // The session died mid-write; its error handling owns the toast.
             Err(_) => {}
         }
@@ -660,7 +663,7 @@ pub fn export_current_contacts(window: &adw::ApplicationWindow, entries: &Rc<Ref
         }
         match std::fs::write(&path, body) {
             Ok(()) => toast_overlay.add_toast(adw::Toast::new(&format!("Exported {} contact(s)", cards.len()))),
-            Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't export contacts: {e}"))),
+            Err(e) => toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't export contacts: {e}")))),
         }
     });
 }
@@ -1112,7 +1115,7 @@ pub fn spawn_contacts_discovery(
             Ok(_) => show_page("contacts-empty"),
             Err(e) => {
                 show_page("contacts-empty");
-                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't reach GNOME Online Accounts contacts: {e}")));
+                toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts contacts: {e}"))));
             }
         }
     });
@@ -1244,7 +1247,8 @@ pub fn sync_contacts_account(
                     // Surface an initial failure to the user, but avoid
                     // repeating the same toast every poll interval.
                     if is_first {
-                        toast_overlay.add_toast(adw::Toast::new(&format!("{label}: {message}")));
+                        let text = glib::markup_escape_text(&format!("{label}: {message}"));
+                        toast_overlay.add_toast(adw::Toast::new(&text));
                     }
                 }
             }

@@ -2203,7 +2203,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             }
                             Err(message) => {
                                 if let Some(overlay) = &state_for_post.borrow().toast_overlay {
-                                    overlay.add_toast(adw::Toast::new(&format!("Couldn't unsubscribe: {message}")));
+                                    let title = glib::markup_escape_text(&format!("Couldn't unsubscribe: {message}"));
+                                    overlay.add_toast(adw::Toast::new(&title));
                                 }
                                 // The list may still accept the RFC 2369
                                 // mailto path - degrade to it rather than
@@ -3773,7 +3774,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         background_brightness_row.set_sensitive(true);
                     }
                     Err(e) => {
-                        toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't load background image: {e}")));
+                        let title = glib::markup_escape_text(&format!("Couldn't load background image: {e}"));
+                        toast_overlay.add_toast(adw::Toast::new(&title));
                     }
                 }
             });
@@ -3984,8 +3986,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.clear_cache_row.connect_activated(move |_| {
             match (lookout_mail::clear_all_caches(), lookout_dav::clear_all_caches()) {
                 (Ok(()), Ok(())) => toast_overlay.add_toast(adw::Toast::new("Cleared email, calendar and contacts caches")),
-                (Err(e), _) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't clear caches: {e}"))),
-                (_, Err(e)) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't clear caches: {e}"))),
+                (Err(e), _) => {
+                    let title = glib::markup_escape_text(&format!("Couldn't clear caches: {e}"));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
+                }
+                (_, Err(e)) => {
+                    let title = glib::markup_escape_text(&format!("Couldn't clear caches: {e}"));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
+                }
             }
             let month = calendar_state.borrow().displayed_month;
             for handle in calendar_state.borrow_mut().accounts.values_mut() {
@@ -4880,7 +4888,8 @@ fn spawn_account_discovery(
             }
             Err(e) => {
                 show_page("empty");
-                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't reach GNOME Online Accounts: {e}")));
+                let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
+                toast_overlay.add_toast(adw::Toast::new(&title));
             }
         }
     });
@@ -4987,7 +4996,8 @@ fn connect_account(
                     // itself with backoff, so they must not pop a toast on
                     // every attempt. Only non-retryable (fatal) errors surface.
                     if !retryable {
-                        toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", account_label(&state, &account_id))));
+                        let title = glib::markup_escape_text(&format!("{}: {message}", account_label(&state, &account_id)));
+                        toast_overlay.add_toast(adw::Toast::new(&title));
                     }
                 }
                 AccountEvent::ConnectionStateChanged(_) => {}
@@ -5194,7 +5204,7 @@ fn connect_account(
                     if let Some(p) = pending {
                         if p.mailbox == mailbox && p.uid == uid && p.part_number == part_number {
                             p.button.set_sensitive(true);
-                            toast_overlay.add_toast(adw::Toast::new(&message));
+                            toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                         } else {
                             state.borrow_mut().pending_attachment = Some(p);
                         }
@@ -5253,7 +5263,7 @@ fn connect_account(
                         }
                     };
                     if pending.is_some() {
-                        toast_overlay.add_toast(adw::Toast::new(&message));
+                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                     }
                 }
                 AccountEvent::SendCompleted => {
@@ -5309,7 +5319,8 @@ fn connect_account(
                     repopulate_search_results(&state, &message_list);
                 }
                 AccountEvent::Error(message) => {
-                    toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", account_label(&state, &account_id))));
+                    let title = glib::markup_escape_text(&format!("{}: {message}", account_label(&state, &account_id)));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
                 }
             }
         }
@@ -5392,7 +5403,8 @@ fn spawn_calendar_discovery(
             Err(e) => {
                 show_page("calendar-empty");
                 show_tasks_page("tasks-empty");
-                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't reach GNOME Online Accounts: {e}")));
+                let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
+                toast_overlay.add_toast(adw::Toast::new(&title));
             }
         }
     });
@@ -5482,7 +5494,8 @@ fn connect_google_tasks(worker: &Rc<Worker>, calendar_state: &Rc<RefCell<Calenda
                 connect_google_tasks_account(worker, calendar_state, tasks_view, toast_overlay, email);
             }
             Ok(Err(e)) => {
-                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't connect Google Tasks: {e}")));
+                let title = glib::markup_escape_text(&format!("Couldn't connect Google Tasks: {e}"));
+                toast_overlay.add_toast(adw::Toast::new(&title));
             }
             Err(_) => {}
         }
@@ -5549,7 +5562,7 @@ fn connect_google_tasks_account(
                     if let Some(handle) = calendar_state.borrow_mut().google_tasks.get_mut(&email) {
                         handle.error = Some(message.clone());
                     }
-                    toast_overlay.add_toast(adw::Toast::new(&message));
+                    toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                 }
             }
         }
@@ -5774,7 +5787,8 @@ fn connect_calendar_account(
                         // toast spams on every attempt. Only non-retryable
                         // (fatal) errors surface.
                         if !retryable {
-                            toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
+                            let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
+                            toast_overlay.add_toast(adw::Toast::new(&title));
                         }
                     }
                     refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
@@ -5812,7 +5826,8 @@ fn connect_calendar_account(
                     }
                 }
                 CalendarSessionEvent::Error(message) => {
-                    toast_overlay.add_toast(adw::Toast::new(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id))));
+                    let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
                 }
                 CalendarSessionEvent::TasksUpdated(tasks) => {
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
@@ -5892,7 +5907,8 @@ fn spawn_webcal_session(
                 }
             }
             for name in error_toasts {
-                toast_overlay.add_toast(adw::Toast::new(&format!("Calendar feed \"{name}\" could not be fetched")));
+                let title = glib::markup_escape_text(&format!("Calendar feed \"{name}\" could not be fetched"));
+                toast_overlay.add_toast(adw::Toast::new(&title));
             }
             refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
             refresh_displayed_calendar_view(&calendar_state, &calendar_main);
