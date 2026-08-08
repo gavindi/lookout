@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, NaiveTime};
-use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EventOccurrence};
+use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EventOccurrence, EventUid};
 
 use crate::cache::CalendarCache;
 use crate::client::DavClient;
@@ -344,8 +344,34 @@ async fn sync_month(
     for calendar in calendars {
         match client.fetch_events_in_range(calendar, fetch_start, fetch_end, credential).await {
             Ok(calendar_events) => {
+                // Group by UID: a recurring master and its per-occurrence
+                // overrides (VEVENTs sharing the UID with RECURRENCE-ID) must
+                // be expanded together, or the override would double-render
+                // next to the master instance it replaces. A master without
+                // overrides (the common case) expands exactly as before.
+                let mut masters: Vec<&CalendarEvent> = Vec::new();
+                let mut overrides: std::collections::HashMap<&EventUid, Vec<&CalendarEvent>> = std::collections::HashMap::new();
                 for event in &calendar_events {
-                    occurrences.extend(recurrence::expand_occurrences(event, window_start, window_end));
+                    if event.recurrence_id.is_some() {
+                        overrides.entry(&event.uid).or_default().push(event);
+                    } else {
+                        masters.push(event);
+                    }
+                }
+                for master in masters {
+                    occurrences.extend(recurrence::expand_master_with_overrides(
+                        master,
+                        overrides.remove(&master.uid).unwrap_or_default(),
+                        window_start,
+                        window_end,
+                    ));
+                }
+                // Stray overrides whose master didn't arrive in this fetch
+                // (e.g. split across responses) still render, alone.
+                for events in overrides.values() {
+                    for event in events {
+                        occurrences.extend(recurrence::expand_occurrences(event, window_start, window_end));
+                    }
                 }
             }
             Err(e) => {

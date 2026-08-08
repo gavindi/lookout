@@ -4,7 +4,7 @@ use icalendar::{
 };
 use lookout_core::{
     Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventTransparency, EventUid, ImipInvitation, ImipMethod,
-    TaskPriority, TaskStatus, TaskUid,
+    RecurrenceRange, TaskPriority, TaskStatus, TaskUid,
 };
 
 /// Parses every VEVENT out of a raw iCalendar document (as returned by a
@@ -21,12 +21,12 @@ pub fn parse_vevents(calendar_id: &CalendarId, ics: &str) -> Vec<CalendarEvent> 
 /// that accompany a `calendar-data`, which the write path needs to PUT/DELETE
 /// the resource back.
 ///
-/// Known, accepted simplifications for this pass (consistent with
-/// recurring-edit-scopes already being an out-of-scope Phase 3 TODO item):
-/// - A VEVENT with `RECURRENCE-ID` (a per-occurrence override of one
-///   instance of a recurring series) is parsed as a standalone event rather
-///   than merged against its master - it may double-render alongside the
-///   RRULE-expanded occurrence it overrides, or show stale data.
+/// A VEVENT with `RECURRENCE-ID` (a per-occurrence override of one instance
+/// of a recurring series) is parsed as a standalone event with its
+/// `recurrence_id` set - merging it into its master's expansion is the
+/// expander's job (`expand_occurrences`), not the parser's.
+///
+/// Known, accepted simplifications for this pass:
 /// - `TZID`-qualified `DTSTART`/`DTEND` are resolved to UTC via
 ///   `CalendarDateTime::try_into_utc` (icalendar's own `chrono-tz`
 ///   integration, enabled via this crate's `chrono-tz` feature). A
@@ -86,6 +86,10 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         end: end_utc,
         all_day,
         rrule: event.property_value("RRULE").map(|s| s.to_string()),
+        recurrence_id: parse_recurrence_id(event),
+        recurrence_range: parse_recurrence_range(event),
+        exdates: parse_datetime_list(event, "EXDATE"),
+        rdates: parse_datetime_list(event, "RDATE"),
         // The parse side has no href/etag (those come from the enclosing
         // `multistatus` `<href>`/`getetag`, not the `calendar-data`) - the
         // caller fills them in after the fact via
@@ -103,6 +107,54 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         conference_url: event.property_value("CONFERENCE").or_else(|| event.get_url()).map(str::to_string),
         reminder_minutes_before: parse_reminder(event),
     })
+}
+
+/// Every parsed `Property` under `key`, in multi-property order then
+/// single-property order. `EXDATE`/`RDATE` are legally repeatable and land
+/// in `multi_properties` when repeated but `properties` when they appear
+/// once; `RECURRENCE-ID` appears exactly once and normally sits in
+/// `properties` - checking both maps keeps the lookups uniform.
+fn property_refs<'a>(c: &'a impl Component, key: &str) -> Vec<&'a Property> {
+    let mut refs: Vec<&'a Property> = c.multi_properties().get(key).map(|props| props.iter().collect()).unwrap_or_default();
+    if let Some(property) = c.properties().get(key) {
+        refs.push(property);
+    }
+    refs
+}
+
+/// The `RECURRENCE-ID` of a per-occurrence override, resolved to UTC the
+/// same way `DTSTART` is (TZID-qualified datetimes via `chrono-tz`; DATE
+/// values - all-day series - pinned to midnight UTC).
+fn parse_recurrence_id(event: &icalendar::Event) -> Option<DateTime<Utc>> {
+    let property = property_refs(event, "RECURRENCE-ID").into_iter().next()?;
+    let dpt = DatePerhapsTime::from_property(property)?;
+    to_utc(&dpt).map(|(utc, _)| utc)
+}
+
+/// The `RANGE` parameter of the override's `RECURRENCE-ID` (RFC 5545
+/// §3.2.13): only `THISANDFUTURE` is a real value; anything else (including
+/// an absent parameter) is a single-instance override.
+fn parse_recurrence_range(event: &icalendar::Event) -> RecurrenceRange {
+    let range = property_refs(event, "RECURRENCE-ID")
+        .first()
+        .and_then(|p| p.params().get("RANGE"))
+        .map(|p| p.value().to_ascii_uppercase());
+    if range.as_deref() == Some("THISANDFUTURE") {
+        RecurrenceRange::ThisAndFuture
+    } else {
+        RecurrenceRange::This
+    }
+}
+
+/// `EXDATE`/`RDATE` values as UTC datetimes, resolved the same way
+/// `DTSTART` is (see [`to_utc`]) so TZID-qualified and all-day series
+/// exclusions round-trip losslessly.
+fn parse_datetime_list(event: &icalendar::Event, key: &str) -> Vec<DateTime<Utc>> {
+    property_refs(event, key)
+        .iter()
+        .filter_map(|p| DatePerhapsTime::from_property(p))
+        .filter_map(|dpt| to_utc(&dpt).map(|(utc, _)| utc))
+        .collect()
 }
 
 /// Strips a `mailto:`/`MAILTO:` scheme prefix, if present, from a CAL-ADDRESS.
@@ -484,6 +536,29 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
         // it back verbatim to avoid a parse/re-serialize round trip.
         vevent.append_property(icalendar::Property::new("RRULE", rrule.as_str()));
     }
+    // A per-occurrence override is a separate VEVENT sharing the master's
+    // UID, anchored by RECURRENCE-ID. All-day series anchor on DATE values
+    // (matching the master's DTSTART), timed series on UTC DATE-TIME. The
+    // RANGE=THISANDFUTURE parameter (RFC 5545 §3.2.13) is emitted when the
+    // override extends over every later instance.
+    if let Some(recurrence_id) = &event.recurrence_id {
+        let mut prop = recurrence_property("RECURRENCE-ID", *recurrence_id, event.all_day);
+        if event.recurrence_range == RecurrenceRange::ThisAndFuture {
+            prop.add_parameter("RANGE", "THISANDFUTURE");
+        }
+        vevent.append_property(prop.done());
+    }
+    // EXDATEs/RDATEs repeat, so each goes through `append_multi_property`
+    // (the parser reassembles them from either map - see `property_refs`).
+    // Timestamps are re-emitted in UTC, which is exactly what the parser
+    // produced; a TZID-qualified exclusion a server stored is normalized to
+    // its UTC instant but keeps its exact meaning.
+    for exdate in &event.exdates {
+        vevent.append_multi_property(recurrence_property("EXDATE", *exdate, event.all_day).done());
+    }
+    for rdate in &event.rdates {
+        vevent.append_multi_property(recurrence_property("RDATE", *rdate, event.all_day).done());
+    }
     append_attendees(&mut vevent, &event.attendees);
     // RFC 5545 §3.6.1 requires an ORGANIZER whenever ATTENDEEs are present;
     // omitted otherwise, and omitted even with attendees if the owning
@@ -517,6 +592,22 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     }
 
     vevent
+}
+
+/// A `RECURRENCE-ID`/`EXDATE`/`RDATE` property for `dt`, emitted as a DATE
+/// value for all-day series (anchored on midnight UTC, the form
+/// [`convert_event`]'s parser produces) or a UTC DATE-TIME otherwise.
+fn recurrence_property(key: &str, dt: DateTime<Utc>, all_day: bool) -> Property {
+    let value = if all_day {
+        dt.format("%Y%m%d").to_string()
+    } else {
+        dt.format("%Y%m%dT%H%M%SZ").to_string()
+    };
+    let mut prop = Property::new(key, value);
+    if all_day {
+        prop.add_parameter("VALUE", "DATE");
+    }
+    prop
 }
 
 fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee]) {
@@ -623,6 +714,10 @@ mod tests {
             end: "2026-07-15T15:00:00Z".parse().unwrap(),
             all_day: false,
             rrule: None,
+            recurrence_id: None,
+            recurrence_range: RecurrenceRange::default(),
+            exdates: Vec::new(),
+            rdates: Vec::new(),
             href: None,
             etag: None,
             attendees: Vec::new(),
@@ -684,6 +779,47 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].href.as_deref(), Some("/cal/events/evt-2.ics"));
         assert_eq!(events[0].etag.as_deref(), Some("\"etag1\""));
+    }
+
+    #[test]
+    fn parses_recurrence_id_exdate_and_rdate_on_an_override() {
+        // The master carries an EXDATE; the override replaces one instance
+        // (its DTSTART differs from the instance it anchors, so the two are
+        // distinguishable) with RANGE=THISANDFUTURE and an RDATE of its own.
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:ovr-1@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260706T090000Z\r\nDTEND:20260706T093000Z\r\nRRULE:FREQ=WEEKLY\r\nEXDATE:20260713T090000Z\r\nEXDATE;TZID=Europe/Berlin:20260720T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let events = parse_vevents(&cal_id(), ics);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].exdates.len(), 2, "both EXDATEs parse, TZID-qualified one resolved to UTC");
+        assert!(events[0].exdates.contains(&"2026-07-13T09:00:00Z".parse().unwrap()));
+        assert!(events[0].exdates.contains(&"2026-07-20T09:00:00Z".parse().unwrap()), "Berlin 11:00 = UTC 09:00 (CEST)");
+
+        let mut override_event = full_event();
+        override_event.uid = events[0].uid.clone();
+        override_event.start = "2026-07-20T10:00:00Z".parse().unwrap();
+        override_event.end = "2026-07-20T10:30:00Z".parse().unwrap();
+        override_event.recurrence_id = Some("2026-07-20T09:00:00Z".parse().unwrap());
+        override_event.recurrence_range = RecurrenceRange::ThisAndFuture;
+        override_event.rdates = vec!["2026-07-25T09:00:00Z".parse().unwrap()];
+        let ics = build_vcalendar(&override_event);
+        assert!(ics.contains("RECURRENCE-ID;RANGE=THISANDFUTURE:20260720T090000Z"), "override anchor + range: {ics}");
+        assert!(ics.contains("RDATE:20260725T090000Z"), "rdate round-trips: {ics}");
+        let round = &parse_vevents(&cal_id(), &ics)[0];
+        assert_eq!(round.recurrence_id, override_event.recurrence_id);
+        assert_eq!(round.recurrence_range, RecurrenceRange::ThisAndFuture);
+        assert_eq!(round.rdates, override_event.rdates);
+    }
+
+    #[test]
+    fn build_vcalendar_round_trips_exdates_on_an_all_day_master() {
+        let mut event = full_event();
+        event.all_day = true;
+        event.start = "2026-07-20T00:00:00Z".parse().unwrap();
+        event.end = "2026-07-21T00:00:00Z".parse().unwrap();
+        event.exdates = vec!["2026-07-27T00:00:00Z".parse().unwrap()];
+        let ics = build_vcalendar(&event);
+        assert!(ics.contains("EXDATE;VALUE=DATE:20260727"), "all-day exdate is a DATE value: {ics}");
+        let round = &parse_vevents(&cal_id(), &ics)[0];
+        assert_eq!(round.exdates, event.exdates, "all-day EXDATE round-trips through the DATE parse");
     }
 
     #[test]

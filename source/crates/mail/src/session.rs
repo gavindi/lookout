@@ -199,6 +199,16 @@ pub enum AccountCommand {
         uids: Vec<Uid>,
         role: MailboxRole,
     },
+    /// `MoveMessages` to an explicit target mailbox rather than by
+    /// special-use role - the drag-to-folder path, where the drop target can
+    /// be any folder (not just Trash/Archive/Junk). `target` is the
+    /// destination `MailboxId`; same MOVE/COPY+EXPUNGE semantics and the
+    /// same one-resync-on-success contract as `MoveMessages`.
+    MoveMessagesTo {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        target: MailboxId,
+    },
     /// Client-side only - IMAP has no native snooze. Records `until` in the
     /// local cache and hides the message from `MessagesUpdated` until that
     /// time passes.
@@ -247,6 +257,16 @@ pub enum AccountCommand {
     StoreKeywords {
         mailbox: MailboxId,
         uid: Uid,
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
+    /// `StoreKeywords` for a whole batch of messages in one mailbox at once -
+    /// one `STORE` per add/remove side over a joined UID set, and the cache
+    /// patched (or a single resync issued) for the whole batch. Backs the
+    /// drag-messages-onto-a-tag action.
+    StoreKeywordsMany {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
         add: Vec<String>,
         remove: Vec<String>,
     },
@@ -983,6 +1003,46 @@ async fn connect_and_run(
                         }
                     }
                 }
+                AccountCommand::MoveMessagesTo { mailbox, uids, target } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    let Some(target_path) = target.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if path == target_path {
+                        continue;
+                    }
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    match move_uids_to_path(&mut session, &uids, &target_path).await {
+                        Ok(()) => {
+                            // `Custom` here is just a marker for the generic
+                            // "Moved" toast - the target was an arbitrary
+                            // folder, not a special-use role.
+                            let _ = events.send(AccountEvent::MessageMoved { role: MailboxRole::Custom }).await;
+                            if let Some(cache) = cache {
+                                for uid in &uids {
+                                    if let Err(e) = cache.delete_message(&mailbox, *uid) {
+                                        tracing::warn!("failed to drop moved message from cache: {e}");
+                                    }
+                                }
+                                emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                            }
+                            relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't move messages: {e}"))).await;
+                        }
+                    }
+                }
                 AccountCommand::SnoozeMessage { mailbox, uid, until } => {
                     if let Some(cache) = cache {
                         if let Err(e) = cache.snooze_message(&mailbox, uid, until) {
@@ -1175,6 +1235,39 @@ async fn connect_and_run(
                                 // No cache (or the uid fell outside the
                                 // cached window): re-sync so the UI still
                                 // sees the new keywords.
+                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                                session_selected = current_mailbox_id.clone();
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't update message tags: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::StoreKeywordsMany { mailbox, uids, add, remove } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    let add: Vec<String> = add.into_iter().filter(|k| valid_keyword_atom(k)).collect();
+                    let remove: Vec<String> = remove.into_iter().filter(|k| valid_keyword_atom(k)).collect();
+                    match store_raw_flags(&mut session, &uids, &add, &remove).await {
+                        Ok(()) => {
+                            // Same all-or-resync contract as `StoreFlagsMany`:
+                            // patch the cache for every uid, or resync once.
+                            let all_patched = match cache {
+                                Some(cache) => uids.iter().all(|uid| cache.update_keywords(&mailbox, *uid, &add, &remove).unwrap_or(false)),
+                                None => false,
+                            };
+                            if all_patched {
+                                emit_cached_messages(cache, &mailbox, events).await;
+                            } else if mailbox == current_mailbox_id {
                                 sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                                 session_selected = current_mailbox_id.clone();
                             }
@@ -1436,6 +1529,14 @@ async fn move_message_to_role(session: &mut Session<ImapStream>, folders: &[Mail
     let Some(path) = target.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
         return Ok(());
     };
+    move_uids_to_path(session, uids, path).await
+}
+
+/// The IMAP move itself, shared by the role-based (`MoveMessages`) and
+/// explicit-target (`MoveMessagesTo`) paths: one MOVE over the joined UID
+/// set (RFC 6851) when the server advertises it, else COPY + STORE
+/// `\Deleted` + EXPUNGE.
+async fn move_uids_to_path(session: &mut Session<ImapStream>, uids: &[Uid], path: &str) -> Result<()> {
     let uid_set = join_uids(uids);
     let caps = session.capabilities().await?;
     if caps.has_str("MOVE") {

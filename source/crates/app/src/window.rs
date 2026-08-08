@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use chrono::Timelike;
+use chrono::{Datelike, Timelike};
 use gtk::{gio, glib};
 use lookout_core::{
     AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody, EmailSummary,
@@ -759,6 +759,13 @@ fn install_paned_css() {
         .folder-pane scrolledwindow {
             background-color: transparent;
         }
+        /* A folder or tag row accepting a message drag: a rounded accent
+           outline marks the drop target while the drag hovers over it. */
+        .lookout-drop-target {
+            outline: 2px solid alpha(currentColor, 0.45);
+            outline-offset: -2px;
+            border-radius: 8px;
+        }
         .reading-pane-transparent {
             background-color: transparent;
         }
@@ -1032,32 +1039,78 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Folder sidebar: one expanded-by-default group per account ---
     let folder_selection = gtk::SingleSelection::new(None::<gio::ListModel>);
     let folder_factory = gtk::SignalListItemFactory::new();
-    folder_factory.connect_setup(|_, list_item| {
-        let expander = gtk::TreeExpander::new();
-        let icon = gtk::Image::builder().icon_size(gtk::IconSize::Normal).build();
-        // `hexpand` on the name, not the box, is what pushes the count to the
-        // trailing edge: the name takes all the slack (and ellipsizes into it
-        // when the pane is narrow) and the count keeps its natural width.
-        let label = gtk::Label::builder()
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .margin_top(6)
-            .margin_bottom(6)
-            .build();
-        let count = gtk::Label::builder()
-            .xalign(1.0)
-            .margin_top(6)
-            .margin_bottom(6)
-            .css_classes(["folder-unread-count"])
-            .build();
-        let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-        row_box.append(&icon);
-        row_box.append(&label);
-        row_box.append(&count);
-        expander.set_child(Some(&row_box));
-        list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&expander));
-    });
+    // The folder rows are built before `state` exists (it's created further
+    // down, once the mail accounts are wired up), so the drop target reaches
+    // it through this slot, filled right after `state` is created.
+    let state_slot: Rc<RefCell<Option<Rc<RefCell<UiState>>>>> = Rc::new(RefCell::new(None));
+    {
+        let state_slot = state_slot.clone();
+        folder_factory.connect_setup(move |_, list_item| {
+            let expander = gtk::TreeExpander::new();
+            let icon = gtk::Image::builder().icon_size(gtk::IconSize::Normal).build();
+            // `hexpand` on the name, not the box, is what pushes the count to the
+            // trailing edge: the name takes all the slack (and ellipsizes into it
+            // when the pane is narrow) and the count keeps its natural width.
+            let label = gtk::Label::builder()
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .margin_top(6)
+                .margin_bottom(6)
+                .build();
+            let count = gtk::Label::builder()
+                .xalign(1.0)
+                .margin_top(6)
+                .margin_bottom(6)
+                .css_classes(["folder-unread-count"])
+                .build();
+            let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+            row_box.append(&icon);
+            row_box.append(&label);
+            row_box.append(&count);
+            expander.set_child(Some(&row_box));
+            // Drop target: a folder row accepts the internal message-drag
+            // payload and moves the messages into that folder. The target
+            // identity (which folder this row shows) is written by `bind`
+            // into `drop_data`, since the drop can't read the model itself.
+            let drop_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+            let drop_target = gtk::DropTarget::builder()
+                .formats(&gtk::gdk::ContentFormats::new(&[MESSAGE_DRAG_MIME]))
+                .actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE)
+                .build();
+            {
+                let drop_data = drop_data.clone();
+                let state_slot = state_slot.clone();
+                drop_target.connect_drop(move |_target, value, _x, _y| {
+                    let Some(mailbox) = drop_data.borrow().clone() else {
+                        return false;
+                    };
+                    let Some(state) = state_slot.borrow().clone() else {
+                        return false;
+                    };
+                    handle_message_drag_drop(&state, &mailbox, value)
+                });
+            }
+            {
+                let expander = expander.clone();
+                drop_target.connect_enter(move |_target, _x, _y| {
+                    expander.add_css_class("lookout-drop-target");
+                    gtk::gdk::DragAction::MOVE
+                });
+            }
+            {
+                let expander = expander.clone();
+                drop_target.connect_leave(move |_target| {
+                    expander.remove_css_class("lookout-drop-target");
+                });
+            }
+            expander.add_controller(drop_target);
+            unsafe {
+                expander.set_data("lookout-drop-target", drop_data);
+            }
+            list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&expander));
+        });
+    }
     folder_factory.connect_bind(|_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(row) = list_item.item().and_downcast::<gtk::TreeListRow>() else { return };
@@ -1110,6 +1163,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 label.set_css_classes(&[]);
                 set_count(node.mailbox.unread);
             }
+        }
+        // Refresh the row's drag-drop identity: folder rows accept moves
+        // into that folder, everything else accepts nothing.
+        if let Some(drop_data) = unsafe { expander.data::<Rc<RefCell<Option<Mailbox>>>>("lookout-drop-target") } {
+            let mut slot = unsafe { drop_data.as_ref() }.borrow_mut();
+            *slot = match &*tree_item {
+                TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.clone()),
+                _ => None,
+            };
         }
     });
 
@@ -1208,6 +1270,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         search_results: Vec::new(),
         search_pending: HashSet::new(),
     }));
+    // The folder rows' drop targets reach `state` through this slot (they
+    // were built before it existed).
+    *state_slot.borrow_mut() = Some(state.clone());
     // Clean up the temporary files materialized for the attachment strip's
     // "Open" action when the app exits - the viewer process may still be
     // running, but Lookout must not leak temp files. (On Flatpak the portal
@@ -1555,6 +1620,54 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 tag_popover.popup();
             });
             overlay.add_controller(context_menu);
+        }
+
+        // Drag source for every message row: dragging a message - or, when
+        // the dragged row is part of a multi-selection, the whole selection -
+        // offers two payloads in one provider union: the internal
+        // `(mailbox, uid)` list for folder drops (see the folder rows' drop
+        // target), and a `text/uri-list` of temp `.eml` files (only when the
+        // raw bytes are already cached, since the drag must be synchronous)
+        // so the drag can land in a file manager too. GTK's union provider
+        // lets each drop target pick whichever format it understands.
+        {
+            let drag_source = gtk::DragSource::new();
+            drag_source.set_actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE);
+            let bound_for_drag = bound.clone();
+            let state_for_drag = state_clone.clone();
+            let message_list_for_drag = message_list_for_rows.clone();
+            let drag_temp_files: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+            let drag_temp_files_for_prepare = drag_temp_files.clone();
+            drag_source.connect_prepare(move |_source, _x, _y| {
+                let summaries = dragged_summaries(&message_list_for_drag, &bound_for_drag);
+                if summaries.is_empty() {
+                    return None;
+                }
+                let internal: Vec<(String, u32)> = summaries.iter().map(|s| (s.mailbox.0.clone(), s.uid.0)).collect();
+                let bytes = match serde_json::to_vec(&internal) {
+                    Ok(bytes) => glib::Bytes::from(bytes.as_slice()),
+                    Err(e) => {
+                        tracing::warn!("failed to serialize message drag payload: {e}");
+                        return None;
+                    }
+                };
+                let internal_provider = gtk::gdk::ContentProvider::for_bytes(MESSAGE_DRAG_MIME, &bytes);
+                Some(match write_external_drag_files(&state_for_drag, &summaries, &drag_temp_files_for_prepare) {
+                    Some(files) => gtk::gdk::ContentProvider::new_union(&[internal_provider, files]),
+                    None => internal_provider,
+                })
+            });
+            // The temp `.eml` files written for the drag-out are cleaned up
+            // once the drag finishes, whatever its outcome.
+            {
+                let drag_temp_files = drag_temp_files.clone();
+                drag_source.connect_drag_end(move |_source, _drag, _delete| {
+                    for path in drag_temp_files.borrow_mut().drain(..) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                });
+            }
+            overlay.add_controller(drag_source);
         }
 
         {
@@ -2911,10 +3024,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let message_list = message_list.clone();
         let state = state.clone();
+        let reading_stack_for_menu = reading_stack.clone();
         let more_popover_for_menu = more_popover.clone();
         more_popover.connect_show(move |popover| {
             let has_selection = message_list.selected_summary().is_some();
-            let menu = build_more_menu(has_selection, &message_list, &state, &more_popover_for_menu);
+            let menu = build_more_menu(has_selection, &message_list, &state, &reading_stack_for_menu, &more_popover_for_menu);
             popover.set_child(Some(&menu));
         });
     }
@@ -5027,6 +5141,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, suggested_start, None);
         });
     }
+    // Print: snapshots the currently-displayed month (checked calendars
+    // only, matching the view) as an agenda and sends it through WebKit's
+    // print pipeline.
+    {
+        let window = window.clone();
+        let calendar_state = calendar_state.clone();
+        print_button.connect_clicked(move |_| {
+            print_calendar_month(&calendar_state, &window);
+        });
+    }
     // --- Task editor + list wiring: the "New Task" toolbar button opens a
     // blank form, clicking a task row opens it for editing, and the row
     // checkbox flips completion (the modified task goes through the same
@@ -5124,7 +5248,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // in the Day/Week/Work week or Month/Split grids persists the change
     // through the same route the editor's save uses (an etag-guarded
     // `UpdateEvent`, resync on success, error toast on failure). Webcal
-    // subscriptions have no write-back path, so their events can't move.
+    // subscriptions have no write-back path, so their events can't move. A
+    // recurring occurrence's drag lands as a per-occurrence override ("This
+    // occurrence" scope): the instance moves without re-anchoring the series.
     {
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
@@ -5133,19 +5259,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 toast_overlay.add_toast(adw::Toast::new("Events from calendar subscriptions are read-only."));
                 return;
             }
-            let event = crate::event_editor::calendar_event_from_occurrence(
+            let mut event = crate::event_editor::calendar_event_from_occurrence(
                 &occ,
                 new_start.with_timezone(&chrono::Local).naive_local(),
                 new_end.with_timezone(&chrono::Local).naive_local(),
             );
+            crate::event_editor::apply_edit_scope(&mut event, 0, Some(&occ));
             route_calendar_save(&calendar_state, event.calendar_id.clone(), event);
-        });
-    }
-    {
-        let toast_overlay = toast_overlay.clone();
-        calendar_view::connect_event_drag_blocked(&calendar_main, move |occ| {
-            let summary = occ.summary.unwrap_or_else(|| "(untitled)".to_string());
-            toast_overlay.add_toast(adw::Toast::new(&format!("\"{summary}\" repeats - dragging individual occurrences isn't supported yet.")));
         });
     }
     // --- Calendar main grid interactions: the first click on an empty time
@@ -6265,6 +6385,96 @@ fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>
     calendar_view::set_occurrences(calendar_main, &merged);
 }
 
+/// Prints the currently-displayed calendar month as an agenda: one section
+/// per day, each day's events sorted by start time (all-day first), with
+/// calendar names as context. Uses the same merged occurrence set as
+/// [`refresh_displayed_calendar_view`] - checked calendars only, whatever
+/// month the user is looking at - so the printout matches the view.
+fn print_calendar_month<T: IsA<gtk::Window>>(calendar_state: &Rc<RefCell<CalendarUiState>>, window: &T) {
+    let st = calendar_state.borrow();
+    let month = st.displayed_month;
+    let merged: Vec<EventOccurrence> = st
+        .accounts
+        .values()
+        .filter(|h| h.last_synced_month == Some(month))
+        .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned())
+        .chain(
+            st.webcal_handles
+                .values()
+                .filter(|h| h.last_synced_month == Some(month))
+                .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned()),
+        )
+        .collect();
+    let mut calendar_names: std::collections::HashMap<CalendarId, String> = std::collections::HashMap::new();
+    for handle in st.accounts.values() {
+        for calendar in &handle.calendars {
+            calendar_names.insert(calendar.id.clone(), calendar.display_name.clone());
+        }
+    }
+    for handle in st.webcal_handles.values() {
+        calendar_names.insert(handle.calendar_id.clone(), handle.display_name.clone());
+    }
+    let month_start = month.with_day(1).unwrap();
+    let month_end = (month_start + chrono::Months::new(1)) - chrono::Duration::days(1);
+    let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, Vec<EventOccurrence>> = std::collections::BTreeMap::new();
+    for occ in &merged {
+        for day in calendar_view::covered_local_dates(occ, month_start, month_end) {
+            by_day.entry(day).or_default().push(occ.clone());
+        }
+    }
+    drop(st);
+    let esc = |s: &str| gtk::glib::markup_escape_text(s).to_string();
+    let mut sections = String::new();
+    let mut day = month_start;
+    while day <= month_end {
+        if let Some(events) = by_day.get(&day) {
+            let mut sorted = events.clone();
+            sorted.sort_by_key(|occ| (occ.all_day, occ.start));
+            let mut items = String::new();
+            for occ in sorted {
+                let time = if occ.all_day {
+                    "All day".to_string()
+                } else {
+                    format!(
+                        "{} – {}",
+                        occ.start.with_timezone(&chrono::Local).format("%H:%M"),
+                        occ.end.with_timezone(&chrono::Local).format("%H:%M")
+                    )
+                };
+                let summary = occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string());
+                let calendar = calendar_names.get(&occ.calendar_id).cloned().unwrap_or_default();
+                items.push_str(&format!(
+                    "<li><span class=\"time\">{}</span><span class=\"title\">{}</span>{}</li>",
+                    esc(&time),
+                    esc(&summary),
+                    if calendar.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" <span class=\"cal\">· {}</span>", esc(&calendar))
+                    },
+                ));
+            }
+            sections.push_str(&format!("<h2>{}</h2><ul>{}</ul>", esc(&day.format("%A, %B %-e, %Y").to_string()), items));
+        }
+        day += chrono::Duration::days(1);
+    }
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+         <style>body {{ font-family: sans-serif; color: #1f2328; margin: 2em; }} \
+         h1 {{ font-size: 1.5em; margin: 0 0 0.6em; }} \
+         h2 {{ font-size: 1.1em; margin: 1.1em 0 0.3em; border-bottom: 1px solid #d0d7de; padding-bottom: 0.15em; }} \
+         ul {{ list-style: none; margin: 0; padding: 0; }} \
+         li {{ padding: 0.15em 0; }} \
+         .time {{ display: inline-block; min-width: 9em; color: #57606a; font-variant-numeric: tabular-nums; }} \
+         .title {{ font-weight: 600; }} \
+         .cal {{ color: #57606a; }}</style>\
+         </head><body><h1>{}</h1>{}</body></html>",
+        esc(&month_start.format("%B %Y").to_string()),
+        sections,
+    );
+    print_html_once(&html, window);
+}
+
 /// Fills the Mail-screen overview pane's event list with every checked
 /// calendar's occurrences (from whatever's currently cached - no new fetch
 /// here) whose local date matches `day`, sorted by start time. Shows a
@@ -6712,7 +6922,7 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
         },
         {
             let calendar_state = calendar_state.clone();
-            move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
+            move |calendar_id, occ| route_calendar_delete(&calendar_state, calendar_id, occ)
         },
     );
 }
@@ -6758,7 +6968,7 @@ fn show_new_event_editor(
         },
         {
             let calendar_state = calendar_state.clone();
-            move |calendar_id, uid, href, etag| route_calendar_delete(&calendar_state, calendar_id, uid, href, etag)
+            move |calendar_id, occ| route_calendar_delete(&calendar_state, calendar_id, occ)
         },
     );
 }
@@ -6790,18 +7000,77 @@ fn route_calendar_save(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_i
     }
 }
 
-/// Routes an event deletion to its account's session. The editor's form isn't
-/// consulted - only the target resource (`calendar_id`, `href`, `etag`).
-fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, _uid: EventUid, href: Option<String>, etag: Option<String>) {
+/// Routes an event deletion to its account's session, honoring the event's
+/// recurrence structure: an override (or a non-recurring event) deletes its
+/// own resource; a plain expansion of a recurring series instead adds its
+/// instance time to the master's EXDATEs (via the etag-guarded
+/// `UpdateEvent`), removing exactly that instance without touching the rest
+/// of the series.
+fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, occ: EventOccurrence) {
+    if calendar_state.borrow().webcal_handles.values().any(|h| h.calendar_id == occ.calendar_id) {
+        tracing::warn!("refusing to delete a read-only subscription event");
+        return;
+    }
     let Some(handle) = calendar_handle_for_id(calendar_state, &calendar_id) else {
         tracing::warn!("tried to delete an event from an unknown calendar {calendar_id}");
         return;
     };
-    let Some(href) = href else {
+    if occ.recurrence_id.is_some() {
+        // A per-occurrence override: delete its own resource.
+        let Some(href) = occ.href else {
+            tracing::warn!("tried to delete an override event without a server href");
+            return;
+        };
+        let _ = handle.send_blocking(CalendarCommand::DeleteEvent {
+            calendar_id,
+            href,
+            etag: occ.etag,
+        });
+        return;
+    }
+    if occ.rrule.is_some() {
+        // A plain instance of a recurring series: EXDATE it out of the
+        // master. The occurrence already carries the master's fields -
+        // its href/etag are the master's resource, and its exdates list is
+        // the master's - so the only change is pushing the instance time.
+        let mut master = CalendarEvent {
+            uid: occ.uid.clone(),
+            calendar_id: occ.calendar_id.clone(),
+            summary: occ.summary.clone(),
+            description: occ.description.clone(),
+            location: occ.location.clone(),
+            start: occ.start,
+            end: occ.end,
+            all_day: occ.all_day,
+            rrule: occ.rrule.clone(),
+            recurrence_id: None,
+            recurrence_range: lookout_core::RecurrenceRange::default(),
+            exdates: occ.exdates.clone(),
+            rdates: Vec::new(),
+            href: occ.master_href.clone().or_else(|| occ.href.clone()),
+            etag: occ.master_etag.clone().or_else(|| occ.etag.clone()),
+            attendees: occ.attendees.clone(),
+            organizer: occ.organizer.clone(),
+            categories: occ.categories.clone(),
+            sensitivity: occ.sensitivity,
+            transparency: occ.transparency,
+            reminder_minutes_before: occ.reminder_minutes_before,
+            conference_url: occ.conference_url.clone(),
+        };
+        master.exdates.push(occ.start);
+        let _ = handle.send_blocking(CalendarCommand::UpdateEvent { event: Box::new(master) });
+        return;
+    }
+    // A standalone non-recurring event: delete its resource outright.
+    let Some(href) = occ.href else {
         tracing::warn!("tried to delete an event without a server href");
         return;
     };
-    let _ = handle.send_blocking(CalendarCommand::DeleteEvent { calendar_id, href, etag });
+    let _ = handle.send_blocking(CalendarCommand::DeleteEvent {
+        calendar_id,
+        href,
+        etag: occ.etag,
+    });
 }
 
 /// The account session that owns `calendar_id`, for task writes - the
@@ -7137,13 +7406,21 @@ fn route_task_delete(
 /// The calendar object already stored under `event.uid`, if any - the iMIP
 /// reply flows upsert against it instead of creating a duplicate.
 fn find_calendar_occurrence(calendar_state: &Rc<RefCell<CalendarUiState>>, uid: &EventUid) -> Option<EventOccurrence> {
-    calendar_state
-        .borrow()
+    let st = calendar_state.borrow();
+    let occurrences = st
         .accounts
         .values()
         .flat_map(|handle| handle.last_occurrences.iter())
-        .find(|occurrence| occurrence.uid == *uid)
-        .cloned()
+        .filter(|occurrence| occurrence.uid == *uid)
+        .collect::<Vec<_>>();
+    // Overrides share their master's UID; prefer a master (or any
+    // non-recurring) occurrence so whole-event lookups (the iMIP upsert
+    // path) don't accidentally resolve to a single-instance override.
+    occurrences
+        .iter()
+        .find(|occ| occ.recurrence_id.is_none())
+        .or_else(|| occurrences.first())
+        .map(|occ| (*occ).clone())
 }
 
 /// The user's answer to an iMIP invitation (REQUEST): sends the RFC 6047
@@ -7656,6 +7933,100 @@ fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
     mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
 }
 
+/// The private mime type message rows expose for internal folder drops -
+/// an opaque token so a drop from any other source can't be misread as a
+/// message move.
+const MESSAGE_DRAG_MIME: &str = "application/x-lookout-messages";
+
+/// Which summaries a message-row drag carries: the whole current selection
+/// when the dragged row is part of one, otherwise just that row's message.
+fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefCell<Option<EmailSummary>>>) -> Vec<EmailSummary> {
+    let Some(row_summary) = bound.borrow().clone() else {
+        return Vec::new();
+    };
+    let selected = message_list.selected_summaries();
+    if selected.len() > 1 && selected.iter().any(|s| s.mailbox == row_summary.mailbox && s.uid == row_summary.uid) {
+        selected
+    } else {
+        vec![row_summary]
+    }
+}
+
+/// Writes the dragged messages' raw bytes - when already in the flat-file
+/// cache - to temp `.eml` files and returns a `text/uri-list` content
+/// provider for them, so the drag can land in a file manager. `None` when
+/// none of the messages are cached (the internal move payload still works).
+/// The written paths are recorded in `temp_files` for cleanup on drag end.
+fn write_external_drag_files(state: &Rc<RefCell<UiState>>, summaries: &[EmailSummary], temp_files: &Rc<RefCell<Vec<PathBuf>>>) -> Option<gtk::gdk::ContentProvider> {
+    let state = state.borrow();
+    let mut files: Vec<gio::File> = Vec::new();
+    for summary in summaries {
+        let Some(account_id) = mailbox_account_id(&summary.mailbox) else { continue };
+        let Some(handle) = state.accounts.get(&account_id) else { continue };
+        let Some(cache) = handle.address_cache.as_ref() else { continue };
+        let Some(uidvalidity) = handle.folders.iter().find(|f| f.id == summary.mailbox).map(|f| f.uidvalidity) else {
+            continue;
+        };
+        let Ok(Some(bytes)) = cache.load_raw_message(&summary.mailbox, summary.uid, uidvalidity) else {
+            continue;
+        };
+        let path = std::env::temp_dir().join(format!("lookout-drag-{}.eml", uuid::Uuid::new_v4()));
+        if std::fs::write(&path, bytes).is_err() {
+            continue;
+        }
+        temp_files.borrow_mut().push(path.clone());
+        files.push(gio::File::for_path(path));
+    }
+    if files.is_empty() {
+        return None;
+    }
+    let file_list = gtk::gdk::FileList::from_array(&files);
+    Some(gtk::gdk::ContentProvider::for_value(&file_list.to_value()))
+}
+
+/// Handles a folder row's drop: deserializes the dragged `(mailbox, uid)`
+/// list, keeps only the messages belonging to the target folder's own
+/// account (messages can't move across accounts), and issues one
+/// `MoveMessagesTo` per source mailbox. `false` when the payload isn't ours
+/// (or empty), which lets GTK try other drop targets.
+fn handle_message_drag_drop(state: &Rc<RefCell<UiState>>, target: &Mailbox, value: &glib::Value) -> bool {
+    let Ok(bytes) = value.get::<glib::Bytes>() else {
+        return false;
+    };
+    let payload: Vec<(String, u32)> = match serde_json::from_slice(bytes.as_ref()) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("failed to parse message drag payload: {e}");
+            return false;
+        }
+    };
+    if payload.is_empty() {
+        return false;
+    }
+    let mut groups: HashMap<AccountId, (MailboxId, Vec<Uid>)> = HashMap::new();
+    for (mailbox, uid) in payload {
+        let Some(account_id) = mailbox_account_id(&MailboxId(mailbox.clone())) else { continue };
+        if account_id != target.account_id {
+            continue;
+        }
+        let entry = groups.entry(account_id).or_insert_with(|| (MailboxId(mailbox), Vec::new()));
+        entry.1.push(Uid(uid));
+    }
+    if groups.is_empty() {
+        return false;
+    }
+    let state = state.borrow();
+    for (account_id, (source, uids)) in groups {
+        let Some(handle) = state.accounts.get(&account_id) else { continue };
+        let _ = handle.cmd_tx.send_blocking(AccountCommand::MoveMessagesTo {
+            mailbox: source,
+            uids,
+            target: target.id.clone(),
+        });
+    }
+    true
+}
+
 /// The message-list header's mutable parts: the two title lines and the
 /// favorite star. Bundled so the handful of places that change the active view
 /// can refresh the header without each threading four widgets through its own
@@ -7795,12 +8166,53 @@ fn send_keyword_store(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, add:
     });
 }
 
-/// Builds the "More" menu popover's contents: currently a single
-/// "Save as .eml…" item that exports the selected message's whole raw RFC
-/// 5322 bytes to a file. Rebuilt on every popover `show` (like the
-/// categorize menu) so the item's sensitivity tracks whether a message is
-/// selected when the menu opens.
-fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: &Rc<RefCell<UiState>>, popover: &gtk::Popover) -> gtk::Box {
+/// Applies the tag `key` to every message in the dragged payload - the drop
+/// side of the tag menu rows' drop targets. Groups the messages per
+/// `(account, mailbox)` and issues one `StoreKeywordsMany` per group, the
+/// same way a folder drop groups `MoveMessagesTo`. `false` when the payload
+/// isn't a message drag (or empty), letting GTK try other drop targets.
+fn handle_keyword_drag_drop(state: &Rc<RefCell<UiState>>, key: &str, value: &glib::Value) -> bool {
+    let Ok(bytes) = value.get::<glib::Bytes>() else {
+        return false;
+    };
+    let payload: Vec<(String, u32)> = match serde_json::from_slice(bytes.as_ref()) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("failed to parse message drag payload: {e}");
+            return false;
+        }
+    };
+    if payload.is_empty() {
+        return false;
+    }
+    let keyword = lookout_core::tag_keyword(key);
+    let state = state.borrow();
+    let mut groups: HashMap<AccountId, (MailboxId, Vec<Uid>)> = HashMap::new();
+    for (mailbox, uid) in payload {
+        let Some(account_id) = mailbox_account_id(&MailboxId(mailbox.clone())) else { continue };
+        let entry = groups.entry(account_id).or_insert_with(|| (MailboxId(mailbox), Vec::new()));
+        entry.1.push(Uid(uid));
+    }
+    let mut sent = false;
+    for (account_id, (source, uids)) in groups {
+        let Some(handle) = state.accounts.get(&account_id) else { continue };
+        let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreKeywordsMany {
+            mailbox: source,
+            uids,
+            add: vec![keyword.clone()],
+            remove: Vec::new(),
+        });
+        sent = true;
+    }
+    sent
+}
+
+/// Builds the "More" menu popover's contents: "Save as .eml…" exports the
+/// selected message's whole raw RFC 5322 bytes to a file, and "Print…" sends
+/// the visible body through WebKit's print pipeline. Rebuilt on every popover
+/// `show` (like the categorize menu) so each item's sensitivity tracks
+/// whether a message is selected when the menu opens.
+fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, popover: &gtk::Popover) -> gtk::Box {
     let boxed = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -7821,7 +8233,71 @@ fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: 
         });
     }
     boxed.append(&save_eml);
+    let print_button = gtk::Button::builder().label("Print…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    // Print is only meaningful while a message is actually showing in the
+    // reading pane; the selection alone isn't enough (it may be a selection
+    // the pane hasn't rendered yet, or nothing rendered at all).
+    print_button.set_sensitive(has_selection && reading_stack.visible_child_name().as_deref() == Some("message"));
+    {
+        let popover = popover.clone();
+        let reading_stack = reading_stack.clone();
+        print_button.connect_clicked(move |_| {
+            popover.popdown();
+            let Some(parent) = popover.root().and_downcast::<gtk::Window>() else { return };
+            print_visible_message(&reading_stack, &parent);
+        });
+    }
+    boxed.append(&print_button);
     boxed
+}
+
+/// Prints the currently-visible message body. HTML bodies print directly
+/// through the reading pane's WebView; plain-text bodies (rendered in the
+/// `GtkTextView` fallback) are wrapped in a minimal HTML page and printed
+/// through an offscreen WebView, so every message goes through WebKit's
+/// print pipeline.
+fn print_visible_message(reading_stack: &gtk::Stack, parent: &gtk::Window) {
+    let Some(content_stack) = find_named_child(reading_stack, "body").and_then(|child| child.downcast::<gtk::Stack>().ok()) else {
+        return;
+    };
+    match content_stack.visible_child_name().as_deref() {
+        Some("html") => {
+            if let Some(web_view) = content_stack.child_by_name("html").and_downcast::<webkit::WebView>() {
+                let _ = webkit::PrintOperation::new(&web_view).run_dialog(Some(parent));
+            }
+        }
+        Some("text") => {
+            let text = content_stack
+                .child_by_name("text")
+                .and_downcast::<gtk::ScrolledWindow>()
+                .and_then(|scroller| scroller.child())
+                .and_downcast::<gtk::TextView>()
+                .map(|text_view| text_view.buffer().text(&text_view.buffer().start_iter(), &text_view.buffer().end_iter(), false))
+                .unwrap_or_default();
+            let html = format!(
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+                 <style>body {{ font-family: sans-serif; white-space: pre-wrap; margin: 1em; }}</style>\
+                 </head><body>{}</body></html>",
+                glib::markup_escape_text(&text)
+            );
+            print_html_once(&html, parent);
+        }
+        _ => {}
+    }
+}
+
+/// Prints an HTML string through a throwaway offscreen WebView once its load
+/// finishes; the WebKit print dialog is modal, so the page only needs to be
+/// parsed far enough to lay out - it never appears on screen.
+pub(crate) fn print_html_once<T: IsA<gtk::Window>>(html: &str, parent: &T) {
+    let parent = parent.clone();
+    let web_view = webkit::WebView::builder().build();
+    web_view.connect_load_changed(move |web_view, event| {
+        if event == webkit::LoadEvent::Finished {
+            let _ = webkit::PrintOperation::new(web_view).run_dialog(Some(&parent));
+        }
+    });
+    web_view.load_html(html, None);
 }
 
 /// Builds the tag menu shown by both the toolbar Categorize popover and the
@@ -7876,13 +8352,36 @@ fn build_tag_menu(
             let summary = target.clone();
             let key = tag.key.clone();
             let state = state.clone();
+            let state_for_toggle = state.clone();
             toggle.connect_toggled(move |t| {
                 if let Some(summary) = &summary {
                     let keyword = lookout_core::tag_keyword(&key);
                     let (add, remove) = if t.is_active() { (vec![keyword], Vec::new()) } else { (Vec::new(), vec![keyword]) };
-                    send_keyword_store(&state, summary, add, remove);
+                    send_keyword_store(&state_for_toggle, summary, add, remove);
                 }
             });
+            // Dropping messages onto the tag row applies that tag to all of
+            // them - the batch counterpart of the toggles (one
+            // `StoreKeywordsMany` per source mailbox).
+            {
+                let drop_state = state.clone();
+                let drop_key = tag.key.clone();
+                let row_for_enter = row.clone();
+                let row_for_leave = row.clone();
+                let drop_target = gtk::DropTarget::builder()
+                    .formats(&gtk::gdk::ContentFormats::new(&[MESSAGE_DRAG_MIME]))
+                    .actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE)
+                    .build();
+                drop_target.connect_drop(move |_target, value, _x, _y| handle_keyword_drag_drop(&drop_state, &drop_key, value));
+                drop_target.connect_enter(move |_target, _x, _y| {
+                    row_for_enter.add_css_class("lookout-drop-target");
+                    gtk::gdk::DragAction::COPY
+                });
+                drop_target.connect_leave(move |_target| {
+                    row_for_leave.remove_css_class("lookout-drop-target");
+                });
+                row.add_controller(drop_target);
+            }
             boxed.append(&row);
         }
     }
@@ -10502,10 +11001,14 @@ mod tests {
             end: chrono::Utc::now(),
             all_day: false,
             rrule: None,
+            recurrence_id: None,
+            exdates: Vec::new(),
             master_start: None,
             master_end: None,
             href: None,
             etag: None,
+            master_href: None,
+            master_etag: None,
             attendees: vec![],
             organizer: None,
             categories: vec![],

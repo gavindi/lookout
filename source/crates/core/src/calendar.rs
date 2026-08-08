@@ -56,6 +56,18 @@ pub enum EventSensitivity {
     Confidential,
 }
 
+/// RFC 5545 `RANGE` parameter on a `RECURRENCE-ID` (§3.2.13): how far a
+/// per-occurrence override reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RecurrenceRange {
+    /// No `RANGE` parameter: the override replaces just this one instance.
+    #[default]
+    This,
+    /// `RANGE=THISANDFUTURE`: the override replaces this instance and every
+    /// later one in the series.
+    ThisAndFuture,
+}
+
 /// RFC 5545 `TRANSP`: whether this event blocks other bookings at the same time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum EventTransparency {
@@ -105,6 +117,29 @@ pub struct CalendarEvent {
     /// `lookout-dav`'s job since this crate has no I/O deps and RRULE parsing
     /// is a heavier dependency than this crate should carry.
     pub rrule: Option<String>,
+    /// RFC 5545 `RECURRENCE-ID` (UTC): set when this VEVENT is a
+    /// *per-occurrence override* of a recurring master rather than the master
+    /// itself - the instance it replaces. `None` for masters and for
+    /// non-recurring events.
+    #[serde(default)]
+    pub recurrence_id: Option<DateTime<Utc>>,
+    /// The `RANGE` parameter of the override's `RECURRENCE-ID` (see
+    /// [`RecurrenceRange`]) - `ThisAndFuture` means the override also applies
+    /// to every later instance of the series. Meaningless when
+    /// `recurrence_id` is `None`.
+    #[serde(default)]
+    pub recurrence_range: RecurrenceRange,
+    /// RFC 5545 `EXDATE` values (UTC): instances of the series to omit.
+    /// Modeled directly (unlike `RRULE`'s raw string) since they're plain
+    /// timestamps, and re-emitted verbatim on serialize - the only operation
+    /// ever performed on them is add/remove.
+    #[serde(default)]
+    pub exdates: Vec<DateTime<Utc>>,
+    /// RFC 5545 `RDATE` values (UTC): extra instances beyond the `RRULE`'s
+    /// expansion. Read and round-tripped so a master's RDATEs survive a PUT;
+    /// feeding them into expansion is a follow-up.
+    #[serde(default)]
+    pub rdates: Vec<DateTime<Utc>>,
     /// The resource's URL within its calendar collection (e.g.
     /// `.../events/abc.ics`) as reported by the server, if known - the target
     /// for an update or delete (`PUT`/`DELETE`). `None` for an event that
@@ -169,6 +204,16 @@ pub struct EventOccurrence {
     /// non-recurring event.
     #[serde(default)]
     pub rrule: Option<String>,
+    /// The `RECURRENCE-ID` of the VEVENT this occurrence came from - set when
+    /// the occurrence is a per-occurrence override of a recurring series
+    /// (see [`CalendarEvent::recurrence_id`]).
+    #[serde(default)]
+    pub recurrence_id: Option<DateTime<Utc>>,
+    /// The master's `EXDATE` list (see [`CalendarEvent::exdates`]) - carried
+    /// so editing an override doesn't silently drop the master's other
+    /// exclusions on save.
+    #[serde(default)]
+    pub exdates: Vec<DateTime<Utc>>,
     /// The master event's anchor `DTSTART`/`DTEND` (UTC). For a non-recurring
     /// event these equal the occurrence's own times; for a recurring one they
     /// are the series anchor - an occurrence's `start`/`end` are just one
@@ -181,10 +226,22 @@ pub struct EventOccurrence {
     pub master_end: Option<DateTime<Utc>>,
     /// The master [`CalendarEvent`]'s resource URL/etag, so the occurrence can
     /// be edited or deleted in place (see [`CalendarEvent`] for the semantics).
+    /// For an occurrence derived from a per-occurrence override these are the
+    /// *override's* resource - the master's own live at
+    /// [`Self::master_href`]/[`Self::master_etag`] (when known), so a
+    /// whole-series edit can be routed to the right resource from any
+    /// occurrence.
     #[serde(default)]
     pub href: Option<String>,
     #[serde(default)]
     pub etag: Option<String>,
+    /// The series master's own resource URL/etag. Only set on occurrences
+    /// derived from per-occurrence overrides (a plain expansion's `href`/`etag`
+    /// already *are* the master's). `None` when unknown.
+    #[serde(default)]
+    pub master_href: Option<String>,
+    #[serde(default)]
+    pub master_etag: Option<String>,
     #[serde(default)]
     pub attendees: Vec<Attendee>,
     #[serde(default)]

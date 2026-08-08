@@ -13,8 +13,8 @@ pub mod trust;
 pub mod vcard;
 
 pub use calendar::{
-    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, CalendarTask, EventOccurrence, EventSensitivity, EventTransparency, TaskPriority, TaskStatus,
-    WebcalSubscription,
+    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, CalendarTask, EventOccurrence, EventSensitivity, EventTransparency, RecurrenceRange, TaskPriority,
+    TaskStatus, WebcalSubscription,
 };
 pub use email::{
     cid_matches, header_value, parse_imip_method, parse_list_unsubscribe, sanitize_tag_key, tag_key_from_keyword, tag_keyword, AuthenticationResults, BodyPart, ContactsProvider,

@@ -104,23 +104,6 @@ type EventDrag = Rc<dyn Fn(EventOccurrence, DateTime<Utc>, DateTime<Utc>)>;
 /// pass from `CalendarMain::connect_event_dragged`.
 type PendingEventDrag = Rc<RefCell<Option<EventDrag>>>;
 
-/// A callback fired when the user tries to drag an event that can't be
-/// drag-rescheduled (a recurring occurrence), so the caller can explain why.
-type DragBlocked = Rc<dyn Fn(EventOccurrence)>;
-
-/// One entry in a widget's pending drag-blocked callback: set by the current
-/// render pass from `CalendarMain::connect_event_drag_blocked`.
-type PendingDragBlocked = Rc<RefCell<Option<DragBlocked>>>;
-
-/// Whether an occurrence can be drag-rescheduled. Recurring events can't yet:
-/// moving a single occurrence needs a per-occurrence override
-/// (`RECURRENCE-ID` + `EXDATE`), which lands with the recurring-edit-scopes
-/// work; a whole-series drag is more surprising than helpful. Pure so the
-/// gesture can decide (and toast) before any drag state is touched.
-fn can_drag(occ: &EventOccurrence) -> bool {
-    occ.rrule.is_none()
-}
-
 /// How a chip drag changes the event: move shifts both ends together, resize
 /// keeps the start and follows the pointer with the end.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -287,9 +270,6 @@ pub struct MonthGrid {
     /// The drag-reschedule callback, set by each `set_month_occurrences`
     /// render pass (see [`connect_event_dragged`]).
     on_drag: PendingEventDrag,
-    /// The drag-blocked callback (recurring events), set by each
-    /// `set_month_occurrences` render pass (see [`connect_event_drag_blocked`]).
-    on_drag_blocked: PendingDragBlocked,
     /// A chip drag in flight, if any (see [`MonthDrag`]).
     month_drag: Rc<RefCell<Option<MonthDrag>>>,
     /// The `lookout-occ` data the chips normally carry. Rebuilt by every
@@ -387,8 +367,7 @@ fn build_month_grid() -> MonthGrid {
     let month_drag: Rc<RefCell<Option<MonthDrag>>> = Rc::new(RefCell::new(None));
     let chip_events: Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>> = Rc::new(RefCell::new(HashMap::new()));
     let on_drag: PendingEventDrag = Rc::new(RefCell::new(None));
-    let on_drag_blocked: PendingDragBlocked = Rc::new(RefCell::new(None));
-    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag, &on_drag_blocked);
+    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag);
 
     MonthGrid {
         root: root_box.upcast(),
@@ -396,7 +375,6 @@ fn build_month_grid() -> MonthGrid {
         anchor_month,
         on_activate,
         on_drag,
-        on_drag_blocked,
         month_drag,
         chip_events,
         on_day_selected,
@@ -456,11 +434,9 @@ pub fn set_month_occurrences(
     colors: &HashMap<CalendarId, String>,
     on_activate: Option<ActivateEvent>,
     on_drag: Option<EventDrag>,
-    on_drag_blocked: Option<DragBlocked>,
 ) {
     *mg.on_activate.borrow_mut() = on_activate;
     *mg.on_drag.borrow_mut() = on_drag;
-    *mg.on_drag_blocked.borrow_mut() = on_drag_blocked;
     // A re-render rebuilds every chip, so any in-flight drag is stale.
     *mg.month_drag.borrow_mut() = None;
     mg.chip_events.borrow_mut().clear();
@@ -580,11 +556,10 @@ fn cell_index_at_point(width: f64, height: f64, x: f64, y: f64) -> Option<usize>
 /// button (identified by its `lookout-occ` data) arms a potential drag, motion
 /// beyond [`DRAG_THRESHOLD`] turns it into a drag across day cells (the chip
 /// is live re-parented between cells as it moves, with the target cell
-/// highlighted), and a drag-free release activates the event. Occurrences
-/// that can't be dragged ([`can_drag`]) fire `on_drag_blocked` instead. Only
-/// the grabbed chip follows the pointer live - the sibling chips of a
-/// multi-day event in other cells catch up when the resync after the drop
-/// lands. Coordinates stay grid-relative for the gesture's whole lifetime, so
+/// highlighted), and a drag-free release activates the event. Only the
+/// grabbed chip follows the pointer live - the sibling chips of a multi-day
+/// event in other cells catch up when the resync after the drop lands.
+/// Coordinates stay grid-relative for the gesture's whole lifetime, so
 /// reparenting the chip never skews them.
 #[allow(clippy::too_many_arguments)]
 fn attach_month_drag(
@@ -595,7 +570,6 @@ fn attach_month_drag(
     chip_events: &Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>>,
     on_activate: &PendingActivate,
     on_drag: &PendingEventDrag,
-    on_drag_blocked: &PendingDragBlocked,
 ) {
     let gesture = gtk::GestureClick::new();
     let events_boxes: Vec<gtk::Box> = day_cells.iter().map(|c| c.events_box.clone()).collect();
@@ -638,7 +612,6 @@ fn attach_month_drag(
         let grid = grid.clone();
         let anchor_month = anchor_month.clone();
         let month_drag = month_drag.clone();
-        let on_drag_blocked = on_drag_blocked.clone();
         let events_boxes = events_boxes.clone();
         let containers = containers.clone();
         gesture.connect_update(move |gesture, sequence| {
@@ -649,15 +622,6 @@ fn attach_month_drag(
             let dy = y - d.py;
             if !d.dragging {
                 if dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD {
-                    return;
-                }
-                if !can_drag(&d.occ) {
-                    let occ = d.occ.clone();
-                    drop(guard);
-                    if let Some(callback) = on_drag_blocked.borrow().as_ref() {
-                        callback(occ);
-                    }
-                    *month_drag.borrow_mut() = None;
                     return;
                 }
                 d.dragging = true;
@@ -727,7 +691,7 @@ fn clickable_event_label(label: gtk::Label, occ: &EventOccurrence, mg: &MonthGri
         .css_classes(["flat", "calendar-event-chip-button"])
         .halign(gtk::Align::Fill)
         .build();
-    if mg.on_drag.borrow().is_some() || mg.on_drag_blocked.borrow().is_some() {
+    if mg.on_drag.borrow().is_some() {
         // The grid-level drag gesture (see `attach_month_drag`) identifies
         // this chip by its occurrence (looked up from `chip_events`); the
         // activation also happens there, so a drag never also opens the
@@ -801,9 +765,6 @@ pub struct TimeGrid {
     /// The drag-reschedule callback, set by each `set_time_grid` render pass
     /// (see [`connect_event_dragged`]).
     on_drag: PendingEventDrag,
-    /// The drag-blocked callback (recurring events), set by each
-    /// `set_time_grid` render pass (see [`connect_event_drag_blocked`]).
-    on_drag_blocked: PendingDragBlocked,
 }
 
 /// The per-grid render state shared with the draw/hover closures.
@@ -904,7 +865,6 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
     let on_activate: PendingActivate = Rc::new(RefCell::new(None));
     let on_slot_activate: PendingSlotActivate = Rc::new(RefCell::new(None));
     let on_drag: PendingEventDrag = Rc::new(RefCell::new(None));
-    let on_drag_blocked: PendingDragBlocked = Rc::new(RefCell::new(None));
 
     {
         let data = data.clone();
@@ -923,8 +883,8 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
 
     attach_hover(&band, true, &data, &hover);
     attach_hover(&canvas, false, &data, &hover);
-    attach_click(&band, true, &data, &on_activate, &on_slot_activate, &on_drag, &on_drag_blocked);
-    attach_click(&canvas, false, &data, &on_activate, &on_slot_activate, &on_drag, &on_drag_blocked);
+    attach_click(&band, true, &data, &on_activate, &on_slot_activate, &on_drag);
+    attach_click(&canvas, false, &data, &on_activate, &on_slot_activate, &on_drag);
 
     let mut headers = Vec::new();
     let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
@@ -963,7 +923,6 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         on_activate,
         on_slot_activate,
         on_drag,
-        on_drag_blocked,
     }
 }
 
@@ -1029,21 +988,12 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
 /// [`DRAG_THRESHOLD`] the press becomes a drag instead (a move for a whole-
 /// chip grab, a resize for a bottom-edge grab). The drag's live position is
 /// rendered as a translucent ghost by the paint passes; release fires
-/// `on_drag` with the resolved new start/end. Occurrences that can't be
-/// dragged ([`can_drag`]) fire `on_drag_blocked` instead. `band` selects the
-/// split half (all-day chips vs timed chips), the same convention as
-/// [`attach_hover`]; the hit-test is the shared [`hovered_chip`]. The
-/// callbacks come from `on_activate`/`on_slot_activate`/`on_drag`/
-/// `on_drag_blocked`, set by the latest `set_time_grid` render pass.
-fn attach_click(
-    canvas: &gtk::DrawingArea,
-    band: bool,
-    data: &TimeGridData,
-    on_activate: &PendingActivate,
-    on_slot_activate: &PendingSlotActivate,
-    on_drag: &PendingEventDrag,
-    on_drag_blocked: &PendingDragBlocked,
-) {
+/// `on_drag` with the resolved new start/end. `band` selects the split half
+/// (all-day chips vs timed chips), the same convention as [`attach_hover`];
+/// the hit-test is the shared [`hovered_chip`]. The callbacks come from
+/// `on_activate`/`on_slot_activate`/`on_drag`, set by the latest
+/// `set_time_grid` render pass.
+fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_activate: &PendingActivate, on_slot_activate: &PendingSlotActivate, on_drag: &PendingEventDrag) {
     let gesture = gtk::GestureClick::new();
     {
         let canvas_widget = canvas.clone();
@@ -1051,7 +1001,6 @@ fn attach_click(
         let on_activate = on_activate.clone();
         let on_slot_activate = on_slot_activate.clone();
         let on_drag = on_drag.clone();
-        let on_drag_blocked = on_drag_blocked.clone();
         // The snapped slot under `(x, y)` (timeline only - the band has no
         // slots), or `None` for gutter/band/chip hits.
         let slot_at = {
@@ -1146,18 +1095,7 @@ fn attach_click(
                     let chips_guard = update_data.chips.borrow();
                     let occurrences_guard = update_data.occurrences.borrow();
                     let chip = &chips_guard[chip_idx];
-                    let occ = occurrences_guard.get(chip.occurrence);
-                    if occ.is_some_and(|o| !can_drag(o)) {
-                        // Recurring events can't be drag-rescheduled yet -
-                        // explain rather than silently dropping the gesture.
-                        let occ = occ.unwrap().clone();
-                        if let Some(callback) = on_drag_blocked.borrow().as_ref() {
-                            callback(occ);
-                        }
-                        update_canvas.queue_draw();
-                        return;
-                    }
-                    let Some(_) = occ else { return };
+                    let Some(_) = occurrences_guard.get(chip.occurrence) else { return };
                     (chip.column as i64 * 1440 + chip.start_minutes, chip.column as i64 * 1440 + chip.end_minutes, chip.all_day)
                 };
                 let dates_len = update_data.dates.borrow().len();
@@ -1413,8 +1351,8 @@ fn hovered_chip(chips: &[TimeChip], canvas_width: f64, n_cols: usize, x: f64, y:
 /// replacing the old `set_week`/`set_week_occurrences`/`set_day`/
 /// `set_day_occurrences` calls. `on_activate` fires when an event chip is
 /// clicked; `on_slot_activate` when an already-selected time slot is clicked
-/// again (see [`SlotActivate`]); `on_drag`/`on_drag_blocked` carry the
-/// drag-reschedule path (see [`connect_event_dragged`]).
+/// again (see [`SlotActivate`]); `on_drag` carries the drag-reschedule path
+/// (see [`connect_event_dragged`]).
 #[allow(clippy::too_many_arguments)]
 pub fn set_time_grid(
     t: &TimeGrid,
@@ -1424,12 +1362,10 @@ pub fn set_time_grid(
     on_activate: Option<ActivateEvent>,
     on_slot_activate: Option<SlotActivate>,
     on_drag: Option<EventDrag>,
-    on_drag_blocked: Option<DragBlocked>,
 ) {
     *t.on_activate.borrow_mut() = on_activate;
     *t.on_slot_activate.borrow_mut() = on_slot_activate;
     *t.on_drag.borrow_mut() = on_drag;
-    *t.on_drag_blocked.borrow_mut() = on_drag_blocked;
     *t.anchor.borrow_mut() = anchor;
     *t.data.occurrences.borrow_mut() = occurrences.to_vec();
     *t.data.colors.borrow_mut() = colors.clone();
@@ -2160,10 +2096,6 @@ pub struct CalendarMain {
     /// The drag-reschedule callback, handed to every drag-capable sub-view by
     /// each render pass (see [`connect_event_dragged`]).
     on_drag: PendingEventDrag,
-    /// The drag-blocked callback (recurring events), handed to every
-    /// drag-capable sub-view by each render pass (see
-    /// [`connect_event_drag_blocked`]).
-    on_drag_blocked: PendingDragBlocked,
 }
 
 pub fn build_main() -> CalendarMain {
@@ -2247,7 +2179,6 @@ pub fn build_main() -> CalendarMain {
         on_activate: Rc::new(RefCell::new(None)),
         on_slot_activate: Rc::new(RefCell::new(None)),
         on_drag: Rc::new(RefCell::new(None)),
-        on_drag_blocked: Rc::new(RefCell::new(None)),
     };
     // Extracted into a local first (rather than inlined into the call
     // below) so the `Ref` temporary from `.borrow()` is dropped before
@@ -2327,13 +2258,6 @@ pub fn connect_event_dragged(c: &CalendarMain, f: impl Fn(EventOccurrence, DateT
     *c.on_drag.borrow_mut() = Some(Rc::new(f));
 }
 
-/// Registers `f` to run when the user tries to drag an occurrence that can't
-/// be drag-rescheduled (a recurring event), so the caller can explain why.
-/// One subscriber is expected (the window); a later registration replaces it.
-pub fn connect_event_drag_blocked(c: &CalendarMain, f: impl Fn(EventOccurrence) + 'static) {
-    *c.on_drag_blocked.borrow_mut() = Some(Rc::new(f));
-}
-
 /// Registers `f` to run when the user clicks a highlighted slot range in the
 /// Day or Week grids (selected by a click, or a click-and-drag), receiving
 /// the range as `(start_date, start_minutes, end_date, end_minutes)` so the
@@ -2390,43 +2314,15 @@ fn refresh(c: &CalendarMain) {
     let on_activate = c.on_activate.borrow().clone();
     let on_slot_activate = c.on_slot_activate.borrow().clone();
     let on_drag = c.on_drag.borrow().clone();
-    let on_drag_blocked = c.on_drag_blocked.borrow().clone();
 
     set_month(&c.month, anchor);
-    set_month_occurrences(&c.month, &occurrences, &colors, on_activate.clone(), on_drag.clone(), on_drag_blocked.clone());
+    set_month_occurrences(&c.month, &occurrences, &colors, on_activate.clone(), on_drag.clone());
     set_month(&c.split.month, anchor);
-    set_month_occurrences(&c.split.month, &occurrences, &colors, on_activate.clone(), on_drag.clone(), on_drag_blocked.clone());
+    set_month_occurrences(&c.split.month, &occurrences, &colors, on_activate.clone(), on_drag.clone());
 
-    set_time_grid(
-        &c.workweek,
-        anchor,
-        &occurrences,
-        &colors,
-        on_activate.clone(),
-        on_slot_activate.clone(),
-        on_drag.clone(),
-        on_drag_blocked.clone(),
-    );
-    set_time_grid(
-        &c.week,
-        anchor,
-        &occurrences,
-        &colors,
-        on_activate.clone(),
-        on_slot_activate.clone(),
-        on_drag.clone(),
-        on_drag_blocked.clone(),
-    );
-    set_time_grid(
-        &c.day,
-        anchor,
-        &occurrences,
-        &colors,
-        on_activate.clone(),
-        on_slot_activate,
-        on_drag.clone(),
-        on_drag_blocked.clone(),
-    );
+    set_time_grid(&c.workweek, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone(), on_drag.clone());
+    set_time_grid(&c.week, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone(), on_drag.clone());
+    set_time_grid(&c.day, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate, on_drag.clone());
 
     set_agenda(&c.agenda, anchor, &occurrences, &colors, on_activate.clone());
     set_agenda(&c.split.agenda, anchor, &occurrences, &colors, on_activate);
@@ -3029,10 +2925,14 @@ mod tests {
             end: chrono::Local.from_local_datetime(&end).single().unwrap().with_timezone(&chrono::Utc),
             all_day,
             rrule: None,
+            recurrence_id: None,
+            exdates: Vec::new(),
             master_start: None,
             master_end: None,
             href: None,
             etag: None,
+            master_href: None,
+            master_etag: None,
             attendees: Vec::new(),
             organizer: None,
             categories: Vec::new(),
@@ -3557,15 +3457,6 @@ mod tests {
             grab_offset: 0,
             all_day: false,
         }
-    }
-
-    #[test]
-    fn can_drag_rejects_recurring_occurrences() {
-        let mut recurring = occ("Weekly", NaiveDateTime::default(), NaiveDateTime::default(), false);
-        recurring.rrule = Some("FREQ=WEEKLY".to_string());
-        assert!(!can_drag(&recurring));
-        let plain = occ("Once", NaiveDateTime::default(), NaiveDateTime::default(), false);
-        assert!(can_drag(&plain));
     }
 
     #[test]

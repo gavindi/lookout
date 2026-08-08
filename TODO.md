@@ -54,7 +54,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Ribbon-style Home/View tabs — Home toolbars + View layout toggles (GSettings)
 - [x] Message-list sorting (date/sender/subject) + favorites section pinned to the folder tree (GSettings)
 - [x] Full-text search: per-account SQLite FTS5 index + IMAP `SEARCH` fallback (SearchBar, 300ms debounce)
-- [ ] Internal drag-drop (move/tag) + external drag-out (`.eml`/`.zip`)
+- [x] Internal drag-drop (move/tag) + external drag-out (`.eml`/`.zip`)
 - [x] Collapsible thread UI — conversations grouped under collapsible headers (View tab "Conversations" toggle, GSettings `mail-threaded`), threads placed by their newest message's date section, children oldest-first, collapse state keyed by stable `(mailbox, thread key)` identity so it survives rebuilds and mode toggles
 - [x] Color-tag keywords (`$Lookout-tag-*`) + "Manage tags…" dialog — server-side `STORE` atoms, cache-patched, per-tag row dots
 - [x] Recipient-chip/autocomplete composer widget (see Phase 1)
@@ -63,7 +63,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Batch actions + `Gtk.MultiSelection` — per-row checkboxes, batched move/flag/snooze per (account, mailbox), Mark read/unread
 - [x] Hover quick-actions
 - [ ] Physical-keycode global keyboard shortcuts
-- [ ] Print support
+- [x] Print support
 - [x] List-Unsubscribe banner — `Adw.Banner` in the reading pane, RFC 8058 one-click POST with mailto fallback into the composer
 - [x] External-content trust-sender flow — per-sender (address or `@domain`) trust levels persisted in the UI-state DB, "Trust sender…" banner in the reading pane (load-once / images / all-content), Config → Mail "Trusted senders…" manager
 - [ ] RFC 8098 read-receipt (MDN) generation
@@ -79,7 +79,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Select-then-edit in the main grids: clicking a Month-grid day (highlight + re-anchor every view) or a Day/Week time slot (highlight) selects it; clicking the selection again opens the New Event editor prefilled for that day (9am) or time
 - [x] Click-and-drag range selection in the Day/Week grids — dragging across hours and day columns highlights a whole range (interior columns fill as full days); clicking it opens the editor spanning exactly the selection (a `suggested_end` prefill, so a 9:00–11:00 drag is a two-hour event)
 - [x] Drag-reschedule — chip drags in the Day/Week/Work week grids (move + bottom-edge resize, half-hour snap, ghost rendering, clamped to the visible window) and Month/Split grids (day-granular move with live chip re-parenting + target-cell highlight), persisted via the etag-guarded `UpdateEvent` path; recurring occurrences and webcal feed events are blocked with a toast
-- [ ] Recurring edit scopes (this / this-and-following / all) — per-occurrence overrides (`RECURRENCE-ID` + `EXDATE`); also unlocks dragging individual occurrences of a series
+- [x] Recurring edit scopes (this / this-and-following / all) — per-occurrence overrides (`RECURRENCE-ID` + `EXDATE`); also unlocks dragging individual occurrences of a series
 - [x] iMIP invitation banners in the mail viewer — `text/calendar` parts fetched with the body, `METHOD:REQUEST` (Accept/Maybe/Decline → RFC 6047 `METHOD:REPLY` + calendar upsert), `METHOD:CANCEL` (remove-from-calendar), `METHOD:REPLY` (informational)
 - [x] `.ics` import / webcal subscription — sidebar "Add calendar" dialog (subscribe/import/manage), `lookout-dav` feed session (5-min poll, per-feed cache + error isolation), read-only event viewer for feed events, Config-view subscription list
 - [x] Mini-calendar sidebar widget (240px sidebar + compact copy docked on the Mail screen)

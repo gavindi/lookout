@@ -18,7 +18,9 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
-use lookout_core::{Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventTransparency, EventUid};
+use lookout_core::{
+    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventTransparency, EventUid, RecurrenceRange,
+};
 
 use crate::calendar_colors::CalendarColorMap;
 use crate::recipient_entry::{address_of, RecipientEntry, SuggestionSource};
@@ -26,8 +28,11 @@ use crate::recurrence;
 
 /// The save callback's target: the picked calendar plus the finished event.
 pub type SaveCallback = Rc<dyn Fn(CalendarId, CalendarEvent)>;
-/// The delete callback's target: the calendar plus the resource to remove.
-type DeleteCallback = Rc<dyn Fn(CalendarId, EventUid, Option<String>, Option<String>)>;
+/// The delete callback's target: the calendar plus the occurrence being
+/// deleted - the whole occurrence, so the caller can decide whether to
+/// delete the resource outright (an override) or EXDATE the instance out of
+/// its master (a plain expansion of a recurring series).
+type DeleteCallback = Rc<dyn Fn(CalendarId, EventOccurrence)>;
 /// The edited occurrence's identity + write target, threaded through the form.
 type EventMeta = (EventUid, Option<String>, Option<String>);
 
@@ -82,7 +87,7 @@ pub fn show_event_editor(
     prefill: EventEditorPrefill,
     attendee_suggestions: SuggestionSource,
     on_save: impl Fn(CalendarId, CalendarEvent) + 'static,
-    on_delete: impl Fn(CalendarId, EventUid, Option<String>, Option<String>) + 'static,
+    on_delete: impl Fn(CalendarId, EventOccurrence) + 'static,
 ) {
     // Boxed as trait objects: a closure capturing a generic `impl Fn`
     // parameter can't implement `Fn` itself (its own `call` needs the captured
@@ -173,12 +178,15 @@ pub fn show_event_editor(
     // start (for a new event), or a sensible fresh default (next whole hour,
     // one hour long). A recurring event is prefilled from the series *anchor*
     // (master DTSTART/DTEND), not the clicked occurrence's expansion, so a
-    // metadata-only edit can't silently re-anchor the whole series.
+    // metadata-only edit can't silently re-anchor the whole series. An
+    // occurrence that *is* a per-occurrence override is the exception: its
+    // own times are the override's, and prefilling the master anchor would
+    // re-anchor the override to the series time.
     let existing_all_day = existing.as_ref().map(|occ| occ.all_day).unwrap_or(false);
     let (initial_start, initial_end) = existing
         .as_ref()
         .map(|occ| {
-            if occ.rrule.is_some() {
+            if occ.recurrence_id.is_none() {
                 if let (Some(master_start), Some(master_end)) = (occ.master_start, occ.master_end) {
                     return (
                         master_start.with_timezone(&chrono::Local).naive_local(),
@@ -427,9 +435,11 @@ pub fn show_event_editor(
     let options_button = gtk::Button::from_icon_name(themed_icon("view-grid-symbolic", &["open-menu-symbolic"]));
     options_button.set_tooltip_text(Some("More options"));
     options_button.set_sensitive(false);
+    // Print snapshots the form's current state as HTML and sends it through
+    // WebKit's print pipeline - useful for read-only (webcal) events too,
+    // which have no other way out of the dialog.
     let print_button = gtk::Button::from_icon_name("printer-symbolic");
     print_button.set_tooltip_text(Some("Print"));
-    print_button.set_sensitive(false);
 
     let delete_button = gtk::Button::from_icon_name(themed_icon("user-trash-symbolic", &["edit-delete-symbolic"]));
     delete_button.add_css_class("destructive-action");
@@ -441,6 +451,17 @@ pub fn show_event_editor(
     top_bar.append(&save_button);
     top_bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     top_bar.append(&series.button);
+    // The recurring-edit scope: "This occurrence" (a per-occurrence override),
+    // "This and following" (an override with RANGE=THISANDFUTURE), or "All
+    // events" (rewrite the master). Only meaningful for a recurring event -
+    // hidden otherwise, and defaulting to the pre-scope behavior ("All
+    // events") so a plain edit keeps doing exactly what it always did.
+    let is_recurring = existing.as_ref().is_some_and(|occ| occ.rrule.is_some() || occ.recurrence_id.is_some());
+    let scope_model = gtk::StringList::new(&["This occurrence", "This and following", "All events"]);
+    let scope_dropdown = gtk::DropDown::builder().model(&scope_model).tooltip_text("Edit scope").build();
+    scope_dropdown.set_selected(2);
+    scope_dropdown.set_visible(is_recurring);
+    top_bar.append(&scope_dropdown);
     top_bar.append(&busy_dropdown);
     top_bar.append(&categorize_button);
     top_bar.append(&reminder_dropdown);
@@ -511,7 +532,7 @@ pub fn show_event_editor(
                 .collect();
             occs.push(synthetic);
             crate::calendar_view::set_mini_month(&preview_mini, day, &month_event_days);
-            crate::calendar_view::set_time_grid(&preview_day_strip, day, &occs, &calendar_colors, None, None, None, None);
+            crate::calendar_view::set_time_grid(&preview_day_strip, day, &occs, &calendar_colors, None, None, None);
             crate::calendar_view::scroll_time_grid_to_minutes(&preview_day_strip, start_local.hour() as i64 * 60 + start_local.minute() as i64);
         })
     };
@@ -562,6 +583,10 @@ pub fn show_event_editor(
     let series = Rc::new(series);
     let existing_meta: Option<EventMeta> = existing.as_ref().map(|occ| (occ.uid.clone(), occ.href.clone(), occ.etag.clone()));
     let existing_attendees: Vec<Attendee> = existing.as_ref().map(|occ| occ.attendees.clone()).unwrap_or_default();
+    // The delete handler needs the occurrence itself (so the caller can
+    // decide resource-delete vs EXDATE), but the save handler below moves
+    // `existing` into its own closure - grab the delete handler's copy now.
+    let existing_for_delete = existing.clone();
     let owner_email = prefill.owner_email.clone();
 
     let save_handler = {
@@ -589,6 +614,7 @@ pub fn show_event_editor(
         let series = series.clone();
         let existing_meta = existing_meta.clone();
         let existing_attendees = existing_attendees.clone();
+        let scope_dropdown = scope_dropdown.clone();
         let on_save = on_save;
         // The parameter is annotated so the closure is created with a
         // higher-ranked `&Button` signature from the start - an unannotated
@@ -630,12 +656,16 @@ pub fn show_event_editor(
                 video_enabled: video_toggle.is_active(),
                 conference_url_text: video_url_row.text().to_string(),
                 rrule,
+                recurrence_id: None,
+                recurrence_range: RecurrenceRange::default(),
+                exdates: existing.as_ref().map(|occ| occ.exdates.clone()).unwrap_or_default(),
                 owner_email: owner_email.clone(),
                 existing_meta: existing_meta.clone(),
             };
             match build_event_from_input(input) {
                 Ok(mut event) => {
                     event.calendar_id = calendar_id.clone();
+                    apply_edit_scope(&mut event, scope_dropdown.selected() as usize, existing.as_ref());
                     on_save(calendar_id, event);
                     dialog.close();
                 }
@@ -659,7 +689,7 @@ pub fn show_event_editor(
         let calendar_dropdown = calendar_dropdown.clone();
         let calendar_ids = calendar_ids.clone();
         let error_label = error_label.clone();
-        let existing_meta = existing_meta.clone();
+        let existing = existing_for_delete;
         delete_button.connect_clicked(move |_| {
             let selected = calendar_dropdown.selected() as usize;
             let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
@@ -669,10 +699,62 @@ pub fn show_event_editor(
             };
             // Delete doesn't validate the form's times - the user may have
             // left the fields in a broken state and still want the event gone.
-            if let Some((uid, href, etag)) = &existing_meta {
-                on_delete(calendar_id, uid.clone(), href.clone(), etag.clone());
+            if let Some(occ) = &existing {
+                on_delete(calendar_id, occ.clone());
                 dialog.close();
             }
+        });
+    }
+
+    // Print: snapshot the live form state (title, when, series, attendees,
+    // ... exactly what the user is looking at) into a printable HTML document.
+    {
+        let dialog = dialog.clone();
+        let calendar_labels = calendar_labels.clone();
+        let calendar_dropdown = calendar_dropdown.clone();
+        let title_row = title_row.clone();
+        let attendees_field = attendees_field.clone();
+        let location_row = location_row.clone();
+        let all_day_switch = all_day_switch.clone();
+        let start_date = start_date.clone();
+        let start_hour = start_hour.clone();
+        let start_minute = start_minute.clone();
+        let end_date = end_date.clone();
+        let end_hour = end_hour.clone();
+        let end_minute = end_minute.clone();
+        let video_toggle = video_toggle.clone();
+        let video_url_row = video_url_row.clone();
+        let categorize_entry = categorize_entry.clone();
+        let busy_dropdown = busy_dropdown.clone();
+        let sensitivity_dropdown = sensitivity_dropdown.clone();
+        let reminder_dropdown = reminder_dropdown.clone();
+        let description_buffer = description_buffer.clone();
+        let series = series.clone();
+        print_button.connect_clicked(move |_| {
+            let html = printable_event_html(
+                &calendar_labels,
+                &calendar_dropdown,
+                &title_row,
+                &attendees_field,
+                &location_row,
+                &all_day_switch,
+                &start_date,
+                &start_hour,
+                &start_minute,
+                &end_date,
+                &end_hour,
+                &end_minute,
+                &video_toggle,
+                &video_url_row,
+                &categorize_entry,
+                &busy_dropdown,
+                &sensitivity_dropdown,
+                &reminder_dropdown,
+                reminder_choices,
+                &description_buffer,
+                &series,
+            );
+            crate::window::print_html_once(&html, &dialog);
         });
     }
 
@@ -758,10 +840,14 @@ fn synthetic_occurrence(calendar_id: CalendarId, title: &str, start: DateTime<Ut
         end,
         all_day,
         rrule: None,
+        recurrence_id: None,
+        exdates: Vec::new(),
         master_start: None,
         master_end: None,
         href: None,
         etag: None,
+        master_href: None,
+        master_etag: None,
         attendees: Vec::new(),
         organizer: None,
         categories: Vec::new(),
@@ -803,6 +889,112 @@ fn local_to_utc(naive: NaiveDateTime) -> DateTime<Utc> {
         chrono::LocalResult::Ambiguous(earlier, _later) => earlier.with_timezone(&Utc),
         chrono::LocalResult::None => chrono::Local.from_utc_datetime(&naive).with_timezone(&Utc),
     }
+}
+
+/// Renders the editor's current form state as a self-contained HTML document
+/// for the Print action - a snapshot of exactly what the user is looking at,
+/// so printing an event never depends on the dialog staying open (and works
+/// for read-only webcal events, whose form fields are locked but still
+/// carry the event's details).
+#[allow(clippy::too_many_arguments)]
+fn printable_event_html(
+    calendar_labels: &[String],
+    calendar_dropdown: &gtk::DropDown,
+    title_row: &adw::EntryRow,
+    attendees_field: &RecipientEntry,
+    location_row: &adw::EntryRow,
+    all_day_switch: &gtk::Switch,
+    start_date: &Rc<Cell<NaiveDate>>,
+    start_hour: &gtk::SpinButton,
+    start_minute: &gtk::SpinButton,
+    end_date: &Rc<Cell<NaiveDate>>,
+    end_hour: &gtk::SpinButton,
+    end_minute: &gtk::SpinButton,
+    video_toggle: &adw::SwitchRow,
+    video_url_row: &adw::EntryRow,
+    categorize_entry: &gtk::Entry,
+    busy_dropdown: &gtk::DropDown,
+    sensitivity_dropdown: &gtk::DropDown,
+    reminder_dropdown: &gtk::DropDown,
+    reminder_choices: &[(&str, Option<i64>)],
+    description_buffer: &gtk::TextBuffer,
+    series: &recurrence::SeriesControl,
+) -> String {
+    let esc = |s: &str| gtk::glib::markup_escape_text(s).to_string();
+    let all_day = all_day_switch.is_active();
+    let start_local = date_time_from_form(start_date, start_hour, start_minute, all_day);
+    let end_local = date_time_from_form(end_date, end_hour, end_minute, all_day);
+    let when = if all_day {
+        format!("{} – {}", start_local.format("%A, %B %-e, %Y"), end_local.format("%A, %B %-e, %Y"))
+    } else {
+        format!("{} – {}", start_local.format("%A, %B %-e, %Y · %H:%M"), end_local.format("%A, %B %-e, %Y · %H:%M"))
+    };
+    let series_text = match &series.unrepresentable_raw {
+        Some(raw) => raw.clone(),
+        None => series.current().map(|rule| recurrence::describe(&rule)).unwrap_or_else(|| "Does not repeat".to_string()),
+    };
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    rows.push(("When", when));
+    rows.push(("Series", series_text));
+    if let Some(label) = calendar_labels.get(calendar_dropdown.selected() as usize) {
+        rows.push(("Calendar", label.clone()));
+    }
+    let location = location_row.text().to_string();
+    if !location.is_empty() {
+        rows.push(("Location", location));
+    }
+    let attendees = attendees_field.addresses().join(", ");
+    if !attendees.is_empty() {
+        rows.push(("Attendees", attendees));
+    }
+    if video_toggle.is_active() {
+        let url = video_url_row.text().to_string();
+        rows.push(("Video call", if url.is_empty() { "Yes".to_string() } else { url }));
+    }
+    let categories = categorize_entry.text().to_string();
+    if !categories.is_empty() {
+        rows.push(("Categories", categories));
+    }
+    rows.push(("Show as", if busy_dropdown.selected() == 1 { "Free".to_string() } else { "Busy".to_string() }));
+    rows.push((
+        "Sensitivity",
+        match sensitivity_dropdown.selected() {
+            1 => "Private",
+            2 => "Confidential",
+            _ => "Public",
+        }
+        .to_string(),
+    ));
+    rows.push((
+        "Reminder",
+        reminder_choices
+            .get(reminder_dropdown.selected() as usize)
+            .map(|(label, _)| label.to_string())
+            .unwrap_or_else(|| "No reminder".to_string()),
+    ));
+    let body = rows
+        .into_iter()
+        .map(|(label, value)| format!("<tr><th>{}</th><td>{}</td></tr>", esc(label), esc(&value)))
+        .collect::<String>();
+    let description = description_buffer.text(&description_buffer.start_iter(), &description_buffer.end_iter(), false).to_string();
+    let description_html = if description.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"description\">{}</div>", esc(&description))
+    };
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+         <style>body {{ font-family: sans-serif; color: #1f2328; margin: 2em; }} \
+         h1 {{ font-size: 1.5em; margin: 0 0 0.8em; }} \
+         table {{ border-collapse: collapse; }} \
+         th {{ text-align: left; padding: 0.2em 1.5em 0.2em 0; vertical-align: top; white-space: nowrap; color: #57606a; font-weight: 600; }} \
+         td {{ padding: 0.2em 0; }} \
+         .description {{ margin-top: 1.2em; white-space: pre-wrap; }}</style>\
+         </head><body><h1>{}</h1><table>{}</table>{}</body></html>",
+        esc(&title_row.text()),
+        body,
+        description_html,
+    )
 }
 
 /// The calendar's currently selected date, formatted for the date button's
@@ -869,6 +1061,13 @@ struct FormInput {
     video_enabled: bool,
     conference_url_text: String,
     rrule: Option<String>,
+    /// The instance this event is an override of (see
+    /// [`CalendarEvent::recurrence_id`]) - set by the scope control, not the
+    /// form fields.
+    recurrence_id: Option<DateTime<Utc>>,
+    recurrence_range: RecurrenceRange,
+    /// The series' EXDATEs, carried so a whole-series save doesn't drop them.
+    exdates: Vec<DateTime<Utc>>,
     owner_email: Option<String>,
     existing_meta: Option<EventMeta>,
 }
@@ -883,6 +1082,66 @@ struct FormInput {
 /// model's exclusive convention - one day after the last day for all-day
 /// events). The drag path's counterpart of [`build_event_from_input`], which
 /// rebuilds the same fields from the form instead.
+/// Applies the recurring-edit scope choice to the finished event, right
+/// before it's handed to the save route. `occurrence` is the occurrence the
+/// editor opened with (None for a brand-new event). A no-op for non-recurring
+/// events (there's only one instance, so there's no scope to choose) -
+/// safe to call unconditionally from every save path.
+///
+/// - "All events" (2): the event is the master itself. When the occurrence
+///   being edited was derived from a per-occurrence override, the target
+///   resource becomes the master's own (an override-derived occurrence
+///   carries the master's href/etag separately), not the override's.
+/// - "This occurrence" (0): the event becomes a per-occurrence override
+///   VEVENT anchored at the series instance it replaces (`RECURRENCE-ID` =
+///   the instance's original series time, not the form's possibly-edited
+///   times). A plain expansion creates a brand-new resource (no href/etag →
+///   `If-None-Match`); an existing override is updated in place, keeping its
+///   own href/etag.
+/// - "This and following" (1): like "This occurrence", but the override
+///   carries `RANGE=THISANDFUTURE` and keeps the series rule, so it also
+///   replaces every later instance.
+pub(crate) fn apply_edit_scope(event: &mut CalendarEvent, scope: usize, occurrence: Option<&EventOccurrence>) {
+    let recurring = occurrence.is_some_and(|occ| occ.rrule.is_some() || occ.recurrence_id.is_some());
+    if !recurring {
+        return;
+    }
+    let from_override = occurrence.is_some_and(|occ| occ.recurrence_id.is_some());
+    match scope {
+        // "This occurrence": a single-instance override.
+        0 => {
+            event.recurrence_id = occurrence.and_then(|occ| occ.recurrence_id).or_else(|| occurrence.map(|occ| occ.start));
+            event.recurrence_range = RecurrenceRange::This;
+            // A single-instance override is a non-recurring VEVENT, and the
+            // master's EXDATEs belong to the master - neither rides along.
+            event.rrule = None;
+            event.exdates = Vec::new();
+            if !from_override {
+                event.href = None;
+                event.etag = None;
+            }
+        }
+        // "This and following": a THISANDFUTURE override.
+        1 => {
+            event.recurrence_id = occurrence.and_then(|occ| occ.recurrence_id).or_else(|| occurrence.map(|occ| occ.start));
+            event.recurrence_range = RecurrenceRange::ThisAndFuture;
+            event.exdates = Vec::new();
+            if !from_override {
+                event.href = None;
+                event.etag = None;
+            }
+        }
+        // "All events": the master's own resource is the update target even
+        // when the occurrence came from an override.
+        _ => {
+            if from_override {
+                event.href = occurrence.and_then(|occ| occ.master_href.clone()).or_else(|| occurrence.and_then(|occ| occ.href.clone()));
+                event.etag = occurrence.and_then(|occ| occ.master_etag.clone()).or_else(|| occurrence.and_then(|occ| occ.etag.clone()));
+            }
+        }
+    }
+}
+
 pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveDateTime, end_local: NaiveDateTime) -> CalendarEvent {
     let model_end = if occ.all_day { end_local + chrono::Duration::days(1) } else { end_local };
     CalendarEvent {
@@ -895,6 +1154,10 @@ pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveD
         end: local_to_utc(model_end),
         all_day: occ.all_day,
         rrule: occ.rrule.clone(),
+        recurrence_id: occ.recurrence_id,
+        recurrence_range: RecurrenceRange::default(),
+        exdates: occ.exdates.clone(),
+        rdates: Vec::new(),
         href: occ.href.clone(),
         etag: occ.etag.clone(),
         attendees: occ.attendees.clone(),
@@ -957,6 +1220,10 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         end: local_to_utc(model_end),
         all_day: input.all_day,
         rrule: input.rrule,
+        recurrence_id: input.recurrence_id,
+        recurrence_range: input.recurrence_range,
+        exdates: input.exdates,
+        rdates: Vec::new(),
         href,
         etag,
         attendees,
@@ -991,6 +1258,9 @@ mod tests {
             video_enabled: false,
             conference_url_text: String::new(),
             rrule: None,
+            recurrence_id: None,
+            recurrence_range: RecurrenceRange::default(),
+            exdates: Vec::new(),
             owner_email: None,
             existing_meta: None,
         }
@@ -1068,10 +1338,14 @@ mod tests {
             end: local_to_utc(start + chrono::Duration::hours(1)),
             all_day: false,
             rrule: None,
+            recurrence_id: None,
+            exdates: Vec::new(),
             master_start: None,
             master_end: None,
             href: Some("https://dav.example.com/cal/evt-1.ics".to_string()),
             etag: Some("\"abc\"".to_string()),
+            master_href: None,
+            master_etag: None,
             attendees: vec![Attendee {
                 address: EmailAddress::new("alice@example.com"),
                 role: AttendeeRole::Required,
@@ -1118,10 +1392,14 @@ mod tests {
             end: local_to_utc(start + chrono::Duration::days(2)),
             all_day: true,
             rrule: None,
+            recurrence_id: None,
+            exdates: Vec::new(),
             master_start: None,
             master_end: None,
             href: None,
             etag: None,
+            master_href: None,
+            master_etag: None,
             attendees: Vec::new(),
             organizer: None,
             categories: Vec::new(),
@@ -1137,5 +1415,104 @@ mod tests {
         assert_eq!(event.start, local_to_utc(moved));
         assert_eq!(event.end, local_to_utc(moved + chrono::Duration::days(2)));
         assert!(event.all_day);
+    }
+
+    #[test]
+    fn apply_edit_scope_this_turns_a_plain_expansion_into_a_fresh_override() {
+        let instance = local_to_utc(NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(),
+            chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        ));
+        let mut occ = EventOccurrence {
+            uid: EventUid("evt-3@example.com".to_string()),
+            calendar_id: CalendarId("work".to_string()),
+            summary: Some("Sync".to_string()),
+            description: None,
+            location: None,
+            start: instance,
+            end: instance + chrono::Duration::hours(1),
+            all_day: false,
+            rrule: Some("FREQ=WEEKLY".to_string()),
+            recurrence_id: None,
+            exdates: vec!["2026-08-19T09:00:00Z".parse().unwrap()],
+            master_start: Some(instance),
+            master_end: Some(instance + chrono::Duration::hours(1)),
+            href: Some("https://dav.example.com/cal/master.ics".to_string()),
+            etag: Some("\"m1\"".to_string()),
+            master_href: None,
+            master_etag: None,
+            attendees: Vec::new(),
+            organizer: None,
+            categories: Vec::new(),
+            sensitivity: EventSensitivity::default(),
+            transparency: EventTransparency::default(),
+            reminder_minutes_before: None,
+            conference_url: None,
+        };
+        // The form's times are the *edited* times - the override anchors the
+        // original series instance.
+        let edited = instance + chrono::Duration::hours(2);
+        let mut event = calendar_event_from_occurrence(
+            &occ,
+            edited.with_timezone(&chrono::Local).naive_local(),
+            (edited + chrono::Duration::hours(2)).with_timezone(&chrono::Local).naive_local(),
+        );
+        apply_edit_scope(&mut event, 0, Some(&occ));
+        assert_eq!(event.recurrence_id, Some(instance), "anchors the original instance, not the edited time");
+        assert_eq!(event.recurrence_range, RecurrenceRange::This);
+        assert_eq!(event.rrule, None, "a single-instance override carries no RRULE");
+        assert_eq!(event.exdates, Vec::<DateTime<Utc>>::new(), "the master's EXDATEs stay with the master");
+        assert_eq!(event.href, None, "a fresh override is a brand-new resource");
+        assert_eq!(event.etag, None);
+
+        // Editing an *existing* override updates its own resource instead.
+        occ.recurrence_id = Some(instance);
+        occ.href = Some("https://dav.example.com/cal/override.ics".to_string());
+        occ.etag = Some("\"o1\"".to_string());
+        occ.master_href = Some("https://dav.example.com/cal/master.ics".to_string());
+        occ.master_etag = Some("\"m1\"".to_string());
+        let mut event = calendar_event_from_occurrence(
+            &occ,
+            edited.with_timezone(&chrono::Local).naive_local(),
+            (edited + chrono::Duration::hours(2)).with_timezone(&chrono::Local).naive_local(),
+        );
+        apply_edit_scope(&mut event, 0, Some(&occ));
+        assert_eq!(event.recurrence_id, Some(instance));
+        assert_eq!(event.href.as_deref(), Some("https://dav.example.com/cal/override.ics"));
+        assert_eq!(event.etag.as_deref(), Some("\"o1\""));
+
+        // "This and following" keeps the series rule and marks the range.
+        let mut event = calendar_event_from_occurrence(
+            &occ,
+            edited.with_timezone(&chrono::Local).naive_local(),
+            (edited + chrono::Duration::hours(2)).with_timezone(&chrono::Local).naive_local(),
+        );
+        apply_edit_scope(&mut event, 1, Some(&occ));
+        assert_eq!(event.recurrence_range, RecurrenceRange::ThisAndFuture);
+        assert_eq!(event.rrule.as_deref(), Some("FREQ=WEEKLY"));
+
+        // "All events" from an override targets the master's resource.
+        let mut event = calendar_event_from_occurrence(
+            &occ,
+            edited.with_timezone(&chrono::Local).naive_local(),
+            (edited + chrono::Duration::hours(2)).with_timezone(&chrono::Local).naive_local(),
+        );
+        event.rrule = Some("FREQ=WEEKLY".to_string());
+        apply_edit_scope(&mut event, 2, Some(&occ));
+        assert_eq!(event.href.as_deref(), Some("https://dav.example.com/cal/master.ics"));
+        assert_eq!(event.etag.as_deref(), Some("\"m1\""));
+
+        // Non-recurring events are untouched by any scope.
+        occ.rrule = None;
+        occ.recurrence_id = None;
+        occ.exdates = Vec::new();
+        let mut event = calendar_event_from_occurrence(
+            &occ,
+            edited.with_timezone(&chrono::Local).naive_local(),
+            (edited + chrono::Duration::hours(2)).with_timezone(&chrono::Local).naive_local(),
+        );
+        apply_edit_scope(&mut event, 0, Some(&occ));
+        assert_eq!(event.recurrence_id, None);
+        assert_eq!(event.rrule, None);
     }
 }
