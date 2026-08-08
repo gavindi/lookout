@@ -15,7 +15,7 @@ use std::rc::Rc;
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use gtk::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{EmailSummary, MailboxId, Uid};
+use lookout_core::{EmailSummary, MailboxId, ThreadKey, Uid};
 
 /// Which field the message list is ordered by. Paired with
 /// `UiState::sort_descending`, this is the whole of the list's ordering
@@ -249,6 +249,9 @@ pub fn format_row_date(date: DateTime<Utc>, now: DateTime<Utc>) -> String {
 pub enum MessageItem {
     /// A collapsible date-bucket header.
     Section(SectionRow),
+    /// A collapsible conversation header - the date section's children when
+    /// threading is on, itself the parent of its messages' rows.
+    Thread(ThreadRow),
     /// One message. Boxed because `EmailSummary` is large, and an unboxed
     /// variant would size every section row to it too.
     Message(Box<EmailSummary>),
@@ -259,12 +262,69 @@ pub struct SectionRow {
     pub label: String,
 }
 
-/// How the list is arranged for a given sort: grouped under date headers, or
-/// a flat run of messages.
+/// Thread identity: the `(mailbox, thread key)` pair the messages of one
+/// conversation share. Mailbox-prefixed so identical `ThreadKey`s from
+/// different mailboxes - the `subject:`-normalized fallback keys above all -
+/// can't merge unrelated messages in the unified "All Inboxes" view, where
+/// every mailbox's key set was computed independently by
+/// `lookout_core::thread::compute_thread_keys`.
+pub type ThreadId = (MailboxId, ThreadKey);
+
+/// The header row of one collapsible conversation, derived from the thread's
+/// newest message (the one its section placement and the row's date column
+/// follow) plus the aggregate state of its whole message set.
+#[derive(Clone, Debug)]
+pub struct ThreadRow {
+    pub id: ThreadId,
+    /// The newest message's sender, rendered like a message row's sender.
+    pub sender: String,
+    /// Every participant's display name, newest-message first - the header's
+    /// tooltip, so who's in the conversation is a hover away.
+    pub participants: Vec<String>,
+    /// The newest message's subject. `None` (→ "(no subject)") matches how a
+    /// plain message row renders.
+    pub subject: Option<String>,
+    /// How many messages the conversation contains. Hidden for the
+    /// count-1 case - a lone message renders as itself, not as a thread.
+    pub count: usize,
+    /// The newest message's date - the header's date column.
+    pub latest: DateTime<Utc>,
+    /// Any message in the thread is unread - the header bolds like an unread
+    /// message row does.
+    pub has_unread: bool,
+    /// Any message in the thread is flagged - the header shows the flag icon.
+    pub has_starred: bool,
+}
+
+/// One row a date section's child store holds in threaded mode: a
+/// multi-message conversation (a collapsible `Thread` header) or a lone
+/// message (rendered exactly as in unthreaded mode, since a thread of one
+/// would be a header that exists only to hide its single child).
+#[derive(Debug)]
+enum ThreadEntry {
+    Thread(ThreadLayout),
+    Single(EmailSummary),
+}
+
+/// A conversation in the display layout: the header row that goes in the
+/// section's store, plus the messages that fill its child store.
+#[derive(Debug)]
+struct ThreadLayout {
+    row: ThreadRow,
+    /// The thread's messages, oldest-first (natural reading order for a
+    /// conversation). Kept here rather than in `ThreadRow` because the boxed
+    /// row object never needs the messages themselves - only the splice that
+    /// builds the child store does.
+    messages: Vec<EmailSummary>,
+}
+
+/// How the list is arranged for a given sort: grouped under date headers, a
+/// flat run of messages, or date headers over collapsible conversations.
 #[derive(Debug)]
 enum ListLayout {
     Flat(Vec<EmailSummary>),
     Grouped(Vec<(DateBucket, String, Vec<EmailSummary>)>),
+    Threaded(Vec<(DateBucket, String, Vec<ThreadEntry>)>),
 }
 
 /// Splits an already-sorted message list into the sections the list renders.
@@ -278,32 +338,159 @@ enum ListLayout {
 /// date, so runs come out contiguous and already in the right order - and,
 /// for free, an ascending sort yields oldest-section-first, the exact mirror
 /// of the descending layout. That's why `DateBucket` needs no `Ord`.
-fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>) -> ListLayout {
+///
+/// With `threaded` set, conversations (`group_threads`) are cut instead of
+/// bare messages, and each conversation sits in the section of its *newest*
+/// message's date - a two-day-old root whose reply landed today belongs to
+/// Today, not to the root's bucket. The section run-cut stays valid because
+/// each thread's newest message is the first of its members in the
+/// newest-first scan, so the per-thread latest dates the cuts follow are
+/// monotone in the same way single messages' dates were.
+fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>, threaded: bool, descending: bool) -> ListLayout {
     if key != SortKey::Date {
         return ListLayout::Flat(sorted);
     }
-    let mut sections: Vec<(DateBucket, String, Vec<EmailSummary>)> = Vec::new();
-    for message in sorted {
-        let bucket = bucket_for(message.date, now);
-        match sections.last_mut() {
-            Some((last, _, messages)) if *last == bucket => messages.push(message),
-            _ => {
-                debug_assert!(
-                    !sections.iter().any(|(b, _, _)| *b == bucket),
-                    "bucket_for is not monotone in date: {bucket:?} emitted twice"
-                );
-                sections.push((bucket, bucket_label(bucket, now), vec![message]));
+    let sections: Vec<(DateBucket, String, Vec<ThreadEntry>)> = if threaded {
+        // `group_threads` scans newest-first (it needs each thread's newest
+        // member to place it), so an ascending sort is mirrored by reversing
+        // the scan order first and then the finished sections, exactly as the
+        // run-cut below mirrors itself.
+        let mut messages = sorted;
+        if !descending {
+            messages.reverse();
+        }
+        let mut sections: Vec<(DateBucket, String, Vec<ThreadEntry>)> = Vec::new();
+        for entry in group_threads(&messages) {
+            let latest = match &entry {
+                ThreadEntry::Thread(thread) => thread.row.latest,
+                ThreadEntry::Single(message) => message.date,
+            };
+            let bucket = bucket_for(latest, now);
+            match sections.last_mut() {
+                Some((last, _, entries)) if *last == bucket => entries.push(entry),
+                _ => sections.push((bucket, bucket_label(bucket, now), vec![entry])),
             }
         }
+        if !descending {
+            // Mirror the descending layout: sections oldest-first, threads
+            // within a section by oldest latest first. A thread's own message
+            // order is *not* reversed - oldest-first is the natural reading
+            // order of a conversation whichever way the list sorts.
+            sections.reverse();
+            for (_, _, entries) in &mut sections {
+                entries.reverse();
+            }
+        }
+        sections
+    } else {
+        let mut sections: Vec<(DateBucket, String, Vec<ThreadEntry>)> = Vec::new();
+        for message in sorted {
+            let bucket = bucket_for(message.date, now);
+            match sections.last_mut() {
+                Some((last, _, entries)) if *last == bucket => entries.push(ThreadEntry::Single(message)),
+                _ => {
+                    debug_assert!(
+                        !sections.iter().any(|(b, _, _)| *b == bucket),
+                        "bucket_for is not monotone in date: {bucket:?} emitted twice"
+                    );
+                    sections.push((bucket, bucket_label(bucket, now), vec![ThreadEntry::Single(message)]));
+                }
+            }
+        }
+        sections
+    };
+    if !threaded {
+        // The unthreaded layout keeps its old shape: sections of bare
+        // messages.
+        let grouped = sections
+            .into_iter()
+            .map(|(bucket, label, entries)| {
+                let messages = entries.into_iter().map(|e| match e {
+                    ThreadEntry::Single(message) => message,
+                    ThreadEntry::Thread(_) => unreachable!("unthreaded layout never holds thread entries"),
+                });
+                (bucket, label, messages.collect())
+            })
+            .collect();
+        return ListLayout::Grouped(grouped);
     }
-    ListLayout::Grouped(sections)
+    ListLayout::Threaded(sections)
+}
+
+/// Splits a newest-first message list into display entries, in scan order:
+/// multi-message conversations as `Thread` headers (their messages carried
+/// oldest-first) and lone messages as `Single`s.
+///
+/// A conversation's identity is the `(mailbox, thread key)` pair the
+/// summaries already carry (`EmailSummary::thread_key`, computed by
+/// `lookout_core::thread::compute_thread_keys` at sync time and persisted in
+/// the envelope cache), so no re-derivation is needed here - and the key's
+/// stability across re-syncs is what lets a thread's collapse state (keyed by
+/// the same pair) survive the constant rebuilds. A thread of one renders as
+/// its message, not a header: a header whose only child is itself adds a row
+/// to every conversation without earning its keep.
+fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
+    let mut threads: HashMap<ThreadId, Vec<EmailSummary>> = HashMap::new();
+    let mut order: Vec<ThreadId> = Vec::new();
+    for message in messages {
+        let id = (message.mailbox.clone(), message.thread_key.clone());
+        if !threads.contains_key(&id) {
+            order.push(id.clone());
+        }
+        threads.entry(id).or_default().push(message.clone());
+    }
+    let mut entries = Vec::with_capacity(order.len());
+    for id in order {
+        // Newest-first (inserted in scan order), so the first member is the
+        // one the header and the section placement follow.
+        let mut emails = threads.remove(&id).expect("order only lists inserted ids");
+        // An empty key means no sync ever computed one (a summary read from
+        // an old cache, or one that never went through `sync_mailbox`).
+        // Grouping it would merge every such message into one conversation,
+        // so each renders as a lone row instead.
+        if id.1 .0.is_empty() {
+            entries.extend(emails.into_iter().map(ThreadEntry::Single));
+            continue;
+        }
+        let latest = emails.remove(0);
+        if emails.is_empty() {
+            entries.push(ThreadEntry::Single(latest));
+            continue;
+        }
+        // The child store carries the *whole* conversation, oldest-first (the
+        // natural reading order); `latest` goes back on as the newest member.
+        emails.reverse();
+        emails.push(latest.clone());
+        let sender = latest.from.first().map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
+        let mut participants: Vec<String> = Vec::new();
+        for message in &emails {
+            for address in &message.from {
+                let label = address.display_label().to_string();
+                if !participants.contains(&label) {
+                    participants.push(label);
+                }
+            }
+        }
+        let row = ThreadRow {
+            id,
+            sender,
+            participants,
+            subject: latest.subject.clone(),
+            count: emails.len(),
+            latest: latest.date,
+            has_unread: latest.is_unread() || emails.iter().any(|m| m.is_unread()),
+            has_starred: latest.is_starred() || emails.iter().any(|m| m.is_starred()),
+        };
+        entries.push(ThreadEntry::Thread(ThreadLayout { row, messages: emails }));
+    }
+    entries
 }
 
 /// Message identity, the two flag-derived styles (unread, flagged), the four
-/// text fields a row renders, and the color-tag keywords it carries. Named
-/// rather than written inline so the tuple stays under clippy's
-/// type-complexity threshold.
-type MessageRowKey = (MailboxId, Uid, bool, bool, DateTime<Utc>, Option<String>, String, Option<String>, Vec<String>);
+/// text fields a row renders, the color-tag keywords it carries, and its
+/// thread key. Named rather than written inline so the tuple stays under
+/// clippy's type-complexity threshold.
+type MessageRowKey = (MailboxId, Uid, bool, bool, DateTime<Utc>, Option<String>, String, Option<String>, Vec<String>, ThreadKey);
 
 /// A compact fingerprint of the fields one message-list row displays, keyed
 /// to keep the row distinct from any other. Used to detect "nothing changed"
@@ -326,6 +513,9 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
     // be skipped. (A tag *recolor/rename* changes no keyword, so it can't be
     // detected here - `MessageListModel::refresh` exists for that.)
     let tags: Vec<String> = m.keywords.iter().filter(|k| lookout_core::tag_key_from_keyword(k).is_some()).cloned().collect();
+    // `thread_key` decides which conversation a row belongs to when the list
+    // is threaded, so a re-sync that re-groups messages must count as a
+    // change even when every rendered field is identical.
     (
         m.mailbox.clone(),
         m.uid,
@@ -336,12 +526,13 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
         from,
         m.preview.clone(),
         tags,
+        m.thread_key.clone(),
     )
 }
 
-/// The list's contents as last rendered, plus the sort and filter that
-/// produced them - the comparison `repopulate` skips a rebuild on.
-type DisplayedMessages = Option<(SortKey, bool, ListFilter, Vec<EmailSummary>)>;
+/// The list's contents as last rendered, plus the sort, filter, and threading
+/// mode that produced them - the comparison `repopulate` skips a rebuild on.
+type DisplayedMessages = Option<(SortKey, bool, ListFilter, bool, Vec<EmailSummary>)>;
 
 /// What the message list's selection currently points at. The cases are
 /// genuinely distinct to the reading pane: nothing selected clears it, a
@@ -364,10 +555,12 @@ pub enum SelectionKind {
     Multiple(Vec<EmailSummary>),
 }
 
-/// The message list's model: a two-level `Gtk.TreeListModel` whose root rows
-/// are collapsible date sections and whose children are the messages in each,
-/// plus the selection over it. Replaces what used to be a flat
-/// `gio::ListStore` of messages paired with a `SingleSelection`.
+/// The message list's model: a `Gtk.TreeListModel` whose root rows are
+/// collapsible date sections and whose children are either the messages in
+/// each (unthreaded) or collapsible conversation headers whose own children
+/// are their messages (threaded), plus the selection over it. Replaces what
+/// used to be a flat `gio::ListStore` of messages paired with a
+/// `SingleSelection`.
 ///
 /// The selection is a `MultiSelection` (not `SingleSelection`) so batch
 /// actions can act on more than one message - `GtkListView` handles
@@ -392,11 +585,28 @@ pub struct MessageListModel {
     /// swapping in a fresh store would leave that row pointing at a discarded
     /// one. Rebuilds splice *into* these instead.
     sections: Rc<RefCell<HashMap<DateBucket, gio::ListStore>>>,
+    /// One child store per conversation, for the thread rows' own children -
+    /// the third tree level, only populated while threading is on. Same
+    /// outlive-the-rebuild discipline as `sections`.
+    threads: Rc<RefCell<HashMap<ThreadId, gio::ListStore>>>,
     /// Sections the user has collapsed. Collapse is the exception, so an
     /// absent bucket means expanded and a newly-appearing section defaults
     /// open. Lives outside the model so it survives the constant rebuilds
     /// (cache replay, live sync, on-demand sync) that recreate every row.
     collapsed: Rc<RefCell<HashSet<DateBucket>>>,
+    /// Conversations the user has collapsed, keyed by the thread's stable
+    /// `(mailbox, thread key)` identity - the same discipline as `collapsed`,
+    /// and the reason `ThreadRow` keeps its id rather than deriving anything
+    /// from display data. Kept even across threading-mode toggles (a capture
+    /// only rewrites it when thread rows were actually on screen), so
+    /// off-and-on doesn't forget the user's collapses.
+    collapsed_threads: Rc<RefCell<HashSet<ThreadId>>>,
+    /// Whether conversations render collapsed under their headers (on) or as
+    /// bare messages (off). Owned by the model rather than `UiState`, like
+    /// `filter`, so the rebuild-skipping check in `repopulate` can compare it
+    /// without threading it through every call site; `set_threaded` is the
+    /// one way in.
+    threaded: Rc<RefCell<bool>>,
     /// What's currently on screen, in display order, and the sort + filter
     /// that produced it. Kept here rather than in `UiState` so `repopulate`
     /// never has to hold a `UiState` borrow across a `splice` - which
@@ -419,20 +629,30 @@ impl MessageListModel {
     pub fn build() -> Self {
         let root = gio::ListStore::new::<glib::BoxedAnyObject>();
         let sections: Rc<RefCell<HashMap<DateBucket, gio::ListStore>>> = Rc::new(RefCell::new(HashMap::new()));
+        let threads: Rc<RefCell<HashMap<ThreadId, gio::ListStore>>> = Rc::new(RefCell::new(HashMap::new()));
         let tree = gtk::TreeListModel::new(root.clone(), false, false, {
             let sections = sections.clone();
+            let threads = threads.clone();
             move |item| {
                 let boxed = item.downcast_ref::<glib::BoxedAnyObject>()?;
                 let item = boxed.borrow::<MessageItem>();
-                let MessageItem::Section(section) = &*item else {
+                let store = match &*item {
+                    // A section's children are its conversation headers and
+                    // lone messages.
+                    MessageItem::Section(section) => sections
+                        .borrow_mut()
+                        .entry(section.bucket)
+                        .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
+                        .clone(),
+                    // A conversation's children are its messages.
+                    MessageItem::Thread(thread) => threads
+                        .borrow_mut()
+                        .entry(thread.id.clone())
+                        .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
+                        .clone(),
                     // A message is a leaf: no child model, no expander.
-                    return None;
+                    MessageItem::Message(_) => return None,
                 };
-                let store = sections
-                    .borrow_mut()
-                    .entry(section.bucket)
-                    .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
-                    .clone();
                 Some(store.upcast::<gio::ListModel>())
             }
         });
@@ -446,7 +666,10 @@ impl MessageListModel {
             tree,
             selection,
             sections,
+            threads,
             collapsed: Rc::new(RefCell::new(HashSet::new())),
+            collapsed_threads: Rc::new(RefCell::new(HashSet::new())),
+            threaded: Rc::new(RefCell::new(true)),
             displayed: Rc::new(RefCell::new(None)),
             truth: Rc::new(RefCell::new(Vec::new())),
             filter: Rc::new(RefCell::new(ListFilter::All)),
@@ -501,17 +724,17 @@ impl MessageListModel {
     }
 
     /// The full `EmailSummary` at flat position `i`, or `None` if that row is
-    /// a section header. Like `message_at`, but cloning the whole summary
-    /// rather than just its `(mailbox, uid)` identity - `message_at` stays
-    /// separate since `restore_selection`'s identity-only walk shouldn't pay
-    /// for a clone it doesn't need.
+    /// a section or thread header. Like `message_at`, but cloning the whole
+    /// summary rather than just its `(mailbox, uid)` identity - `message_at`
+    /// stays separate since `restore_selection`'s identity-only walk
+    /// shouldn't pay for a clone it doesn't need.
     fn summary_at(&self, i: u32) -> Option<EmailSummary> {
         let row = self.selection.item(i).and_downcast::<gtk::TreeListRow>()?;
         let boxed = row.item().and_downcast::<glib::BoxedAnyObject>()?;
         let item = boxed.borrow::<MessageItem>();
         match &*item {
             MessageItem::Message(summary) => Some((**summary).clone()),
-            MessageItem::Section(_) => None,
+            MessageItem::Section(_) | MessageItem::Thread(_) => None,
         }
     }
 
@@ -556,11 +779,16 @@ impl MessageListModel {
         // can be element-identical under ascending and descending order yet
         // still need re-grouping, because the sections come out mirrored. So
         // is the filter - a change to it must rebuild even when the surviving
-        // subset happens to be element-identical.
-        let unchanged = self.displayed.borrow().as_ref().is_some_and(|(key, descending, shown_filter, current)| {
+        // subset happens to be element-identical. And so is the threading
+        // mode: the same message set renders a different tree under
+        // conversations than under bare messages, and flipping the View-tab
+        // toggle must rebuild even when nothing else moved.
+        let threaded = *self.threaded.borrow();
+        let unchanged = self.displayed.borrow().as_ref().is_some_and(|(key, descending, shown_filter, shown_threaded, current)| {
             *key == sort_key
                 && *descending == sort_descending
                 && *shown_filter == filter
+                && *shown_threaded == threaded
                 && current.len() == messages.len()
                 && current.iter().zip(messages.iter()).all(|(a, b)| message_row_key(a) == message_row_key(b))
         });
@@ -586,11 +814,15 @@ impl MessageListModel {
             gtk::INVALID_LIST_POSITION
         };
 
-        *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, messages.clone()));
+        *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, threaded, messages.clone()));
 
-        match build_layout(messages, sort_key, Local::now()) {
+        match build_layout(messages, sort_key, Local::now(), threaded, sort_descending) {
             ListLayout::Flat(messages) => {
+                // No sections, no threads: every child store drains, so a
+                // later threaded rebuild can't resurrect rows from a layout
+                // that has been gone since the last capture.
                 self.clear_sections(&HashSet::new());
+                self.clear_threads(&HashSet::new());
                 let rows: Vec<glib::Object> = messages
                     .into_iter()
                     .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m))).upcast())
@@ -616,6 +848,62 @@ impl MessageListModel {
                     store.splice(0, store.n_items(), &rows);
                 }
                 self.clear_sections(&live);
+                // A grouped layout holds no thread rows, so every thread store
+                // drains too - stale threads must not survive into a rebuild
+                // that re-threads and finds the same id again.
+                self.clear_threads(&HashSet::new());
+
+                let rows: Vec<glib::Object> = sections
+                    .into_iter()
+                    .map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast())
+                    .collect();
+                self.root.splice(0, self.root.n_items(), &rows);
+                self.apply_expansion();
+            }
+            ListLayout::Threaded(sections) => {
+                // Two child levels to splice before the roots: each section's
+                // store holds its conversation headers and lone messages, and
+                // each conversation's store holds its messages.
+                let live_buckets: HashSet<DateBucket> = sections.iter().map(|(b, _, _)| *b).collect();
+                let mut live_threads: HashSet<ThreadId> = HashSet::new();
+                for (bucket, _, entries) in &sections {
+                    let store = self
+                        .sections
+                        .borrow_mut()
+                        .entry(*bucket)
+                        .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
+                        .clone();
+                    let rows: Vec<glib::Object> = entries
+                        .iter()
+                        .map(|entry| match entry {
+                            ThreadEntry::Thread(thread) => glib::BoxedAnyObject::new(MessageItem::Thread(thread.row.clone())).upcast(),
+                            ThreadEntry::Single(message) => glib::BoxedAnyObject::new(MessageItem::Message(Box::new(message.clone()))).upcast(),
+                        })
+                        .collect();
+                    store.splice(0, store.n_items(), &rows);
+
+                    for entry in entries {
+                        let ThreadEntry::Thread(thread) = entry else { continue };
+                        live_threads.insert(thread.row.id.clone());
+                        let thread_store = self
+                            .threads
+                            .borrow_mut()
+                            .entry(thread.row.id.clone())
+                            .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
+                            .clone();
+                        // Children oldest-first (the order `group_threads`
+                        // left them in) - the natural reading order of a
+                        // conversation regardless of the list's sort.
+                        let message_rows: Vec<glib::Object> = thread
+                            .messages
+                            .iter()
+                            .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast())
+                            .collect();
+                        thread_store.splice(0, thread_store.n_items(), &message_rows);
+                    }
+                }
+                self.clear_sections(&live_buckets);
+                self.clear_threads(&live_threads);
 
                 let rows: Vec<glib::Object> = sections
                     .into_iter()
@@ -638,9 +926,27 @@ impl MessageListModel {
         }
         *self.filter.borrow_mut() = filter;
         let (sort_key, sort_descending) = match *self.displayed.borrow() {
-            Some((key, descending, _, _)) => (key, descending),
+            Some((key, descending, _, _, _)) => (key, descending),
             // Nothing has ever been rendered; the defaults are what a first
             // repopulate would use anyway.
+            None => (SortKey::Date, true),
+        };
+        let truth = self.all_messages();
+        self.repopulate(truth, sort_key, sort_descending);
+    }
+
+    /// Turns conversation grouping on or off and re-renders from the stored
+    /// unfiltered set. Only a `SortKey::Date` list is affected - sender and
+    /// subject sorts render flat either way (`build_layout`), so toggling
+    /// while one is active just records the mode for when the list is next
+    /// sorted by date. A no-op when the mode is already in effect.
+    pub fn set_threaded(&self, threaded: bool) {
+        if *self.threaded.borrow() == threaded {
+            return;
+        }
+        *self.threaded.borrow_mut() = threaded;
+        let (sort_key, sort_descending) = match *self.displayed.borrow() {
+            Some((key, descending, _, _, _)) => (key, descending),
             None => (SortKey::Date, true),
         };
         let truth = self.all_messages();
@@ -656,7 +962,7 @@ impl MessageListModel {
     /// rendered yet" and rebuild unconditionally.
     pub fn refresh(&self) {
         let (sort_key, sort_descending) = match *self.displayed.borrow() {
-            Some((key, descending, _, _)) => (key, descending),
+            Some((key, descending, _, _, _)) => (key, descending),
             None => (SortKey::Date, true),
         };
         // Clearing `displayed` first makes the no-op check see "nothing
@@ -682,6 +988,19 @@ impl MessageListModel {
         }
     }
 
+    /// Empties every conversation store whose thread id isn't in `live` - the
+    /// `sections`-level counterpart for the threads map. Called whenever the
+    /// new layout holds no thread rows at all (flat and grouped layouts pass
+    /// an empty set), so a stale thread store can never resurface its old
+    /// messages under a row the next threaded rebuild re-creates for the same
+    /// id.
+    fn clear_threads(&self, live: &HashSet<ThreadId>) {
+        let stale: Vec<gio::ListStore> = self.threads.borrow().iter().filter(|(id, _)| !live.contains(*id)).map(|(_, store)| store.clone()).collect();
+        for store in stale {
+            store.splice(0, store.n_items(), &[] as &[glib::Object]);
+        }
+    }
+
     /// Re-projects the user's collapsed-section set onto the freshly-created
     /// `TreeListRow`s, and re-arms the handler that keeps it up to date. This
     /// is what makes a collapse survive the constant rebuilds.
@@ -692,6 +1011,7 @@ impl MessageListModel {
     /// count and scroll extent would be wrong.
     fn apply_expansion(&self) {
         let collapsed = self.collapsed.borrow().clone();
+        let collapsed_threads = self.collapsed_threads.borrow().clone();
         for i in 0..self.root.n_items() {
             // `child_row` indexes the *root* model, so this walk is immune to
             // the flat row count changing underneath it as each expansion
@@ -699,12 +1019,29 @@ impl MessageListModel {
             let Some(row) = self.tree.child_row(i) else { continue };
             let Some(bucket) = section_bucket(&row) else { continue };
             row.set_expanded(!collapsed.contains(&bucket));
+            // One level deeper: each section's children include conversation
+            // headers, which get their own expansion state. `row.child_row`
+            // is the tree's own child accessor (the section must be expanded
+            // first, hence the order above); `row.children()` would hand back
+            // the *raw* child store - `BoxedAnyObject` items, not
+            // `TreeListRow`s - and a thread collapsed by the user would then
+            // silently re-expand here.
+            if row.is_expanded() {
+                let mut c = 0;
+                while let Some(child) = row.child_row(c) {
+                    c += 1;
+                    if let Some(id) = thread_id(&child) {
+                        child.set_expanded(!collapsed_threads.contains(&id));
+                    }
+                }
+            }
         }
     }
 
-    /// Records which sections are collapsed right now, so the next rebuild
-    /// can put them back. Must run before any splice - the rows it reads are
-    /// exactly what the splice destroys.
+    /// Records which sections - and, one level deeper, which conversations -
+    /// are collapsed right now, so the next rebuild can put them back. Must
+    /// run before any splice - the rows it reads are exactly what the splice
+    /// destroys.
     ///
     /// Reading the model beats listening to `notify::expanded`, which was the
     /// obvious approach and does not work: `TreeListModel` hands out
@@ -713,9 +1050,16 @@ impl MessageListModel {
     /// user's later collapse. The same signal also fires when a splice tears
     /// rows down, which is indistinguishable from a real collapse. The
     /// model's own expansion state has neither problem.
+    ///
+    /// A thread row nested under a *collapsed* section is invisible, so it
+    /// can never have been collapsed by the user and reads as expanded
+    /// whatever the model materialized - capturing that as "not collapsed" is
+    /// exactly right.
     fn capture_collapsed(&self) {
         let mut collapsed = HashSet::new();
+        let mut collapsed_threads = HashSet::new();
         let mut saw_section = false;
+        let mut saw_thread = false;
         for i in 0..self.root.n_items() {
             let Some(row) = self.tree.child_row(i) else { continue };
             let Some(bucket) = section_bucket(&row) else { continue };
@@ -723,13 +1067,32 @@ impl MessageListModel {
             if !row.is_expanded() {
                 collapsed.insert(bucket);
             }
+            // Only an expanded section's thread rows can carry a user's
+            // collapse - a collapsed one hides its threads from interaction.
+            if row.is_expanded() {
+                let mut c = 0;
+                while let Some(child) = row.child_row(c) {
+                    c += 1;
+                    if let Some(id) = thread_id(&child) {
+                        saw_thread = true;
+                        if !child.is_expanded() {
+                            collapsed_threads.insert(id);
+                        }
+                    }
+                }
+            }
         }
-        // Only a grouped list can speak for the collapsed set. A flat one
-        // (a sender/subject sort) has no section rows at all, and letting it
-        // write an empty set would forget the user's collapses across a
-        // there-and-back sort change.
+        // Only a grouped list can speak for the collapsed sets. A flat one
+        // (a sender/subject sort) has no section or thread rows at all, and
+        // letting it write empty sets would forget the user's collapses
+        // across a there-and-back sort change. Each set is only rewritten
+        // when rows of its own kind were on screen, so an unthreaded capture
+        // never wipes the thread collapses (or vice versa).
         if saw_section {
             *self.collapsed.borrow_mut() = collapsed;
+        }
+        if saw_thread {
+            *self.collapsed_threads.borrow_mut() = collapsed_threads;
         }
     }
 
@@ -790,14 +1153,14 @@ impl MessageListModel {
     }
 
     /// The `(mailbox, uid)` of the message at flat position `i`, or `None`
-    /// if that row is a section header.
+    /// if that row is a section or thread header.
     fn message_at(&self, i: u32) -> Option<(MailboxId, Uid)> {
         let row = self.selection.item(i).and_downcast::<gtk::TreeListRow>()?;
         let boxed = row.item().and_downcast::<glib::BoxedAnyObject>()?;
         let item = boxed.borrow::<MessageItem>();
         match &*item {
             MessageItem::Message(summary) => Some((summary.mailbox.clone(), summary.uid)),
-            MessageItem::Section(_) => None,
+            MessageItem::Section(_) | MessageItem::Thread(_) => None,
         }
     }
 }
@@ -809,7 +1172,18 @@ fn section_bucket(row: &gtk::TreeListRow) -> Option<DateBucket> {
     let item = boxed.borrow::<MessageItem>();
     match &*item {
         MessageItem::Section(section) => Some(section.bucket),
-        MessageItem::Message(_) => None,
+        MessageItem::Message(_) | MessageItem::Thread(_) => None,
+    }
+}
+
+/// The thread identity a section-level `TreeListRow` heads, or `None` if the
+/// row is a section header or a message.
+fn thread_id(row: &gtk::TreeListRow) -> Option<ThreadId> {
+    let boxed = row.item().and_downcast::<glib::BoxedAnyObject>()?;
+    let item = boxed.borrow::<MessageItem>();
+    match &*item {
+        MessageItem::Thread(thread) => Some(thread.id.clone()),
+        MessageItem::Section(_) | MessageItem::Message(_) => None,
     }
 }
 
@@ -980,6 +1354,55 @@ mod tests {
         // Switching back to All restores everything from the truth.
         filtered.set_filter(ListFilter::All);
         assert_eq!(filtered.selection.n_items(), 6, "switching back to All restored the hidden rows");
+
+        // --- Conversations: a thread of two collapses under one header, and
+        // the collapse survives both rebuilds and a threading-mode round-trip
+        // ---
+        let threaded = MessageListModel::build();
+        // The reply is today's, the root yesterday's - the thread's section is
+        // the *newest* member's, so only Today remains.
+        let root = in_thread(summary(1, yesterday), "t");
+        let reply = in_thread(summary(2, today), "t");
+        let single = summary(3, today);
+        threaded.repopulate(vec![reply, root, single], SortKey::Date, true);
+        // Today's header + thread header + its 2 children + the single.
+        assert_eq!(threaded.selection.n_items(), 5, "the thread did not expand");
+        assert!(threaded.collapsed_threads.borrow().is_empty(), "a rebuild recorded a phantom thread collapse");
+
+        threaded.tree.child_row(0).expect("root row 0").set_expanded(true);
+        let thread_row = threaded.tree.child_row(0).expect("root row 0").child_row(0).expect("thread row");
+        assert!(thread_row.is_expandable(), "the thread header is not a collapsible row");
+        thread_row.set_expanded(false);
+        assert_eq!(threaded.selection.n_items(), 3, "collapsing the thread hid its messages");
+
+        // A rebuild with different contents can't short-circuit the identity
+        // check - the thread collapse must survive it.
+        threaded.repopulate(
+            vec![in_thread(summary(4, today), "t"), in_thread(summary(1, yesterday), "t"), summary(3, today)],
+            SortKey::Date,
+            true,
+        );
+        let thread_row = threaded.tree.child_row(0).expect("root row 0").child_row(0).expect("thread row");
+        assert!(!thread_row.is_expanded(), "the thread collapse did not survive a rebuild");
+
+        // Toggling conversations off flattens the thread back into messages,
+        // and back on re-groups it - with the collapse remembered.
+        threaded.set_threaded(false);
+        assert_eq!(threaded.selection.n_items(), 5, "unthreaded: two sections + three messages");
+        threaded.set_threaded(true);
+        assert_eq!(threaded.selection.n_items(), 3, "threading back on must not expand a collapsed thread");
+        let thread_row = threaded.tree.child_row(0).expect("root row 0").child_row(0).expect("thread row");
+        assert!(!thread_row.is_expanded(), "the collapse was forgotten across the mode toggle");
+
+        // --- A threading toggle is a real change even when the message set
+        // is byte-identical, so the no-op check can't swallow the rebuild ---
+        threaded.set_threaded(false);
+        threaded.set_threaded(true);
+        assert_eq!(threaded.selection.n_items(), 3, "flipping the mode did not rebuild");
+
+        // --- A sender sort ignores threading and renders flat ---
+        threaded.repopulate(vec![summary(1, today), summary(2, today)], SortKey::Sender, true);
+        assert_eq!(threaded.selection.n_items(), 2, "a sender sort should render flat under threading");
     }
 
     #[test]
@@ -1043,8 +1466,14 @@ mod tests {
     fn non_date_sorts_render_flat() {
         let now = local(2026, 8, 4, 8);
         let messages = vec![summary(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 2, 1))];
-        assert!(matches!(build_layout(messages.clone(), SortKey::Sender, now), ListLayout::Flat(m) if m.len() == 2));
-        assert!(matches!(build_layout(messages, SortKey::Subject, now), ListLayout::Flat(m) if m.len() == 2));
+        assert!(matches!(
+            build_layout(messages.clone(), SortKey::Sender, now, true, true),
+            ListLayout::Flat(m) if m.len() == 2
+        ));
+        assert!(matches!(
+            build_layout(messages, SortKey::Subject, now, true, true),
+            ListLayout::Flat(m) if m.len() == 2
+        ));
     }
 
     #[test]
@@ -1057,7 +1486,7 @@ mod tests {
             summary(3, utc_on(now, 2026, 7, 15)),
             summary(4, utc_on(now, 2026, 2, 22)),
         ];
-        let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now) else {
+        let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now, false, true) else {
             panic!("expected a grouped layout");
         };
         let shape: Vec<(DateBucket, &str, usize)> = sections.iter().map(|(b, l, m)| (*b, l.as_str(), m.len())).collect();
@@ -1078,7 +1507,7 @@ mod tests {
             summary(3, utc_on(now, 2024, 12, 25)),
             summary(4, utc_on(now, 2023, 1, 1)),
         ];
-        let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now) else {
+        let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now, false, true) else {
             panic!("expected a grouped layout");
         };
         let shape: Vec<(DateBucket, &str, usize)> = sections.iter().map(|(b, l, m)| (*b, l.as_str(), m.len())).collect();
@@ -1102,11 +1531,153 @@ mod tests {
             summary(3, utc_on(now, 2026, 7, 15)),
             summary(1, utc_on(now, 2026, 8, 4)),
         ];
-        let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now) else {
+        let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now, false, false) else {
             panic!("expected a grouped layout");
         };
         let buckets: Vec<DateBucket> = sections.iter().map(|(b, _, _)| *b).collect();
         assert_eq!(buckets, vec![DateBucket::Older, DateBucket::LastMonth, DateBucket::Today]);
+    }
+
+    fn in_thread(mut summary: EmailSummary, key: &str) -> EmailSummary {
+        summary.thread_key = ThreadKey(key.into());
+        summary
+    }
+
+    fn from_alice(mut summary: EmailSummary) -> EmailSummary {
+        summary.from = vec![lookout_core::EmailAddress {
+            name: Some("Alice".to_string()),
+            address: "alice@example.com".to_string(),
+        }];
+        summary
+    }
+
+    /// The latest message a thread header's `messages` vec ends with -
+    /// `messages` is oldest-first, so the newest member is its last element.
+    fn latest_uid(entry: &ThreadEntry) -> u32 {
+        match entry {
+            ThreadEntry::Thread(t) => t.messages.last().map(|m| m.uid.0).unwrap_or(t.row.latest.timestamp() as u32),
+            ThreadEntry::Single(m) => m.uid.0,
+        }
+    }
+
+    fn shape(sections: &[(DateBucket, String, Vec<ThreadEntry>)]) -> Vec<(DateBucket, &str, Vec<&str>)> {
+        sections
+            .iter()
+            .map(|(b, l, entries)| {
+                let kinds = entries.iter().map(|e| match e {
+                    ThreadEntry::Thread(t) => t.row.subject.as_deref().unwrap_or("(no subject)"),
+                    ThreadEntry::Single(m) => m.subject.as_deref().unwrap_or("(no subject)"),
+                });
+                (*b, l.as_str(), kinds.collect())
+            })
+            .collect()
+    }
+
+    /// A two-message conversation (root + reply) collapses under one thread
+    /// header, which sits in the section of its *newest* message - the reply
+    /// landing today pulls the whole thread (two-day-old root included) up
+    /// into Today. A lone message stays a bare row.
+    #[test]
+    fn threaded_layout_buckets_by_the_newest_message_and_keeps_singletons_flat() {
+        let now = local(2026, 8, 4, 8);
+        let root = with_subject(from_alice(in_thread(summary(1, utc_on(now, 2026, 8, 2)), "kickoff")), "Project kickoff");
+        let reply = with_subject(from_alice(in_thread(summary(2, utc_on(now, 2026, 8, 4)), "kickoff")), "Re: Project kickoff");
+        let single = with_subject(summary(3, utc_on(now, 2026, 7, 15)), "Standalone");
+        let messages = vec![reply.clone(), single.clone(), root.clone()];
+        let ListLayout::Threaded(sections) = build_layout(messages, SortKey::Date, now, true, true) else {
+            panic!("expected a threaded layout");
+        };
+        // The thread's root stays inside it (not a second Today row) and the
+        // thread itself sits in the bucket of its newest member.
+        assert_eq!(
+            shape(&sections),
+            vec![
+                (DateBucket::Today, "Today", vec!["Re: Project kickoff"]),
+                (DateBucket::LastMonth, "July", vec!["Standalone"])
+            ]
+        );
+        let (_, _, today) = &sections[0];
+        match &today[0] {
+            ThreadEntry::Thread(thread) => {
+                assert_eq!(thread.row.count, 2);
+                assert_eq!(thread.row.subject.as_deref(), Some("Re: Project kickoff"));
+                // Oldest-first reading order inside the conversation.
+                assert_eq!(thread.messages.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1, 2]);
+                // The sender and aggregate flags follow the newest message
+                // (the test fixtures are unread by default, so the header
+                // inherits that from its newest member).
+                assert_eq!(thread.row.sender, "Alice");
+                assert!(thread.row.has_unread);
+            }
+            ThreadEntry::Single(_) => panic!("the conversation should be a thread header"),
+        }
+    }
+
+    /// An ascending date sort mirrors the sections and the threads within
+    /// them, but a conversation's own message order stays oldest-first - the
+    /// natural reading order, whatever direction the list sorts.
+    #[test]
+    fn threaded_layout_mirrors_sections_not_thread_contents() {
+        let now = local(2026, 8, 4, 8);
+        // Two threads, both with replies today; the earlier-started one is
+        // also the one with the older latest reply.
+        let older_thread = {
+            let root = in_thread(summary(1, utc_on(now, 2026, 8, 1)), "a");
+            let reply = in_thread(summary(2, utc_on(now, 2026, 8, 4) + chrono::Duration::hours(9)), "a");
+            vec![root, reply]
+        };
+        let newer_thread = {
+            let root = in_thread(summary(3, utc_on(now, 2026, 8, 2)), "b");
+            let reply = in_thread(summary(4, utc_on(now, 2026, 8, 4) + chrono::Duration::hours(11)), "b");
+            vec![root, reply]
+        };
+        let mut descending = older_thread.clone();
+        descending.extend(newer_thread.iter().cloned());
+        sort_messages(&mut descending, SortKey::Date, true);
+        let ListLayout::Threaded(desc) = build_layout(descending, SortKey::Date, now, true, true) else {
+            panic!("expected a threaded layout");
+        };
+        let (_, _, entries) = &desc[0];
+        let desc_order: Vec<u32> = entries.iter().map(latest_uid).collect();
+        assert_eq!(desc_order, vec![4, 2], "newest latest-reply first");
+
+        let mut ascending = older_thread;
+        ascending.extend(newer_thread);
+        // The ascending caller passes the list oldest-first, matching what
+        // `sort_messages` produces for `descending = false`.
+        sort_messages(&mut ascending, SortKey::Date, false);
+        let ListLayout::Threaded(asc) = build_layout(ascending, SortKey::Date, now, true, false) else {
+            panic!("expected a threaded layout");
+        };
+        let (_, _, entries) = &asc[0];
+        let asc_order: Vec<u32> = entries.iter().map(latest_uid).collect();
+        assert_eq!(asc_order, vec![2, 4], "oldest latest-reply first when ascending");
+        let ThreadEntry::Thread(first) = &entries[0] else { panic!("expected a thread") };
+        assert_eq!(first.messages.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1, 2], "thread contents never mirror");
+    }
+
+    /// Two mailboxes can produce identical `ThreadKey`s (the subject-fallback
+    /// keys in particular), and the unified view merges both mailboxes into
+    /// one list - so the thread identity must be mailbox-prefixed or the
+    /// unrelated messages would merge into one conversation.
+    #[test]
+    fn thread_identity_is_mailbox_scoped() {
+        let now = local(2026, 8, 4, 8);
+        let mut a = with_subject(in_thread(at(1, "one:INBOX", 2026, 8, 4, 9), "weekly"), "Weekly sync");
+        let mut b = with_subject(in_thread(at(2, "two:INBOX", 2026, 8, 4, 9), "weekly"), "Weekly sync");
+        a.message_id = Some("<a@x>".into());
+        b.message_id = Some("<b@x>".into());
+        let ListLayout::Threaded(sections) = build_layout(vec![a, b], SortKey::Date, now, true, true) else {
+            panic!("expected a threaded layout");
+        };
+        let (_, _, entries) = &sections[0];
+        assert_eq!(entries.len(), 2, "same subject-fallback key in two mailboxes must not merge");
+        assert!(entries.iter().all(|e| matches!(e, ThreadEntry::Single(_))));
+    }
+
+    fn with_subject(mut summary: EmailSummary, subject: &str) -> EmailSummary {
+        summary.subject = Some(subject.to_string());
+        summary
     }
 
     /// True when two ordered message lists are display-identical - the pure

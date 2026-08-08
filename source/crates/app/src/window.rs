@@ -92,6 +92,17 @@ struct MessageRowWidgets {
     expander: gtk::TreeExpander,
     header_label: gtk::Label,
     message_box: gtk::Box,
+    /// The conversation-header row: an expander over the same sender /
+    /// subject / date line a message row shows, plus the participant count.
+    /// Built in `connect_setup` and toggled in `bind` like the other two row
+    /// kinds (see the `header_box`/`message_box` notes there).
+    thread_box: gtk::Box,
+    thread_expander: gtk::TreeExpander,
+    thread_sender: gtk::Label,
+    thread_subject: gtk::Label,
+    thread_count: gtk::Label,
+    thread_flag: gtk::Image,
+    thread_date: gtk::Label,
     /// Batch-select checkbox, kept in sync with the row's real selection
     /// state (see `checkbox_suppress`'s note) rather than driving it
     /// directly - clicking it and ctrl/shift-clicking the row are two inputs
@@ -875,6 +886,22 @@ fn install_paned_css() {
             border-top: 1px solid rgba(255, 255, 255, 0.06);
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
         }
+        /* Conversation headers read as a distinct row kind from both section
+           headers (darker band) and messages (bordered): a subtle tint that
+           also backs the expander's chevron so the thread's disclosure is
+           visible against the background image. */
+        .message-thread-row {
+            background-color: rgba(255, 255, 255, 0.04);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        /* The participant-count badge: a pill so the number reads as a count,
+           not a fourth text column. */
+        .message-thread-count {
+            font-size: 0.9em;
+            background-color: rgba(255, 255, 255, 0.08);
+            border-radius: 9999px;
+            padding: 0 7px;
+        }
         .message-column-header {
             background-color: rgba(0, 0, 0, 0.3);
             border-top: 1px solid rgba(255, 255, 255, 0.06);
@@ -1309,9 +1336,45 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         message_box.append(&checkbox);
         message_box.append(&text_column);
 
+        // The conversation-header row: its own expander (the section header's
+        // expander lives in `header_box`) driving a single sender/subject/date
+        // line, with the participant count as the extra column that marks a
+        // row as a thread rather than a message. Widths deliberately match
+        // the message row's (`width_request(180)` sender, hexpand subject) so
+        // threads and messages line up in the same columns.
+        let thread_sender = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let thread_subject = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let thread_count = gtk::Label::builder().xalign(0.0).css_classes(["message-thread-count"]).build();
+        let thread_flag = gtk::Image::builder()
+            .icon_name(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"]))
+            .pixel_size(12)
+            .css_classes(["message-flag-icon"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let thread_date = gtk::Label::builder().xalign(1.0).build();
+        let thread_top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+        thread_top.append(&thread_sender);
+        thread_top.append(&thread_subject);
+        thread_top.append(&thread_count);
+        thread_top.append(&thread_flag);
+        thread_top.append(&thread_date);
+        let thread_expander = gtk::TreeExpander::new();
+        thread_expander.set_child(Some(&thread_top));
+        let thread_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(14)
+            .margin_end(10)
+            .build();
+        thread_box.add_css_class("message-thread-row");
+        thread_box.append(&thread_expander);
+
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         row_box.append(&header_box);
         row_box.append(&message_box);
+        row_box.append(&thread_box);
 
         // Action box (initially hidden)
         let action_box = gtk::Box::builder()
@@ -1512,6 +1575,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     expander,
                     header_label,
                     message_box,
+                    thread_box,
+                    thread_expander,
+                    thread_sender,
+                    thread_subject,
+                    thread_count,
+                    thread_flag,
+                    thread_date,
                     checkbox,
                     checkbox_suppress,
                     accent,
@@ -1540,6 +1610,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             MessageItem::Section(section) => {
                 widgets.header_box.set_visible(true);
                 widgets.message_box.set_visible(false);
+                widgets.thread_box.set_visible(false);
                 widgets.action_box.set_visible(false);
                 widgets.tag_dots.set_visible(false);
                 // What actually draws the disclosure chevron and drives
@@ -1566,6 +1637,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             MessageItem::Message(summary) => {
                 widgets.header_box.set_visible(false);
                 widgets.message_box.set_visible(true);
+                widgets.thread_box.set_visible(false);
                 // Must be set explicitly, not just left alone: these are
                 // `ListItem` properties that survive widget recycling, so a
                 // row that last rendered a header would stay unclickable.
@@ -1655,6 +1727,48 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
                 *widgets.bound.borrow_mut() = Some((**summary).clone());
             }
+            MessageItem::Thread(thread) => {
+                widgets.header_box.set_visible(false);
+                widgets.message_box.set_visible(false);
+                widgets.thread_box.set_visible(true);
+                widgets.action_box.set_visible(false);
+                widgets.tag_dots.set_visible(false);
+                // A conversation header is not a selection target, exactly
+                // like a section header: clicking it expands/collapses (via
+                // the `TreeExpander`) rather than selecting, and it can never
+                // enter `MultiSelection`'s selection set. The batch actions'
+                // checkboxes and the hover quick actions both key off the row
+                // being a message, so a thread row shows neither.
+                list_item.set_selectable(false);
+                list_item.set_activatable(false);
+                *widgets.bound.borrow_mut() = None;
+                widgets.thread_expander.set_list_row(Some(&row));
+                widgets.thread_sender.set_label(&thread.sender);
+                widgets.thread_subject.set_label(thread.subject.as_deref().unwrap_or("(no subject)"));
+                widgets.thread_count.set_label(&thread.count.to_string());
+                // Who's in the conversation, a hover away - on the row itself
+                // rather than the count badge, so the whole header answers it.
+                widgets
+                    .thread_box
+                    .set_tooltip_text(Some(&format!("{} messages: {}", thread.count, thread.participants.join(", "))));
+                widgets.thread_date.set_label(&format_row_date(thread.latest, chrono::Utc::now()));
+                widgets.thread_flag.set_visible(thread.has_starred);
+                // Unread bolds the whole header like it bolds a message row:
+                // an unread member makes the conversation's sender, subject,
+                // and date read as unread.
+                let unread = thread.has_unread;
+                widgets
+                    .thread_sender
+                    .set_css_classes(if unread { &["message-sender-unread"] } else { &["message-sender-read"] });
+                widgets
+                    .thread_subject
+                    .set_css_classes(if unread { &["message-subject-unread"] } else { &["message-subject-read"] });
+                widgets.thread_date.set_css_classes(if unread {
+                    &["caption", "message-date-unread"]
+                } else {
+                    &["caption", "message-date-read"]
+                });
+            }
         }
     });
     message_factory.connect_unbind(move |_, list_item| {
@@ -1669,6 +1783,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // Don't keep a recycled row pinned to a `TreeListRow` it no longer
         // renders.
         widgets.expander.set_list_row(None);
+        widgets.thread_expander.set_list_row(None);
     });
     let message_list_view = gtk::ListView::new(Some(message_list.selection.clone()), Some(message_factory));
     message_list_view.add_css_class("message-list");
@@ -2816,11 +2931,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let overview_pane_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").build();
     overview_pane_toggle.set_tooltip_text(Some("Calendar overview"));
     overview_pane_toggle.set_active(true);
+    let conversations_toggle = gtk::ToggleButton::builder()
+        .icon_name(themed_icon_name(&["mail-replied-symbolic", "mail-forwarded-symbolic"]))
+        .build();
+    conversations_toggle.set_tooltip_text(Some("Conversations: group replies under collapsible thread headers"));
+    conversations_toggle.set_active(true);
     let view_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     view_toolbar.append(&layout_label);
     view_toolbar.append(&folder_pane_toggle);
     view_toolbar.append(&reading_pane_toggle);
     view_toolbar.append(&overview_pane_toggle);
+    view_toolbar.append(&conversations_toggle);
 
     let view_toolbar_stack = gtk::Stack::new();
     view_toolbar_stack.add_named(&command_toolbar, Some("mail-home"));
@@ -2995,6 +3116,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             mail_calendar_overview_card.set_visible(btn.is_active());
         });
     }
+    {
+        // Conversations: re-render the message list in or out of thread
+        // grouping. The mode lives in the model (`set_threaded`), and the
+        // setting persists it - mirroring how the sort controls own their
+        // state in `UiState` while GSettings mirrors it.
+        let state = state.clone();
+        let message_list = message_list.clone();
+        conversations_toggle.connect_toggled(move |btn| {
+            state.borrow().settings.set_bool(crate::settings::MAIL_THREADED, btn.is_active());
+            message_list.set_threaded(btn.is_active());
+        });
+    }
     // Phase 5: apply the persisted Layout toggles now that their handlers are
     // wired (each `set_active` fires `toggled`, which sets the card's
     // visibility), so the pane layout comes back as the user left it. The
@@ -3004,6 +3137,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         folder_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_FOLDER_PANE));
         reading_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_READING_PANE));
         overview_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_CALENDAR_OVERVIEW));
+        conversations_toggle.set_active(persisted.get_bool(crate::settings::MAIL_THREADED));
     }
 
     // Which sub-page each view should show when its nav-rail button becomes

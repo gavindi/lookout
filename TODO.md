@@ -55,7 +55,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [x] Message-list sorting (date/sender/subject) + favorites section pinned to the folder tree (GSettings)
 - [x] Full-text search: per-account SQLite FTS5 index + IMAP `SEARCH` fallback (SearchBar, 300ms debounce)
 - [ ] Internal drag-drop (move/tag) + external drag-out (`.eml`/`.zip`)
-- [ ] Collapsible thread UI
+- [x] Collapsible thread UI — conversations grouped under collapsible headers (View tab "Conversations" toggle, GSettings `mail-threaded`), threads placed by their newest message's date section, children oldest-first, collapse state keyed by stable `(mailbox, thread key)` identity so it survives rebuilds and mode toggles
 - [x] Color-tag keywords (`$Lookout-tag-*`) + "Manage tags…" dialog — server-side `STORE` atoms, cache-patched, per-tag row dots
 - [x] Recipient-chip/autocomplete composer widget (see Phase 1)
 - [x] Message flags (`STORE`) — mark-as-read on open, toolbar Flag toggle

@@ -42,6 +42,7 @@ pub const PANE_CONTACTS_SIDEBAR_WIDTH_PCT: &str = "pane-contacts-sidebar-width-p
 pub const SORT_KEY: &str = "sort-key";
 pub const SORT_DESCENDING: &str = "sort-descending";
 pub const MAIL_FAVORITES: &str = "mail-favorites";
+pub const MAIL_THREADED: &str = "mail-threaded";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
@@ -119,6 +120,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(SORT_KEY, Value::String("date".into()));
     map.insert(SORT_DESCENDING, Value::Bool(true));
     map.insert(MAIL_FAVORITES, Value::Strv(Vec::new()));
+    map.insert(MAIL_THREADED, Value::Bool(true));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));

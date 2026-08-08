@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.3" date="2026-08-08">
+      <description>
+        <p>Conversations in the message list: replies are now grouped under collapsible thread headers (a sender/subject/date line with a participant-count badge) under the default By Date sort, with each conversation placed by its newest message and its messages shown oldest-first. A new Conversations toggle in the View tab turns the grouping off and on, and the setting persists between sessions. Thread headers aren't selection targets - batch actions, quick actions, and the reading pane still work on individual messages.</p>
+      </description>
+    </release>
     <release version="0.9.1" date="2026-08-08">
       <description>
         <p>Composing is cleaner: the composer's "Manage identities…" row and "Rich text" switch are now handled in Config - Manage identities lives under each account in Config → Mail accounts, and the Rich text setting in Config → Mail picks the editor your new messages open in, with the mid-compose plain/rich toggle still available in the editor's formatting toolbar. Also fixed: the nav rail's Config button no longer disappears when the window is made very short - the rail scrolls instead of clipping it.</p>

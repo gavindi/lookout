@@ -74,6 +74,11 @@
       <summary>Favorite mailboxes</summary>
       <description>MailboxIds of folders pinned to the top of the folder tree.</description>
     </key>
+    <key name="mail-threaded" type="b">
+      <default>true</default>
+      <summary>Group replies into conversations</summary>
+      <description>Show replies as collapsible conversation threads in the message list instead of bare messages.</description>
+    </key>
 
     <!-- Mail settings -->
     <key name="mail-load-remote-images" type="b">

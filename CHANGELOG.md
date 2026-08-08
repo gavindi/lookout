@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.3 (2026-08-08)
+
+### Added
+
+- **Mail**: collapsible conversation threads in the message list. Under the default "By Date" sort, replies are grouped under a collapsible thread header (a sender/subject/date line plus a participant-count badge, unread-bolded and flag-marked when any member is) instead of rendering as bare rows; the thread sits in the date section of its *newest* message, its messages are shown oldest-first (natural reading order) under the header, and the header's chevron or a click on the disclosure collapses/expands it. A lone message (no Message-ID chain, no subject-fallback partner) renders exactly as before - no single-message "threads". Thread identity is the `(mailbox, thread key)` pair the envelope sync already computes (`lookout_core::thread::compute_thread_keys`) and the cache persists, so a thread's collapse state survives the constant rebuilds, a threading-mode off/on round-trip, and even a restart; the mailbox prefix keeps two mailboxes' `subject:`-fallback keys from merging in the unified "All Inboxes" view, and summaries without any computed key (old caches) render ungrouped. The View tab gains a **Conversations** toggle (next to the Layout toggles) that flips the mode live, persisted in the new `mail-threaded` GSettings key (default on); sender/subject sorts and search results keep rendering flat regardless. Thread headers are not selection targets - the batch checkboxes, hover quick-actions, and reading pane continue to operate on individual messages.
+
+### Testing
+
+- `lookout-app`: `message_list` tests for the threaded layout - conversations bucketed by their newest message's section, singletons staying bare rows, ascending sorts mirroring sections/threads but never a thread's own oldest-first contents, mailbox-scoped thread identity, empty-key messages never merging, and an end-to-end `TreeListModel` segment (threads expand by default, a collapse survives both rebuilds and a mode round-trip, mode toggles force a rebuild, sender sorts ignore threading) alongside the existing suites.
+
 ## 0.9.2 (2026-08-08)
 
 ### Added
