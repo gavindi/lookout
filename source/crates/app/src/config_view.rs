@@ -73,6 +73,17 @@ pub struct ConfigView {
     /// widgets that animate) can wire its `active` state to disable the
     /// reading pane's crossfades.
     pub animations_row: adw::SwitchRow,
+    /// "Theme" dropdown (Config → Appearance), exposed so the caller can wire
+    /// its selection into the `ThemeManager` and seed it from GSettings.
+    pub theme_row: adw::ComboRow,
+    /// "Custom accent color" switch (Config → Appearance), exposed so the
+    /// caller can arm the accent picker row and map its state to the
+    /// `accent-color` GSettings key (off = follow the system accent).
+    pub accent_switch_row: adw::SwitchRow,
+    /// "Accent color" picker row, exposed so the caller can wire its colour
+    /// button into the `ThemeManager`; disabled until the switch above is on.
+    pub accent_color_row: adw::ActionRow,
+    pub accent_color_button: gtk::ColorDialogButton,
     /// "Window background" row, exposed so the caller can wire its `activated`
     /// signal to a file chooser and update its subtitle to reflect the image
     /// currently in use.
@@ -161,6 +172,31 @@ pub fn build() -> ConfigView {
         .active(true)
         .build();
     appearance_group.add(&animations_row);
+    let theme_model = gtk::StringList::new(&["System", "Flat Dark", "Flat Light"]);
+    let theme_row = adw::ComboRow::builder()
+        .title("Theme")
+        .subtitle("Flat Dark is the classic Lookout look; System follows the desktop scheme")
+        .model(&theme_model)
+        .build();
+    appearance_group.add(&theme_row);
+    let accent_switch_row = adw::SwitchRow::builder()
+        .title("Custom accent color")
+        .subtitle("Use a Lookout-specific accent instead of the system one")
+        .build();
+    appearance_group.add(&accent_switch_row);
+    // The picker row only matters once the switch above is on, so it starts
+    // disabled and the caller arms it with the switch. The button needs a
+    // colour to show from the start - it's replaced by the persisted accent
+    // (or left unused) when the switch is off anyway. The dialog is created
+    // explicitly: GTK does not auto-create one for a NULL button dialog.
+    let accent_color_row = adw::ActionRow::builder().title("Accent color").build();
+    let accent_color_dialog = gtk::ColorDialog::new();
+    let accent_color_button = gtk::ColorDialogButton::new(Some(accent_color_dialog));
+    accent_color_button.set_rgba(&gtk::gdk::RGBA::new(0.21, 0.52, 0.89, 1.0));
+    accent_color_button.set_halign(gtk::Align::End);
+    accent_color_row.set_child(Some(&accent_color_button));
+    accent_color_row.set_sensitive(false);
+    appearance_group.add(&accent_color_row);
     let background_image_row = adw::ActionRow::builder()
         .title("Window background")
         .subtitle("Default Lookout artwork")
@@ -284,6 +320,10 @@ pub fn build() -> ConfigView {
         add_account_row,
         clear_cache_row,
         animations_row,
+        theme_row,
+        accent_switch_row,
+        accent_color_row,
+        accent_color_button,
         background_image_row,
         background_brightness_row,
         background_brightness_scale,

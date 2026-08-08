@@ -170,7 +170,7 @@ fn install_tasks_css() {
                 color: alpha(currentColor, 0.6);
             }
             .task-due-overdue {
-                color: #f66151;
+                color: @lookout-task-overdue;
             }",
         );
         if let Some(display) = gtk::gdk::Display::default() {

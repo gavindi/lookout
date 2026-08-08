@@ -1,6 +1,6 @@
 # TODO
 
-Phases 1-4 are complete; Phase 5 is complete except theming. Four items remain across the roadmap.
+Phases 1-5 are complete. Three items remain across the roadmap.
 
 ## Phase 1 — Mail MVP
 
@@ -111,4 +111,4 @@ Phases 1-4 are complete; Phase 5 is complete except theming. Four items remain a
 
 - [x] In-window Config view (`config_view.rs`) — live account overview, Appearance (transitions, window background), Mail switches, "Clear all caches"; General/Layout/Privacy/Apps placeholders
 - [x] GSettings (schema from system or `build.rs` `OUT_DIR`; in-memory fallback) + serde config file (`app_config.rs`)
-- [ ] libadwaita named-color theming; optional bundled flat-token themes
+- [x] libadwaita named-color theming; optional bundled flat-token themes (0.9.10) — `theme.rs` `ThemeManager` (base palette + `flat-dark`/`flat-light` overrides + custom accent in one display-level provider, registered before the app's rule providers so rules reference `@lookout-*` tokens), Config → Appearance Theme dropdown + Custom accent color picker (the `GtkColorDialogButton` owns an explicit `GtkColorDialog` — a NULL button dialog crashes the colour chooser), `theme-id`/`accent-color` GSettings keys

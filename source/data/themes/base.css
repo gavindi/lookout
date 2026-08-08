@@ -1,0 +1,83 @@
+/* The base named-color palette: every `lookout-*` token the app's CSS rules
+   reference, with a value that either follows the active color scheme
+   (`@theme_*` / `@accent_color` references, re-resolved whenever the system
+   switches light/dark) or is deliberately fixed because it was chosen to read
+   consistently against the window background artwork in both schemes.
+
+   Bundled flat-token themes (`flat-dark.css`, `flat-light.css`) override the
+   tokens they care about; "System" selects this file alone. `theme.rs` loads
+   this first, then the selected theme's overrides, then any custom accent
+   color, all into one display-level CssProvider at APPLICATION priority (so
+   the app's own rules, which only reference these tokens, always win). */
+
+/* --- Surfaces ---------------------------------------------------------- */
+
+/* The translucent folder/config card: fixed black so the window background
+   artwork reads through identically in both schemes. */
+@define-color lookout-pane-bg rgba(0, 0, 0, 0.5);
+/* The overlay that dims the window background toward black. */
+@define-color lookout-dim #000000;
+/* The menu bar's full-width band. */
+@define-color lookout-toolbar-band #000000;
+/* The icon toolbar strip and the checked ribbon tab. */
+@define-color lookout-icon-toolbar-bg #2e2e32;
+/* The Calendar view's main background. */
+@define-color lookout-calendar-bg #2e2e32;
+/* The search entry in the message-list pane header. */
+@define-color lookout-header-search-bg #202020;
+/* Message-list section header bands. */
+@define-color lookout-section-header-bg rgba(0, 0, 0, 0.55);
+/* Message-list column header band. */
+@define-color lookout-column-header-bg rgba(0, 0, 0, 0.3);
+
+/* --- Status text ------------------------------------------------------- */
+
+/* Unread accent, folder unread counts and the dashboard count. Follows the
+   accent so every blue accent in the app stays one axis. */
+@define-color lookout-unread @accent_color;
+/* The amber flag: deliberately not accent-derived so it reads as a separate
+   axis from unread. Fixed: amber works on both schemes. */
+@define-color lookout-flag #e5a50a;
+/* Warm subject colour for read messages. Fixed: works on both schemes. */
+@define-color lookout-subject #c1815c;
+/* Muted metadata (read dates, previews). Scheme-aware. */
+@define-color lookout-muted alpha(@theme_fg_color, 0.6);
+/* Column-header labels. Scheme-aware. */
+@define-color lookout-column-header-fg alpha(@theme_fg_color, 0.5);
+/* Hairline row separators across the message list. Scheme-aware. */
+@define-color lookout-row-separator alpha(@theme_fg_color, 0.08);
+
+/* --- Message-list tints -------------------------------------------------- */
+
+/* The subject bar above the reading pane. Fixed translucent white so it
+   reads against the artwork in both schemes. */
+@define-color lookout-subject-bar-bg rgba(255, 255, 255, 0.05);
+@define-color lookout-subject-bar-border rgba(255, 255, 255, 0.08);
+/* Conversation header rows and the participant-count pill. Fixed: these sit
+   directly over the artwork. */
+@define-color lookout-thread-row-bg rgba(255, 255, 255, 0.04);
+@define-color lookout-thread-count-bg rgba(255, 255, 255, 0.08);
+
+/* --- Recipient chips ----------------------------------------------------- */
+
+/* Valid chip fills follow the accent; invalid chips are a fixed error red. */
+@define-color lookout-chip-bg alpha(@accent_color, 0.18);
+@define-color lookout-chip-border alpha(@accent_color, 0.35);
+@define-color lookout-chip-invalid-bg rgba(224, 108, 117, 0.18);
+@define-color lookout-chip-invalid-border rgba(224, 108, 117, 0.55);
+
+/* --- Avatars ------------------------------------------------------------- */
+
+/* Fixed palette: the fills are chosen to be distinct on both schemes and
+   always carry white initials. */
+@define-color lookout-avatar-0 #e57373;
+@define-color lookout-avatar-1 #64b5f6;
+@define-color lookout-avatar-2 #81c784;
+@define-color lookout-avatar-3 #ffb74d;
+@define-color lookout-avatar-4 #ba68c8;
+@define-color lookout-avatar-5 #4db6ac;
+
+/* --- Tasks ----------------------------------------------------------------- */
+
+/* Overdue task text: the standard error red, legible on both schemes. */
+@define-color lookout-task-overdue #f66151;

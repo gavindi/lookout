@@ -187,7 +187,7 @@ fn install_calendar_css() {
             border: 2px solid alpha(currentColor, 0.45);
         }
         .calendar-main-background {
-            background-color: #2e2e32;
+            background-color: @lookout-calendar-bg;
             border-radius: 12px;
         }
         .calendar-toggle {

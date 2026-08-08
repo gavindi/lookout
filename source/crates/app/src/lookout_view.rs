@@ -420,7 +420,7 @@ fn install_lookout_css() {
         let provider = gtk::CssProvider::new();
         provider.load_from_string(
             ".lookout-count {
-                color: #62a0ea;
+                color: @lookout-unread;
                 font-weight: bold;
                 font-feature-settings: 'tnum';
             }",

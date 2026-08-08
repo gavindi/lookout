@@ -39,6 +39,7 @@ fn main() {
     let gresource_xml = data_dir.join("resources.gresource.xml");
     println!("cargo:rerun-if-changed={}", gresource_xml.display());
     println!("cargo:rerun-if-changed={}", data_dir.join("resources").display());
+    println!("cargo:rerun-if-changed={}", data_dir.join("themes").display());
     println!("cargo:rerun-if-changed={}", data_dir.join("icons/hicolor/scalable/apps").display());
     let gres_bin = PathBuf::from(&out_dir).join("gres.bin");
     match Command::new("glib-compile-resources")

@@ -733,14 +733,14 @@ fn install_paned_css() {
             min-height: 12px;
         }
         .folder-pane {
-            background-color: rgba(0, 0, 0, 0.5);
+            background-color: @lookout-pane-bg;
         }
         /* The black widget overlaid on the window background image while the
            user dims it (Config → Appearance → 'Background dimming'): its
            opacity, set from the widget, controls how much the image darkens
            toward black. */
         .window-background-dim {
-            background-color: black;
+            background-color: @lookout-dim;
         }
         /* The folder rows' trailing unread count. Bold and accent-blue to
            match the message list's unread rows. Tabular figures ('tnum') so
@@ -748,7 +748,7 @@ fn install_paned_css() {
            counts visibly jitter as they update. Single-quoted because this
            whole stylesheet is a plain Rust string literal. */
         .folder-unread-count {
-            color: #62a0ea;
+            color: @lookout-unread;
             font-weight: bold;
             font-size: 0.9em;
             font-feature-settings: 'tnum';
@@ -782,11 +782,11 @@ fn install_paned_css() {
             min-height: 6px;
         }
         .window-toolbars-background {
-            background-color: black;
+            background-color: @lookout-toolbar-band;
             border-radius: 8px;
         }
         .window-icon-toolbar-background {
-            background-color: #2e2e32;
+            background-color: @lookout-icon-toolbar-bg;
             border-radius: 8px;
         }
         .message-header-subject {
@@ -794,8 +794,8 @@ fn install_paned_css() {
             font-size: 1.05em;
         }
         .message-subject-bar {
-            background-color: rgba(255, 255, 255, 0.05);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            background-color: @lookout-subject-bar-bg;
+            border-bottom: 1px solid @lookout-subject-bar-border;
             padding: 10px 12px;
         }
         .message-action-bar {
@@ -809,12 +809,12 @@ fn install_paned_css() {
             color: white;
             font-weight: bold;
         }
-        .avatar-color-0 { background-color: #e57373; }
-        .avatar-color-1 { background-color: #64b5f6; }
-        .avatar-color-2 { background-color: #81c784; }
-        .avatar-color-3 { background-color: #ffb74d; }
-        .avatar-color-4 { background-color: #ba68c8; }
-        .avatar-color-5 { background-color: #4db6ac; }
+        .avatar-color-0 { background-color: @lookout-avatar-0; }
+        .avatar-color-1 { background-color: @lookout-avatar-1; }
+        .avatar-color-2 { background-color: @lookout-avatar-2; }
+        .avatar-color-3 { background-color: @lookout-avatar-3; }
+        .avatar-color-4 { background-color: @lookout-avatar-4; }
+        .avatar-color-5 { background-color: @lookout-avatar-5; }
         .hover-quick-actions {
             background-color: @theme_bg_color;
             border-radius: 8px;
@@ -838,7 +838,7 @@ fn install_paned_css() {
             margin: 2px 0;
         }
         .ribbon-tab:checked {
-            background-color: #2e2e32;
+            background-color: @lookout-icon-toolbar-bg;
         }
         .ribbon-group-label {
             margin-right: 6px;
@@ -855,18 +855,18 @@ fn install_paned_css() {
             padding: 0;
         }
         .message-row {
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            border-bottom: 1px solid @lookout-row-separator;
         }
         .message-accent-bar {
             background-color: transparent;
         }
         .message-accent-bar.unread {
-            background-color: #4d9dff;
+            background-color: @lookout-unread;
         }
         /* Amber rather than the list's blue: the flag has to read as a
            separate axis from unread, which owns every blue accent here. */
         .message-flag-icon {
-            color: #e5a50a;
+            color: @lookout-flag;
         }
         /* The attachment and meeting-invite indicators, dimmed so they stay
            secondary to the sender/subject text and the amber flag. */
@@ -888,16 +888,16 @@ fn install_paned_css() {
             padding: 6px 10px;
         }
         .recipient-chip {
-            background-color: rgba(77, 157, 255, 0.18);
-            border: 1px solid rgba(77, 157, 255, 0.35);
+            background-color: @lookout-chip-bg;
+            border: 1px solid @lookout-chip-border;
             border-radius: 999px;
             padding: 1px 2px 1px 10px;
         }
         /* A chip that doesn't parse as an address is flagged, never
            rejected - the user has to be able to see and fix it. */
         .recipient-chip.recipient-chip-invalid {
-            background-color: rgba(224, 108, 117, 0.18);
-            border-color: rgba(224, 108, 117, 0.55);
+            background-color: @lookout-chip-invalid-bg;
+            border-color: @lookout-chip-invalid-border;
         }
         .recipient-chip-remove {
             min-width: 18px;
@@ -907,55 +907,55 @@ fn install_paned_css() {
         .message-sender-unread,
         .message-subject-unread,
         .message-date-unread {
-            color: #4d9dff;
+            color: @lookout-unread;
             font-weight: bold;
         }
         .message-sender-read,
         .message-date-read {
-            color: #a9b7c6;
+            color: @lookout-muted;
         }
         .message-subject-read {
-            color: #c1815c;
+            color: @lookout-subject;
         }
         .message-preview {
-            color: #a9b7c6;
+            color: @lookout-muted;
             opacity: 0.75;
             font-size: 0.95em;
         }
         .message-section-header {
-            background-color: rgba(0, 0, 0, 0.55);
-            border-top: 1px solid rgba(255, 255, 255, 0.06);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            background-color: @lookout-section-header-bg;
+            border-top: 1px solid @lookout-row-separator;
+            border-bottom: 1px solid @lookout-row-separator;
         }
         /* Conversation headers read as a distinct row kind from both section
            headers (darker band) and messages (bordered): a subtle tint that
            also backs the expander's chevron so the thread's disclosure is
            visible against the background image. */
         .message-thread-row {
-            background-color: rgba(255, 255, 255, 0.04);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            background-color: @lookout-thread-row-bg;
+            border-bottom: 1px solid @lookout-row-separator;
         }
         /* The participant-count badge: a pill so the number reads as a count,
            not a fourth text column. */
         .message-thread-count {
             font-size: 0.9em;
-            background-color: rgba(255, 255, 255, 0.08);
+            background-color: @lookout-thread-count-bg;
             border-radius: 9999px;
             padding: 0 7px;
         }
         .message-column-header {
-            background-color: rgba(0, 0, 0, 0.3);
-            border-top: 1px solid rgba(255, 255, 255, 0.06);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            background-color: @lookout-column-header-bg;
+            border-top: 1px solid @lookout-row-separator;
+            border-bottom: 1px solid @lookout-row-separator;
             padding: 4px 0;
         }
         .message-column-header label {
-            color: #8a97a5;
+            color: @lookout-column-header-fg;
             font-size: 0.85em;
             font-weight: bold;
         }
         entry.header-search-entry {
-            background-color: #202020;
+            background-color: @lookout-header-search-bg;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -964,6 +964,11 @@ fn install_paned_css() {
 }
 
 pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::ApplicationWindow {
+    // The theme stack (base palette + bundled flat-token theme + custom
+    // accent) registers before any other CSS provider so the app's rules can
+    // reference its `lookout-*` tokens. Seeded from GSettings when the Config
+    // rows are wired further down.
+    let theme_manager = crate::theme::ThemeManager::install();
     install_paned_css();
 
     let quit_action = gio::SimpleAction::new("quit", None);
@@ -4226,6 +4231,53 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Appearance → "Theme" / "Custom accent color": live re-theme.
+    // Every change writes through to GSettings and re-applies the theme stack
+    // (base palette + selected theme + accent), so the effect is immediate.
+    // The accent picker only feeds the stack while its switch is on; the
+    // switch's own handler re-applies with the system accent when turned off.
+    {
+        let theme_manager = theme_manager.clone();
+        let state = state.clone();
+        config_view.theme_row.connect_selected_notify(move |row| {
+            let theme_id = crate::theme::theme_at(row.selected());
+            state.borrow().settings.set_string(crate::theme::THEME_ID_KEY, theme_id);
+            let accent = state.borrow().settings.get_string(crate::theme::ACCENT_COLOR_KEY);
+            theme_manager.apply(theme_id, Some(&accent));
+        });
+    }
+    {
+        let theme_manager = theme_manager.clone();
+        let state = state.clone();
+        let accent_color_row = config_view.accent_color_row.clone();
+        let accent_color_button = config_view.accent_color_button.clone();
+        config_view.accent_switch_row.connect_active_notify(move |row| {
+            accent_color_row.set_sensitive(row.is_active());
+            let stored = if row.is_active() {
+                crate::theme::rgba_to_stored(&accent_color_button.rgba())
+            } else {
+                String::new()
+            };
+            state.borrow().settings.set_string(crate::theme::ACCENT_COLOR_KEY, &stored);
+            let theme_id = state.borrow().settings.get_string(crate::theme::THEME_ID_KEY);
+            theme_manager.apply(&theme_id, Some(&stored));
+        });
+    }
+    {
+        let theme_manager = theme_manager.clone();
+        let state = state.clone();
+        let accent_switch_row = config_view.accent_switch_row.clone();
+        config_view.accent_color_button.connect_rgba_notify(move |button| {
+            if !accent_switch_row.is_active() {
+                return;
+            }
+            let stored = crate::theme::rgba_to_stored(&button.rgba());
+            state.borrow().settings.set_string(crate::theme::ACCENT_COLOR_KEY, &stored);
+            let theme_id = state.borrow().settings.get_string(crate::theme::THEME_ID_KEY);
+            theme_manager.apply(&theme_id, Some(&stored));
+        });
+    }
+
     // Config → Mail → "Load images from the web": flips the WebView's
     // remote-image veto live, then re-renders whatever's on the reading pane
     // so the change applies to the open message, not just the next selection.
@@ -4288,6 +4340,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
         config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
+        // Theme rows: seeding fires the notify handlers above, which apply
+        // the persisted theme/accent through the ThemeManager, so startup
+        // can't drift from what was saved.
+        let theme_id = persisted.get_string(crate::theme::THEME_ID_KEY);
+        config_view.theme_row.set_selected(crate::theme::theme_index(&theme_id));
+        let accent = persisted.get_string(crate::theme::ACCENT_COLOR_KEY);
+        if let Some(rgba) = crate::theme::accent_rgba(&accent) {
+            config_view.accent_color_button.set_rgba(&rgba);
+        }
+        config_view.accent_switch_row.set_active(!accent.is_empty());
     }
 
     {

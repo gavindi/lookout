@@ -1,0 +1,10 @@
+/* Flat Dark: the classic Lookout look, expressed as token overrides. Where
+   `base.css` is scheme-aware (muted text, row separators, chips), this theme
+   re-pins the original hardcoded dark values so the UI is identical to
+   pre-theming Lookout in any scheme. */
+@define-color lookout-unread #4d9dff;
+@define-color lookout-muted #a9b7c6;
+@define-color lookout-column-header-fg #8a97a5;
+@define-color lookout-row-separator rgba(255, 255, 255, 0.06);
+@define-color lookout-chip-bg rgba(77, 157, 255, 0.18);
+@define-color lookout-chip-border rgba(77, 157, 255, 0.35);

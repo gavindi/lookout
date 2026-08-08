@@ -21,6 +21,12 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.10" date="2026-08-09">
+      <description>
+        <p>Lookout's look is now fully themeable. Every colour the app drew is a named token that follows the system light/dark scheme where that makes sense (unread accents, muted text, chips), while the deliberately fixed surfaces (the translucent panes over the background artwork, the toolbar bands, the amber flag) stay put. Config → Appearance gains a Theme dropdown - System, Flat Dark (the classic look), or Flat Light - plus a Custom accent color switch and picker that recolour buttons and selections app-wide, both persisting between sessions and applying live.</p>
+        <p>Fixed: picking a custom accent colour no longer trips a GTK assertion - the picker's dialog is now created explicitly, so the colour dialog opens and applies normally.</p>
+      </description>
+    </release>
     <release version="0.9.9" date="2026-08-09">
       <description>
         <p>Print support lands everywhere: the reading pane's More menu prints the message you're reading (HTML bodies print from the reading pane's own view, plain-text bodies via a wrapped page), the event editor's Print button prints the event details, and the Calendar toolbar prints the month you're viewing as an agenda.</p>

@@ -25,6 +25,16 @@
       <summary>Window background brightness</summary>
       <description>How bright the user-picked window background image is shown: 1.0 means no darkening, 0.0 means darkened to black. Only applies while a custom background is set.</description>
     </key>
+    <key name="theme-id" type="s">
+      <default>'flat-dark'</default>
+      <summary>Colour theme</summary>
+      <description>The bundled flat-token theme: 'system' follows the system light/dark scheme, 'flat-dark' and 'flat-light' pin the app's surfaces to one scheme.</description>
+    </key>
+    <key name="accent-color" type="s">
+      <default>''</default>
+      <summary>Accent colour</summary>
+      <description>A CSS colour string (as written by gdk::RGBA::to_str) used app-wide instead of the system accent; empty means follow the system accent.</description>
+    </key>
 
     <!-- View → Layout -->
     <key name="layout-folder-pane" type="b">

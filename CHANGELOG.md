@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.10 (2026-08-09)
+
+### Added
+
+- **UI**: named-color theming with bundled flat-token themes. Every colour literal the app's stylesheets hardcoded is now a named `lookout-*` token defined in a bundled `themes/base.css` (shipped in the GResource, with `include_str!` fallbacks for builds without `glib-compile-resources`), loaded by a new `ThemeManager` into one display-level CSS provider registered before the app's own rules, so the rules reference tokens and never compete with theme definitions. The palette is split by intent: tokens that follow the system scheme re-resolve automatically when the desktop switches light/dark (unread/muted text via `@theme_*`, recipient chips and the accent bars via `@accent_color`), while the deliberately fixed values stay fixed (the translucent folder pane, the black toolbar band, the amber flag, the avatar palette). Config → Appearance gains a **Theme** dropdown - *System* (the scheme-following base palette), *Flat Dark* (the classic Lookout look, re-pinning the original dark values) and *Flat Light* (light surfaces) - plus a **Custom accent color** switch and picker that redefines the whole libadwaita accent family (`accent_color`/`accent_bg_color`/`accent_fg_color`/hover/active) via CSS, so buttons and selections follow the picker too. Both settings persist through new `theme-id` and `accent-color` GSettings keys and switch live without a restart.
+
+### Fixed
+
+- **UI**: picking a custom accent colour tripped GTK's `gtk_color_dialog_choose_rgba: assertion 'GTK_IS_COLOR_DIALOG (self)' failed` - the picker never opened, and under fatal-critical settings the assertion aborted the app. The accent picker is a `GtkColorDialogButton` constructed with a NULL dialog (`ColorDialogButton::new(None)`), and GTK does not auto-create one - the button is only supposed to create its dialog lazily, but the 4.14-era implementation calls straight into the dialog on click, so a NULL dialog crashed the pick. The button now owns an explicit `GtkColorDialog` at build time, so the picker opens and applies normally.
+
+### Testing
+
+- `lookout-app`: new `theme` tests - theme-id ↔ dropdown-index mapping, accent storage round-tripping through `gdk::RGBA::to_str` (including the empty-follows-system case), the bundled themes parsing as valid GTK CSS, and a display-backed test proving a real widget's style context resolves a `flat-dark` token override and a custom accent (via the same FFI `gtk_style_context_lookup_color` the `calendar_view` precedence test uses).
+
 ## 0.9.9 (2026-08-09)
 
 ### Added

@@ -32,6 +32,8 @@ pub const SCHEMA_ID: &str = "io.github.gavindi.Lookout";
 pub const ANIMATE_TRANSITIONS: &str = "animate-transitions";
 pub const WINDOW_BACKGROUND_PATH: &str = "window-background-path";
 pub const BACKGROUND_BRIGHTNESS: &str = "background-brightness";
+pub const THEME_ID: &str = "theme-id";
+pub const ACCENT_COLOR: &str = "accent-color";
 pub const LAYOUT_FOLDER_PANE: &str = "layout-folder-pane";
 pub const LAYOUT_READING_PANE: &str = "layout-reading-pane";
 pub const LAYOUT_CALENDAR_OVERVIEW: &str = "layout-calendar-overview";
@@ -110,6 +112,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(ANIMATE_TRANSITIONS, Value::Bool(true));
     map.insert(WINDOW_BACKGROUND_PATH, Value::String(String::new()));
     map.insert(BACKGROUND_BRIGHTNESS, Value::Double(1.0));
+    map.insert(THEME_ID, Value::String(crate::theme::DEFAULT_THEME.into()));
+    map.insert(ACCENT_COLOR, Value::String(String::new()));
     map.insert(LAYOUT_FOLDER_PANE, Value::Bool(true));
     map.insert(LAYOUT_READING_PANE, Value::Bool(true));
     map.insert(LAYOUT_CALENDAR_OVERVIEW, Value::Bool(true));
@@ -275,6 +279,8 @@ mod tests {
         assert_eq!(store.get_string(LAST_VIEW_MAILBOX), "");
         assert_eq!(store.get_string(SORT_KEY), "date");
         assert_eq!(store.get_double(BACKGROUND_BRIGHTNESS), 1.0);
+        assert_eq!(store.get_string(THEME_ID), "flat-dark");
+        assert_eq!(store.get_string(ACCENT_COLOR), "");
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());
     }
 }
