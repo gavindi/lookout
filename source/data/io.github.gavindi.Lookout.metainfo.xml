@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.5" date="2026-08-08">
+      <description>
+        <p>The composer can be popped out into its own window: a button in the compose header moves it to a standalone window (with its own title bar holding Cancel, Send, and a Back button), where draft autosave keeps running. Closing the window - or using Back - pops the composer back into the reading pane with everything intact.</p>
+      </description>
+    </release>
     <release version="0.9.4" date="2026-08-08">
       <description>
         <p>Fixed a spate of GTK "Failed to set text … from markup" warnings: Adw rows (like Config's "Sending identities" subtitle) parse their titles as Pango markup by default, so identity labels such as "Name &lt;address&gt;" - and the remaining dynamic error toasts that weren't escaped yet - are now escaped so &lt;, &gt;, &amp;, and friends display literally.</p>

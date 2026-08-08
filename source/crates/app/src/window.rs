@@ -532,6 +532,24 @@ pub(crate) struct UiState {
     /// change, so an identity added/edited while a composer is open shows up
     /// in its From list immediately. `None` while no composer is open.
     composer_identities_refresh: Option<Rc<dyn Fn()>>,
+    /// Which compose session's relays (`draft_saved_tx` and
+    /// `composer_identities_refresh`) are currently installed. Every composer
+    /// bumps this when it opens and remembers its own value; a finishing
+    /// composer clears the relays only if its generation still owns them, so
+    /// a popped-out composer that finishes after a newer inline composer
+    /// opened can't strip the newer composer's relays.
+    composer_relay_generation: u64,
+    /// The pop-out window hosting the composer, while one exists (the
+    /// composer header's pop-out button moves the still-alive composer into
+    /// its own window; `None` otherwise), paired with the composer
+    /// generation that created it (its captured `composer_relay_generation`
+    /// value) - so a finishing composer closes only its own window, never a
+    /// newer composer's. Kept here so the window survives after the button
+    /// handler returns - GTK only keeps a presented window alive for as long
+    /// as it's on screen. The window's close handler pops the composer back
+    /// into the reading pane, and a finishing composer destroys the window
+    /// outright; both clear this.
+    compose_popout_window: Option<(u64, adw::Window)>,
     /// What the folder sidebar currently has rendered (see
     /// `folder_tree_signature`). `FoldersUpdated` now arrives repeatedly per
     /// account as the unread counts fill in, and almost all of those carry
@@ -1165,6 +1183,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         trust_banner_dismissed: None,
         draft_saved_tx: None,
         composer_identities_refresh: None,
+        composer_relay_generation: 0,
+        compose_popout_window: None,
         folder_tree: None,
         suppress_folder_selection: false,
         search_active: false,
@@ -9808,7 +9828,11 @@ fn render_body(
 /// clicks don't accumulate stale pages, and restores whatever page was
 /// visible beforehand once `on_done` fires (Cancel or Send) - so Reply's
 /// Cancel lands back on the same message, and New Message's Cancel lands
-/// back on the empty placeholder.
+/// back on the empty placeholder. Arms the composer's header pop-out button:
+/// clicking it moves the still-alive composer into its own window (see the
+/// `on_pop_out` closure below), and closing that window pops the composer
+/// back into this stack - the same move-in / move-out round trip as the
+/// People screen's detach.
 #[allow(clippy::too_many_arguments)]
 fn show_composer_in_reading_pane(
     state: &Rc<RefCell<UiState>>,
@@ -9825,18 +9849,174 @@ fn show_composer_in_reading_pane(
     let previous_page = reading_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_else(|| "empty".to_string());
     let reading_stack_for_close = reading_stack.clone();
     let state_for_close = state.clone();
+    // The pop-out closure below shares these with `on_done` - clone them
+    // before `on_done` moves the originals in.
+    let reading_stack_for_popout = reading_stack.clone();
+    let state_for_popout = state.clone();
+    let previous_page_for_popout = previous_page.clone();
+    // Claim the draft-confirmation relay / identities-refresh slots under a
+    // fresh generation. A finishing composer only clears them when its own
+    // generation still owns them, so a popped-out composer that finishes
+    // after a newer inline composer opened can't strip the newer one's
+    // relays.
+    let relay_generation = {
+        let mut st = state.borrow_mut();
+        st.composer_relay_generation += 1;
+        st.composer_relay_generation
+    };
+    // True while this composer lives in its pop-out window. Set by the
+    // pop-out handler, cleared by the window's close handler on pop-back-in.
+    // `on_done` consults it to skip the reading-pane surgery entirely while
+    // popped out: the compose page was already removed at pop-out (and any
+    // page under that name now belongs to a newer composer), and there's no
+    // pre-compose page to restore.
+    let popped = Rc::new(Cell::new(false));
+    let popped_for_popout = popped.clone();
     let on_done: Rc<dyn Fn()> = Rc::new(move || {
-        if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
-            reading_stack_for_close.remove(&existing);
+        if !popped.get() {
+            if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
+                reading_stack_for_close.remove(&existing);
+            }
+            // Restore the pre-compose page only if the pane is still on the
+            // composer.
+            if reading_stack_for_close.visible_child_name().as_deref() == Some("compose") {
+                reading_stack_for_close.set_visible_child_name(&previous_page);
+            }
         }
-        reading_stack_for_close.set_visible_child_name(&previous_page);
-        // The composer is gone; drop its draft-confirmation relay so its
-        // consumer future exits and late events go nowhere, and its
-        // identities-refresh hook so a later Config manage-identities edit
-        // doesn't poke a dead dropdown.
-        state_for_close.borrow_mut().draft_saved_tx = None;
-        state_for_close.borrow_mut().composer_identities_refresh = None;
+        let mut st = state_for_close.borrow_mut();
+        if st.composer_relay_generation == relay_generation {
+            // The composer is gone; drop its draft-confirmation relay so its
+            // consumer future exits and late events go nowhere, and its
+            // identities-refresh hook so a later Config manage-identities
+            // edit doesn't poke a dead dropdown.
+            st.draft_saved_tx = None;
+            st.composer_identities_refresh = None;
+        }
+        // Close this composer's own pop-out window when it finishes -
+        // Cancel/Send in the window must take it down, not leave a dead
+        // composer on screen. Guarded by the window's own generation, which
+        // is independent of the relay ownership above: a popped-out composer
+        // finishing after a newer inline composer opened still closes its
+        // own window.
+        let owns_window = st
+            .compose_popout_window
+            .as_ref()
+            .map(|(gen, _)| *gen == relay_generation)
+            .unwrap_or(false);
+        if owns_window {
+            if let Some((_, win)) = st.compose_popout_window.take() {
+                win.destroy();
+            }
+        }
     });
+    // The header's pop-out button hands the composer to this closure, which
+    // moves it into its own window - the composer itself stays alive (draft
+    // autosave included), so nothing needs rebuilding or re-seeding. The
+    // composer set `moving`/`popped_out` around the removal, which the
+    // autosave's `root-notify` guard consults so the move isn't mistaken for
+    // a displacement. Closing the window pops the composer back into the
+    // reading pane (same `"compose"` page, displacing any newer composer
+    // that opened meanwhile), unless Send/Cancel already finished the
+    // session - then the window just closes.
+    let on_pop_out: Option<Rc<dyn Fn(crate::compose::PopOutHandle)>> = Some(Rc::new({
+        let state_for_close = state_for_popout;
+        let reading_stack_for_close = reading_stack_for_popout;
+        let previous_page = previous_page_for_popout;
+        let title = title.to_string();
+        let popped = popped_for_popout;
+        move |handle| {
+            popped.set(true);
+            if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
+                reading_stack_for_close.remove(&existing);
+            }
+            if reading_stack_for_close.visible_child_name().as_deref() == Some("compose") {
+                reading_stack_for_close.set_visible_child_name(&previous_page);
+            }
+            // A header bar of its own is what gives the window a drag
+            // region - a bare `adw::Window` has none (the People pop-out
+            // needed the same, see 0.8.0).
+            let win = adw::Window::builder().default_width(860).default_height(640).build();
+            let header = adw::HeaderBar::new();
+            header.set_title_widget(Some(&adw::WindowTitle::new(&title, "")));
+            // Cancel and Send live in the title bar while popped out - the
+            // composer's own header row is redundant once the window has a
+            // title bar (and is hidden wholesale, see compose.rs's
+            // `root-notify` handler) - and are moved back on pop-back-in
+            // (see the close handler below). They're the same widgets, so
+            // their click handlers keep working across the move. The draft
+            // status label moves into the title bar with them; the title
+            // label stays hidden with its row.
+            handle.top_row.remove(&handle.cancel_button);
+            handle.top_row.remove(&handle.send_button);
+            handle.top_row.remove(&handle.status_label);
+            // A button to pop the composer back into the reading pane
+            // without closing the session: it closes the window, and the
+            // close handler below performs the pop-back-in (the same path
+            // as the window's own close button, minus the "already
+            // finished" branch).
+            let back_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["go-previous-symbolic", "go-back-symbolic"]));
+            back_button.set_tooltip_text(Some("Back to main window"));
+            {
+                let win = win.clone();
+                back_button.connect_clicked(move |_| win.close());
+            }
+            // Header bar packing order: start-side children are prepended
+            // and end-side children appended, so packing cancel before back
+            // yields [back, cancel, title, status, send].
+            header.pack_start(&handle.cancel_button);
+            header.pack_start(&back_button);
+            header.pack_end(&handle.status_label);
+            header.pack_end(&handle.send_button);
+            let content_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+            content_box.append(&header);
+            content_box.append(&handle.widget);
+            win.set_content(Some(&content_box));
+            // Held here (not just by the closure below) so the window
+            // survives after this handler returns - GTK only keeps a
+            // presented window alive while it's on screen.
+            state_for_close.borrow_mut().compose_popout_window = Some((relay_generation, win.clone()));
+            {
+                let state_for_close = state_for_close.clone();
+                let reading_stack_for_close = reading_stack_for_close.clone();
+                let popped = popped.clone();
+                let handle = handle;
+                win.connect_close_request(move |_| {
+                    if !handle.done.get() {
+                        handle.moving.set(true);
+                        handle.popped_out.set(false);
+                        if let Some(parent) = handle.widget.parent().and_then(|parent| parent.downcast::<gtk::Box>().ok()) {
+                            parent.remove(&handle.widget);
+                        }
+                        // Send Cancel and Send home to the composer's header
+                        // row, out of the title bar they're about to leave.
+                        if let Some(parent) = handle.cancel_button.parent().and_then(|parent| parent.downcast::<adw::HeaderBar>().ok()) {
+                            parent.remove(&handle.cancel_button);
+                        }
+                        if let Some(parent) = handle.send_button.parent().and_then(|parent| parent.downcast::<adw::HeaderBar>().ok()) {
+                            parent.remove(&handle.send_button);
+                        }
+                        if let Some(parent) = handle.status_label.parent().and_then(|parent| parent.downcast::<adw::HeaderBar>().ok()) {
+                            parent.remove(&handle.status_label);
+                        }
+                        handle.top_row.prepend(&handle.cancel_button);
+                        handle.top_row.append(&handle.send_button);
+                        handle.top_row.append(&handle.status_label);
+                        handle.top_row.reorder_child_after(&handle.status_label, Some(&handle.title_label));
+                        if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
+                            reading_stack_for_close.remove(&existing);
+                        }
+                        reading_stack_for_close.add_named(&handle.widget, Some("compose"));
+                        handle.moving.set(false);
+                        popped.set(false);
+                        reading_stack_for_close.set_visible_child_name("compose");
+                    }
+                    state_for_close.borrow_mut().compose_popout_window = None;
+                    glib::Propagation::Proceed
+                });
+            }
+            win.present();
+        }
+    }));
     // Recipient autocomplete combines local mail-history addresses with
     // CardDAV contacts discovered for this account. Both are queried from UI
     // memory/state synchronously so a keystroke never waits on a worker round
@@ -9878,6 +10058,7 @@ fn show_composer_in_reading_pane(
         on_done,
         rich_text_default,
         suggestions,
+        on_pop_out,
     );
     // Replacing any previous composer's relay (dropped sender = its consumer
     // exits), and hooking the Config manage-identities dialog into the new
@@ -10164,6 +10345,8 @@ mod tests {
             trust_banner_dismissed: None,
             draft_saved_tx: None,
             composer_identities_refresh: None,
+            composer_relay_generation: 0,
+            compose_popout_window: None,
             folder_tree: None,
             suppress_folder_selection: false,
             search_active: false,

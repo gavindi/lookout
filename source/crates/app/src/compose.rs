@@ -18,6 +18,45 @@ use crate::recipient_entry::{RecipientEntry, SuggestionSource};
 /// several IMAP round trips (replace + append), so this errs slow.
 const DRAFT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Everything the window layer needs to move a composer between the reading
+/// pane and its pop-out window. `widget` is the composer root the window
+/// layer reparents; the flags are the composer's own session state, which
+/// must follow it across the move:
+///
+/// * `moving` is set by whoever performs the reparent (the composer itself
+///   for pop-out, the window layer for pop-back-in) around the removal, so
+///   the composer's `root-notify` handler can tell an intentional move apart
+///   from being displaced by a second composer (which must stop the
+///   autosave).
+/// * `popped_out` is true while the composer lives in the pop-out window;
+///   the composer hides its pop-out button while set, and the window layer
+///   clears it before popping back in.
+/// * `done` is the composer's `closed` flag - the window layer's X button
+///   pops the composer back in only while it's still alive, and just closes
+///   the window once Send or Cancel has already finished the session.
+///
+/// The window layer also relocates the header row's Cancel and Send buttons
+/// into the pop-out window's title bar (`top_row` is where they normally
+/// live, so they can be returned on pop-back-in); the buttons keep their
+/// click handlers across the move, since they're the same widgets.
+pub struct PopOutHandle {
+    pub widget: gtk::Box,
+    pub cancel_button: gtk::Button,
+    pub send_button: gtk::Button,
+    /// The composer's own header row, which Cancel and Send are removed from
+    /// while popped out and restored to on pop-back-in.
+    pub top_row: gtk::Box,
+    /// The header row's title and draft-status labels. While popped out the
+    /// whole row is hidden (the window's title bar duplicates the title), so
+    /// the status label is relocated into the title bar; both are restored
+    /// to the header row on pop-back-in.
+    pub title_label: gtk::Label,
+    pub status_label: gtk::Label,
+    pub moving: Rc<Cell<bool>>,
+    pub popped_out: Rc<Cell<bool>>,
+    pub done: Rc<Cell<bool>>,
+}
+
 /// Everything the compose window can be pre-filled with, beyond a blank "New
 /// Message" (`ComposePrefill::default()`). Grouped into one struct rather
 /// than more loose parameters since Reply/Reply-All/Forward all need to set
@@ -619,6 +658,14 @@ fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
 /// From dropdown - the caller invokes it after the Config → Mail accounts
 /// manage-identities dialog changes the account's identities, so an edit
 /// made while a composer is open shows up in its From list immediately.
+///
+/// `on_pop_out`, when provided, arms the header's pop-out button: clicking
+/// it hands the composer (still fully alive - draft autosave included) to
+/// the caller via `PopOutHandle`, which is expected to move it into its own
+/// window. The composer sets the handle's `moving`/`popped_out` flags for
+/// the duration of the move so its autosave isn't mistaken for a displaced
+/// composer, and hides the button while popped out; the window layer flips
+/// the same flags when moving it back and re-shows it via `root-notify`.
 /// Cohesive arguments (they all describe one composer to open), so they stay
 /// positional rather than being bundled into a single-use struct.
 #[allow(clippy::too_many_arguments)]
@@ -630,6 +677,7 @@ pub fn build_compose_view(
     on_done: Rc<dyn Fn()>,
     rich_text_default: bool,
     suggestions: SuggestionSource,
+    on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
 ) -> (gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
     let to_row = RecipientEntry::new("To");
     if let Some(to) = &prefill.to {
@@ -803,6 +851,15 @@ pub fn build_compose_view(
     let send_button = gtk::Button::builder().label("Send").css_classes(["suggested-action"]).build();
     let title_label = gtk::Label::builder().label(title).hexpand(true).build();
 
+    // The header's pop-out button: moves this (still fully alive) composer
+    // into its own window. Only built when the caller arms it; hidden while
+    // the composer lives in the pop-out window and re-shown when it pops
+    // back into the reading pane (see the `root-notify` handler below).
+    let moving = Rc::new(Cell::new(false));
+    let popped_out = Rc::new(Cell::new(false));
+    let pop_out_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["window-new-symbolic", "view-restore-symbolic"]));
+    pop_out_button.set_tooltip_text(Some("Pop out compose window"));
+
     let top_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -814,6 +871,9 @@ pub fn build_compose_view(
     top_row.append(&cancel_button);
     top_row.append(&title_label);
     top_row.append(&status_label);
+    if on_pop_out.is_some() {
+        top_row.append(&pop_out_button);
+    }
     top_row.append(&send_button);
 
     let content = gtk::Box::builder()
@@ -942,15 +1002,76 @@ pub fn build_compose_view(
         });
     }
 
+    // --- Pop-out button wiring: hand the composer (still alive) to the
+    // caller so it can move it into its own window. The flags must be set
+    // *before* the move and cleared after it returns: the removal unroots
+    // the composer, and the `root-notify` handler below would otherwise read
+    // that as a displacement and kill the autosave. All of this runs
+    // synchronously on the main loop, so the autosave tick can never observe
+    // the transient unroot.
+    if let Some(on_pop_out) = on_pop_out {
+        let moving = moving.clone();
+        let popped_out = popped_out.clone();
+        let closed = closed.clone();
+        let content = content.clone();
+        let top_row = top_row.clone();
+        let title_label = title_label.clone();
+        let status_label = status_label.clone();
+        let cancel_button = cancel_button.clone();
+        let send_button = send_button.clone();
+        pop_out_button.connect_clicked(move |_| {
+            if popped_out.get() {
+                return;
+            }
+            moving.set(true);
+            popped_out.set(true);
+            on_pop_out(PopOutHandle {
+                widget: content.clone(),
+                cancel_button: cancel_button.clone(),
+                send_button: send_button.clone(),
+                top_row: top_row.clone(),
+                title_label: title_label.clone(),
+                status_label: status_label.clone(),
+                moving: moving.clone(),
+                popped_out: popped_out.clone(),
+                done: closed.clone(),
+            });
+            moving.set(false);
+        });
+    }
+
     // Belt and braces for the autosave timer: Cancel and Send set `closed`
     // themselves, but a composer displaced some other way (a second composer
     // opening over this one) would otherwise leave its 5-second loop running
-    // forever against a detached editor - still writing drafts.
+    // forever against a detached editor - still writing drafts. A pop-out is
+    // not a displacement: `moving` is set around the removal, so the flag
+    // gates the kill. Re-rooting (the composer landing in the pop-out window
+    // or popping back into the reading pane) re-syncs the pop-out button's
+    // visibility to `popped_out` - it's hidden while the composer lives in
+    // its own window, where the button would be a pointless no-op.
     {
         let closed = closed.clone();
+        let moving = moving.clone();
+        let popped_out = popped_out.clone();
+        let pop_out_button = pop_out_button.clone();
+        let title_label = title_label.clone();
+        let top_row = top_row.clone();
         content.connect_root_notify(move |widget| {
             if widget.root().is_none() {
-                closed.set(true);
+                if !moving.get() {
+                    closed.set(true);
+                }
+            } else {
+                // While popped out the window's own title bar replaces the
+                // composer's header row entirely - it shows the title,
+                // hosts Cancel/Send (and the status label, relocated there
+                // by the window layer), and makes the pop-out button a
+                // no-op - so the row is hidden; it comes back with the
+                // whole composer on pop-back-in.
+                let shown = !popped_out.get();
+                pop_out_button.set_visible(shown);
+                title_label.set_visible(shown);
+                top_row.set_visible(shown);
             }
         });
     }

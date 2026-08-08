@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.5 (2026-08-08)
+
+### Added
+
+- **Compose**: the composer can now be popped out into its own window. A new icon button (a window glyph - `window-new-symbolic` with `view-restore-symbolic` fallback) sits in the composer's header row between the draft status and Send: clicking it moves the whole composer - still fully alive, draft autosave and rich-editor content included - out of the reading pane and into a standalone `adw::Window` (860×640, titled after the compose mode), while the pane itself returns to whatever it showed before the composer opened. Closing that window (its header's close button, or the window manager) pops the composer *back* into the reading pane instead of discarding it - the same move-out / move-back-in round trip as the People screen's detach - so nothing about the session (recipients, body, the stable per-session draft Message-ID) is disturbed by the trip. Send and Cancel finish the session exactly as before, and the window closes with it. The pop-out button hides while the composer lives in its own window (where it would be a no-op) and re-shows when it pops back in; popping back in displaces any newer inline composer that opened meanwhile, exactly as a second composer opening over this one would. Two edge cases are handled explicitly: a popped-out composer finishing (Send/Cancel) while the user has navigated the reading pane elsewhere no longer yanks the pane back to the pre-compose page, and a popped-out composer that finishes after a newer inline composer opened can't strip the newer composer's draft-confirmation relay or identities-refresh hook - the relay slots are owned per composer generation. The draft autosave's displacement guard (the `root-notify` belt-and-braces that stops a detached composer from still writing drafts) now tells an intentional move apart from a displacement, so autosave keeps running across both directions of the trip.
+
 ## 0.9.4 (2026-08-08)
 
 ### Fixed
