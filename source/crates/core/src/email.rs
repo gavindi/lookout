@@ -135,6 +135,12 @@ pub struct EmailSummary {
     pub keywords: BTreeSet<String>,
     pub size: u32,
     pub has_attachment: bool,
+    /// Whether the message carries an iCalendar (`text/calendar`) part - the
+    /// iMIP path's cue that this is a meeting invitation (or related message)
+    /// rather than ordinary mail. Derived from `structure` like
+    /// `has_attachment`, so a `None` structure leaves both false.
+    #[serde(default)]
+    pub has_calendar: bool,
     pub preview: Option<String>,
     /// The message's MIME part tree, flattened into its leaf parts (with
     /// `BODYSTRUCTURE`-derived part numbers), or `None` if the server didn't

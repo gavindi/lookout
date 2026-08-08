@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.6 (2026-08-09)
+
+### Added
+
+- **Mail**: the message list now flags attachments and meeting invites at a glance. Every message row (and, with the Conversations toggle on, every thread header) renders two small symbolic icons right after the fixed sender column - a paperclip (`mail-attachment-symbolic`) when the message has an attachment, and a calendar glyph (`x-office-calendar-symbolic`) when it carries an iCalendar (`text/calendar`) part - dimmed below the sender/subject text and the amber flag, with "Has attachments" / "Meeting invite" tooltips, and hidden entirely on rows that have neither so a plain row takes no extra width. The two indicators are independent: a named `invite.ics` counts as both. A thread header shows each icon if *any* message in the conversation has one, mirroring how the header already aggregates unread and flagged. The calendar flag is a new `EmailSummary::has_calendar` field (serde-defaulted, so older envelope-cache rows deserialize cleanly and fill in on the next sync) derived from the same `BODYSTRUCTURE` that has driven `has_attachment` all along, via a new `lookout-mail` `has_calendar_parts` helper.
+
+### Testing
+
+- `lookout-mail`: `structure` tests for `has_calendar_parts` - a filename-less `text/calendar` part counts as calendar but not attachment, a named `invite.ics` counts as both, and ordinary mail with a PDF attachment has neither flag. `lookout-core`/`lookout-app` suites (including the message-list thread aggregation) pass unchanged.
+
 ## 0.9.5 (2026-08-08)
 
 ### Added

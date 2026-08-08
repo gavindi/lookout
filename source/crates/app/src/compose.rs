@@ -1119,6 +1119,7 @@ mod tests {
             keywords: BTreeSet::new(),
             size: 100,
             has_attachment: false,
+            has_calendar: false,
             preview: None,
             structure: None,
         }

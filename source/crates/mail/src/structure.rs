@@ -24,6 +24,16 @@ pub fn has_attachments(parts: &[BodyPart]) -> bool {
     parts.iter().any(|p| p.is_attachment)
 }
 
+/// Whether the flattened structure contains an iCalendar (`text/calendar`)
+/// part - the source of truth for `EmailSummary::has_calendar`, and the
+/// summary-level counterpart of the reading pane's invitation banner.
+/// Independent of `has_attachments`: an invite that declares a filename
+/// (e.g. `invite.ics`) counts as both, one without does not count as an
+/// attachment.
+pub fn has_calendar_parts(parts: &[BodyPart]) -> bool {
+    parts.iter().any(|p| p.is_calendar())
+}
+
 fn walk(structure: &BodyStructure, path: &mut Vec<u32>, out: &mut Vec<BodyPart>) {
     match structure {
         BodyStructure::Multipart { bodies, .. } => {
@@ -354,6 +364,66 @@ mod tests {
         assert!(parts[0].is_attachment);
         assert!(!parts[0].is_text());
         assert!(has_attachments(&parts));
+    }
+
+    #[test]
+    fn calendar_part_is_detected_with_and_without_a_filename() {
+        // An iMIP invitation without a filename (the common Outlook form) -
+        // calendar yes, attachment no.
+        let unnamed = BodyStructure::Multipart {
+            common: common("multipart", "mixed", None, None),
+            bodies: vec![
+                text_plain(),
+                BodyStructure::Basic {
+                    common: common("text", "calendar", None, None),
+                    other: single(None, ContentEncoding::QuotedPrintable, 2000),
+                    extension: None,
+                },
+            ],
+            extension: None,
+        };
+        let parts = parts_from_bodystructure(&unnamed);
+        assert!(parts[1].is_calendar());
+        assert!(!parts[1].is_attachment);
+        assert!(has_calendar_parts(&parts));
+        assert!(!has_attachments(&parts));
+
+        // A named invite (`invite.ics`) counts as both - the two indicators
+        // are independent.
+        let named = BodyStructure::Multipart {
+            common: common("multipart", "mixed", None, None),
+            bodies: vec![
+                text_plain(),
+                BodyStructure::Basic {
+                    common: common("text", "calendar", Some(("attachment", Some(vec![("filename", "invite.ics")]))), None),
+                    other: single(None, ContentEncoding::QuotedPrintable, 2000),
+                    extension: None,
+                },
+            ],
+            extension: None,
+        };
+        let parts = parts_from_bodystructure(&named);
+        assert!(has_calendar_parts(&parts));
+        assert!(has_attachments(&parts));
+    }
+
+    #[test]
+    fn ordinary_mail_has_no_calendar_parts() {
+        let bs = BodyStructure::Multipart {
+            common: common("multipart", "mixed", None, None),
+            bodies: vec![
+                text_plain(),
+                BodyStructure::Basic {
+                    common: common("application", "pdf", Some(("attachment", Some(vec![("filename", "report.pdf")]))), None),
+                    other: single(None, ContentEncoding::Base64, 4096),
+                    extension: None,
+                },
+            ],
+            extension: None,
+        };
+        let parts = parts_from_bodystructure(&bs);
+        assert!(has_attachments(&parts));
+        assert!(!has_calendar_parts(&parts));
     }
 
     #[test]

@@ -145,6 +145,7 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
 
     let structure = fetch.bodystructure().map(crate::structure::parts_from_bodystructure);
     let has_attachment = structure.as_ref().map(|p| crate::structure::has_attachments(p)).unwrap_or(false);
+    let has_calendar = structure.as_ref().map(|p| crate::structure::has_calendar_parts(p)).unwrap_or(false);
 
     Some(EmailSummary {
         uid,
@@ -162,6 +163,7 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
         keywords,
         size: fetch.size.unwrap_or(0),
         has_attachment,
+        has_calendar,
         preview: None, // Requires a body fetch; filled in by `sync_mailbox`'s second phase.
         structure,
     })

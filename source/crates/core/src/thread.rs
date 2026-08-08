@@ -231,6 +231,7 @@ mod tests {
             keywords: Default::default(),
             size: 100,
             has_attachment: false,
+            has_calendar: false,
             preview: None,
             structure: None,
         }

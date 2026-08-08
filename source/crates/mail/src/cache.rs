@@ -1254,6 +1254,7 @@ mod tests {
             keywords: Default::default(),
             size: 0,
             has_attachment: false,
+            has_calendar: false,
             preview: preview.map(|p| p.to_string()),
             structure: None,
         }

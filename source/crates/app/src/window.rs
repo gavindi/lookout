@@ -99,6 +99,11 @@ struct MessageRowWidgets {
     thread_box: gtk::Box,
     thread_expander: gtk::TreeExpander,
     thread_sender: gtk::Label,
+    /// Attachment/calendar indicator icons on the conversation-header row,
+    /// sitting right after the sender column exactly like the message row's
+    /// own pair.
+    thread_attachment_icon: gtk::Image,
+    thread_calendar_icon: gtk::Image,
     thread_subject: gtk::Label,
     thread_count: gtk::Label,
     thread_flag: gtk::Image,
@@ -117,6 +122,12 @@ struct MessageRowWidgets {
     accent: gtk::Box,
     avatar: gtk::Label,
     sender_label: gtk::Label,
+    /// Attachment/calendar indicator icons, right after the sender column.
+    /// Hidden on rows that have neither, so they take no width at all there -
+    /// the same discipline as `flag_icon`, and the fixed sender column keeps
+    /// their position aligned across rows.
+    attachment_icon: gtk::Image,
+    calendar_icon: gtk::Image,
     subject_label: gtk::Label,
     flag_icon: gtk::Image,
     /// The color-tag dots: one small circle per configured tag the message
@@ -850,6 +861,11 @@ fn install_paned_css() {
         .message-flag-icon {
             color: #e5a50a;
         }
+        /* The attachment and meeting-invite indicators, dimmed so they stay
+           secondary to the sender/subject text and the amber flag. */
+        .message-row-icon {
+            color: alpha(currentColor, 0.5);
+        }
         /* Color-tag dots. The circle shape is what makes one tag read as a
            swatch at a glance; each tag's fill comes from the per-tag
            `.message-tag-dot.tag-<key>` rules `apply_tag_colors` maintains,
@@ -1274,6 +1290,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // row's subject up in one column, rather than letting it start
         // wherever the sender happens to end.
         let sender_label = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        // The attachment and meeting-invite indicators, drawn after the
+        // sender column on rows that carry either. Same footprint as the flag
+        // icon; hidden (not just blank) when absent so a plain row takes no
+        // extra width.
+        let attachment_icon = gtk::Image::builder()
+            .icon_name("mail-attachment-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Has attachments")
+            .visible(false)
+            .build();
+        let calendar_icon = gtk::Image::builder()
+            .icon_name("x-office-calendar-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Meeting invite")
+            .visible(false)
+            .build();
         let subject_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let date_label = gtk::Label::builder().xalign(1.0).build();
         // Sits between the expanding subject and the date, so a flagged row
@@ -1292,6 +1328,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let tag_dots = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).valign(gtk::Align::Center).build();
         let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
         top_row.append(&sender_label);
+        top_row.append(&attachment_icon);
+        top_row.append(&calendar_icon);
         top_row.append(&subject_label);
         top_row.append(&flag_icon);
         top_row.append(&tag_dots);
@@ -1363,6 +1401,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // the message row's (`width_request(180)` sender, hexpand subject) so
         // threads and messages line up in the same columns.
         let thread_sender = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let thread_attachment_icon = gtk::Image::builder()
+            .icon_name("mail-attachment-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Has attachments")
+            .visible(false)
+            .build();
+        let thread_calendar_icon = gtk::Image::builder()
+            .icon_name("x-office-calendar-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Meeting invite")
+            .visible(false)
+            .build();
         let thread_subject = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let thread_count = gtk::Label::builder().xalign(0.0).css_classes(["message-thread-count"]).build();
         let thread_flag = gtk::Image::builder()
@@ -1375,6 +1429,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let thread_date = gtk::Label::builder().xalign(1.0).build();
         let thread_top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
         thread_top.append(&thread_sender);
+        thread_top.append(&thread_attachment_icon);
+        thread_top.append(&thread_calendar_icon);
         thread_top.append(&thread_subject);
         thread_top.append(&thread_count);
         thread_top.append(&thread_flag);
@@ -1598,6 +1654,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     thread_box,
                     thread_expander,
                     thread_sender,
+                    thread_attachment_icon,
+                    thread_calendar_icon,
                     thread_subject,
                     thread_count,
                     thread_flag,
@@ -1607,6 +1665,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     accent,
                     avatar,
                     sender_label,
+                    attachment_icon,
+                    calendar_icon,
                     subject_label,
                     flag_icon,
                     tag_dots,
@@ -1705,6 +1765,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     None => from,
                 });
                 widgets.subject_label.set_label(summary.subject.as_deref().unwrap_or("(no subject)"));
+                // The attachment and invite indicators: explicit on every
+                // bind, so a recycled row never shows the previous
+                // occupant's icons. Both are independent - a named `invite.ics`
+                // attachment is both.
+                widgets.attachment_icon.set_visible(summary.has_attachment);
+                widgets.calendar_icon.set_visible(summary.has_calendar);
                 widgets.date_label.set_label(&format_row_date(summary.date, chrono::Utc::now()));
                 widgets.preview_label.set_label(summary.preview.as_deref().unwrap_or(""));
 
@@ -1764,6 +1830,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 *widgets.bound.borrow_mut() = None;
                 widgets.thread_expander.set_list_row(Some(&row));
                 widgets.thread_sender.set_label(&thread.sender);
+                widgets.thread_attachment_icon.set_visible(thread.has_attachment);
+                widgets.thread_calendar_icon.set_visible(thread.has_calendar);
                 widgets.thread_subject.set_label(thread.subject.as_deref().unwrap_or("(no subject)"));
                 widgets.thread_count.set_label(&thread.count.to_string());
                 // Who's in the conversation, a hover away - on the row itself
@@ -10392,6 +10460,7 @@ mod tests {
             keywords: BTreeSet::new(),
             size: 0,
             has_attachment: false,
+            has_calendar: false,
             preview: None,
             structure: None,
         }

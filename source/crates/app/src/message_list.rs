@@ -294,6 +294,12 @@ pub struct ThreadRow {
     pub has_unread: bool,
     /// Any message in the thread is flagged - the header shows the flag icon.
     pub has_starred: bool,
+    /// Any message in the thread has an attachment - the header shows the
+    /// attachment icon, mirroring how a lone message row renders its own.
+    pub has_attachment: bool,
+    /// Any message in the thread carries an iCalendar part (a meeting invite
+    /// or related message) - the header shows the calendar icon.
+    pub has_calendar: bool,
 }
 
 /// One row a date section's child store holds in threaded mode: a
@@ -480,6 +486,8 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
             latest: latest.date,
             has_unread: latest.is_unread() || emails.iter().any(|m| m.is_unread()),
             has_starred: latest.is_starred() || emails.iter().any(|m| m.is_starred()),
+            has_attachment: latest.has_attachment || emails.iter().any(|m| m.has_attachment),
+            has_calendar: latest.has_calendar || emails.iter().any(|m| m.has_calendar),
         };
         entries.push(ThreadEntry::Thread(ThreadLayout { row, messages: emails }));
     }
@@ -1457,6 +1465,7 @@ mod tests {
             keywords: Default::default(),
             size: 0,
             has_attachment: false,
+            has_calendar: false,
             preview: None,
             structure: None,
         }
