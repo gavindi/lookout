@@ -511,7 +511,7 @@ pub fn show_event_editor(
                 .collect();
             occs.push(synthetic);
             crate::calendar_view::set_mini_month(&preview_mini, day, &month_event_days);
-            crate::calendar_view::set_time_grid(&preview_day_strip, day, &occs, &calendar_colors, None, None);
+            crate::calendar_view::set_time_grid(&preview_day_strip, day, &occs, &calendar_colors, None, None, None, None);
             crate::calendar_view::scroll_time_grid_to_minutes(&preview_day_strip, start_local.hour() as i64 * 60 + start_local.minute() as i64);
         })
     };
@@ -877,6 +877,36 @@ struct FormInput {
 /// impossible time range, which the caller surfaces in the dialog's error
 /// line. `calendar_id` is left as a placeholder the caller fills with the
 /// picked calendar.
+/// Builds the event a drag-reschedule drop should persist: the occurrence's
+/// master fields carried verbatim (uid, href/etag, attendees, and the rest),
+/// with `start`/`end` replaced by the dragged times (`end_local` in the
+/// model's exclusive convention - one day after the last day for all-day
+/// events). The drag path's counterpart of [`build_event_from_input`], which
+/// rebuilds the same fields from the form instead.
+pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveDateTime, end_local: NaiveDateTime) -> CalendarEvent {
+    let model_end = if occ.all_day { end_local + chrono::Duration::days(1) } else { end_local };
+    CalendarEvent {
+        uid: occ.uid.clone(),
+        calendar_id: occ.calendar_id.clone(),
+        summary: occ.summary.clone(),
+        description: occ.description.clone(),
+        location: occ.location.clone(),
+        start: local_to_utc(start_local),
+        end: local_to_utc(model_end),
+        all_day: occ.all_day,
+        rrule: occ.rrule.clone(),
+        href: occ.href.clone(),
+        etag: occ.etag.clone(),
+        attendees: occ.attendees.clone(),
+        organizer: occ.organizer.clone(),
+        categories: occ.categories.clone(),
+        sensitivity: occ.sensitivity,
+        transparency: occ.transparency,
+        reminder_minutes_before: occ.reminder_minutes_before,
+        conference_url: occ.conference_url.clone(),
+    }
+}
+
 fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
     let model_end = if input.all_day { input.end_local + chrono::Duration::days(1) } else { input.end_local };
     if model_end <= input.start_local {
@@ -1023,5 +1053,89 @@ mod tests {
         input.conference_url_text = "https://example.com/join".to_string();
         let event = build_event_from_input(input).unwrap();
         assert_eq!(event.conference_url.as_deref(), Some("https://example.com/join"));
+    }
+
+    #[test]
+    fn calendar_event_from_occurrence_preserves_metadata_and_replaces_times() {
+        let start = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(), chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        let occ = EventOccurrence {
+            uid: EventUid("evt-1@example.com".to_string()),
+            calendar_id: CalendarId("work".to_string()),
+            summary: Some("Sync".to_string()),
+            description: Some("Agenda".to_string()),
+            location: Some("HQ".to_string()),
+            start: local_to_utc(start),
+            end: local_to_utc(start + chrono::Duration::hours(1)),
+            all_day: false,
+            rrule: None,
+            master_start: None,
+            master_end: None,
+            href: Some("https://dav.example.com/cal/evt-1.ics".to_string()),
+            etag: Some("\"abc\"".to_string()),
+            attendees: vec![Attendee {
+                address: EmailAddress::new("alice@example.com"),
+                role: AttendeeRole::Required,
+                status: AttendeeStatus::Accepted,
+            }],
+            organizer: Some(EmailAddress::new("me@example.com")),
+            categories: vec!["team".to_string()],
+            sensitivity: EventSensitivity::Private,
+            transparency: EventTransparency::Free,
+            reminder_minutes_before: Some(10),
+            conference_url: Some("https://meet.example.com/x".to_string()),
+        };
+        let moved = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(), chrono::NaiveTime::from_hms_opt(14, 0, 0).unwrap());
+        let event = calendar_event_from_occurrence(&occ, moved, moved + chrono::Duration::hours(2));
+        assert_eq!(event.uid, occ.uid);
+        assert_eq!(event.calendar_id, occ.calendar_id);
+        assert_eq!(event.summary.as_deref(), Some("Sync"));
+        assert_eq!(event.description.as_deref(), Some("Agenda"));
+        assert_eq!(event.location.as_deref(), Some("HQ"));
+        assert_eq!(event.href, occ.href);
+        assert_eq!(event.etag, occ.etag);
+        assert_eq!(event.attendees.len(), 1);
+        assert_eq!(event.attendees[0].status, AttendeeStatus::Accepted);
+        assert_eq!(event.organizer, occ.organizer);
+        assert_eq!(event.categories, occ.categories);
+        assert_eq!(event.sensitivity, EventSensitivity::Private);
+        assert_eq!(event.transparency, EventTransparency::Free);
+        assert_eq!(event.reminder_minutes_before, Some(10));
+        assert_eq!(event.conference_url.as_deref(), Some("https://meet.example.com/x"));
+        assert_eq!(event.start, local_to_utc(moved));
+        assert_eq!(event.end, local_to_utc(moved + chrono::Duration::hours(2)));
+    }
+
+    #[test]
+    fn calendar_event_from_occurrence_applies_the_exclusive_end_convention_for_all_day() {
+        let start = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(), chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        let occ = EventOccurrence {
+            uid: EventUid("evt-2@example.com".to_string()),
+            calendar_id: CalendarId("work".to_string()),
+            summary: None,
+            description: None,
+            location: None,
+            start: local_to_utc(start),
+            end: local_to_utc(start + chrono::Duration::days(2)),
+            all_day: true,
+            rrule: None,
+            master_start: None,
+            master_end: None,
+            href: None,
+            etag: None,
+            attendees: Vec::new(),
+            organizer: None,
+            categories: Vec::new(),
+            sensitivity: EventSensitivity::default(),
+            transparency: EventTransparency::default(),
+            reminder_minutes_before: None,
+            conference_url: None,
+        };
+        let moved = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(), chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        // The drag reports the last *day* (inclusive); the model stores the
+        // day after.
+        let event = calendar_event_from_occurrence(&occ, moved, moved + chrono::Duration::days(1));
+        assert_eq!(event.start, local_to_utc(moved));
+        assert_eq!(event.end, local_to_utc(moved + chrono::Duration::days(2)));
+        assert!(event.all_day);
     }
 }

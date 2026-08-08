@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-use chrono::{Datelike, NaiveDate, Timelike};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::prelude::*;
 use lookout_core::{CalendarId, CalendarInfo, EventOccurrence};
@@ -53,6 +53,14 @@ const GRID_ALL_DAY_RGB: (f64, f64, f64) = (0.180, 0.180, 0.196);
 const GRID_DIM_TEXT_RGBA: (f64, f64, f64, f64) = (0.66, 0.66, 0.72, 1.0);
 /// Pixels of slack the text baseline sits above a chip's vertical centre.
 const CHIP_TEXT_BASELINE_OFFSET: f64 = 0.36;
+/// Pointer travel (pixels) before a press on an event chip becomes a drag
+/// rather than a click - the same jitter tolerance the slot selection uses.
+const DRAG_THRESHOLD: f64 = 8.0;
+/// Bottom-edge strip of a timed chip (pixels) that grabs a resize instead of
+/// a move.
+const RESIZE_GRAB_HEIGHT: f64 = 8.0;
+/// The snap grid for dragged timed chips: half hours, like slot selection.
+const DRAG_SNAP_MINUTES: i64 = 30;
 
 /// A callback fired when the user activates (clicks) an event in any view, so
 /// the caller can open its editor. Multiple views share one subscription: the
@@ -86,6 +94,87 @@ type DayActivate = Rc<dyn Fn(NaiveDate)>;
 /// registration time from `CalendarMain::connect_main_day_activated`.
 type PendingDayActivate = Rc<RefCell<Option<DayActivate>>>;
 
+/// A callback fired when the user drags an event chip to a new time in a
+/// Day/Week/Work week or Month grid, receiving the dragged occurrence and its
+/// resolved new start/end (UTC). The caller is responsible for persisting the
+/// change (route it through the event editor's save path).
+type EventDrag = Rc<dyn Fn(EventOccurrence, DateTime<Utc>, DateTime<Utc>)>;
+
+/// One entry in a widget's pending drag callback: set by the current render
+/// pass from `CalendarMain::connect_event_dragged`.
+type PendingEventDrag = Rc<RefCell<Option<EventDrag>>>;
+
+/// A callback fired when the user tries to drag an event that can't be
+/// drag-rescheduled (a recurring occurrence), so the caller can explain why.
+type DragBlocked = Rc<dyn Fn(EventOccurrence)>;
+
+/// One entry in a widget's pending drag-blocked callback: set by the current
+/// render pass from `CalendarMain::connect_event_drag_blocked`.
+type PendingDragBlocked = Rc<RefCell<Option<DragBlocked>>>;
+
+/// Whether an occurrence can be drag-rescheduled. Recurring events can't yet:
+/// moving a single occurrence needs a per-occurrence override
+/// (`RECURRENCE-ID` + `EXDATE`), which lands with the recurring-edit-scopes
+/// work; a whole-series drag is more surprising than helpful. Pure so the
+/// gesture can decide (and toast) before any drag state is touched.
+fn can_drag(occ: &EventOccurrence) -> bool {
+    occ.rrule.is_none()
+}
+
+/// How a chip drag changes the event: move shifts both ends together, resize
+/// keeps the start and follows the pointer with the end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DragMode {
+    Move,
+    ResizeEnd,
+}
+
+/// A chip drag in flight on a time-grid canvas. Positions are stored as
+/// *absolute grid minutes*: minutes since local midnight of the grid's first
+/// day column (`column * 1440 + minutes`), so a drag across day columns is a
+/// plain integer shift and the half-hour snap stays aligned across midnight.
+/// All-day chips occupy whole 1440-minute days.
+#[derive(Clone, Copy, Debug)]
+struct TimeGridDrag {
+    /// Index into `chips` of the dragged chip.
+    chip: usize,
+    mode: DragMode,
+    /// The dragged occurrence's original span, in absolute grid minutes.
+    original_start: i64,
+    original_end: i64,
+    /// The live span, in absolute grid minutes (snapped, clamped to the grid).
+    live_start: i64,
+    live_end: i64,
+    /// The pointer's offset from the chip's start at grab time (absolute grid
+    /// minutes), preserved across a move so the chip doesn't jump to the
+    /// pointer. Meaningless for a resize (the end follows the pointer).
+    grab_offset: i64,
+    all_day: bool,
+}
+
+/// A pending press on a time-grid event chip: the chip index, the grab mode
+/// (move vs bottom-edge resize, decided at press time), and the press point.
+type ChipPress = Option<(usize, DragMode, f64, f64)>;
+
+/// A chip drag in flight on a month grid: the occurrence being dragged, the
+/// chip button itself (re-parented between cells as the pointer moves), and
+/// the day cell it started in plus the live target date under the pointer.
+struct MonthDrag {
+    occ: EventOccurrence,
+    /// The chip button being dragged.
+    button: gtk::Widget,
+    /// The date of the day cell the chip started in (unchanged by reparenting
+    /// the chip between cells mid-drag).
+    from_date: NaiveDate,
+    /// The date of the day cell currently under the pointer.
+    to_date: NaiveDate,
+    px: f64,
+    py: f64,
+    /// True once the pointer crossed the drag threshold (the press became a
+    /// drag rather than a click).
+    dragging: bool,
+}
+
 struct DayCell {
     container: gtk::Box,
     date_label: gtk::Label,
@@ -110,6 +199,9 @@ fn install_calendar_css() {
         }
         .calendar-selected-cell {
             border: 2px solid alpha(currentColor, 0.35);
+        }
+        .calendar-drag-target {
+            border: 2px solid alpha(currentColor, 0.45);
         }
         .calendar-main-background {
             background-color: #2e2e32;
@@ -192,6 +284,17 @@ pub struct MonthGrid {
     day_cells: Vec<DayCell>,
     anchor_month: Rc<RefCell<NaiveDate>>,
     on_activate: PendingActivate,
+    /// The drag-reschedule callback, set by each `set_month_occurrences`
+    /// render pass (see [`connect_event_dragged`]).
+    on_drag: PendingEventDrag,
+    /// The drag-blocked callback (recurring events), set by each
+    /// `set_month_occurrences` render pass (see [`connect_event_drag_blocked`]).
+    on_drag_blocked: PendingDragBlocked,
+    /// A chip drag in flight, if any (see [`MonthDrag`]).
+    month_drag: Rc<RefCell<Option<MonthDrag>>>,
+    /// The `lookout-occ` data the chips normally carry. Rebuilt by every
+    /// `set_month_occurrences` render pass alongside the chips themselves.
+    chip_events: Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>>,
     /// Day-selection callbacks, fired when a day cell is clicked (see
     /// [`connect_main_day_selected`]). Registered once at build time via
     /// `CalendarMain::connect_main_day_selected`, which forwards to the main
@@ -280,11 +383,22 @@ fn build_month_grid() -> MonthGrid {
     let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
     root_box.append(&grid);
 
+    let on_activate: PendingActivate = Rc::new(RefCell::new(None));
+    let month_drag: Rc<RefCell<Option<MonthDrag>>> = Rc::new(RefCell::new(None));
+    let chip_events: Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>> = Rc::new(RefCell::new(HashMap::new()));
+    let on_drag: PendingEventDrag = Rc::new(RefCell::new(None));
+    let on_drag_blocked: PendingDragBlocked = Rc::new(RefCell::new(None));
+    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag, &on_drag_blocked);
+
     MonthGrid {
         root: root_box.upcast(),
         day_cells,
         anchor_month,
-        on_activate: Rc::new(RefCell::new(None)),
+        on_activate,
+        on_drag,
+        on_drag_blocked,
+        month_drag,
+        chip_events,
         on_day_selected,
         selected_day,
         on_day_activate,
@@ -336,8 +450,23 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
 /// appear in each day cell they occupy, and events that started before the
 /// grid's window still show on their in-grid days); dates outside the grid's
 /// currently-displayed 6-week span are silently ignored.
-pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>, on_activate: Option<ActivateEvent>) {
+pub fn set_month_occurrences(
+    mg: &MonthGrid,
+    occurrences: &[EventOccurrence],
+    colors: &HashMap<CalendarId, String>,
+    on_activate: Option<ActivateEvent>,
+    on_drag: Option<EventDrag>,
+    on_drag_blocked: Option<DragBlocked>,
+) {
     *mg.on_activate.borrow_mut() = on_activate;
+    *mg.on_drag.borrow_mut() = on_drag;
+    *mg.on_drag_blocked.borrow_mut() = on_drag_blocked;
+    // A re-render rebuilds every chip, so any in-flight drag is stale.
+    *mg.month_drag.borrow_mut() = None;
+    mg.chip_events.borrow_mut().clear();
+    for cell in &mg.day_cells {
+        cell.container.remove_css_class("calendar-drag-target");
+    }
     let grid_start = first_grid_day(*mg.anchor_month.borrow());
 
     for cell in &mg.day_cells {
@@ -351,8 +480,8 @@ pub fn set_month_occurrences(mg: &MonthGrid, occurrences: &[EventOccurrence], co
         let Some(day_occurrences) = by_date.get(&date) else { continue };
         for occ in &day_occurrences[..day_occurrences.len().min(MAX_VISIBLE_EVENTS_PER_DAY)] {
             let label = event_label(occ, colors);
-            if let Some(callback) = mg.on_activate.borrow().as_ref() {
-                cell.events_box.append(&clickable_event_label(label, occ, callback));
+            if mg.on_activate.borrow().is_some() {
+                cell.events_box.append(&clickable_event_label(label, occ, mg));
             } else {
                 cell.events_box.append(&label);
             }
@@ -430,19 +559,187 @@ pub(crate) fn covered_local_dates(occ: &EventOccurrence, window_start: NaiveDate
         .unwrap_or_default()
 }
 
+/// The 0-based index into `day_cells` (row-major, Sunday-first) of the month
+/// grid cell under the grid-relative point `(x, y)`, or `None` for points in
+/// the weekday-header row or outside the grid. The grid's seven columns and
+/// seven rows (one header + six week rows) are all homogeneous. Pure - the
+/// caller passes the grid's allocated size.
+fn cell_index_at_point(width: f64, height: f64, x: f64, y: f64) -> Option<usize> {
+    if width <= 0.0 || height <= 0.0 || x < 0.0 || y < 0.0 || x >= width || y >= height {
+        return None;
+    }
+    let col = (x / (width / 7.0)) as usize;
+    let row = (y / (height / 7.0)) as usize;
+    if row == 0 {
+        return None;
+    }
+    Some((row - 1) * 7 + col)
+}
+
+/// Attaches the month grid's chip-drag gesture: a press landing on a chip
+/// button (identified by its `lookout-occ` data) arms a potential drag, motion
+/// beyond [`DRAG_THRESHOLD`] turns it into a drag across day cells (the chip
+/// is live re-parented between cells as it moves, with the target cell
+/// highlighted), and a drag-free release activates the event. Occurrences
+/// that can't be dragged ([`can_drag`]) fire `on_drag_blocked` instead. Only
+/// the grabbed chip follows the pointer live - the sibling chips of a
+/// multi-day event in other cells catch up when the resync after the drop
+/// lands. Coordinates stay grid-relative for the gesture's whole lifetime, so
+/// reparenting the chip never skews them.
+#[allow(clippy::too_many_arguments)]
+fn attach_month_drag(
+    grid: &gtk::Grid,
+    day_cells: &[DayCell],
+    anchor_month: &Rc<RefCell<NaiveDate>>,
+    month_drag: &Rc<RefCell<Option<MonthDrag>>>,
+    chip_events: &Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>>,
+    on_activate: &PendingActivate,
+    on_drag: &PendingEventDrag,
+    on_drag_blocked: &PendingDragBlocked,
+) {
+    let gesture = gtk::GestureClick::new();
+    let events_boxes: Vec<gtk::Box> = day_cells.iter().map(|c| c.events_box.clone()).collect();
+    let containers: Vec<gtk::Box> = day_cells.iter().map(|c| c.container.clone()).collect();
+    {
+        let grid = grid.clone();
+        let anchor_month = anchor_month.clone();
+        let month_drag = month_drag.clone();
+        let chip_events = chip_events.clone();
+        gesture.connect_pressed(move |_, _, x, y| {
+            // Only presses that land on a chip arm the drag; the day cells'
+            // own gestures handle everything else.
+            let mut current = grid.pick(x, y, gtk::PickFlags::DEFAULT);
+            let mut occ = None;
+            while let Some(w) = current.as_ref() {
+                if w.is::<gtk::Button>() {
+                    occ = chip_events.borrow().get(w).cloned();
+                    break;
+                }
+                current = w.parent();
+            }
+            let Some(occ) = occ else { return };
+            let Some(button) = current else { return };
+            let Some(cell) = cell_index_at_point(grid.width() as f64, grid.height() as f64, x, y) else {
+                return;
+            };
+            let date = first_grid_day(*anchor_month.borrow()) + chrono::Duration::days(cell as i64);
+            *month_drag.borrow_mut() = Some(MonthDrag {
+                occ,
+                button,
+                from_date: date,
+                to_date: date,
+                px: x,
+                py: y,
+                dragging: false,
+            });
+        });
+    }
+    {
+        let grid = grid.clone();
+        let anchor_month = anchor_month.clone();
+        let month_drag = month_drag.clone();
+        let on_drag_blocked = on_drag_blocked.clone();
+        let events_boxes = events_boxes.clone();
+        let containers = containers.clone();
+        gesture.connect_update(move |gesture, sequence| {
+            let Some((x, y)) = gesture.point(sequence) else { return };
+            let mut guard = month_drag.borrow_mut();
+            let Some(d) = guard.as_mut() else { return };
+            let dx = x - d.px;
+            let dy = y - d.py;
+            if !d.dragging {
+                if dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD {
+                    return;
+                }
+                if !can_drag(&d.occ) {
+                    let occ = d.occ.clone();
+                    drop(guard);
+                    if let Some(callback) = on_drag_blocked.borrow().as_ref() {
+                        callback(occ);
+                    }
+                    *month_drag.borrow_mut() = None;
+                    return;
+                }
+                d.dragging = true;
+            }
+            let Some(cell) = cell_index_at_point(grid.width() as f64, grid.height() as f64, x, y) else {
+                return;
+            };
+            let date = first_grid_day(*anchor_month.borrow()) + chrono::Duration::days(cell as i64);
+            if d.to_date != date {
+                d.to_date = date;
+                // Live feedback: reparent the chip into the target cell and
+                // highlight it.
+                let target = &events_boxes[cell];
+                if !d.button.parent().is_some_and(|parent| parent == *target.upcast_ref::<gtk::Widget>()) {
+                    d.button.unparent();
+                    target.append(&d.button);
+                }
+                for (i, container) in containers.iter().enumerate() {
+                    if i == cell {
+                        container.add_css_class("calendar-drag-target");
+                    } else {
+                        container.remove_css_class("calendar-drag-target");
+                    }
+                }
+            }
+        });
+    }
+    {
+        let month_drag = month_drag.clone();
+        let on_activate = on_activate.clone();
+        let on_drag = on_drag.clone();
+        gesture.connect_released(move |_, _, _, _| {
+            let drag = month_drag.borrow_mut().take();
+            for container in &containers {
+                container.remove_css_class("calendar-drag-target");
+            }
+            let Some(d) = drag else { return };
+            if !d.dragging {
+                if let Some(callback) = on_activate.borrow().as_ref() {
+                    callback(d.occ);
+                }
+                return;
+            }
+            // A drop: shift the event by the day-cell delta (only the grabbed
+            // chip has been reparented live; the resync repaints everything).
+            let shift = (d.to_date - d.from_date).num_days();
+            let new_start = d.occ.start + chrono::Duration::days(shift);
+            let new_end = d.occ.end + chrono::Duration::days(shift);
+            if let Some(callback) = on_drag.borrow().as_ref() {
+                callback(d.occ, new_start, new_end);
+            }
+        });
+    }
+    grid.add_controller(gesture);
+}
+
 /// Wraps a month-grid event chip in a clickable button that fires
 /// `on_activate` with the occurrence - the month view's edit entry point.
 /// The button chrome is stripped by `.calendar-event-chip-button` so it still
-/// renders as the plain colored chip.
-fn clickable_event_label(label: gtk::Label, occ: &EventOccurrence, on_activate: &Rc<dyn Fn(EventOccurrence)>) -> gtk::Button {
+/// renders as the plain colored chip. When a drag callback is wired up, the
+/// button additionally hosts the drag state the grid-level gesture reads, and
+/// activation fires from that gesture's drag-free release instead of the
+/// button's `clicked` signal (so a drag never also opens the editor).
+fn clickable_event_label(label: gtk::Label, occ: &EventOccurrence, mg: &MonthGrid) -> gtk::Button {
     let button = gtk::Button::builder()
         .child(&label)
         .css_classes(["flat", "calendar-event-chip-button"])
         .halign(gtk::Align::Fill)
         .build();
+    if mg.on_drag.borrow().is_some() || mg.on_drag_blocked.borrow().is_some() {
+        // The grid-level drag gesture (see `attach_month_drag`) identifies
+        // this chip by its occurrence (looked up from `chip_events`); the
+        // activation also happens there, so a drag never also opens the
+        // editor.
+        mg.chip_events.borrow_mut().insert(button.clone().upcast(), occ.clone());
+        return button;
+    }
     let occ = occ.clone();
-    let on_activate = on_activate.clone();
-    button.connect_clicked(move |_| on_activate(occ.clone()));
+    let on_activate = mg.on_activate.borrow().clone();
+    if let Some(on_activate) = on_activate {
+        button.connect_clicked(move |_| on_activate(occ.clone()));
+    }
     button
 }
 
@@ -501,6 +798,12 @@ pub struct TimeGrid {
     /// The click-a-time-slot-to-create callback, set by each `set_time_grid`
     /// render pass (see [`SlotActivate`]).
     on_slot_activate: PendingSlotActivate,
+    /// The drag-reschedule callback, set by each `set_time_grid` render pass
+    /// (see [`connect_event_dragged`]).
+    on_drag: PendingEventDrag,
+    /// The drag-blocked callback (recurring events), set by each
+    /// `set_time_grid` render pass (see [`connect_event_drag_blocked`]).
+    on_drag_blocked: PendingDragBlocked,
 }
 
 /// The per-grid render state shared with the draw/hover closures.
@@ -564,6 +867,14 @@ struct TimeGridData {
     /// The slot the drag started from, used to distinguish a jittery click
     /// from a real drag and to anchor the range while dragging.
     drag_anchor: Rc<RefCell<Option<(NaiveDate, i64)>>>,
+    /// A pending press on an event chip: `(chip index, grab mode, press x,
+    /// press y)`. Armed by `attach_click`'s pressed handler; a release without
+    /// further movement activates the event, movement beyond the drag
+    /// threshold starts a chip drag (see `drag`).
+    chip_press: Rc<RefCell<ChipPress>>,
+    /// The chip drag currently in flight, if any - set once a chip press
+    /// crosses the drag threshold, cleared on release or re-render.
+    drag: Rc<RefCell<Option<TimeGridDrag>>>,
 }
 
 pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
@@ -586,10 +897,14 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         selection: Rc::new(RefCell::new(None)),
         drag_active: Rc::new(Cell::new(false)),
         drag_anchor: Rc::new(RefCell::new(None)),
+        chip_press: Rc::new(RefCell::new(None)),
+        drag: Rc::new(RefCell::new(None)),
     };
     let hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let on_activate: PendingActivate = Rc::new(RefCell::new(None));
     let on_slot_activate: PendingSlotActivate = Rc::new(RefCell::new(None));
+    let on_drag: PendingEventDrag = Rc::new(RefCell::new(None));
+    let on_drag_blocked: PendingDragBlocked = Rc::new(RefCell::new(None));
 
     {
         let data = data.clone();
@@ -608,8 +923,8 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
 
     attach_hover(&band, true, &data, &hover);
     attach_hover(&canvas, false, &data, &hover);
-    attach_click(&band, true, &data, &on_activate, &on_slot_activate);
-    attach_click(&canvas, false, &data, &on_activate, &on_slot_activate);
+    attach_click(&band, true, &data, &on_activate, &on_slot_activate, &on_drag, &on_drag_blocked);
+    attach_click(&canvas, false, &data, &on_activate, &on_slot_activate, &on_drag, &on_drag_blocked);
 
     let mut headers = Vec::new();
     let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
@@ -647,6 +962,8 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         data,
         on_activate,
         on_slot_activate,
+        on_drag,
+        on_drag_blocked,
     }
 }
 
@@ -662,6 +979,15 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
         let data = data.clone();
         let hover = hover.clone();
         motion.connect_motion(move |_, x, y| {
+            // While a drag is in flight the ghost chip owns the pointer: no
+            // hover ring or tooltip for the chip under it.
+            if data.drag.borrow().is_some() {
+                if hover.take().is_some() {
+                    canvas_widget.queue_draw();
+                }
+                canvas_widget.set_tooltip_text(None);
+                return;
+            }
             let dates_guard = data.dates.borrow();
             let chips_guard = data.chips.borrow();
             let hit = hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band);
@@ -689,24 +1015,43 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
 }
 
 /// Wires a click handler onto a time-grid canvas so clicking a chip opens its
-/// editor, and empty time slots on the timeline support select-then-edit:
-/// a click highlights the slot, a click-and-drag extends the highlight over
-/// a whole range (across hours and day columns, drawn by `paint_time_grid`),
-/// and a click inside the highlighted range fires `on_slot_activate` with the
-/// snapped start/end slots (a new-event entry point for the caller). Dragging
-/// tracks pointer motion via the gesture's `update` signal, so a jittery
-/// click on a selected range still just activates it. `band` selects the
+/// editor (or drags it to a new time), and empty time slots on the timeline
+/// support select-then-edit: a click highlights the slot, a click-and-drag
+/// extends the highlight over a whole range (across hours and day columns,
+/// drawn by `paint_time_grid`), and a click inside the highlighted range fires
+/// `on_slot_activate` with the snapped start/end slots (a new-event entry
+/// point for the caller). Dragging tracks pointer motion via the gesture's
+/// `update` signal, so a jittery click on a selected range still just
+/// activates it.
+///
+/// A press on an event chip arms a potential drag: the event still activates
+/// on a release without movement, but once the pointer moves beyond
+/// [`DRAG_THRESHOLD`] the press becomes a drag instead (a move for a whole-
+/// chip grab, a resize for a bottom-edge grab). The drag's live position is
+/// rendered as a translucent ghost by the paint passes; release fires
+/// `on_drag` with the resolved new start/end. Occurrences that can't be
+/// dragged ([`can_drag`]) fire `on_drag_blocked` instead. `band` selects the
 /// split half (all-day chips vs timed chips), the same convention as
 /// [`attach_hover`]; the hit-test is the shared [`hovered_chip`]. The
-/// callbacks come from `on_activate` and `on_slot_activate`, set by the
-/// latest `set_time_grid` render pass.
-fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_activate: &PendingActivate, on_slot_activate: &PendingSlotActivate) {
+/// callbacks come from `on_activate`/`on_slot_activate`/`on_drag`/
+/// `on_drag_blocked`, set by the latest `set_time_grid` render pass.
+fn attach_click(
+    canvas: &gtk::DrawingArea,
+    band: bool,
+    data: &TimeGridData,
+    on_activate: &PendingActivate,
+    on_slot_activate: &PendingSlotActivate,
+    on_drag: &PendingEventDrag,
+    on_drag_blocked: &PendingDragBlocked,
+) {
     let gesture = gtk::GestureClick::new();
     {
         let canvas_widget = canvas.clone();
         let data = data.clone();
         let on_activate = on_activate.clone();
         let on_slot_activate = on_slot_activate.clone();
+        let on_drag = on_drag.clone();
+        let on_drag_blocked = on_drag_blocked.clone();
         // The snapped slot under `(x, y)` (timeline only - the band has no
         // slots), or `None` for gutter/band/chip hits.
         let slot_at = {
@@ -742,17 +1087,27 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
         let release_canvas = canvas_widget.clone();
         gesture.connect_pressed(move |_, _, x, y| {
             if let Some(hit) = chip_at(x, y) {
-                *pressed_data.selection.borrow_mut() = None;
-                pressed_canvas.queue_draw();
-                let occ = {
+                // Arm a potential chip drag. The event still activates if the
+                // pointer is released without moving (see `connect_released`).
+                let mode = {
                     let chips_guard = pressed_data.chips.borrow();
-                    let occurrence_index = chips_guard[hit].occurrence;
-                    pressed_data.occurrences.borrow().get(occurrence_index).cloned()
+                    let dates_guard = pressed_data.dates.borrow();
+                    let chip = &chips_guard[hit];
+                    if chip.all_day {
+                        DragMode::Move
+                    } else {
+                        let col_width = col_width_for(pressed_canvas.width() as f64, dates_guard.len());
+                        let (_, cy, _, ch) = chip_geometry(chip, col_width);
+                        if y >= cy + ch - RESIZE_GRAB_HEIGHT {
+                            DragMode::ResizeEnd
+                        } else {
+                            DragMode::Move
+                        }
+                    }
                 };
-                let Some(occ) = occ else { return };
-                if let Some(callback) = on_activate.borrow().as_ref() {
-                    callback(occ);
-                }
+                *pressed_data.selection.borrow_mut() = None;
+                *pressed_data.chip_press.borrow_mut() = Some((hit, mode, x, y));
+                pressed_canvas.queue_draw();
                 return;
             }
             let Some(slot) = slot_at(x, y) else { return };
@@ -772,6 +1127,79 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
         });
         gesture.connect_update(move |gesture, sequence| {
             let Some((x, y)) = gesture.point(sequence) else { return };
+            // A press that started on a chip: once the pointer moves beyond
+            // the threshold the press becomes a drag (a release before that
+            // still activates the event). The drag starts from the *press*
+            // position, so the grab offset is preserved exactly. The pending
+            // press is copied out first - an `if let` scrutinee would hold
+            // the `Ref` alive for the whole body, panicking on the
+            // `borrow_mut` below.
+            let chip_press = *update_data.chip_press.borrow();
+            if let Some((chip_idx, mode, px, py)) = chip_press {
+                let dx = x - px;
+                let dy = y - py;
+                if dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD {
+                    return;
+                }
+                *update_data.chip_press.borrow_mut() = None;
+                let chip_span = {
+                    let chips_guard = update_data.chips.borrow();
+                    let occurrences_guard = update_data.occurrences.borrow();
+                    let chip = &chips_guard[chip_idx];
+                    let occ = occurrences_guard.get(chip.occurrence);
+                    if occ.is_some_and(|o| !can_drag(o)) {
+                        // Recurring events can't be drag-rescheduled yet -
+                        // explain rather than silently dropping the gesture.
+                        let occ = occ.unwrap().clone();
+                        if let Some(callback) = on_drag_blocked.borrow().as_ref() {
+                            callback(occ);
+                        }
+                        update_canvas.queue_draw();
+                        return;
+                    }
+                    let Some(_) = occ else { return };
+                    (chip.column as i64 * 1440 + chip.start_minutes, chip.column as i64 * 1440 + chip.end_minutes, chip.all_day)
+                };
+                let dates_len = update_data.dates.borrow().len();
+                let Some((col, minutes)) = col_minutes_at(x, y, update_canvas.width() as f64, dates_len) else {
+                    return;
+                };
+                // The grab offset comes from the *press* point, so the chip
+                // keeps its grab position exactly as the drag starts.
+                let grab_offset = col_minutes_at(px, py, update_canvas.width() as f64, dates_len)
+                    .map(|(c, m)| c as i64 * 1440 + m)
+                    .unwrap_or(chip_span.0)
+                    - chip_span.0;
+                let mut drag = TimeGridDrag {
+                    chip: chip_idx,
+                    mode,
+                    original_start: chip_span.0,
+                    original_end: chip_span.1,
+                    live_start: chip_span.0,
+                    live_end: chip_span.1,
+                    grab_offset,
+                    all_day: chip_span.2,
+                };
+                drag_update(&mut drag, col as i64, minutes, dates_len as i64 * 1440);
+                *update_data.drag.borrow_mut() = Some(drag);
+                update_canvas.set_cursor_from_name(Some("grabbing"));
+                update_canvas.queue_draw();
+                return;
+            }
+            // An in-flight chip drag: track the pointer and repaint the ghost.
+            // The drag is copied out first (same `if let` scrutinee-lifetime
+            // reason as the chip press above).
+            let drag_state = *update_data.drag.borrow();
+            if let Some(mut drag) = drag_state {
+                let dates_len = update_data.dates.borrow().len();
+                let Some((col, minutes)) = col_minutes_at(x, y, update_canvas.width() as f64, dates_len) else {
+                    return;
+                };
+                drag_update(&mut drag, col as i64, minutes, dates_len as i64 * 1440);
+                *update_data.drag.borrow_mut() = Some(drag);
+                update_canvas.queue_draw();
+                return;
+            }
             let Some(slot) = slot_at_update(x, y) else { return };
             let Some(anchor) = *update_data.drag_anchor.borrow() else { return };
             if (slot.0, slot.1) == anchor {
@@ -788,6 +1216,42 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
             update_canvas.queue_draw();
         });
         gesture.connect_released(move |_, _, x, y| {
+            // A chip press released without ever crossing the drag threshold:
+            // a plain click - activate the event. The press is copied out
+            // first, as in the update handler above.
+            let chip_press = *release_data.chip_press.borrow();
+            if let Some((chip_idx, _, _, _)) = chip_press {
+                *release_data.chip_press.borrow_mut() = None;
+                let occ = {
+                    let chips_guard = release_data.chips.borrow();
+                    let occurrence_index = chips_guard[chip_idx].occurrence;
+                    release_data.occurrences.borrow().get(occurrence_index).cloned()
+                };
+                if let Some(occ) = occ {
+                    if let Some(callback) = on_activate.borrow().as_ref() {
+                        callback(occ);
+                    }
+                }
+                return;
+            }
+            // A chip drag ended: report the resolved new start/end so the
+            // caller can persist the move/resize.
+            let ended_drag = release_data.drag.borrow_mut().take();
+            if let Some(drag) = ended_drag {
+                release_canvas.set_cursor_from_name(None);
+                let occ = {
+                    let chips_guard = release_data.chips.borrow();
+                    let occurrence_index = chips_guard[drag.chip].occurrence;
+                    release_data.occurrences.borrow().get(occurrence_index).cloned()
+                };
+                let Some(occ) = occ else { return };
+                let (new_start, new_end) = drag_times(&drag, &occ);
+                if let Some(callback) = on_drag.borrow().as_ref() {
+                    callback(occ, new_start, new_end);
+                }
+                release_canvas.queue_draw();
+                return;
+            }
             let was_dragging = release_data.drag_active.replace(false);
             let Some(anchor) = *release_data.drag_anchor.borrow() else { return };
             let Some(release_slot) = slot_at_release(x, y) else { return };
@@ -830,6 +1294,99 @@ fn slot_from_point(x: f64, y: f64, width: f64, n_cols: usize) -> Option<(usize, 
     Some((col, snapped))
 }
 
+/// The day-column width for a grid `width` wide with `n_cols` columns - the
+/// shared geometry behind chip hit-testing, geometry, and drag positions.
+fn col_width_for(width: f64, n_cols: usize) -> f64 {
+    if n_cols > 0 {
+        ((width - HOUR_GUTTER_WIDTH).max(0.0)) / n_cols as f64
+    } else {
+        0.0
+    }
+}
+
+/// The `(column, unsnapped minutes)` under `(x, y)` on a grid `width` wide
+/// with `n_cols` day columns, or `None` for the hour gutter/outside. Like
+/// [`slot_from_point`] but without the half-hour snapping (drag live positions
+/// snap separately in [`drag_update`]) and with the full 0..=1440 minute range
+/// so a drag can end exactly at midnight.
+fn col_minutes_at(x: f64, y: f64, width: f64, n_cols: usize) -> Option<(usize, i64)> {
+    if n_cols == 0 || x < HOUR_GUTTER_WIDTH {
+        return None;
+    }
+    let col_width = col_width_for(width, n_cols);
+    let col = (((x - HOUR_GUTTER_WIDTH) / col_width) as usize).min(n_cols - 1);
+    let minutes = ((y / TIME_SLOT_HEIGHT * 60.0) as i64).clamp(0, 1440);
+    Some((col, minutes))
+}
+
+/// Recomputes a chip drag's live span from a pointer at `(col, minutes)`
+/// (minutes unsnapped, clamped to 0..=1440 by the caller). `total_minutes` is
+/// the grid window's span (`n_cols * 1440`). Pure and unit-testable.
+///
+/// A move preserves the pointer's grab offset against the chip's original
+/// start and shifts both ends together (duration unchanged); a resize keeps
+/// the original start and follows the pointer with the end, never letting the
+/// span flip or fall below one snap slot. All-day chips move by whole days.
+/// Timed live positions snap to [`DRAG_SNAP_MINUTES`] and everything is
+/// clamped inside the visible grid window.
+fn drag_update(drag: &mut TimeGridDrag, col: i64, minutes: i64, total_minutes: i64) {
+    if drag.all_day {
+        let span = drag.original_end - drag.original_start;
+        drag.live_start = (col * 1440 - drag.grab_offset).clamp(0, (total_minutes - span).max(0));
+        drag.live_end = drag.live_start + span;
+        return;
+    }
+    let pointer = (col * 1440 + minutes).clamp(0, total_minutes);
+    let snap = |v: i64| ((v + DRAG_SNAP_MINUTES / 2) / DRAG_SNAP_MINUTES) * DRAG_SNAP_MINUTES;
+    match drag.mode {
+        DragMode::Move => {
+            let duration = drag.original_end - drag.original_start;
+            let start = snap(pointer - drag.grab_offset).clamp(0, (total_minutes - duration).max(0));
+            drag.live_start = start;
+            drag.live_end = start + duration;
+        }
+        DragMode::ResizeEnd => {
+            drag.live_start = drag.original_start;
+            drag.live_end = snap(pointer).clamp(0, total_minutes).max(drag.live_start + DRAG_SNAP_MINUTES);
+        }
+    }
+}
+
+/// The UTC start/end a dropped drag resolves to: a move shifts both ends by
+/// the live-span delta, a resize shifts only the end. Deltas are applied to
+/// the occurrence's original UTC instants, so the wall-clock times in the
+/// user's timezone shift by exactly the drag's grid minutes.
+fn drag_times(drag: &TimeGridDrag, occ: &EventOccurrence) -> (DateTime<Utc>, DateTime<Utc>) {
+    let start = occ.start + Duration::minutes(drag.live_start - drag.original_start);
+    let end = occ.end + Duration::minutes(drag.live_end - drag.original_end);
+    (start, end)
+}
+
+/// The [`TimeChip`] the drag ghost renders as: the live span laid out with the
+/// same column/start/end conventions as [`compute_time_grid_chips`] (an end at
+/// exactly midnight of the day after the chip's start renders as a full
+/// `1440`-minute last column). Full-width (`lane 0` of `lanes 1`) so the
+/// dragged chip always reads clearly.
+fn drag_ghost_chip(drag: &TimeGridDrag, occurrence: usize) -> TimeChip {
+    let start_col = drag.live_start / 1440;
+    let end_col = ((drag.live_end - 1).max(drag.live_start)) / 1440;
+    let end_minutes = if drag.live_end % 1440 == 0 && drag.live_end > drag.live_start {
+        1440
+    } else {
+        drag.live_end % 1440
+    };
+    TimeChip {
+        column: start_col as usize,
+        span: (end_col - start_col + 1) as usize,
+        lane: 0,
+        lanes: 1,
+        all_day: drag.all_day,
+        start_minutes: drag.live_start % 1440,
+        end_minutes,
+        occurrence,
+    }
+}
+
 /// The index of the chip under `(x, y)` among the chips of one split half
 /// (`band` = all-day chips, otherwise timed chips), or `None`. Uses the same
 /// geometry maths as the paint code, so hover hits exactly what is drawn.
@@ -856,7 +1413,9 @@ fn hovered_chip(chips: &[TimeChip], canvas_width: f64, n_cols: usize, x: f64, y:
 /// replacing the old `set_week`/`set_week_occurrences`/`set_day`/
 /// `set_day_occurrences` calls. `on_activate` fires when an event chip is
 /// clicked; `on_slot_activate` when an already-selected time slot is clicked
-/// again (see [`SlotActivate`]).
+/// again (see [`SlotActivate`]); `on_drag`/`on_drag_blocked` carry the
+/// drag-reschedule path (see [`connect_event_dragged`]).
+#[allow(clippy::too_many_arguments)]
 pub fn set_time_grid(
     t: &TimeGrid,
     anchor: NaiveDate,
@@ -864,18 +1423,25 @@ pub fn set_time_grid(
     colors: &HashMap<CalendarId, String>,
     on_activate: Option<ActivateEvent>,
     on_slot_activate: Option<SlotActivate>,
+    on_drag: Option<EventDrag>,
+    on_drag_blocked: Option<DragBlocked>,
 ) {
     *t.on_activate.borrow_mut() = on_activate;
     *t.on_slot_activate.borrow_mut() = on_slot_activate;
+    *t.on_drag.borrow_mut() = on_drag;
+    *t.on_drag_blocked.borrow_mut() = on_drag_blocked;
     *t.anchor.borrow_mut() = anchor;
     *t.data.occurrences.borrow_mut() = occurrences.to_vec();
     *t.data.colors.borrow_mut() = colors.clone();
 
     // A new render pass repaints the whole grid: the previously highlighted
-    // range no longer corresponds to visible positions.
+    // range no longer corresponds to visible positions, and any armed chip
+    // press/drag is stale too.
     *t.data.selection.borrow_mut() = None;
     t.data.drag_active.set(false);
     *t.data.drag_anchor.borrow_mut() = None;
+    *t.data.chip_press.borrow_mut() = None;
+    *t.data.drag.borrow_mut() = None;
 
     let dates = grid_dates(t);
     let chips = compute_time_grid_chips(&dates, occurrences);
@@ -1185,9 +1751,19 @@ fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &
 
     paint_right_text(cr, "All day", HOUR_GUTTER_WIDTH - 5.0, 3.0, 10.0, GRID_DIM_TEXT_RGBA, FontWeight::Normal);
 
+    let dragged = data.drag.borrow().map(|d| d.chip);
     for (i, chip) in chips.iter().enumerate() {
         if chip.all_day {
-            paint_chip(cr, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover);
+            if dragged == Some(i) {
+                continue;
+            }
+            paint_chip(cr, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92);
+        }
+    }
+    if let Some(drag) = *data.drag.borrow() {
+        if drag.all_day {
+            let occurrence = chips[drag.chip].occurrence;
+            paint_chip(cr, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
         }
     }
 }
@@ -1273,15 +1849,27 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
         }
     }
 
+    let dragged = data.drag.borrow().map(|d| d.chip);
     for (i, chip) in chips.iter().enumerate() {
         if !chip.all_day {
-            paint_chip(cr, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover);
+            if dragged == Some(i) {
+                continue;
+            }
+            paint_chip(cr, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92);
+        }
+    }
+    if let Some(drag) = *data.drag.borrow() {
+        if !drag.all_day {
+            let occurrence = chips[drag.chip].occurrence;
+            paint_chip(cr, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
         }
     }
 }
 
 /// Paints one event chip (fill, hairline border, hover ring, and its label).
-fn paint_chip(cr: &gtk::cairo::Context, chip: &TimeChip, occ: &EventOccurrence, colors: &HashMap<CalendarId, String>, col_width: f64, hovered: bool) {
+/// `alpha` scales the fill opacity - the drag ghost paints at a lower alpha
+/// so the grid stays readable under it.
+fn paint_chip(cr: &gtk::cairo::Context, chip: &TimeChip, occ: &EventOccurrence, colors: &HashMap<CalendarId, String>, col_width: f64, hovered: bool, alpha: f64) {
     let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
     let (r, g, b) = css_color_rgb(color);
     let (cx, cy, cw, ch) = chip_geometry(chip, col_width);
@@ -1289,7 +1877,7 @@ fn paint_chip(cr: &gtk::cairo::Context, chip: &TimeChip, occ: &EventOccurrence, 
         return;
     }
     cr.rectangle(cx, cy, cw, ch);
-    cr.set_source_rgba(r, g, b, 0.92);
+    cr.set_source_rgba(r, g, b, 0.92 * alpha);
     let _ = cr.fill();
     cr.rectangle(cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0);
     cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
@@ -1569,6 +2157,13 @@ pub struct CalendarMain {
     /// The click-a-time-slot-to-create callback, handed to every time grid by
     /// each render pass (see [`connect_slot_activated`]).
     on_slot_activate: PendingSlotActivate,
+    /// The drag-reschedule callback, handed to every drag-capable sub-view by
+    /// each render pass (see [`connect_event_dragged`]).
+    on_drag: PendingEventDrag,
+    /// The drag-blocked callback (recurring events), handed to every
+    /// drag-capable sub-view by each render pass (see
+    /// [`connect_event_drag_blocked`]).
+    on_drag_blocked: PendingDragBlocked,
 }
 
 pub fn build_main() -> CalendarMain {
@@ -1651,6 +2246,8 @@ pub fn build_main() -> CalendarMain {
         check_colors,
         on_activate: Rc::new(RefCell::new(None)),
         on_slot_activate: Rc::new(RefCell::new(None)),
+        on_drag: Rc::new(RefCell::new(None)),
+        on_drag_blocked: Rc::new(RefCell::new(None)),
     };
     // Extracted into a local first (rather than inlined into the call
     // below) so the `Ref` temporary from `.borrow()` is dropped before
@@ -1721,6 +2318,22 @@ pub fn connect_event_activated(c: &CalendarMain, f: impl Fn(EventOccurrence) + '
     *c.on_activate.borrow_mut() = Some(Rc::new(f));
 }
 
+/// Registers `f` to run when the user drags an event chip to a new time in
+/// any drag-capable view (the Day/Week/Work week grids and the Month/Split
+/// grids), receiving the dragged occurrence and its resolved new start/end
+/// (UTC) so the caller can persist the move/resize through the session.
+/// One subscriber is expected (the window); a later registration replaces it.
+pub fn connect_event_dragged(c: &CalendarMain, f: impl Fn(EventOccurrence, DateTime<Utc>, DateTime<Utc>) + 'static) {
+    *c.on_drag.borrow_mut() = Some(Rc::new(f));
+}
+
+/// Registers `f` to run when the user tries to drag an occurrence that can't
+/// be drag-rescheduled (a recurring event), so the caller can explain why.
+/// One subscriber is expected (the window); a later registration replaces it.
+pub fn connect_event_drag_blocked(c: &CalendarMain, f: impl Fn(EventOccurrence) + 'static) {
+    *c.on_drag_blocked.borrow_mut() = Some(Rc::new(f));
+}
+
 /// Registers `f` to run when the user clicks a highlighted slot range in the
 /// Day or Week grids (selected by a click, or a click-and-drag), receiving
 /// the range as `(start_date, start_minutes, end_date, end_minutes)` so the
@@ -1776,15 +2389,44 @@ fn refresh(c: &CalendarMain) {
     let colors = c.colors.borrow();
     let on_activate = c.on_activate.borrow().clone();
     let on_slot_activate = c.on_slot_activate.borrow().clone();
+    let on_drag = c.on_drag.borrow().clone();
+    let on_drag_blocked = c.on_drag_blocked.borrow().clone();
 
     set_month(&c.month, anchor);
-    set_month_occurrences(&c.month, &occurrences, &colors, on_activate.clone());
+    set_month_occurrences(&c.month, &occurrences, &colors, on_activate.clone(), on_drag.clone(), on_drag_blocked.clone());
     set_month(&c.split.month, anchor);
-    set_month_occurrences(&c.split.month, &occurrences, &colors, on_activate.clone());
+    set_month_occurrences(&c.split.month, &occurrences, &colors, on_activate.clone(), on_drag.clone(), on_drag_blocked.clone());
 
-    set_time_grid(&c.workweek, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone());
-    set_time_grid(&c.week, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone());
-    set_time_grid(&c.day, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate);
+    set_time_grid(
+        &c.workweek,
+        anchor,
+        &occurrences,
+        &colors,
+        on_activate.clone(),
+        on_slot_activate.clone(),
+        on_drag.clone(),
+        on_drag_blocked.clone(),
+    );
+    set_time_grid(
+        &c.week,
+        anchor,
+        &occurrences,
+        &colors,
+        on_activate.clone(),
+        on_slot_activate.clone(),
+        on_drag.clone(),
+        on_drag_blocked.clone(),
+    );
+    set_time_grid(
+        &c.day,
+        anchor,
+        &occurrences,
+        &colors,
+        on_activate.clone(),
+        on_slot_activate,
+        on_drag.clone(),
+        on_drag_blocked.clone(),
+    );
 
     set_agenda(&c.agenda, anchor, &occurrences, &colors, on_activate.clone());
     set_agenda(&c.split.agenda, anchor, &occurrences, &colors, on_activate);
@@ -2900,5 +3542,197 @@ mod tests {
         assert_eq!(minutes, 1440 - 30);
         let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, 23.9 * TIME_SLOT_HEIGHT, 752.0, 7).unwrap();
         assert_eq!(minutes, 1440 - 30);
+    }
+
+    // --- Drag-reschedule math.
+
+    fn drag_at(original_start: i64, original_end: i64, mode: DragMode) -> TimeGridDrag {
+        TimeGridDrag {
+            chip: 0,
+            mode,
+            original_start,
+            original_end,
+            live_start: original_start,
+            live_end: original_end,
+            grab_offset: 0,
+            all_day: false,
+        }
+    }
+
+    #[test]
+    fn can_drag_rejects_recurring_occurrences() {
+        let mut recurring = occ("Weekly", NaiveDateTime::default(), NaiveDateTime::default(), false);
+        recurring.rrule = Some("FREQ=WEEKLY".to_string());
+        assert!(!can_drag(&recurring));
+        let plain = occ("Once", NaiveDateTime::default(), NaiveDateTime::default(), false);
+        assert!(can_drag(&plain));
+    }
+
+    #[test]
+    fn drag_move_shifts_both_ends_preserving_duration_and_grab_offset() {
+        // 9:00-10:00 on Monday (absolute grid minutes of a Sunday-first grid).
+        let mut drag = drag_at(1440 + 9 * 60, 1440 + 10 * 60, DragMode::Move);
+        drag.grab_offset = 30; // grabbed 30 minutes into the chip
+                               // Pointer lands 9:30 Tuesday: the chip start should land 9:00 Tuesday.
+        drag_update(&mut drag, 2, 9 * 60 + 30, 7 * 1440);
+        assert_eq!(drag.live_start, 2 * 1440 + 9 * 60);
+        assert_eq!(drag.live_end, 2 * 1440 + 10 * 60);
+    }
+
+    #[test]
+    fn drag_move_snaps_to_half_hours() {
+        let mut drag = drag_at(1440 + 9 * 60, 1440 + 10 * 60, DragMode::Move);
+        // A pointer 13 minutes past the hour lands the start on the hour.
+        drag_update(&mut drag, 2, 9 * 60 + 43, 7 * 1440);
+        assert_eq!(drag.live_start, 2 * 1440 + 9 * 60 + 30);
+        // ...and 7 minutes past lands it on the hour.
+        let mut drag = drag_at(1440 + 9 * 60, 1440 + 10 * 60, DragMode::Move);
+        drag_update(&mut drag, 2, 9 * 60 + 7, 7 * 1440);
+        assert_eq!(drag.live_start, 2 * 1440 + 9 * 60);
+    }
+
+    #[test]
+    fn drag_move_clamps_to_the_visible_grid_window() {
+        // Dragging far past the right edge clamps the chip inside the grid.
+        let mut drag = drag_at(0, 60, DragMode::Move);
+        drag_update(&mut drag, 6, 23 * 60, 7 * 1440);
+        assert_eq!(drag.live_end, 7 * 1440);
+        // ...and before the left edge clamps it back to the start.
+        let mut drag = drag_at(2 * 1440 + 9 * 60, 2 * 1440 + 10 * 60, DragMode::Move);
+        drag_update(&mut drag, 0, 0, 7 * 1440);
+        assert_eq!(drag.live_start, 0);
+        assert_eq!(drag.live_end, 60);
+    }
+
+    #[test]
+    fn drag_resize_follows_the_pointer_with_the_start_pinned() {
+        let mut drag = drag_at(1440 + 9 * 60, 1440 + 10 * 60, DragMode::ResizeEnd);
+        drag_update(&mut drag, 1, 11 * 60 + 40, 7 * 1440);
+        assert_eq!(drag.live_start, 1440 + 9 * 60);
+        assert_eq!(drag.live_end, 1440 + 11 * 60 + 30);
+    }
+
+    #[test]
+    fn drag_resize_never_flips_or_underflows_the_minimum_duration() {
+        // Dragging the end above the start floors it one snap slot later.
+        let mut drag = drag_at(1440 + 9 * 60, 1440 + 10 * 60, DragMode::ResizeEnd);
+        drag_update(&mut drag, 1, 8 * 60, 7 * 1440);
+        assert_eq!(drag.live_start, 1440 + 9 * 60);
+        assert_eq!(drag.live_end, 1440 + 9 * 60 + 30);
+        // A resize can extend across midnight into the next day.
+        let mut drag = drag_at(1440 + 22 * 60, 1440 + 23 * 60, DragMode::ResizeEnd);
+        drag_update(&mut drag, 2, 6 * 60, 7 * 1440);
+        assert_eq!(drag.live_start, 1440 + 22 * 60);
+        assert_eq!(drag.live_end, 2 * 1440 + 6 * 60);
+    }
+
+    #[test]
+    fn drag_all_day_moves_by_whole_days() {
+        let mut drag = drag_at(2 * 1440, 4 * 1440, DragMode::Move);
+        drag.all_day = true;
+        drag.grab_offset = 1440; // grabbed on the second day of the span
+                                 // Pointer over Tuesday (col 2): the span keeps its grab offset, so it
+                                 // lands Monday-Wednesday.
+        drag_update(&mut drag, 2, 720, 7 * 1440);
+        assert_eq!(drag.live_start, 1440);
+        assert_eq!(drag.live_end, 3 * 1440);
+    }
+
+    #[test]
+    fn drag_times_move_shifts_both_ends_by_the_live_delta() {
+        let e = occ("Move", NaiveDateTime::default(), NaiveDateTime::default(), false);
+        let drag = TimeGridDrag {
+            chip: 0,
+            mode: DragMode::Move,
+            original_start: 1440 + 9 * 60,
+            original_end: 1440 + 10 * 60,
+            live_start: 2 * 1440 + 9 * 60 + 30,
+            live_end: 2 * 1440 + 10 * 60 + 30,
+            grab_offset: 0,
+            all_day: false,
+        };
+        let (start, end) = drag_times(&drag, &e);
+        assert_eq!(start - e.start, chrono::Duration::minutes(24 * 60 + 30));
+        assert_eq!(end - e.end, chrono::Duration::minutes(24 * 60 + 30));
+    }
+
+    #[test]
+    fn drag_times_resize_only_shifts_the_end() {
+        let e = occ("Resize", NaiveDateTime::default(), NaiveDateTime::default(), false);
+        let drag = TimeGridDrag {
+            chip: 0,
+            mode: DragMode::ResizeEnd,
+            original_start: 1440 + 9 * 60,
+            original_end: 1440 + 10 * 60,
+            live_start: 1440 + 9 * 60,
+            live_end: 1440 + 12 * 60,
+            grab_offset: 0,
+            all_day: false,
+        };
+        let (start, end) = drag_times(&drag, &e);
+        assert_eq!(start, e.start);
+        assert_eq!(end - e.end, chrono::Duration::minutes(2 * 60));
+    }
+
+    #[test]
+    fn drag_ghost_chip_spans_midnight_and_renders_full_last_columns() {
+        // 22:00 Monday - 06:00 Tuesday.
+        let drag = TimeGridDrag {
+            chip: 0,
+            mode: DragMode::Move,
+            original_start: 1440 + 22 * 60,
+            original_end: 1440 + 30 * 60,
+            live_start: 1440 + 22 * 60,
+            live_end: 2 * 1440 + 6 * 60,
+            grab_offset: 0,
+            all_day: false,
+        };
+        let ghost = drag_ghost_chip(&drag, 0);
+        assert_eq!((ghost.column, ghost.span, ghost.start_minutes, ghost.end_minutes), (1, 2, 22 * 60, 6 * 60));
+
+        // An end at exactly midnight renders as a full 1440-minute last column.
+        let drag = TimeGridDrag {
+            chip: 0,
+            mode: DragMode::ResizeEnd,
+            original_start: 1440 + 9 * 60,
+            original_end: 1440 + 10 * 60,
+            live_start: 1440 + 9 * 60,
+            live_end: 2 * 1440,
+            grab_offset: 0,
+            all_day: false,
+        };
+        let ghost = drag_ghost_chip(&drag, 0);
+        assert_eq!((ghost.column, ghost.span, ghost.start_minutes, ghost.end_minutes), (1, 1, 9 * 60, 1440));
+
+        // An all-day span keeps whole-day columns.
+        let drag = TimeGridDrag {
+            chip: 0,
+            mode: DragMode::Move,
+            original_start: 2 * 1440,
+            original_end: 4 * 1440,
+            live_start: 3 * 1440,
+            live_end: 5 * 1440,
+            grab_offset: 0,
+            all_day: true,
+        };
+        let ghost = drag_ghost_chip(&drag, 0);
+        assert_eq!((ghost.column, ghost.span, ghost.start_minutes, ghost.end_minutes), (3, 2, 0, 1440));
+    }
+
+    #[test]
+    fn cell_index_at_point_maps_grid_coordinates_to_day_cells() {
+        // A 700x700 grid (7 homogeneous rows/columns of 100px each).
+        assert_eq!(cell_index_at_point(700.0, 700.0, 0.0, 100.0), Some(0));
+        assert_eq!(cell_index_at_point(700.0, 700.0, 650.0, 100.0), Some(6));
+        assert_eq!(cell_index_at_point(700.0, 700.0, 0.0, 690.0), Some(42 - 7));
+        assert_eq!(cell_index_at_point(700.0, 700.0, 650.0, 690.0), Some(41));
+        // The weekday header row (top 100px) is not a day cell.
+        assert_eq!(cell_index_at_point(700.0, 700.0, 50.0, 50.0), None);
+        // Outside the grid.
+        assert_eq!(cell_index_at_point(700.0, 700.0, -1.0, 100.0), None);
+        assert_eq!(cell_index_at_point(700.0, 700.0, 700.0, 100.0), None);
+        assert_eq!(cell_index_at_point(700.0, 700.0, 50.0, 700.0), None);
+        // Degenerate sizes.
+        assert_eq!(cell_index_at_point(0.0, 700.0, 0.0, 0.0), None);
     }
 }

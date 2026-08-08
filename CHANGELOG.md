@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.8 (2026-08-09)
+
+### Added
+
+- **Calendar**: event chips can now be dragged to a new time. In the Day/Week/Work week grids, a press on an event chip still opens the editor on release - but once the pointer moves a few pixels, the press becomes a drag instead: grabbing anywhere above the chip's bottom edge moves the event (duration unchanged), while grabbing its bottom 8px strip resizes the end. The dragged chip follows the pointer as a translucent ghost with a "grabbing" cursor, snapped to half-hour slots and clamped inside the visible grid window, so a move can cross day columns and a resize can extend past midnight (a resize never flips or undercuts a half hour); all-day band chips move by whole days. The existing click-and-drag selection on empty slots is untouched. The Month and Split grids support the same move at day granularity: the chip is live re-parented between day cells as the pointer crosses them (the target cell highlighted), and a multi-day event moves as a block by the day delta. Dropping persists the change through the same etag-guarded `UpdateEvent` path the editor's save uses - resync on success, error toast on failure - with two deliberate gates: recurring events can't be dragged yet (a toast explains, rather than silently moving the whole series), and events from webcal subscriptions, which have no write-back path, toast as read-only instead of moving.
+
+### Testing
+
+- `lookout-app`: `calendar_view` drag-math tests - a move preserves duration and the pointer's grab offset and snaps to half hours, clamping at the grid's edges; a resize pins the start and never flips or underflows below one snap slot; all-day moves shift by whole days; `drag_times` resolves a drop correctly for move vs resize; the ghost chip's geometry handles spans crossing midnight and ends landing exactly on midnight (full 1440-minute last columns); the month grid's pointer-to-cell mapping covers corners, the excluded weekday header row, and outside/degenerate sizes; and `can_drag` rejects recurring occurrences. `event_editor` tests for the new `calendar_event_from_occurrence` helper - every master field carried verbatim with the dragged times applied, and the all-day exclusive-end convention.
+
 ## 0.9.7 (2026-08-09)
 
 ### Changed

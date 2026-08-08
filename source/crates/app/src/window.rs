@@ -5120,6 +5120,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             open_event_editor_for(&window, &state, &calendar_state, &occ);
         });
     }
+    // --- Calendar drag-reschedule: dropping an event chip at a new position
+    // in the Day/Week/Work week or Month/Split grids persists the change
+    // through the same route the editor's save uses (an etag-guarded
+    // `UpdateEvent`, resync on success, error toast on failure). Webcal
+    // subscriptions have no write-back path, so their events can't move.
+    {
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        calendar_view::connect_event_dragged(&calendar_main, move |occ, new_start, new_end| {
+            if calendar_state.borrow().webcal_handles.values().any(|h| h.calendar_id == occ.calendar_id) {
+                toast_overlay.add_toast(adw::Toast::new("Events from calendar subscriptions are read-only."));
+                return;
+            }
+            let event = crate::event_editor::calendar_event_from_occurrence(
+                &occ,
+                new_start.with_timezone(&chrono::Local).naive_local(),
+                new_end.with_timezone(&chrono::Local).naive_local(),
+            );
+            route_calendar_save(&calendar_state, event.calendar_id.clone(), event);
+        });
+    }
+    {
+        let toast_overlay = toast_overlay.clone();
+        calendar_view::connect_event_drag_blocked(&calendar_main, move |occ| {
+            let summary = occ.summary.unwrap_or_else(|| "(untitled)".to_string());
+            toast_overlay.add_toast(adw::Toast::new(&format!("\"{summary}\" repeats - dragging individual occurrences isn't supported yet.")));
+        });
+    }
     // --- Calendar main grid interactions: the first click on an empty time
     // slot in the Day/Week grids (or on a month-grid day cell) selects and
     // highlights it; a second click on the highlighted slot/day opens the
@@ -9967,11 +9995,7 @@ fn show_composer_in_reading_pane(
         // is independent of the relay ownership above: a popped-out composer
         // finishing after a newer inline composer opened still closes its
         // own window.
-        let owns_window = st
-            .compose_popout_window
-            .as_ref()
-            .map(|(gen, _)| *gen == relay_generation)
-            .unwrap_or(false);
+        let owns_window = st.compose_popout_window.as_ref().map(|(gen, _)| *gen == relay_generation).unwrap_or(false);
         if owns_window {
             if let Some((_, win)) = st.compose_popout_window.take() {
                 win.destroy();
