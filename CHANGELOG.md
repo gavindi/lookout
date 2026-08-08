@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.7 (2026-08-09)
+
+### Changed
+
+- **UI**: the pop-out / pop-back-in buttons across the app now share a matching pair of bundled icons instead of borrowing unrelated window glyphs. Two new themed SVGs (`popin1.svg`, `popout1.svg`, white so they read against the dark UI) ride in the GResource bundle alongside the nav-rail icons, and all four buttons that move a surface between the main window and its own window use them: the composer header's pop-out button (previously `window-new-symbolic`), the popped-out composer window's "Back to main window" header button (previously `go-previous-symbolic`), and the People screen's "Open in new window" toolbar button and its popped-out window's "Back to main window" header button - the latter two were plain text labels before and are now icon-only buttons with tooltips ("Open the People screen in its own window" / "Return the People screen to the main window"). Every site keeps its system-icon fallback via `themed_icon_name`, so the buttons stay usable even when a dev build's GResource bundle is missing.
+
+### Testing
+
+- `lookout-app`: the `resources` bundle test now also asserts both pop-out icons ship in the compiled GResource, alongside the nav-rail icons.
+
 ## 0.9.6 (2026-08-09)
 
 ### Added

@@ -3048,7 +3048,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_command_toolbar.append(&export_contacts_button);
     let manage_groups_button = gtk::Button::with_label("Manage groups…");
     contacts_command_toolbar.append(&manage_groups_button);
-    let open_contacts_window_button = gtk::Button::with_label("Open in new window");
+    let open_contacts_window_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]));
+    open_contacts_window_button.set_tooltip_text(Some("Open the People screen in its own window"));
     contacts_command_toolbar.append(&open_contacts_window_button);
     view_toolbar_stack.add_named(&contacts_command_toolbar, Some("contacts"));
 
@@ -3388,7 +3389,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let win = adw::Window::builder().default_width(960).default_height(680).build();
             let header = adw::HeaderBar::new();
             header.set_title_widget(Some(&adw::WindowTitle::new("People", "")));
-            let back_button = gtk::Button::with_label("Back to main window");
+            let back_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popin1", "go-previous-symbolic", "go-back-symbolic"]));
             back_button.set_tooltip_text(Some("Return the People screen to the main window"));
             header.pack_start(&back_button);
             {
@@ -10022,7 +10023,7 @@ fn show_composer_in_reading_pane(
             // close handler below performs the pop-back-in (the same path
             // as the window's own close button, minus the "already
             // finished" branch).
-            let back_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["go-previous-symbolic", "go-back-symbolic"]));
+            let back_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popin1", "go-previous-symbolic", "go-back-symbolic"]));
             back_button.set_tooltip_text(Some("Back to main window"));
             {
                 let win = win.clone();

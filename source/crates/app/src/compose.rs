@@ -857,7 +857,7 @@ pub fn build_compose_view(
     // back into the reading pane (see the `root-notify` handler below).
     let moving = Rc::new(Cell::new(false));
     let popped_out = Rc::new(Cell::new(false));
-    let pop_out_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["window-new-symbolic", "view-restore-symbolic"]));
+    let pop_out_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]));
     pop_out_button.set_tooltip_text(Some("Pop out compose window"));
 
     let top_row = gtk::Box::builder()

@@ -6,6 +6,8 @@
         <file alias="icons/email-1.svg">resources/icons/email-1.svg</file>
         <file alias="icons/observatorium-1.svg">resources/icons/observatorium-1.svg</file>
         <file alias="icons/task-1.svg">resources/icons/task-1.svg</file>
+        <file alias="icons/popin1.svg">resources/icons/popin1.svg</file>
+        <file alias="icons/popout1.svg">resources/icons/popout1.svg</file>
         <file alias="backgrounds/background1.jpg">resources/backgrounds/background1.jpg</file>
         <file alias="backgrounds/background2.png">resources/backgrounds/background2.png</file>
         <file alias="icons/io.github.gavindi.Lookout.svg">icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg</file>
