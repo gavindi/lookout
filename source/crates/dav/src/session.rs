@@ -29,6 +29,11 @@ pub enum CalendarCommand {
     /// Any date within the month to display; the actor resolves the
     /// month's own first/last-instant bounds itself.
     SyncMonth(NaiveDate),
+    /// Fetch one month's occurrences without making it the polled month -
+    /// the Lookout dashboard's "upcoming events" horizon reaches into next
+    /// month without hijacking `current_month`, so the 5-minute poll keeps
+    /// re-syncing whatever month the calendar view is showing.
+    FetchMonth(NaiveDate),
     /// Force a resync of the currently-displayed month outside the poll cadence.
     Refresh,
     /// A hint that it's worth retrying the connection now rather than
@@ -261,6 +266,9 @@ async fn connect_and_run(
                 CalendarCommand::SyncMonth(date) => {
                     current_month = first_of_month(date);
                     sync_month(&client, &calendars, &credential, current_month, events, cache).await;
+                }
+                CalendarCommand::FetchMonth(date) => {
+                    sync_month(&client, &calendars, &credential, first_of_month(date), events, cache).await;
                 }
                 CalendarCommand::CreateEvent { event } => {
                     write_event(&client, &calendars, &credential, &event, current_month, events, cache).await;

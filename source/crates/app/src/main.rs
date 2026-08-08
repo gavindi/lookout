@@ -15,6 +15,7 @@ mod goa_credentials;
 mod google_tasks;
 mod identities;
 mod last_view;
+mod lookout_view;
 mod message_header;
 mod message_list;
 mod microsoft_oauth;

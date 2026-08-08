@@ -31,6 +31,10 @@ pub enum SubscriptionCommand {
     /// Any date within the month to display; the actor resolves the month's
     /// own bounds itself.
     SyncMonth(NaiveDate),
+    /// Fetch every feed's occurrences for one month without making it the
+    /// polled month - the Lookout dashboard's next-month horizon, which
+    /// must not hijack the feed session's own displayed month.
+    FetchMonth(NaiveDate),
     /// Force a re-fetch of every feed outside the poll cadence.
     Refresh,
     /// The subscription list changed (added or removed) - adopt this full
@@ -125,6 +129,9 @@ pub async fn run_subscription_session(
                 SubscriptionCommand::SyncMonth(date) => {
                     current_month = first_of_month(date);
                     sync_all(&http, &subscriptions, current_month, &events).await;
+                }
+                SubscriptionCommand::FetchMonth(date) => {
+                    sync_all(&http, &subscriptions, first_of_month(date), &events).await;
                 }
                 SubscriptionCommand::Reload { subscriptions: new_list } => {
                     subscriptions = new_list;

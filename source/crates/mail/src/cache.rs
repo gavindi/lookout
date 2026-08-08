@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailBody, EmailSummary, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
 use rusqlite::Connection;
 
@@ -749,8 +749,68 @@ impl Cache {
         Ok(out)
     }
 
-    /// Full-text search over this account's cached envelopes and bodies.
-    /// Runs entirely against the local index (no IMAP round trip), returning
+    /// The top `limit` correspondents by lifetime appearances across the
+    /// cached envelopes (from/to/cc combined), most-contacted first, with
+    /// each person's count - the Lookout dashboard's "People most contacted"
+    /// feed. Reuses the `addresses` table the composer's autocomplete ranks,
+    /// so no extra indexing is needed: `addresses_by_count` already orders by
+    /// `seen_count` (ties broken by `last_seen`, matching the autocomplete).
+    pub fn top_addresses(&self, limit: usize) -> Result<Vec<(EmailAddress, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT address, name, seen_count FROM addresses
+             ORDER BY seen_count DESC, last_seen DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok((
+                EmailAddress {
+                    address: row.get::<_, String>(0)?,
+                    name: row.get::<_, Option<String>>(1)?.filter(|n| !n.trim().is_empty()),
+                },
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Counts every cached message's date by hour of day, bucketed in the
+    /// user's *local* timezone - the Lookout dashboard's "Emails by time of
+    /// day" feed. `since` optionally limits the window to messages at or
+    /// after that instant (`None` covers everything the cache holds). The
+    /// bucketing happens in Rust rather than SQL `strftime` so the hours
+    /// stay accurate across DST changes; SQL only extracts the stored
+    /// RFC 3339 strings and filters them lexicographically, which is valid
+    /// because every cached date serializes in UTC with a trailing `Z`.
+    /// Rows whose date can't be parsed are skipped.
+    pub fn hour_histogram(&self, since: Option<DateTime<Utc>>) -> Result<[i64; 24]> {
+        let conn = self.conn.lock().unwrap();
+        // The cut is passed as the stored format (RFC 3339 UTC), which sorts
+        // lexicographically like the serialized dates themselves.
+        let (sql, since_string) = match since {
+            Some(since) => (
+                "SELECT json_extract(data, '$.date') FROM messages WHERE json_extract(data, '$.date') >= ?1",
+                Some(since.to_rfc3339()),
+            ),
+            None => ("SELECT json_extract(data, '$.date') FROM messages", None),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let params: Vec<String> = since_string.into_iter().collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| row.get::<_, String>(0))?;
+        let mut histogram = [0i64; 24];
+        for row in rows {
+            let Ok(date_string) = row else { continue };
+            let Ok(date) = DateTime::parse_from_rfc3339(&date_string) else { continue };
+            histogram[date.with_timezone(&Local).hour() as usize] += 1;
+        }
+        Ok(histogram)
+    }
+
+    /// Full-text search over this account's cached envelopes and bodies.    /// Runs entirely against the local index (no IMAP round trip), returning
     /// at most `limit` matches, most-relevant first, with snoozed messages
     /// excluded to match what the message list shows.
     ///
@@ -1348,6 +1408,80 @@ mod tests {
 
         // LIKE metacharacters are searched for literally, not as wildcards.
         assert!(cache.search_addresses("%", 10).unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The dashboard's "most contacted" feed: top addresses ranked by
+    /// lifetime appearance count, with the count alongside, ties broken by
+    /// recency.
+    #[test]
+    fn top_addresses_ranks_by_lifetime_appearances_with_counts() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let addressed = |uid: u32, from: &str, to: &[&str]| {
+            let mut msg = sample_summary(&mailbox_id, uid, None);
+            msg.from = vec![lookout_core::EmailAddress::new(from)];
+            msg.to = to.iter().map(|a| lookout_core::EmailAddress::new(*a)).collect();
+            msg
+        };
+
+        cache
+            .record_addresses(&[
+                addressed(1, "ada@example.com", &["bob@example.com", "carol@example.com"]),
+                addressed(2, "bob@example.com", &["ada@example.com"]),
+                addressed(3, "dave@example.com", &[]),
+            ])
+            .unwrap();
+
+        let top = cache.top_addresses(2).unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0.address, "ada@example.com", "appears in from and to");
+        assert_eq!(top[0].1, 2);
+        assert_eq!(top[1].0.address, "bob@example.com");
+        assert_eq!(top[1].1, 2);
+
+        let top = cache.top_addresses(10).unwrap();
+        assert_eq!(top.len(), 4, "every recorded address, most-contacted first");
+        assert_eq!(top[3].0.address, "dave@example.com");
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The dashboard's "emails by time of day" feed: cached envelope dates
+    /// are bucketed by the *local* hour of day, and the `since` window only
+    /// counts newer messages.
+    #[test]
+    fn hour_histogram_buckets_by_local_hour_and_honors_the_window() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let dated = |uid: u32, utc_hour: u32| {
+            let mut msg = sample_summary(&mailbox_id, uid, None);
+            msg.date = DateTime::parse_from_rfc3339(&format!("2026-08-06T{utc_hour:02}:30:00Z")).unwrap().with_timezone(&Utc);
+            msg
+        };
+
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[dated(1, 2), dated(2, 2), dated(3, 9)]).unwrap();
+
+        let histogram = cache.hour_histogram(None).unwrap();
+        let expected_local_hour = |utc_hour: u32| {
+            DateTime::parse_from_rfc3339(&format!("2026-08-06T{utc_hour:02}:30:00Z"))
+                .unwrap()
+                .with_timezone(&Local)
+                .hour() as usize
+        };
+        assert_eq!(histogram.iter().sum::<i64>(), 3, "every cached message is counted");
+        assert_eq!(histogram[expected_local_hour(2)], 2);
+        assert_eq!(histogram[expected_local_hour(9)], 1);
+
+        let windowed = cache.hour_histogram(Some(DateTime::parse_from_rfc3339("2026-08-06T09:30:00Z").unwrap().into())).unwrap();
+        assert_eq!(windowed.iter().sum::<i64>(), 1, "the window is inclusive of the cut instant");
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

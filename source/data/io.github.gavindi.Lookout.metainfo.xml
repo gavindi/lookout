@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.0" date="2026-08-08">
+      <description>
+        <p>New: the Lookout dashboard tab. A new header-corner tab (with the app's Observatorium telescope icon) shows your connected accounts at a glance - people most contacted, emails by time of day, outstanding tasks, and upcoming calendar events - fed from the local caches and the calendar sessions, live-updating as mail, events, and tasks change. Upcoming events now span the current and next month and stay populated while the dashboard is on screen. The search entry moves beside the tab in the header.</p>
+      </description>
+    </release>
     <release version="0.8.8" date="2026-08-08">
       <description>
         <p>Saving drafts works again: draft autosaves and the copy of a sent message kept in Sent were being rejected by the server as malformed, so a draft never appeared in your Drafts folder. Error messages shown as toasts (account failures, contacts import/export problems, and more) also display properly now instead of tripping a GTK markup warning when they contain addresses or angle brackets.</p>

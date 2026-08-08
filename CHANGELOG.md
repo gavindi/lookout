@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.0 (2026-08-08)
+
+### Added
+
+- **Lookout**: a new dashboard tab - the app's first surface for seeing your connected accounts at a glance. Four sections, each fed by data the app already holds: **People most contacted** (the top correspondents by lifetime appearances in the cached envelope from/to/cc fields, name + address + count, from each connected mail account's cache), **Emails by time of day** (a 24-bar hour-of-day histogram over every cached message, bucketed in the user's *local* timezone so DST never shifts the bars, painted with Cairo and annotated with the total), **Outstanding tasks** (Overdue / Today / This week / Later, completed excluded, reusing the Tasks view's own rows so the checkbox completes through the session and a click opens the editor), and **Upcoming events** (the next fourteen days of checked calendars, with time or date captions and each calendar's colour dot). The whole tab is a new `lookout_view` module following the codebase's data-in/widget-state-out convention - pure, unit-tested selection logic, repaint-from-scratch widgets, per-section empty states ("No mail history yet", "No upcoming events", ...). Mail stats come from two new `lookout-mail` cache queries (`top_addresses`, `hour_histogram` - the same WAL reader the composer autocomplete uses, so no session round trip); the dashboard repaints on every folder/message sync, every occurrences/tasks update, and every time it's opened. A Refresh button in its command toolbar re-reads the caches and widens the calendar sync horizon.
+- **Lookout**: the dashboard's events reach into next month without disturbing anything else. New `FetchMonth` commands on both the CalDAV and webcal sessions fetch one month's occurrences *without* making it the session's polled month - deliberately not `SyncMonth`, which would hijack the 5-minute poll away from whatever the Calendar view is showing - and the app now keeps a per-month occurrence map (current + next month, pruned on insert) alongside the existing single-month `last_occurrences` snapshot the calendar views and reminders still use, so the dashboard sees a true two-month window. Opening the tab or hitting Refresh issues `FetchMonth` for both months.
+- **UI**: the Lookout tab lives in the header bar's top-left corner rather than the nav rail - its Observatorium telescope artwork reads like a logo, with the permanent mail-search entry directly to its right (the old 62px search margin that compensated for the rail's width is gone). It stays a toggle button in the rail buttons' group, so tab switching remains mutually exclusive; the rail itself is back to Mail / Calendar / People / Tasks / Config.
+
+### Fixed
+
+- **Lookout**: the Upcoming events section drained over time the longer the tab stayed displayed. Every account handle kept only its *last-synched month* of occurrences, and the old horizon-widening sent `SyncMonth` for the current and next month, leaving each session's single polled month pinned on the next one - so the dashboard's fourteen-day horizon mostly pointed at a month the cache never held, and entries only ever dropped off as `now` advanced. The per-month occurrence map plus the fetch-only `FetchMonth` commands fix both halves: the sessions keep polling the calendar's real month, and the dashboard unions the current and next month, so events replenish instead of draining.
+- **Lookout**: the dashboard cards were cramped and lopsided. Each card's heading and rows now get proper margins from the card border (12px sides, 10px top/bottom, matching the app's other cards), and the histogram card expands to fill its pane, so the bar chart stretches with the card instead of leaving a dead band below the caption.
+
+### Changed
+
+- **UI**: the nav rail drops the Lookout button (it moved to the header); the mail search entry's start margin shrinks from 62px to 12px, since it now sits beside the header icon instead of aligning with the menu bar below. The `lookout-dav` session command enums gain `FetchMonth` variants (both CalDAV `CalendarCommand` and `SubscriptionCommand`), and both account handle types in the window state gain the pruned per-month occurrence map.
+
+### Testing
+
+- `lookout-mail`: cache tests for `top_addresses` (ranking by lifetime appearance count with the count alongside, ties by recency) and `hour_histogram` (local-hour bucketing across all cached messages, the `since` window inclusive of the cut instant, unparseable dates skipped). `lookout-app`: `lookout_view` tests for the outstanding-task selection (bucket order preserved, completed excluded, truncation) and upcoming-occurrence filtering (checked calendars only, past and beyond-horizon events out, sorted by start, truncated); `window` tests for the dashboard's per-month occurrence map pruning to exactly the current and next month with stale months evicting themselves on insert.
+
 ## 0.8.8 (2026-08-08)
 
 ### Fixed

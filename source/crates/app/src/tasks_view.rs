@@ -119,7 +119,7 @@ pub struct TasksView {
 /// status/completed/percent updated) to its account session.
 pub type ToggleHandler = Rc<dyn Fn(CalendarTask, bool) + 'static>;
 /// A clicked row: the caller should open the task editor for it.
-type ActivateHandler = Rc<dyn Fn(CalendarTask) + 'static>;
+pub(crate) type ActivateHandler = Rc<dyn Fn(CalendarTask) + 'static>;
 
 /// Builds a fresh Tasks view: a scrolled list inside a card, with an empty
 /// placeholder for the no-tasks state.
@@ -223,8 +223,9 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
 /// One task row: a completion checkbox, a calendar colour dot, the summary,
 /// and a right-aligned due-date caption. Completed rows render dimmed and
 /// struck through. Clicking the row body (not the checkbox) activates the
-/// row's edit callback.
-fn task_row(task: &CalendarTask, colors: &CalendarColorMap, toggle: ToggleHandler, activate: ActivateHandler) -> gtk::Button {
+/// row's edit callback. `pub(crate)` for the Lookout dashboard, whose
+/// outstanding-tasks section reuses the same row.
+pub(crate) fn task_row(task: &CalendarTask, colors: &CalendarColorMap, toggle: ToggleHandler, activate: ActivateHandler) -> gtk::Button {
     let task = task.clone();
     let completed = task.status == TaskStatus::Completed || task.percent_complete == Some(100);
 
@@ -316,7 +317,8 @@ fn task_completed(task: &CalendarTask) -> bool {
 
 /// Parses a `#rgb`/`#rrggbb` hex colour to an `(r, g, b)` tuple in 0..=1 for
 /// Cairo, falling back to a neutral grey on anything unparseable.
-fn parse_css_color(color: &str) -> (f64, f64, f64) {
+/// `pub(crate)` for the Lookout dashboard's event rows.
+pub(crate) fn parse_css_color(color: &str) -> (f64, f64, f64) {
     let body = color.trim_start_matches('#');
     let expanded = if body.len() == 3 && body.chars().all(|c| c.is_ascii_hexdigit()) {
         body.chars().flat_map(|c| [c, c]).collect::<String>()

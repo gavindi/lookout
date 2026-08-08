@@ -547,6 +547,13 @@ struct CalendarAccountHandle {
     /// `MessagesUpdated` handling.
     last_occurrences: Vec<EventOccurrence>,
     last_synced_month: Option<chrono::NaiveDate>,
+    /// Occurrences keyed by the month they were synced in, pruned to the
+    /// current and next month. The Lookout dashboard's "upcoming events"
+    /// section reads this union: a single month's window would drain as
+    /// events pass and the session's poll never advances past its one
+    /// polled month. The calendar view and reminders keep using
+    /// `last_occurrences`, so this map stays dashboard-only.
+    occurrences_by_month: HashMap<chrono::NaiveDate, Vec<EventOccurrence>>,
     /// Latest full task list from the account's last `TasksUpdated` - tasks
     /// have no month window, so a whole-set snapshot is the natural unit.
     last_tasks: Vec<CalendarTask>,
@@ -568,6 +575,9 @@ struct WebcalHandle {
     /// `CalendarAccountHandle::last_occurrences`.
     last_occurrences: Vec<EventOccurrence>,
     last_synced_month: Option<chrono::NaiveDate>,
+    /// Per-month occurrences for the Lookout dashboard, pruned like
+    /// `CalendarAccountHandle::occurrences_by_month`.
+    occurrences_by_month: HashMap<chrono::NaiveDate, Vec<EventOccurrence>>,
     /// The feed's latest fetch error, if any - the UI toasts on the
     /// transition into error, not on every 5-minute poll.
     error: Option<String>,
@@ -627,6 +637,11 @@ struct CalendarUiState {
     /// Best-effort handle on the UI-state database for local-task writes;
     /// `None` when it couldn't open (local tasks then live in memory only).
     local_tasks_db: Option<Rc<RefCell<UiStateDb>>>,
+    /// The Lookout dashboard's repaint hook, registered by the window once
+    /// `calendar_state` exists. `refresh_tasks_view` and the calendar event
+    /// loops call it so the dashboard stays live; `None` until then (a
+    /// no-op, never an error).
+    dashboard_refresh: Option<Rc<dyn Fn()>>,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -2360,6 +2375,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     root_stack.add_named(&tasks_status_page, Some("tasks-empty"));
     root_stack.add_named(&tasks_card, Some("tasks"));
 
+    // --- Lookout view: the dashboard tab at the top of the nav rail. A
+    // snapshot of every connected account - people most contacted, emails
+    // by time of day, outstanding tasks, and upcoming events - fed from
+    // the mail caches and the calendar state, so "no accounts" shows a
+    // status page like the other modules' empty states.
+    let lookout_status_page = adw::StatusPage::builder()
+        .icon_name("view-grid-symbolic")
+        .title("No Accounts Connected")
+        .description("Connect an account in GNOME Online Accounts to see your dashboard here.")
+        .build();
+    let lookout_view = Rc::new(crate::lookout_view::build_lookout_view());
+    let lookout_card = card_section(&lookout_view.root);
+    lookout_card.add_css_class("folder-pane");
+    root_stack.add_named(&lookout_status_page, Some("lookout-empty"));
+    root_stack.add_named(&lookout_card, Some("lookout"));
+
     let contacts_status_page = adw::StatusPage::builder()
         .icon_name("avatar-default-symbolic")
         .title("No Contact Accounts")
@@ -2416,12 +2447,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `card_section`), so there's exactly one set, not four.
     let window_header = adw::HeaderBar::new();
     window_header.set_title_widget(Some(&adw::WindowTitle::new("Lookout", "")));
-    // The permanent mail-search entry, packed at the header's start. Its
-    // 62px start margin lines its left edge up with the menu bar's first
-    // item (File) below - the nav rail (56px, `width_request` plus its 6px
-    // `margin_start`) shifts the menu bar's start that far right of the
-    // header's own left edge, which spans the full window width.
-    search_entry.set_margin_start(62);
+    // The Lookout tab lives in the header's top-left corner rather than the
+    // nav rail (it's the app's own dashboard, and its Observatorium icon
+    // reads like a logo), with the permanent mail-search entry to its
+    // right. Still a toggle button in the rail's group, so the tab switch
+    // stays mutually exclusive with the other views.
+    let lookout_icon_image = nav_rail_image(
+        "/io/github/gavindi/Lookout/icons/observatorium-1.svg",
+        include_bytes!("../../../data/resources/icons/observatorium-1.svg"),
+    );
+    let lookout_view_button = gtk::ToggleButton::builder()
+        .child(&lookout_icon_image)
+        .css_classes(["flat"])
+        .tooltip_text("Lookout")
+        .build();
+    window_header.pack_start(&lookout_view_button);
+    // The old 62px margin existed to line the search up with the menu bar
+    // below (which the rail shifts right); the header icon now owns that
+    // corner, so the search sits directly beside it.
+    search_entry.set_margin_start(12);
     window_header.pack_start(&search_entry);
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
@@ -2652,11 +2696,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_command_toolbar.append(&open_contacts_window_button);
     view_toolbar_stack.add_named(&contacts_command_toolbar, Some("contacts"));
 
+    // The Lookout dashboard's command toolbar: a single Refresh button that
+    // re-reads the caches and widens the calendar sync horizon so upcoming
+    // events reach into next month.
+    let lookout_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    let lookout_refresh_button = gtk::Button::from_icon_name("view-refresh-symbolic");
+    lookout_refresh_button.set_tooltip_text(Some("Refresh dashboard"));
+    lookout_command_toolbar.append(&lookout_refresh_button);
+    view_toolbar_stack.add_named(&lookout_command_toolbar, Some("lookout"));
+
     // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
     // no background) strip along the window's left edge so the background
-    // image shows straight through it. Four views today (Mail/Calendar/
-    // Contacts/Config), joined into one toggle group for mutual-exclusive
-    // selection.
+    // image shows straight through it. Five views today (Mail/Calendar/
+    // People/Tasks/Config - the Lookout tab lives in the header instead),
+    // joined into one toggle group for mutual-exclusive selection.
     let mail_icon_image = nav_rail_image("/io/github/gavindi/Lookout/icons/email-1.svg", include_bytes!("../../../data/resources/icons/email-1.svg"));
     let mail_view_button = gtk::ToggleButton::builder()
         .child(&mail_icon_image)
@@ -2687,6 +2740,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let tasks_icon_image = nav_rail_image("/io/github/gavindi/Lookout/icons/task-1.svg", include_bytes!("../../../data/resources/icons/task-1.svg"));
     let tasks_view_button = gtk::ToggleButton::builder().child(&tasks_icon_image).css_classes(["flat"]).tooltip_text("Tasks").build();
     tasks_view_button.set_group(Some(&contacts_view_button));
+    // The Lookout button was built up in the header section; joining it to
+    // the rail buttons' toggle group keeps the tab switching exclusive.
+    lookout_view_button.set_group(Some(&mail_view_button));
 
     // `vexpand(true)` so the rail stretches the window's full height (it
     // sits beside `outer_toolbar_view` - header bar, menu bar, and command
@@ -2801,6 +2857,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let current_calendar_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("calendar-empty"));
     let current_contacts_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("contacts-empty"));
     let current_tasks_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("tasks-empty"));
+    let current_lookout_page: Rc<Cell<&'static str>> = Rc::new(Cell::new("lookout-empty"));
     // The standalone People window, when the People screen is popped out of
     // the main window (see the "Open in new window" contacts-toolbar button).
     // `None` while the paned lives in `root_stack`; `Some` while it lives in
@@ -2897,6 +2954,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 current_module.set("tasks");
                 root_stack.set_visible_child_name(current_tasks_page.get());
                 view_toolbar_stack.set_visible_child_name("tasks");
+                mail_calendar_overview_card.set_visible(false);
+                home_button.set_sensitive(false);
+                view_button.set_sensitive(false);
+            }
+        });
+    }
+    {
+        let root_stack = root_stack.clone();
+        let current_lookout_page = current_lookout_page.clone();
+        let view_toolbar_stack = view_toolbar_stack.clone();
+        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let current_module = current_module.clone();
+        let home_button = home_button.clone();
+        let view_button = view_button.clone();
+        lookout_view_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                current_module.set("lookout");
+                root_stack.set_visible_child_name(current_lookout_page.get());
+                view_toolbar_stack.set_visible_child_name("lookout");
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
@@ -3389,7 +3465,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         google_account_emails: Vec::new(),
         local_tasks,
         local_tasks_db,
+        dashboard_refresh: None,
     }));
+
+    // --- Lookout dashboard refresh hook: the window registers one closure
+    // that repaints the whole dashboard, and hands it to the mail sessions
+    // (which refresh it on folder/message syncs) and into `calendar_state`
+    // (where `refresh_tasks_view` and the calendar event loops reach it).
+    // The tab-open and toolbar-Refresh handlers call it directly too.
+    let dashboard_refresh: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let lookout_view = lookout_view.clone();
+        Rc::new(move || refresh_lookout_view(&state, &calendar_state, &lookout_view))
+    };
+    calendar_state.borrow_mut().dashboard_refresh = Some(dashboard_refresh.clone());
 
     // --- Calendar event reminders. The engine accumulates every occurrence
     // the sessions report (via `connect_calendar_account`'s ingest) and the
@@ -3999,6 +4089,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             for handle in calendar_state.borrow_mut().accounts.values_mut() {
                 handle.last_occurrences.clear();
                 handle.last_synced_month = None;
+                handle.occurrences_by_month.clear();
                 let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
             }
             refresh_displayed_calendar_view(&calendar_state, &calendar_main);
@@ -4574,6 +4665,42 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
+    // --- Lookout dashboard wiring: its task rows route through the same
+    // session paths as the Tasks view (so a completion or edit lands on the
+    // owning store), the tab open repaints + widens the sync horizon, and
+    // the toolbar's Refresh does the same on demand. The dashboard's own
+    // repaint on task changes piggybacks on `refresh_tasks_view`, which
+    // every save path funnels through.
+    {
+        let window = window.clone();
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        let calendar_state_for_activate = calendar_state.clone();
+        let tasks_view_for_activate = tasks_view.clone();
+        crate::lookout_view::set_handlers(
+            &lookout_view,
+            Rc::new(move |task, completed| route_task_toggle(&calendar_state, &tasks_view, task, completed)),
+            Rc::new(move |task| open_task_editor_for(&window, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
+        );
+    }
+    {
+        let calendar_state = calendar_state.clone();
+        let dashboard_refresh = dashboard_refresh.clone();
+        lookout_view_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                dashboard_refresh();
+                widen_calendar_sync_horizon(&calendar_state);
+            }
+        });
+    }
+    {
+        let calendar_state = calendar_state.clone();
+        let dashboard_refresh = dashboard_refresh.clone();
+        lookout_refresh_button.connect_clicked(move |_| {
+            dashboard_refresh();
+            widen_calendar_sync_horizon(&calendar_state);
+        });
+    }
     {
         let worker = worker.clone();
         let calendar_state = calendar_state.clone();
@@ -4704,6 +4831,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mail_view_button,
         list_header,
         refresh_config.clone(),
+        current_lookout_page.clone(),
+        lookout_view_button.clone(),
+        dashboard_refresh.clone(),
     );
     spawn_contacts_discovery(
         worker.clone(),
@@ -4732,6 +4862,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         tasks_view,
         reminders_engine,
         refresh_config,
+        current_lookout_page,
+        lookout_view_button,
     );
 
     window
@@ -4818,6 +4950,7 @@ fn ribbon_stack_name(module: &str, tab: &str) -> &'static str {
         ("calendar", _) => "calendar",
         ("tasks", _) => "tasks",
         ("contacts", _) => "contacts",
+        ("lookout", _) => "lookout",
         ("config", _) => "config",
         _ => "mail-home",
     }
@@ -4838,6 +4971,9 @@ fn spawn_account_discovery(
     mail_view_button: gtk::ToggleButton,
     list_header: ListHeader,
     refresh_config: Rc<dyn Fn()>,
+    current_lookout_page: Rc<Cell<&'static str>>,
+    lookout_view_button: gtk::ToggleButton,
+    dashboard_refresh: Rc<dyn Fn()>,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -4858,9 +4994,20 @@ fn spawn_account_discovery(
                 root_stack.set_visible_child_name(name);
             }
         };
+        // The Lookout tab flips between its status page (no accounts at all)
+        // and the live dashboard once *any* account set exists. Mail
+        // discovery owns the downgrade: only it knows whether nothing is
+        // connected; the calendar discovery only ever upgrades.
+        let show_lookout_page = |name: &'static str| {
+            current_lookout_page.set(name);
+            if lookout_view_button.is_active() {
+                root_stack.set_visible_child_name(name);
+            }
+        };
         match result {
             Ok((client, accounts)) if !accounts.is_empty() => {
                 show_page("mail");
+                show_lookout_page("lookout");
                 // One AccountSession actor per connected account, all
                 // running concurrently on the worker thread. `GoaClient` is
                 // a cheap Arc-backed handle (see its doc comment), so
@@ -4879,15 +5026,18 @@ fn spawn_account_discovery(
                         client.clone(),
                         list_header.clone(),
                         account,
+                        dashboard_refresh.clone(),
                     );
                 }
                 refresh_config();
             }
             Ok(_) => {
                 show_page("empty");
+                show_lookout_page("lookout-empty");
             }
             Err(e) => {
                 show_page("empty");
+                show_lookout_page("lookout-empty");
                 let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
                 toast_overlay.add_toast(adw::Toast::new(&title));
             }
@@ -4908,6 +5058,7 @@ fn connect_account(
     goa_client: GoaClient,
     list_header: ListHeader,
     account: lookout_goa::GoaMailAccount,
+    dashboard_refresh: Rc<dyn Fn()>,
 ) {
     let account_id = AccountId(account.account_id.0.clone());
     let display_name = account.display_name.clone();
@@ -5018,10 +5169,16 @@ fn connect_account(
                     // event lands, so a view restored before it (or adopted by
                     // the race below) gets its header filled in here.
                     refresh_list_header(&state, &list_header);
+                    // The dashboard's mail stats follow the folder syncs.
+                    dashboard_refresh();
                 }
                 AccountEvent::MessagesUpdated { mailbox, messages } => {
                     // The sync this mailbox was asked for (if any) has landed.
                     state.borrow_mut().syncing.remove(&mailbox);
+                    // A sync means the envelope cache this dashboard reads
+                    // changed - repaint its mail sections. (The calendar
+                    // sections repaint via their own event loops.)
+                    dashboard_refresh();
                     // While a search is active the results list owns the
                     // pane: a background sync repopulating it would clobber
                     // the results with the folder's full set. Still fold
@@ -5348,6 +5505,8 @@ fn spawn_calendar_discovery(
     tasks_view: Rc<crate::tasks_view::TasksView>,
     reminders_engine: Rc<RefCell<crate::reminders::ReminderEngine>>,
     refresh_config: Rc<dyn Fn()>,
+    current_lookout_page: Rc<Cell<&'static str>>,
+    lookout_view_button: gtk::ToggleButton,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -5374,10 +5533,21 @@ fn spawn_calendar_discovery(
                 root_stack.set_visible_child_name(name);
             }
         };
+        // The Lookout tab goes live as soon as *any* account set exists.
+        // Deliberately upgrade-only: the mail discovery owns the downgrade
+        // to "lookout-empty", so finding no calendar accounts here must not
+        // hide the dashboard when mail accounts exist.
+        let show_lookout_page = |name: &'static str| {
+            current_lookout_page.set(name);
+            if lookout_view_button.is_active() {
+                root_stack.set_visible_child_name(name);
+            }
+        };
         match result {
             Ok((client, accounts)) if !accounts.is_empty() => {
                 show_page("calendar");
                 show_tasks_page("tasks");
+                show_lookout_page("lookout");
                 for account in accounts {
                     connect_calendar_account(
                         worker.clone(),
@@ -5767,6 +5937,7 @@ fn connect_calendar_account(
             connection_state: CalConnectionState::Connecting,
             last_occurrences: Vec::new(),
             last_synced_month: None,
+            occurrences_by_month: HashMap::new(),
             last_tasks: Vec::new(),
         },
     );
@@ -5813,9 +5984,13 @@ fn connect_calendar_account(
                     if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
                         handle.last_occurrences = occurrences;
                         handle.last_synced_month = Some(month);
+                        insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, handle.last_occurrences.clone());
                     }
                     refresh_displayed_calendar_view(&calendar_state, &calendar_main);
                     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+                    // The dashboard's upcoming-events section follows the
+                    // synced occurrences.
+                    refresh_dashboard_hook(&calendar_state);
                     // The sidebar mini-calendar's bold event-day numerals track
                     // the currently-displayed month - refresh them when a fetch
                     // for that month lands (navigating to an uncached month
@@ -5880,6 +6055,7 @@ fn spawn_webcal_session(
                     display_name: sub.display_name.clone(),
                     last_occurrences: Vec::new(),
                     last_synced_month: None,
+                    occurrences_by_month: HashMap::new(),
                     error: None,
                 },
             );
@@ -5898,6 +6074,7 @@ fn spawn_webcal_session(
                     let Some(handle) = st.webcal_handles.get_mut(&feed.subscription_id) else { continue };
                     handle.last_occurrences = feed.occurrences;
                     handle.last_synced_month = Some(month);
+                    insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, handle.last_occurrences.clone());
                     // Toast on the *transition* into an error (or the first
                     // error for a fresh handle), not on every 5-minute poll.
                     if handle.error.is_none() && feed.error.is_some() {
@@ -5913,6 +6090,8 @@ fn spawn_webcal_session(
             refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
             refresh_displayed_calendar_view(&calendar_state, &calendar_main);
             refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+            // The dashboard's upcoming-events section follows webcal feeds too.
+            refresh_dashboard_hook(&calendar_state);
             if calendar_view::mini_month(&mini_calendar) == month {
                 let event_days = calendar_event_days(&calendar_state, month);
                 calendar_view::set_mini_event_days(&mini_calendar, &event_days);
@@ -6250,6 +6429,110 @@ fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view:
     };
     crate::tasks_view::set_empty_message(tasks_view, &message);
     crate::tasks_view::set_tasks(tasks_view, &tasks, &colors);
+    // Every task change funnels through here (CalDAV and Google Tasks
+    // `TasksUpdated` events, local saves, checkbox flips), so this is the
+    // single point that keeps the Lookout dashboard's task section live.
+    refresh_dashboard_hook(calendar_state);
+}
+
+/// Runs the Lookout dashboard's repaint hook if the window has registered
+/// one - a no-op in tests and before the window finishes wiring, never an
+/// error.
+fn refresh_dashboard_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
+    let hook = calendar_state.borrow().dashboard_refresh.clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Repaints the Lookout dashboard from the current mail caches and
+/// calendar state: most-contacted people and the hour-of-day histogram are
+/// read straight off each connected account's cache SQLite (the same WAL
+/// reader the composer autocomplete uses, so no session round trip), and
+/// tasks/events come from the in-memory calendar state.
+fn refresh_lookout_view(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, lookout_view: &Rc<crate::lookout_view::LookoutView>) {
+    // Top contacts: union each account's top list, re-rank, keep the best.
+    let mut contacts: Vec<(lookout_core::EmailAddress, i64)> = Vec::new();
+    let mut histogram = [0i64; 24];
+    for cache in state.borrow().accounts.values().filter_map(|h| h.address_cache.as_ref()) {
+        if let Ok(top) = cache.top_addresses(crate::lookout_view::TOP_CONTACTS_LIMIT) {
+            contacts.extend(top);
+        }
+        if let Ok(h) = cache.hour_histogram(None) {
+            for (i, count) in h.iter().enumerate() {
+                histogram[i] += count;
+            }
+        }
+    }
+    contacts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    contacts.truncate(crate::lookout_view::TOP_CONTACTS_LIMIT);
+
+    let (tasks, events, checked_calendar_ids, colors) = {
+        let st = calendar_state.borrow();
+        (
+            merged_tasks(calendar_state),
+            // The dashboard unions *every* cached month (pruned to current +
+            // next by `insert_dashboard_occurrences`), so its 14-day horizon
+            // stays populated as events pass instead of draining to whatever
+            // single month the sessions' polls last synced.
+            st.accounts
+                .values()
+                .flat_map(|h| h.occurrences_by_month.values().flatten().cloned())
+                .chain(st.webcal_handles.values().flat_map(|h| h.occurrences_by_month.values().flatten().cloned()))
+                .collect(),
+            st.checked_calendar_ids.clone(),
+            st.calendar_colors.clone(),
+        )
+    };
+
+    crate::lookout_view::set_data(
+        lookout_view,
+        &crate::lookout_view::LookoutData {
+            contacts,
+            histogram,
+            tasks,
+            events,
+            checked_calendar_ids,
+            colors,
+        },
+    );
+}
+
+/// Asks every calendar source to fetch the current and next month, so the
+/// dashboard's "upcoming events" can reach past the month each session last
+/// fetched on its 5-minute cadence. Uses the fetch-only `FetchMonth`
+/// commands - deliberately *not* `SyncMonth` - so the sessions' polled
+/// month (whatever the calendar view is showing) is left alone; hijacking
+/// it would starve the mail-overview day list and the calendar tab.
+fn widen_calendar_sync_horizon(calendar_state: &Rc<RefCell<CalendarUiState>>) {
+    let today = chrono::Local::now().date_naive();
+    let months = [today, today + chrono::Months::new(1)];
+    for handle in calendar_state.borrow().accounts.values() {
+        for month in months {
+            let _ = handle.cmd_tx.send_blocking(CalendarCommand::FetchMonth(month));
+        }
+    }
+    if let Some(cmd_tx) = &calendar_state.borrow().webcal_cmd_tx {
+        for month in months {
+            let _ = cmd_tx.send_blocking(SubscriptionCommand::FetchMonth(month));
+        }
+    }
+}
+
+/// The months the Lookout dashboard's events section cares about - the
+/// current month and the next, which together cover its 14-day horizon.
+fn dashboard_month_window() -> [chrono::NaiveDate; 2] {
+    let current = chrono::Local::now().date_naive();
+    [first_of_month(current), first_of_month(current) + chrono::Months::new(1)]
+}
+
+/// Stashes one synced month's occurrences in a dashboard map, pruning any
+/// month outside the current/next window so a long-lived session never
+/// accumulates stale month buckets.
+fn insert_dashboard_occurrences(map: &mut HashMap<chrono::NaiveDate, Vec<EventOccurrence>>, month: chrono::NaiveDate, occurrences: Vec<EventOccurrence>) {
+    map.insert(month, occurrences);
+    let window = dashboard_month_window();
+    map.retain(|m, _| *m >= window[0] && *m <= window[1]);
 }
 
 /// Routes a completion-toggle (list checkbox) to the task's store: the
@@ -6821,6 +7104,7 @@ fn show_calendar_dialog(
                         display_name: subscription.display_name.clone(),
                         last_occurrences: Vec::new(),
                         last_synced_month: None,
+                        occurrences_by_month: HashMap::new(),
                         error: None,
                     },
                 );
@@ -9516,5 +9800,60 @@ mod tests {
             preview: None,
             structure: None,
         }
+    }
+
+    fn occ(uid: &str, calendar: &str) -> EventOccurrence {
+        EventOccurrence {
+            uid: lookout_core::EventUid(uid.to_string()),
+            calendar_id: CalendarId(calendar.to_string()),
+            summary: Some(uid.to_string()),
+            description: None,
+            location: None,
+            start: chrono::Utc::now(),
+            end: chrono::Utc::now(),
+            all_day: false,
+            rrule: None,
+            master_start: None,
+            master_end: None,
+            href: None,
+            etag: None,
+            attendees: vec![],
+            organizer: None,
+            categories: vec![],
+            sensitivity: Default::default(),
+            transparency: Default::default(),
+            reminder_minutes_before: None,
+            conference_url: None,
+        }
+    }
+
+    /// The dashboard's per-month occurrence map must never grow beyond the
+    /// current and next month - the two months its 14-day horizon needs -
+    /// or a long-lived session would accumulate stale month buckets (and a
+    /// single-month window is exactly the bug that made the upcoming-events
+    /// section drain over time).
+    #[test]
+    fn dashboard_occurrence_map_prunes_to_the_current_and_next_month() {
+        let window = dashboard_month_window();
+        assert_eq!(window[0], first_of_month(window[0]), "the window is month-normalized");
+        assert_eq!(window[1], window[0] + chrono::Months::new(1), "the window spans current + next month");
+        let stale_before = window[0] - chrono::Months::new(1);
+        let stale_after = window[1] + chrono::Months::new(1);
+
+        let mut map = HashMap::new();
+        insert_dashboard_occurrences(&mut map, stale_before, vec![occ("stale", "cal")]);
+        assert!(map.is_empty(), "a stale month is pruned immediately");
+        insert_dashboard_occurrences(&mut map, window[0], vec![occ("now", "cal")]);
+        insert_dashboard_occurrences(&mut map, window[1], vec![occ("next", "cal")]);
+        assert_eq!(map.len(), 2, "only the current and next month survive");
+        assert_eq!(map[&window[0]].len(), 1);
+        assert_eq!(map[&window[1]].len(), 1);
+
+        // A re-insert of an out-of-window month evicts itself but keeps the
+        // in-window months (and their events) intact.
+        insert_dashboard_occurrences(&mut map, stale_after, vec![occ("further", "cal")]);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&window[0]));
+        assert!(map.contains_key(&window[1]));
     }
 }
