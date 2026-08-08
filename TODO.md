@@ -65,7 +65,7 @@ Phase 1 is the current milestone; Phases 2-5 are the scoped roadmap (derived fro
 - [ ] Physical-keycode global keyboard shortcuts
 - [ ] Print support
 - [x] List-Unsubscribe banner — `Adw.Banner` in the reading pane, RFC 8058 one-click POST with mailto fallback into the composer
-- [ ] External-content trust-sender flow
+- [x] External-content trust-sender flow — per-sender (address or `@domain`) trust levels persisted in the UI-state DB, "Trust sender…" banner in the reading pane (load-once / images / all-content), Config → Mail "Trusted senders…" manager
 - [ ] RFC 8098 read-receipt (MDN) generation
 
 ## Phase 3 — Calendar (roadmap)

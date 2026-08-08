@@ -9,6 +9,7 @@ pub mod identity;
 pub mod ids;
 pub mod mailbox;
 pub mod thread;
+pub mod trust;
 pub mod vcard;
 
 pub use calendar::{
@@ -23,4 +24,5 @@ pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
 pub use mailbox::{Mailbox, MailboxRole};
 pub use thread::{ThreadGroup, ThreadKey};
+pub use trust::{html_remote_content_scan, normalize_trust_entry, sender_matches_trust_entry, RemoteContentScan, TrustLevel};
 pub use vcard::{AddressField, EmailField, Name, OtherProperty, Parameter, TelephoneField, VCard, VCardError};

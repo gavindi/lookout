@@ -24,6 +24,13 @@
 //! full serialized `CalendarTask` JSON, keyed by their (client-generated,
 //! UUID) uid.
 //!
+//! Trusted senders are the reading pane's external-content trust flow: which
+//! senders may load remote content, and at what trust level. `(account,
+//! entry)` pairs like starred contacts - an entry is a lowercased address
+//! (`ada@example.com`) or an `@domain` pattern - with a `TrustLevel` encoded
+//! as its integer column. A preference like favourites, so it must survive
+//! both the "Clear all caches" action and a `user_version` bump.
+//!
 //! Best-effort like the rest of the config modules: an unreadable or
 //! unwritable database just means favourites don't persist and reminders can
 //! fire again.
@@ -103,6 +110,12 @@ impl UiStateDb {
                 uid TEXT PRIMARY KEY,
                 data TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS trusted_senders (
+                account TEXT NOT NULL,
+                entry TEXT NOT NULL,
+                level INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (account, entry)
+            );
             ",
         )?;
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
@@ -139,6 +152,40 @@ impl UiStateDb {
             self.conn
                 .execute("DELETE FROM starred_contacts WHERE account = ?1 AND identity = ?2", rusqlite::params![account.0, identity])?;
         }
+        Ok(())
+    }
+
+    /// Every persisted trusted-sender row, ordered by account then entry -
+    /// the persisted shape of the reading pane's external-content trust flow
+    /// (`UiState::trusted_senders`). `level` is the integer encoding of
+    /// [`lookout_core::TrustLevel`]; unknown encodings resolve to the
+    /// conservative `Images` level.
+    pub fn load_trusted_senders(&self) -> rusqlite::Result<Vec<(AccountId, String, lookout_core::TrustLevel)>> {
+        let mut stmt = self.conn.prepare("SELECT account, entry, level FROM trusted_senders ORDER BY account, entry")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                AccountId(row.get::<_, String>(0)?),
+                row.get::<_, String>(1)?,
+                lookout_core::TrustLevel::from_i64(row.get::<_, i64>(2)?),
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Stores or replaces the trust level for `(account, entry)`. Idempotent:
+    /// re-setting the same entry with the same level is a no-op row-wise.
+    pub fn set_trusted_sender(&self, account: &AccountId, entry: &str, level: lookout_core::TrustLevel) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO trusted_senders (account, entry, level) VALUES (?1, ?2, ?3)",
+            rusqlite::params![account.0, entry, level.as_i64()],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets one trusted-sender entry. A missing row is not an error.
+    pub fn remove_trusted_sender(&self, account: &AccountId, entry: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM trusted_senders WHERE account = ?1 AND entry = ?2", rusqlite::params![account.0, entry])?;
         Ok(())
     }
 
@@ -409,6 +456,57 @@ mod tests {
         let loaded = upgraded.load_local_tasks().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].summary.as_deref(), Some("Second"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_senders_round_trip_levels_and_wipe_survival() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
+        let dir = dir.join("trusted-senders");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_trusted_senders().unwrap().is_empty());
+
+        let account = AccountId("/org/gnome/OnlineAccounts/Accounts/account_1".into());
+        db.set_trusted_sender(&account, "ada@example.com", lookout_core::TrustLevel::Images).unwrap();
+        // Re-setting the same entry with a higher level replaces the row
+        // (INSERT OR REPLACE) rather than duplicating it.
+        db.set_trusted_sender(&account, "ada@example.com", lookout_core::TrustLevel::AllContent).unwrap();
+        db.set_trusted_sender(&account, "@news.example", lookout_core::TrustLevel::Images).unwrap();
+
+        let loaded = db.load_trusted_senders().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains(&(account.clone(), "ada@example.com".to_string(), lookout_core::TrustLevel::AllContent)));
+        assert!(loaded.contains(&(account.clone(), "@news.example".to_string(), lookout_core::TrustLevel::Images)));
+
+        // Removal drops exactly that entry; a missing row is not an error.
+        db.remove_trusted_sender(&account, "ada@example.com").unwrap();
+        db.remove_trusted_sender(&account, "ada@example.com").unwrap();
+        let loaded = db.load_trusted_senders().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, "@news.example");
+
+        // A fresh session reads the same rows, and an unknown level encoding
+        // degrades to the conservative Images level instead of failing.
+        let reopened = UiStateDb::open().expect("existing database should reopen");
+        assert_eq!(reopened.load_trusted_senders().unwrap(), loaded);
+        reopened.conn.execute("UPDATE trusted_senders SET level = 99 WHERE entry = '@news.example'", []).unwrap();
+        let loaded = reopened.load_trusted_senders().unwrap();
+        assert_eq!(loaded[0].2, lookout_core::TrustLevel::Images);
+
+        // Trust is a preference like favourites: the version-wipe path must
+        // not touch it (only `starred_contacts` is wiped).
+        reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
+        drop(reopened);
+        let upgraded = UiStateDb::open().unwrap();
+        let loaded = upgraded.load_trusted_senders().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, "@news.example");
+        assert_eq!(loaded[0].2, lookout_core::TrustLevel::Images);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

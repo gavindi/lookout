@@ -92,6 +92,10 @@ pub struct ConfigView {
     /// caller can wire its `active` state into the reading pane's remote-image
     /// policy.
     pub remote_images_row: adw::SwitchRow,
+    /// "Trusted senders…" row (Config → Mail), exposed so the caller can wire
+    /// its `activated` signal to the external-content trust manage dialog
+    /// (and refresh the subtitle after a change).
+    pub trusted_senders_row: adw::ActionRow,
     /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
     /// `active` state into the composer's default body mode.
     pub rich_text_row: adw::SwitchRow,
@@ -194,6 +198,12 @@ pub fn build() -> ConfigView {
         .subtitle("Display images hosted on remote servers in messages")
         .build();
     mail_settings_group.add(&remote_images_row);
+    let trusted_senders_row = adw::ActionRow::builder()
+        .title("Trusted senders…")
+        .subtitle("Choose who may load remote images and other external content")
+        .activatable(true)
+        .build();
+    mail_settings_group.add(&trusted_senders_row);
     let rich_text_row = adw::SwitchRow::builder()
         .title("Rich text")
         .subtitle("Start new messages in the formatted editor")
@@ -278,6 +288,7 @@ pub fn build() -> ConfigView {
         background_brightness_scale,
         restore_background_row,
         remote_images_row,
+        trusted_senders_row,
         rich_text_row,
         calendar_alerts_row,
         google_tasks_client_row,

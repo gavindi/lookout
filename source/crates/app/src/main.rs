@@ -28,6 +28,7 @@ mod settings;
 mod tags;
 mod task_editor;
 mod tasks_view;
+mod trusted_senders;
 mod ui_state_db;
 mod window;
 mod worker;

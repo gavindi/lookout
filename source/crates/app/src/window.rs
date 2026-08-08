@@ -485,6 +485,30 @@ pub(crate) struct UiState {
     /// sessions, read when the composer opens. Persisted via the
     /// `mail-rich-text-default` GSettings key.
     rich_text_default: bool,
+    /// Trusted-sender entries (`name@example.com` or `@example.com`,
+    /// normalized lowercase) with their trust level, keyed by the receiving
+    /// account - the persisted shape of the external-content trust flow. The
+    /// reading pane's load-policy handler consults this for the message
+    /// currently on screen. Persisted in the UI-state database
+    /// (`ui_state_db`), loaded at startup and written through on every
+    /// trust/revoke action, like `starred_contacts`.
+    pub(crate) trusted_senders: HashMap<(AccountId, String), lookout_core::TrustLevel>,
+    /// The `(account, normalized sender address)` of the message currently on
+    /// the reading pane, re-stashed by `render_body` from the rendered
+    /// summary's From address. The load-policy handler resolves this against
+    /// `trusted_senders` on every resource decision; `None` when the pane
+    /// shows nothing or the message has no usable sender (the debug `.eml`
+    /// viewer, which also has no account to key trust on).
+    rendered_trust_sender: Option<(AccountId, String)>,
+    /// Session-only "load remote images just this once" override for the
+    /// message currently on the reading pane - the external-content banner's
+    /// transient action. Cleared on every navigation.
+    load_once_images: bool,
+    /// The `(mailbox, uid)` of the message whose external-content banner the
+    /// user acted on (trusted the sender or loaded once); while that message
+    /// stays on screen the banner must not come back. Cleared on every
+    /// navigation, like `unsubscribe_dismissed`.
+    trust_banner_dismissed: Option<(MailboxId, Uid)>,
     /// Relay to the currently-open composer for its draft-autosave
     /// confirmations: the account event loops forward `DraftSaved`
     /// Message-Ids here, and the composer flips its "Saving draft…" label to
@@ -1052,7 +1076,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // no schema is available, which is exactly these old values.
     let ui_db = crate::ui_state_db::UiStateDb::open()
         .map(Rc::new)
-        .inspect_err(|e| tracing::warn!("starred contacts won't persist: {e}"))
+        .inspect_err(|e| tracing::warn!("starred contacts and trusted senders won't persist: {e}"))
         .ok();
     let starred_contacts: HashSet<(AccountId, String)> = ui_db
         .as_ref()
@@ -1063,6 +1087,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .into_iter()
                 .flat_map(|(account, identities)| identities.into_iter().map(move |identity| (account.clone(), identity)))
         })
+        .collect();
+    let trusted_senders: HashMap<(AccountId, String), lookout_core::TrustLevel> = ui_db
+        .as_ref()
+        .and_then(|db| db.load_trusted_senders().ok())
+        .into_iter()
+        .flatten()
+        .map(|(account, entry, level)| ((account, entry), level))
         .collect();
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
@@ -1101,6 +1132,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         favorites: settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId).collect(),
         load_remote_images: settings.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES),
         rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
+        trusted_senders,
+        rendered_trust_sender: None,
+        load_once_images: false,
+        trust_banner_dismissed: None,
         draft_saved_tx: None,
         composer_identities_refresh: None,
         folder_tree: None,
@@ -2006,6 +2041,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // The preference lives in `UiState::load_remote_images` - the single
     // source of truth the Config toggle flips - and is re-read on every
     // decision, so the viewer always reflects the current setting.
+    //
+    // The external-content trust flow extends the same predicate per
+    // message: `render_body` stashes the rendered message's sender in
+    // `UiState::rendered_trust_sender`, and the sender's entry in
+    // `UiState::trusted_senders` (an exact address or `@domain`, per
+    // receiving account, persisted in the UI-state database) raises the
+    // bar to the entry's `TrustLevel`. State is re-read on every decision
+    // too, so trusting a sender while a message is open applies on the
+    // next render.
     let state_for_policy = state.clone();
     web_view.connect_decide_policy(move |_view, decision, decision_type| {
         let uri_is_local = |uri: &str| -> bool {
@@ -2036,16 +2080,35 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // Veto remote subresource responses (images, fonts, scripts)
                 // so the page's load event isn't held hostage by external
                 // servers. The main frame's own resource - the `data:` body
-                // URL - is always let through. With "Load images from the
-                // web" on, remote `image/*` responses are allowed; everything
-                // else stays blocked.
+                // URL - is always let through. "Load images from the web"
+                // (Config → Mail) allows remote `image/*` responses; the
+                // external-content trust flow (the "Trust sender" banner)
+                // additionally lets a trusted sender's message load images,
+                // or - at the `AllContent` level - every remote subresource
+                // response. Everything else stays blocked, and the veto
+                // still applies to the navigation branch above.
                 if let Some(response) = decision.downcast_ref::<webkit::ResponsePolicyDecision>() {
                     if !response.is_main_frame_main_resource() {
                         if let Some(uri) = response.request().and_then(|r| r.uri()) {
                             if !uri_is_local(&uri) {
                                 let is_image = response.response().and_then(|r| r.mime_type()).is_some_and(|m| m.starts_with("image/"));
-                                let images_enabled = state_for_policy.borrow().load_remote_images;
-                                if !(images_enabled && is_image) {
+                                let st = state_for_policy.borrow();
+                                // The rendered message's sender (re-stashed
+                                // by `render_body`) resolves its trust level;
+                                // a `@domain` entry covers every address on
+                                // that domain, and the strongest matching
+                                // entry wins (an exact address outranks the
+                                // account's broader domain entry).
+                                let level = st.rendered_trust_sender.as_ref().and_then(|(account, sender)| {
+                                    st.trusted_senders
+                                        .iter()
+                                        .filter(|((acc, entry), _)| acc == account && lookout_core::sender_matches_trust_entry(sender, entry))
+                                        .map(|(_, level)| *level)
+                                        .max()
+                                });
+                                let images_ok = st.load_remote_images || st.load_once_images || level.is_some_and(|l| l >= lookout_core::TrustLevel::Images);
+                                let all_ok = level.is_some_and(|l| l >= lookout_core::TrustLevel::AllContent);
+                                if !((images_ok && is_image) || all_ok) {
                                     decision.ignore();
                                     return true;
                                 }
@@ -2152,6 +2215,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     imip_banner.set_button_label(Some("Respond…"));
     imip_banner.set_revealed(false);
     message_page.append(&imip_banner);
+    // The external-content trust banner, between the header and the body
+    // like the others: revealed by `render_body` when the message on screen
+    // references remote content the load policy is blocking for its sender,
+    // hidden otherwise and once the user acts on it. Its button opens the
+    // trust dialog (load once / trust images / trust everything) - see the
+    // handler registered below.
+    let trust_banner = adw::Banner::new("Remote content is blocked");
+    trust_banner.set_widget_name("trust-banner");
+    trust_banner.set_button_label(Some("Trust sender…"));
+    trust_banner.set_revealed(false);
+    message_page.append(&trust_banner);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
@@ -2246,6 +2320,73 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 banner.set_revealed(false);
                 open_mailto_unsubscribe(&state, &reading_stack, mailto, cmd_tx, mailbox_account_id(&mailbox));
             }
+        });
+    }
+    // --- External-content trust banner actions. The banner's button acts on
+    // the sender of whatever message is on the reading pane (stashed in
+    // `UiState::rendered_trust_sender` by `render_body`): a three-way dialog
+    // lets the user load the message's remote images just this once, trust
+    // the sender's images, or trust all of the sender's remote content. Trust
+    // is persisted in the UI-state database and written through to
+    // `trusted_senders`; every action dismisses the banner for that message
+    // (Adw.Banner has no close button of its own) and re-renders the body so
+    // the new policy applies to the open message immediately.
+    {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        let message_header = message_header.clone();
+        let message_list = message_list.clone();
+        trust_banner.connect_button_clicked(move |banner| {
+            let (mailbox, uid) = {
+                let st = state.borrow();
+                let (mailbox, uid) = match &st.rendered_message {
+                    Some(rendered) => rendered.clone(),
+                    None => return,
+                };
+                let Some((_account, _sender)) = st.rendered_trust_sender.clone() else { return };
+                (mailbox, uid)
+            };
+            let dialog = adw::AlertDialog::builder()
+                .heading("Remote content blocked")
+                .body("This message references content hosted on remote servers, which Lookout blocks. You can load it once, or trust this sender to load it from now on.")
+                .default_response("images")
+                .close_response("cancel")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("once", "Load images once");
+            dialog.add_response("images", "Trust sender (images only)");
+            dialog.add_response("all", "Trust sender (all content)");
+            let state_for_dialog = state.clone();
+            let reading_stack_for_dialog = reading_stack.clone();
+            let message_header_for_dialog = message_header.clone();
+            let message_list_for_dialog = message_list.clone();
+            let banner_for_dialog = banner.clone();
+            dialog.connect_response(None, move |_dialog, response| {
+                if response == "cancel" {
+                    return;
+                }
+                {
+                    let mut st = state_for_dialog.borrow_mut();
+                    st.trust_banner_dismissed = Some((mailbox.clone(), uid));
+                    st.load_once_images = response == "once";
+                    if response == "images" || response == "all" {
+                        let level = if response == "all" {
+                            lookout_core::TrustLevel::AllContent
+                        } else {
+                            lookout_core::TrustLevel::Images
+                        };
+                        if let Some((account, sender)) = st.rendered_trust_sender.clone() {
+                            if let Some(db) = &st.ui_db {
+                                let _ = db.set_trusted_sender(&account, &sender, level);
+                            }
+                            st.trusted_senders.insert((account, sender), level);
+                        }
+                    }
+                }
+                banner_for_dialog.set_revealed(false);
+                rerender_current_message(&state_for_dialog, &reading_stack_for_dialog, &message_header_for_dialog, &message_list_for_dialog);
+            });
+            dialog.present(Some(banner));
         });
     } // WebKit paints asynchronously - revealing the HTML page while a fresh
       // body is still loading would show a blank/white page before the message
@@ -3761,21 +3902,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.remote_images_row.connect_active_notify(move |row| {
             state.borrow_mut().load_remote_images = row.is_active();
             state.borrow().settings.set_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES, row.is_active());
-            if reading_stack.visible_child_name().as_deref() == Some("compose") {
-                return;
-            }
-            let (mailbox, uid, body) = {
-                let mut st = state.borrow_mut();
-                let Some(summary) = message_list.selected_summary() else { return };
-                let Some(body) = st.body_cache.get(&summary.mailbox, &summary.uid) else { return };
-                (summary.mailbox, summary.uid, body)
-            };
-            // Drop `rendered_message` and route through "empty" first, or
-            // `render_body`'s already-shown guard would treat the reload of
-            // the same message as a no-op and never re-issue the `load_html`.
-            reading_stack.set_visible_child_name("empty");
-            state.borrow_mut().rendered_message = None;
-            render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
+            rerender_current_message(&state, &reading_stack, &message_header, &message_list);
+        });
+    }
+
+    // Config → Mail → "Trusted senders…": opens the manage dialog for the
+    // external-content trust flow (add/remove sender entries, change trust
+    // levels). Every change writes through to the UI-state database and the
+    // in-memory `trusted_senders` mirror, so the reading pane's load policy
+    // picks it up on the next decision.
+    {
+        let state = state.clone();
+        let row = config_view.trusted_senders_row.clone();
+        row.clone().connect_activated(move |_| {
+            crate::trusted_senders::show_manage_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
         });
     }
 
@@ -4353,6 +4493,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.unsubscribe_dismissed = None;
                     st.imip = None;
                     st.imip_dismissed = None;
+                    st.rendered_trust_sender = None;
+                    st.load_once_images = false;
+                    st.trust_banner_dismissed = None;
                     st.rendered_message = None;
                     drop(st);
                     drop_pending_cid(&state);
@@ -4372,6 +4515,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.unsubscribe_dismissed = None;
                     st.imip = None;
                     st.imip_dismissed = None;
+                    st.rendered_trust_sender = None;
+                    st.load_once_images = false;
+                    st.trust_banner_dismissed = None;
                     st.rendered_message = None;
                     drop(st);
                     drop_pending_cid(&state);
@@ -9249,6 +9395,43 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
     }
 }
 
+/// Re-renders the message currently selected in the message list onto the
+/// reading pane, routing through "empty" first so `render_body`'s
+/// already-shown guard doesn't treat the reload of the same message as a
+/// no-op. Used by the Config → Mail "Load images" toggle and the
+/// external-content banner's actions, which both change the load policy
+/// for the open message and must apply to it rather than the next
+/// selection. Skipped while a composer is up - `render_body` would route
+/// the pane back to the message page and yank the user out of their draft.
+fn rerender_current_message(
+    state: &Rc<RefCell<UiState>>,
+    reading_stack: &gtk::Stack,
+    message_header: &crate::message_header::MessageHeader,
+    message_list: &crate::message_list::MessageListModel,
+) {
+    if reading_stack.visible_child_name().as_deref() == Some("compose") {
+        return;
+    }
+    let (mailbox, uid, body) = {
+        let mut st = state.borrow_mut();
+        let Some(summary) = message_list.selected_summary() else { return };
+        let Some(body) = st.body_cache.get(&summary.mailbox, &summary.uid) else { return };
+        // Stash the summary for the fresh render: `render_body` re-derives
+        // the reading-pane header and the rendered sender (which the load
+        // policy and the trust banner consult) from it.
+        let mailbox = summary.mailbox.clone();
+        let uid = summary.uid;
+        st.pending_header = Some(summary);
+        (mailbox, uid, body)
+    };
+    // Drop `rendered_message` and route through "empty" first, or
+    // `render_body`'s already-shown guard would treat the reload of the
+    // same message as a no-op and never re-issue the `load_html`.
+    reading_stack.set_visible_child_name("empty");
+    state.borrow_mut().rendered_message = None;
+    render_body(state, reading_stack, message_header, mailbox, uid, body);
+}
+
 fn render_body(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
@@ -9287,9 +9470,21 @@ fn render_body(
     // handler stores the summary here instead of updating the header
     // immediately, so the previous message's header stays on screen through
     // its whole fade-out; by the time we get here the pane is already on the
-    // "empty" placeholder, so updating the (hidden) header can't flash.
-    if let Some(summary) = state.borrow_mut().pending_header.take() {
-        message_header.update(&summary);
+    // "empty" placeholder, so updating the (hidden) header can't flash. The
+    // summary's From address is also stashed - normalized - as the rendered
+    // sender the load policy resolves against `trusted_senders` and the
+    // trust banner shows. The debug `.eml` viewer has no summary (and no
+    // account to key trust on anyway), so the sender ends up `None` there
+    // and all remote content stays blocked.
+    {
+        let mut st = state.borrow_mut();
+        if let Some(summary) = st.pending_header.take() {
+            message_header.update(&summary);
+            let sender = summary.from.first().map(|a| a.address.trim().to_lowercase());
+            st.rendered_trust_sender = mailbox_account_id(&mailbox).zip(sender);
+        } else {
+            st.rendered_trust_sender = None;
+        }
     }
     // Rebuild the attachment strip from the body's part list; the body is
     // available regardless of which text path (html/text/none) renders below.
@@ -9344,6 +9539,32 @@ fn render_body(
             // when the message carries no invitation at all - `st.imip` was
             // set from this message's `text/calendar` part above).
             render_invite_card(reading_stack, st.imip.as_ref().filter(|_| !dismissed));
+        }
+    }
+    // External-content trust banner: reveal it when the message on screen
+    // references remote content the load policy is *currently blocking* -
+    // its sender isn't trusted (at a high enough level) and the global
+    // "Load images from the web" toggle isn't covering the gap. The HTML
+    // scan is advisory; the decide-policy handler stays authoritative. The
+    // sender comes from `rendered_trust_sender`, stashed above; hidden
+    // when there's no sender to key trust on (the debug `.eml` viewer).
+    {
+        let st = state.borrow();
+        let dismissed = st.trust_banner_dismissed.as_ref() == Some(&(mailbox.clone(), uid));
+        if let Some(banner) = find_named_child(reading_stack, "trust-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+            match st.rendered_trust_sender.clone() {
+                // No sender to key trust on (the debug `.eml` viewer): the
+                // banner has nothing to act on, so leave it hidden.
+                None => banner.set_revealed(false),
+                Some((account, sender)) => {
+                    let level = st.trusted_senders.get(&(account, sender.clone())).copied();
+                    let scan = body.html_body.as_deref().map(lookout_core::html_remote_content_scan).unwrap_or_default();
+                    let images_blocked = scan.has_images && !(st.load_remote_images || st.load_once_images || level.is_some_and(|l| l >= lookout_core::TrustLevel::Images));
+                    let other_blocked = scan.has_other && !level.is_some_and(|l| l >= lookout_core::TrustLevel::AllContent);
+                    banner.set_title(&format!("Remote content from {sender} is blocked"));
+                    banner.set_revealed(!dismissed && (images_blocked || other_blocked));
+                }
+            }
         }
     }
     // Config → Appearance → "Animate transitions" can switch the stack's
@@ -9788,6 +10009,10 @@ mod tests {
             favorites: HashSet::new(),
             load_remote_images: false,
             rich_text_default: true,
+            trusted_senders: HashMap::new(),
+            rendered_trust_sender: None,
+            load_once_images: false,
+            trust_banner_dismissed: None,
             draft_saved_tx: None,
             composer_identities_refresh: None,
             folder_tree: None,
