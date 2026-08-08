@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.9.3 (2026-08-08)
+## 0.9.4 (2026-08-08)
+
+### Fixed
+
+- **UI**: the app still tripped GTK's `Failed to set text … from markup` warning on startup - the previous toast fix (0.8.8) covered `Adw.Toast`, but `AdwPreferencesRow`/`AdwActionRow` parse their `title`/`subtitle` as Pango markup by default too (`use-markup` defaults to TRUE), and Config → Mail accounts' "Sending identities" rows put each identity's `Name <address>` label straight into an `AdwActionRow` subtitle. An account whose GOA display name is the address itself rendered `gavindi@gmail.com <gavindi@gmail.com>`, which the markup parser reads as a `<tag>` whose name contains an `@` - an invalid name - so every launch and every Config activation printed one warning per account. The Config view now runs every dynamic string through `glib::markup_escape_text` (the identities subtitle, the account rows' display name/IMAP/SMTP subtitle, and the cache-file rows' name/size), and the Trusted senders dialog's account group titles and entry rows do the same, so `<`, `>`, `&`, and friends display literally instead of being interpreted. The remaining dynamic toasts that still bypassed the escaping - contacts import summaries, attachment save/open errors, raw-message export and Google Tasks failures - are escaped as well, closing out the last markup-parsing paths in the app.
 
 ### Added
 

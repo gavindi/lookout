@@ -607,8 +607,10 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
                     _ => format!("Imported {created}, updated {updated}, skipped {skipped} duplicate(s)"),
                 };
                 if failures > 0 {
-                    toast_overlay.add_toast(adw::Toast::new(&format!("{summary} ({failures} failed)")));
+                    let summary = glib::markup_escape_text(&format!("{summary} ({failures} failed)"));
+                    toast_overlay.add_toast(adw::Toast::new(&summary));
                 } else {
+                    let summary = glib::markup_escape_text(&summary);
                     toast_overlay.add_toast(adw::Toast::new(&summary));
                 }
             });
@@ -1677,7 +1679,8 @@ fn toast_contact_batch(toast_overlay: adw::ToastOverlay, replies: Vec<async_chan
             }
         }
         if failures > 0 {
-            toast_overlay.add_toast(adw::Toast::new(&format!("{failures} change(s) couldn't be saved")));
+            let summary = glib::markup_escape_text(&format!("{failures} change(s) couldn't be saved"));
+            toast_overlay.add_toast(adw::Toast::new(&summary));
         } else if skipped > 0 {
             toast_overlay.add_toast(adw::Toast::new("Some changes couldn't be saved"));
         } else {

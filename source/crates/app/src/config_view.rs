@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 
 /// The caller's hook for opening the manage-identities dialog: takes the
 /// anchoring widget and the account id (opaque string).
@@ -350,7 +351,7 @@ pub fn refresh(
             let identities_subtitle = if info.identity_labels.is_empty() {
                 "Send as this account's own address".to_string()
             } else {
-                info.identity_labels.join(" · ")
+                glib::markup_escape_text(&info.identity_labels.join(" · ")).to_string()
             };
             let identity_row = adw::ActionRow::builder()
                 .title("Sending identities")
@@ -424,7 +425,10 @@ pub fn refresh(
 }
 
 fn account_row(title: &str, subtitle: &str) -> adw::ActionRow {
-    adw::ActionRow::builder().title(title).subtitle(subtitle).build()
+    adw::ActionRow::builder()
+        .title(glib::markup_escape_text(title))
+        .subtitle(glib::markup_escape_text(subtitle))
+        .build()
 }
 
 fn empty_row(title: &str) -> adw::ActionRow {
@@ -439,7 +443,10 @@ fn push_row(group: &adw::PreferencesGroup, rows: &RefCell<Vec<adw::ActionRow>>, 
 }
 
 fn cache_file_row(name: &str, size: &str) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title(name).subtitle(size).build();
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(name))
+        .subtitle(glib::markup_escape_text(size))
+        .build();
     row.set_sensitive(false);
     row
 }

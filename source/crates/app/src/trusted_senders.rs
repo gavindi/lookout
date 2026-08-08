@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use lookout_core::{AccountId, TrustLevel};
 
 use crate::window::UiState;
@@ -117,11 +118,11 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                 return;
             }
             for (account, label) in accounts {
-                let group = adw::PreferencesGroup::builder().title(&label).build();
+                let group = adw::PreferencesGroup::builder().title(glib::markup_escape_text(&label)).build();
                 let mut account_entries: Vec<(String, TrustLevel)> = entries.iter().filter(|(a, _, _)| *a == account).map(|(_, entry, level)| (entry.clone(), *level)).collect();
                 account_entries.sort_by(|a, b| a.0.cmp(&b.0));
                 for (entry, level) in &account_entries {
-                    let row = adw::ActionRow::builder().title(entry).build();
+                    let row = adw::ActionRow::builder().title(glib::markup_escape_text(entry)).build();
                     let remove = gtk::Button::from_icon_name("user-trash-symbolic");
                     remove.set_tooltip_text(Some("Remove this sender"));
                     remove.add_css_class("flat");

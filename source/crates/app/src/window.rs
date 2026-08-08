@@ -5973,7 +5973,8 @@ fn connect_google_tasks(worker: &Rc<Worker>, calendar_state: &Rc<RefCell<Calenda
     glib::spawn_future_local(async move {
         match rx.recv().await {
             Ok(Ok(_token)) => {
-                toast_overlay.add_toast(adw::Toast::new(&format!("Google Tasks connected for {email}")));
+                let title = glib::markup_escape_text(&format!("Google Tasks connected for {email}"));
+                toast_overlay.add_toast(adw::Toast::new(&title));
                 connect_google_tasks_account(worker, calendar_state, tasks_view, toast_overlay, email);
             }
             Ok(Err(e)) => {
@@ -8726,7 +8727,8 @@ fn show_google_tasks_client_id_dialog(window: &adw::ApplicationWindow, toast_ove
                 let _ = std::fs::remove_file(google_tasks::client_id_file_path());
                 toast_overlay.add_toast(adw::Toast::new("Google Tasks client id cleared"));
             } else if let Err(e) = google_tasks::set_client_id(&id) {
-                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't save client id: {e}")));
+                let title = glib::markup_escape_text(&format!("Couldn't save client id: {e}"));
+                toast_overlay.add_toast(adw::Toast::new(&title));
                 return;
             } else {
                 toast_overlay.add_toast(adw::Toast::new("Google Tasks client id saved"));
@@ -9242,7 +9244,10 @@ async fn save_attachment_to_disk(window: &adw::ApplicationWindow, toast_overlay:
         .await;
     match result {
         Ok(_) => toast_overlay.add_toast(adw::Toast::new("Attachment saved")),
-        Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't save attachment: {e}"))),
+        Err(e) => {
+            let title = glib::markup_escape_text(&format!("Couldn't save attachment: {e}"));
+            toast_overlay.add_toast(adw::Toast::new(&title));
+        }
     }
 }
 
@@ -9268,7 +9273,10 @@ async fn save_raw_message_to_disk(window: &adw::ApplicationWindow, toast_overlay
         .await;
     match result {
         Ok(_) => toast_overlay.add_toast(adw::Toast::new("Message saved as .eml")),
-        Err(e) => toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't save message: {e}"))),
+        Err(e) => {
+            let title = glib::markup_escape_text(&format!("Couldn't save message: {e}"));
+            toast_overlay.add_toast(adw::Toast::new(&title));
+        }
     }
 }
 
@@ -9424,7 +9432,8 @@ async fn open_attachment_temp(window: &adw::ApplicationWindow, state: &Rc<RefCel
     let path = match materialize_temp_attachment(state, part, bytes) {
         Ok(path) => path,
         Err(e) => {
-            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't open attachment: {e}")));
+            let title = glib::markup_escape_text(&format!("Couldn't open attachment: {e}"));
+            toast_overlay.add_toast(adw::Toast::new(&title));
             return;
         }
     };
@@ -9443,7 +9452,8 @@ async fn open_attachment_temp(window: &adw::ApplicationWindow, state: &Rc<RefCel
     let launcher = gtk::FileLauncher::new(Some(&file));
     if let Err(e) = launcher.launch_future(Some(window)).await {
         discard_temp_attachment(state, &path);
-        toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't open attachment: {e}")));
+        let title = glib::markup_escape_text(&format!("Couldn't open attachment: {e}"));
+        toast_overlay.add_toast(adw::Toast::new(&title));
     }
 }
 
@@ -9462,7 +9472,8 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
     let path = match materialize_temp_attachment(state, part, bytes) {
         Ok(path) => path,
         Err(e) => {
-            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't open attachment: {e}")));
+            let title = glib::markup_escape_text(&format!("Couldn't open attachment: {e}"));
+            toast_overlay.add_toast(adw::Toast::new(&title));
             return;
         }
     };
@@ -9476,7 +9487,8 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
         Ok(file) => file,
         Err(e) => {
             discard_temp_attachment(state, &path);
-            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't ask which app to open with: {e}")));
+            let title = glib::markup_escape_text(&format!("Couldn't ask which app to open with: {e}"));
+            toast_overlay.add_toast(adw::Toast::new(&title));
             return;
         }
     };
@@ -9485,7 +9497,8 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
         Ok(index) => index,
         Err(e) => {
             discard_temp_attachment(state, &path);
-            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't ask which app to open with: {e}")));
+            let title = glib::markup_escape_text(&format!("Couldn't ask which app to open with: {e}"));
+            toast_overlay.add_toast(adw::Toast::new(&title));
             return;
         }
     };
@@ -9516,7 +9529,8 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
         Ok(proxy) => proxy,
         Err(e) => {
             discard_temp_attachment(state, &path);
-            toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't ask which app to open with: {e}")));
+            let title = glib::markup_escape_text(&format!("Couldn't ask which app to open with: {e}"));
+            toast_overlay.add_toast(adw::Toast::new(&title));
             return;
         }
     };
@@ -9525,7 +9539,8 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
         .await
     {
         discard_temp_attachment(state, &path);
-        toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't ask which app to open with: {e}")));
+        let title = glib::markup_escape_text(&format!("Couldn't ask which app to open with: {e}"));
+        toast_overlay.add_toast(adw::Toast::new(&title));
     }
 }
 
