@@ -492,6 +492,11 @@ pub(crate) struct UiState {
     /// open; replaced whenever a new composer opens (dropping the previous
     /// sender lets the old composer's consumer exit).
     draft_saved_tx: Option<async_channel::Sender<String>>,
+    /// Refresh hook for the currently-open composer's From dropdown: the
+    /// Config → Mail accounts manage-identities dialog fires it after every
+    /// change, so an identity added/edited while a composer is open shows up
+    /// in its From list immediately. `None` while no composer is open.
+    composer_identities_refresh: Option<Rc<dyn Fn()>>,
     /// What the folder sidebar currently has rendered (see
     /// `folder_tree_signature`). `FoldersUpdated` now arrives repeatedly per
     /// account as the unread counts fill in, and almost all of those carry
@@ -1097,6 +1102,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         load_remote_images: settings.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES),
         rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
         draft_saved_tx: None,
+        composer_identities_refresh: None,
         folder_tree: None,
         suppress_folder_selection: false,
         search_active: false,
@@ -2746,8 +2752,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // `vexpand(true)` so the rail stretches the window's full height (it
     // sits beside `outer_toolbar_view` - header bar, menu bar, and command
-    // toolbar included - rather than below those top bars).
-    let nav_rail = gtk::Box::builder()
+    // toolbar included - rather than below those top bars). The content is a
+    // fixed-height Box, wrapped in a scrolled window: a window shrunk shorter
+    // than the buttons' total height would otherwise clip the bottom-anchored
+    // Config button off-screen (a Box clips its trailing children first), and
+    // scrolling keeps every rail button reachable at any height.
+    let nav_rail_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .width_request(56)
         .margin_top(6)
@@ -2755,10 +2765,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .spacing(6)
         .vexpand(true)
         .build();
-    nav_rail.append(&mail_view_button);
-    nav_rail.append(&calendar_view_button);
-    nav_rail.append(&contacts_view_button);
-    nav_rail.append(&tasks_view_button);
+    nav_rail_content.append(&mail_view_button);
+    nav_rail_content.append(&calendar_view_button);
+    nav_rail_content.append(&contacts_view_button);
+    nav_rail_content.append(&tasks_view_button);
+    let nav_rail = gtk::ScrolledWindow::builder()
+        .child(&nav_rail_content)
+        .has_frame(false)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .overlay_scrolling(true)
+        .vexpand(true)
+        .build();
 
     // --- Mail-screen calendar overview pane: a mini month-picker + a list
     // of the clicked day's events, docked to the far right of the window,
@@ -3925,11 +3943,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     config_view_button.set_group(Some(&contacts_view_button));
     // Anchored to the bottom of the rail: Mail/Calendar stay at the top, a
-    // `vexpand(true)` spacer fills the middle, Config sits below it.
+    // `vexpand(true)` spacer fills the middle, Config sits below it (inside
+    // the scrolled window, so a very short window scrolls rather than
+    // clipping it).
     let nav_rail_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     nav_rail_spacer.set_vexpand(true);
-    nav_rail.append(&nav_rail_spacer);
-    nav_rail.append(&config_view_button);
+    nav_rail_content.append(&nav_rail_spacer);
+    nav_rail_content.append(&config_view_button);
 
     // The config view's manage-identities dialog refreshes through this
     // slot: it's filled with `refresh_config` right after that closure is
@@ -4014,7 +4034,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 Rc::new(move |anchor, account_id| {
                     let account_id = AccountId(account_id.to_string());
                     let app_config = state.borrow().app_config.clone();
-                    let on_changed = refresh_hook.borrow().clone();
+                    let on_changed = {
+                        let state = state.clone();
+                        let refresh_hook = refresh_hook.borrow().clone();
+                        Rc::new(move || {
+                            // Any open composer's From dropdown re-reads its
+                            // identities live, so a change made in Config
+                            // while composing lands in the open list too.
+                            if let Some(refresh) = state.borrow().composer_identities_refresh.clone() {
+                                refresh();
+                            }
+                            refresh_hook();
+                        })
+                    };
                     crate::identities::show_manage_dialog(anchor, app_config, account_id, on_changed);
                 })
             };
@@ -4034,9 +4066,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
     });
     // From here on, the manage-identities dialog's `on_changed` re-runs this
-    // closure, keeping the Config view's rows current after an edit. (The
-    // `Rc` cycle this creates lives for the window's lifetime, like the
-    // other closure cycles this file already accepts.)
+    // closure (and refreshes any open composer's From dropdown via
+    // `composer_identities_refresh`), keeping the Config view's rows current
+    // after an edit. (The `Rc` cycle this creates lives for the window's
+    // lifetime, like the other closure cycles this file already accepts.)
     *refresh_hook.borrow_mut() = refresh_config.clone();
     // Populate the placeholder rows now (both groups are empty at startup).
     refresh_config();
@@ -9428,8 +9461,11 @@ fn show_composer_in_reading_pane(
         }
         reading_stack_for_close.set_visible_child_name(&previous_page);
         // The composer is gone; drop its draft-confirmation relay so its
-        // consumer future exits and late events go nowhere.
+        // consumer future exits and late events go nowhere, and its
+        // identities-refresh hook so a later Config manage-identities edit
+        // doesn't poke a dead dropdown.
         state_for_close.borrow_mut().draft_saved_tx = None;
+        state_for_close.borrow_mut().composer_identities_refresh = None;
     });
     // Recipient autocomplete combines local mail-history addresses with
     // CardDAV contacts discovered for this account. Both are queried from UI
@@ -9445,10 +9481,11 @@ fn show_composer_in_reading_pane(
         let carddav = carddav_provider.search_contacts(prefix, 8);
         merge_contact_suggestions(mail_history, &carddav, prefix.trim(), 8)
     });
-    let (composer, draft_tx) = crate::compose::build_compose_view(
+    let (composer, draft_tx, identities_refresh) = crate::compose::build_compose_view(
         title,
-        // The composer's From dropdown re-fetches from here whenever the
-        // manage-identities dialog fires `on_changed`, so edits made while a
+        // The composer's From dropdown re-reads from here whenever the
+        // Config → Mail accounts manage-identities dialog fires `on_changed`
+        // (see `composer_identities_refresh`), so edits made while a
         // composer is open are live. Falls back to the first connected
         // account when no explicit account was resolved.
         {
@@ -9466,8 +9503,6 @@ fn show_composer_in_reading_pane(
                 }
             })
         },
-        state.borrow().app_config.clone(),
-        account_id,
         cmd_tx,
         prefill,
         on_done,
@@ -9475,8 +9510,10 @@ fn show_composer_in_reading_pane(
         suggestions,
     );
     // Replacing any previous composer's relay (dropped sender = its consumer
-    // exits).
+    // exits), and hooking the Config manage-identities dialog into the new
+    // composer's From dropdown.
     state.borrow_mut().draft_saved_tx = Some(draft_tx);
+    state.borrow_mut().composer_identities_refresh = Some(identities_refresh);
     reading_stack.add_named(&composer, Some("compose"));
     reading_stack.set_visible_child_name("compose");
 }
@@ -9752,6 +9789,7 @@ mod tests {
             load_remote_images: false,
             rich_text_default: true,
             draft_saved_tx: None,
+            composer_identities_refresh: None,
             folder_tree: None,
             suppress_folder_selection: false,
             search_active: false,

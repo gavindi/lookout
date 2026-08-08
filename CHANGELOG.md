@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.1 (2026-08-08)
+
+### Changed
+
+- **Compose**: the "Manage identities…" row and the "Rich text" switch are gone from the composer's header rows - both options now live in the Config tab, which already hosted them: Config → Mail accounts lists a "Sending identities" row per account that opens the same manage dialog, and Config → Mail's "Rich text" switch sets the body mode for new messages. The composer keeps the From dropdown, and the per-message plain/rich switch isn't lost with the row: it moves into the editor toolbar as a "Rich text" toggle at the head of the formatting row (bold/italic/lists/… stay disabled in plain mode), so formatting can still be turned on or off per message while the Config switch only picks which mode a new composer opens on. The live identity-refresh behaviour survives the move: `build_compose_view` (which drops its now-unused app-config/account-id arguments) returns its From-dropdown refresh hook, window state holds it while a composer is open (`composer_identities_refresh`), and the Config manage dialog's `on_changed` fires it after every edit - so an identity added or changed while a composer is open still shows up in its From list immediately.
+
+### Fixed
+
+- **UI**: shrinking the window height made the nav rail's Config button disappear. The rail is a fixed-height vertical box with the Config button bottom-anchored behind a `vexpand` spacer, and a box clips its trailing children when the window gets shorter than the buttons' total height - so the bottom-anchored button was the first casualty. The rail content now sits in a frameless `gtk::ScrolledWindow` (vertical scrolling only, overlay scrollbar, no frame), so a very short window scrolls to reach Config instead of clipping it off-screen; at normal heights nothing changes, and the spacer still pins Config to the bottom.
+
 ## 0.9.0 (2026-08-08)
 
 ### Added

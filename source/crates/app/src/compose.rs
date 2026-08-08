@@ -354,7 +354,7 @@ struct AutosaveCtx {
     cc_row: RecipientEntry,
     bcc_row: RecipientEntry,
     subject_row: adw::EntryRow,
-    rich_toggle: adw::SwitchRow,
+    rich_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
     rich_web_view: Rc<webkit::WebView>,
     /// The last snapshot queued for saving; a tick whose fields still match
@@ -469,16 +469,19 @@ fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
     snap.to.trim().is_empty() && snap.cc.trim().is_empty() && snap.bcc.trim().is_empty() && snap.subject.trim().is_empty() && snap.body_text.trim().is_empty()
 }
 
-/// Builds the rich-text editor page: a formatting toolbar above an editable
-/// WebKit `WebView`. The whole page behaves as a contenteditable document,
-/// so formatting actions map to WebKit editing commands (`Bold`,
-/// `InsertUnorderedList`, `FontSize`, `ForeColor`, `CreateLink`, ...) and
-/// the final content is read back with `evaluate_javascript` at send time
-/// (see `read_content`). Navigation and remote subresources are vetoed
-/// regardless of the reading pane's "Load images" setting - composing must
-/// never fetch remote content. Returns the page plus the WebView, which the
-/// caller keeps alive for send-time content reads.
-fn build_rich_editor(initial_html: String) -> (gtk::Box, Rc<webkit::WebView>) {
+/// Builds the rich-text editor's pieces: the contenteditable WebKit `WebView`
+/// plus its formatting toolbar (bold, italic, lists, font size, color,
+/// link). The caller composes the toolbar row (adding the plain/rich toggle
+/// ahead of these buttons) and the scroller around the view. The whole page
+/// behaves as a contenteditable document, so formatting actions map to
+/// WebKit editing commands (`Bold`, `InsertUnorderedList`, `FontSize`,
+/// `ForeColor`, `CreateLink`, ...) and the final content is read back with
+/// `evaluate_javascript` at send time (see `read_content`). Navigation and
+/// remote subresources are vetoed regardless of the reading pane's "Load
+/// images" setting - composing must never fetch remote content. Returns the
+/// WebView (which the caller keeps alive for send-time content reads) plus
+/// the toolbar.
+fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
     let settings = webkit::Settings::builder().enable_javascript(true).build();
     let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).build());
 
@@ -583,12 +586,7 @@ fn build_rich_editor(initial_html: String) -> (gtk::Box, Rc<webkit::WebView>) {
     link_button.connect_clicked(move |button| link_dialog.present(Some(button)));
     toolbar.append(&link_button);
 
-    let scroller = gtk::ScrolledWindow::builder().child(&*web_view).hexpand(true).vexpand(true).build();
-    let page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
-    page.append(&toolbar);
-    page.append(&scroller);
-
-    (page, web_view)
+    (web_view, toolbar)
 }
 
 /// Builds a composer widget, meant to be embedded as a page in the reading
@@ -597,14 +595,15 @@ fn build_rich_editor(initial_html: String) -> (gtk::Box, Rc<webkit::WebView>) {
 /// `on_done` is called once Cancel or Send is clicked, so the caller can
 /// tear the page down and restore whatever the reading pane showed before.
 ///
-/// The body supports two modes, switched with the "Rich text" row: the
-/// plain `gtk::TextView` fallback (also a send-time fallback for HTML
-/// clients), and a contenteditable `WebKit.WebView` with a formatting
-/// toolbar (see `build_rich_editor`). Only one mode is live at a time;
-/// `rich_text_default` picks which one the composer opens on (Config → Mail).
-/// The HTML mode sends `multipart/alternative` - both the rich HTML and a
-/// plain-text rendering - so recipients without HTML support still get the
-/// text.
+/// The body supports two modes, switched with the "Rich text" toggle in the
+/// editor toolbar (the same row as the formatting buttons, which only make
+/// sense in rich mode): the plain `gtk::TextView` fallback (also a send-time
+/// fallback for HTML clients), and a contenteditable `WebKit.WebView` with a
+/// formatting toolbar (see `build_rich_editor`). Only one mode is live at a
+/// time; `rich_text_default` picks which one the composer opens on (Config →
+/// Mail). The HTML mode sends `multipart/alternative` - both the rich HTML
+/// and a plain-text rendering - so recipients without HTML support still get
+/// the text.
 ///
 /// Draft autosave: while the composer is open, a periodic timer compares
 /// the fields against the last saved snapshot and, when they differ (and
@@ -616,21 +615,22 @@ fn build_rich_editor(initial_html: String) -> (gtk::Box, Rc<webkit::WebView>) {
 /// how the account's event loop forwards `DraftSaved` confirmations back to
 /// this composer (which flips the status label from "Saving draft…" to
 /// "Draft saved"); dropping it lets the composer's confirmation consumer
-/// exit.
+/// exit. The returned refresh hook re-reads `identities_source` into the
+/// From dropdown - the caller invokes it after the Config → Mail accounts
+/// manage-identities dialog changes the account's identities, so an edit
+/// made while a composer is open shows up in its From list immediately.
 /// Cohesive arguments (they all describe one composer to open), so they stay
 /// positional rather than being bundled into a single-use struct.
 #[allow(clippy::too_many_arguments)]
 pub fn build_compose_view(
     title: &str,
     identities_source: Rc<dyn Fn() -> Vec<Identity>>,
-    app_config: Rc<RefCell<crate::app_config::AppConfig>>,
-    account_id: Option<AccountId>,
     cmd_tx: async_channel::Sender<AccountCommand>,
     prefill: ComposePrefill,
     on_done: Rc<dyn Fn()>,
     rich_text_default: bool,
     suggestions: SuggestionSource,
-) -> (gtk::Box, async_channel::Sender<String>) {
+) -> (gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
     let to_row = RecipientEntry::new("To");
     if let Some(to) = &prefill.to {
         to_row.set_from_text(to);
@@ -650,12 +650,12 @@ pub fn build_compose_view(
         subject_row.set_text(subject);
     }
 
-    let rich_toggle = adw::SwitchRow::builder().title("Rich text").subtitle("Formatting (bold, lists, links, ...)").build();
-
     // --- From selector: a dropdown of the account's identities (its own
-    // address first), re-fetched from `identities_source` whenever the
-    // manage dialog changes them. Same ActionRow + `gtk::DropDown` pattern
-    // as the event editor's calendar picker.
+    // address first). The returned refresh hook re-reads `identities_source`
+    // when the Config → Mail accounts manage dialog changes them, so an edit
+    // while a composer is open lands in its From list immediately. Same
+    // ActionRow + `gtk::DropDown` pattern as the event editor's calendar
+    // picker.
     let identities = Rc::new(RefCell::new(identities_source()));
     let from_row = adw::ActionRow::builder().title("From").build();
     let from_dropdown = gtk::DropDown::builder().selected(0).build();
@@ -676,18 +676,6 @@ pub fn build_compose_view(
         })
     };
     refresh_from_dropdown();
-    let manage_row = adw::ActionRow::builder()
-        .title("Manage identities…")
-        .subtitle("Add, edit or remove the addresses you can send as")
-        .activatable(account_id.is_some())
-        .build();
-    if let Some(account_id) = account_id {
-        let app_config = app_config.clone();
-        let refresh = refresh_from_dropdown.clone();
-        manage_row.connect_activated(move |row| {
-            crate::identities::show_manage_dialog(row.upcast_ref::<gtk::Widget>(), app_config.clone(), account_id.clone(), refresh.clone());
-        });
-    }
 
     let fields_group = adw::PreferencesGroup::new();
     fields_group.add(to_row.widget());
@@ -695,8 +683,6 @@ pub fn build_compose_view(
     fields_group.add(bcc_row.widget());
     fields_group.add(&subject_row);
     fields_group.add(&from_row);
-    fields_group.add(&manage_row);
-    fields_group.add(&rich_toggle);
 
     let body_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
@@ -710,17 +696,33 @@ pub fn build_compose_view(
     }
     let text_scroller = gtk::ScrolledWindow::builder().child(&body_view).hexpand(true).vexpand(true).build();
 
-    let (rich_page, rich_web_view) = build_rich_editor(prefill.body.as_deref().map(text_to_html).unwrap_or_default());
+    let (rich_web_view, format_toolbar) = build_rich_editor(prefill.body.as_deref().map(text_to_html).unwrap_or_default());
 
     let body_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     body_stack.add_named(&text_scroller, Some("text"));
-    body_stack.add_named(&rich_page, Some("rich"));
+    let rich_scroller = gtk::ScrolledWindow::builder().child(&*rich_web_view).hexpand(true).vexpand(true).build();
+    body_stack.add_named(&rich_scroller, Some("rich"));
     body_stack.set_visible_child_name("text");
+
+    // The plain/rich switch lives in a shared toolbar row above the body,
+    // ahead of the formatting buttons - it must be reachable in both modes,
+    // while the formatting buttons only make sense in rich mode and so stay
+    // disabled (insensitive) otherwise.
+    let rich_toggle = gtk::ToggleButton::builder()
+        .label("Rich text")
+        .tooltip_text("Toggle between plain text and formatted editing")
+        .build();
+    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
+    editor_toolbar.append(&rich_toggle);
+    editor_toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
+    editor_toolbar.append(&format_toolbar);
 
     {
         let web_view = rich_web_view.clone();
         let stack_for_toggle = body_stack.clone();
-        rich_toggle.connect_active_notify(move |toggle| {
+        let format_toolbar = format_toolbar.clone();
+        rich_toggle.connect_toggled(move |toggle| {
+            format_toolbar.set_sensitive(toggle.is_active());
             if toggle.is_active() {
                 stack_for_toggle.set_visible_child_name("rich");
                 web_view.grab_focus();
@@ -730,8 +732,9 @@ pub fn build_compose_view(
         });
     }
     // Wire the Config → Mail preference into the composer's opening mode. The
-    // notify handler above is connected first, so `set_active` also routes
-    // the stack to the right page and focuses the editor.
+    // toggled handler above is connected first, so `set_active` also routes
+    // the stack to the right page, focuses the editor, and arms the toolbar.
+    format_toolbar.set_sensitive(rich_text_default);
     rich_toggle.set_active(rich_text_default);
 
     // --- Draft autosave state ---
@@ -823,6 +826,7 @@ pub fn build_compose_view(
         .build();
     content.append(&top_row);
     content.append(&fields_group);
+    content.append(&editor_toolbar);
     content.append(&body_stack);
 
     {
@@ -951,7 +955,7 @@ pub fn build_compose_view(
         });
     }
 
-    (content, draft_saved_tx)
+    (content, draft_saved_tx, refresh_from_dropdown)
 }
 
 #[cfg(test)]

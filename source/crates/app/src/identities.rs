@@ -1,9 +1,9 @@
 //! The "Manage identities…" dialog: add/edit/delete the sending identities
 //! pinned to one account. Everything writes through to the shared
 //! `AppConfig` (and `app_config::save`) on every change, and fires
-//! `on_changed` so the caller (the composer's From dropdown, the Config
-//! view) can re-render - the same write-through pattern as the Manage-tags
-//! dialog.
+//! `on_changed` so the caller (Config → Mail accounts, which also refreshes
+//! any open composer's From dropdown) can re-render - the same write-through
+//! pattern as the Manage-tags dialog.
 
 use std::cell::RefCell;
 use std::rc::Rc;

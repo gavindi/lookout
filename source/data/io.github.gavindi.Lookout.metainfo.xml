@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.1" date="2026-08-08">
+      <description>
+        <p>Composing is cleaner: the composer's "Manage identities…" row and "Rich text" switch are now handled in Config - Manage identities lives under each account in Config → Mail accounts, and the Rich text setting in Config → Mail picks the editor your new messages open in, with the mid-compose plain/rich toggle still available in the editor's formatting toolbar. Also fixed: the nav rail's Config button no longer disappears when the window is made very short - the rail scrolls instead of clipping it.</p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-08-08">
       <description>
         <p>New: the Lookout dashboard tab. A new header-corner tab (with the app's Observatorium telescope icon) shows your connected accounts at a glance - people most contacted, emails by time of day, outstanding tasks, and upcoming calendar events - fed from the local caches and the calendar sessions, live-updating as mail, events, and tasks change. Upcoming events now span the current and next month and stay populated while the dashboard is on screen. The search entry moves beside the tab in the header.</p>
