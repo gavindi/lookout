@@ -477,6 +477,28 @@ pub(crate) struct UiState {
     /// Cleared on every navigation, so returning to the message later shows
     /// the banner again.
     imip_dismissed: Option<(MailboxId, Uid)>,
+    /// The addresses a read receipt for the message currently on the reading
+    /// pane should go to - parsed from its `Disposition-Notification-To`
+    /// header by `render_body`, read by the banner's button handler and the
+    /// automatic-send path. `None` when the pane shows nothing or the
+    /// message doesn't request a receipt.
+    read_receipt_request: Option<Vec<String>>,
+    /// The `(mailbox, uid)` of the message whose read-receipt banner the user
+    /// acted on (sent the receipt); while that message stays on screen the
+    /// banner must not come back. Cleared on every navigation, like
+    /// `unsubscribe_dismissed`.
+    read_receipt_dismissed: Option<(MailboxId, Uid)>,
+    /// Every `(mailbox, uid)` a read receipt has been sent for this session -
+    /// the fire-once guard for the automatic policy (a message re-opened
+    /// later, or re-rendered by a Config toggle, must not receipt twice).
+    /// Session-only, like the `load_once_images` override.
+    read_receipts_sent: HashSet<(MailboxId, Uid)>,
+    /// The original-message details a read receipt for the message currently
+    /// on the reading pane needs, stashed by `render_body` (which has the
+    /// body) alongside `read_receipt_request` and read by the send path. The
+    /// `imip`/`unsubscribe_info` equivalent - per-render data, so the
+    /// banner's button handler doesn't need the (LRU-evictable) body cache.
+    read_receipt_context: Option<ReadReceiptContext>,
     /// Mailboxes with a `SyncMailbox` request outstanding - sent but not yet
     /// answered by a `MessagesUpdated`. The startup burst (the session's
     /// cache replay plus the app's on-demand syncs) would otherwise queue
@@ -626,6 +648,22 @@ struct CalendarAccountHandle {
     /// Latest full task list from the account's last `TasksUpdated` - tasks
     /// have no month window, so a whole-set snapshot is the natural unit.
     last_tasks: Vec<CalendarTask>,
+}
+
+/// The original-message details a read receipt (RFC 8098 MDN) is built
+/// from, stashed by `render_body` alongside the parsed
+/// `Disposition-Notification-To` request. The builder (`lookout_mail`'s
+/// `ReadReceipt`) needs the original's Message-ID/From/Subject/Date and its
+/// headers (the report's third part); keeping them here means the banner's
+/// button handler - and the automatic policy - never touch the
+/// LRU-evictable body cache.
+#[derive(Clone)]
+struct ReadReceiptContext {
+    message_id: String,
+    original_from: String,
+    subject: String,
+    date: Option<String>,
+    headers: Vec<(String, String)>,
 }
 
 /// Per-subscription state for one webcal feed - the fetch-only cousin of
@@ -1321,6 +1359,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         unsubscribe_dismissed: None,
         imip: None,
         imip_dismissed: None,
+        read_receipt_request: None,
+        read_receipt_dismissed: None,
+        read_receipts_sent: HashSet::new(),
+        read_receipt_context: None,
         pending_cid: HashMap::new(),
         rendered_inline_parts: Vec::new(),
         temp_attachment_files: HashSet::new(),
@@ -2625,6 +2667,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     trust_banner.set_button_label(Some("Trust sender…"));
     trust_banner.set_revealed(false);
     message_page.append(&trust_banner);
+    // The read-receipt banner (RFC 8098 `Disposition-Notification-To`),
+    // between the header and the body like the others: revealed by
+    // `render_body` when the message on screen requests a read receipt and
+    // the automatic policy is off (when it's on, the receipt is sent
+    // silently instead). Its button sends the receipt - see the handler
+    // registered below.
+    let read_receipt_banner = adw::Banner::new("This message requests a read receipt");
+    read_receipt_banner.set_widget_name("read-receipt-banner");
+    read_receipt_banner.set_button_label(Some("Send read receipt"));
+    read_receipt_banner.set_revealed(false);
+    message_page.append(&read_receipt_banner);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
@@ -2787,15 +2840,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             });
             dialog.present(Some(banner));
         });
-    } // WebKit paints asynchronously - revealing the HTML page while a fresh
-      // body is still loading would show a blank/white page before the message
-      // appears. So the body is loaded while the pane holds on "empty", and a
-      // single persistent `load-changed` handler reveals the page only once the
-      // load completes. `render_body` arms this with `pending_html_reveal`; the
-      // selection handler disarms it whenever the user moves on, so a load
-      // started for a stale message can never yank the pane back open (the
-      // older per-render one-shot handlers instead fired on *any* Finished and
-      // caused double reveals / stale emails appearing).
+    }
+    // --- Read-receipt banner actions. The banner's button sends the RFC
+    // 8098 receipt for whatever message is on the reading pane (the request
+    // and context stashed by `render_body`): one click, one receipt, and the
+    // message is marked receipted so re-opening it won't offer again - the
+    // same per-message dismissal convention as the other banners.
+    {
+        let state = state.clone();
+        read_receipt_banner.connect_button_clicked(move |banner| {
+            let sent = send_read_receipt(&state, false);
+            if sent {
+                banner.set_revealed(false);
+            }
+        });
+    }
+    // WebKit paints asynchronously - revealing the HTML page while a fresh
+    // body is still loading would show a blank/white page before the message
+    // appears. So the body is loaded while the pane holds on "empty", and a
+    // single persistent `load-changed` handler reveals the page only once the
+    // load completes. `render_body` arms this with `pending_html_reveal`; the
+    // selection handler disarms it whenever the user moves on, so a load
+    // started for a stale message can never yank the pane back open (the
+    // older per-render one-shot handlers instead fired on *any* Finished and
+    // caused double reveals / stale emails appearing).
     let state_for_reveal = state.clone();
     let content_stack_for_reveal = content_stack.clone();
     let reading_stack_for_reveal = reading_stack.clone();
@@ -4404,6 +4472,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Send read receipts automatically": the reading pane's
+    // read-receipt policy. Read per message at display time, so a flip
+    // affects the next message opened - no re-render needed.
+    {
+        let state = state.clone();
+        config_view.read_receipts_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::MAIL_SEND_READ_RECEIPTS, row.is_active());
+        });
+    }
+
     // Config → Calendar → "Event alerts": gates the reminder loop. The loop
     // (see `reminders::spawn_reminder_loop`) reads the key on every tick, so
     // nothing needs re-arming here - disabling mid-session simply stops new
@@ -4424,6 +4502,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.animations_row.set_active(persisted.get_bool(crate::settings::ANIMATE_TRANSITIONS));
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
+        config_view.read_receipts_row.set_active(persisted.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS));
         config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
         // Theme rows: seeding fires the notify handlers above, which apply
         // the persisted theme/accent through the ThemeManager, so startup
@@ -4662,6 +4741,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 st.unsubscribe_dismissed = None;
                 st.imip = None;
                 st.imip_dismissed = None;
+                st.read_receipt_request = None;
+                st.read_receipt_dismissed = None;
+                st.read_receipt_context = None;
                 st.rendered_trust_sender = None;
                 st.load_once_images = false;
                 st.trust_banner_dismissed = None;
@@ -5208,6 +5290,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.unsubscribe_dismissed = None;
                     st.imip = None;
                     st.imip_dismissed = None;
+                    st.read_receipt_request = None;
+                    st.read_receipt_dismissed = None;
+                    st.read_receipt_context = None;
                     st.rendered_trust_sender = None;
                     st.load_once_images = false;
                     st.trust_banner_dismissed = None;
@@ -5230,6 +5315,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.unsubscribe_dismissed = None;
                     st.imip = None;
                     st.imip_dismissed = None;
+                    st.read_receipt_request = None;
+                    st.read_receipt_dismissed = None;
+                    st.read_receipt_context = None;
                     st.rendered_trust_sender = None;
                     st.load_once_images = false;
                     st.trust_banner_dismissed = None;
@@ -7976,6 +8064,8 @@ fn respond_to_imip_invitation(
         text_body: format!("{subject_prefix}."),
         html_body: None,
         calendar_part: Some(reply_ics),
+        read_receipt: None,
+        request_read_receipt: false,
         in_reply_to: invitation.in_reply_to.clone(),
         references: vec![],
         message_id: None,
@@ -10694,6 +10784,96 @@ fn rerender_current_message(
     render_body(state, reading_stack, message_header, mailbox, uid, body);
 }
 
+/// Strips the angle brackets an `In-Reply-To`/`References` value must not
+/// carry (the composer prefill's convention: `mail_builder`'s MessageId
+/// writer adds them itself).
+fn bare_message_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    trimmed.strip_prefix('<').and_then(|r| r.strip_suffix('>')).unwrap_or(trimmed).to_string()
+}
+
+/// Sends the RFC 8098 read receipt for the message currently on the reading
+/// pane - the `Disposition-Notification-To` request and the original-message
+/// context stashed by `render_body`. `automatic` picks the report's
+/// disposition mode (`automatic-action/MDN-sent-automatically` vs
+/// `manual-action/MDN-sent-manually`). Returns whether the receipt was
+/// queued; on success the message is marked receipted (the banner won't
+/// offer it again) and a toast confirms. Both callers - the banner's Send
+/// button and the automatic policy - route through this, so the receipt is
+/// built and sent one way. The send itself is the same `SendMessage` path
+/// the composer uses (SMTP + a copy in Sent), from the receiving account's
+/// own address so the receipt is legitimate.
+fn send_read_receipt(state: &Rc<RefCell<UiState>>, automatic: bool) -> bool {
+    let (mailbox, uid, request, context) = {
+        let st = state.borrow();
+        let (mailbox, uid) = match &st.rendered_message {
+            Some(rendered) => rendered.clone(),
+            None => return false,
+        };
+        let Some(request) = st.read_receipt_request.clone() else { return false };
+        let Some(context) = st.read_receipt_context.clone() else { return false };
+        (mailbox, uid, request, context)
+    };
+    let Some(account_id) = mailbox_account_id(&mailbox) else { return false };
+    let account_lookup = {
+        let st = state.borrow();
+        st.accounts
+            .get(&account_id)
+            .map(|handle| (handle.email.clone(), handle.display_name.clone(), handle.cmd_tx.clone()))
+    };
+    let Some((email, display_name, cmd_tx)) = account_lookup else {
+        return false;
+    };
+    let Some(to) = request.first() else { return false };
+    let original_message_id = context.message_id;
+    let bare_id = bare_message_id(&original_message_id);
+    let subject = if context.subject.trim().is_empty() {
+        "Read receipt".to_string()
+    } else {
+        format!("Read receipt: {}", context.subject.trim())
+    };
+    let message = lookout_mail::ComposedMessage {
+        from: email.clone(),
+        display_name: Some(display_name).filter(|name| !name.trim().is_empty()),
+        to: vec![to.clone()],
+        cc: vec![],
+        bcc: vec![],
+        reply_to: vec![],
+        subject,
+        // The report branch of `build_raw_message` replaces the text body
+        // with the human-readable part it builds itself.
+        text_body: String::new(),
+        html_body: None,
+        calendar_part: None,
+        read_receipt: Some(lookout_mail::ReadReceipt {
+            original_message_id,
+            original_from: context.original_from,
+            original_subject: context.subject,
+            original_date: context.date,
+            final_recipient: email,
+            automatic,
+            displayed_at: chrono::Local::now().format("%a, %e %b %Y %H:%M %z").to_string(),
+            original_headers: context.headers,
+        }),
+        request_read_receipt: false,
+        in_reply_to: Some(bare_id.clone()),
+        references: vec![bare_id],
+        message_id: None,
+    };
+    if cmd_tx.send_blocking(AccountCommand::SendMessage(Box::new(message))).is_err() {
+        return false;
+    }
+    {
+        let mut st = state.borrow_mut();
+        st.read_receipts_sent.insert((mailbox.clone(), uid));
+        st.read_receipt_dismissed = Some((mailbox, uid));
+        if let Some(toast_overlay) = &st.toast_overlay {
+            toast_overlay.add_toast(adw::Toast::new("Read receipt sent"));
+        }
+    }
+    true
+}
+
 fn render_body(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
@@ -10702,7 +10882,6 @@ fn render_body(
     uid: Uid,
     body: lookout_core::EmailBody,
 ) {
-    // Defense-in-depth for the direct `BodyFetched` caller: if this exact
     // Defense-in-depth for the direct `BodyFetched` caller: if this exact
     // message is already on screen, a duplicate body event must not route the
     // pane through "empty" and crossfade the same email again. The selection
@@ -10827,6 +11006,41 @@ fn render_body(
                     banner.set_revealed(!dismissed && (images_blocked || other_blocked));
                 }
             }
+        }
+    }
+    // Read-receipt request (RFC 8098 `Disposition-Notification-To`): stash
+    // the rendered message's requested addresses - and the original-message
+    // context a receipt needs - for the banner's button handler and the
+    // automatic policy. Under the automatic policy the receipt goes out
+    // immediately (once per message per session) with a toast instead of a
+    // banner; otherwise the banner asks. Neither happens for
+    // machine-generated mail (RFC 3834) or reports (RFC 8098 §2.1.4) - a
+    // receipt for a receipt is how loops start - and never for the debug
+    // `.eml` viewer, which has no account to send from.
+    {
+        let request = lookout_core::parse_disposition_notification_to(&body.headers);
+        let mut st = state.borrow_mut();
+        st.read_receipt_request = (!request.is_empty()).then_some(request);
+        st.read_receipt_context = st.read_receipt_request.as_ref().map(|_| ReadReceiptContext {
+            message_id: lookout_core::header_value(&body.headers, "message-id").unwrap_or("").to_string(),
+            original_from: lookout_core::header_value(&body.headers, "from").unwrap_or("").to_string(),
+            subject: lookout_core::header_value(&body.headers, "subject").unwrap_or("").to_string(),
+            date: lookout_core::header_value(&body.headers, "date").map(str::to_string),
+            headers: body.headers.clone(),
+        });
+        let key = (mailbox.clone(), uid);
+        let automatic = st.settings.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS);
+        let eligible = st.read_receipt_request.is_some()
+            && !lookout_core::is_auto_submitted(&body.headers)
+            && !lookout_core::is_report_message(&body.headers)
+            && mailbox_account_id(&mailbox).is_some();
+        let already_sent = st.read_receipts_sent.contains(&key);
+        if let Some(banner) = find_named_child(reading_stack, "read-receipt-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+            banner.set_revealed(eligible && !automatic && !already_sent && st.read_receipt_dismissed.as_ref() != Some(&key));
+        }
+        drop(st);
+        if automatic && eligible && !already_sent {
+            send_read_receipt(state, true);
         }
     }
     // Config → Appearance → "Animate transitions" can switch the stack's
@@ -11411,6 +11625,10 @@ mod tests {
             unsubscribe_dismissed: None,
             imip: None,
             imip_dismissed: None,
+            read_receipt_request: None,
+            read_receipt_dismissed: None,
+            read_receipts_sent: HashSet::new(),
+            read_receipt_context: None,
             pending_cid: HashMap::new(),
             rendered_inline_parts: Vec::new(),
             temp_attachment_files: HashSet::new(),

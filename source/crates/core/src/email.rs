@@ -389,6 +389,101 @@ pub fn parse_list_unsubscribe(headers: &[(String, String)]) -> Option<ListUnsubs
     Some(ListUnsubscribe { mailto, http, one_click })
 }
 
+/// Parses a message's `Disposition-Notification-To` header (RFC 8098 §2.1.1)
+/// into the addresses the sender wants a read receipt sent to. Returns an
+/// empty vec when the header is missing or names no usable address. The
+/// header is an RFC 5322 address list, so each comma-separated item may be a
+/// bare address or `Display Name <address>`; parsing is deliberately lenient
+/// (real-world senders put spaces, stray brackets and the like around the
+/// addresses) - an item yields its address when an angle-bracketed or bare
+/// token containing an `@` can be extracted, junk items are dropped, and
+/// duplicates are kept (senders list each recipient they want notified).
+pub fn parse_disposition_notification_to(headers: &[(String, String)]) -> Vec<String> {
+    let Some(raw) = header_value(headers, "disposition-notification-to") else {
+        return Vec::new();
+    };
+    let mut addresses = Vec::new();
+    for item in raw.split(',') {
+        if let Some(address) = dnt_address(item) {
+            addresses.push(address);
+        }
+    }
+    addresses
+}
+
+/// Extracts one routable address from a comma-separated item of a
+/// `Disposition-Notification-To` value, or `None` when the item names no
+/// usable address. Accepts `Display Name <address>`, bare `<address>`, a
+/// bare address, and the stray-bracket variants real-world senders produce
+/// (`<<address>>`, `name<address>`); junk items are dropped.
+fn dnt_address(item: &str) -> Option<String> {
+    let item = item.trim();
+    // `Name <address>` (or `<address>`): the address is the last
+    // angle-bracketed group - but only when the group is well-formed,
+    // otherwise the item may still be a bare address below.
+    if let Some(start) = item.rfind('<') {
+        if let Some(addr) = item[start + 1..].strip_suffix('>') {
+            let addr = addr.trim();
+            if looks_like_address(addr) {
+                return Some(addr.to_string());
+            }
+        }
+    }
+    // Bare address with one or more surrounding bracket pairs.
+    let mut candidate = item;
+    loop {
+        let stripped = candidate.strip_prefix('<').and_then(|r| r.strip_suffix('>')).unwrap_or(candidate).trim();
+        if stripped == candidate {
+            break;
+        }
+        candidate = stripped;
+    }
+    looks_like_address(candidate).then(|| candidate.to_string())
+}
+
+/// Whether a value plausibly names an email address: exactly one `@` with
+/// non-empty sides, and no whitespace, brackets, or delimiter characters -
+/// the checks that keep `Name <addr>` fragments and dangling brackets out of
+/// the parsed list. Quoted local parts are not validated further; the
+/// receipt target just needs to be routable enough for SMTP to accept it (a
+/// malformed address then fails at send time and toasts, rather than
+/// silently skipping the receipt).
+fn looks_like_address(value: &str) -> bool {
+    let mut parts = value.split('@');
+    let local = parts.next().unwrap_or("");
+    let domain = parts.next().unwrap_or("");
+    if local.is_empty() || domain.is_empty() || parts.next().is_some() {
+        return false;
+    }
+    let clean = |part: &str| part.chars().all(|c| !c.is_whitespace() && !"<>(),;:\"\\".contains(c));
+    clean(local) && clean(domain)
+}
+
+/// Whether the message is machine-generated (RFC 3834 `Auto-Submitted`):
+/// `auto-generated` and `auto-replied` mark automated mail that must never
+/// receive an automated response, or the response would loop. An absent
+/// header (the common case for human mail) is *not* auto-submitted; `no` is
+/// the explicit RFC 3834 value for human-originated mail and is not either.
+pub fn is_auto_submitted(headers: &[(String, String)]) -> bool {
+    header_value(headers, "auto-submitted")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v.starts_with("auto-generated") || v.starts_with("auto-replied")
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the message is itself a return receipt (or other report) - the
+/// `multipart/report` test of RFC 8098 §2.1.4. Receipts for reports are
+/// never generated; only a message whose *top-level* content type is a
+/// report is caught (subparts may legitimately carry `message/rfc822` and
+/// other embedded types).
+pub fn is_report_message(headers: &[(String, String)]) -> bool {
+    header_value(headers, "content-type")
+        .map(|v| v.to_ascii_lowercase().contains("multipart/report"))
+        .unwrap_or(false)
+}
+
 /// The iMIP `METHOD` property (RFC 5546 §3.2): what an email carrying a
 /// `text/calendar` part asks the recipient to do. `REQUEST` is an invitation
 /// (or re-invitation), `REPLY` carries an attendee's RSVP back to the
@@ -634,6 +729,71 @@ mod tests {
         // An empty value.
         let empty = vec![("list-unsubscribe".to_string(), "".to_string())];
         assert_eq!(parse_list_unsubscribe(&empty), None);
+    }
+
+    #[test]
+    fn parse_disposition_notification_to_extracts_addresses() {
+        // Bare address.
+        let headers = vec![("Disposition-Notification-To".to_string(), "sender@example.com".to_string())];
+        assert_eq!(parse_disposition_notification_to(&headers), vec!["sender@example.com".to_string()]);
+
+        // Display-name form.
+        let headers = vec![("Disposition-Notification-To".to_string(), "Sally Sender <sender@example.com>".to_string())];
+        assert_eq!(parse_disposition_notification_to(&headers), vec!["sender@example.com".to_string()]);
+
+        // Multiple addresses, whitespace tolerated.
+        let headers = vec![("disposition-notification-to".to_string(), " a@b.example, <c@d.example>, Name <e@f.example> ".to_string())];
+        assert_eq!(
+            parse_disposition_notification_to(&headers),
+            vec!["a@b.example".to_string(), "c@d.example".to_string(), "e@f.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_disposition_notification_to_drops_junk() {
+        // Missing header -> empty.
+        assert!(parse_disposition_notification_to(&[]).is_empty());
+        // Empty value.
+        let empty = vec![("Disposition-Notification-To".to_string(), "".to_string())];
+        assert!(parse_disposition_notification_to(&empty).is_empty());
+        // A list of unusable items yields nothing; the one valid item survives.
+        let junk = vec![("Disposition-Notification-To".to_string(), "not an address, Name <>, valid@example.com".to_string())];
+        assert_eq!(parse_disposition_notification_to(&junk), vec!["valid@example.com".to_string()]);
+        // Dangling brackets and double angles around a bare address.
+        let messy = vec![("Disposition-Notification-To".to_string(), "<<messy@example.com>>".to_string())];
+        assert_eq!(parse_disposition_notification_to(&messy), vec!["messy@example.com".to_string()]);
+    }
+
+    #[test]
+    fn parse_disposition_notification_to_keeps_duplicates() {
+        let headers = vec![("Disposition-Notification-To".to_string(), "a@b.example, a@b.example".to_string())];
+        assert_eq!(parse_disposition_notification_to(&headers), vec!["a@b.example".to_string(), "a@b.example".to_string()]);
+    }
+
+    #[test]
+    fn is_auto_submitted_detects_rfc_3834_machine_mail() {
+        for value in ["auto-generated", "auto-replied", "Auto-Generated", "auto-replied; foo"] {
+            let headers = vec![("Auto-Submitted".to_string(), value.to_string())];
+            assert!(is_auto_submitted(&headers), "{value:?}");
+        }
+        // Absent, explicit `no`, and unknown values are all human mail.
+        assert!(!is_auto_submitted(&[]));
+        for value in ["no", "", "yes", "auto-notified"] {
+            let headers = vec![("Auto-Submitted".to_string(), value.to_string())];
+            assert!(!is_auto_submitted(&headers), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn is_report_message_detects_multipart_report() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "multipart/report; report-type=disposition-notification; boundary=xyz".to_string(),
+        )];
+        assert!(is_report_message(&headers));
+        let plain = vec![("Content-Type".to_string(), "multipart/alternative; boundary=xyz".to_string())];
+        assert!(!is_report_message(&plain));
+        assert!(!is_report_message(&[]));
     }
 
     #[test]

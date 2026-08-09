@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.15" date="2026-08-09">
+      <description>
+        <p>Read receipts (RFC 8098). The composer gains a "Request read receipt" switch that adds a Disposition-Notification-To header, so recipients can notify you when they read your message. On the receiving side, a message that asks for a receipt shows a "Send read receipt" banner in the reading pane - or, under the new Config → Mail "Send read receipts automatically" setting, the receipt is sent silently the moment the message is displayed. The receipt is a proper multipart/report document (a human-readable part, the disposition fields with the message's original Message-ID, and the original message's headers), is marked as auto-generated so automated senders don't loop, and is sent once per message per session - never for machine-generated mail or for other reports.</p>
+      </description>
+    </release>
     <release version="0.9.13" date="2026-08-09">
       <description>
         <p>A new Birthdays calendar, synthesized from your contacts: every contact with a birthday appears as an all-day event in a "Birthdays" row of the calendar sidebar, with its own colour and show/hide toggle. Dated birthdays show the age ("Alice's 36th birthday"); yearless ones (the --MMDD form or Apple's X-APPLE-OMIT-YEAR) recur every year; and Feb 29 lands on Feb 28 in non-leap years. Birthdays appear in every calendar surface - month, week and day grids, the agenda, print, the mini-calendar's event-day markers, the Mail overview and the dashboard - update live whenever your contacts resync, and fire a notification when the day begins. The events are read-only, with the editor explaining that they're synthesized from contacts rather than savable. vCard BDAY parsing now also accepts the yearless forms, and reminder notifications for all-day events say "All day" instead of "Starts at 00:00".</p>

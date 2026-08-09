@@ -368,6 +368,10 @@ struct DraftSnapshot {
     bcc: String,
     subject: String,
     rich: bool,
+    /// Whether the "Request read receipt" switch is on - a flip re-saves the
+    /// draft so the stored copy carries (or stops carrying) the
+    /// `Disposition-Notification-To` header, like any other edit.
+    read_receipt: bool,
     body: String,
     body_text: String,
 }
@@ -393,6 +397,7 @@ struct AutosaveCtx {
     cc_row: RecipientEntry,
     bcc_row: RecipientEntry,
     subject_row: adw::EntryRow,
+    read_receipt_row: adw::SwitchRow,
     rich_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
     rich_web_view: Rc<webkit::WebView>,
@@ -444,6 +449,7 @@ impl AutosaveCtx {
             bcc: self.bcc_row.text_value(),
             subject: self.subject_row.text().to_string(),
             rich,
+            read_receipt: self.read_receipt_row.is_active(),
             body,
             body_text,
         })
@@ -490,6 +496,8 @@ impl AutosaveCtx {
             text_body: snap.body_text.clone(),
             html_body: snap.rich.then(|| snap.body.clone()),
             calendar_part: None,
+            read_receipt: None,
+            request_read_receipt: snap.read_receipt,
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             message_id: Some((*self.draft_message_id).clone()),
@@ -732,6 +740,16 @@ pub fn build_compose_view(
     fields_group.add(&subject_row);
     fields_group.add(&from_row);
 
+    // --- Read-receipt request: RFC 8098's `Disposition-Notification-To`
+    // header, asking recipients to notify us when they read the message.
+    // The header is only added at build time (see `build_raw_message`), so
+    // the switch's state flows through the draft snapshot and the send.
+    let read_receipt_row = adw::SwitchRow::builder()
+        .title("Request read receipt")
+        .subtitle("Ask recipients to notify you when they read this message")
+        .build();
+    fields_group.add(&read_receipt_row);
+
     let body_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .left_margin(8)
@@ -797,6 +815,7 @@ pub fn build_compose_view(
         cc_row: cc_row.clone(),
         bcc_row: bcc_row.clone(),
         subject_row: subject_row.clone(),
+        read_receipt_row: read_receipt_row.clone(),
         rich_toggle: rich_toggle.clone(),
         body_view: body_view.clone(),
         rich_web_view: rich_web_view.clone(),
@@ -941,6 +960,7 @@ pub fn build_compose_view(
             let cmd_tx = cmd_tx.clone();
             let identities = identities.clone();
             let from_dropdown = from_dropdown.clone();
+            let read_receipt_row = read_receipt_row.clone();
             let in_reply_to = in_reply_to.clone();
             let references = references.clone();
             let closed = closed.clone();
@@ -991,6 +1011,8 @@ pub fn build_compose_view(
                     text_body,
                     html_body,
                     calendar_part: None,
+                    read_receipt: None,
+                    request_read_receipt: read_receipt_row.is_active(),
                     in_reply_to,
                     references,
                     message_id: None,
@@ -1263,6 +1285,7 @@ mod tests {
             bcc: String::new(),
             subject: subject.to_string(),
             rich: false,
+            read_receipt: false,
             body: body_text.to_string(),
             body_text: body_text.to_string(),
         }
@@ -1297,6 +1320,7 @@ mod tests {
             bcc: String::new(),
             subject: String::new(),
             rich: true,
+            read_receipt: false,
             body: "<p><br></p>".to_string(),
             body_text: "\n".to_string(),
         };

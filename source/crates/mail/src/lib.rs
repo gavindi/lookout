@@ -27,4 +27,4 @@ mod structure;
 pub use cache::{cache_info, clear_all_caches, Cache};
 pub use config::{AccountConfig, Credential, EndpointConfig};
 pub use error::{Error, Result};
-pub use send::{new_message_id, ComposedMessage};
+pub use send::{new_message_id, ComposedMessage, ReadReceipt};

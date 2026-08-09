@@ -1,0 +1,16 @@
+From: Alice Sender <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: Read-receipt fixture
+Date: Tue, 28 Jul 2026 10:00:00 +0000
+Message-ID: <mdn-fixture@example.com>
+Disposition-Notification-To: alice@example.com
+Content-Type: text/plain; charset=utf-8
+
+Hello Bob,
+
+This message carries a Disposition-Notification-To (RFC 8098) header, so the
+reading pane should offer a read receipt (a banner asking to send it, or an
+automatic receipt under the "Send read receipts automatically" policy) when
+this message is displayed.
+
+- Alice

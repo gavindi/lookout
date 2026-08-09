@@ -105,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
                                 text_body: "This is an automated self-test from Lookout's send_test example.".into(),
                                 html_body: None,
                                 calendar_part: None,
+                                read_receipt: None,
+                                request_read_receipt: false,
                                 in_reply_to: None,
                                 references: vec![],
                                 message_id: None,

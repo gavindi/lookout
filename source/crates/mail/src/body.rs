@@ -569,6 +569,19 @@ mod tests {
         assert!(ics.contains("METHOD:CANCEL"));
     }
 
+    /// The read-receipt fixture: `parse_body` must carry the
+    /// `Disposition-Notification-To` request through the headers (the
+    /// reading pane's banner reads it with `parse_disposition_notification_to`).
+    #[test]
+    fn mdn_request_fixture_carries_the_receipt_request_header() {
+        let body = parse_body(Uid(0), &fixture("mdn-request.eml")).expect("parses");
+        let request = lookout_core::parse_disposition_notification_to(&body.headers);
+        assert_eq!(request, vec!["alice@example.com".to_string()]);
+        assert!(!lookout_core::is_auto_submitted(&body.headers));
+        assert!(!lookout_core::is_report_message(&body.headers));
+        assert!(body.text_body.is_some());
+    }
+
     /// The partial-fetch assembly path: a fetched base64 `text/calendar` part
     /// is transfer-decoded into `calendar_ics`, and stays out of `parts`.
     #[test]

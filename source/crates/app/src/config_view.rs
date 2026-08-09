@@ -124,6 +124,10 @@ pub struct ConfigView {
     /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
     /// `active` state into the composer's default body mode.
     pub rich_text_row: adw::SwitchRow,
+    /// "Send read receipts automatically" switch (Config → Mail), exposed so
+    /// the caller can wire its `active` state into the reading pane's
+    /// read-receipt policy (read per message at display time).
+    pub read_receipts_row: adw::SwitchRow,
     /// "Event alerts" switch (Config → Calendar), exposed so the caller can
     /// wire its `active` state into the `Gio::Notification` reminder
     /// scheduling.
@@ -267,6 +271,11 @@ pub fn build() -> ConfigView {
         .active(true)
         .build();
     mail_settings_group.add(&rich_text_row);
+    let read_receipts_row = adw::SwitchRow::builder()
+        .title("Send read receipts automatically")
+        .subtitle("Reply with a read receipt when a message asks for one; when off, the reading pane asks first")
+        .build();
+    mail_settings_group.add(&read_receipts_row);
 
     // The real "Calendar" group, replacing that section's placeholder: the
     // event-alerts toggle, wired by the caller into the `Gio::Notification`
@@ -387,6 +396,7 @@ pub fn build() -> ConfigView {
         remote_images_row,
         trusted_senders_row,
         rich_text_row,
+        read_receipts_row,
         calendar_alerts_row,
         google_tasks_client_row,
         keyboard_rows: RefCell::new(keyboard_rows),

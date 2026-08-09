@@ -1,6 +1,6 @@
 # TODO
 
-Phases 1-5 are complete. One item remains across the roadmap.
+Phases 1-5 and the full roadmap are complete.
 
 ## Phase 1 — Mail MVP
 
@@ -66,7 +66,7 @@ Phases 1-5 are complete. One item remains across the roadmap.
 - [x] Print support
 - [x] List-Unsubscribe banner — `Adw.Banner` in the reading pane, RFC 8058 one-click POST with mailto fallback into the composer
 - [x] External-content trust-sender flow — per-sender (address or `@domain`) trust levels persisted in the UI-state DB, "Trust sender…" banner in the reading pane (load-once / images / all-content), Config → Mail "Trusted senders…" manager
-- [ ] RFC 8098 read-receipt (MDN) generation
+- [x] RFC 8098 read-receipt (MDN) generation — composer "Request read receipt" switch (`Disposition-Notification-To` header, preserved through draft autosave), reading-pane banner ("This message requests a read receipt" → Send read receipt) or automatic sending under Config → Mail "Send read receipts automatically" (GSettings `mail-send-read-receipts`), the receipt itself a `multipart/report; report-type=disposition-notification` (text/plain + `message/disposition-notification` fields with `Reporting-UA`/`Original-Recipient`/`Final-Recipient`/`Original-Message-ID`/`Disposition`/`Received-Date` + headers-only `message/rfc822` original), sent through the account's own SMTP path with `Auto-Submitted: auto-generated` (RFC 3834), fire-once per message per session, and never for machine-generated mail or reports
 
 ## Phase 3 — Calendar (roadmap)
 
