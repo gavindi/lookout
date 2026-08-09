@@ -291,12 +291,18 @@ pub fn build() -> ConfigView {
     google_tasks_group.add(&google_tasks_client_row);
 
     // The real "Keyboard shortcuts" group, replacing that section's
-    // placeholder: one row per built-in action, each showing its current
-    // accelerator and starting the capture flow when activated. The labels
-    // are seeded from the live shortcut table by the caller (which also
-    // owns the capture controller); the defaults shown here are only a
-    // stopgap for a not-yet-wired session.
-    let keyboard_group = adw::PreferencesGroup::builder().title("Keyboard shortcuts").build();
+    // placeholder: an expander row (collapsed by default - there are
+    // nineteen bindings) holding one row per built-in action, each showing
+    // its current accelerator and starting the capture flow when activated.
+    // The labels are seeded from the live shortcut table by the caller
+    // (which also owns the capture controller); the defaults shown here are
+    // only a stopgap for a not-yet-wired session.
+    let keyboard_expander = adw::ExpanderRow::builder()
+        .title("Keyboard shortcuts")
+        .subtitle("Global key combinations - click a binding to record a new one")
+        .build();
+    let keyboard_group = adw::PreferencesGroup::new();
+    keyboard_group.add(&keyboard_expander);
     let mut keyboard_rows = Vec::new();
     for d in crate::shortcuts::DEFAULT_SHORTCUTS {
         let label = gtk::Label::builder().css_classes(["dim-label"]).halign(gtk::Align::End).build();
@@ -304,7 +310,7 @@ pub fn build() -> ConfigView {
         let row = adw::ActionRow::builder().title(d.title).activatable(true).build();
         row.add_suffix(&label);
         row.set_activatable_widget(Some(&row));
-        keyboard_group.add(&row);
+        keyboard_expander.add_row(&row);
         keyboard_rows.push(ShortcutRow { row, label, action: d.action });
     }
     let reset_shortcuts_row = adw::ActionRow::builder()
@@ -312,7 +318,7 @@ pub fn build() -> ConfigView {
         .subtitle("Put every shortcut back to its built-in binding")
         .activatable(true)
         .build();
-    keyboard_group.add(&reset_shortcuts_row);
+    keyboard_expander.add_row(&reset_shortcuts_row);
 
     for section in PLACEHOLDER_SECTIONS {
         // "Keyboard shortcuts" lives in the "General" section's place - the

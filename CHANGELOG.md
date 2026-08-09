@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.12 (2026-08-09)
+
+### Changed
+
+- **Settings**: the Config → Keyboard shortcuts list no longer fills the page. The nineteen binding rows - plus "Restore default shortcuts" - now sit inside an expander row titled **Keyboard shortcuts**, collapsed by default with a "Global key combinations - click a binding to record a new one" subtitle, so the section reads as a single row until you expand it to see or edit a binding.
+
 ## 0.9.11 (2026-08-09)
 
 ### Added
