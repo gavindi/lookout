@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.17" date="2026-08-10">
+      <description>
+        <p>Reworked the composer's header: Cc/Bcc are now reveal buttons on the To row, "Request read receipt" is a toggle icon next to the pop-out button, Cancel is a red trash icon, and the From selector moved into the header next to Send. Fixed the popped-out compose window's controls staying invisible after popping back in, and a leftover highlighted card sometimes left over the background after cancelling a message.</p>
+      </description>
+    </release>
     <release version="0.9.16" date="2026-08-10">
       <description>
         <p>Fixed the Config (settings) icon at the bottom of the left nav rail occasionally going invisible about a second after startup, staying that way until the window was manually resized.</p>

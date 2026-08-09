@@ -35,6 +35,18 @@ pub struct Mailbox {
     pub subscribed: bool,
 }
 
+/// The conventional display spelling for a mailbox name. IMAP canonicalizes
+/// its special mailbox to "INBOX" (RFC 3501), but clients show it in title
+/// case, so `"INBOX"` renders as `"Inbox"` while every other name passes
+/// through untouched.
+pub fn display_name(name: &str) -> String {
+    if name.eq_ignore_ascii_case("INBOX") {
+        "Inbox".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 /// Guesses a [`MailboxRole`] from a folder's display name when the server
 /// doesn't advertise `SPECIAL-USE` attributes. Case-insensitive, matches the
 /// common names used by Gmail, Outlook/Exchange, Dovecot, and other major
@@ -84,6 +96,15 @@ mod tests {
         assert_eq!(guess_role_from_name("Junk E-mail"), MailboxRole::Junk);
         assert_eq!(guess_role_from_name("Deleted Items"), MailboxRole::Trash);
         assert_eq!(guess_role_from_name("Projects"), MailboxRole::Custom);
+    }
+
+    #[test]
+    fn displays_inbox_in_title_case() {
+        assert_eq!(display_name("INBOX"), "Inbox");
+        assert_eq!(display_name("inbox"), "Inbox");
+        assert_eq!(display_name("Inbox"), "Inbox");
+        assert_eq!(display_name("Archive"), "Archive");
+        assert_eq!(display_name("Projects"), "Projects");
     }
 
     #[test]

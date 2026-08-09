@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.17 (2026-08-10)
+
+### Added
+
+- **Mail**: Cc and Bcc reveal buttons on the composer's To row. Both fields start hidden behind small "Cc"/"Bcc" buttons right-aligned on the To line; clicking one reveals its row and removes the button, Gmail-style. A row that already carries content when the composer opens - Reply All's Cc list - starts shown instead, with its button skipped.
+
+### Changed
+
+- **Mail**: the composer's header row was reorganized. "Request read receipt" is now a `mark-location-symbolic` toggle icon next to the pop-out button rather than its own switch row; Cancel is a plain red trash icon with no label, on the header's right edge opposite Send on the left; the From identity dropdown moved out of its own field row into the header, right of Send; and the "New Message"/"Reply"/"Forward" title text no longer shows in the embedded header - it was redundant next to the fields right below it, and the popped-out window's own title bar already carries it. The popped-out window's title bar mirrors this layout - From and Send on the left, status, Cancel, pop-in and the read-receipt toggle on the right - and keeps that arrangement across repeated pop-out/pop-in cycles.
+
+### Fixed
+
+- **Mail**: popping a composer back into the main window left every header control but the pop-out button invisible. `AdwHeaderBar`'s `pack_start`/`pack_end` parent a widget to an internal box rather than to the header bar itself, so the pop-back-in code's type-checked removal (looking for an `AdwHeaderBar` parent) never matched, and the controls stayed stuck attached to the window that was closing around them. They're now detached with `unparent()`, which works regardless of what the actual parent widget is.
+- **Mail**: cancelling a composer, or popping it out, could leave a ghost of its card-styled fields group painted over the background behind it. The reading pane's page stack removed the composer's page before switching away from it, tearing the widget out from under the crossfade transition's outgoing-page snapshot mid-blend. Switching pages first and removing the old page after clears it.
+
 ## 0.9.16 (2026-08-10)
 
 ### Fixed

@@ -23,7 +23,7 @@ pub use email::{
 };
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
-pub use mailbox::{Mailbox, MailboxRole};
+pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use thread::{ThreadGroup, ThreadKey};
 pub use trust::{html_remote_content_scan, normalize_trust_entry, sender_matches_trust_entry, RemoteContentScan, TrustLevel};
 pub use vcard::{AddressField, Birthday, EmailField, Name, OtherProperty, Parameter, TelephoneField, VCard, VCardError};

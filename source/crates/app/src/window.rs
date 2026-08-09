@@ -8,7 +8,7 @@ use chrono::{Datelike, Timelike};
 use gtk::{gio, glib};
 use lookout_core::{
     AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody, EmailSummary,
-    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskUid, Uid, VCard, WebcalSubscription,
+    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskUid, Uid, VCard, WebcalSubscription, display_name,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
@@ -1280,7 +1280,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             TreeItem::Folder(node) | TreeItem::Favorite(node) => {
                 icon.set_visible(true);
                 icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
-                label.set_label(&node.mailbox.name);
+                label.set_label(&display_name(&node.mailbox.name));
                 label.set_css_classes(&[]);
                 set_count(node.mailbox.unread);
             }
@@ -8657,8 +8657,9 @@ fn current_view_title(state: &Rc<RefCell<UiState>>) -> (String, String) {
     // segment rather than showing nothing.
     let folder = handle
         .and_then(|h| h.folders.iter().find(|m| &m.id == mailbox_id))
-        .map(|m| m.name.clone())
-        .unwrap_or_else(|| mailbox_id.0.split_once(':').map(|(_, path)| path.to_string()).unwrap_or_else(|| mailbox_id.0.clone()));
+        .map(|m| display_name(&m.name))
+        .or_else(|| mailbox_id.0.split_once(':').map(|(_, path)| display_name(path)))
+        .unwrap_or_else(|| display_name(&mailbox_id.0));
     let account = handle
         .map(|h| if h.display_name.is_empty() { h.email.clone() } else { h.display_name.clone() })
         .unwrap_or_default();
@@ -11189,13 +11190,19 @@ fn show_composer_in_reading_pane(
     let popped_for_popout = popped.clone();
     let on_done: Rc<dyn Fn()> = Rc::new(move || {
         if !popped.get() {
-            if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
-                reading_stack_for_close.remove(&existing);
-            }
-            // Restore the pre-compose page only if the pane is still on the
-            // composer.
+            // Switch away from the composer's page before removing it, not
+            // after: the stack's crossfade transition snapshots the
+            // outgoing page to blend it out, and removing "compose" first
+            // (only then switching) tore the widget out from under that
+            // snapshot, leaving a stale ghost of its card-styled fields
+            // group painted over the background once the transition
+            // finished. Restore the pre-compose page only if the pane is
+            // still on the composer.
             if reading_stack_for_close.visible_child_name().as_deref() == Some("compose") {
                 reading_stack_for_close.set_visible_child_name(&previous_page);
+            }
+            if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
+                reading_stack_for_close.remove(&existing);
             }
         }
         let mut st = state_for_close.borrow_mut();
@@ -11237,11 +11244,14 @@ fn show_composer_in_reading_pane(
         let popped = popped_for_popout;
         move |handle| {
             popped.set(true);
-            if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
-                reading_stack_for_close.remove(&existing);
-            }
+            // Switch away from "compose" before removing it - see the
+            // matching note in `on_done` above for why the order matters
+            // (a stale crossfade snapshot ghosting over the background).
             if reading_stack_for_close.visible_child_name().as_deref() == Some("compose") {
                 reading_stack_for_close.set_visible_child_name(&previous_page);
+            }
+            if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
+                reading_stack_for_close.remove(&existing);
             }
             // A header bar of its own is what gives the window a drag
             // region - a bare `adw::Window` has none (the People pop-out
@@ -11249,17 +11259,19 @@ fn show_composer_in_reading_pane(
             let win = adw::Window::builder().default_width(860).default_height(640).build();
             let header = adw::HeaderBar::new();
             header.set_title_widget(Some(&adw::WindowTitle::new(&title, "")));
-            // Cancel and Send live in the title bar while popped out - the
-            // composer's own header row is redundant once the window has a
-            // title bar (and is hidden wholesale, see compose.rs's
-            // `root-notify` handler) - and are moved back on pop-back-in
-            // (see the close handler below). They're the same widgets, so
-            // their click handlers keep working across the move. The draft
-            // status label moves into the title bar with them; the title
-            // label stays hidden with its row.
+            // Cancel, Send, From and the read-receipt toggle live in the
+            // title bar while popped out - the composer's own header row is
+            // redundant once the window has a title bar (and is hidden
+            // wholesale, see compose.rs's `root-notify` handler) - and are
+            // moved back on pop-back-in (see the close handler below).
+            // They're the same widgets, so their handlers keep working
+            // across the move. The draft status label moves into the title
+            // bar with them; the title label stays hidden with its row.
             handle.top_row.remove(&handle.cancel_button);
             handle.top_row.remove(&handle.send_button);
             handle.top_row.remove(&handle.status_label);
+            handle.top_row.remove(&handle.from_dropdown);
+            handle.top_row.remove(&handle.read_receipt_toggle);
             // A button to pop the composer back into the reading pane
             // without closing the session: it closes the window, and the
             // close handler below performs the pop-back-in (the same path
@@ -11272,12 +11284,17 @@ fn show_composer_in_reading_pane(
                 back_button.connect_clicked(move |_| win.close());
             }
             // Header bar packing order: start-side children are prepended
-            // and end-side children appended, so packing cancel before back
-            // yields [back, cancel, title, status, send].
-            header.pack_start(&handle.cancel_button);
-            header.pack_start(&back_button);
+            // (each new call lands leftmost), end-side children are appended
+            // outward (each new call lands further right), so this yields,
+            // left to right: [from, send | title | status, cancel, back,
+            // read receipt] - the read-receipt toggle is now the outermost
+            // widget on the right.
+            header.pack_start(&handle.send_button);
+            header.pack_start(&handle.from_dropdown);
             header.pack_end(&handle.status_label);
-            header.pack_end(&handle.send_button);
+            header.pack_end(&handle.cancel_button);
+            header.pack_end(&back_button);
+            header.pack_end(&handle.read_receipt_toggle);
             let content_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
             content_box.append(&header);
             content_box.append(&handle.widget);
@@ -11298,21 +11315,26 @@ fn show_composer_in_reading_pane(
                         if let Some(parent) = handle.widget.parent().and_then(|parent| parent.downcast::<gtk::Box>().ok()) {
                             parent.remove(&handle.widget);
                         }
-                        // Send Cancel and Send home to the composer's header
-                        // row, out of the title bar they're about to leave.
-                        if let Some(parent) = handle.cancel_button.parent().and_then(|parent| parent.downcast::<adw::HeaderBar>().ok()) {
-                            parent.remove(&handle.cancel_button);
-                        }
-                        if let Some(parent) = handle.send_button.parent().and_then(|parent| parent.downcast::<adw::HeaderBar>().ok()) {
-                            parent.remove(&handle.send_button);
-                        }
-                        if let Some(parent) = handle.status_label.parent().and_then(|parent| parent.downcast::<adw::HeaderBar>().ok()) {
-                            parent.remove(&handle.status_label);
-                        }
-                        handle.top_row.prepend(&handle.cancel_button);
-                        handle.top_row.append(&handle.send_button);
+                        // Send Cancel, Send, From and the read-receipt
+                        // toggle home to the composer's header row, out of
+                        // the title bar they're about to leave. `pack_start`/
+                        // `pack_end` parent a widget to an internal box
+                        // inside `AdwHeaderBar`, not the header bar itself,
+                        // so a type-checked removal off the header bar never
+                        // matches - `unparent()` detaches a widget from
+                        // whatever its actual current parent is.
+                        handle.cancel_button.unparent();
+                        handle.send_button.unparent();
+                        handle.status_label.unparent();
+                        handle.from_dropdown.unparent();
+                        handle.read_receipt_toggle.unparent();
+                        handle.top_row.prepend(&handle.from_dropdown);
+                        handle.top_row.prepend(&handle.send_button);
+                        handle.top_row.append(&handle.cancel_button);
                         handle.top_row.append(&handle.status_label);
                         handle.top_row.reorder_child_after(&handle.status_label, Some(&handle.title_label));
+                        handle.top_row.append(&handle.read_receipt_toggle);
+                        handle.top_row.reorder_child_after(&handle.read_receipt_toggle, Some(&handle.status_label));
                         if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
                             reading_stack_for_close.remove(&existing);
                         }

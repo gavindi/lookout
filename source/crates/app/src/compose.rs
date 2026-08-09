@@ -35,16 +35,19 @@ const DRAFT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
 ///   pops the composer back in only while it's still alive, and just closes
 ///   the window once Send or Cancel has already finished the session.
 ///
-/// The window layer also relocates the header row's Cancel and Send buttons
-/// into the pop-out window's title bar (`top_row` is where they normally
-/// live, so they can be returned on pop-back-in); the buttons keep their
-/// click handlers across the move, since they're the same widgets.
+/// The window layer also relocates the header row's Cancel, Send, From and
+/// read-receipt-toggle widgets into the pop-out window's title bar (`top_row`
+/// is where they normally live, so they can be returned on pop-back-in); the
+/// widgets keep their click/state handlers across the move, since they're
+/// the same widgets.
 pub struct PopOutHandle {
     pub widget: gtk::Box,
     pub cancel_button: gtk::Button,
     pub send_button: gtk::Button,
-    /// The composer's own header row, which Cancel and Send are removed from
-    /// while popped out and restored to on pop-back-in.
+    pub from_dropdown: gtk::DropDown,
+    pub read_receipt_toggle: gtk::ToggleButton,
+    /// The composer's own header row, which the widgets above are removed
+    /// from while popped out and restored to on pop-back-in.
     pub top_row: gtk::Box,
     /// The header row's title and draft-status labels. While popped out the
     /// whole row is hidden (the window's title bar duplicates the title), so
@@ -397,7 +400,7 @@ struct AutosaveCtx {
     cc_row: RecipientEntry,
     bcc_row: RecipientEntry,
     subject_row: adw::EntryRow,
-    read_receipt_row: adw::SwitchRow,
+    read_receipt_toggle: gtk::ToggleButton,
     rich_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
     rich_web_view: Rc<webkit::WebView>,
@@ -449,7 +452,7 @@ impl AutosaveCtx {
             bcc: self.bcc_row.text_value(),
             subject: self.subject_row.text().to_string(),
             rich,
-            read_receipt: self.read_receipt_row.is_active(),
+            read_receipt: self.read_receipt_toggle.is_active(),
             body,
             body_text,
         })
@@ -692,6 +695,7 @@ pub fn build_compose_view(
         to_row.set_from_text(to);
     }
     let cc_row = RecipientEntry::new("Cc");
+    let cc_prefilled = prefill.cc.as_ref().is_some_and(|cc| !cc.trim().is_empty());
     if let Some(cc) = &prefill.cc {
         cc_row.set_from_text(cc);
     }
@@ -701,21 +705,48 @@ pub fn build_compose_view(
     for row in [&to_row, &cc_row, &bcc_row] {
         row.set_suggestion_source(suggestions.clone());
     }
+
+    // --- Cc/Bcc reveal buttons: right-aligned on the To row, each hiding
+    // itself and showing its row once clicked (Gmail's classic Cc/Bcc
+    // links). A row that already has prefilled content (e.g. Reply All's Cc
+    // list) starts shown, with its button skipped so there's nothing to
+    // click for a field the user can already see.
+    let cc_button = gtk::Button::builder().label("Cc").css_classes(["flat", "caption"]).tooltip_text("Show Cc").build();
+    let bcc_button = gtk::Button::builder().label("Bcc").css_classes(["flat", "caption"]).tooltip_text("Show Bcc").build();
+    to_row.add_header_suffix(&cc_button);
+    to_row.add_header_suffix(&bcc_button);
+    cc_row.widget().set_visible(cc_prefilled);
+    cc_button.set_visible(!cc_prefilled);
+    bcc_row.widget().set_visible(false);
+    {
+        let cc_row = cc_row.clone();
+        let cc_button_self = cc_button.clone();
+        cc_button.connect_clicked(move |_| {
+            cc_row.widget().set_visible(true);
+            cc_button_self.set_visible(false);
+        });
+    }
+    {
+        let bcc_row = bcc_row.clone();
+        let bcc_button_self = bcc_button.clone();
+        bcc_button.connect_clicked(move |_| {
+            bcc_row.widget().set_visible(true);
+            bcc_button_self.set_visible(false);
+        });
+    }
     let subject_row = adw::EntryRow::builder().title("Subject").build();
     if let Some(subject) = &prefill.subject {
         subject_row.set_text(subject);
     }
 
     // --- From selector: a dropdown of the account's identities (its own
-    // address first). The returned refresh hook re-reads `identities_source`
-    // when the Config → Mail accounts manage dialog changes them, so an edit
-    // while a composer is open lands in its From list immediately. Same
-    // ActionRow + `gtk::DropDown` pattern as the event editor's calendar
-    // picker.
+    // address first), living in the header row next to Send rather than as
+    // its own field row. The returned refresh hook re-reads
+    // `identities_source` when the Config → Mail accounts manage dialog
+    // changes them, so an edit while a composer is open lands in its From
+    // list immediately.
     let identities = Rc::new(RefCell::new(identities_source()));
-    let from_row = adw::ActionRow::builder().title("From").build();
     let from_dropdown = gtk::DropDown::builder().selected(0).build();
-    from_row.add_suffix(&from_dropdown);
     let refresh_from_dropdown: Rc<dyn Fn()> = {
         let identities = identities.clone();
         let from_dropdown = from_dropdown.clone();
@@ -738,17 +769,17 @@ pub fn build_compose_view(
     fields_group.add(cc_row.widget());
     fields_group.add(bcc_row.widget());
     fields_group.add(&subject_row);
-    fields_group.add(&from_row);
 
     // --- Read-receipt request: RFC 8098's `Disposition-Notification-To`
     // header, asking recipients to notify us when they read the message.
     // The header is only added at build time (see `build_raw_message`), so
-    // the switch's state flows through the draft snapshot and the send.
-    let read_receipt_row = adw::SwitchRow::builder()
-        .title("Request read receipt")
-        .subtitle("Ask recipients to notify you when they read this message")
+    // the toggle's state flows through the draft snapshot and the send. It
+    // lives in the header next to the pop-out button rather than as its own
+    // field row (built and placed into `top_row` further down).
+    let read_receipt_toggle = gtk::ToggleButton::builder()
+        .icon_name("mark-location-symbolic")
+        .tooltip_text("Request read receipt")
         .build();
-    fields_group.add(&read_receipt_row);
 
     let body_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
@@ -815,7 +846,7 @@ pub fn build_compose_view(
         cc_row: cc_row.clone(),
         bcc_row: bcc_row.clone(),
         subject_row: subject_row.clone(),
-        read_receipt_row: read_receipt_row.clone(),
+        read_receipt_toggle: read_receipt_toggle.clone(),
         rich_toggle: rich_toggle.clone(),
         body_view: body_view.clone(),
         rich_web_view: rich_web_view.clone(),
@@ -866,9 +897,18 @@ pub fn build_compose_view(
         });
     }
 
-    let cancel_button = gtk::Button::builder().label("Cancel").build();
+    let cancel_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["user-trash-symbolic", "edit-delete-symbolic"]));
+    cancel_button.add_css_class("destructive-action");
+    cancel_button.set_tooltip_text(Some("Cancel"));
     let send_button = gtk::Button::builder().label("Send").css_classes(["suggested-action"]).build();
-    let title_label = gtk::Label::builder().label(title).hexpand(true).build();
+    // Not shown while embedded - it's redundant next to the compose fields
+    // right below it - but kept in `top_row` (invisible) as the anchor
+    // `reorder_child_after` puts the status label back next to on
+    // pop-back-in; the pop-out window shows the title in its own title bar
+    // instead (see `PopOutHandle`'s docs).
+    let title_label = gtk::Label::builder().label(title).visible(false).build();
+    let header_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    header_spacer.set_hexpand(true);
 
     // The header's pop-out button: moves this (still fully alive) composer
     // into its own window. Only built when the caller arms it; hidden while
@@ -887,13 +927,16 @@ pub fn build_compose_view(
         .margin_start(6)
         .margin_end(6)
         .build();
-    top_row.append(&cancel_button);
+    top_row.append(&send_button);
+    top_row.append(&from_dropdown);
+    top_row.append(&header_spacer);
     top_row.append(&title_label);
     top_row.append(&status_label);
+    top_row.append(&read_receipt_toggle);
     if on_pop_out.is_some() {
         top_row.append(&pop_out_button);
     }
-    top_row.append(&send_button);
+    top_row.append(&cancel_button);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -933,6 +976,8 @@ pub fn build_compose_view(
         let autosave = autosave.clone();
         let draft_message_id = draft_message_id.clone();
         let closed = closed.clone();
+        let from_dropdown = from_dropdown.clone();
+        let read_receipt_toggle = read_receipt_toggle.clone();
         send_button.connect_clicked(move |_| {
             // Commit anything typed but not yet turned into a chip, so the
             // field ends up showing exactly what is about to be sent.
@@ -960,7 +1005,7 @@ pub fn build_compose_view(
             let cmd_tx = cmd_tx.clone();
             let identities = identities.clone();
             let from_dropdown = from_dropdown.clone();
-            let read_receipt_row = read_receipt_row.clone();
+            let read_receipt_toggle = read_receipt_toggle.clone();
             let in_reply_to = in_reply_to.clone();
             let references = references.clone();
             let closed = closed.clone();
@@ -1012,7 +1057,7 @@ pub fn build_compose_view(
                     html_body,
                     calendar_part: None,
                     read_receipt: None,
-                    request_read_receipt: read_receipt_row.is_active(),
+                    request_read_receipt: read_receipt_toggle.is_active(),
                     in_reply_to,
                     references,
                     message_id: None,
@@ -1041,6 +1086,8 @@ pub fn build_compose_view(
         let status_label = status_label.clone();
         let cancel_button = cancel_button.clone();
         let send_button = send_button.clone();
+        let from_dropdown = from_dropdown.clone();
+        let read_receipt_toggle = read_receipt_toggle.clone();
         pop_out_button.connect_clicked(move |_| {
             if popped_out.get() {
                 return;
@@ -1051,6 +1098,8 @@ pub fn build_compose_view(
                 widget: content.clone(),
                 cancel_button: cancel_button.clone(),
                 send_button: send_button.clone(),
+                from_dropdown: from_dropdown.clone(),
+                read_receipt_toggle: read_receipt_toggle.clone(),
                 top_row: top_row.clone(),
                 title_label: title_label.clone(),
                 status_label: status_label.clone(),
@@ -1076,7 +1125,6 @@ pub fn build_compose_view(
         let moving = moving.clone();
         let popped_out = popped_out.clone();
         let pop_out_button = pop_out_button.clone();
-        let title_label = title_label.clone();
         let top_row = top_row.clone();
         content.connect_root_notify(move |widget| {
             if widget.root().is_none() {
@@ -1092,7 +1140,6 @@ pub fn build_compose_view(
                 // whole composer on pop-back-in.
                 let shown = !popped_out.get();
                 pop_out_button.set_visible(shown);
-                title_label.set_visible(shown);
                 top_row.set_visible(shown);
             }
         });

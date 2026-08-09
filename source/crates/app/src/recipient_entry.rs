@@ -98,6 +98,9 @@ pub type SuggestionSource = Rc<dyn Fn(&str) -> Vec<EmailAddress>>;
 #[derive(Clone)]
 pub struct RecipientEntry {
     root: gtk::Box,
+    /// The title row: the field's caption label plus, on the To row, the
+    /// Cc/Bcc reveal buttons appended via `add_header_suffix`.
+    header: gtk::Box,
     /// Wraps chips onto further lines as they accumulate, with the text entry
     /// as the final child so typing always continues after the last chip.
     flow: gtk::FlowBox,
@@ -114,7 +117,9 @@ pub struct RecipientEntry {
 
 impl RecipientEntry {
     pub fn new(title: &str) -> Self {
-        let title_label = gtk::Label::builder().label(title).xalign(0.0).css_classes(["caption", "dim-label"]).build();
+        let title_label = gtk::Label::builder().label(title).xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+        let header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+        header.append(&title_label);
 
         let flow = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -133,7 +138,7 @@ impl RecipientEntry {
             .spacing(2)
             .css_classes(["recipient-field"])
             .build();
-        root.append(&title_label);
+        root.append(&header);
         root.append(&flow);
 
         let suggestion_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
@@ -157,6 +162,7 @@ impl RecipientEntry {
 
         let this = RecipientEntry {
             root,
+            header,
             flow,
             entry,
             tokens: Rc::new(RefCell::new(Vec::new())),
@@ -172,6 +178,13 @@ impl RecipientEntry {
     /// The widget to pack into the composer.
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Appends a widget to the field's title row, right-aligned by the title
+    /// label's `hexpand`. The composer uses this to put the Cc/Bcc reveal
+    /// buttons on the To row.
+    pub fn add_header_suffix(&self, widget: &impl IsA<gtk::Widget>) {
+        self.header.append(widget);
     }
 
     /// Replaces the field's contents from a comma-separated string - how
