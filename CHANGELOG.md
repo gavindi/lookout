@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.11 (2026-08-09)
+
+### Added
+
+- **UI**: global keyboard shortcuts, matched by *physical keycode*. A window-level `GtkEventControllerKey` looks up every key press in a table resolved from logical accelerator strings against the running keymap at startup (`gdk::Display::map_keyval`, with `translate_key` doing the inverse for capture), so chords fire from anywhere in the window - message list, reading pane, composer, search entry - and keep working when the active keyboard layout changes: on Dvorak, Ctrl+R is still the physical R key. The shipped bindings mirror Outlook/Gmail conventions - New Message Ctrl+N, Reply Ctrl+R, Reply All Ctrl+Shift+R, Forward Ctrl+Shift+F, Delete, Archive Ctrl+E, Report junk Ctrl+Shift+E, Snooze Ctrl+Shift+S, Flag Ctrl+Shift+G, Mark read/unread Ctrl+Q, Print Ctrl+P, Find Ctrl+F (replacing the old dedicated `ShortcutController` block), Close reading pane Esc, and Ctrl+1-6 to switch modules - and dispatch reuses the toolbar/rail buttons themselves (`emit_clicked`/`set_active`), so each verb keeps exactly one implementation including its selection-gating (a shortcut with nothing selected is a silent no-op, same as the button). Config → General is now a live **Keyboard shortcuts** group: each action's row shows its current binding, clicking it records a replacement (plain Escape cancels, modifier-free typing keys and dead keys are refused, chords already held by another action refuse with a toast and the recording continues), and "Restore default shortcuts" puts everything back. Bindings persist through the new `shortcuts` GSettings key as `action=accelerator` entries, so a rebind survives restarts and round-trips through the store unchanged.
+
+### Testing
+
+- `lookout-app`: new `shortcuts` tests - the accelerator parser (plain keys, modifier combos with `<Primary>`/`<Control>`/`<Ctrl>`/`<Alt>`/`<Super>` normalization, uppercase-letter-means-Shift, malformed strings rejected), canonical-format round-trips and shift-letter lowercasing, the defaults table's action/chord uniqueness and parseability, override merging from the GSettings `shortcuts` key (garbage entries ignored), and the modifier-free allowlist; plus the `settings` store's `shortcuts` key default. The keymap-dependent halves (keyval↔keycode resolution, capture validation) are display-bound and covered by manual smoke; the whole suite stays green under `cargo clippy -D warnings`.
+
 ## 0.9.10 (2026-08-09)
 
 ### Added

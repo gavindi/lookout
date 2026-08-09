@@ -25,6 +25,7 @@ mod recurrence;
 mod reminders;
 mod resources;
 mod settings;
+mod shortcuts;
 mod tags;
 mod task_editor;
 mod tasks_view;

@@ -2,8 +2,9 @@
 //! is connected to, a live Appearance section (the smooth-transitions
 //! preference, the window-background image picker and its dimming slider), live Mail and Calendar
 //! preference groups (the remote-images/rich-text toggles and the event-alerts
-//! toggle), disabled placeholder
-//! sections mirroring the rest of the Phase 5 settings taxonomy (General/Layout/Mail/Privacy/Apps) and a live
+//! toggle), a live Keyboard-shortcuts section (per-action
+//! capture rows over the `shortcuts` GSettings key), disabled placeholder
+//! sections mirroring the rest of the Phase 5 settings taxonomy (Layout/Mail/Privacy/Apps) and a live
 //! Advanced section with a cache-clear action. Data-in/widget-out like
 //! `calendar_view.rs` and `folder_tree.rs`: the caller (window.rs) owns the
 //! session state and feeds plain display structs into `refresh`.
@@ -54,6 +55,18 @@ pub struct WebcalSubscriptionInfo {
 pub struct CacheFile {
     pub name: String,
     pub size: String,
+}
+
+/// One editable keyboard-shortcut row: the action it edits and the label
+/// showing its current accelerator. The caller refreshes the label from the
+/// live shortcut table and wires the row's activation to the capture flow.
+pub struct ShortcutRow {
+    pub row: adw::ActionRow,
+    /// Shows the canonical accelerator string (`<Primary>n`); "Press keys…"
+    /// while a replacement is being recorded.
+    pub label: gtk::Label,
+    /// The action id this row edits (see `shortcuts`).
+    pub action: &'static str,
 }
 
 /// The config screen's widget tree. `root` goes into the main `root_stack`;
@@ -119,6 +132,13 @@ pub struct ConfigView {
     /// can wire its `activated` signal to the client-id dialog (and update
     /// the subtitle after a save).
     pub google_tasks_client_row: adw::ActionRow,
+    /// The per-action keyboard-shortcut rows (Config → Keyboard shortcuts),
+    /// exposed so the caller can seed their labels from the live shortcut
+    /// table and wire each row's activation to the chord-capture flow.
+    pub keyboard_rows: RefCell<Vec<ShortcutRow>>,
+    /// "Restore default shortcuts" row at the bottom of the keyboard group,
+    /// exposed so the caller can wire it to `ShortcutState::reset_all`.
+    pub reset_shortcuts_row: adw::ActionRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     webcal_group: adw::PreferencesGroup,
@@ -139,9 +159,9 @@ pub struct ConfigView {
 /// placeholder group until that work lands - same honest-disabled convention
 /// as the menu bar's Home/View ribbon tabs. "Appearance" is deliberately
 /// absent: it's a real, enabled group with the smooth-transitions preference
-/// (see `build`), as is "Advanced" below and the "Mail" and "Calendar" groups
-/// (the remote-images/rich-text toggles and the event-alerts toggle) the
-/// loop's `Mail` and `Calendar` entries hand off to.
+/// (see `build`), as is "Advanced" below and the "Mail", "Calendar" and
+/// "Keyboard shortcuts" groups the loop's `Mail`, `Calendar` and `General`
+/// entries hand off to.
 const PLACEHOLDER_SECTIONS: [&str; 6] = ["General", "Layout", "Mail", "Calendar", "Privacy", "Apps"];
 pub fn build() -> ConfigView {
     let page = adw::PreferencesPage::new();
@@ -270,7 +290,37 @@ pub fn build() -> ConfigView {
         .build();
     google_tasks_group.add(&google_tasks_client_row);
 
+    // The real "Keyboard shortcuts" group, replacing that section's
+    // placeholder: one row per built-in action, each showing its current
+    // accelerator and starting the capture flow when activated. The labels
+    // are seeded from the live shortcut table by the caller (which also
+    // owns the capture controller); the defaults shown here are only a
+    // stopgap for a not-yet-wired session.
+    let keyboard_group = adw::PreferencesGroup::builder().title("Keyboard shortcuts").build();
+    let mut keyboard_rows = Vec::new();
+    for d in crate::shortcuts::DEFAULT_SHORTCUTS {
+        let label = gtk::Label::builder().css_classes(["dim-label"]).halign(gtk::Align::End).build();
+        label.set_label(&crate::shortcuts::format_accel(d.modifiers, d.keyval));
+        let row = adw::ActionRow::builder().title(d.title).activatable(true).build();
+        row.add_suffix(&label);
+        row.set_activatable_widget(Some(&row));
+        keyboard_group.add(&row);
+        keyboard_rows.push(ShortcutRow { row, label, action: d.action });
+    }
+    let reset_shortcuts_row = adw::ActionRow::builder()
+        .title("Restore default shortcuts")
+        .subtitle("Put every shortcut back to its built-in binding")
+        .activatable(true)
+        .build();
+    keyboard_group.add(&reset_shortcuts_row);
+
     for section in PLACEHOLDER_SECTIONS {
+        // "Keyboard shortcuts" lives in the "General" section's place - the
+        // first group, matching the taxonomy order.
+        if section == "General" {
+            page.add(&keyboard_group);
+            continue;
+        }
         // "Mail" is a live group (see `mail_settings_group` above), not a
         // placeholder - add it in this section's place so the taxonomy order
         // is preserved.
@@ -333,6 +383,8 @@ pub fn build() -> ConfigView {
         rich_text_row,
         calendar_alerts_row,
         google_tasks_client_row,
+        keyboard_rows: RefCell::new(keyboard_rows),
+        reset_shortcuts_row,
         mail_group,
         calendar_group,
         webcal_group,

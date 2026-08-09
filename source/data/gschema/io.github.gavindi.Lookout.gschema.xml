@@ -108,6 +108,13 @@
       <description>Show a notification when an event reminder comes due.</description>
     </key>
 
+    <!-- Keyboard shortcuts -->
+    <key name="shortcuts" type="as">
+      <default>[]</default>
+      <summary>Global keyboard shortcuts</summary>
+      <description>One 'action=accelerator' entry per action overriding the built-in default, e.g. 'compose=&lt;Primary&gt;n'. An empty array means all built-in defaults.</description>
+    </key>
+
     <!-- Session memory -->
     <key name="last-view-unified" type="b">
       <default>false</default>

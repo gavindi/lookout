@@ -21,6 +21,12 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.11" date="2026-08-09">
+      <description>
+        <p>Global keyboard shortcuts, matched by physical key so they work no matter what keyboard layout you use: New message (Ctrl+N), Reply (Ctrl+R), Reply all, Forward, Delete, Archive, Report junk, Snooze, Flag, Mark read/unread, Print, Find (Ctrl+F), closing the reading pane (Esc), and Ctrl+1-6 to jump between Mail, Calendar, People, Tasks, Lookout and Settings.</p>
+        <p>Config → General now lists every shortcut, and clicking one records a new key combination: plain Escape cancels, modifier-free typing keys and dead keys are refused, and a chord already used by another action is rejected with a toast. "Restore default shortcuts" puts everything back, and your bindings are remembered between sessions.</p>
+      </description>
+    </release>
     <release version="0.9.10" date="2026-08-09">
       <description>
         <p>Lookout's look is now fully themeable. Every colour the app drew is a named token that follows the system light/dark scheme where that makes sense (unread accents, muted text, chips), while the deliberately fixed surfaces (the translucent panes over the background artwork, the toolbar bands, the amber flag) stay put. Config → Appearance gains a Theme dropdown - System, Flat Dark (the classic look), or Flat Light - plus a Custom accent color switch and picker that recolour buttons and selections app-wide, both persisting between sessions and applying live.</p>

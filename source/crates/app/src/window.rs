@@ -3926,24 +3926,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // --- Ctrl+F focuses the header's permanent search entry, from anywhere
-    // in the window. A `ShortcutController` on the window itself (rather than
-    // an accelerator string, which this codebase doesn't use) so the keypress
-    // is caught even while a list row or the reading pane has focus.
-    // Selecting the entry's existing text means typing replaces the old
-    // query. ---
-    {
-        let search_entry = search_entry.clone();
-        let controller = gtk::ShortcutController::new();
-        let trigger = gtk::KeyvalTrigger::new(gtk::gdk::Key::f, gtk::gdk::ModifierType::CONTROL_MASK);
-        let action = gtk::CallbackAction::new(move |_widget, _args| {
-            search_entry.select_region(0, -1);
-            search_entry.grab_focus();
-            glib::Propagation::Proceed
-        });
-        controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
-        window.add_controller(controller);
-    }
+    // --- Ctrl+F is a global keyboard shortcut now: see the shortcuts block
+    // after the nav-rail buttons below (it dispatches through the same
+    // `EventControllerKey` as every other chord). ---
 
     let state = state.clone();
     // The UI-state database also holds local-only tasks - best-effort, like
@@ -4489,6 +4474,237 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     nav_rail_spacer.set_vexpand(true);
     nav_rail_content.append(&nav_rail_spacer);
     nav_rail_content.append(&config_view_button);
+
+    // --- Global keyboard shortcuts. One window-level `EventControllerKey`
+    // matches every key press against `shortcuts.rs`'s physical-keycode
+    // table - the logical GSettings accelerators are resolved against the
+    // keymap at startup, so a chord fires from anywhere in the window
+    // (message list, reading pane, composer, search entry) and is
+    // independent of the active keyboard layout. Actions dispatch through
+    // the toolbar/rail buttons themselves (`emit_clicked` / `set_active`),
+    // so each verb keeps exactly one implementation - its button handler,
+    // including the sensitivity gating that makes a shortcut with no
+    // selection a silent no-op (same convention as clicking the button).
+    // The Config screen's Keyboard group captures replacements through the
+    // same controller: while `capturing` is set the dispatcher is bypassed
+    // and presses feed `set_chord` instead. ---
+    let shortcut_settings = state.borrow().settings.clone();
+    let shortcuts = Rc::new(RefCell::new(crate::shortcuts::ShortcutState::load(&shortcut_settings)));
+    let display = gtk::gdk::Display::default();
+    if let Some(display) = &display {
+        shortcuts.borrow_mut().rebuild(display);
+    }
+    let mut dispatch: HashMap<&'static str, Rc<dyn Fn()>> = HashMap::new();
+    for (action, button) in [
+        (crate::shortcuts::ACTION_COMPOSE, &compose_button),
+        (crate::shortcuts::ACTION_REPLY, &reply_button),
+        (crate::shortcuts::ACTION_REPLY_ALL, &reply_all_button),
+        (crate::shortcuts::ACTION_FORWARD, &forward_button),
+        (crate::shortcuts::ACTION_DELETE, &delete_button),
+        (crate::shortcuts::ACTION_ARCHIVE, &archive_button),
+        (crate::shortcuts::ACTION_REPORT_JUNK, &report_button),
+        (crate::shortcuts::ACTION_SNOOZE, &snooze_button),
+        (crate::shortcuts::ACTION_FLAG, &flag_button),
+        (crate::shortcuts::ACTION_MARK_READ, &mark_read_button),
+    ] {
+        let button = button.clone();
+        dispatch.insert(action, Rc::new(move || button.emit_clicked()));
+    }
+    // Print: the reading-pane print path (the calendar toolbar's Print
+    // button prints the month instead), gated the same way the More menu's
+    // Print item is: only while a message is actually rendered.
+    dispatch.insert(
+        crate::shortcuts::ACTION_PRINT,
+        Rc::new({
+            let window = window.clone();
+            let reading_stack = reading_stack.clone();
+            move || {
+                if reading_stack.visible_child_name().as_deref() == Some("message") {
+                    let parent: &gtk::Window = window.upcast_ref();
+                    print_visible_message(&reading_stack, parent);
+                }
+            }
+        }),
+    );
+    // Find: Ctrl+F now lives in the same table as everything else (it
+    // replaced the old `ShortcutController` block above). Selecting the
+    // entry's existing text means typing replaces the old query.
+    dispatch.insert(
+        crate::shortcuts::ACTION_SEARCH,
+        Rc::new({
+            let search_entry = search_entry.clone();
+            move || {
+                search_entry.select_region(0, -1);
+                search_entry.grab_focus();
+            }
+        }),
+    );
+    // Close reading pane: back to the blank pane, mirroring the state reset
+    // the message-selection handler performs for "nothing selected". A
+    // composer in the pane is left alone - drafts are never yanked away.
+    dispatch.insert(
+        crate::shortcuts::ACTION_CLOSE_PANE,
+        Rc::new({
+            let state = state.clone();
+            let reading_stack = reading_stack.clone();
+            move || {
+                if reading_stack.visible_child_name().as_deref() == Some("compose") {
+                    return;
+                }
+                let mut st = state.borrow_mut();
+                st.pending_body_request = None;
+                st.pending_html_reveal = false;
+                st.reveal_generation += 1;
+                st.pending_header = None;
+                st.pending_attachment = None;
+                st.pending_raw_message = None;
+                st.unsubscribe_info = None;
+                st.unsubscribe_dismissed = None;
+                st.imip = None;
+                st.imip_dismissed = None;
+                st.rendered_trust_sender = None;
+                st.load_once_images = false;
+                st.trust_banner_dismissed = None;
+                st.rendered_message = None;
+                drop(st);
+                drop_pending_cid(&state);
+                reading_stack.set_visible_child_name("empty");
+            }
+        }),
+    );
+    // Module switching via the rail toggles: `set_active` fires the same
+    // `toggled` handler a click would, and is a no-op when already there.
+    for (action, button) in [
+        (crate::shortcuts::ACTION_MAIL, &mail_view_button),
+        (crate::shortcuts::ACTION_CALENDAR, &calendar_view_button),
+        (crate::shortcuts::ACTION_CONTACTS, &contacts_view_button),
+        (crate::shortcuts::ACTION_TASKS, &tasks_view_button),
+        (crate::shortcuts::ACTION_LOOKOUT, &lookout_view_button),
+        (crate::shortcuts::ACTION_CONFIG, &config_view_button),
+    ] {
+        let button = button.clone();
+        dispatch.insert(action, Rc::new(move || button.set_active(true)));
+    }
+
+    // The Config keyboard rows refresh through this closure: it repaints
+    // every row's accelerator label from the live table.
+    let refresh_shortcut_rows: Rc<dyn Fn()> = Rc::new({
+        let shortcuts = shortcuts.clone();
+        let config_view = config_view.clone();
+        move || {
+            let table = shortcuts.borrow();
+            for row in config_view.keyboard_rows.borrow().iter() {
+                row.label.set_label(&table.accel_for(row.action));
+            }
+        }
+    });
+
+    // The action currently being recorded by the Config rows, or None.
+    let capture_action: Rc<RefCell<Option<&'static str>>> = Rc::new(RefCell::new(None));
+
+    // Row wiring: activating a row starts (or re-targets) the recording;
+    // activating the row that is recording again cancels it.
+    {
+        let rows: Vec<_> = config_view
+            .keyboard_rows
+            .borrow()
+            .iter()
+            .map(|row| (row.row.clone(), row.label.clone(), row.action))
+            .collect();
+        for (row, label, action) in rows {
+            let shortcuts = shortcuts.clone();
+            let capture_action = capture_action.clone();
+            let refresh_shortcut_rows = refresh_shortcut_rows.clone();
+            row.connect_activated(move |_| {
+                let capturing = shortcuts.borrow().capturing;
+                if capturing && *capture_action.borrow() == Some(action) {
+                    shortcuts.borrow_mut().capturing = false;
+                    *capture_action.borrow_mut() = None;
+                    refresh_shortcut_rows();
+                    return;
+                }
+                *capture_action.borrow_mut() = Some(action);
+                shortcuts.borrow_mut().capturing = true;
+                label.set_label("Press keys…");
+            });
+        }
+    }
+
+    // "Restore default shortcuts": back to the shipped bindings.
+    {
+        let shortcuts = shortcuts.clone();
+        let shortcut_settings = shortcut_settings.clone();
+        let display = display.clone();
+        let refresh_shortcut_rows = refresh_shortcut_rows.clone();
+        config_view.reset_shortcuts_row.connect_activated(move |_| {
+            let Some(display) = &display else { return };
+            shortcuts.borrow_mut().reset_all(&shortcut_settings, display);
+            refresh_shortcut_rows();
+        });
+    }
+
+    // The single controller: dispatch matching chords, or feed the capture
+    // flow while a Config row is recording. Stop on anything handled, so a
+    // matched chord never also reaches the focused widget (an entry
+    // retyping "n" because Ctrl+N got through would be wrong).
+    {
+        let shortcuts = shortcuts.clone();
+        let shortcut_settings = shortcut_settings.clone();
+        let capture_action = capture_action.clone();
+        let refresh_shortcut_rows = refresh_shortcut_rows.clone();
+        let state = state.clone();
+        let dispatch = Rc::new(dispatch);
+        let controller = gtk::EventControllerKey::new();
+        controller.connect_key_pressed(move |_controller, _keyval, keycode, state_modifiers| {
+            if shortcuts.borrow().capturing {
+                if let Some(display) = &display {
+                    if let Some((modifiers, keyval)) = crate::shortcuts::chord_from_key(display, keycode, state_modifiers) {
+                        // Escape (no modifiers) cancels the recording.
+                        if keyval == gtk::gdk::Key::Escape && (modifiers & crate::shortcuts::MODIFIER_MASK).is_empty() {
+                            shortcuts.borrow_mut().capturing = false;
+                            *capture_action.borrow_mut() = None;
+                            refresh_shortcut_rows();
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
+                let Some(action) = *capture_action.borrow() else {
+                    return glib::Propagation::Stop;
+                };
+                let Some(display) = &display else {
+                    return glib::Propagation::Stop;
+                };
+                match shortcuts.borrow_mut().set_chord(&shortcut_settings, display, action, keycode, state_modifiers) {
+                    Ok(_) => {
+                        shortcuts.borrow_mut().capturing = false;
+                        *capture_action.borrow_mut() = None;
+                        refresh_shortcut_rows();
+                    }
+                    Err(err) => {
+                        // Stay in recording mode; the toast says what to fix.
+                        let st = state.borrow();
+                        if let Some(overlay) = &st.toast_overlay {
+                            overlay.add_toast(adw::Toast::new(&err.message()));
+                        }
+                    }
+                }
+                return glib::Propagation::Stop;
+            }
+            let Some(action) = shortcuts.borrow().action_for(keycode, state_modifiers) else {
+                return glib::Propagation::Proceed;
+            };
+            if let Some(run) = dispatch.get(action) {
+                run();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        window.add_controller(controller);
+    }
+
+    // Seed the Config rows' labels once; captures refresh them live.
+    refresh_shortcut_rows();
 
     // The config view's manage-identities dialog refreshes through this
     // slot: it's filled with `refresh_config` right after that closure is
