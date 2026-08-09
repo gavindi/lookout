@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.16 (2026-08-10)
+
+### Fixed
+
+- **UI**: the Config (settings) icon at the bottom of the left nav rail could go invisible about a second after startup, and stayed that way until the window was manually resized. `root_stack` - the `GtkStack` switching between the Mail/Calendar/People/Tasks/Config pages - defaulted to GTK's homogeneous sizing on both axes, so its overall requested size tracked the *largest* natural size across every named page, not just the visible one. A hidden page's content filling in from a background sync (e.g. the calendar sidebar populating with newly-discovered calendars, moments after startup) reflowed the whole window - including the nav rail sitting beside it - even while Mail stayed the visible page. `root_stack` is now sized to its visible page only (`hhomogeneous`/`vhomogeneous` set to false), so a hidden page's content no longer disturbs the layout around it.
+
 ## 0.9.15 (2026-08-09)
 
 ### Added

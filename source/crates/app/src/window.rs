@@ -2948,6 +2948,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let status_page_as_widget: gtk::Widget = status_page.clone().upcast();
     let main_paned_as_widget: gtk::Widget = main_paned.clone().upcast();
     let root_stack = gtk::Stack::new();
+    // GtkStack defaults to homogeneous sizing on both axes, so its overall
+    // requested size tracks the largest natural size across *every* named
+    // page, not just the visible one - meaning a hidden page's content
+    // filling in (e.g. the calendar/contacts sidebars populating from a
+    // background sync) reflows the visible page too, and everything beside
+    // it (nav_rail included).
+    root_stack.set_hhomogeneous(false);
+    root_stack.set_vhomogeneous(false);
     root_stack.add_named(&status_page_as_widget, Some("empty"));
     root_stack.add_named(&main_paned_as_widget, Some("mail"));
     root_stack.set_visible_child_name("empty");
