@@ -652,6 +652,80 @@ struct WebcalHandle {
     error: Option<String>,
 }
 
+/// State for the synthesized "Birthdays" calendar - the calendar-id-keyed
+/// cousin of `WebcalHandle`, but there is no fetch or poll to run: the
+/// source is the `UiState::contacts_by_account` snapshots the CardDAV sync
+/// already maintains, copied in on every contacts update, and the
+/// per-month occurrences are recomputed in place (cheap: a few thousand
+/// contacts at most) instead of cached. `None` until any contacts exist, so
+/// the checklist's "Birthdays" row only appears when it has a data source.
+struct BirthdaysHandle {
+    /// The synthetic calendar id (`"birthdays"`) its events carry - the
+    /// shared calendar-id machinery works unchanged, and read-only parity
+    /// with webcal feeds falls out of the same id-based checks.
+    calendar_id: CalendarId,
+    display_name: String,
+    /// The source contacts, one batch per account, replaced whenever a
+    /// contacts snapshot lands (the signal that `BDAY` data changed).
+    contacts: Vec<(AccountId, Vec<lookout_dav::ContactRecord>)>,
+    /// Latest occurrences for whatever month last synced, computed by
+    /// `sync_month` - keyed the same "only apply if it matches what's on
+    /// screen" way as `CalendarAccountHandle::last_occurrences`.
+    last_occurrences: Vec<EventOccurrence>,
+    last_synced_month: Option<chrono::NaiveDate>,
+    /// Per-month occurrences for the Lookout dashboard, computed by
+    /// `sync_dashboard_window` and pruned like
+    /// `CalendarAccountHandle::occurrences_by_month`.
+    occurrences_by_month: HashMap<chrono::NaiveDate, Vec<EventOccurrence>>,
+}
+
+impl BirthdaysHandle {
+    /// Replaces the source contact set (called when a contacts snapshot
+    /// lands) - the only thing that can change birthday data besides the
+    /// passage of time.
+    fn set_contacts(&mut self, contacts: Vec<(AccountId, Vec<lookout_dav::ContactRecord>)>) {
+        self.contacts = contacts;
+    }
+
+    /// (Re)computes the handle's occurrences for `month` - the scoped
+    /// snapshot the calendar views, print path, and mini-calendar read.
+    /// Deterministic (sorted by start then uid) so repeated calls are
+    /// diff-friendly.
+    fn sync_month(&mut self, month: chrono::NaiveDate) {
+        self.last_occurrences = birthday_occurrences_batch(&self.contacts, &self.calendar_id, month);
+        self.last_synced_month = Some(month);
+    }
+
+    /// (Re)computes the dashboard-horizon months (current + next) - the
+    /// same window the account sessions' `FetchMonth` commands cover, so
+    /// the dashboard's upcoming-events section and the reminder engine see
+    /// next month's birthdays too.
+    fn sync_dashboard_window(&mut self) {
+        for month in dashboard_month_window() {
+            let occurrences = birthday_occurrences_batch(&self.contacts, &self.calendar_id, month);
+            insert_dashboard_occurrences(&mut self.occurrences_by_month, month, occurrences);
+        }
+    }
+}
+
+/// The synthetic calendar id every birthday occurrence carries.
+fn birthdays_calendar_id() -> CalendarId {
+    CalendarId("birthdays".to_string())
+}
+
+/// Runs `lookout_dav::birthday_occurrences` across every account's contact
+/// batch and merges the results into one sorted set - the batch-level mirror
+/// of the per-account function, kept here since `ContactRecord`'s account
+/// grouping is an app-side concern.
+fn birthday_occurrences_batch(contacts: &[(AccountId, Vec<lookout_dav::ContactRecord>)], calendar_id: &CalendarId, month: chrono::NaiveDate) -> Vec<EventOccurrence> {
+    let mut occurrences: Vec<EventOccurrence> = contacts
+        .iter()
+        .flat_map(|(account_id, contacts)| lookout_dav::birthday_occurrences(account_id, calendar_id, contacts, month))
+        .collect();
+    occurrences.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.uid.0.cmp(&b.uid.0)));
+    occurrences
+}
+
 /// Per-Google-account state for the Google Tasks integration (keyed by the
 /// account's email). One `run_google_tasks_session` actor per connected
 /// account; its task lists map to synthetic `googletasks:<list id>`
@@ -694,6 +768,10 @@ struct CalendarUiState {
     webcal_subscriptions: Vec<WebcalSubscription>,
     /// Per-subscription feed state, keyed by subscription id.
     webcal_handles: HashMap<String, WebcalHandle>,
+    /// The synthesized "Birthdays" calendar, `None` until any contacts exist
+    /// (the checklist row appears only when it has a data source - mirroring
+    /// how the webcal group appears only when subscriptions exist).
+    birthdays: Option<BirthdaysHandle>,
     /// Connected Google Tasks accounts, keyed by email.
     google_tasks: HashMap<String, GoogleTasksHandle>,
     /// Every Google GOA account's email, discovered at startup - the
@@ -3947,6 +4025,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         webcal_cmd_tx: None,
         webcal_subscriptions: Vec::new(),
         webcal_handles: HashMap::new(),
+        birthdays: None,
         google_tasks: HashMap::new(),
         google_account_emails: Vec::new(),
         local_tasks,
@@ -4129,8 +4208,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let contacts_list = contacts_list.clone();
         let contacts_categories = contacts_categories.clone();
         let contacts_entries = contacts_entries.clone();
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        let reminders_engine = reminders_engine.clone();
         move |selected_index: Option<i32>| {
             refresh_contacts_category_ui(&state, &contacts_category_list, &contacts_list, &contacts_categories, &contacts_entries, selected_index);
+            // Contacts are the birthdays calendar's only data source, so
+            // every snapshot (startup cache paint, poll tick, post-write
+            // resync) refreshes the synthesized calendar and everything that
+            // renders it - the same funnel the webcal session uses.
+            if refresh_birthdays_from_contacts(&state, &calendar_state, &reminders_engine) {
+                refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
+                refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+                refresh_dashboard_hook(&calendar_state);
+                let displayed = calendar_state.borrow().displayed_month;
+                if calendar_view::mini_month(&mini_calendar) == displayed {
+                    let event_days = calendar_event_days(&calendar_state, displayed);
+                    calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+                }
+            }
         }
     });
     refresh_contacts_ui(None);
@@ -5533,7 +5633,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
         calendar_view::connect_event_dragged(&calendar_main, move |occ, new_start, new_end| {
-            if calendar_state.borrow().webcal_handles.values().any(|h| h.calendar_id == occ.calendar_id) {
+            if calendar_state.borrow().is_read_only_calendar(&occ.calendar_id) {
                 toast_overlay.add_toast(adw::Toast::new("Events from calendar subscriptions are read-only."));
                 return;
             }
@@ -5704,10 +5804,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 fn show_anchor(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &CalendarMain, mini_calendar: &calendar_view::MiniCalendar) {
     let day = calendar_view::anchor(calendar_main);
     let month = first_of_month(day);
-    let event_days = calendar_event_days(calendar_state, month);
-    calendar_view::set_mini_month(mini_calendar, day, &event_days);
     let mut st = calendar_state.borrow_mut();
     st.displayed_month = month;
+    // The birthdays calendar has no session to ask - recompute the month's
+    // occurrences in place so the mini-calendar's event-day markers (and any
+    // surface reading `checked_occurrences`) see them immediately.
+    if let Some(birthdays) = &mut st.birthdays {
+        birthdays.sync_month(month);
+    }
     for handle in st.accounts.values() {
         let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
     }
@@ -5715,6 +5819,9 @@ fn show_anchor(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &Ca
     if let Some(cmd) = webcal_cmd {
         let _ = cmd.send_blocking(SubscriptionCommand::SyncMonth(month));
     }
+    drop(st);
+    let event_days = calendar_event_days(calendar_state, month);
+    calendar_view::set_mini_month(mini_calendar, day, &event_days);
 }
 
 /// The local dates within `month` that have at least one occurrence from a
@@ -5727,20 +5834,8 @@ fn calendar_event_days(calendar_state: &Rc<RefCell<CalendarUiState>>, month: chr
     let mut days = HashSet::new();
     let month_start = first_of_month(month);
     let month_end = last_of_month(month);
-    for (synced, occurrences) in st
-        .accounts
-        .values()
-        .map(|h| (h.last_synced_month, h.last_occurrences.iter()))
-        .chain(st.webcal_handles.values().map(|h| (h.last_synced_month, h.last_occurrences.iter())))
-    {
-        if synced != Some(month) {
-            continue;
-        }
-        for occ in occurrences {
-            if st.checked_calendar_ids.contains(&occ.calendar_id) {
-                days.extend(calendar_view::covered_local_dates(occ, month_start, month_end));
-            }
-        }
+    for occ in st.checked_occurrences(month) {
+        days.extend(calendar_view::covered_local_dates(occ, month_start, month_end));
     }
     days
 }
@@ -6568,6 +6663,125 @@ fn connect_google_tasks_account(
     });
 }
 
+impl CalendarUiState {
+    /// Every checked calendar's latest occurrences for `month`, unioned
+    /// across accounts, webcal feeds, and the birthdays calendar - the one
+    /// merge every calendar-facing surface (main view, print, mini-calendar
+    /// event days, agenda) uses. Callers must have synced the birthdays
+    /// handle for `month` first (the contacts hook and `show_anchor` do).
+    fn checked_occurrences(&self, month: chrono::NaiveDate) -> Vec<&EventOccurrence> {
+        self.accounts
+            .values()
+            .filter(|h| h.last_synced_month == Some(month))
+            .flat_map(|h| h.last_occurrences.iter())
+            .chain(
+                self.webcal_handles
+                    .values()
+                    .filter(|h| h.last_synced_month == Some(month))
+                    .flat_map(|h| h.last_occurrences.iter()),
+            )
+            .chain(
+                self.birthdays
+                    .as_ref()
+                    .filter(|h| h.last_synced_month == Some(month))
+                    .into_iter()
+                    .flat_map(|h| h.last_occurrences.iter()),
+            )
+            .filter(|occ| self.checked_calendar_ids.contains(&occ.calendar_id))
+            .collect()
+    }
+
+    /// Like [`Self::checked_occurrences`], but across every synced month -
+    /// the surfaces that filter by exact day (the mail-overview day list,
+    /// the event editor's preview) rather than by the displayed month.
+    fn checked_occurrences_all_months(&self) -> Vec<&EventOccurrence> {
+        self.accounts
+            .values()
+            .flat_map(|h| h.last_occurrences.iter())
+            .chain(self.webcal_handles.values().flat_map(|h| h.last_occurrences.iter()))
+            .chain(self.birthdays.as_ref().into_iter().flat_map(|h| h.last_occurrences.iter()))
+            .filter(|occ| self.checked_calendar_ids.contains(&occ.calendar_id))
+            .collect()
+    }
+
+    /// Whether `calendar_id` is a read-only synthetic calendar (a webcal
+    /// feed, or the birthdays calendar) - shared by the editor's read-only
+    /// mode, the drag guard, and the delete route, so one id-based check
+    /// covers every "no write-back path" source.
+    fn is_read_only_calendar(&self, calendar_id: &CalendarId) -> bool {
+        self.read_only_note(calendar_id).is_some()
+    }
+
+    /// The read-only explanation the event editor shows under the form for a
+    /// synthetic calendar, or `None` when the calendar is writable.
+    fn read_only_note(&self, calendar_id: &CalendarId) -> Option<&'static str> {
+        if self.webcal_handles.values().any(|h| &h.calendar_id == calendar_id) {
+            Some("This calendar is a read-only subscription - changes can't be saved back to the feed.")
+        } else if self.birthdays.as_ref().is_some_and(|h| &h.calendar_id == calendar_id) {
+            Some("This birthday is synthesized from your contacts - it can't be edited or deleted.")
+        } else {
+            None
+        }
+    }
+}
+
+/// Copies the current contacts snapshots into the birthdays handle
+/// (creating it on the first contact, dropping it when the last contact
+/// goes away) and recomputes the displayed month plus the dashboard
+/// horizon, then feeds the reminder engine the freshly-computed
+/// occurrences - the `OccurrencesUpdated`-ingest equivalent for a calendar
+/// that has no session of its own. Returns whether any contacts exist (the
+/// caller only runs the render funnel when they do).
+fn refresh_birthdays_from_contacts(
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    reminders_engine: &Rc<RefCell<crate::reminders::ReminderEngine>>,
+) -> bool {
+    let contacts: Vec<(AccountId, Vec<lookout_dav::ContactRecord>)> = {
+        let st = state.borrow();
+        st.contacts_by_account
+            .iter()
+            .map(|(account_id, snapshot)| (account_id.clone(), snapshot.contacts.clone()))
+            .collect()
+    };
+    if contacts.is_empty() {
+        // No contacts anywhere - hide the calendar (the checklist row
+        // disappears with it) rather than show an empty "Birthdays" row.
+        calendar_state.borrow_mut().birthdays = None;
+        return false;
+    }
+    let mut st = calendar_state.borrow_mut();
+    let month = st.displayed_month;
+    let handle = st.birthdays.get_or_insert_with(|| BirthdaysHandle {
+        calendar_id: birthdays_calendar_id(),
+        display_name: "Birthdays".to_string(),
+        contacts: Vec::new(),
+        last_occurrences: Vec::new(),
+        last_synced_month: None,
+        occurrences_by_month: HashMap::new(),
+    });
+    handle.set_contacts(contacts);
+    handle.sync_month(month);
+    handle.sync_dashboard_window();
+    drop(st);
+    // Ingest both the displayed month and the dashboard horizon, so an alert
+    // for an upcoming month's birthday is already in the engine before the
+    // calendar view ever navigates there (the same union the CalDAV
+    // sessions' `OccurrencesUpdated` ingests build up month by month).
+    let occurrences: Vec<EventOccurrence> = {
+        let st = calendar_state.borrow();
+        let handle = st.birthdays.as_ref().expect("created just above");
+        handle
+            .last_occurrences
+            .iter()
+            .cloned()
+            .chain(handle.occurrences_by_month.values().flatten().cloned())
+            .collect()
+    };
+    reminders_engine.borrow_mut().ingest(&AccountId("birthdays".to_string()), &occurrences);
+    true
+}
+
 /// Recomputes which calendars actually exist across every connected account,
 /// defaults any newly-seen id to checked (shown), and re-renders the
 /// sidebar's "My calendars" checklist against that - the checklist's own
@@ -6604,6 +6818,27 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
                         supports_tasks: false,
                     })
                     .collect(),
+                status: None,
+            });
+        }
+    }
+    // The synthesized birthdays calendar renders as one row in its own
+    // group, present only while any contacts exist (the handle is `None`
+    // otherwise) - same inheritance of the toggle/color machinery.
+    {
+        let st = calendar_state.borrow();
+        if let Some(birthdays) = &st.birthdays {
+            groups.push(calendar_view::CalendarAccountGroup {
+                display_name: "Birthdays".to_string(),
+                calendars: vec![CalendarInfo {
+                    id: birthdays.calendar_id.clone(),
+                    account_id: AccountId("birthdays".to_string()),
+                    display_name: birthdays.display_name.clone(),
+                    color: None,
+                    href: String::new(),
+                    // Events-only, like feeds - never a task target.
+                    supports_tasks: false,
+                }],
                 status: None,
             });
         }
@@ -6647,18 +6882,7 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
 fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &CalendarMain) {
     let st = calendar_state.borrow();
     let month = st.displayed_month;
-    let merged: Vec<EventOccurrence> = st
-        .accounts
-        .values()
-        .filter(|h| h.last_synced_month == Some(month))
-        .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned())
-        .chain(
-            st.webcal_handles
-                .values()
-                .filter(|h| h.last_synced_month == Some(month))
-                .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned()),
-        )
-        .collect();
+    let merged: Vec<EventOccurrence> = st.checked_occurrences(month).into_iter().cloned().collect();
     drop(st);
     calendar_view::set_occurrences(calendar_main, &merged);
 }
@@ -6671,18 +6895,7 @@ fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>
 fn print_calendar_month<T: IsA<gtk::Window>>(calendar_state: &Rc<RefCell<CalendarUiState>>, window: &T) {
     let st = calendar_state.borrow();
     let month = st.displayed_month;
-    let merged: Vec<EventOccurrence> = st
-        .accounts
-        .values()
-        .filter(|h| h.last_synced_month == Some(month))
-        .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned())
-        .chain(
-            st.webcal_handles
-                .values()
-                .filter(|h| h.last_synced_month == Some(month))
-                .flat_map(|h| h.last_occurrences.iter().filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id)).cloned()),
-        )
-        .collect();
+    let merged: Vec<EventOccurrence> = st.checked_occurrences(month).into_iter().cloned().collect();
     let mut calendar_names: std::collections::HashMap<CalendarId, String> = std::collections::HashMap::new();
     for handle in st.accounts.values() {
         for calendar in &handle.calendars {
@@ -6691,6 +6904,9 @@ fn print_calendar_month<T: IsA<gtk::Window>>(calendar_state: &Rc<RefCell<Calenda
     }
     for handle in st.webcal_handles.values() {
         calendar_names.insert(handle.calendar_id.clone(), handle.display_name.clone());
+    }
+    if let Some(birthdays) = &st.birthdays {
+        calendar_names.insert(birthdays.calendar_id.clone(), birthdays.display_name.clone());
     }
     let month_start = month.with_day(1).unwrap();
     let month_end = (month_start + chrono::Months::new(1)) - chrono::Duration::days(1);
@@ -6767,11 +6983,8 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
 
     let st = calendar_state.borrow();
     let mut occurrences: Vec<&EventOccurrence> = st
-        .accounts
-        .values()
-        .flat_map(|h| h.last_occurrences.iter())
-        .chain(st.webcal_handles.values().flat_map(|h| h.last_occurrences.iter()))
-        .filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id))
+        .checked_occurrences_all_months()
+        .into_iter()
         .filter(|occ| !calendar_view::covered_local_dates(occ, day, day).is_empty())
         .collect();
     occurrences.sort_by_key(|occ| occ.start);
@@ -7137,13 +7350,7 @@ struct EventEditorPreviewData {
 fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anchor: chrono::NaiveDate) -> EventEditorPreviewData {
     let occurrences: Vec<EventOccurrence> = {
         let st = calendar_state.borrow();
-        st.accounts
-            .values()
-            .flat_map(|h| h.last_occurrences.iter())
-            .chain(st.webcal_handles.values().flat_map(|h| h.last_occurrences.iter()))
-            .filter(|occ| st.checked_calendar_ids.contains(&occ.calendar_id))
-            .cloned()
-            .collect()
+        st.checked_occurrences_all_months().into_iter().cloned().collect()
     };
     let month_event_days = calendar_event_days(calendar_state, first_of_month(anchor));
     let colors = calendar_state.borrow().calendar_colors.clone();
@@ -7159,11 +7366,16 @@ fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anch
 /// reminder's Open action (the engine hands the full occurrence back, so the
 /// editor works even when the month it belongs to isn't the one on screen).
 ///
-/// An occurrence from a webcal subscription opens the editor in read-only
-/// mode (feeds have no write-back path) - every input is disabled and the
-/// save/delete actions are hidden.
+/// An occurrence from a read-only synthetic calendar (a webcal subscription,
+/// or the birthdays calendar) opens the editor in read-only mode - neither
+/// has a write-back path - so every input is disabled and the save/delete
+/// actions are hidden, with a dim note explaining the source.
 fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, occ: &EventOccurrence) {
-    let read_only = calendar_state.borrow().webcal_handles.values().any(|h| h.calendar_id == occ.calendar_id);
+    let (read_only, read_only_note) = {
+        let st = calendar_state.borrow();
+        let note = st.read_only_note(&occ.calendar_id);
+        (note.is_some(), note.unwrap_or(""))
+    };
     let calendars = pickable_calendars(calendar_state);
     let default_calendar = if read_only {
         occ.calendar_id.clone()
@@ -7192,6 +7404,7 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
             calendar_colors: &preview.colors,
             owner_email,
             read_only,
+            read_only_note,
         },
         calendar_attendee_suggestions(state),
         {
@@ -7238,6 +7451,7 @@ fn show_new_event_editor(
             calendar_colors: &preview.colors,
             owner_email,
             read_only: false,
+            read_only_note: "",
         },
         calendar_attendee_suggestions(state),
         {
@@ -7285,7 +7499,7 @@ fn route_calendar_save(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_i
 /// `UpdateEvent`), removing exactly that instance without touching the rest
 /// of the series.
 fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: CalendarId, occ: EventOccurrence) {
-    if calendar_state.borrow().webcal_handles.values().any(|h| h.calendar_id == occ.calendar_id) {
+    if calendar_state.borrow().is_read_only_calendar(&occ.calendar_id) {
         tracing::warn!("refusing to delete a read-only subscription event");
         return;
     }
@@ -7457,6 +7671,7 @@ fn refresh_lookout_view(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCel
                 .values()
                 .flat_map(|h| h.occurrences_by_month.values().flatten().cloned())
                 .chain(st.webcal_handles.values().flat_map(|h| h.occurrences_by_month.values().flatten().cloned()))
+                .chain(st.birthdays.as_ref().into_iter().flat_map(|h| h.occurrences_by_month.values().flatten().cloned()))
                 .collect(),
             st.checked_calendar_ids.clone(),
             st.calendar_colors.clone(),
@@ -7485,12 +7700,16 @@ fn refresh_lookout_view(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCel
 fn widen_calendar_sync_horizon(calendar_state: &Rc<RefCell<CalendarUiState>>) {
     let today = chrono::Local::now().date_naive();
     let months = [today, today + chrono::Months::new(1)];
-    for handle in calendar_state.borrow().accounts.values() {
+    let mut st = calendar_state.borrow_mut();
+    if let Some(birthdays) = &mut st.birthdays {
+        birthdays.sync_dashboard_window();
+    }
+    for handle in st.accounts.values() {
         for month in months {
             let _ = handle.cmd_tx.send_blocking(CalendarCommand::FetchMonth(month));
         }
     }
-    if let Some(cmd_tx) = &calendar_state.borrow().webcal_cmd_tx {
+    if let Some(cmd_tx) = &st.webcal_cmd_tx {
         for month in months {
             let _ = cmd_tx.send_blocking(SubscriptionCommand::FetchMonth(month));
         }

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.13 (2026-08-09)
+
+### Added
+
+- **Calendar**: a synthesized **Birthdays** calendar, built from every connected contacts account's `BDAY` values and rendered through the same machinery as real calendars and webcal feeds - so it needs no new view, cache, or fetch of its own. A "Birthdays" row appears in the sidebar's "My calendars" checklist whenever any contacts exist (it vanishes with the last one), with its own colour and show/hide toggle, and every contact with a birthday lands on the grids as an all-day event: dated birthdays carry the age ("Alice's 36th birthday"), yearless birthdays recur every year, and a Feb 29 birthday shifts to Feb 28 in non-leap years (century years included). Birthdays appear in every calendar-facing surface - month/week/day grids, the agenda, print, the mini-calendar's event-day markers, the Mail screen's day overview, and the Lookout dashboard - and update live whenever the CardDAV sync refreshes contacts, so editing or deleting a contact's birthday is reflected as soon as the next poll lands. Clicking a birthday opens the event editor in read-only mode (like webcal events): every field is locked and a dim note explains the event is synthesized from contacts rather than savable. Each birthday carries an "at time of event" reminder, so the existing notification engine fires a `Gio.Notification` as the day begins, with the same Open/Snooze/Dismiss actions as any other event.
+- **People**: vCard `BDAY` parsing understands the yearless forms real address books export. `BDAY:--MMDD` (RFC 6350's no-year shape, used by Google and Apple for contacts whose birth year is unknown or private) parses into a birthday that recurs every year, and Apple's `X-APPLE-OMIT-YEAR` marker is honoured in either line order next to a dated `BDAY`; basic and ISO date-time spellings (`19900523T120000Z`, `1990-05-23T12:00:00`) parse to the date part. The writer round-trips a yearless birthday as `BDAY:--MMDD` (with Apple's marker alongside, so Apple-oriented servers keep the no-year semantics), and the contact editor shows yearless birthdays as `MM-DD` - a full date typed in the field re-dates the card, an `MM-DD` keeps it recurring yearly, and a yearless card saved without touching the field stays yearless.
+
+### Changed
+
+- **Calendar**: reminder notifications for all-day events no longer read "Starts at 00:00" - all-day events anchor at local midnight, so the body was noise (birthdays were the first to hit it). The alert now reads "All day", benefiting every all-day CalDAV event too.
+- **Calendar**: the event editor's read-only note is now source-specific - a webcal event explains the calendar is a read-only subscription with no write-back path, a birthday explains it's synthesized from your contacts.
+
+### Testing
+
+- `lookout-core`: vCard tests for the new `BDAY` forms - five full-date/date-time spellings, the yearless `--MMDD` shape, `X-APPLE-OMIT-YEAR` before or after the `BDAY` line, and a yearless birthday round-tripping as the RFC 6350 `--MMDD` form.
+- `lookout-dav`: a new `birthdays` module's tests - month-window scoping (a May birthday never leaks into June, a Dec 31 birthday stays in December across the year boundary), yearless birthdays recurring every year without an age, Feb 29 → Feb 28 in non-leap years (2100 included), contacts without a name or birthday skipped, structured-name fallback when `FN` is blank, stable account-scoped occurrence UIDs, and the all-day span plus "at time of event" reminder. The whole workspace suite stays green under `cargo clippy -D warnings`.
+
 ## 0.9.12 (2026-08-09)
 
 ### Changed

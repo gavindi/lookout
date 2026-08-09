@@ -19,9 +19,23 @@ pub struct VCard {
     pub addresses: Vec<AddressField>,
     pub urls: Vec<String>,
     pub note: Option<String>,
-    pub birthday: Option<NaiveDate>,
+    pub birthday: Option<Birthday>,
     pub categories: Vec<String>,
     pub other: Vec<OtherProperty>,
+}
+
+/// A contact's `BDAY` value. `omit_year` is the important distinction the
+/// calendar layer needs: a full-date birthday happens once and has a year to
+/// compute an age from, a yearless one (`BDAY:--MMDD`, or Apple's
+/// `X-APPLE-OMIT-YEAR`) recurs every year - which is how the synthesized
+/// birthdays calendar treats it. When `omit_year` is set the year carried in
+/// `date` is an arbitrary anchor (2000 for `--MMDD` forms), not the birth
+/// year.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Birthday {
+    pub date: NaiveDate,
+    #[serde(default)]
+    pub omit_year: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +135,11 @@ impl VCard {
             categories: Vec::new(),
             other: Vec::new(),
         };
+        // Apple writes `X-APPLE-OMIT-YEAR:<year>` next to a `BDAY` whose year
+        // is present only so clients can compute ages - the birthday itself
+        // recurs yearly. Collected here because the property may precede or
+        // follow the `BDAY` line, and applied once both have been read.
+        let mut apple_omit_year = false;
 
         for line in unfolded {
             if line.eq_ignore_ascii_case("BEGIN:VCARD") || line.eq_ignore_ascii_case("END:VCARD") {
@@ -152,8 +171,15 @@ impl VCard {
                 "URL" => card.urls.push(value),
                 "NOTE" => card.note = Some(value),
                 "BDAY" => card.birthday = Some(parse_birthday(&value)?),
+                "X-APPLE-OMIT-YEAR" => apple_omit_year = true,
                 "CATEGORIES" => card.categories = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
                 _ => card.other.push(OtherProperty { name, params, value }),
+            }
+        }
+
+        if apple_omit_year {
+            if let Some(birthday) = card.birthday.as_mut() {
+                birthday.omit_year = true;
             }
         }
 
@@ -258,7 +284,16 @@ impl VCard {
             lines.push(format!("NOTE:{}", escape_value(note)));
         }
         if let Some(bday) = &self.birthday {
-            lines.push(format!("BDAY:{}", bday.format("%Y-%m-%d")));
+            if bday.omit_year {
+                // RFC 6350 §3.3.4's yearless form; the X- property is Apple's
+                // marker that the year is decorative (their exports carry
+                // both), so a round-trip through Apple-oriented servers
+                // keeps the no-year semantics.
+                lines.push(format!("BDAY:--{}", bday.date.format("%m%d")));
+                lines.push(format!("X-APPLE-OMIT-YEAR:{}", bday.date.format("%Y")));
+            } else {
+                lines.push(format!("BDAY:{}", bday.date.format("%Y-%m-%d")));
+            }
         }
         if !self.categories.is_empty() {
             lines.push(format!("CATEGORIES:{}", self.categories.join(",")));
@@ -411,8 +446,39 @@ fn parse_address_field(params: &[Parameter], value: &str) -> Result<AddressField
     })
 }
 
-fn parse_birthday(value: &str) -> Result<NaiveDate, VCardError> {
-    NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| VCardError::InvalidDate(value.to_string()))
+fn parse_birthday(value: &str) -> Result<Birthday, VCardError> {
+    let value = value.trim();
+    // RFC 6350 §3.3.4: `BDAY:--MMDD` - a yearless birthday that recurs every
+    // year. Google and Apple both export this shape for contacts whose birth
+    // year is unknown (or private). The 2000 anchor is a leap year, so every
+    // month/day combination round-trips through `NaiveDate`.
+    if let Some(rest) = value.strip_prefix("--") {
+        if rest.len() >= 4 {
+            let month = rest[..2].parse::<u32>().ok();
+            let day = rest[2..4].parse::<u32>().ok();
+            if let (Some(month), Some(day)) = (month, day) {
+                if let Some(date) = NaiveDate::from_ymd_opt(2000, month, day) {
+                    return Ok(Birthday { date, omit_year: true });
+                }
+            }
+        }
+        return Err(VCardError::InvalidDate(value.to_string()));
+    }
+    // A full date or date-time - ISO-ish (`1990-05-23T12:00:00Z`) or basic
+    // (`19900523T120000Z`). Only the date part matters: the time of day a
+    // birthday carries is never rendered.
+    let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 8 {
+        let year = digits[..4].parse::<i32>().ok();
+        let month = digits[4..6].parse::<u32>().ok();
+        let day = digits[6..8].parse::<u32>().ok();
+        if let (Some(year), Some(month), Some(day)) = (year, month, day) {
+            if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+                return Ok(Birthday { date, omit_year: false });
+            }
+        }
+    }
+    Err(VCardError::InvalidDate(value.to_string()))
 }
 
 fn param_values(params: &[Parameter], key: &str) -> Vec<String> {
@@ -541,7 +607,10 @@ mod tests {
             }],
             urls: vec!["https://example.com".to_string()],
             note: Some("Example contact".to_string()),
-            birthday: Some(NaiveDate::from_ymd_opt(1990, 5, 23).unwrap()),
+            birthday: Some(Birthday {
+                date: NaiveDate::from_ymd_opt(1990, 5, 23).unwrap(),
+                omit_year: false,
+            }),
             categories: vec!["friend".to_string(), "colleague".to_string()],
             other: vec![],
         };
@@ -550,6 +619,13 @@ mod tests {
         assert_eq!(parsed.full_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(parsed.organization.as_ref().unwrap()[0], "Example Corp");
         assert_eq!(parsed.categories, vec!["friend", "colleague"]);
+        assert_eq!(
+            parsed.birthday,
+            Some(Birthday {
+                date: NaiveDate::from_ymd_opt(1990, 5, 23).unwrap(),
+                omit_year: false,
+            })
+        );
     }
 
     #[test]
@@ -591,6 +667,54 @@ mod tests {
     fn parse_all_of_an_empty_or_cardless_document_is_empty() {
         assert!(VCard::parse_all("").is_empty());
         assert!(VCard::parse_all("no cards here\njust text\n").is_empty());
+    }
+
+    #[test]
+    fn parses_full_date_birthday_forms() {
+        for (bday, expected) in [
+            ("1990-05-23", NaiveDate::from_ymd_opt(1990, 5, 23).unwrap()),
+            ("19900523", NaiveDate::from_ymd_opt(1990, 5, 23).unwrap()),
+            ("19900523T120000Z", NaiveDate::from_ymd_opt(1990, 5, 23).unwrap()),
+            ("1990-05-23T12:00:00Z", NaiveDate::from_ymd_opt(1990, 5, 23).unwrap()),
+            ("1990-05-23T12:00:00", NaiveDate::from_ymd_opt(1990, 5, 23).unwrap()),
+        ] {
+            let text = format!("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nBDAY:{bday}\r\nEND:VCARD\r\n");
+            let card = VCard::parse(&text).unwrap();
+            assert_eq!(card.birthday, Some(Birthday { date: expected, omit_year: false }), "BDAY:{bday}");
+        }
+    }
+
+    #[test]
+    fn parses_yearless_birthday_and_marks_omit_year() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nBDAY:--0523\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert_eq!(
+            card.birthday,
+            Some(Birthday {
+                date: NaiveDate::from_ymd_opt(2000, 5, 23).unwrap(),
+                omit_year: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_apple_omit_year_whichever_line_order() {
+        let before = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nX-APPLE-OMIT-YEAR:1979\r\nBDAY:1979-05-23\r\nEND:VCARD\r\n";
+        let after = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nBDAY:1979-05-23\r\nX-APPLE-OMIT-YEAR:1979\r\nEND:VCARD\r\n";
+        for text in [before, after] {
+            let card = VCard::parse(text).unwrap();
+            assert!(card.birthday.unwrap().omit_year);
+        }
+    }
+
+    #[test]
+    fn round_trips_yearless_birthday_as_rfc_6350_form() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nBDAY:--0523\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        let serialized = card.serialize();
+        assert!(serialized.contains("BDAY:--0523"), "{serialized}");
+        let reparsed = VCard::parse(&serialized).unwrap();
+        assert!(reparsed.birthday.unwrap().omit_year);
     }
 
     #[test]

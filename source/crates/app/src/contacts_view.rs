@@ -35,7 +35,9 @@ pub struct ContactsAccountSnapshot {
     /// `refresh_contacts_category_ui`), so which book a card came from
     /// doesn't need tracking here. Each record carries the server-side
     /// `href`/`getetag` the write path needs to PUT/DELETE it back.
-    contacts: Vec<lookout_dav::ContactRecord>,
+    /// `pub(crate)` so the birthdays calendar can read the same contact
+    /// set the People screen shows.
+    pub(crate) contacts: Vec<lookout_dav::ContactRecord>,
     suggestions: Vec<EmailAddress>,
 }
 

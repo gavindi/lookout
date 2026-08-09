@@ -1,6 +1,6 @@
 # TODO
 
-Phases 1-5 are complete. Two items remain across the roadmap.
+Phases 1-5 are complete. One item remains across the roadmap.
 
 ## Phase 1 — Mail MVP
 
@@ -84,7 +84,7 @@ Phases 1-5 are complete. Two items remain across the roadmap.
 - [x] `.ics` import / webcal subscription — sidebar "Add calendar" dialog (subscribe/import/manage), `lookout-dav` feed session (5-min poll, per-feed cache + error isolation), read-only event viewer for feed events, Config-view subscription list
 - [x] Mini-calendar sidebar widget (240px sidebar + compact copy docked on the Mail screen)
 - [x] VTODO tasks — `lookout-core` `CalendarTask` model, `lookout-dav` `todo-query` REPORT + VTODO parse/serialize + session commands (`SyncTasks`/`CreateTask`/`UpdateTask`/`DeleteTask`) + cache table, `tasks_view.rs` grouped list (Overdue/Today/This week/Later/Completed, checkbox completion toggle, calendar color dots), `task_editor.rs` dialog (summary/notes/due/priority/percent), Tasks nav-rail view + toolbar
-- [ ] Birthday calendar synthesized from Contacts
+- [x] Birthday calendar synthesized from Contacts — synthetic "Birthdays" calendar (checklist group, own color/toggle) synthesized from every contacts account's `BDAY` values (full-date with ordinal ages, RFC 6350 yearless `--MMDD`/Apple `X-APPLE-OMIT-YEAR` recurring yearly, Feb 29 → Feb 28 in non-leap years), recomputed in place when contacts sync or the displayed month changes, read-only like webcal feeds (editor note explains why), fed into the notification engine ("At time of event" alerts) and every calendar surface (grids, mini-calendar markers, agenda, print, mail overview, dashboard)
 - [x] `Gio.Notification` event alerts
 - [x] Event create/edit ("New Event" toolbar button)
   - [x] Attendee invites (`ATTENDEE`/`ORGANIZER`), a recurrence/series builder (previously read-only display only), a video-call link (`CONFERENCE`), and categories/sensitivity/busy-free/reminder (`CATEGORIES`/`CLASS`/`TRANSP`/`VALARM`) via a new toolbar

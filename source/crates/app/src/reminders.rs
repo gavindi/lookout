@@ -250,8 +250,15 @@ fn parse_action_target(param: Option<&glib::Variant>) -> Option<EventOccurrence>
 /// occurrence, so every action can rebuild the exact event.
 fn show_notification(app: &adw::Application, alert: &DueAlert) {
     let title = alert.occurrence.summary.as_deref().unwrap_or("(No title)");
+    // All-day events (birthdays among them) anchor at local midnight, so
+    // "Starts at 00:00" would be noise - "All day" reads better.
+    let body = if alert.occurrence.all_day {
+        "All day".to_string()
+    } else {
+        format!("Starts at {}", alert.starts_local.format("%H:%M"))
+    };
     let notification = gio::Notification::new(title);
-    notification.set_body(Some(&format!("Starts at {}", alert.starts_local.format("%H:%M"))));
+    notification.set_body(Some(&body));
     let json = serde_json::to_string(&alert.occurrence).expect("EventOccurrence serialization cannot fail");
     let variant = glib::Variant::from(json);
     notification.set_default_action_and_target_value("app.open-event", Some(&variant));

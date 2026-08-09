@@ -214,7 +214,11 @@ pub fn show_contact_editor(
         org_row.set_text(card.organization.as_ref().and_then(|org| org.first()).map(String::as_str).unwrap_or(""));
         title_row.set_text(card.title.as_deref().unwrap_or(""));
         if let Some(birthday) = card.birthday {
-            birthday_row.set_text(&birthday.format("%Y-%m-%d").to_string());
+            if birthday.omit_year {
+                birthday_row.set_text(&birthday.date.format("%m-%d").to_string());
+            } else {
+                birthday_row.set_text(&birthday.date.format("%Y-%m-%d").to_string());
+            }
         }
         groups_row.set_text(&card.categories.join(", "));
         notes_entry.set_text(card.note.as_deref().unwrap_or(""));
@@ -419,8 +423,17 @@ pub fn show_contact_editor(
         let birthday = birthday_row.text().trim().to_string();
         card.birthday = if birthday.is_empty() {
             None
+        } else if let Ok(date) = chrono::NaiveDate::parse_from_str(&birthday, "%Y-%m-%d") {
+            // A full date entered (or left untouched from a dated card)
+            // clears any year-omission the card carried.
+            Some(lookout_core::Birthday { date, omit_year: false })
+        } else if let Ok(date) = chrono::NaiveDate::parse_from_str(&birthday, "%m-%d") {
+            // Yearless form ("MM-DD", how yearless cards show in the entry):
+            // the birthday recurs every year.
+            Some(lookout_core::Birthday { date, omit_year: true })
         } else {
-            Some(chrono::NaiveDate::parse_from_str(&birthday, "%Y-%m-%d").ok()?)
+            // Invalid input - the Save handler just doesn't fire.
+            return None;
         };
 
         card.categories = groups_row.text().split(',').map(str::trim).filter(|part| !part.is_empty()).map(str::to_string).collect();

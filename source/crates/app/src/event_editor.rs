@@ -72,10 +72,15 @@ pub struct EventEditorPrefill<'a> {
     /// couldn't be derived - `ATTENDEE`s are still written without an
     /// `ORGANIZER` in that case (a documented non-conformance, not a blocker).
     pub owner_email: Option<String>,
-    /// View-only mode for events from webcal subscriptions (feeds have no
-    /// write-back path): every input is disabled, the save/delete actions
-    /// are hidden, and a dim note explains why. Requires `existing`.
+    /// View-only mode for events from read-only calendars (webcal feeds and
+    /// the synthesized birthdays calendar have no write-back path): every
+    /// input is disabled, the save/delete actions are hidden, and a dim note
+    /// explains why. Requires `existing`.
     pub read_only: bool,
+    /// The dim note shown under the form when `read_only` - why this
+    /// calendar can't be written to (the source differs: feeds vs.
+    /// synthesized birthdays). Ignored when not read-only.
+    pub read_only_note: &'a str,
 }
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
@@ -307,7 +312,7 @@ pub fn show_event_editor(
         .build();
     recurring_note.set_visible(existing.as_ref().is_some_and(|occ| occ.rrule.is_some()));
     let read_only_note = gtk::Label::builder()
-        .label("This calendar is a read-only subscription - changes can't be saved back to the feed.")
+        .label(prefill.read_only_note)
         .css_classes(["dim-label", "caption"])
         .wrap(true)
         .xalign(0.0)

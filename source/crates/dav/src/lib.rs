@@ -4,6 +4,7 @@
 //! [`session::CalendarCredentialProvider`] trait, keeping this crate free of
 //! D-Bus concerns.
 
+pub mod birthdays;
 pub mod cache;
 mod client;
 mod config;
@@ -14,6 +15,7 @@ pub mod session;
 pub mod subscription;
 mod xml;
 
+pub use birthdays::birthday_occurrences;
 pub use cache::{cache_info, clear_all_caches, contacts_cache_info, remove_subscription_cache, CachedAddressBook, CachedContact, ContactsCache};
 pub use client::{fetch_webcal_ics, normalize_webcal_url, AddressBookInfo, ContactRecord, DavClient, MAX_FEED_BYTES};
 pub use config::{CalendarAccountConfig, CardDavAccountConfig, Credential};

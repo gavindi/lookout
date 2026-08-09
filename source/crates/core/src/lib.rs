@@ -25,4 +25,4 @@ pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValid
 pub use mailbox::{Mailbox, MailboxRole};
 pub use thread::{ThreadGroup, ThreadKey};
 pub use trust::{html_remote_content_scan, normalize_trust_entry, sender_matches_trust_entry, RemoteContentScan, TrustLevel};
-pub use vcard::{AddressField, EmailField, Name, OtherProperty, Parameter, TelephoneField, VCard, VCardError};
+pub use vcard::{AddressField, Birthday, EmailField, Name, OtherProperty, Parameter, TelephoneField, VCard, VCardError};
