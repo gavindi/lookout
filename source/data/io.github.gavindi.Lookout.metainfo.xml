@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.22" date="2026-08-11">
+      <description>
+        <p>Fixed sent messages not appearing in the Sent folder, and new mail sometimes not appearing in a folder's message list even though the sidebar already showed an updated unread count - including when the folder was the one already open.</p>
+      </description>
+    </release>
     <release version="0.9.21" date="2026-08-10">
       <description>
         <p>Fixed inserting and sending inline images in the composer: the "Insert image" button did nothing when clicked before the message body had been focused, a body that was only an image with no other text silently sent as blank, and - the main event - a security setting meant to protect the inline-image mechanism was inadvertently blocking the reading pane's own page from displaying it, so a correctly-sent inline image never actually appeared when viewing the message. Also fixed folder refresh being slow and new mail sometimes not appearing until restart, and an interaction (opening a message, switching folders) landing during a connection retry being silently dropped instead of answered once reconnected.</p>

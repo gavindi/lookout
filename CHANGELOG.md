@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.22 (2026-08-11)
+
+### Fixed
+
+- **Mail**: a sent message never showed up in the Sent folder. The IMAP `APPEND` that archives it there was landing fine, but nothing told the running account session to refresh Sent's cached message list afterward - and the folder-switch shortcut that repaints a mailbox from its on-disk cache instead of re-fetching it (whenever that cache is already non-empty, for instant folder-switch latency) then kept serving the stale list indefinitely, surviving even an app restart. Sending now resyncs the Sent mailbox immediately after a successful `APPEND`, the same resync-after-mutation pattern already used after moving or deleting a message.
+- **Mail**: new mail could sit invisible in a folder's message list even though the sidebar already showed its unread count - whether the folder was the one currently open or one the user then switched into. IMAP IDLE only reports changes to whichever mailbox is selected *at the moment* they happen, so mail landing while the session was briefly selected elsewhere (a background body prefetch, another command's own folder) was never reported by IDLE at all; the sidebar count instead came from a separate lightweight `STATUS`-only poll that checks every folder in rotation regardless of what's selected, but never touches the message cache. That poll now marks a folder's cache stale whenever it catches a count change IDLE missed, so switching into it forces a real resync instead of repainting the same stale list - and when the folder with the changed count is the one already on screen, the poll resyncs it immediately instead of waiting for a switch away and back.
+
 ## 0.9.21 (2026-08-10)
 
 ### Fixed

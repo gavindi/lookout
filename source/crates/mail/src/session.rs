@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use async_imap::Session;
@@ -167,6 +167,9 @@ pub enum AccountCommand {
     /// Sent mailbox (two explicit steps - IMAP has no JMAP-style implicit
     /// filing on submit). If no Sent mailbox can be identified, the message
     /// is still sent; only the archival copy is skipped (logged as a warning).
+    /// When the APPEND does land, the handler also resyncs the Sent mailbox
+    /// so the new message shows up immediately instead of waiting behind the
+    /// cache-hit shortcut in `SyncMailbox` below.
     /// Boxed: the message can be large (an iMIP reply carries a whole
     /// iCalendar document), and commands are passed one at a time through an
     /// mpsc channel - the heap indirection keeps the command enum compact.
@@ -560,6 +563,20 @@ async fn connect_and_run(
     // Re-filled by `relist_folders` whenever the list changes.
     let mut counts_pending: VecDeque<MailboxId> = queue_folder_counts(&folders, &inbox_id);
 
+    // Mailboxes *other than the one currently on screen* whose server-side
+    // counts have moved since their message cache was last synced - new mail
+    // landing in a folder that isn't selected/IDLE'd, discovered by the
+    // STATUS drain below rather than an unsolicited IMAP notification (plain
+    // IDLE only reports the selected mailbox, and even a freshly re-entered
+    // IDLE never reports a change that happened before it started).
+    // `SyncMailbox`'s cache-hit shortcut consults this so a folder switch
+    // doesn't repaint a stale envelope list just because the cache happens to
+    // be non-empty; a real sync clears the entry once it runs. The
+    // currently-open mailbox never lives in this set - the same STATUS drain
+    // resyncs it immediately instead of waiting for a switch away and back,
+    // since the user is looking at it right now.
+    let mut dirty_mailboxes: HashSet<MailboxId> = HashSet::new();
+
     let mut current_mailbox_name = "INBOX".to_string();
     let mut current_mailbox_id = inbox_id.clone();
 
@@ -669,6 +686,7 @@ async fn connect_and_run(
             Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
             Wake::Idle(Ok(_)) => {
                 sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                dirty_mailboxes.remove(&current_mailbox_id);
                 // New mail just landed in (or was expunged from) the open
                 // folder; refresh its count so the sidebar matches the list.
                 refresh_one_folder_count(&mut session, &mut folders, &account_id, &current_mailbox_id, cache, events).await;
@@ -723,7 +741,13 @@ async fn connect_and_run(
                         // *not* a safe completeness reference: on Gmail's All
                         // Mail it over-reports vs. what a fetch returns, which
                         // would force a pointless full re-sync every open.)
-                        let cached = cache.is_some_and(|c| c.has_messages(&current_mailbox_id).unwrap_or(false));
+                        // A STATUS pass may have observed this mailbox's count
+                        // move while it wasn't selected (new mail arriving
+                        // outside IDLE's view, see `dirty_mailboxes` above) -
+                        // that makes the cached envelope list stale even
+                        // though it's non-empty, so the shortcut below must
+                        // not apply to it.
+                        let cached = !dirty_mailboxes.contains(&current_mailbox_id) && cache.is_some_and(|c| c.has_messages(&current_mailbox_id).unwrap_or(false));
                         if cached {
                             tracing::debug!(mailbox = %current_mailbox_id, "SyncMailbox: cache hit, emitting cached messages without IMAP sync");
                             emit_cached_messages(cache, &current_mailbox_id, events).await;
@@ -731,6 +755,7 @@ async fn connect_and_run(
                         }
                         sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
                         session_selected = current_mailbox_id.clone();
+                        dirty_mailboxes.remove(&current_mailbox_id);
                     }
                 }
                 AccountCommand::FetchBody { mailbox, uid } => {
@@ -925,8 +950,26 @@ async fn connect_and_run(
                     let _ = events.send(AccountEvent::SearchResults { mailbox, query, messages }).await;
                 }
                 AccountCommand::SendMessage(msg) => match send_message(config, credentials, &mut session, &folders, *msg).await {
-                    Ok(()) => {
+                    Ok(sent_mailbox) => {
                         let _ = events.send(AccountEvent::SendCompleted).await;
+                        // The APPEND landed in Sent - resync it now rather than
+                        // leaving the newly archived copy stuck behind the
+                        // cache-hit shortcut in `SyncMailbox` above, which would
+                        // otherwise hide it indefinitely (even across restarts)
+                        // until an explicit Refresh. Mirrors the resync-after-
+                        // mutation pattern `MoveMessage` uses below.
+                        if let Some(sent_id) = sent_mailbox {
+                            if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
+                                relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                                sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache).await?;
+                                dirty_mailboxes.remove(&sent_id);
+                                session_selected = sent_id;
+                                if session_selected != current_mailbox_id {
+                                    session.select(&current_mailbox_name).await?;
+                                    session_selected = current_mailbox_id.clone();
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = events.send(AccountEvent::Error(format!("Couldn't send message: {e}"))).await;
@@ -1373,7 +1416,31 @@ async fn connect_and_run(
                 // The folder may have vanished from a re-list between being
                 // queued and being drained; skip it rather than miscounting.
                 let Some(index) = folders.iter().position(|m| m.id == mailbox_id) else { continue };
-                dirty |= refresh_folder_counts(&mut session, &mut folders[index], &account_id).await;
+                let changed = refresh_folder_counts(&mut session, &mut folders[index], &account_id).await;
+                dirty |= changed;
+                if changed {
+                    if mailbox_id == current_mailbox_id {
+                        // This STATUS drain - not IDLE - is what caught the
+                        // change: new mail can land while the session is
+                        // SELECTed elsewhere (a prefetch batch, another
+                        // command's folder), and a plain IDLE re-entered
+                        // afterward never reports a change that happened
+                        // before it started (see the module notes on
+                        // `dirty_mailboxes`). Since the user is looking at
+                        // this exact mailbox right now, don't wait for a
+                        // folder switch to notice the dirty flag - resync it
+                        // immediately so the message list and the sidebar
+                        // count land together.
+                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                        session_selected = current_mailbox_id.clone();
+                    } else {
+                        // Not on screen right now - the message cache (if
+                        // any) no longer matches the server's count for this
+                        // mailbox, so a later folder switch must not serve it
+                        // from cache until a real sync runs.
+                        dirty_mailboxes.insert(mailbox_id);
+                    }
+                }
                 since_emit += 1;
                 if since_emit >= COUNT_STATUS_BATCH {
                     since_emit = 0;
@@ -1622,8 +1689,11 @@ async fn move_uids_to_path(session: &mut Session<ImapStream>, uids: &[Uid], path
 /// Sends `msg` over SMTP, then best-effort `APPEND`s the raw message to the
 /// account's Sent mailbox (if one was identified in `folders`) so it shows
 /// up in the Sent view - IMAP has no server-side "file to Sent on submit"
-/// the way JMAP's EmailSubmission does.
-async fn send_message(config: &AccountConfig, credentials: &dyn CredentialProvider, session: &mut Session<ImapStream>, folders: &[Mailbox], msg: ComposedMessage) -> Result<()> {
+/// the way JMAP's EmailSubmission does. Returns the Sent mailbox's id when
+/// the APPEND actually landed, so the caller can resync it - archiving is
+/// best-effort, but the resync must not run against a mailbox nothing was
+/// appended to.
+async fn send_message(config: &AccountConfig, credentials: &dyn CredentialProvider, session: &mut Session<ImapStream>, folders: &[Mailbox], msg: ComposedMessage) -> Result<Option<MailboxId>> {
     let (raw, _message_id, recipients) = build_raw_message(&msg);
 
     let smtp_credential = credentials.smtp_credential().await.map_err(Error::LoginFailed)?;
@@ -1631,15 +1701,16 @@ async fn send_message(config: &AccountConfig, credentials: &dyn CredentialProvid
 
     let Some(sent) = folders.iter().find(|m| matches!(m.role, lookout_core::MailboxRole::Sent)) else {
         tracing::warn!("no Sent mailbox found; message was sent but not archived");
-        return Ok(());
+        return Ok(None);
     };
     let Some(path) = sent.id.0.strip_prefix(&format!("{}:", config.account_id.0)) else {
-        return Ok(());
+        return Ok(None);
     };
     if let Err(e) = session.append(path, Some("(\\Seen)"), None, raw.as_slice()).await {
         tracing::warn!("message was sent but APPEND to Sent failed: {e}");
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(sent.id.clone()))
 }
 
 /// The account's Drafts folder path from the latest folder list, or `None`
