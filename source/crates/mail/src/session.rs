@@ -555,7 +555,7 @@ async fn connect_and_run(
     publish_folders(&folders, &account_id, cache, events).await;
 
     let inbox_id = MailboxId::new(&account_id, "INBOX");
-    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache).await?;
+    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders).await?;
 
     // Folders still awaiting their STATUS count, drained cooperatively below.
     // Held as ids rather than indices so a re-list that reorders (or shortens)
@@ -685,7 +685,7 @@ async fn connect_and_run(
             // see `sync_mailbox` and the module docs.
             Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
             Wake::Idle(Ok(_)) => {
-                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
                 // New mail just landed in (or was expunged from) the open
                 // folder; refresh its count so the sidebar matches the list.
@@ -707,7 +707,7 @@ async fn connect_and_run(
                 }
                 AccountCommand::Refresh => {
                     relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
-                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                     session_selected = current_mailbox_id.clone();
                     // Rebuild the prefetch list to include any new folders.
                     let new_mailboxes: Vec<MailboxId> = folders.iter().filter(|m| m.id != current_mailbox_id).map(|m| m.id.clone()).collect();
@@ -753,7 +753,7 @@ async fn connect_and_run(
                             emit_cached_messages(cache, &current_mailbox_id, events).await;
                             continue;
                         }
-                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                         session_selected = current_mailbox_id.clone();
                         dirty_mailboxes.remove(&current_mailbox_id);
                     }
@@ -961,7 +961,7 @@ async fn connect_and_run(
                         if let Some(sent_id) = sent_mailbox {
                             if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
                                 relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
-                                sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache).await?;
+                                sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache, &mut folders).await?;
                                 dirty_mailboxes.remove(&sent_id);
                                 session_selected = sent_id;
                                 if session_selected != current_mailbox_id {
@@ -1044,7 +1044,7 @@ async fn connect_and_run(
                                 emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             }
                             relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
-                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                             session_selected = current_mailbox_id.clone();
                         }
                         Err(e) => {
@@ -1075,7 +1075,7 @@ async fn connect_and_run(
                                 emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             }
                             relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
-                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                             session_selected = current_mailbox_id.clone();
                         }
                         Err(e) => {
@@ -1115,7 +1115,7 @@ async fn connect_and_run(
                                 emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             }
                             relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
-                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                             session_selected = current_mailbox_id.clone();
                         }
                         Err(e) => {
@@ -1145,7 +1145,7 @@ async fn connect_and_run(
                                 }
                             }
                             relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
-                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                             session_selected = current_mailbox_id.clone();
                         }
                         Err(e) => {
@@ -1160,7 +1160,7 @@ async fn connect_and_run(
                         }
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
-                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                     session_selected = current_mailbox_id.clone();
                 }
                 AccountCommand::SnoozeMessages { mailbox, uids, until } => {
@@ -1172,7 +1172,7 @@ async fn connect_and_run(
                         }
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
-                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                    sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                     session_selected = current_mailbox_id.clone();
                 }
                 AccountCommand::StoreFlags { mailbox, uid, add, remove } => {
@@ -1213,7 +1213,7 @@ async fn connect_and_run(
                                 // No cache (or the uid fell outside the
                                 // cached window): re-sync so the UI still
                                 // sees the new flags.
-                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                                 session_selected = current_mailbox_id.clone();
                             }
                             // A \Seen store changes the folder's unread count;
@@ -1273,7 +1273,7 @@ async fn connect_and_run(
                             if all_patched {
                                 emit_cached_messages(cache, &mailbox, events).await;
                             } else if mailbox == current_mailbox_id {
-                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                                 session_selected = current_mailbox_id.clone();
                             }
                             // Best-effort delta scaled by batch size, same
@@ -1345,7 +1345,7 @@ async fn connect_and_run(
                                 // No cache (or the uid fell outside the
                                 // cached window): re-sync so the UI still
                                 // sees the new keywords.
-                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                                 session_selected = current_mailbox_id.clone();
                             }
                         }
@@ -1378,7 +1378,7 @@ async fn connect_and_run(
                             if all_patched {
                                 emit_cached_messages(cache, &mailbox, events).await;
                             } else if mailbox == current_mailbox_id {
-                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                                sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                                 session_selected = current_mailbox_id.clone();
                             }
                         }
@@ -1431,7 +1431,7 @@ async fn connect_and_run(
                         // folder switch to notice the dirty flag - resync it
                         // immediately so the message list and the sidebar
                         // count land together.
-                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                        sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache, &mut folders).await?;
                         session_selected = current_mailbox_id.clone();
                     } else {
                         // Not on screen right now - the message cache (if
@@ -2038,7 +2038,9 @@ async fn sync_mailbox(
     mailbox_id: &MailboxId,
     events: &async_channel::Sender<AccountEvent>,
     cache: Option<&crate::cache::Cache>,
+    folders: &mut Vec<Mailbox>,
 ) -> Result<()> {
+    let is_sent = folders.iter().find(|f| f.id == *mailbox_id).is_some_and(|f| matches!(f.role, MailboxRole::Sent));
     let mailbox_meta = session.select(folder_path).await?;
     let uidvalidity = UidValidity(mailbox_meta.uid_validity.unwrap_or(0));
     // The display list shows every message in the folder, so every sync
@@ -2085,7 +2087,34 @@ async fn sync_mailbox(
             .await?
             .try_collect()
             .await?;
-        messages.extend(fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)));
+        let mut new_messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)).collect();
+
+        // A Sent folder is never supposed to carry unread mail, regardless of
+        // which client (or which path - this app's own send, another
+        // device, webmail) put a message there. Only newly-arrived messages
+        // are swept here, not every cached one on every sync, so a user who
+        // deliberately marks a Sent message unread later isn't fought.
+        if is_sent {
+            let unseen: Vec<Uid> = new_messages.iter().filter(|m| !m.flags.contains(&SystemFlagBit::Seen)).map(|m| m.uid).collect();
+            if !unseen.is_empty() {
+                match store_flags(session, &unseen, &[SystemFlagBit::Seen], &[]).await {
+                    Ok(()) => {
+                        for msg in new_messages.iter_mut() {
+                            if unseen.contains(&msg.uid) {
+                                msg.flags.insert(SystemFlagBit::Seen);
+                            }
+                        }
+                        if let Some(f) = folders.iter_mut().find(|f| f.id == *mailbox_id) {
+                            f.unread = f.unread.saturating_sub(unseen.len() as u32);
+                        }
+                        publish_folders(folders, account_id, cache, events).await;
+                    }
+                    Err(e) => tracing::warn!("failed to auto-mark Sent arrival as read: {e}"),
+                }
+            }
+        }
+
+        messages.extend(new_messages);
     }
 
     let keys = lookout_core::thread::compute_thread_keys(&messages);

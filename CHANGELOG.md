@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.24 (2026-08-11)
+
+### Fixed
+
+- **Mail**: the Sent folder could show an unread-count badge for a message that had just been sent. `APPEND`ing the outgoing copy already asked the server to set `\Seen` on it, but that request wasn't guaranteed - and a message landing in Sent from anywhere else (another device, a webmail client) was never covered at all. Any mailbox recognized as Sent now has this enforced centrally: whenever a sync finds a message newly arrived there without `\Seen`, it stores the flag on the server and reflects it locally before the message is ever cached or shown, so Sent never carries an unread badge regardless of what put the mail there. Messages a user deliberately marks unread afterward are left alone - only genuinely new arrivals are swept.
+
 ## 0.9.23 (2026-08-11)
 
 ### Fixed
