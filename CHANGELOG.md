@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.20 (2026-08-10)
+
+### Fixed
+
+- **Mail**: sending to a recipient picked from the address book could fail with "Invalid recipient Address" even though the address was valid. A picked contact fills the To/Cc/Bcc chip with the full `Name <address>` form, but that whole string was going straight into both the `To`/`Cc` MIME headers and the SMTP envelope's address parser - the latter (`lettre::Address`) only understands a bare address, so any recipient with a display name was rejected outright, and the header would have come out malformed (a second, nested pair of angle brackets) even where it wasn't. A new `split_mailbox` helper in `lookout-mail` separates the name from the address before either use, so the header renders correctly (`To: "Gavin Graham" <gavindi@gmail.com>`) and the envelope gets the bare address it expects.
+
 ## 0.9.19 (2026-08-10)
 
 ### Added

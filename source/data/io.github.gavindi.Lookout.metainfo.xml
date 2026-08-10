@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.20" date="2026-08-10">
+      <description>
+        <p>Fixed sending to a contact picked from the address book sometimes failing with "Invalid recipient Address" - a recipient with a display name attached to it was being rejected by the SMTP send instead of being sent correctly.</p>
+      </description>
+    </release>
     <release version="0.9.19" date="2026-08-10">
       <description>
         <p>Trash and Junk folders now have an expunge quick action: hovering a folder row shows an "Empty" button that permanently deletes all messages in that folder after a confirmation.</p>

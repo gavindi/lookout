@@ -202,19 +202,43 @@ pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>
         }
     }
 
+    // `to`/`cc`/`reply_to` entries are whatever the composer's recipient
+    // chips produced - a bare address, or `Name <address>` when picked from
+    // the address book - so each is split before use: the name (if any)
+    // goes into the header's display-name slot, never smuggled into the
+    // `email` field verbatim (that would nest a second `<...>` around the
+    // whole token in the written header).
     if !msg.to.is_empty() {
         builder = builder.to(BuilderAddress::new_list(
-            msg.to.iter().map(|a| BuilderAddress::new_address(None::<String>, a.clone())).collect(),
+            msg.to
+                .iter()
+                .map(|a| {
+                    let (name, address) = split_mailbox(a);
+                    BuilderAddress::new_address(name, address)
+                })
+                .collect(),
         ));
     }
     if !msg.cc.is_empty() {
         builder = builder.cc(BuilderAddress::new_list(
-            msg.cc.iter().map(|a| BuilderAddress::new_address(None::<String>, a.clone())).collect(),
+            msg.cc
+                .iter()
+                .map(|a| {
+                    let (name, address) = split_mailbox(a);
+                    BuilderAddress::new_address(name, address)
+                })
+                .collect(),
         ));
     }
     if !msg.reply_to.is_empty() {
         builder = builder.reply_to(BuilderAddress::new_list(
-            msg.reply_to.iter().map(|a| BuilderAddress::new_address(None::<String>, a.clone())).collect(),
+            msg.reply_to
+                .iter()
+                .map(|a| {
+                    let (name, address) = split_mailbox(a);
+                    BuilderAddress::new_address(name, address)
+                })
+                .collect(),
         ));
     }
     // Bcc is deliberately not added as a header (that would leak it to
@@ -297,6 +321,27 @@ fn angle_wrap(message_id: &str) -> String {
     }
 }
 
+/// Splits an RFC 5322 mailbox string into its display name (if any) and bare
+/// address. `ComposedMessage::to`/`cc`/`reply_to` carry whatever the
+/// composer's recipient chips produced - a bare address, or `Name <address>`
+/// when picked from the address book - and both the MIME header writer
+/// (which wants the name and address as separate fields) and the SMTP
+/// envelope (whose `Address` parser only accepts a bare address, and rejects
+/// the `Name <address>` form outright) need the split, not the raw token.
+fn split_mailbox(token: &str) -> (Option<String>, String) {
+    let token = token.trim();
+    if let Some(start) = token.rfind('<') {
+        if let Some(address) = token[start + 1..].strip_suffix('>') {
+            let name = token[..start].trim().trim_matches('"').trim();
+            return (
+                (!name.is_empty()).then(|| name.to_string()),
+                address.trim().to_string(),
+            );
+        }
+    }
+    (None, token.to_string())
+}
+
 /// Builds a `HeaderType` from a raw value - `mail_builder`'s `.header`
 /// wants a typed `HeaderType`, and `Raw` is the escape hatch for values
 /// that have no dedicated type (unencoded, line-wrapped only).
@@ -329,9 +374,16 @@ pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: 
     let transport = builder.build();
 
     let from_addr: SmtpAddress = from.parse().map_err(|_| Error::LoginFailed(format!("invalid From address: {from}")))?;
+    // `recipients` (built from `ComposedMessage::to`/`cc`/`bcc`) may carry a
+    // display name alongside the address (`Name <address>`) - the envelope
+    // only wants the bare address, `Address`'s parser has no notion of the
+    // `Name <address>` form.
     let to_addrs: Vec<SmtpAddress> = recipients
         .iter()
-        .map(|r| r.parse::<SmtpAddress>().map_err(|_| Error::LoginFailed(format!("invalid recipient address: {r}"))))
+        .map(|r| {
+            let address = split_mailbox(r).1;
+            address.parse::<SmtpAddress>().map_err(|_| Error::LoginFailed(format!("invalid recipient address: {r}")))
+        })
         .collect::<Result<_>>()?;
     let envelope = Envelope::new(Some(from_addr), to_addrs).map_err(|e| Error::LoginFailed(e.to_string()))?;
 
@@ -554,6 +606,44 @@ mod tests {
 
         let raw = raw_to_string(&sample_message(None));
         assert!(!raw.to_lowercase().contains("reply-to"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn split_mailbox_separates_display_name_from_address() {
+        assert_eq!(split_mailbox("gavindi@gmail.com"), (None, "gavindi@gmail.com".to_string()));
+        assert_eq!(
+            split_mailbox("Gavin Graham <gavindi@gmail.com>"),
+            (Some("Gavin Graham".to_string()), "gavindi@gmail.com".to_string())
+        );
+        assert_eq!(split_mailbox("  spaced@example.com  "), (None, "spaced@example.com".to_string()));
+        assert_eq!(
+            split_mailbox("\"Ada Lovelace\" <ada@example.com>"),
+            (Some("Ada Lovelace".to_string()), "ada@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn to_header_carries_a_picked_contacts_display_name_and_stays_well_formed() {
+        // A recipient picked from the address book arrives as a full
+        // `Name <address>` token (see `RecipientEntry`/`address_of`) - it
+        // must not get nested in a second pair of angle brackets, and the
+        // SMTP envelope this drives must still parse to the bare address
+        // rather than erroring "invalid recipient address".
+        let mut msg = sample_message(None);
+        msg.to = vec!["Gavin Graham <gavindi@gmail.com>".to_string()];
+        let raw = raw_to_string(&msg);
+        // `mail_builder` RFC 2047-quotes display names containing spaces,
+        // same as the `From:` header (see `display_name_goes_into_the_from_header`).
+        assert!(raw.contains("To: \"Gavin Graham\" <gavindi@gmail.com>"), "raw:\n{raw}");
+        assert!(!raw.contains("<Gavin Graham"), "display name leaked inside the address angle brackets:\n{raw}");
+        let (_, _, recipients) = build_raw_message(&msg);
+        assert_eq!(recipients, vec!["Gavin Graham <gavindi@gmail.com>".to_string()]);
+    }
+
+    #[test]
+    fn to_header_without_a_display_name_is_unchanged() {
+        let raw = raw_to_string(&sample_message(None));
+        assert!(raw.contains("To: <you@example.com>"), "raw:\n{raw}");
     }
 
     #[test]
