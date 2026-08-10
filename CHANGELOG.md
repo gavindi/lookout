@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.23 (2026-08-11)
+
+### Fixed
+
+- **Mail**: switching folders in the sidebar left the previous folder's messages on screen until the new folder's own data arrived - a live IMAP fetch on a folder visited for the first time (or one the STATUS drain had marked stale) could take a moment, during which the wrong folder's mail was still visible. The message list now repaints from the newly-selected folder's own cache immediately on click, even to empty if nothing's cached yet, instead of waiting on the async sync to answer. When that leaves the list empty, a spinner with "Fetching message list." now shows in its place for exactly as long as that folder's sync is still outstanding, so a folder that's genuinely empty - nothing left to fetch - still just shows a plain empty list rather than spinning forever.
+
 ## 0.9.22 (2026-08-11)
 
 ### Fixed

@@ -2259,6 +2259,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
+    // Shown instead of the list while the folder on screen is empty and its
+    // sync is still outstanding - see `refresh_message_loading_state`.
+    // Without this, the empty list a folder switch eagerly paints (see
+    // `select_mailbox`) looks identical to a folder that's genuinely empty
+    // for however long the live IMAP fetch takes.
+    let message_loading_spinner = gtk::Spinner::builder().spinning(true).width_request(32).height_request(32).build();
+    let message_loading_label = gtk::Label::builder().label("Fetching message list.").css_classes(["dim-label"]).build();
+    let message_loading_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .build();
+    message_loading_box.append(&message_loading_spinner);
+    message_loading_box.append(&message_loading_label);
+    let message_list_stack = gtk::Stack::new();
+    message_list_stack.add_named(&message_scroller, Some("list"));
+    message_list_stack.add_named(&message_loading_box, Some("loading"));
+    message_list_stack.set_visible_child_name("list");
     // Header row atop the message list: what's being shown on the left (the
     // folder's name over its account, plus the favorite star), and the list's
     // own controls on the right - sync, filter, sort direction, sort key.
@@ -2422,7 +2442,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let message_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_box.append(&message_header_row);
     message_box.append(&column_header_row);
-    message_box.append(&message_scroller);
+    message_box.append(&message_list_stack);
     let message_card = card_section(&message_box);
     message_card.add_css_class("card-flush-start");
     message_card.set_margin_start(0);
@@ -3903,6 +3923,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
         let list_header = list_header.clone();
         let search_debounce = search_debounce.clone();
         let mail_view_button = mail_view_button.clone();
@@ -3914,7 +3935,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // needed. Bumping the token also invalidates any timeout armed
                 // for a query still being typed.
                 search_debounce.set(search_debounce.get() + 1);
-                exit_search(&state, &message_list, &list_header, entry);
+                exit_search(&state, &message_list, &message_list_stack, &list_header, entry);
                 return;
             }
             let token = search_debounce.get() + 1;
@@ -3941,6 +3962,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
         let list_header = list_header.clone();
         let search_debounce = search_debounce.clone();
         // Esc in the entry: leave search mode entirely rather than just
@@ -3953,7 +3975,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // and re-enter a search for the (already-cleared) query.
                 search_debounce.set(search_debounce.get() + 1);
             }
-            exit_search(&state, &message_list, &list_header, entry);
+            exit_search(&state, &message_list, &message_list_stack, &list_header, entry);
         });
     }
 
@@ -5412,6 +5434,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
         let list_header = list_header.clone();
         let search_entry = search_entry.clone();
         folder_selection.connect_selected_item_notify(move |sel| {
@@ -5428,16 +5451,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     drop(tree_item);
                     // Clicking a folder is a deliberate navigation away from
                     // search; leave it and let the selection take over.
-                    exit_search(&state, &message_list, &list_header, &search_entry);
-                    enter_unified_inbox(&state, &message_list);
+                    exit_search(&state, &message_list, &message_list_stack, &list_header, &search_entry);
+                    enter_unified_inbox(&state, &message_list, &message_list_stack);
                     refresh_list_header(&state, &list_header);
                 }
                 TreeItem::Folder(node) | TreeItem::Favorite(node) => {
                     let mailbox_id = node.mailbox.id.clone();
                     let account_id = node.mailbox.account_id.clone();
                     drop(tree_item);
-                    exit_search(&state, &message_list, &list_header, &search_entry);
-                    select_mailbox(&state, account_id, mailbox_id);
+                    exit_search(&state, &message_list, &message_list_stack, &list_header, &search_entry);
+                    select_mailbox(&state, &message_list, &message_list_stack, account_id, mailbox_id);
                     refresh_list_header(&state, &list_header);
                 }
                 TreeItem::Account(_) | TreeItem::Favorites => {}
@@ -6028,6 +6051,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         window.clone(),
         folder_selection,
         message_list,
+        message_list_stack,
         message_header,
         reading_stack,
         current_mail_page,
@@ -6163,6 +6187,7 @@ fn spawn_account_discovery(
     window: adw::ApplicationWindow,
     folder_selection: gtk::SingleSelection,
     message_list: MessageListModel,
+    message_list_stack: gtk::Stack,
     message_header: crate::message_header::MessageHeader,
     reading_stack: gtk::Stack,
     current_mail_page: Rc<Cell<&'static str>>,
@@ -6217,6 +6242,7 @@ fn spawn_account_discovery(
                         state.clone(),
                         folder_selection.clone(),
                         message_list.clone(),
+                        message_list_stack.clone(),
                         message_header.clone(),
                         reading_stack.clone(),
                         toast_overlay.clone(),
@@ -6249,6 +6275,7 @@ fn connect_account(
     state: Rc<RefCell<UiState>>,
     folder_selection: gtk::SingleSelection,
     message_list: MessageListModel,
+    message_list_stack: gtk::Stack,
     message_header: crate::message_header::MessageHeader,
     reading_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
@@ -6369,10 +6396,16 @@ fn connect_account(
                     refresh_list_header(&state, &list_header);
                     // The dashboard's mail stats follow the folder syncs.
                     dashboard_refresh();
+                    // A reconnect can clear the open mailbox's `syncing` entry
+                    // (its old request is dead) without ever answering it -
+                    // don't leave the spinner running for a request that will
+                    // never land.
+                    refresh_message_loading_state(&state, &message_list, &message_list_stack);
                 }
                 AccountEvent::MessagesUpdated { mailbox, messages } => {
                     // The sync this mailbox was asked for (if any) has landed.
                     state.borrow_mut().syncing.remove(&mailbox);
+                    refresh_message_loading_state(&state, &message_list, &message_list_stack);
                     // A sync means the envelope cache this dashboard reads
                     // changed - repaint its mail sections. (The calendar
                     // sections repaint via their own event loops.)
@@ -9418,7 +9451,7 @@ fn sort_direction_icon(descending: bool) -> &'static str {
 /// Switches the message list to a single mailbox and asks its owning account
 /// to sync it. Shared by the folder-selection handler and the account
 /// switcher's fallback path.
-fn select_mailbox(state: &Rc<RefCell<UiState>>, account_id: AccountId, mailbox_id: MailboxId) {
+fn select_mailbox(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, message_list_stack: &gtk::Stack, account_id: AccountId, mailbox_id: MailboxId) {
     {
         let mut st = state.borrow_mut();
         st.mail_view = MailView::Single;
@@ -9433,7 +9466,28 @@ fn select_mailbox(state: &Rc<RefCell<UiState>>, account_id: AccountId, mailbox_i
             },
         );
     }
+    // Paint the new folder's own cached messages immediately - even an
+    // empty list if nothing's cached yet - rather than leaving the
+    // previously-selected folder's rows on screen until the async sync
+    // below answers. Mirrors `exit_search`'s single-view repaint, but
+    // unconditional: a missing cache must still clear the list rather than
+    // leaving stale content, since that's the actual bug being fixed here.
+    let cached = state
+        .borrow()
+        .accounts
+        .get(&account_id)
+        .and_then(|h| h.address_cache.clone())
+        .and_then(|cache| {
+            let mut messages = cache.load_messages(&mailbox_id).ok()?;
+            let snoozed = cache.active_snoozed_uids(&mailbox_id, chrono::Utc::now()).unwrap_or_default();
+            messages.retain(|m| !snoozed.contains(&m.uid));
+            Some(messages)
+        })
+        .unwrap_or_default();
+    let (key, descending) = current_sort(state);
+    message_list.repopulate(cached, key, descending);
     request_mailbox_sync(state, &account_id, &mailbox_id);
+    refresh_message_loading_state(state, message_list, message_list_stack);
 }
 
 /// Requests a mailbox sync from its account, deduplicating against
@@ -9455,6 +9509,32 @@ fn request_mailbox_sync(state: &Rc<RefCell<UiState>>, account_id: &AccountId, ma
         let _ = handle.cmd_tx.send_blocking(AccountCommand::SyncMailbox(mailbox_id.clone()));
     }
     true
+}
+
+/// Shows the "Fetching message list." spinner in place of the message list
+/// exactly while the view on screen is empty *and* its sync is still
+/// outstanding (tracked in `UiState::syncing`) - never for a folder that's
+/// genuinely empty, since nothing ever clears `syncing` for a mailbox that
+/// isn't waiting on anything, and a permanently-spinning "fetching" message
+/// would be worse than the plain empty list it replaces. Call after anything
+/// that can change either input: a `repopulate`, or a `syncing`/
+/// `FoldersUpdated` change.
+fn refresh_message_loading_state(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, message_list_stack: &gtk::Stack) {
+    let empty = message_list.selection.n_items() == 0;
+    let waiting = if empty {
+        let (mail_view, current_mailbox, syncing) = {
+            let st = state.borrow();
+            (st.mail_view, st.current_mailbox.clone(), st.syncing.clone())
+        };
+        match mail_view {
+            MailView::Single => current_mailbox.is_some_and(|m| syncing.contains(&m)),
+            MailView::UnifiedInbox => account_inboxes(state).into_iter().any(|(_, inbox)| syncing.contains(&inbox)),
+            MailView::Search => false,
+        }
+    } else {
+        false
+    };
+    message_list_stack.set_visible_child_name(if waiting { "loading" } else { "list" });
 }
 
 /// Every connected account's Inbox - the mailbox set the unified view is
@@ -9588,7 +9668,7 @@ fn start_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, l
 /// its cache with a fresh sync requested) or the unified "All Inboxes" view
 /// (`MailView::UnifiedInbox`, repopulated from the per-mailbox snapshots). A
 /// no-op when no search is active, aside from clearing an idle (empty) entry.
-fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, list_header: &ListHeader, search_entry: &gtk::SearchEntry) {
+fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, message_list_stack: &gtk::Stack, list_header: &ListHeader, search_entry: &gtk::SearchEntry) {
     if !state.borrow().search_active {
         search_entry.set_text("");
         return;
@@ -9632,12 +9712,13 @@ fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, li
             }
         }
     }
+    refresh_message_loading_state(state, message_list, message_list_stack);
 }
 
 /// Enters the "All Inboxes" view: asks every connected account that has an
 /// Inbox to sync it, and immediately repopulates the list from whatever the
 /// per-mailbox snapshots already hold.
-fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel) {
+fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, message_list_stack: &gtk::Stack) {
     let inboxes = account_inboxes(state);
     {
         let mut st = state.borrow_mut();
@@ -9656,6 +9737,7 @@ fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_list: &MessageListM
     let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
     let (key, descending) = current_sort(state);
     message_list.repopulate(all, key, descending);
+    refresh_message_loading_state(state, message_list, message_list_stack);
 }
 
 /// Merges the unified view's per-mailbox snapshots into a single newest-first
