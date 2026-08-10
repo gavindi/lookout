@@ -3,10 +3,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::glib;
+use base64::Engine;
+use gtk::{gio, glib};
 use lookout_core::{header_value, AccountId, EmailBody, EmailSummary, Identity};
 use lookout_mail::session::AccountCommand;
-use lookout_mail::{new_message_id, ComposedMessage};
+use lookout_mail::{new_message_id, Attachment, ComposedMessage, InlineImage};
 use webkit::prelude::*;
 
 use crate::recipient_entry::{RecipientEntry, SuggestionSource};
@@ -289,6 +290,22 @@ blockquote {{ margin: 4px 0 4px 16px; padding-left: 8px; border-left: 2px solid 
     )
 }
 
+/// Builds the HTML for the "Insert table" toolbar button - `rows`/`cols`
+/// come from trusted `gtk::SpinButton` values, not free text, so no
+/// HTML-escaping is needed here.
+fn table_html(rows: u32, cols: u32) -> String {
+    let mut html = String::from(r#"<table style="border-collapse:collapse;width:100%">"#);
+    for _ in 0..rows {
+        html.push_str("<tr>");
+        for _ in 0..cols {
+            html.push_str(r#"<td style="border:1px solid #ccc;padding:4px;">&nbsp;</td>"#);
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</table><p><br></p>");
+    html
+}
+
 /// Reads the editor's content back out of the WebView with one
 /// `evaluate_javascript` round trip, returning the normalized HTML and the
 /// plain-text rendering. WebKit's `FontSize`/`ForeColor` editing commands
@@ -307,7 +324,13 @@ blockquote {{ margin: 4px 0 4px 16px; padding-left: 8px; border-left: 2px solid 
 /// dispatch` is an `extern "C"` callback that cannot unwind, so the panic
 /// becomes an abort. Awaiting on the executor that's already running avoids
 /// the nested loop entirely.
-async fn read_content(web_view: &webkit::WebView) -> Option<(String, String)> {
+struct EditorContent {
+    html: String,
+    text: String,
+    images: Vec<InlineImage>,
+}
+
+async fn read_content(web_view: &webkit::WebView) -> Option<EditorContent> {
     const READ_SCRIPT: &str = r#"(
         function () {
             document.querySelectorAll('font').forEach(function (el) {
@@ -326,7 +349,25 @@ async fn read_content(web_view: &webkit::WebView) -> Option<(String, String)> {
                 }
                 el.parentNode.replaceChild(span, el);
             });
-            return JSON.stringify({ html: document.body.innerHTML, text: document.body.innerText });
+            // Inline images are held as `data:` URIs while composing (the
+            // compose WebView has no `cid:` scheme handler, unlike the
+            // reading pane's, so rewriting a *live* `data:` <img> to `cid:`
+            // would make it vanish from the editor). Extraction therefore
+            // runs on a clone, never the live document.
+            var clone = document.body.cloneNode(true);
+            var images = [];
+            var seen = {};
+            clone.querySelectorAll('img[src^="data:"]').forEach(function (img) {
+                var m = /^data:([^;,]+)(;base64)?,(.*)$/s.exec(img.getAttribute('src'));
+                if (!m || !m[2]) return;
+                var contentType = m[1], data = m[3];
+                var hash = 0;
+                for (var i = 0; i < data.length; i++) { hash = ((hash << 5) - hash + data.charCodeAt(i)) | 0; }
+                var cid = 'img-' + Math.abs(hash) + '@lookout.local';
+                if (!seen[cid]) { seen[cid] = true; images.push({ cid: cid, contentType: contentType, data: data }); }
+                img.setAttribute('src', 'cid:' + cid);
+            });
+            return JSON.stringify({ html: clone.innerHTML, text: document.body.innerText, images: images });
         }
     )()"#;
 
@@ -334,7 +375,21 @@ async fn read_content(web_view: &webkit::WebView) -> Option<(String, String)> {
     let parsed: serde_json::Value = serde_json::from_str(&value.to_string()).ok()?;
     let html = parsed.get("html").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let text = parsed.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    Some((html, text))
+    let images = parsed
+        .get("images")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let cid = entry.get("cid")?.as_str()?.to_string();
+                    let content_type = entry.get("contentType")?.as_str()?.to_string();
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(entry.get("data")?.as_str()?).ok()?;
+                    Some(InlineImage { cid, content_type, bytes })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(EditorContent { html, text, images })
 }
 
 /// Adds a toolbar button that fires a plain WebKit editing command (bold,
@@ -377,6 +432,39 @@ struct DraftSnapshot {
     read_receipt: bool,
     body: String,
     body_text: String,
+    attachments: Vec<PendingAttachment>,
+    inline_images: Vec<InlineImage>,
+}
+
+/// One file attached to the message being composed, held in memory for the
+/// compose session - Cancel or a crash simply drops the bytes, like any
+/// other unsaved edit (there is no attachment persistence for drafts: see
+/// the note on `ComposePrefill` near where drafts get reopened - they don't,
+/// today, at all). `bytes` is `Rc`-wrapped so add/remove/rebuild never
+/// reclones potentially multi-MB payloads; it's cloned into an owned
+/// `lookout_mail::Attachment` only at the two points that actually build a
+/// `ComposedMessage` (Send, and a changed autosave tick).
+#[derive(Clone)]
+struct PendingAttachment {
+    filename: String,
+    content_type: String,
+    bytes: Rc<Vec<u8>>,
+}
+
+impl PartialEq for PendingAttachment {
+    // Identity, not content: two entries from the same pick share the same
+    // `Rc`; a distinct pick (even of the same file) gets a fresh one. Keeps
+    // `DraftSnapshot` equality (checked every autosave tick) cheap instead
+    // of a multi-MB `memcmp`.
+    fn eq(&self, other: &Self) -> bool {
+        self.filename == other.filename && self.content_type == other.content_type && Rc::ptr_eq(&self.bytes, &other.bytes)
+    }
+}
+
+impl PendingAttachment {
+    fn to_mail_attachment(&self) -> Attachment {
+        Attachment { filename: self.filename.clone(), content_type: self.content_type.clone(), bytes: (*self.bytes).clone() }
+    }
 }
 
 /// The identity the composer is currently set to send as: the dropdown's
@@ -404,6 +492,9 @@ struct AutosaveCtx {
     rich_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
     rich_web_view: Rc<webkit::WebView>,
+    /// The canonical in-session attachment list, shared with the attach
+    /// button and the Send handler.
+    attachments: Rc<RefCell<Vec<PendingAttachment>>>,
     /// The last snapshot queued for saving; a tick whose fields still match
     /// it does nothing.
     last_saved: Rc<RefCell<Option<DraftSnapshot>>>,
@@ -438,12 +529,13 @@ impl AutosaveCtx {
     /// be read this tick (document still loading) - the next tick retries.
     async fn snapshot(&self) -> Option<DraftSnapshot> {
         let rich = self.rich_toggle.is_active();
-        let (body, body_text) = if rich {
-            read_content(&self.rich_web_view).await?
+        let (body, body_text, inline_images) = if rich {
+            let content = read_content(&self.rich_web_view).await?;
+            (content.html, content.text, content.images)
         } else {
             let buffer = self.body_view.buffer();
             let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
-            (text.clone(), text)
+            (text.clone(), text, vec![])
         };
         Some(DraftSnapshot {
             from: selected_identity(&self.identities, &self.from_dropdown).email,
@@ -455,6 +547,8 @@ impl AutosaveCtx {
             read_receipt: self.read_receipt_toggle.is_active(),
             body,
             body_text,
+            attachments: self.attachments.borrow().clone(),
+            inline_images,
         })
     }
 
@@ -498,6 +592,8 @@ impl AutosaveCtx {
             subject: snap.subject.clone(),
             text_body: snap.body_text.clone(),
             html_body: snap.rich.then(|| snap.body.clone()),
+            attachments: snap.attachments.iter().map(PendingAttachment::to_mail_attachment).collect(),
+            inline_images: snap.inline_images.clone(),
             calendar_part: None,
             read_receipt: None,
             request_read_receipt: snap.read_receipt,
@@ -516,7 +612,13 @@ impl AutosaveCtx {
 /// editor's blank document (`<p><br></p>`) renders to whitespace-only text,
 /// so it's caught by the same check.
 fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
-    snap.to.trim().is_empty() && snap.cc.trim().is_empty() && snap.bcc.trim().is_empty() && snap.subject.trim().is_empty() && snap.body_text.trim().is_empty()
+    snap.to.trim().is_empty()
+        && snap.cc.trim().is_empty()
+        && snap.bcc.trim().is_empty()
+        && snap.subject.trim().is_empty()
+        && snap.body_text.trim().is_empty()
+        && snap.attachments.is_empty()
+        && snap.inline_images.is_empty()
 }
 
 /// Builds the rich-text editor's pieces: the contenteditable WebKit `WebView`
@@ -569,6 +671,49 @@ fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
 
     let initial_body = if initial_html.trim().is_empty() { "<p><br></p>".to_string() } else { initial_html };
     web_view.load_html(&html_document(&initial_body), None);
+
+    // A pasted image becomes an inline `data:` <img> (extracted back out to
+    // a `cid:` attachment at read time - see `read_content`). WebKitGTK's
+    // default paste behavior for clipboard image data in a contenteditable
+    // document isn't relied on here - this listener owns the whole path
+    // explicitly, guarded so a second `load_html` (this composer never
+    // re-loads, but this stays safe if that ever changes) doesn't double up.
+    // Drag-and-drop image insertion is out of scope: dropping is prevented
+    // outright rather than left to an unverified WebKit default (which could
+    // otherwise navigate the frame to a dropped file).
+    {
+        let web_view = web_view.clone();
+        web_view.connect_load_changed(move |view, event| {
+            if event != webkit::LoadEvent::Finished {
+                return;
+            }
+            const PASTE_SCRIPT: &str = r#"(function () {
+                if (window.__lookoutPasteHandlerInstalled) return;
+                window.__lookoutPasteHandlerInstalled = true;
+                document.body.addEventListener('paste', function (e) {
+                    var items = e.clipboardData && e.clipboardData.items;
+                    if (!items) return;
+                    for (var i = 0; i < items.length; i++) {
+                        if (items[i].type.indexOf('image/') !== 0) continue;
+                        e.preventDefault();
+                        var file = items[i].getAsFile();
+                        var reader = new FileReader();
+                        reader.onload = function () {
+                            document.execCommand('insertHTML', false, '<img src="' + reader.result + '" alt="">');
+                        };
+                        reader.readAsDataURL(file);
+                        return;
+                    }
+                });
+                document.body.addEventListener('dragover', function (e) { e.preventDefault(); });
+                document.body.addEventListener('drop', function (e) { e.preventDefault(); });
+            })()"#;
+            let view = view.clone();
+            glib::spawn_future_local(async move {
+                let _ = view.evaluate_javascript_future(PASTE_SCRIPT, None, None).await;
+            });
+        });
+    }
 
     let toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
     toolbar_command_button(&toolbar, "format-text-bold-symbolic", "Bold", "Bold", &web_view);
@@ -636,7 +781,141 @@ fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
     link_button.connect_clicked(move |button| link_dialog.present(Some(button)));
     toolbar.append(&link_button);
 
+    toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
+    toolbar_command_button(&toolbar, "format-justify-left-symbolic", "Align left", "JustifyLeft", &web_view);
+    toolbar_command_button(&toolbar, "format-justify-center-symbolic", "Center", "JustifyCenter", &web_view);
+    toolbar_command_button(&toolbar, "format-justify-right-symbolic", "Align right", "JustifyRight", &web_view);
+    toolbar_command_button(&toolbar, "format-justify-fill-symbolic", "Justify", "JustifyFull", &web_view);
+    toolbar_command_button(&toolbar, "format-indent-more-symbolic", "Indent", "Indent", &web_view);
+    toolbar_command_button(&toolbar, "format-indent-less-symbolic", "Outdent", "Outdent", &web_view);
+    toolbar_command_button(&toolbar, "insert-hr-symbolic", "Horizontal rule", "InsertHorizontalRule", &web_view);
+    toolbar_command_button(&toolbar, "edit-clear-all-symbolic", "Remove formatting", "RemoveFormat", &web_view);
+
+    let font_families = gtk::StringList::new(&["Sans-serif", "Serif", "Monospace", "Cursive"]);
+    let font_family_args = ["sans-serif", "serif", "monospace", "cursive"];
+    let font_family = gtk::DropDown::builder().model(&font_families).selected(0).tooltip_text("Font family").build();
+    {
+        let web_view = web_view.clone();
+        font_family.connect_selected_notify(move |dropdown| {
+            if let Some(arg) = font_family_args.get(dropdown.selected() as usize) {
+                web_view.execute_editing_command_with_argument("FontName", arg);
+            }
+        });
+    }
+    toolbar.append(&font_family);
+
+    let table_rows = gtk::SpinButton::with_range(1.0, 20.0, 1.0);
+    table_rows.set_value(2.0);
+    let table_cols = gtk::SpinButton::with_range(1.0, 10.0, 1.0);
+    table_cols.set_value(2.0);
+    let table_grid = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+    table_grid.append(&gtk::Label::new(Some("Rows")));
+    table_grid.append(&table_rows);
+    table_grid.append(&gtk::Label::new(Some("Columns")));
+    table_grid.append(&table_cols);
+    let table_dialog = adw::AlertDialog::builder()
+        .heading("Insert table")
+        .default_response("insert")
+        .close_response("cancel")
+        .build();
+    table_dialog.add_response("cancel", "Cancel");
+    table_dialog.add_response("insert", "Insert");
+    table_dialog.set_response_appearance("insert", adw::ResponseAppearance::Suggested);
+    table_dialog.set_extra_child(Some(&table_grid));
+    let table_dialog = Rc::new(table_dialog);
+    {
+        let web_view = web_view.clone();
+        let table_rows = table_rows.clone();
+        let table_cols = table_cols.clone();
+        table_dialog.connect_response(None, move |_dialog, response| {
+            if response == "insert" {
+                let html = table_html(table_rows.value() as u32, table_cols.value() as u32);
+                web_view.execute_editing_command_with_argument("InsertHTML", &html);
+            }
+        });
+    }
+    let table_button = gtk::Button::builder().icon_name("view-grid-symbolic").tooltip_text("Insert table").build();
+    table_button.connect_clicked(move |button| table_dialog.present(Some(button)));
+    toolbar.append(&table_button);
+
+    let insert_image_button = gtk::Button::builder().icon_name("insert-image-symbolic").tooltip_text("Insert image").build();
+    {
+        let web_view = web_view.clone();
+        insert_image_button.connect_clicked(move |button| {
+            let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+            let web_view = web_view.clone();
+            glib::spawn_future_local(async move {
+                let filter = gtk::FileFilter::new();
+                filter.add_pixbuf_formats();
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                let dialog = gtk::FileDialog::builder().title("Insert image").filters(&filters).build();
+                let Ok(file) = dialog.open_future(Some(&window)).await else { return };
+                let Ok(info) = file.query_info_future("standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT).await else { return };
+                let content_type = info
+                    .content_type()
+                    .and_then(|ct| gio::functions::content_type_get_mime_type(&ct))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "image/png".to_string());
+                let Ok((bytes, _etag)) = file.load_contents_future().await else { return };
+                let data_uri = format!("data:{content_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+                web_view.execute_editing_command_with_argument("InsertHTML", &format!("<img src=\"{data_uri}\" alt=\"\">"));
+            });
+        });
+    }
+    toolbar.append(&insert_image_button);
+
     (web_view, toolbar)
+}
+
+/// Rebuilds `flow`'s attachment chips from `attachments`' current contents -
+/// the same repopulate-from-truth shape `RecipientEntry` uses for its
+/// recipient chips - and toggles the flow's visibility on empty/non-empty so
+/// it collapses out of the layout when there's nothing attached.
+fn rebuild_attachment_chips(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, flow: &gtk::FlowBox) {
+    while let Some(child) = flow.first_child() {
+        flow.remove(&child);
+    }
+    for (index, item) in attachments.borrow().iter().enumerate() {
+        let chip = build_attachment_chip(attachments, flow, index, item);
+        flow.insert(&chip, index as i32);
+    }
+    flow.set_visible(!attachments.borrow().is_empty());
+}
+
+fn build_attachment_chip(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, flow: &gtk::FlowBox, index: usize, item: &PendingAttachment) -> gtk::Box {
+    let label = gtk::Label::builder()
+        .label(format!("{}  ·  {}", item.filename, crate::window::human_size(item.bytes.len() as u32)))
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .max_width_chars(28)
+        .build();
+    let remove = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .css_classes(["flat", "circular", "recipient-chip-remove"])
+        .tooltip_text("Remove attachment")
+        .build();
+    {
+        let attachments = attachments.clone();
+        let flow = flow.clone();
+        remove.connect_clicked(move |_| {
+            // Read the index at click time from the position the chip was
+            // built at: a rebuild recreates every chip, so a handler can
+            // never outlive its own row.
+            let mut list = attachments.borrow_mut();
+            if index < list.len() {
+                list.remove(index);
+            }
+            drop(list);
+            rebuild_attachment_chips(&attachments, &flow);
+        });
+    }
+
+    let chip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).build();
+    chip.add_css_class("recipient-chip");
+    chip.set_tooltip_text(Some(&item.filename));
+    chip.append(&label);
+    chip.append(&remove);
+    chip
 }
 
 /// Builds a composer widget, meant to be embedded as a page in the reading
@@ -770,6 +1049,22 @@ pub fn build_compose_view(
     fields_group.add(bcc_row.widget());
     fields_group.add(&subject_row);
 
+    // --- Attachments: a canonical in-session list (gone on Cancel/crash
+    // like any other unsaved edit - there's no draft-attachment
+    // persistence, matching Bcc/read-receipt's existing gap on reopening a
+    // draft), rendered as removable chips below the fields, same
+    // repopulate-from-truth shape `RecipientEntry` uses for To/Cc/Bcc.
+    let attachments: Rc<RefCell<Vec<PendingAttachment>>> = Rc::new(RefCell::new(Vec::new()));
+    let attachment_flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .row_spacing(4)
+        .column_spacing(4)
+        .min_children_per_line(1)
+        .max_children_per_line(64)
+        .homogeneous(false)
+        .visible(false)
+        .build();
+
     // --- Read-receipt request: RFC 8098's `Disposition-Notification-To`
     // header, asking recipients to notify us when they read the message.
     // The header is only added at build time (see `build_raw_message`), so
@@ -810,6 +1105,44 @@ pub fn build_compose_view(
         .tooltip_text("Toggle between plain text and formatted editing")
         .build();
     let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
+    // Always sensitive - unlike the formatting buttons, plain-text mode can
+    // carry real file attachments too.
+    let attach_button = gtk::Button::builder().icon_name("mail-attachment-symbolic").tooltip_text("Attach files").build();
+    {
+        let attachments = attachments.clone();
+        let attachment_flow = attachment_flow.clone();
+        attach_button.connect_clicked(move |button| {
+            let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+            let attachments = attachments.clone();
+            let attachment_flow = attachment_flow.clone();
+            glib::spawn_future_local(async move {
+                let dialog = gtk::FileDialog::builder().title("Attach files").build();
+                let Ok(files) = dialog.open_multiple_future(Some(&window)).await else { return };
+                for i in 0..files.n_items() {
+                    let Some(file) = files.item(i).and_downcast::<gio::File>() else { continue };
+                    let Ok(info) = file
+                        .query_info_future("standard::display-name,standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
+                        .await
+                    else {
+                        continue;
+                    };
+                    let content_type = info
+                        .content_type()
+                        .and_then(|ct| gio::functions::content_type_get_mime_type(&ct))
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    let Ok((bytes, _etag)) = file.load_contents_future().await else { continue };
+                    attachments.borrow_mut().push(PendingAttachment {
+                        filename: info.display_name().to_string(),
+                        content_type,
+                        bytes: Rc::new(bytes.to_vec()),
+                    });
+                }
+                rebuild_attachment_chips(&attachments, &attachment_flow);
+            });
+        });
+    }
+    editor_toolbar.append(&attach_button);
     editor_toolbar.append(&rich_toggle);
     editor_toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
     editor_toolbar.append(&format_toolbar);
@@ -850,6 +1183,7 @@ pub fn build_compose_view(
         rich_toggle: rich_toggle.clone(),
         body_view: body_view.clone(),
         rich_web_view: rich_web_view.clone(),
+        attachments: attachments.clone(),
         last_saved: Rc::new(RefCell::new(None)),
         draft_queued: Rc::new(Cell::new(false)),
         in_flight: Rc::new(Cell::new(false)),
@@ -948,6 +1282,7 @@ pub fn build_compose_view(
         .build();
     content.append(&top_row);
     content.append(&fields_group);
+    content.append(&attachment_flow);
     content.append(&editor_toolbar);
     content.append(&body_stack);
 
@@ -1006,32 +1341,33 @@ pub fn build_compose_view(
             let identities = identities.clone();
             let from_dropdown = from_dropdown.clone();
             let read_receipt_toggle = read_receipt_toggle.clone();
+            let attachments = attachments.clone();
             let in_reply_to = in_reply_to.clone();
             let references = references.clone();
             let closed = closed.clone();
             let on_done = on_done.clone();
             glib::spawn_future_local(async move {
-                let (text_body, html_body) = if rich {
+                let (text_body, html_body, inline_images) = if rich {
                     // Reading the editor's live HTML back out is a round trip
                     // through WebKit; if that fails (e.g. the page hasn't
                     // finished loading yet) fall back to the prefill body so a
                     // Send click can never silently drop the message.
                     match read_content(&rich_web_view).await {
-                        Some((html, text)) => {
-                            let text = text.trim().to_string();
+                        Some(content) => {
+                            let text = content.text.trim().to_string();
                             if text.is_empty() {
-                                (String::new(), None)
+                                (String::new(), None, vec![])
                             } else {
-                                let html = html.trim().to_string();
-                                (text, Some(html))
+                                let html = content.html.trim().to_string();
+                                (text, Some(html), content.images)
                             }
                         }
-                        None => (prefill_body_text, None),
+                        None => (prefill_body_text, None, vec![]),
                     }
                 } else {
                     let buffer = body_view.buffer();
                     let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
-                    (text, None)
+                    (text, None, vec![])
                 };
                 // If this message was draft-autosaved, delete the stored draft
                 // first so the sent mail doesn't linger in Drafts. Queued ahead
@@ -1055,6 +1391,8 @@ pub fn build_compose_view(
                     subject,
                     text_body,
                     html_body,
+                    attachments: attachments.borrow().iter().map(PendingAttachment::to_mail_attachment).collect(),
+                    inline_images,
                     calendar_part: None,
                     read_receipt: None,
                     request_read_receipt: read_receipt_toggle.is_active(),
@@ -1335,6 +1673,8 @@ mod tests {
             read_receipt: false,
             body: body_text.to_string(),
             body_text: body_text.to_string(),
+            attachments: vec![],
+            inline_images: vec![],
         }
     }
 
@@ -1357,6 +1697,21 @@ mod tests {
     }
 
     #[test]
+    fn an_attachment_or_inline_image_alone_makes_a_draft_worth_saving() {
+        let mut with_attachment = snapshot("", "", "");
+        with_attachment.attachments = vec![PendingAttachment {
+            filename: "photo.png".to_string(),
+            content_type: "image/png".to_string(),
+            bytes: Rc::new(vec![0u8; 4]),
+        }];
+        assert!(!draft_is_trivial(&with_attachment));
+
+        let mut with_image = snapshot("", "", "");
+        with_image.inline_images = vec![InlineImage { cid: "img-1@lookout.local".to_string(), content_type: "image/png".to_string(), bytes: vec![0u8; 4] }];
+        assert!(!draft_is_trivial(&with_image));
+    }
+
+    #[test]
     fn rich_blank_document_is_trivial() {
         // The rich editor's untouched document renders to whitespace-only
         // text even though its HTML is non-empty.
@@ -1370,6 +1725,8 @@ mod tests {
             read_receipt: false,
             body: "<p><br></p>".to_string(),
             body_text: "\n".to_string(),
+            attachments: vec![],
+            inline_images: vec![],
         };
         assert!(draft_is_trivial(&snap));
     }

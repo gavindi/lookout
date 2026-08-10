@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.18" date="2026-08-10">
+      <description>
+        <p>The composer now supports full HTML emails: attach files (shown as removable chips), insert or paste images directly into the body as inline pictures, and format with text alignment, font family, horizontal rules, indent/outdent, remove-formatting, and table insertion alongside the existing bold/italic/lists/color/link tools.</p>
+      </description>
+    </release>
     <release version="0.9.17" date="2026-08-10">
       <description>
         <p>Reworked the composer's header: Cc/Bcc are now reveal buttons on the To row, "Request read receipt" is a toggle icon next to the pop-out button, Cancel is a red trash icon, and the From selector moved into the header next to Send. Fixed the popped-out compose window's controls staying invisible after popping back in, and a leftover highlighted card sometimes left over the background after cancelling a message.</p>

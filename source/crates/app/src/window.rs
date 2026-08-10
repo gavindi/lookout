@@ -3089,6 +3089,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // corner, so the search sits directly beside it.
     search_entry.set_margin_start(12);
     window_header.pack_start(&search_entry);
+    // A second home for the View tab's Calendar overview toggle, docked at
+    // the header's right end just left of the (debug-only) .eml opener.
+    // Wired to `overview_pane_toggle` below, so either button flips both -
+    // they can never disagree about the pane's visibility, and the toggle
+    // state survives a round-trip through the Calendar/Config views. Like
+    // Home/View, it goes honest-disabled while another module is active
+    // (see the nav-rail handlers).
+    let header_calendar_overview_toggle = gtk::ToggleButton::builder()
+        .icon_name("x-office-calendar-symbolic")
+        .css_classes(["flat"])
+        .build();
+    header_calendar_overview_toggle.set_tooltip_text(Some("Calendar overview"));
+    window_header.pack_end(&header_calendar_overview_toggle);
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
 
@@ -3473,9 +3486,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         let state = state.clone();
+        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         overview_pane_toggle.connect_toggled(move |btn| {
             state.borrow().settings.set_bool(crate::settings::LAYOUT_CALENDAR_OVERVIEW, btn.is_active());
             mail_calendar_overview_card.set_visible(btn.is_active());
+            // Keep the header's copy in lockstep. `set_active` with the
+            // button's current value is a no-op, so the mirror handler below
+            // can't loop back into this one.
+            header_calendar_overview_toggle.set_active(btn.is_active());
+        });
+    }
+    {
+        // The header's own copy is a mirror: flipping it just drives
+        // `overview_pane_toggle`, whose handler owns the setting, the pane's
+        // visibility, and this button's state.
+        let overview_pane_toggle = overview_pane_toggle.clone();
+        header_calendar_overview_toggle.connect_toggled(move |btn| {
+            overview_pane_toggle.set_active(btn.is_active());
         });
     }
     {
@@ -3539,6 +3566,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let overview_pane_toggle = overview_pane_toggle.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
+        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         mail_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("mail");
@@ -3549,6 +3577,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active());
                 home_button.set_sensitive(true);
                 view_button.set_sensitive(true);
+                header_calendar_overview_toggle.set_sensitive(true);
             }
         });
     }
@@ -3560,6 +3589,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_module = current_module.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
+        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         calendar_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("calendar");
@@ -3568,6 +3598,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
+                header_calendar_overview_toggle.set_sensitive(false);
             }
         });
     }
@@ -3580,6 +3611,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let contacts_window = contacts_window.clone();
+        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         contacts_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("contacts");
@@ -3588,6 +3620,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
+                header_calendar_overview_toggle.set_sensitive(false);
                 // People may have been popped out into their own window -
                 // bring that to the front instead of the in-stack placeholder.
                 if let Some(win) = contacts_window.borrow().as_ref() {
@@ -3604,6 +3637,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_module = current_module.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
+        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         tasks_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("tasks");
@@ -3612,6 +3646,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
+                header_calendar_overview_toggle.set_sensitive(false);
             }
         });
     }
@@ -3623,6 +3658,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_module = current_module.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
+        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         lookout_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("lookout");
@@ -3631,6 +3667,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
+                header_calendar_overview_toggle.set_sensitive(false);
             }
         });
     }
@@ -8071,6 +8108,8 @@ fn respond_to_imip_invitation(
         subject,
         text_body: format!("{subject_prefix}."),
         html_body: None,
+        attachments: vec![],
+        inline_images: vec![],
         calendar_part: Some(reply_ics),
         read_receipt: None,
         request_read_receipt: false,
@@ -10213,7 +10252,7 @@ fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<&lookout_co
 
 /// Renders an attachment's size as a human-readable string (e.g. `"12.3 KB"`),
 /// matching the binary-unit convention everyone expects for file sizes.
-fn human_size(bytes: u32) -> String {
+pub(crate) fn human_size(bytes: u32) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
@@ -10853,6 +10892,8 @@ fn send_read_receipt(state: &Rc<RefCell<UiState>>, automatic: bool) -> bool {
         // with the human-readable part it builds itself.
         text_body: String::new(),
         html_body: None,
+        attachments: vec![],
+        inline_images: vec![],
         calendar_part: None,
         read_receipt: Some(lookout_mail::ReadReceipt {
             original_message_id,

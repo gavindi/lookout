@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.18 (2026-08-10)
+
+### Added
+
+- **Mail**: the composer's rich-text mode grew into a genuinely full-HTML editor. A paperclip button in the editor toolbar attaches one or more files, shown as removable chips (reusing the To/Cc/Bcc chip style) below the fields, sent as regular `multipart/mixed` attachments. An "Insert image" toolbar button and clipboard paste both drop a picture straight into the body - held as a `data:` URI while composing (so it renders live in the editor) and rewritten to a `cid:`-referenced inline attachment at send/autosave time, with the extraction keyed off a deterministic hash of the image data so the same picture always gets the same Content-ID across autosave ticks. The formatting toolbar gained text alignment (left/center/right/justify), indent/outdent, a horizontal rule button, remove-formatting, a font-family dropdown alongside the existing font-size one, and a table insert (a small rows × columns dialog). Drag-and-drop image insertion is explicitly out of scope for now - dropping a file onto the editor is suppressed outright rather than left to WebKit's default handling.
+
+### Testing
+
+- `lookout-mail`: `send` tests for the new `Attachment`/`InlineImage` types - an attachment alone producing `multipart/mixed` with the right `Content-Disposition`/filename/content type, an inline image carrying its `Content-ID` and `inline` disposition, text+HTML+attachment+inline image together assembling the full nested structure, empty attachments/images leaving existing output unchanged, and calendar replies (which build their own custom MIME body) never picking up attachments by accident.
+- `lookout-app`: a `compose` test confirming an attachment- or inline-image-only draft (no typed text) still counts as worth autosaving, matching the existing recipient/subject/body-text trivia checks.
+
 ## 0.9.17 (2026-08-10)
 
 ### Added

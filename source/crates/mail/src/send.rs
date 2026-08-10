@@ -49,6 +49,28 @@ pub struct ReadReceipt {
     pub original_headers: Vec<(String, String)>,
 }
 
+/// A regular (non-inline) file attached to a composed message. `content_type`
+/// is always supplied by the caller - the app crate resolves it from the
+/// picked file before building this; nothing here guesses it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub filename: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// An inline, `cid:`-referenced image embedded in an HTML body - extracted
+/// from a `data:` URI at compose time (see the app crate's `read_content`).
+/// `cid` is the bare Content-ID (no angle brackets) the HTML body's
+/// `<img src="cid:...">` already references; `mail_builder`'s `.inline()`
+/// adds the brackets itself when writing the `Content-ID` header.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlineImage {
+    pub cid: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
 /// A message the user has composed, ready to be built into a raw RFC 5322
 /// document and sent. `from` is the sending identity's address (an account
 /// can send as several identities); `display_name`, when set, goes into the
@@ -73,6 +95,13 @@ pub struct ComposedMessage {
     /// Optional HTML rendering of the same body. Both parts are sent when
     /// set; recipients that only handle plain text fall back to `text_body`.
     pub html_body: Option<String>,
+    /// Regular (non-inline) file attachments. Ignored by the calendar-reply
+    /// and read-receipt branches below, which build their own MIME body via
+    /// `.body(...)` and so never see `mail_builder`'s attachment assembly.
+    pub attachments: Vec<Attachment>,
+    /// Inline, `cid:`-referenced images embedded in `html_body`. Same
+    /// calendar-reply/read-receipt exclusion as `attachments`.
+    pub inline_images: Vec<InlineImage>,
     /// An RFC 6047 iMIP payload: the raw iCalendar document (which itself
     /// carries its `METHOD` - see `lookout-dav`'s `build_imip_vcalendar`).
     /// When set, the message is built as `multipart/alternative`
@@ -161,6 +190,15 @@ pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>
         builder = builder.text_body(msg.text_body.clone());
         if let Some(html) = msg.html_body.as_deref().filter(|h| !h.is_empty()) {
             builder = builder.html_body(html.to_string());
+        }
+        // `.inline()`/`.attachment()` both push into the same internal list;
+        // `write_body()` wraps everything in one `multipart/mixed` alongside
+        // the text/html `multipart/alternative` - no custom MIME tree needed.
+        for image in &msg.inline_images {
+            builder = builder.inline(image.content_type.clone(), image.cid.clone(), image.bytes.clone());
+        }
+        for attachment in &msg.attachments {
+            builder = builder.attachment(attachment.content_type.clone(), attachment.filename.clone(), attachment.bytes.clone());
         }
     }
 
@@ -316,6 +354,8 @@ mod tests {
             subject: "test".to_string(),
             text_body: "plain part".to_string(),
             html_body: html,
+            attachments: vec![],
+            inline_images: vec![],
             calendar_part: None,
             read_receipt: None,
             request_read_receipt: false,
@@ -371,6 +411,68 @@ mod tests {
         let raw = raw_to_string(&sample_message(Some(String::new())));
         assert!(!raw.to_lowercase().contains("text/html"));
         assert!(raw.contains("plain part"));
+    }
+
+    fn sample_attachment() -> Attachment {
+        Attachment { filename: "report.pdf".to_string(), content_type: "application/pdf".to_string(), bytes: b"%PDF-fake".to_vec() }
+    }
+
+    fn sample_inline_image() -> InlineImage {
+        InlineImage { cid: "img-1@lookout.local".to_string(), content_type: "image/png".to_string(), bytes: vec![0x89, 0x50, 0x4e, 0x47] }
+    }
+
+    #[test]
+    fn attachment_produces_multipart_mixed_with_content_disposition_and_filename() {
+        let mut msg = sample_message(None);
+        msg.attachments = vec![sample_attachment()];
+        let raw = raw_to_string(&msg);
+        let lower = raw.to_lowercase();
+        assert!(lower.contains("multipart/mixed"), "raw:\n{raw}");
+        assert!(lower.contains("content-disposition: attachment"), "raw:\n{raw}");
+        assert!(lower.contains("filename=\"report.pdf\""), "raw:\n{raw}");
+        assert!(lower.contains("application/pdf"), "raw:\n{raw}");
+        assert!(raw.contains("plain part"));
+    }
+
+    #[test]
+    fn inline_image_carries_content_id_and_inline_disposition() {
+        let mut msg = sample_message(Some("<p>see <img src=\"cid:img-1@lookout.local\"></p>".to_string()));
+        msg.inline_images = vec![sample_inline_image()];
+        let raw = raw_to_string(&msg);
+        let lower = raw.to_lowercase();
+        assert!(lower.contains("content-disposition: inline"), "raw:\n{raw}");
+        assert!(raw.contains("Content-ID: <img-1@lookout.local>"), "raw:\n{raw}");
+        assert!(lower.contains("image/png"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn text_html_attachment_and_inline_image_together_assemble_the_full_nested_structure() {
+        let mut msg = sample_message(Some("<p>hi</p>".to_string()));
+        msg.attachments = vec![sample_attachment()];
+        msg.inline_images = vec![sample_inline_image()];
+        let raw = raw_to_string(&msg);
+        let lower = raw.to_lowercase();
+        assert!(lower.contains("multipart/mixed"), "raw:\n{raw}");
+        assert!(lower.contains("multipart/alternative"), "raw:\n{raw}");
+        assert!(lower.contains("text/plain"));
+        assert!(lower.contains("text/html"));
+        assert!(lower.contains("content-disposition: inline"));
+        assert!(lower.contains("filename=\"report.pdf\""));
+    }
+
+    #[test]
+    fn no_attachments_or_inline_images_leaves_output_unchanged() {
+        let raw = raw_to_string(&sample_message(Some("<p>x</p>".to_string())));
+        assert!(!raw.to_lowercase().contains("multipart/mixed"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn calendar_reply_ignores_attachments() {
+        let mut msg = sample_message(None);
+        msg.calendar_part = Some(imip_ics("REPLY"));
+        msg.attachments = vec![sample_attachment()];
+        let raw = raw_to_string(&msg);
+        assert!(!raw.to_lowercase().contains("report.pdf"), "raw:\n{raw}");
     }
 
     #[test]
