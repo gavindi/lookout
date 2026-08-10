@@ -2563,14 +2563,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // thread, so it must not touch `UiState` - it only forwards the request
     // to the main loop, which matches it against the rendered message's
     // inline parts and fetches the bytes on demand (`FetchAttachment`, served
-    // from the flat-file cache on repeat visits). Marking the scheme local
-    // makes it behave like `file://` for the page's subresource loads
-    // (defensive; image loads are CORS-free anyway).
+    // from the flat-file cache on repeat visits).
+    //
+    // Deliberately *not* calling `WebKitSecurityManager::register_uri_scheme_
+    // as_local` here - despite how it reads, "local" is a restriction, not a
+    // grant: it means *other* non-local pages are forbidden from linking to
+    // this scheme, not that this scheme is reachable from anywhere. The
+    // message body is loaded via `load_html(html, None)`, which gives the
+    // page a non-local origin - so marking "cid" local was actively cutting
+    // the page's own image tags off from the scheme meant to serve them,
+    // which is exactly why no inline image ever loaded. A bare
+    // `register_uri_scheme` with no security-manager registration is what
+    // makes the scheme reachable from any page, local or not.
     let (cid_tx, cid_rx) = async_channel::unbounded();
     if let Some(context) = web_view.context() {
-        if let Some(security_manager) = context.security_manager() {
-            security_manager.register_uri_scheme_as_local("cid");
-        }
         context.register_uri_scheme("cid", move |request| {
             let Some(cid) = request.path() else { return };
             let _ = cid_tx.send_blocking(CidSchemeRequest {

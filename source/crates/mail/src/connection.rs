@@ -1,11 +1,48 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
 use crate::error::{Error, Result};
+
+/// A connection sitting in IMAP IDLE deliberately has no traffic flowing for
+/// long stretches (up to `IDLE_SLICE` in `session.rs`), which is exactly what
+/// a dead connection also looks like from the client's perspective - the OS
+/// gives no signal on its own that a NAT/firewall/wifi-sleep dropped the
+/// socket underneath. Without keepalive probes, a read on that socket just
+/// hangs forever instead of erroring, so the reconnect-with-backoff logic in
+/// `session.rs` never gets a chance to run - the app silently stops seeing
+/// new mail until it's restarted. TCP keepalive (not an app-level idle
+/// timeout, which would need to special-case legitimate IDLE silence) lets
+/// the OS itself detect this: after `KEEPALIVE_IDLE` with no traffic it sends
+/// probes every `KEEPALIVE_INTERVAL`, and surfaces a connection-reset error
+/// after `KEEPALIVE_RETRIES` unanswered probes - well within a single
+/// `IDLE_SLICE`, so a dead connection is caught long before the next
+/// scheduled IDLE re-issue would have noticed anything wrong.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RETRIES: u32 = 6;
+
+/// Enables TCP keepalive on `stream` so a connection that dies silently
+/// underneath (see `KEEPALIVE_IDLE`'s doc comment) surfaces as an error
+/// instead of hanging every read/write on it forever. Applied via `SockRef`
+/// on the live socket - no ownership change, so it composes with `tokio`'s
+/// async `TcpStream` and ordinary connect-time errors from the OS are
+/// non-fatal (logged, not propagated): keepalive is a reliability
+/// improvement, not a requirement for the connection to function.
+fn enable_keepalive(stream: &TcpStream) {
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    if let Err(e) = SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!("failed to enable TCP keepalive: {e}");
+    }
+}
 
 /// The stream type handed to `async_imap::Client::new()`. With the crate's
 /// `runtime-tokio` feature enabled, async-imap's internal `Read`/`Write`
@@ -74,6 +111,7 @@ pub async fn connect_tls(host: &str, port: u16) -> Result<ImapStream> {
 
     tracing::debug!("connect_tls: tcp connecting to {host}:{port}");
     let tcp = TcpStream::connect((host, port)).await?;
+    enable_keepalive(&tcp);
     tracing::debug!("connect_tls: tcp connected, starting tls handshake");
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| Error::InvalidServerName(host.to_string()))?;
     let tls = connector.connect(server_name, tcp).await?;
@@ -141,6 +179,7 @@ async fn connect_tls_insecure_for_tests(host: &str, port: u16) -> Result<ImapStr
     let connector = TlsConnector::from(Arc::new(config));
 
     let tcp = TcpStream::connect((host, port)).await?;
+    enable_keepalive(&tcp);
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| Error::InvalidServerName(host.to_string()))?;
     let tls = connector.connect(server_name, tcp).await?;
     Ok(tls)

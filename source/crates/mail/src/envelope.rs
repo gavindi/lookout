@@ -128,20 +128,7 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
         .or_else(|| fetch.internal_date().map(|d| d.with_timezone(&Utc)))
         .unwrap_or_else(Utc::now);
 
-    let mut flags = BTreeSet::new();
-    let mut keywords = BTreeSet::new();
-    for flag in fetch.flags() {
-        let raw = imap_flag_to_string(&flag);
-        match SystemFlagBit::from_imap_flag(&raw) {
-            Some(bit) => {
-                flags.insert(bit);
-            }
-            None if raw == "\\Recent" => {}
-            None => {
-                keywords.insert(raw);
-            }
-        }
-    }
+    let (flags, keywords) = flags_from_fetch(fetch);
 
     let structure = fetch.bodystructure().map(crate::structure::parts_from_bodystructure);
     let has_attachment = structure.as_ref().map(|p| crate::structure::has_attachments(p)).unwrap_or(false);
@@ -167,6 +154,28 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
         preview: None, // Requires a body fetch; filled in by `sync_mailbox`'s second phase.
         structure,
     })
+}
+
+/// Parses a fetch response item's `FLAGS` into system flag bits and custom
+/// keyword atoms (including the `$Lookout-tag-*` color-tag namespace).
+/// Shared by `summary_from_fetch` and `sync_mailbox`'s lightweight
+/// flags-only refresh, so both classify flags identically.
+pub fn flags_from_fetch(fetch: &Fetch) -> (BTreeSet<SystemFlagBit>, BTreeSet<String>) {
+    let mut flags = BTreeSet::new();
+    let mut keywords = BTreeSet::new();
+    for flag in fetch.flags() {
+        let raw = imap_flag_to_string(&flag);
+        match SystemFlagBit::from_imap_flag(&raw) {
+            Some(bit) => {
+                flags.insert(bit);
+            }
+            None if raw == "\\Recent" => {}
+            None => {
+                keywords.insert(raw);
+            }
+        }
+    }
+    (flags, keywords)
 }
 
 fn imap_flag_to_string(flag: &async_imap::types::Flag<'_>) -> String {

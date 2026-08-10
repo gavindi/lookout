@@ -10,7 +10,7 @@ use crate::auth::XOAuth2Authenticator;
 use crate::body::{parse_body, preview_from_raw};
 use crate::config::{AccountConfig, Credential};
 use crate::connection::{connect_tls, ImapStream};
-use crate::envelope::summary_from_fetch;
+use crate::envelope::{flags_from_fetch, summary_from_fetch};
 use crate::error::{Error, Result};
 use crate::send::{build_raw_message, send_smtp, ComposedMessage};
 
@@ -461,9 +461,15 @@ pub async fn run_account_session(
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+    // A command that arrived while disconnected (see below) and must not be
+    // lost - handed to the next `connect_and_run` so it's the first thing
+    // processed once a session exists again, exactly as if it had arrived
+    // right after connecting.
+    let mut carried_command: Option<AccountCommand> = None;
+
     loop {
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
-        match connect_and_run(&config, credentials.as_ref(), &commands, &events, cache.as_ref()).await {
+        match connect_and_run(&config, credentials.as_ref(), &commands, &events, cache.as_ref(), carried_command.take()).await {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
                 return;
@@ -488,13 +494,22 @@ pub async fn run_account_session(
         // when `Gio.NetworkMonitor` reports connectivity is back - no point
         // waiting out a multi-second delay once the network is actually
         // usable again). `Shutdown` received while disconnected exits
-        // immediately rather than looping back into another connect attempt.
+        // immediately rather than looping back into another connect attempt;
+        // any other command (the user opened a message, switched folders,
+        // ...) can't be answered without a session, but must not just vanish
+        // either - it's carried into the next `connect_and_run` above rather
+        // than dropped, so reconnecting doesn't silently eat the interaction
+        // that was waiting on it.
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
             cmd = commands.recv() => {
-                if matches!(cmd, Ok(AccountCommand::Shutdown)) {
-                    let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
-                    return;
+                match cmd {
+                    Ok(AccountCommand::Shutdown) => {
+                        let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                        return;
+                    }
+                    Ok(other) => carried_command = Some(other),
+                    Err(_) => {}
                 }
             }
         }
@@ -512,6 +527,7 @@ async fn connect_and_run(
     commands: &async_channel::Receiver<AccountCommand>,
     events: &async_channel::Sender<AccountEvent>,
     cache: Option<&crate::cache::Cache>,
+    mut carried_command: Option<AccountCommand>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
     let mut session = login(config, credential).await?;
@@ -583,57 +599,63 @@ async fn connect_and_run(
         // folder-count STATUS) waited on a SELECT plus those two round trips
         // purely to be handed something already in hand. That is most of what
         // made a folder click land a beat late while counts were filling in.
-        let wake = match commands.try_recv() {
-            Ok(cmd) => Wake::Command(cmd),
-            Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
-            Err(async_channel::TryRecvError::Empty) => {
-                let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
+        // A command carried over from a previous, failed connection attempt
+        // (see `run_account_session`) takes priority over the queue - it's
+        // already the oldest thing waiting to be answered.
+        let wake = match carried_command.take() {
+            Some(cmd) => Wake::Command(cmd),
+            None => match commands.try_recv() {
+                Ok(cmd) => Wake::Command(cmd),
+                Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
+                Err(async_channel::TryRecvError::Empty) => {
+                    let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
-                // A cache-served folder switch (or an interrupted prefetch) can
-                // leave the session SELECTed on a different folder than the one
-                // the user is viewing. IDLE only reports changes to the
-                // currently-selected folder, so bring the session back in line
-                // before the wait. This is a cheap round trip (no FETCH) and is
-                // skipped whenever the session already matches. Only reached on
-                // the way *into* IDLE, so a queued command never pays for it -
-                // its own handler selects whatever folder it needs.
-                if session_selected != current_mailbox_id {
-                    session.select(&current_mailbox_name).await?;
-                    session_selected = current_mailbox_id.clone();
+                    // A cache-served folder switch (or an interrupted prefetch) can
+                    // leave the session SELECTed on a different folder than the one
+                    // the user is viewing. IDLE only reports changes to the
+                    // currently-selected folder, so bring the session back in line
+                    // before the wait. This is a cheap round trip (no FETCH) and is
+                    // skipped whenever the session already matches. Only reached on
+                    // the way *into* IDLE, so a queued command never pays for it -
+                    // its own handler selects whatever folder it needs.
+                    if session_selected != current_mailbox_id {
+                        session.select(&current_mailbox_name).await?;
+                        session_selected = current_mailbox_id.clone();
+                    }
+
+                    let mut handle = session.idle();
+                    handle.init().await?;
+                    let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
+
+                    // Race the IDLE wait against the next command so an on-demand
+                    // request (open a message, switch folders, ...) doesn't wait for
+                    // IDLE_SLICE to elapse. If the command branch wins, `wait_fut` is
+                    // dropped along with `stop_source`; dropping a `StopSource` cancels
+                    // its associated wait immediately (see `stop_token::StopSource`'s
+                    // docs) - but since we're also dropping `wait_fut` itself here, we
+                    // don't even need to observe that cancellation, we just move
+                    // straight on to `handle.done()` below to send IMAP's `DONE` and
+                    // reclaim the session.
+                    let wake = tokio::select! {
+                        r = wait_fut => Wake::Idle(r),
+                        c = commands.recv() => match c {
+                            Ok(cmd) => Wake::Command(cmd),
+                            Err(_) => Wake::ChannelClosed,
+                        },
+                    };
+
+                    // Emit cached messages for instant display the instant a folder
+                    // switch arrives, *before* the IDLE teardown (handle.done().await)
+                    // so the UI paints from disk while we wait for the network round-trip.
+                    if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
+                        emit_cached_messages(cache, mailbox_id, events).await;
+                    }
+
+                    drop(stop_source);
+                    session = handle.done().await?;
+                    wake
                 }
-
-                let mut handle = session.idle();
-                handle.init().await?;
-                let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
-
-                // Race the IDLE wait against the next command so an on-demand
-                // request (open a message, switch folders, ...) doesn't wait for
-                // IDLE_SLICE to elapse. If the command branch wins, `wait_fut` is
-                // dropped along with `stop_source`; dropping a `StopSource` cancels
-                // its associated wait immediately (see `stop_token::StopSource`'s
-                // docs) - but since we're also dropping `wait_fut` itself here, we
-                // don't even need to observe that cancellation, we just move
-                // straight on to `handle.done()` below to send IMAP's `DONE` and
-                // reclaim the session.
-                let wake = tokio::select! {
-                    r = wait_fut => Wake::Idle(r),
-                    c = commands.recv() => match c {
-                        Ok(cmd) => Wake::Command(cmd),
-                        Err(_) => Wake::ChannelClosed,
-                    },
-                };
-
-                // Emit cached messages for instant display the instant a folder
-                // switch arrives, *before* the IDLE teardown (handle.done().await)
-                // so the UI paints from disk while we wait for the network round-trip.
-                if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
-                    emit_cached_messages(cache, mailbox_id, events).await;
-                }
-
-                drop(stop_source);
-                session = handle.done().await?;
-                wake
-            }
+            },
         };
 
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Busy)).await;
@@ -1068,11 +1090,7 @@ async fn connect_and_run(
                     }
                     match empty_mailbox(&mut session).await {
                         Ok(count) => {
-                            let role = folders
-                                .iter()
-                                .find(|m| m.id == mailbox)
-                                .map(|m| m.role)
-                                .unwrap_or(MailboxRole::Custom);
+                            let role = folders.iter().find(|m| m.id == mailbox).map(|m| m.role).unwrap_or(MailboxRole::Custom);
                             let _ = events.send(AccountEvent::MailboxExpunged { role }).await;
                             if count > 0 {
                                 if let Some(cache) = cache {
@@ -1952,22 +1970,52 @@ async fn sync_mailbox(
 ) -> Result<()> {
     let mailbox_meta = session.select(folder_path).await?;
     let uidvalidity = UidValidity(mailbox_meta.uid_validity.unwrap_or(0));
-    // The display list shows every message in the folder, so fetch it all:
-    // any window - UID or sequence - silently drops the older mail that large
-    // folders like Gmail's All Mail exist to show (the account-global UID
-    // counter makes a UID window miss still-present messages outright). Full
-    // CONDSTORE/QRESYNC incremental sync is Phase 2 - until then every sync
-    // is a full re-fetch of the folder's envelope set.
-    // `BODYSTRUCTURE` rides along so `summary_from_fetch` can fill in the
-    // part structure / `has_attachment` without any body fetch - it's what
-    // lets opening a message download only its text parts.
-    let fetches: Vec<_> = session
-        .fetch("1:*", "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
-        .await?
-        .try_collect()
-        .await?;
+    // The display list shows every message in the folder, so every sync
+    // still learns the full current UID set: any window - UID or sequence -
+    // silently drops the older mail that large folders like Gmail's All Mail
+    // exist to show (the account-global UID counter makes a UID window miss
+    // still-present messages outright). But `ENVELOPE`/`BODYSTRUCTURE` never
+    // change once a message exists - only `FLAGS` does - so a UID already
+    // cached under the mailbox's current `uidvalidity` doesn't need either
+    // refetched, just its flags refreshed. This first fetch is deliberately
+    // cheap (`UID FLAGS` only) so it also doubles as the full-mailbox
+    // liveness/membership check.
+    let cached: HashMap<Uid, EmailSummary> = match cache {
+        Some(cache) => cache.load_messages_by_uid(mailbox_id, uidvalidity).unwrap_or_default(),
+        None => HashMap::new(),
+    };
+    let flag_fetches: Vec<_> = session.fetch("1:*", "(UID FLAGS)").await?.try_collect().await?;
 
-    let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)).collect();
+    let mut messages: Vec<EmailSummary> = Vec::with_capacity(flag_fetches.len());
+    let mut new_uids: Vec<Uid> = Vec::new();
+    for fetch in &flag_fetches {
+        let Some(uid) = fetch.uid.map(Uid) else { continue };
+        match cached.get(&uid) {
+            Some(cached_summary) => {
+                let (flags, keywords) = flags_from_fetch(fetch);
+                let mut msg = cached_summary.clone();
+                msg.flags = flags;
+                msg.keywords = keywords;
+                messages.push(msg);
+            }
+            None => new_uids.push(uid),
+        }
+    }
+    // Full `ENVELOPE`/`BODYSTRUCTURE` fetch, but only for UIDs this mailbox
+    // hasn't cached yet - new arrivals, or the first sync since a
+    // `UIDVALIDITY` change invalidated everything cached. `BODYSTRUCTURE`
+    // rides along so `summary_from_fetch` can fill in the part structure /
+    // `has_attachment` without any body fetch - it's what lets opening a
+    // message download only its text parts.
+    if !new_uids.is_empty() {
+        let uid_set = new_uids.iter().map(|u| u.0.to_string()).collect::<Vec<_>>().join(",");
+        let fetches: Vec<_> = session
+            .uid_fetch(&uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
+            .await?
+            .try_collect()
+            .await?;
+        messages.extend(fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)));
+    }
 
     let keys = lookout_core::thread::compute_thread_keys(&messages);
     for msg in &mut messages {
@@ -1976,22 +2024,15 @@ async fn sync_mailbox(
         }
     }
 
-    // Carry cached snippets forward before `replace_messages` wipes them.
-    // The envelope fetch above can't produce a preview, so without this every
-    // resync would blank the whole list and re-fetch every body.
-    if let Some(cache) = cache {
-        match cache.load_previews(mailbox_id) {
-            Ok(previews) if !previews.is_empty() => {
-                for msg in &mut messages {
-                    msg.preview = previews.get(&msg.uid).cloned();
-                }
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("failed to load cached previews for {mailbox_id}: {e}"),
-        }
-    }
-
-    tracing::debug!(account = %account_id, mailbox = %folder_path, exists = mailbox_meta.exists, count = messages.len(), "synced mailbox");
+    tracing::debug!(
+        account = %account_id,
+        mailbox = %folder_path,
+        exists = mailbox_meta.exists,
+        count = messages.len(),
+        new = new_uids.len(),
+        reused = messages.len().saturating_sub(new_uids.len()),
+        "synced mailbox"
+    );
     emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
 
     // Phase two: fill in the snippets this sync is still missing, then emit a

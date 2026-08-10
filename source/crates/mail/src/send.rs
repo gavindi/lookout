@@ -333,10 +333,7 @@ fn split_mailbox(token: &str) -> (Option<String>, String) {
     if let Some(start) = token.rfind('<') {
         if let Some(address) = token[start + 1..].strip_suffix('>') {
             let name = token[..start].trim().trim_matches('"').trim();
-            return (
-                (!name.is_empty()).then(|| name.to_string()),
-                address.trim().to_string(),
-            );
+            return ((!name.is_empty()).then(|| name.to_string()), address.trim().to_string());
         }
     }
     (None, token.to_string())
@@ -466,11 +463,19 @@ mod tests {
     }
 
     fn sample_attachment() -> Attachment {
-        Attachment { filename: "report.pdf".to_string(), content_type: "application/pdf".to_string(), bytes: b"%PDF-fake".to_vec() }
+        Attachment {
+            filename: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            bytes: b"%PDF-fake".to_vec(),
+        }
     }
 
     fn sample_inline_image() -> InlineImage {
-        InlineImage { cid: "img-1@lookout.local".to_string(), content_type: "image/png".to_string(), bytes: vec![0x89, 0x50, 0x4e, 0x47] }
+        InlineImage {
+            cid: "img-1@lookout.local".to_string(),
+            content_type: "image/png".to_string(),
+            bytes: vec![0x89, 0x50, 0x4e, 0x47],
+        }
     }
 
     #[test]

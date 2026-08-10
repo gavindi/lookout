@@ -471,10 +471,14 @@ impl Cache {
         Ok(mailboxes)
     }
 
-    /// Replaces the cached envelope window for one mailbox. Like
-    /// `replace_mailboxes`, this mirrors `sync_mailbox`'s own
-    /// bounded-re-fetch-not-diff strategy (see that function's doc comment)
-    /// rather than trying to merge incrementally.
+    /// Replaces the cached envelope window for one mailbox with `messages` -
+    /// the mailbox's full current set, as assembled by `sync_mailbox`
+    /// (itself an incremental fetch: unchanged UIDs' `ENVELOPE`/`BODYSTRUCTURE`
+    /// come straight from this same cache rather than the network - see that
+    /// function's doc comment). The wholesale delete-and-reinsert here is
+    /// just how the *storage* is kept in sync with that already-merged list,
+    /// so a message missing from `messages` (expunged since last sync)
+    /// naturally drops out of the cache too.
     pub fn replace_messages(&self, mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -503,6 +507,26 @@ impl Cache {
         for row in rows {
             if let Ok(msg) = serde_json::from_str::<EmailSummary>(&row?) {
                 messages.push(msg);
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Loads cached summaries for `mailbox_id`, keyed by UID, but only the
+    /// ones cached under `uidvalidity` - a mismatch (the mailbox was
+    /// recreated, RFC 3501 §2.3.1.1) means a cached UID no longer names the
+    /// same message, so those rows must never be reused as-is. Used by
+    /// `sync_mailbox`'s incremental refresh to tell which UIDs already have
+    /// an ENVELOPE/BODYSTRUCTURE worth keeping - those never change once a
+    /// message exists, so only a UID missing here needs a full re-fetch.
+    pub fn load_messages_by_uid(&self, mailbox_id: &MailboxId, uidvalidity: UidValidity) -> Result<std::collections::HashMap<Uid, EmailSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uidvalidity = ?2")?;
+        let rows = stmt.query_map(rusqlite::params![mailbox_id.0, uidvalidity.0], |row| row.get::<_, String>(0))?;
+        let mut messages = std::collections::HashMap::new();
+        for row in rows {
+            if let Ok(msg) = serde_json::from_str::<EmailSummary>(&row?) {
+                messages.insert(msg.uid, msg);
             }
         }
         Ok(messages)
@@ -1272,9 +1296,6 @@ mod tests {
         }
     }
 
-    /// The stickiness `sync_mailbox` depends on: a preview written once is
-    /// readable back after the wholesale `replace_messages` wipe, so a resync
-    /// doesn't blank every snippet and re-fetch them all.
     #[test]
     fn round_trips_previews_and_omits_messages_without_one() {
         let account_id = temp_account_id();
@@ -1291,6 +1312,36 @@ mod tests {
         assert_eq!(previews.len(), 1);
         assert_eq!(previews.get(&Uid(1)).map(String::as_str), Some("Truffle Security Co. says it scanned..."));
         assert!(!previews.contains_key(&Uid(2)));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The stickiness `sync_mailbox`'s incremental refresh depends on: a
+    /// cached summary (envelope, structure, preview - everything but flags)
+    /// is readable back keyed by uid, so a UID already known under the
+    /// current `uidvalidity` never needs its `ENVELOPE`/`BODYSTRUCTURE`
+    /// refetched - only a cheap `FLAGS` lookup. A uidvalidity mismatch (the
+    /// mailbox was recreated) must yield nothing, the same guarantee
+    /// `load_body`/`load_attachment` give elsewhere - a stale UID can never
+    /// be reused as if it named the same message.
+    #[test]
+    fn load_messages_by_uid_respects_uidvalidity() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let messages = vec![sample_summary(&mailbox_id, 1, Some("preview one")), sample_summary(&mailbox_id, 2, None)];
+        cache.replace_messages(&mailbox_id, UidValidity(7), &messages).unwrap();
+
+        let by_uid = cache.load_messages_by_uid(&mailbox_id, UidValidity(7)).unwrap();
+        assert_eq!(by_uid.len(), 2);
+        assert_eq!(by_uid.get(&Uid(1)).and_then(|m| m.preview.as_deref()), Some("preview one"));
+        assert_eq!(by_uid.get(&Uid(2)).and_then(|m| m.subject.as_deref()), Some("subject 2"));
+
+        // A different uidvalidity - as if the mailbox had been recreated -
+        // must not resolve any of the same UIDs to this cached data.
+        assert!(cache.load_messages_by_uid(&mailbox_id, UidValidity(8)).unwrap().is_empty());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

@@ -27,6 +27,7 @@ uuid.workspace = true
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json.workspace = true
+socket2 = "0.6.5"
 
 [features]
 # Only for lookout-mail's own integration tests (see tests/imap_integration.rs):

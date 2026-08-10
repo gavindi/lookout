@@ -859,7 +859,30 @@ fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
                     .unwrap_or_else(|| "image/png".to_string());
                 let Ok((bytes, _etag)) = file.load_contents_future().await else { return };
                 let data_uri = format!("data:{content_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
-                web_view.execute_editing_command_with_argument("InsertHTML", &format!("<img src=\"{data_uri}\" alt=\"\">"));
+                web_view.grab_focus();
+                // `grab_focus` only gives the WebView widget keyboard focus - it
+                // doesn't put a caret in `document.body`, which is what the
+                // insert command actually targets. If the user hasn't clicked
+                // into the body yet there's no selection to insert at, so one
+                // is created here (collapsed to the end of the content) before
+                // firing the insert.
+                let script = format!(
+                    r#"(function () {{
+                        document.body.focus();
+                        var sel = window.getSelection();
+                        var inBody = sel.rangeCount > 0 && document.body.contains(sel.getRangeAt(0).commonAncestorContainer);
+                        if (!inBody) {{
+                            var r = document.createRange();
+                            r.selectNodeContents(document.body);
+                            r.collapse(false);
+                            sel.removeAllRanges();
+                            sel.addRange(r);
+                        }}
+                        document.execCommand('insertImage', false, {data_uri_json});
+                    }})()"#,
+                    data_uri_json = serde_json::to_string(&data_uri).unwrap()
+                );
+                let _ = web_view.evaluate_javascript_future(&script, None, None).await;
             });
         });
     }
@@ -1355,7 +1378,12 @@ pub fn build_compose_view(
                     match read_content(&rich_web_view).await {
                         Some(content) => {
                             let text = content.text.trim().to_string();
-                            if text.is_empty() {
+                            // A body that's purely an inserted image (no
+                            // surrounding text) has no visible text at all -
+                            // `innerText` only sees text nodes - so emptiness
+                            // alone can't mean "nothing worth sending" here;
+                            // an image with no caption is still real content.
+                            if text.is_empty() && content.images.is_empty() {
                                 (String::new(), None, vec![])
                             } else {
                                 let html = content.html.trim().to_string();
