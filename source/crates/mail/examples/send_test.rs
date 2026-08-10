@@ -150,6 +150,10 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::PartFetchFailed { .. } => {}
                     AccountEvent::RawMessageFetched { .. } => {}
                     AccountEvent::RawMessageFetchFailed { .. } => {}
+                    AccountEvent::SendFailed(e) => {
+                        println!("SEND FAILED: {e}");
+                        break;
+                    }
                     AccountEvent::Error(e) => {
                         println!("ERROR: {e}");
                         break;

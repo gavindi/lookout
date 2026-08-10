@@ -377,6 +377,11 @@ pub enum AccountEvent {
         message: String,
     },
     SendCompleted,
+    /// A `SendMessage` request failed. Kept distinct from the generic
+    /// `Error` below so the UI can retract the "Sending…" toast it showed
+    /// for this specific send without also swallowing unrelated errors
+    /// (sync, connection, etc.) that might land while a send is outstanding.
+    SendFailed(String),
     /// A `SaveDraft` request landed server-side; `message_id` is the draft's
     /// stable `Message-ID`, so only the compose session that owns that id
     /// acts on it.
@@ -972,7 +977,7 @@ async fn connect_and_run(
                         }
                     }
                     Err(e) => {
-                        let _ = events.send(AccountEvent::Error(format!("Couldn't send message: {e}"))).await;
+                        let _ = events.send(AccountEvent::SendFailed(format!("Couldn't send message: {e}"))).await;
                     }
                 },
                 AccountCommand::SaveDraft { msg, replace } => {

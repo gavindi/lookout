@@ -991,6 +991,7 @@ pub fn build_compose_view(
     rich_text_default: bool,
     suggestions: SuggestionSource,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
+    on_send_started: Rc<dyn Fn(String)>,
 ) -> (gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
     let to_row = RecipientEntry::new("To");
     if let Some(to) = &prefill.to {
@@ -1336,6 +1337,7 @@ pub fn build_compose_view(
         let closed = closed.clone();
         let from_dropdown = from_dropdown.clone();
         let read_receipt_toggle = read_receipt_toggle.clone();
+        let on_send_started = on_send_started.clone();
         send_button.connect_clicked(move |_| {
             // Commit anything typed but not yet turned into a chip, so the
             // field ends up showing exactly what is about to be sent.
@@ -1369,6 +1371,7 @@ pub fn build_compose_view(
             let references = references.clone();
             let closed = closed.clone();
             let on_done = on_done.clone();
+            let on_send_started = on_send_started.clone();
             glib::spawn_future_local(async move {
                 let (text_body, html_body, inline_images) = if rich {
                     // Reading the editor's live HTML back out is a round trip
@@ -1428,6 +1431,7 @@ pub fn build_compose_view(
                     references,
                     message_id: None,
                 };
+                on_send_started(msg.subject.clone());
                 let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(Box::new(msg)));
                 closed.set(true);
                 on_done();

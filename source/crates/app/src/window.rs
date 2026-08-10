@@ -423,6 +423,13 @@ pub(crate) struct UiState {
     /// runs from widget callbacks, not the account event loop) can surface
     /// fetch-timeout feedback. `None` only in tests, where no window exists.
     toast_overlay: Option<adw::ToastOverlay>,
+    /// Persistent "Sending: <subject>" toasts shown while a `SendMessage`
+    /// command is outstanding, queued per account in the order their sends
+    /// were dispatched. The per-account session loop processes commands
+    /// strictly in order, so `SendCompleted`/`SendFailed` always answers the
+    /// oldest outstanding send for that account - popping the front on
+    /// either event and dismissing it is enough to retract the right toast.
+    sending_toasts: HashMap<AccountId, VecDeque<adw::Toast>>,
     /// A body is currently loading into the reading pane's WebView and
     /// should be revealed when its load finishes. Cleared on every selection
     /// change so a load started for a message the user has already navigated
@@ -1503,6 +1510,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rendered_inline_parts: Vec::new(),
         temp_attachment_files: HashSet::new(),
         toast_overlay: Some(toast_overlay.clone()),
+        sending_toasts: HashMap::new(),
         pending_html_reveal: false,
         pending_header: None,
         body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),
@@ -6655,7 +6663,16 @@ fn connect_account(
                     }
                 }
                 AccountEvent::SendCompleted => {
+                    if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
+                        toast.dismiss();
+                    }
                     toast_overlay.add_toast(adw::Toast::new("Message sent"));
+                }
+                AccountEvent::SendFailed(message) => {
+                    if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
+                        toast.dismiss();
+                    }
+                    toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                 }
                 AccountEvent::DraftSaved { message_id } => {
                     // Relay the confirmation to whichever composer is open;
@@ -11637,6 +11654,25 @@ fn show_composer_in_reading_pane(
         let carddav = carddav_provider.search_contacts(prefix, 8);
         merge_contact_suggestions(mail_history, &carddav, prefix.trim(), 8)
     });
+    // Shows the persistent "Sending: <subject>" toast the instant Send is
+    // clicked, and registers it in `sending_toasts` so the account event
+    // loop can retract it once the send actually completes or fails - see
+    // `AccountEvent::SendCompleted`/`SendFailed` in `connect_account`.
+    let on_send_started: Rc<dyn Fn(String)> = {
+        let state = state.clone();
+        let account_id = account_id.clone();
+        Rc::new(move |subject: String| {
+            let toast = adw::Toast::new(&format!("Sending: {subject}"));
+            toast.set_timeout(0);
+            let overlay = state.borrow().toast_overlay.clone();
+            if let Some(overlay) = overlay {
+                overlay.add_toast(toast.clone());
+            }
+            if let Some(id) = &account_id {
+                state.borrow_mut().sending_toasts.entry(id.clone()).or_default().push_back(toast);
+            }
+        })
+    };
     let (composer, draft_tx, identities_refresh) = crate::compose::build_compose_view(
         title,
         // The composer's From dropdown re-reads from here whenever the
@@ -11665,6 +11701,7 @@ fn show_composer_in_reading_pane(
         rich_text_default,
         suggestions,
         on_pop_out,
+        on_send_started,
     );
     // Replacing any previous composer's relay (dropped sender = its consumer
     // exits), and hooking the Config manage-identities dialog into the new
@@ -11936,6 +11973,7 @@ mod tests {
             rendered_inline_parts: Vec::new(),
             temp_attachment_files: HashSet::new(),
             toast_overlay: None,
+            sending_toasts: HashMap::new(),
             pending_html_reveal: false,
             pending_header: None,
             body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),

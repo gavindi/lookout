@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.25 (2026-08-11)
+
+### Added
+
+- **Mail**: sending a message now shows a persistent "Sending: <subject>" toast for as long as the send is in flight, with the usual close ("x") button if you'd rather dismiss it early. Previously the composer closed the moment Send was clicked and gave no feedback at all until the SMTP round trip finished, whenever that happened to be - so there was no way to tell a send was even happening, let alone which one, if more than one was outstanding. The toast is retracted automatically once the send actually completes, replaced by "Message sent" as before, or by an error toast if it failed. Send failures now travel over their own `AccountEvent::SendFailed` rather than the generic `Error` catch-all, so an unrelated error arriving while a send is outstanding can no longer be mistaken for that send's result and retract the wrong toast.
+
 ## 0.9.24 (2026-08-11)
 
 ### Fixed
