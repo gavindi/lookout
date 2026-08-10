@@ -142,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                     AccountEvent::MessagesUpdated { .. } => {}
+                    AccountEvent::NewMessages { .. } => {}
                     AccountEvent::BodyFetched { .. } => {}
                     AccountEvent::DraftSaved { .. } => {}
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}

@@ -4355,6 +4355,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             open_event_editor_for(&window, &state, &calendar_state, &occ);
         })
     });
+    // --- Mail notification actions. `app.raise-window` and `app.open-mailbox`
+    // are the click targets `mail_notifications::show_new_mail_notification`/
+    // `show_send_failed_notification` set as their default action; both just
+    // reuse existing navigation rather than duplicating it. Selecting the row
+    // programmatically fires the same `connect_selected_item_notify` handler
+    // (below) a real sidebar click does, so it gets `select_mailbox` /
+    // `exit_search` / `refresh_list_header` for free.
+    crate::mail_notifications::spawn_actions(
+        app,
+        {
+            let window = window.clone();
+            let folder_selection = folder_selection.clone();
+            Rc::new(move |mailbox_id: MailboxId| {
+                window.present();
+                if let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() {
+                    if let Some(index) = find_mailbox_index(&model, &mailbox_id) {
+                        folder_selection.set_selected(index);
+                    }
+                }
+            })
+        },
+        {
+            let window = window.clone();
+            Rc::new(move || window.present())
+        },
+    );
     // --- iMIP banner actions. The banner's button acts on the invitation
     // stashed in `UiState::imip` by `render_body`; the calendar half of the
     // response (saving an accepted event, removing a cancelled one) needs
@@ -4699,6 +4725,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Mail notifications": gates the new-mail/send-failure
+    // desktop notifications. Read straight off the setting at the point each
+    // event fires (see `connect_account`), so nothing needs re-arming here.
+    {
+        let state = state.clone();
+        config_view.mail_notifications_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED, row.is_active());
+        });
+    }
+
     // Config → Calendar → "Event alerts": gates the reminder loop. The loop
     // (see `reminders::spawn_reminder_loop`) reads the key on every tick, so
     // nothing needs re-arming here - disabling mid-session simply stops new
@@ -4720,6 +4756,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
         config_view.read_receipts_row.set_active(persisted.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS));
+        config_view.mail_notifications_row.set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
         config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
         // Theme rows: seeding fires the notify handlers above, which apply
         // the persisted theme/accent through the ThemeManager, so startup
@@ -6057,6 +6094,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         root_stack.clone(),
         toast_overlay.clone(),
         window.clone(),
+        app.clone(),
         folder_selection,
         message_list,
         message_list_stack,
@@ -6193,6 +6231,7 @@ fn spawn_account_discovery(
     root_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
     window: adw::ApplicationWindow,
+    app: adw::Application,
     folder_selection: gtk::SingleSelection,
     message_list: MessageListModel,
     message_list_stack: gtk::Stack,
@@ -6255,6 +6294,7 @@ fn spawn_account_discovery(
                         reading_stack.clone(),
                         toast_overlay.clone(),
                         window.clone(),
+                        app.clone(),
                         client.clone(),
                         list_header.clone(),
                         account,
@@ -6288,6 +6328,7 @@ fn connect_account(
     reading_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
     window: adw::ApplicationWindow,
+    app: adw::Application,
     goa_client: GoaClient,
     list_header: ListHeader,
     account: lookout_goa::GoaMailAccount,
@@ -6490,6 +6531,24 @@ fn connect_account(
                         message_list.repopulate(all, key, descending);
                     }
                 }
+                AccountEvent::NewMessages { mailbox, messages } => {
+                    // Desktop notification for genuinely-new unread mail
+                    // (`session.rs` already excludes a mailbox's first-ever
+                    // sync). Gated by the settings toggle and the mailbox's
+                    // role (only Inbox/Custom are worth notifying about - see
+                    // `should_notify_role`). Fires even if the window is
+                    // already focused on this exact mailbox - the message
+                    // just arrived and the list may not have repainted yet,
+                    // so the notification is still useful.
+                    if state.borrow().settings.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED) {
+                        let mailbox_info = state.borrow().accounts.get(&account_id).and_then(|h| h.folders.iter().find(|f| f.id == mailbox).cloned());
+                        if let Some(mailbox_info) = mailbox_info {
+                            if crate::mail_notifications::should_notify_role(mailbox_info.role) {
+                                crate::mail_notifications::show_new_mail_notification(&app, &mailbox_info.name, &mailbox, &messages);
+                            }
+                        }
+                    }
+                }
                 AccountEvent::BodyFetched { mailbox, uid, body } => {
                     let should_render = {
                         let mut st = state.borrow_mut();
@@ -6673,6 +6732,12 @@ fn connect_account(
                         toast.dismiss();
                     }
                     toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
+                    // The toast above is enough while the window is focused;
+                    // a desktop notification is for when the user isn't
+                    // looking, so a failed send doesn't go unnoticed.
+                    if !window.is_active() && state.borrow().settings.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED) {
+                        crate::mail_notifications::show_send_failed_notification(&app, &account_id, &message);
+                    }
                 }
                 AccountEvent::DraftSaved { message_id } => {
                     // Relay the confirmation to whichever composer is open;

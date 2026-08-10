@@ -16,6 +16,7 @@ mod google_tasks;
 mod identities;
 mod last_view;
 mod lookout_view;
+mod mail_notifications;
 mod message_header;
 mod message_list;
 mod microsoft_oauth;

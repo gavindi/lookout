@@ -49,6 +49,7 @@ pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
+pub const MAIL_NOTIFICATIONS_ENABLED: &str = "mail-notifications-enabled";
 pub const SHORTCUTS: &str = "shortcuts";
 pub const LAST_VIEW_UNIFIED: &str = "last-view-unified";
 pub const LAST_VIEW_MAILBOX: &str = "last-view-mailbox";
@@ -131,6 +132,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
+    map.insert(MAIL_NOTIFICATIONS_ENABLED, Value::Bool(true));
     map.insert(SHORTCUTS, Value::Strv(Vec::new()));
     map.insert(LAST_VIEW_UNIFIED, Value::Bool(false));
     map.insert(LAST_VIEW_MAILBOX, Value::String(String::new()));

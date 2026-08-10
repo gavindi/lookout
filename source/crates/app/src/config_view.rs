@@ -128,6 +128,10 @@ pub struct ConfigView {
     /// the caller can wire its `active` state into the reading pane's
     /// read-receipt policy (read per message at display time).
     pub read_receipts_row: adw::SwitchRow,
+    /// "Mail notifications" switch (Config → Mail), exposed so the caller can
+    /// wire its `active` state into the `Gio::Notification` new-mail/send-
+    /// failure notifications.
+    pub mail_notifications_row: adw::SwitchRow,
     /// "Event alerts" switch (Config → Calendar), exposed so the caller can
     /// wire its `active` state into the `Gio::Notification` reminder
     /// scheduling.
@@ -276,6 +280,12 @@ pub fn build() -> ConfigView {
         .subtitle("Reply with a read receipt when a message asks for one; when off, the reading pane asks first")
         .build();
     mail_settings_group.add(&read_receipts_row);
+    let mail_notifications_row = adw::SwitchRow::builder()
+        .title("Mail notifications")
+        .subtitle("Show a desktop notification when new mail arrives or a send fails")
+        .active(true)
+        .build();
+    mail_settings_group.add(&mail_notifications_row);
 
     // The real "Calendar" group, replacing that section's placeholder: the
     // event-alerts toggle, wired by the caller into the `Gio::Notification`
@@ -397,6 +407,7 @@ pub fn build() -> ConfigView {
         trusted_senders_row,
         rich_text_row,
         read_receipts_row,
+        mail_notifications_row,
         calendar_alerts_row,
         google_tasks_client_row,
         keyboard_rows: RefCell::new(keyboard_rows),

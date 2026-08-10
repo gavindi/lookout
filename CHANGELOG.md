@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.26 (2026-08-11)
+
+### Added
+
+- **Mail**: new mail arriving in the Inbox (or a custom folder) and messages that fail to send now also raise a desktop notification, not just the in-app toast - a toast is only visible while the window happens to be on screen, so switching away, minimizing, or working on another workspace meant missing both entirely until coming back to look. Built on the same `gio::Notification` mechanism already used for calendar-event reminders: not GNOME-specific, since it routes through the freedesktop.org notification spec (or the portal, under Flatpak), which every mainstream desktop's notification daemon implements - GNOME Shell, KDE Plasma, XFCE's xfce4-notifyd, dunst, mako, and so on. New-mail notifications fire only for genuinely-new unread messages, in Inbox or a custom folder (never Sent/Drafts/Trash/Junk/Archive); a mailbox's first-ever sync - a freshly added account, or a `UIDVALIDITY` reset - never notifies, since every message already sitting in the folder would otherwise count as "new". Clicking a new-mail notification raises the window and switches straight to that mailbox; a send-failure notification only appears when the window isn't already focused, since the existing error toast already covers that case. Both are gated by a new "Mail notifications" switch in Config → Mail, on by default, mirroring the existing "Event alerts" toggle.
+
 ## 0.9.25 (2026-08-11)
 
 ### Added

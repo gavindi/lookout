@@ -105,6 +105,11 @@
       <summary>Send read receipts automatically</summary>
       <description>When a message asks for a read receipt (a Disposition-Notification-To header), reply with one automatically on display. When off, the reading pane asks first.</description>
     </key>
+    <key name="mail-notifications-enabled" type="b">
+      <default>true</default>
+      <summary>Mail notifications</summary>
+      <description>Show a desktop notification when new mail arrives or a send fails.</description>
+    </key>
 
     <!-- Calendar -->
     <key name="calendar-alerts-enabled" type="b">

@@ -329,6 +329,16 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         messages: Vec<EmailSummary>,
     },
+    /// A subset of a `MessagesUpdated` sync: just the messages that are both
+    /// genuinely new (their UID wasn't cached before this sync) and still
+    /// unread, for a desktop "new mail" notification. Never emitted on a
+    /// mailbox's first-ever sync (nothing cached yet to compare against) -
+    /// see `new_unread_for_notification` - so connecting an account doesn't
+    /// notify once per message already sitting in the inbox.
+    NewMessages {
+        mailbox: MailboxId,
+        messages: Vec<EmailSummary>,
+    },
     BodyFetched {
         mailbox: MailboxId,
         uid: Uid,
@@ -2119,6 +2129,16 @@ async fn sync_mailbox(
             }
         }
 
+        let notify = new_unread_for_notification(cached.is_empty(), &new_messages);
+        if !notify.is_empty() {
+            let _ = events
+                .send(AccountEvent::NewMessages {
+                    mailbox: mailbox_id.clone(),
+                    messages: notify,
+                })
+                .await;
+        }
+
         messages.extend(new_messages);
     }
 
@@ -2152,6 +2172,20 @@ async fn sync_mailbox(
         tracing::warn!("preview fetch for {mailbox_id} failed: {e}");
     }
     Ok(())
+}
+
+/// Which of a sync's genuinely-new messages (UIDs `sync_mailbox` didn't find
+/// in the pre-sync cache) are worth an `AccountEvent::NewMessages` desktop
+/// notification: unread ones, but only once the mailbox has synced before.
+/// `cached_is_empty` true means this is the mailbox's first-ever sync (or a
+/// `UIDVALIDITY` change invalidated everything cached) - notifying once per
+/// message already sitting in the folder would be spam, not a signal, so
+/// nothing is returned in that case.
+fn new_unread_for_notification(cached_is_empty: bool, new_messages: &[EmailSummary]) -> Vec<EmailSummary> {
+    if cached_is_empty {
+        return Vec::new();
+    }
+    new_messages.iter().filter(|m| m.is_unread()).cloned().collect()
 }
 
 /// Emits whatever envelope summaries are cached on disk for `mailbox_id`,
@@ -2508,6 +2542,58 @@ mod tests {
         let folders = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0), mailbox(&account, "Work", MailboxRole::Custom, 0)];
         let queue: Vec<MailboxId> = queue_folder_counts(&folders, &MailboxId::new(&account, "INBOX")).into();
         assert_eq!(queue, vec![MailboxId::new(&account, "INBOX"), MailboxId::new(&account, "Work")]);
+    }
+
+    fn summary(uid: u32, mailbox: &MailboxId, seen: bool) -> EmailSummary {
+        let mut flags = std::collections::BTreeSet::new();
+        if seen {
+            flags.insert(SystemFlagBit::Seen);
+        }
+        EmailSummary {
+            uid: Uid(uid),
+            mailbox: mailbox.clone(),
+            message_id: None,
+            in_reply_to: None,
+            references: Vec::new(),
+            thread_key: lookout_core::thread::ThreadKey(format!("thread-{uid}")),
+            subject: Some(format!("Subject {uid}")),
+            from: Vec::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: chrono::Utc::now(),
+            flags,
+            keywords: std::collections::BTreeSet::new(),
+            size: 0,
+            has_attachment: false,
+            has_calendar: false,
+            preview: None,
+            structure: None,
+        }
+    }
+
+    #[test]
+    fn first_sync_never_notifies() {
+        // An empty pre-sync cache means this mailbox has never synced before
+        // (or UIDVALIDITY changed) - every "new" message is really just the
+        // whole folder, not something worth a notification.
+        let account = AccountId("acc".into());
+        let mailbox = MailboxId::new(&account, "INBOX");
+        let new_messages = vec![summary(1, &mailbox, false), summary(2, &mailbox, false)];
+        assert!(new_unread_for_notification(true, &new_messages).is_empty());
+    }
+
+    #[test]
+    fn resync_notifies_only_unread_new_messages() {
+        let account = AccountId("acc".into());
+        let mailbox = MailboxId::new(&account, "INBOX");
+        let new_messages = vec![summary(1, &mailbox, false), summary(2, &mailbox, true)];
+        let notify = new_unread_for_notification(false, &new_messages);
+        assert_eq!(notify.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![Uid(1)]);
+    }
+
+    #[test]
+    fn resync_with_no_new_messages_notifies_nothing() {
+        assert!(new_unread_for_notification(false, &[]).is_empty());
     }
 
     #[test]
