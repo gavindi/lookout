@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.19 (2026-08-10)
+
+### Added
+
+- **Mail**: the Trash (`bin`/`trash`/`Deleted Items`) and Junk (`spam`/`junk`) folders now carry an expunge quick action. Hovering a folder row in the sidebar reveals a trash-can button on its trailing edge (the same hover overlay the message rows use, with a role-named tooltip - "Empty Trash" / "Empty Junk"), which opens a confirmation dialog ("Empty Trash?", Destructive Empty + Cancel) since an expunge is permanent where delete-to-Trash isn't. Confirming drives a new `EmptyMailbox` IMAP command: SELECT the folder on demand, `UID SEARCH ALL` + STORE `\Deleted` + EXPUNGE, the emptied mailbox's cached envelopes dropped instantly, then the folder list and mailbox resync like every other message mutation - with a "Trash emptied" / "Junk emptied" toast on success. Favorite rows of those folders get the button too, ordinary folders never show it, and the button only ever appears on hover so the row layout is untouched.
+
+### Fixed
+
+- `lookout-mail`: the `send_test` example no longer builds broken - it referenced a `ComposedMessage` struct that gained `attachments`/`inline_images` since the example was written, so the example failed to compile and took `cargo test --workspace` down with it.
+
 ## 0.9.18 (2026-08-10)
 
 ### Added

@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.19" date="2026-08-10">
+      <description>
+        <p>Trash and Junk folders now have an expunge quick action: hovering a folder row shows an "Empty" button that permanently deletes all messages in that folder after a confirmation.</p>
+      </description>
+    </release>
     <release version="0.9.18" date="2026-08-10">
       <description>
         <p>The composer now supports full HTML emails: attach files (shown as removable chips), insert or paste images directly into the body as inline pictures, and format with text alignment, font family, horizontal rules, indent/outdent, remove-formatting, and table insertion alongside the existing bold/italic/lists/color/link tools.</p>

@@ -104,6 +104,8 @@ async fn main() -> anyhow::Result<()> {
                                 subject: marker.clone(),
                                 text_body: "This is an automated self-test from Lookout's send_test example.".into(),
                                 html_body: None,
+                                attachments: vec![],
+                                inline_images: vec![],
                                 calendar_part: None,
                                 read_receipt: None,
                                 request_read_receipt: false,
@@ -142,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::MessagesUpdated { .. } => {}
                     AccountEvent::BodyFetched { .. } => {}
                     AccountEvent::DraftSaved { .. } => {}
-                    AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed => {}
+                    AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
                     AccountEvent::SearchResults { .. } => {}
                     AccountEvent::PartFetched { .. } => {}
                     AccountEvent::PartFetchFailed { .. } => {}

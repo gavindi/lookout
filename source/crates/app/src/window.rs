@@ -144,6 +144,23 @@ struct MessageRowWidgets {
     bound: Rc<RefCell<Option<EmailSummary>>>,
 }
 
+/// Per-row widgets for the folder tree rows, stored under a `set_data` key on
+/// the row's `TreeExpander` (same pattern as `MessageRowWidgets` under
+/// `row-widgets`): `bind` refreshes which folder the expunge button acts on
+/// and whether the row is eligible at all, and the click handler reads the
+/// target at click time.
+#[derive(Clone)]
+struct FolderRowWidgets {
+    action_box: gtk::Box,
+    expunge_btn: gtk::Button,
+    /// Which mailbox the expunge button acts on - `None` on rows that aren't
+    /// Trash/Junk (where the button never shows anyway).
+    expunge_data: Rc<RefCell<Option<Mailbox>>>,
+    /// Whether this row's folder can be expunged; gates the hover reveal so
+    /// ordinary folders never flash an empty action box.
+    expunge_enabled: Rc<Cell<bool>>,
+}
+
 /// How many recently-viewed message bodies to keep in memory. Every message
 /// switch used to re-fetch the whole body over IMAP - there was no cache
 /// beyond the single currently-open message - so flipping between emails (or
@@ -1226,16 +1243,106 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 });
             }
             expander.add_controller(drop_target);
+            // Expunge quick action (initially hidden), mirroring the message
+            // rows' hover quick actions: a button that appears on hover over
+            // a Trash/Junk row and empties that folder. `bind` writes which
+            // folder the button acts on and whether the row is eligible into
+            // `expunge_data`/`expunge_enabled`, read at click time - the same
+            // slot pattern as the drop target above.
+            let expunge_btn = gtk::Button::from_icon_name("user-trash-full-symbolic");
+            expunge_btn.add_css_class("hover-quick-action");
+            expunge_btn.set_tooltip_text(Some("Empty folder"));
+            let action_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(0)
+                .halign(gtk::Align::End)
+                .valign(gtk::Align::Center)
+                .margin_end(8)
+                .build();
+            action_box.add_css_class("hover-quick-actions");
+            action_box.append(&expunge_btn);
+            action_box.set_visible(false);
+            let overlay = gtk::Overlay::new();
+            overlay.set_child(Some(&expander));
+            overlay.add_overlay(&action_box);
+            let expunge_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+            let expunge_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            {
+                let expunge_data = expunge_data.clone();
+                let state_slot = state_slot.clone();
+                let expunge_btn_for_dialog = expunge_btn.clone();
+                expunge_btn.connect_clicked(move |_| {
+                    let Some(mailbox) = expunge_data.borrow().clone() else {
+                        return;
+                    };
+                    // Irreversible, so confirm first - unlike delete-to-Trash
+                    // there's no undo for an expunge.
+                    let dialog = adw::AlertDialog::builder()
+                        .heading(format!("Empty {}?", display_name(&mailbox.name)))
+                        .body("All messages in this folder will be permanently deleted. This cannot be undone.")
+                        .default_response("cancel")
+                        .close_response("cancel")
+                        .build();
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("empty", "Empty");
+                    dialog.set_response_appearance("empty", adw::ResponseAppearance::Destructive);
+                    let expunge_data = expunge_data.clone();
+                    let state_slot = state_slot.clone();
+                    dialog.connect_response(None, move |_dialog, response| {
+                        if response != "empty" {
+                            return;
+                        }
+                        let Some(mailbox) = expunge_data.borrow().clone() else { return };
+                        let Some(account_id) = mailbox_account_id(&mailbox.id) else { return };
+                        let Some(state) = state_slot.borrow().clone() else { return };
+                        let state = state.borrow();
+                        if let Some(handle) = state.accounts.get(&account_id) {
+                            let _ = handle.cmd_tx.send_blocking(AccountCommand::EmptyMailbox { mailbox: mailbox.id });
+                        }
+                    });
+                    dialog.present(Some(&expunge_btn_for_dialog));
+                });
+            }
+            {
+                let action_box = action_box.clone();
+                let expunge_enabled = expunge_enabled.clone();
+                let hover_controller = gtk::EventControllerMotion::new();
+                let action_box_for_leave = action_box.clone();
+                hover_controller.connect_enter(move |_, _, _| {
+                    // Only Trash/Junk rows carry an expunge action.
+                    if expunge_enabled.get() {
+                        action_box.set_visible(true);
+                    }
+                });
+                hover_controller.connect_leave(move |_| {
+                    action_box_for_leave.set_visible(false);
+                });
+                overlay.add_controller(hover_controller);
+            }
+            unsafe {
+                expander.set_data(
+                    "lookout-expunge-widgets",
+                    FolderRowWidgets {
+                        action_box,
+                        expunge_btn,
+                        expunge_data,
+                        expunge_enabled,
+                    },
+                );
+            }
             unsafe {
                 expander.set_data("lookout-drop-target", drop_data);
             }
-            list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&expander));
+            list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&overlay));
         });
     }
     folder_factory.connect_bind(|_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(row) = list_item.item().and_downcast::<gtk::TreeListRow>() else { return };
-        let Some(expander) = list_item.child().and_downcast::<gtk::TreeExpander>() else {
+        let Some(overlay) = list_item.child().and_downcast::<gtk::Overlay>() else {
+            return;
+        };
+        let Some(expander) = overlay.child().and_downcast::<gtk::TreeExpander>() else {
             return;
         };
         expander.set_list_row(Some(&row));
@@ -1293,6 +1400,35 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.clone()),
                 _ => None,
             };
+        }
+        // Refresh the row's expunge quick action: Trash and Junk rows get the
+        // button (with a role-named tooltip), everything else hides it.
+        let role = match &*tree_item {
+            TreeItem::Folder(node) | TreeItem::Favorite(node) => node.mailbox.role,
+            _ => MailboxRole::Custom,
+        };
+        let expunge_eligible = matches!(role, MailboxRole::Trash | MailboxRole::Junk);
+        if let Some(widgets) = unsafe { expander.data::<FolderRowWidgets>("lookout-expunge-widgets") } {
+            let widgets = unsafe { widgets.as_ref() };
+            widgets.expunge_enabled.set(expunge_eligible);
+            // Defensive: a recycled row may still carry a visible box from a
+            // stale hover; only hover on an eligible row ever re-shows it.
+            if !expunge_eligible {
+                widgets.action_box.set_visible(false);
+            }
+            *widgets.expunge_data.borrow_mut() = if expunge_eligible {
+                match &*tree_item {
+                    TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            widgets.expunge_btn.set_tooltip_text(Some(match role {
+                MailboxRole::Trash => "Empty Trash",
+                MailboxRole::Junk => "Empty Junk",
+                _ => "Empty folder",
+            }));
         }
     });
 
@@ -6495,6 +6631,14 @@ fn connect_account(
                         MailboxRole::Archive => "Archived",
                         MailboxRole::Junk => "Reported as junk",
                         _ => "Moved",
+                    };
+                    toast_overlay.add_toast(adw::Toast::new(label));
+                }
+                AccountEvent::MailboxExpunged { role } => {
+                    let label = match role {
+                        MailboxRole::Trash => "Trash emptied",
+                        MailboxRole::Junk => "Junk emptied",
+                        _ => "Folder emptied",
                     };
                     toast_overlay.add_toast(adw::Toast::new(label));
                 }

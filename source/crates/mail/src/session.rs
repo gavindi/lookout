@@ -209,6 +209,15 @@ pub enum AccountCommand {
         uids: Vec<Uid>,
         target: MailboxId,
     },
+    /// Permanently deletes every message in `mailbox` - the "empty Trash /
+    /// Junk" quick action, so the UI only offers it for those roles. SELECTs
+    /// the mailbox on demand, then `UID SEARCH ALL` + STORE `\Deleted` +
+    /// EXPUNGE (same mechanics as `purge_by_message_id`, and the whole-mailbox
+    /// `\Deleted` caveat of `move_uids_to_path` is exactly the intent here).
+    /// Irreversible: no move-to-Trash fallback for this one.
+    EmptyMailbox {
+        mailbox: MailboxId,
+    },
     /// Client-side only - IMAP has no native snooze. Records `until` in the
     /// local cache and hides the message from `MessagesUpdated` until that
     /// time passes.
@@ -375,6 +384,12 @@ pub enum AccountEvent {
         role: MailboxRole,
     },
     MessageSnoozed,
+    /// The answer to an `AccountCommand::EmptyMailbox`: every message is gone
+    /// from the server. `role` is the emptied mailbox's role (Trash/Junk),
+    /// so the UI can name the confirmation toast.
+    MailboxExpunged {
+        role: MailboxRole,
+    },
     /// The answer to an `AccountCommand::SearchMailbox`: the envelopes of
     /// every message in `mailbox` whose headers/body matched `query` per the
     /// server's `UID SEARCH`. Emitted even when `messages` is empty, so the
@@ -1043,6 +1058,40 @@ async fn connect_and_run(
                         }
                     }
                 }
+                AccountCommand::EmptyMailbox { mailbox } => {
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    match empty_mailbox(&mut session).await {
+                        Ok(count) => {
+                            let role = folders
+                                .iter()
+                                .find(|m| m.id == mailbox)
+                                .map(|m| m.role)
+                                .unwrap_or(MailboxRole::Custom);
+                            let _ = events.send(AccountEvent::MailboxExpunged { role }).await;
+                            if count > 0 {
+                                if let Some(cache) = cache {
+                                    if let Some(folder) = folders.iter().find(|m| m.id == mailbox) {
+                                        if let Err(e) = cache.replace_messages(&mailbox, folder.uidvalidity, &[]) {
+                                            tracing::warn!("failed to clear emptied mailbox from cache: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                            relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                            sync_mailbox(&mut session, &account_id, &current_mailbox_name, &current_mailbox_id, events, cache).await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't empty folder: {e}"))).await;
+                        }
+                    }
+                }
                 AccountCommand::SnoozeMessage { mailbox, uid, until } => {
                     if let Some(cache) = cache {
                         if let Err(e) = cache.snooze_message(&mailbox, uid, until) {
@@ -1580,6 +1629,26 @@ async fn send_message(config: &AccountConfig, credentials: &dyn CredentialProvid
 fn drafts_path<'a>(folders: &'a [Mailbox], account_id: &AccountId) -> Option<&'a str> {
     let drafts = folders.iter().find(|m| matches!(m.role, MailboxRole::Drafts))?;
     drafts.id.0.strip_prefix(&format!("{}:", account_id.0))
+}
+
+/// Permanently removes every message in the *currently selected* mailbox -
+/// the server side of `AccountCommand::EmptyMailbox`. `UID SEARCH ALL` +
+/// STORE `\Deleted` + EXPUNGE, reusing the same wire pattern as
+/// `purge_by_message_id`; the whole-mailbox `\Deleted` caveat from
+/// `move_uids_to_path` is exactly the intent here, since nothing else in this
+/// crate sets `\Deleted` inside the folder being emptied. Returns how many
+/// messages were removed (0 when the folder is already empty, with no round
+/// trips beyond the search).
+async fn empty_mailbox(session: &mut Session<ImapStream>) -> Result<u32> {
+    let uids = session.uid_search("ALL").await?;
+    let count = uids.len() as u32;
+    if uids.is_empty() {
+        return Ok(count);
+    }
+    let uid_set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    Ok(count)
 }
 
 /// Permanently removes every message in the *currently selected* mailbox
