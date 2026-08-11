@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.29 (2026-08-12)
+
+### Fixed
+
+- **Mail**: shrinking the main window past a certain width clipped the right edge of the mini-calendar overview pane instead of letting it go. The pane is the end child of a fixed-position split that refuses to shrink (`shrink-start/end-child` are both off, so GTK can't shrink either side when the window gets too narrow for both minimums together), so beyond that point the calendar's day-grid was cut off with no way to reclaim the space - even toggling the pane off and back on just re-clipped it. The pane now auto-hides the moment the window is too narrow to display it whole, and reappears as soon as a resize makes it fit again - but only if the View tab's "Calendar overview" toggle is still enabled, so the width check never overrides an explicit hide. The fit check runs on the same debounced window-resize hook that reapplies the saved pane widths (plus once after the window first maps, so a too-narrow restored geometry is corrected without needing a resize), comparing the paned's settled width against the content's and the overview's measured minimums with a small cushion so the pane neither clips nor flickers at the exact boundary. The toggle handler and the Mail-tab re-entry handler both consult the auto-hide flag, so toggling the overview on while the window is still too narrow stays hidden until the window grows.
+
 ## 0.9.28 (2026-08-12)
 
 ### Added

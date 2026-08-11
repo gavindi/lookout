@@ -3618,6 +3618,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let mail_calendar_overview_card = card_section(&mail_overview_box);
     mail_calendar_overview_card.add_css_class("folder-pane");
     mail_calendar_overview_card.set_vexpand(true);
+    // True while the window is too narrow to show the whole overview pane:
+    // the pane is auto-hidden then instead of letting the paned clip it, and
+    // stays hidden until a resize makes it fit again (the toggle handler and
+    // the mail-tab handler both consult this flag; see `check_overview_fits`).
+    let overview_forced_hidden: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     // --- Ribbon tab strip + View-tab pane toggles. Home/View swap the
     // ribbon content row (`view_toolbar_stack`) between Mail's command
@@ -3666,11 +3671,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     {
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let overview_forced_hidden = overview_forced_hidden.clone();
         let state = state.clone();
         let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         overview_pane_toggle.connect_toggled(move |btn| {
             state.borrow().settings.set_bool(crate::settings::LAYOUT_CALENDAR_OVERVIEW, btn.is_active());
-            mail_calendar_overview_card.set_visible(btn.is_active());
+            // The window-width check may have auto-hidden the pane while the
+            // window is too narrow; don't override that here.
+            mail_calendar_overview_card.set_visible(btn.is_active() && !overview_forced_hidden.get());
             // Keep the header's copy in lockstep. `set_active` with the
             // button's current value is a no-op, so the mirror handler below
             // can't loop back into this one.
@@ -3745,6 +3753,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let active_ribbon_tab = active_ribbon_tab.clone();
         let current_module = current_module.clone();
         let overview_pane_toggle = overview_pane_toggle.clone();
+        let overview_forced_hidden = overview_forced_hidden.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
@@ -3754,8 +3763,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 root_stack.set_visible_child_name(current_mail_page.get());
                 view_toolbar_stack.set_visible_child_name(ribbon_stack_name("mail", active_ribbon_tab.get()));
                 // Respect the View tab's toggle rather than forcing the
-                // overview pane back on after a Calendar/Config round-trip.
-                mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active());
+                // overview pane back on after a Calendar/Config round-trip -
+                // and the width-based auto-hide while the window is narrow.
+                mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active() && !overview_forced_hidden.get());
                 home_button.set_sensitive(true);
                 view_button.set_sensitive(true);
                 header_calendar_overview_toggle.set_sensitive(true);
@@ -4054,6 +4064,43 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     content_and_overview_paned.add_css_class("seamless-paned");
 
+    // If the window gets too narrow to fit the overview pane's whole minimum
+    // width beside the content's minimum, GTK clips the pane's right edge
+    // instead of shrinking it (both paned children refuse to shrink). Hide
+    // the pane in that case, and bring it back - if the View tab's toggle is
+    // still on - once a resize widens the window enough again. The separator
+    // also takes space between the children, so the fit threshold includes a
+    // small cushion so the pane neither clips nor flickers exactly at the
+    // boundary. `measure` ignores visibility, so the check works whether the
+    // pane is currently shown or hidden.
+    let check_overview_fits = {
+        let content_and_overview_paned = content_and_overview_paned.clone();
+        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let overview_pane_toggle = overview_pane_toggle.clone();
+        let overview_forced_hidden = overview_forced_hidden.clone();
+        let current_module = current_module.clone();
+        move || {
+            // Not allocated yet (build time / before the first map): leave
+            // visibility alone until the first real resize check.
+            if content_and_overview_paned.width() <= 0 {
+                return;
+            }
+            let start_min = content_and_overview_paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+            let end_min = mail_calendar_overview_card.measure(gtk::Orientation::Horizontal, -1).0;
+            let fits = content_and_overview_paned.width() >= start_min + end_min + 8;
+            if !fits {
+                overview_forced_hidden.set(true);
+                mail_calendar_overview_card.set_visible(false);
+            } else if overview_forced_hidden.replace(false) {
+                // Only the Mail module shows the overview pane; the other
+                // modules' handlers own hiding it there.
+                if current_module.get() == "mail" {
+                    mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active());
+                }
+            }
+        }
+    };
+
     let window_body = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
     window_body.append(&nav_rail);
     window_body.append(&content_and_overview_paned);
@@ -4275,6 +4322,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // so the stored percentages are applied once the window stops resizing.
     {
         let apply_stored_pane_widths = apply_stored_pane_widths.clone();
+        let check_overview_fits = check_overview_fits.clone();
         let wired: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         window.connect_map(move |window| {
             let Some(surface) = window.surface() else {
@@ -4285,6 +4333,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
             wired.set(true);
             let apply_for_notify = apply_stored_pane_widths.clone();
+            let check_for_notify = check_overview_fits.clone();
             let window_for_width = window.clone();
             let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
             surface.connect_width_notify(move |_| {
@@ -4293,12 +4342,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 let window_for_timeout = window_for_width.clone();
                 let apply_for_timeout = apply_for_notify.clone();
+                let check_for_timeout = check_for_notify.clone();
                 let debounce_for_timeout = debounce.clone();
                 debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
                     debounce_for_timeout.set(None);
                     apply_for_timeout(window_for_timeout.width());
+                    check_for_timeout();
                 })));
             });
+            // The window can also come up already too narrow (a restored
+            // geometry) with no subsequent resize to trigger the check, so
+            // run it once the initial allocation settles too.
+            let check_initial = check_overview_fits.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(150), check_initial);
         });
     }
     // The calendar and people panes live in `root_stack`, so they're only
