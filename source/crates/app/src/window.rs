@@ -7509,7 +7509,8 @@ fn print_calendar_month<T: IsA<gtk::Window>>(calendar_state: &Rc<RefCell<Calenda
 
 /// Fills the Mail-screen overview pane's event list with every checked
 /// calendar's occurrences (from whatever's currently cached - no new fetch
-/// here) whose local date matches `day`, sorted by start time. Shows a
+/// here) whose local date matches `day`, sorted by start time. The list is
+/// headed by `day`'s date ("Today"/"Tomorrow"/"Tue 12 Aug") and shows a
 /// "No events" placeholder when there are none. Unlike
 /// `refresh_displayed_calendar_view`, this filters by exact day rather than
 /// by the main Calendar view's own displayed month - the overview pane can
@@ -7526,6 +7527,13 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
         .filter(|occ| !calendar_view::covered_local_dates(occ, day, day).is_empty())
         .collect();
     occurrences.sort_by_key(|occ| occ.start);
+
+    let header = gtk::Label::builder()
+        .label(calendar_view::agenda_day_header(day, chrono::Utc::now().date_naive()))
+        .css_classes(["caption-heading"])
+        .xalign(0.0)
+        .build();
+    day_list_box.append(&header);
 
     if occurrences.is_empty() {
         let placeholder = gtk::Label::builder().label("No events").css_classes(["dim-label", "caption"]).xalign(0.0).build();

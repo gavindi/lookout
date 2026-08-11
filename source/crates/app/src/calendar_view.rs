@@ -2012,7 +2012,7 @@ pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurre
 
 /// The agenda's day-group header: "Today"/"Tomorrow" when relevant, otherwise
 /// the weekday + day + month (e.g. "Wed 12 Aug").
-fn agenda_day_header(date: NaiveDate, today: NaiveDate) -> String {
+pub(crate) fn agenda_day_header(date: NaiveDate, today: NaiveDate) -> String {
     if date == today {
         "Today".to_string()
     } else if date == today + chrono::Duration::days(1) {

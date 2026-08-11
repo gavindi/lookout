@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.30 (2026-08-12)
+
+### Changed
+
+- **Mail**: the mini-calendar overview pane's event list now says which day it's showing. The pane's day list renders the clicked day's events as bare `HH:MM summary` rows (or just `summary` for all-day events), so the only date context on screen was the mini month grid's own selection - easy to lose if you clicked a day and then glanced at the list. Every refresh now tops the list with a day header - "Today"/"Tomorrow" when relevant, otherwise the weekday + day + month (e.g. "Tue 12 Aug") - using the same `agenda_day_header` formatting the Calendar tab's Agenda view uses, so the two read consistently. The header is always present, not just when events exist: a day with nothing on it shows the header above the "No events" placeholder, so an empty selection is still labeled instead of silently blank. Since the header lives in the single `refresh_mail_overview_day_list` entry point, it appears on every path that repaints the list - the initial paint, a day click in the mini grid, a birthday/contact sync, a cache clear, and event save/delete - with no per-site changes.
+
 ## 0.9.29 (2026-08-12)
 
 ### Fixed
