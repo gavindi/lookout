@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.31" date="2026-08-12">
+      <description>
+        <p>Fixed invitations received from Outlook - a Teams meeting invite included - showing no way to respond. Outlook stamps its invites with Windows timezone IDs that the parser couldn't resolve, so the invitation banner never appeared; timezone resolution now falls back to a Windows-to-IANA mapping, so the invite parses with the correct DST-aware meeting time.</p>
+      </description>
+    </release>
     <release version="0.9.30" date="2026-08-12">
       <description>
         <p>The Mail screen's mini-calendar overview pane now heads its day list with the selected date - "Today"/"Tomorrow" when relevant, otherwise the weekday + day + month (e.g. "Tue 12 Aug") - matching the Agenda view's day headers, so the list of events is always labeled with the day it's showing.</p>

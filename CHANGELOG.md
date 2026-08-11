@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.31 (2026-08-12)
+
+### Fixed
+
+- **Mail**: invitations received from Outlook (a Teams meeting invite included) showed no way to respond - no invitation banner, no Accept/Decline/Maybe - where a Google Calendar or iCloud invite for an in-person meeting did. Outlook/Exchange stamp their iMIP invitations with Windows timezone IDs (`DTSTART;TZID=W. Europe Standard Time:...`) instead of the IANA names `chrono-tz` understands, so the invitation's event failed to resolve to UTC and the reading pane dropped the whole payload, banner included. Timezone resolution now falls back to the CLDR `windowsZones.xml` mapping (`W. Europe Standard Time` → `Europe/Berlin` and ~130 more), resolving the event through the mapped zone's own DST rules - a summer invitation comes out as CEST, a winter one as CET - while IANA `TZID`s (and UTC) keep resolving exactly as before and a truly unknown timezone is still dropped with a warning rather than shown at a guessed time. The fix covers `DTEND`, `RECURRENCE-ID`, `EXDATE` and `RDATE` too, which share the same resolution path. A new `imip-outlook.eml` fixture models the real shape (base64 `invite.ics` attachment, `VTIMEZONE`, `X-MICROSOFT-CDO-*` properties, Teams join URL as the location).
+
+### Testing
+
+- `lookout-dav`: new `tzmap` tests (known Windows IDs resolving to IANA, case-insensitive lookup, unknown IDs returning none, every mapped IANA name parsing as a `chrono-tz` zone) and `ical` tests - a full Outlook/Exchange Online invitation with `VTIMEZONE`, quoted `TZID` and `X-MICROSOFT-CDO-*` properties resolving to the DST-correct UTC times, the Outlook-desktop unquoted `TZID` form on a winter date, an unknown timezone still dropping the event, and IANA `TZID`s still resolving directly. `lookout-mail`: the new `imip-outlook.eml` fixture's payload surfaces as `calendar_ics` without joining the attachment list.
+
 ## 0.9.30 (2026-08-12)
 
 ### Changed

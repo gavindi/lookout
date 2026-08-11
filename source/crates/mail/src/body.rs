@@ -569,6 +569,23 @@ mod tests {
         assert!(ics.contains("METHOD:CANCEL"));
     }
 
+    /// The Outlook/Teams invitation fixture - a base64 `text/calendar`
+    /// attachment named `invite.ics` inside a `multipart/mixed` envelope -
+    /// must surface its payload as `calendar_ics` (transfer-decoded) and stay
+    /// out of the attachment list, exactly like the simpler `imip-request`
+    /// fixture.
+    #[test]
+    fn imip_outlook_fixture_carries_the_calendar_payload() {
+        let body = parse_body(Uid(0), &fixture("imip-outlook.eml")).expect("parses");
+        let ics = body.calendar_ics.expect("Outlook invitation has a calendar payload");
+        assert!(ics.contains("METHOD:REQUEST"));
+        assert!(ics.contains("DTSTART;TZID=\"W. Europe Standard Time\":20260810T100000"));
+        assert!(ics.contains("X-MICROSOFT-CDO-BUSYSTATUS:BUSY"));
+        assert!(body.text_body.is_some(), "the alternative's text half still renders");
+        assert!(!has_attachment(&body.parts), "the calendar part is not an attachment");
+        assert!(!body.parts.iter().any(|p| p.content_type == "text/calendar"));
+    }
+
     /// The read-receipt fixture: `parse_body` must carry the
     /// `Disposition-Notification-To` request through the headers (the
     /// reading pane's banner reads it with `parse_disposition_notification_to`).

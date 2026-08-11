@@ -252,7 +252,7 @@ fn to_utc(dpt: &DatePerhapsTime) -> Option<(DateTime<Utc>, bool)> {
     match dpt {
         DatePerhapsTime::Date(date) => Some((Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN)), true)),
         DatePerhapsTime::DateTime(cdt) => {
-            let utc = cdt.try_into_utc().or_else(|| match cdt {
+            let utc = resolve_datetime_utc(cdt).or_else(|| match cdt {
                 CalendarDateTime::Floating(naive) => {
                     tracing::warn!("event has a floating (no timezone) date-time; treating as UTC");
                     Some(Utc.from_utc_datetime(naive))
@@ -260,6 +260,33 @@ fn to_utc(dpt: &DatePerhapsTime) -> Option<(DateTime<Utc>, bool)> {
                 _ => None,
             })?;
             Some((utc, false))
+        }
+    }
+}
+
+/// Resolves a `DTSTART`/`DTEND`/`RECURRENCE-ID`/`EXDATE`/`RDATE` date-time to
+/// its UTC instant. IANA `TZID`s resolve through chrono-tz directly; Windows
+/// timezone IDs (Outlook/Exchange iMIP invitations - Teams meetings included
+/// - stamp their events with `TZID=W. Europe Standard Time` and friends) are
+/// looked up in the CLDR mapping first, since chrono-tz only knows IANA
+/// names. A `TZID` neither set understands is dropped with a warning rather
+/// than guessed - the caller then discards the event the same way it does
+/// any other unresolvable one.
+fn resolve_datetime_utc(cdt: &CalendarDateTime) -> Option<DateTime<Utc>> {
+    match cdt {
+        CalendarDateTime::Utc(inner) => Some(*inner),
+        CalendarDateTime::Floating(_) => None,
+        CalendarDateTime::WithTimezone { date_time, tzid } => {
+            let zone = std::str::FromStr::from_str(tzid)
+                .ok()
+                .or_else(|| crate::tzmap::windows_to_iana(tzid).and_then(|iana| iana.parse().ok()));
+            match zone.and_then(|tz: chrono_tz::Tz| tz.from_local_datetime(date_time).single()) {
+                Some(dt) => Some(dt.with_timezone(&Utc)),
+                None => {
+                    tracing::warn!("event references unknown timezone {tzid:?}; dropping it");
+                    None
+                }
+            }
         }
     }
 }
@@ -992,6 +1019,94 @@ mod tests {
         let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n";
         assert_eq!(parse_imip_invitation(ics), None);
         assert_eq!(parse_imip_invitation("not an icalendar document"), None);
+    }
+
+    /// An Outlook/Exchange Online invitation (the shape a Teams meeting
+    /// invite arrives in): `VTIMEZONE` with a Windows timezone ID, a quoted
+    /// `TZID` on `DTSTART`/`DTEND`, `SENT-BY` on the organizer, and
+    /// `X-MICROSOFT-CDO-*` properties. The Windows ID isn't an IANA name, so
+    /// the pre-fix parser dropped the event and the reading pane showed no
+    /// banner - the CLDR mapping must resolve it (with the DST offset the
+    /// organizer's zone has that day) instead.
+    #[test]
+    fn parse_imip_invitation_resolves_windows_timezone_ids() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+PRODID:Microsoft Exchange Server 2019\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:W. Europe Standard Time\r\n\
+BEGIN:STANDARD\r\n\
+DTSTART:16011001T030000\r\n\
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10\r\n\
+TZOFFSETFROM:+0200\r\n\
+TZOFFSETTO:+0100\r\n\
+END:STANDARD\r\n\
+BEGIN:DAYLIGHT\r\n\
+DTSTART:16010301T020000\r\n\
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3\r\n\
+TZOFFSETFROM:+0100\r\n\
+TZOFFSETTO:+0200\r\n\
+END:DAYLIGHT\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+ORGANIZER;CN=Ada Lovelace;SENT-BY=\"mailto:ada@contoso.com\":mailto:ada@contoso.com\r\n\
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;CN=Bob Example;RSVP=TRUE:mailto:bob@example.com\r\n\
+UID:040000008200E00074C5B7101A82E008000000001AC05E4F0B88D701000000000000000010000000F8B2B12E34C5B94A9B2B2E3B00C47E00\r\n\
+DTSTAMP:20260801T120000Z\r\n\
+DTSTART;TZID=\"W. Europe Standard Time\":20260810T100000\r\n\
+DTEND;TZID=\"W. Europe Standard Time\":20260810T103000\r\n\
+LOCATION:https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc123%40thread.v2/0\r\n\
+SUMMARY:Weekly design sync (Teams)\r\n\
+TRANSP:OPAQUE\r\n\
+X-MICROSOFT-CDO-APPT-SEQUENCE:0\r\n\
+X-MICROSOFT-CDO-BUSYSTATUS:BUSY\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let invitation = parse_imip_invitation(ics).expect("Outlook invitation must parse");
+        assert_eq!(invitation.method, ImipMethod::Request);
+        assert_eq!(invitation.summary.as_deref(), Some("Weekly design sync (Teams)"));
+        assert_eq!(invitation.organizer.as_ref().map(|o| o.address.as_str()), Some("ada@contoso.com"));
+        // 10 August 2026 falls in DST: W. Europe Standard Time = Europe/Berlin
+        // (CEST, UTC+2), so 10:00 local is 08:00 UTC - not 10:00.
+        assert_eq!(invitation.start, "2026-08-10T08:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(invitation.end, "2026-08-10T08:30:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(invitation.location.as_deref(), Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc123%40thread.v2/0"));
+        assert_eq!(invitation.rrule, None);
+    }
+
+    /// The Outlook *desktop* form of the same invitation: `TZID` unquoted
+    /// (`DTSTART;TZID=W. Europe Standard Time:...`, technically invalid RFC
+    /// 5545 but what Outlook emits), on a winter date so the resolved offset
+    /// is the standard one (CET, UTC+1) - DST rules must follow the zone, not
+    /// a fixed offset.
+    #[test]
+    fn parse_imip_invitation_resolves_unquoted_windows_tzid_outside_dst() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:inv-winter@contoso.com\r\nDTSTAMP:20260110T090000Z\r\nDTSTART;TZID=W. Europe Standard Time:20260115T140000\r\nDTEND;TZID=W. Europe Standard Time:20260115T143000\r\nSUMMARY:January sync\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let invitation = parse_imip_invitation(ics).expect("Outlook invitation must parse");
+        assert_eq!(invitation.start, "2026-01-15T13:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(invitation.end, "2026-01-15T13:30:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    /// A `TZID` that is neither IANA nor a known Windows ID stays
+    /// unresolvable: the event is dropped (and logged), matching the
+    /// pre-fix behavior for unknown zones - the alternative, guessing an
+    /// offset, would show the wrong meeting time with no way to tell.
+    #[test]
+    fn parse_imip_invitation_drops_an_unknown_timezone() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:inv-tz@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART;TZID=Fictional Standard Time:20260715T140000\r\nSUMMARY:Elsewhere\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_imip_invitation(ics), None);
+    }
+
+    /// IANA `TZID`s (the form Google Calendar and iCloud invitations use)
+    /// still resolve through chrono-tz directly - the Windows lookup must not
+    /// shadow them.
+    #[test]
+    fn parse_imip_invitation_still_resolves_iana_timezones() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:inv-iana@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART;TZID=Europe/Berlin:20260715T140000\r\nDTEND;TZID=Europe/Berlin:20260715T150000\r\nSUMMARY:IANA sync\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let invitation = parse_imip_invitation(ics).expect("IANA-tzid invitation must parse");
+        assert_eq!(invitation.start, "2026-07-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(invitation.end, "2026-07-15T13:00:00Z".parse::<DateTime<Utc>>().unwrap());
     }
 
     /// The shared `test-fixtures/holidays.ics`: a multi-VEVENT document with

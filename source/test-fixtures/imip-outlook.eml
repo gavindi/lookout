@@ -1,0 +1,67 @@
+From: Ada Lovelace <ada@contoso.com>
+To: bob@example.com
+Subject: Weekly design sync (Teams)
+Message-ID: <outlook-teams-invite-20260810@contoso.com>
+Date: Sat, 1 Aug 2026 12:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary-8f3a5c1d"
+
+--boundary-8f3a5c1d
+Content-Type: multipart/alternative; boundary="boundary-9b2d4e6f"
+
+--boundary-9b2d4e6f
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Weekly design sync (Teams)
+
+When: Monday, 10 August 2026 10:00-10:30 (UTC+02:00) Berlin
+Where: Microsoft Teams meeting
+
+Join with a video conferencing device
+Video ID: 123 456 789 0
+
+Join on your computer or mobile app
+Click here to join the meeting
+
+--boundary-9b2d4e6f
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+<html><head></head><body>Weekly design sync (Teams)<br><br><b>When:</b> Monday, 10 August 2026 10:00-10:30 (UTC+02:00) Berlin<br><b>Where:</b> Microsoft Teams meeting<br><br><a href="https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc123%40thread.v2/0">Join the meeting</a></body></html>
+
+--boundary-9b2d4e6f--
+
+--boundary-8f3a5c1d
+Content-Type: text/calendar; charset="utf-8"; method=REQUEST; name="invite.ics"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="invite.ics"
+
+QkVHSU46VkNBTEVOREFSClBST0RJRDpNaWNyb3NvZnQgRXhjaGFuZ2UgU2VydmVyIDIwMTkKVkVS
+U0lPTjoyLjAKTUVUSE9EOlJFUVVFU1QKQkVHSU46VlRJTUVaT05FClRaSUQ6Vy4gRXVyb3BlIFN0
+YW5kYXJkIFRpbWUKQkVHSU46U1RBTkRBUkQKRFRTVEFSVDoxNjAxMTAwMVQwMzAwMDAKUlJVTEU6
+RlJFUT1ZRUFSTFk7SU5URVJWQUw9MTtCWURBWT0tMVNVO0JZTU9OVEg9MTAKVFpPRkZTRVRGUk9N
+OiswMjAwClRaT0ZGU0VUVE86KzAxMDAKRU5EOlNUQU5EQVJECkJFR0lOOkRBWUxJR0hUCkRUU1RB
+UlQ6MTYwMTAzMDFUMDIwMDAwClJSVUxFOkZSRVE9WUVBUkxZO0lOVEVSVkFMPTE7QllEQVk9LTFT
+VTtCWU1PTlRIPTMKVFpPRkZTRVRGUk9NOiswMTAwClRaT0ZGU0VUVE86KzAyMDAKRU5EOkRBWUxJ
+R0hUCkVORDpWVElNRVpPTkUKQkVHSU46VkVWRU5UCk9SR0FOSVpFUjtDTj1BZGEgTG92ZWxhY2U7
+U0VOVC1CWT0ibWFpbHRvOmFkYUBjb250b3NvLmNvbSI6bWFpbHRvOmFkYUBjb250b3NvLmNvbQpB
+VFRFTkRFRTtST0xFPVJFUS1QQVJUSUNJUEFOVDtQQVJUU1RBVD1ORUVEUy1BQ1RJT047Q049Qm9i
+IEV4YW1wbGU7UlNWUD1UUlVFOm1haWx0bzpib2JAZXhhbXBsZS5jb20KREVTQ1JJUFRJT046V2Vl
+a2x5IGRlc2lnbiBzeW5jIC0gTWljcm9zb2Z0IFRlYW1zIG1lZXRpbmdcXG5cXG5Kb2luIG9uIHlv
+dXIgY29tcHV0ZXIgb3IgbW9iaWxlIGFwcFxcbkNsaWNrIGhlcmUgdG8gam9pbiB0aGUgbWVldGlu
+Z1xcbgpVSUQ6MDQwMDAwMDA4MjAwRTAwMDc0QzVCNzEwMUE4MkUwMDgwMDAwMDAwMDFBQzA1RTRG
+MEI4OEQ3MDEwMDAwMDAwMDAwMDAwMDAwMTAwMDAwMDBGOEIyQjEyRTM0QzVCOTRBOUIyQjJFM0Iw
+MEM0N0UwMApEVFNUQU1QOjIwMjYwODAxVDEyMDAwMFoKRFRTVEFSVDtUWklEPSJXLiBFdXJvcGUg
+U3RhbmRhcmQgVGltZSI6MjAyNjA4MTBUMTAwMDAwCkRURU5EO1RaSUQ9IlcuIEV1cm9wZSBTdGFu
+ZGFyZCBUaW1lIjoyMDI2MDgxMFQxMDMwMDAKTE9DQVRJT046aHR0cHM6Ly90ZWFtcy5taWNyb3Nv
+ZnQuY29tL2wvbWVldHVwLWpvaW4vMTklM2FtZWV0aW5nX2FiYzEyMyU0MHRocmVhZC52Mi8wP2Nv
+bnRleHQ9JTdiJTIyVGlkJTIyJTNhJTIyZGVhZGJlZWYlMjIlN2QKU1VNTUFSWTpXZWVrbHkgZGVz
+aWduIHN5bmMgKFRlYW1zKQpDTEFTUzpQVUJMSUMKUFJJT1JJVFk6NQpUUkFOU1A6T1BBUVVFClgt
+TUlDUk9TT0ZULUNETy1BUFBULVNFUVVFTkNFOjAKWC1NSUNST1NPRlQtQ0RPLUJVU1lTVEFUVVM6
+QlVTWQpYLU1JQ1JPU09GVC1DRE8tSU5URU5ERURTVEFUVVM6QlVTWQpYLU1JQ1JPU09GVC1DRE8t
+QUxMREFZRVZFTlQ6RkFMU0UKWC1NSUNST1NPRlQtQ0RPLUlNUE9SVEFOQ0U6MQpYLU1JQ1JPU09G
+VC1DRE8tT1dORVJBUFBUSUQ6MjA3MzcwMQpYLU1JQ1JPU09GVC1PTkxJTkVNRUVUSU5HSU5GTzph
+bGxvd2Vkc3BlY2lhbHRvOiIxIgpFTkQ6VkVWRU5UCkVORDpWQ0FMRU5EQVIK
+
+--boundary-8f3a5c1d--
