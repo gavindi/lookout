@@ -112,10 +112,16 @@ fn sort_paths(paths: &mut [String], by_path: &HashMap<String, Mailbox>) {
 /// Builds the `Gtk.TreeListModel` for the folder sidebar from every
 /// connected account's flat mailbox list: the synthetic "All Inboxes" unified
 /// row pinned at the top, the "Favorites" section (omitted when nothing is
-/// starred), then one top-level, expanded-by-default `TreeItem::Account` row
-/// per account (Thunderbird-style grouping), each expanding to that account's
-/// own folder tree. Each row's item is a `glib::BoxedAnyObject` wrapping a
-/// `TreeItem`.
+/// starred), then one top-level `TreeItem::Account` row per account
+/// (Thunderbird-style grouping), each expanding to that account's own folder
+/// tree. Each row's item is a `glib::BoxedAnyObject` wrapping a `TreeItem`.
+///
+/// Rows are built *collapsed*; `rebuild_folder_tree` in `window.rs` applies
+/// the session's expansion state afterwards (every account group and the
+/// Favorites section expanded by default on the first build) - the same
+/// split `MessageListModel` uses, so a user's manual account-group collapse
+/// survives the constant `FoldersUpdated` rebuilds instead of being
+/// re-derived from scratch.
 ///
 /// `favorites` are rendered as flat leaves - a favorite is one folder, not a
 /// subtree - and are duplicates of rows that also live under their account.
@@ -160,6 +166,19 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
             TreeItem::Folder(node) => node.children.clone(),
         };
         if children.is_empty() {
+            // An account whose folder list hasn't arrived yet (it's still
+            // connecting, or its session restarted) must render as *expandable
+            // but empty* rather than a leaf: a leaf row can't be expanded, so
+            // a slow-connecting account would otherwise look permanently
+            // collapsed - with no chevron to reopen it - until its folders
+            // land. An empty child store keeps the row expandable, holds its
+            // expanded state (the next rebuild fills the store with content),
+            // and shows nothing beneath it in the meantime. A `Folder` row
+            // stays a leaf - a folder genuinely can have no subfolders.
+            if matches!(&*tree_item, TreeItem::Account(_)) {
+                let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+                return Some(store.upcast::<gio::ListModel>());
+            }
             return None;
         }
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
@@ -168,17 +187,6 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
         }
         Some(store.upcast::<gio::ListModel>())
     });
-
-    // Expand every account row (and the Favorites section) by default so
-    // folders are immediately visible without an extra click - matches the
-    // single-account behavior this replaces. Only the top level: subfolders
-    // still start collapsed. The "All Inboxes" leaf at index 0 has no children
-    // to expand, so it's skipped.
-    for i in 1..model.n_items() {
-        if let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() {
-            row.set_expanded(true);
-        }
-    }
 
     model
 }

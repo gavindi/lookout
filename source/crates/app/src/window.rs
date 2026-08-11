@@ -2537,6 +2537,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let folder_selection = folder_selection.clone();
+        let folder_scroller = folder_scroller.clone();
         let suppress = favorite_suppress.clone();
         favorite_button.connect_toggled(move |button| {
             if suppress.get() {
@@ -2559,7 +2560,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // The tree grows/loses a whole section, so it has to be rebuilt -
             // which swaps the model and drops the highlight. Put it back on the
             // folder the user is still looking at.
-            rebuild_folder_tree(&state, &folder_selection);
+            rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
             if let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() {
                 if let Some(index) = find_mailbox_index(&model, &mailbox) {
                     folder_selection.set_selected(index);
@@ -6096,6 +6097,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         window.clone(),
         app.clone(),
         folder_selection,
+        folder_scroller.clone(),
         message_list,
         message_list_stack,
         message_header,
@@ -6233,6 +6235,7 @@ fn spawn_account_discovery(
     window: adw::ApplicationWindow,
     app: adw::Application,
     folder_selection: gtk::SingleSelection,
+    folder_scroller: gtk::ScrolledWindow,
     message_list: MessageListModel,
     message_list_stack: gtk::Stack,
     message_header: crate::message_header::MessageHeader,
@@ -6288,6 +6291,7 @@ fn spawn_account_discovery(
                         worker.clone(),
                         state.clone(),
                         folder_selection.clone(),
+                        folder_scroller.clone(),
                         message_list.clone(),
                         message_list_stack.clone(),
                         message_header.clone(),
@@ -6322,6 +6326,7 @@ fn connect_account(
     worker: Rc<Worker>,
     state: Rc<RefCell<UiState>>,
     folder_selection: gtk::SingleSelection,
+    folder_scroller: gtk::ScrolledWindow,
     message_list: MessageListModel,
     message_list_stack: gtk::Stack,
     message_header: crate::message_header::MessageHeader,
@@ -6438,7 +6443,7 @@ fn connect_account(
                         // wrongly suppressed by an entry that'll never resolve.
                         st.syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
                     }
-                    rebuild_folder_tree(&state, &folder_selection);
+                    rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
                     // Folder names and account labels only exist once this
                     // event lands, so a view restored before it (or adopted by
                     // the race below) gets its header filled in here.
@@ -9953,7 +9958,7 @@ fn folder_tree_signature(accounts: &[(AccountId, String, Vec<Mailbox>)], favorit
     // and disappears with its membership), so it belongs in the signature.
     // Carried under a reserved pseudo-account id rather than a separate field
     // so the comparison stays a single `==`.
-    signature.push((AccountId("\u{0}favorites".into()), String::new(), favorites.iter().map(row).collect()));
+    signature.push((AccountId(FAVORITES_GROUP_KEY.into()), String::new(), favorites.iter().map(row).collect()));
     signature
 }
 
@@ -9965,7 +9970,7 @@ fn folder_tree_signature(accounts: &[(AccountId, String, Vec<Mailbox>)], favorit
 /// the pane opens on the user's remembered view (see `last_view`), or the
 /// "All Inboxes" unified row by default (see
 /// `restore_or_default_initial_view`).
-fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::SingleSelection) {
+fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::SingleSelection, folder_scroller: &gtk::ScrolledWindow) {
     // Borrow only long enough to snapshot the account data. `set_selected`
     // inside `select_first_inbox` synchronously fires the `selected-item`
     // handler, which itself borrows `state` mutably - so no borrow may be
@@ -10041,9 +10046,15 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
         }
     }
 
-    // The selection and the expanded subfolders don't survive `set_model`, so
-    // note them first and put them back afterwards.
+    // The selection, the expanded subfolders, the account groups' collapse
+    // state, and the scroll position don't survive `set_model`, so note them
+    // all first and put them back afterwards. The scroll value matters too:
+    // `GtkSingleSelection` autoselects row 0 ("All Inboxes") on `set_model`,
+    // and without a restore the pane can end up jumped to the top, leaving a
+    // scrolled-down account's subtree looking collapsed.
     let expanded = expanded_mailboxes(folder_selection);
+    let collapsed_groups = collapsed_account_groups(folder_selection);
+    let scroll_value = folder_scroller.vadjustment().value();
     let restore_to = {
         let st = state.borrow();
         match st.mail_view {
@@ -10064,6 +10075,8 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
     state.borrow_mut().suppress_folder_selection = true;
     folder_selection.set_model(Some(&model));
     expand_mailboxes(&model, &expanded);
+    apply_account_group_expansion(&model, &collapsed_groups);
+    folder_scroller.vadjustment().set_value(scroll_value);
     match restore_to {
         Some(SelectionTarget::Unified) => folder_selection.set_selected(0),
         Some(SelectionTarget::Mailbox(mailbox)) => {
@@ -10090,8 +10103,8 @@ enum SelectionTarget {
 
 /// The mailboxes whose rows are currently expanded, so a rebuild can restore
 /// them. Only `TreeItem::Folder` rows are collected - account groups and the
-/// Favorites section are expanded unconditionally by
-/// `build_multi_account_tree_model`, and `Favorite` rows are leaves.
+/// Favorites section carry their own collapse state (see
+/// `collapsed_account_groups`), and `Favorite` rows are leaves.
 fn expanded_mailboxes(folder_selection: &gtk::SingleSelection) -> HashSet<MailboxId> {
     let mut expanded = HashSet::new();
     let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() else {
@@ -10126,6 +10139,87 @@ fn expand_mailboxes(model: &gtk::TreeListModel, expanded: &HashSet<MailboxId>) {
                 if is_wanted {
                     row.set_expanded(true);
                 }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// The reserved pseudo-account key under which the Favorites section's group
+/// state is carried by `collapsed_account_groups` - the same sentinel
+/// `folder_tree_signature` uses to fold the favorites section into its
+/// comparison.
+const FAVORITES_GROUP_KEY: &str = "\u{0}favorites";
+
+/// The account groups (and the Favorites section) the user has collapsed in
+/// the current tree, so a rebuild can keep them collapsed - the account-level
+/// counterpart of `expanded_mailboxes`, which covers subfolders only.
+///
+/// Only rows that are genuinely collapsible are recorded: an account whose
+/// folder list hasn't arrived yet renders as a row that can't have been
+/// collapsed by the user, so it must never be captured - otherwise a slow
+/// account's pre-connect state would be remembered as "the user collapsed
+/// it", and its subtree would reopen collapsed once its folders landed. The
+/// Favorites section is keyed under `FAVORITES_GROUP_KEY`, mirroring
+/// `folder_tree_signature`.
+fn collapsed_account_groups(folder_selection: &gtk::SingleSelection) -> HashSet<AccountId> {
+    let mut collapsed = HashSet::new();
+    let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() else {
+        return collapsed;
+    };
+    for i in 0..model.n_items() {
+        let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
+        if row.depth() != 0 || row.is_expanded() || !row.is_expandable() {
+            continue;
+        }
+        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { continue };
+        let tree_item = boxed.borrow::<TreeItem>();
+        match &*tree_item {
+            TreeItem::Account(acc) => {
+                collapsed.insert(acc.account_id.clone());
+            }
+            TreeItem::Favorites => {
+                collapsed.insert(AccountId(FAVORITES_GROUP_KEY.into()));
+            }
+            _ => {}
+        }
+    }
+    collapsed
+}
+
+/// Applies the account groups' (and the Favorites section's) collapse state
+/// to a freshly built model, replacing `build_multi_account_tree_model`'s old
+/// unconditional expand-all. Rows the user collapsed stay collapsed;
+/// everything else - including accounts that just connected - defaults to
+/// expanded, the long-standing look of the pane. Only depth-0 rows are
+/// touched: subfolders are the caller's `expand_mailboxes` restore's job.
+/// Walks by index with `n_items` re-evaluated (like `expand_mailboxes`)
+/// because expanding a row inserts its children into the flat model, shifting
+/// every later row's position; a fixed range would silently skip them.
+fn apply_account_group_expansion(model: &gtk::TreeListModel, collapsed: &HashSet<AccountId>) {
+    let mut i = 0;
+    while i < model.n_items() {
+        let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else {
+            i += 1;
+            continue;
+        };
+        if row.depth() != 0 {
+            i += 1;
+            continue;
+        }
+        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else {
+            i += 1;
+            continue;
+        };
+        let tree_item = boxed.borrow::<TreeItem>();
+        let key = match &*tree_item {
+            TreeItem::Account(acc) => Some(acc.account_id.clone()),
+            TreeItem::Favorites => Some(AccountId(FAVORITES_GROUP_KEY.into())),
+            _ => None,
+        };
+        if let Some(key) = key {
+            if !collapsed.contains(&key) {
+                row.set_expanded(true);
             }
         }
         i += 1;
@@ -11992,26 +12086,31 @@ mod tests {
         assert_eq!(keys, vec![("b:INBOX".into(), 2), ("a:INBOX".into(), 1), ("a:INBOX".into(), 2)]);
     }
 
-    #[test]
-    fn request_mailbox_sync_dedupes_until_answered_or_reconnected() {
-        let account_id = AccountId("acc".into());
-        let inbox = MailboxId("acc:INBOX".into());
-        let (cmd_tx, _cmd_rx) = async_channel::unbounded();
-        let state = Rc::new(RefCell::new(UiState {
-            accounts: HashMap::from([(
-                account_id.clone(),
-                AccountHandle {
-                    cmd_tx,
-                    email: "a@b.c".into(),
-                    display_name: String::new(),
-                    imap_host: "imap".into(),
-                    imap_port: 993,
-                    smtp_host: "smtp".into(),
-                    smtp_port: 465,
-                    folders: Vec::new(),
-                    address_cache: None,
-                },
-            )]),
+    /// A minimal `UiState` with one `AccountHandle` per given account (fresh
+    /// command channels, empty folder lists unless the caller passes them).
+    fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> {
+        let accounts: HashMap<AccountId, AccountHandle> = accounts
+            .into_iter()
+            .map(|(id, folders)| {
+                let (cmd_tx, _cmd_rx) = async_channel::unbounded();
+                (
+                    id.clone(),
+                    AccountHandle {
+                        cmd_tx,
+                        email: "a@b.c".into(),
+                        display_name: String::new(),
+                        imap_host: "imap".into(),
+                        imap_port: 993,
+                        smtp_host: "smtp".into(),
+                        smtp_port: 465,
+                        folders,
+                        address_cache: None,
+                    },
+                )
+            })
+            .collect();
+        Rc::new(RefCell::new(UiState {
+            accounts,
             contacts_by_account: HashMap::new(),
             starred_contacts: HashSet::new(),
             ui_db: None,
@@ -12066,7 +12165,14 @@ mod tests {
             search_query: String::new(),
             search_results: Vec::new(),
             search_pending: HashSet::new(),
-        }));
+        }))
+    }
+
+    #[test]
+    fn request_mailbox_sync_dedupes_until_answered_or_reconnected() {
+        let account_id = AccountId("acc".into());
+        let inbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(account_id.clone(), Vec::new())]);
 
         // First request goes out and is marked pending.
         assert!(request_mailbox_sync(&state, &account_id, &inbox));
@@ -12083,6 +12189,180 @@ mod tests {
         state.borrow_mut().syncing.insert(inbox.clone());
         state.borrow_mut().syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
         assert!(!state.borrow().syncing.contains(&inbox));
+    }
+
+    /// The depth-0 row for one account group in a freshly built tree.
+    fn account_row(model: &gtk::TreeListModel, id: &AccountId) -> gtk::TreeListRow {
+        for i in 0..model.n_items() {
+            let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
+            if row.depth() != 0 {
+                continue;
+            }
+            let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { continue };
+            let tree_item = boxed.borrow::<TreeItem>();
+            if let TreeItem::Account(acc) = &*tree_item {
+                if &acc.account_id == id {
+                    return row;
+                }
+            }
+        }
+        panic!("no depth-0 account row for {id:?}");
+    }
+
+    /// The depth-0 Favorites section row of a freshly built tree.
+    fn favorites_row(model: &gtk::TreeListModel) -> gtk::TreeListRow {
+        for i in 0..model.n_items() {
+            let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
+            if row.depth() != 0 {
+                continue;
+            }
+            let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { continue };
+            let tree_item = boxed.borrow::<TreeItem>();
+            if matches!(&*tree_item, TreeItem::Favorites) {
+                return row;
+            }
+        }
+        panic!("no Favorites row");
+    }
+
+    /// The mailbox the folder pane's selection currently highlights, if any.
+    fn selected_mailbox(selection: &gtk::SingleSelection) -> Option<MailboxId> {
+        let row = selection.selected_item().and_downcast::<gtk::TreeListRow>()?;
+        let boxed = row.item().and_downcast::<glib::BoxedAnyObject>()?;
+        let tree_item = boxed.borrow::<TreeItem>();
+        match &*tree_item {
+            TreeItem::Folder(node) => Some(node.mailbox.id.clone()),
+            _ => None,
+        }
+    }
+
+    /// The folder-pane collapse regression tests, in one `#[test]` for the
+    /// same reason `MessageListModel`'s GTK suite is: GTK may only be
+    /// initialised on a single thread, and libtest gives each `#[test]` its
+    /// own - so several GTK-touching tests race to `gtk::init()` and
+    /// whichever loses panics. Skipped when the host has no display to
+    /// initialise against. Covers: (1) a user's manual account-group collapse
+    /// surviving the constant `FoldersUpdated` rebuilds (with the Favorites
+    /// section's own collapse riding along under its reserved key), (2) a
+    /// slow-connecting account rendering *expandable but empty* rather than a
+    /// chevron-less leaf and popping open when its folders land, and (3) the
+    /// end-to-end `rebuild_folder_tree` path preserving collapse, selection,
+    /// and scroll.
+    #[test]
+    fn folder_tree_rebuild_preserves_collapse_state_and_scroll() {
+        // GTK's display-dependent tests can only run when the host has a
+        // display AND this test's thread is the one that initialized GTK -
+        // `gtk::init()` panics if another test thread got there first, so the
+        // suite skips instead of failing (same self-skipping convention as
+        // `theme.rs`'s `gtk_ok`).
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let acc_a = AccountId("acc_a".into());
+        let acc_b = AccountId("acc_b".into());
+
+        // --- (1) A user's account-group collapse survives a rebuild ---
+        let build = || {
+            build_multi_account_tree_model(
+                vec![
+                    (acc_a.clone(), "A".into(), vec![test_mailbox(&acc_a, "INBOX", 3)]),
+                    (acc_b.clone(), "B".into(), vec![test_mailbox(&acc_b, "INBOX", 0)]),
+                ],
+                vec![test_mailbox(&acc_a, "INBOX", 3)],
+            )
+        };
+        let model = build();
+        apply_account_group_expansion(&model, &HashSet::new());
+        assert!(account_row(&model, &acc_a).is_expanded(), "default: every account group expanded");
+        assert!(account_row(&model, &acc_b).is_expanded());
+        assert!(favorites_row(&model).is_expanded());
+
+        // The user collapses account B and the Favorites section.
+        account_row(&model, &acc_b).set_expanded(false);
+        favorites_row(&model).set_expanded(false);
+
+        let selection = gtk::SingleSelection::new(Some(model));
+        let collapsed = collapsed_account_groups(&selection);
+        assert!(collapsed.contains(&acc_b));
+        assert!(collapsed.contains(&AccountId(FAVORITES_GROUP_KEY.into())));
+        assert!(!collapsed.contains(&acc_a), "account A was left expanded");
+
+        // A rebuild (e.g. a count refresh) must put the pane back the way the
+        // user left it, not revert everything to all-expanded.
+        let rebuilt = build();
+        apply_account_group_expansion(&rebuilt, &collapsed);
+        assert!(account_row(&rebuilt, &acc_a).is_expanded());
+        assert!(!account_row(&rebuilt, &acc_b).is_expanded(), "account B's collapse survived the rebuild");
+        assert!(!favorites_row(&rebuilt).is_expanded(), "the Favorites collapse survived too");
+
+        // --- (2) A not-yet-connected account stays expandable-in-waiting ---
+        let waiting = build_multi_account_tree_model(
+            vec![(acc_a.clone(), "A".into(), vec![test_mailbox(&acc_a, "INBOX", 3)]), (acc_b.clone(), "B".into(), Vec::new())],
+            vec![],
+        );
+        apply_account_group_expansion(&waiting, &HashSet::new());
+        let b_row = account_row(&waiting, &acc_b);
+        assert!(b_row.is_expandable(), "a not-yet-connected account must not render as a leaf");
+        assert!(b_row.is_expanded(), "it defaults to expanded like every account group");
+
+        let selection = gtk::SingleSelection::new(Some(waiting));
+        let collapsed = collapsed_account_groups(&selection);
+        assert!(!collapsed.contains(&acc_b), "an account still waiting for folders can't be user-collapsed");
+
+        // Its folders arrive on the next sync: the rebuild re-opens it.
+        let connected = build_multi_account_tree_model(
+            vec![
+                (acc_a.clone(), "A".into(), vec![test_mailbox(&acc_a, "INBOX", 4)]),
+                (acc_b.clone(), "B".into(), vec![test_mailbox(&acc_b, "INBOX", 1)]),
+            ],
+            vec![],
+        );
+        apply_account_group_expansion(&connected, &collapsed);
+        let b_row = account_row(&connected, &acc_b);
+        assert!(b_row.is_expandable());
+        assert!(b_row.is_expanded(), "the account pops open as soon as its folders land");
+        assert!(b_row.child_row(0).is_some(), "its INBOX is reachable beneath it");
+
+        // --- (3) End to end through `rebuild_folder_tree` ---
+        let state = test_state(vec![
+            (acc_a.clone(), vec![test_mailbox(&acc_a, "INBOX", 3)]),
+            (acc_b.clone(), vec![test_mailbox(&acc_b, "INBOX", 0)]),
+        ]);
+        state.borrow_mut().current_account = Some(acc_a.clone());
+        state.borrow_mut().current_mailbox = Some(MailboxId("acc_a:INBOX".into()));
+
+        let folder_selection = gtk::SingleSelection::new(None::<gio::ListModel>);
+        let folder_scroller = gtk::ScrolledWindow::new();
+        folder_scroller.set_vadjustment(Some(&gtk::Adjustment::new(0.0, 0.0, 100.0, 0.0, 0.0, 0.0)));
+        let adjustment = folder_scroller.vadjustment();
+        adjustment.set_value(42.0);
+
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+        let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
+        assert!(account_row(&model, &acc_a).is_expanded());
+        assert!(account_row(&model, &acc_b).is_expanded());
+        assert_eq!(
+            selected_mailbox(&folder_selection),
+            Some(MailboxId("acc_a:INBOX".into())),
+            "first build restores the open mailbox"
+        );
+
+        // The user collapses account B.
+        account_row(&model, &acc_b).set_expanded(false);
+
+        // A count refresh lands: the signature changes, so the rebuild runs.
+        state.borrow_mut().accounts.get_mut(&acc_b).unwrap().folders[0].unread = 5;
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+
+        let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
+        assert!(account_row(&model, &acc_a).is_expanded(), "account A stays expanded");
+        assert!(!account_row(&model, &acc_b).is_expanded(), "account B's collapse survives the rebuild");
+        assert_eq!(selected_mailbox(&folder_selection), Some(MailboxId("acc_a:INBOX".into())), "the selection is restored");
+        assert_eq!(adjustment.value(), 42.0, "the scroll position survives the model swap");
     }
 
     fn summary(uid: Uid, mailbox: &str, year: i32, month: u32, day: u32, hour: u32) -> EmailSummary {

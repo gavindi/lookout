@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.27 (2026-08-12)
+
+### Fixed
+
+- **Mail**: the folder pane could collapse a non-primary account's tree a few seconds after you clicked into it - on startup, opening any account group other than the first and clicking that account's Inbox would, 5-10 seconds later, snap the tree back to "primary expanded, everyone else collapsed". The tree is rebuilt from scratch on every `FoldersUpdated`, and those now arrive repeatedly per account while unread counts fill in (the STATUS refresh pass, and the sync a folder click triggers) - but the rebuild only remembered the selected mailbox and any expanded *subfolders*. Account-group expansion was re-derived from scratch by an unconditional expand-all, the pane's scroll position was never restored (`GtkSingleSelection` autoselects the top "All Inboxes" row on every model swap, and the pane could end up jumped there), and an account whose folder list hadn't arrived yet - the slow OAuth/connect stretch of a Microsoft 365 account - rendered as a chevron-less leaf row that read as permanently collapsed. The rebuild now preserves all four: the collapsed account groups (and a collapsed Favorites section) are captured before the model swap and re-applied after it, so a user's manual collapse/expand survives the count flood; the scroll position is restored, so the pane no longer jumps to the top; and an account still waiting for its folder list renders as an expandable-but-empty group instead of a leaf, popping open with its folders the moment they land. Everything else keeps the long-standing look - every account group and the Favorites section still default to expanded, including accounts that connect late.
+
+### Testing
+
+- `lookout-app`: a new `window` test drives the real `TreeListModel` end to end - a manual account-group collapse (and the Favorites section's) surviving a rebuild, a not-yet-connected account staying expandable-in-waiting and opening once its folders arrive, and `rebuild_folder_tree` preserving collapse state, the selected mailbox, and the scroll position across the model swap.
+
 ## 0.9.26 (2026-08-11)
 
 ### Added
