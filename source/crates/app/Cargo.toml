@@ -34,6 +34,7 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 webkit = { package = "webkit6", version = "0.6" }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
 
 [package.metadata.deb]
 name = "lookout"

@@ -1141,6 +1141,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     crate::last_view::migrate_legacy(&settings);
     crate::background_image::migrate_legacy(&settings);
 
+    // --- Background portal approval: ask the session's portal once (the
+    // shell shows a dialog the first time, then remembers) so Lookout is
+    // listed among the desktop's background apps and can be stopped there,
+    // whenever the close-to-background feature is on. Fire-and-forget: no
+    // portal (or a denial) only means the app is invisible to that listing,
+    // not that background running stops.
+    if settings.get_bool(crate::settings::CLOSE_TO_BACKGROUND) {
+        worker.spawn(async { crate::background::request_background_approval().await });
+    }
+
     let bg_bytes = crate::resources::bytes("/io/github/gavindi/Lookout/backgrounds/background2.png")
         .unwrap_or_else(|| glib::Bytes::from_static(include_bytes!("../../../data/resources/backgrounds/background2.png")));
     let default_bg_texture = gtk::gdk::Texture::from_bytes(&bg_bytes).expect("bundled background image should decode");
@@ -4085,6 +4095,33 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window.add_action(&sort_key_action);
     window.add_action(&list_filter_action);
 
+    // --- Close-to-background: the window's close button hides the window
+    // instead of exiting (Config → General → "Keep running when the window
+    // is closed"), so account sync and the notification loops keep running;
+    // File → Quit (`app.quit`) is the real exit. The portal status line
+    // (v2 `SetStatus`) tells the shell's background-apps list what the
+    // hidden app is doing; clearing it on show keeps that list honest.
+    {
+        let settings = settings.clone();
+        window.connect_close_request({
+            let worker = worker.clone();
+            move |win| {
+                if !settings.get_bool(crate::settings::CLOSE_TO_BACKGROUND) {
+                    return glib::Propagation::Proceed;
+                }
+                worker.spawn(crate::background::set_background_status("Syncing your mail and calendar"));
+                win.set_visible(false);
+                glib::Propagation::Stop
+            }
+        });
+        window.connect_show({
+            let worker = worker.clone();
+            move |_| {
+                worker.spawn(crate::background::set_background_status(""));
+            }
+        });
+    }
+
     // --- Pane widths: persist and reapply. Each paned's `position` change
     // (a horizontal drag) cancels the pending settle and reschedules it, so
     // 150 ms after the drag stops the pane's width as a percentage of the
@@ -4747,6 +4784,37 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             state.borrow().settings.set_bool(crate::settings::CALENDAR_ALERTS_ENABLED, row.is_active());
         });
     }
+
+    // Config → General → "Start Lookout at login": registers login
+    // autostart with the session's Background portal when available (the
+    // shell decides, first time via a dialog, and manages the registration
+    // from then on - see the row's subtitle), falling back to a managed
+    // XDG autostart file when there's no portal. Disabling removes the
+    // XDG entry; a portal registration is revoked from the desktop's app
+    // settings, since the portal API has no unregister call.
+    {
+        let state = state.clone();
+        let worker = worker.clone();
+        config_view.start_at_login_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::START_AT_LOGIN, enabled);
+            if enabled {
+                worker.spawn(async { let _ = crate::background::enable_login_autostart().await; });
+            } else {
+                crate::background::disable_login_autostart();
+            }
+        });
+    }
+
+    // Config → General → "Keep running when the window is closed": read by
+    // the main window's close-request handler at close time (see the
+    // `connect_close_request` above), so nothing needs re-arming here.
+    {
+        let state = state.clone();
+        config_view.close_to_background_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::CLOSE_TO_BACKGROUND, row.is_active());
+        });
+    }
     // Phase 5: apply the persisted Config → Appearance/Mail switch states now
     // that their handlers are wired. Each `set_active` fires the notify
     // handler above, which re-derives UiState and any widget effect from the
@@ -4759,6 +4827,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.read_receipts_row.set_active(persisted.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS));
         config_view.mail_notifications_row.set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
         config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
+        // "Start Lookout at login": the setting is the source of truth for
+        // the portal path; the managed XDG file is the fallback, so an
+        // entry left over (or written while the portal was absent) counts
+        // as enabled too. Seeding fires the notify handler above, which for
+        // an enabled start re-asserts the registration - a silent no-op
+        // when the portal already knows.
+        if crate::background::autostart_file_exists() && !persisted.get_bool(crate::settings::START_AT_LOGIN) {
+            persisted.set_bool(crate::settings::START_AT_LOGIN, true);
+        }
+        config_view.start_at_login_row.set_active(persisted.get_bool(crate::settings::START_AT_LOGIN));
+        config_view.close_to_background_row.set_active(persisted.get_bool(crate::settings::CLOSE_TO_BACKGROUND));
         // Theme rows: seeding fires the notify handlers above, which apply
         // the persisted theme/accent through the ThemeManager, so startup
         // can't drift from what was saved.

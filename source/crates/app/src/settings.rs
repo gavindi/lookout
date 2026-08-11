@@ -30,6 +30,8 @@ use gtk::gio::prelude::{SettingsExt, SettingsExtManual};
 pub const SCHEMA_ID: &str = "io.github.gavindi.Lookout";
 
 pub const ANIMATE_TRANSITIONS: &str = "animate-transitions";
+pub const START_AT_LOGIN: &str = "start-at-login";
+pub const CLOSE_TO_BACKGROUND: &str = "close-to-background";
 pub const WINDOW_BACKGROUND_PATH: &str = "window-background-path";
 pub const BACKGROUND_BRIGHTNESS: &str = "background-brightness";
 pub const THEME_ID: &str = "theme-id";
@@ -113,6 +115,8 @@ fn create_gio_settings() -> Option<gio::Settings> {
 fn defaults() -> HashMap<&'static str, Value> {
     let mut map = HashMap::new();
     map.insert(ANIMATE_TRANSITIONS, Value::Bool(true));
+    map.insert(START_AT_LOGIN, Value::Bool(false));
+    map.insert(CLOSE_TO_BACKGROUND, Value::Bool(true));
     map.insert(WINDOW_BACKGROUND_PATH, Value::String(String::new()));
     map.insert(BACKGROUND_BRIGHTNESS, Value::Double(1.0));
     map.insert(THEME_ID, Value::String(crate::theme::DEFAULT_THEME.into()));

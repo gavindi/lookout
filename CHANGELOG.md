@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.28 (2026-08-12)
+
+### Added
+
+- **Background**: Lookout can now run in the background from login, so mail and calendar notifications keep working with no window on screen. Closing the window now hides it instead of exiting - Config → General's new **Keep running when the window is closed** switch (the `close-to-background` GSettings key, on by default) gates it - with account sync, IMAP IDLE, and the event-reminder loop all continuing underneath; File → Quit remains the real exit, and clicking a notification's action (Open/Reply-to-mailbox/Raise) re-presents the window. A new Config → General **Start Lookout at login** switch (the `start-at-login` GSettings key, off by default) registers a login launch through the session's Background portal (`org.freedesktop.portal.Background`, v2 API): the portal asks the shell once (its approval dialog), and the shell owns the registration from then on (GNOME: Settings → Apps), requested with a `commandline` of `lookout --hidden` so the login launch starts without a window. When the session has no portal - or the call fails outright - the app falls back to writing its own XDG autostart entry (`~/.config/autostart/io.github.gavindi.Lookout.desktop`, atomic temp-file + rename), removed again when the switch is turned off; an explicit denial by the shell is respected and never falls back, and a leftover autostart file counts as enabled at startup so the switch can't drift from what's actually registered. The new `--hidden` flag builds the window but never presents it, and a `window.present()` from a notification action, the app icon, or a second process's D-Bus activation raises it like any other activation. The window lifecycle is now single-window too: an activation while a window exists re-presents it instead of building a duplicate (a long-standing quirk where clicking the app icon while running created a second window). While hidden, the app reports a status line ("Syncing your mail and calendar") into the shell's background-apps list via the portal's v2 `SetStatus`, cleared on show. The Flatpak manifest gains the `--talk-name=org.freedesktop.portal.Background` permission (the sandbox can't write the XDG fallback, so the portal path is its only one).
+
+### Testing
+
+- `lookout-app`: three new `background` tests drive the autostart-entry writer against a temp directory - the entry contains the `Exec=lookout --hidden` line and `X-GNOME-Autostart-enabled=true`, the `~/.config/autostart` directory is created when missing, and removal works and tolerates an already-absent entry.
+
 ## 0.9.27 (2026-08-12)
 
 ### Fixed

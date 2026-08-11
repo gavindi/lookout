@@ -147,6 +147,14 @@ pub struct ConfigView {
     /// "Restore default shortcuts" row at the bottom of the keyboard group,
     /// exposed so the caller can wire it to `ShortcutState::reset_all`.
     pub reset_shortcuts_row: adw::ActionRow,
+    /// "Start Lookout at login" switch (Config → General), exposed so the
+    /// caller can wire it to the background-portal / XDG-autostart
+    /// registration.
+    pub start_at_login_row: adw::SwitchRow,
+    /// "Keep running when the window is closed" switch (Config → General),
+    /// exposed so the caller can wire it into the main window's
+    /// close-request handling.
+    pub close_to_background_row: adw::SwitchRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     webcal_group: adw::PreferencesGroup,
@@ -339,10 +347,31 @@ pub fn build() -> ConfigView {
         .build();
     keyboard_expander.add_row(&reset_shortcuts_row);
 
+    // The real "General" group, replacing that section's placeholder: the
+    // login-autostart and close-to-background switches behind background
+    // running, wired by the caller into `background.rs` and the main
+    // window's close-request handling. "Start Lookout at login" is seeded
+    // from the persisted setting at startup; the portal-managed half of it
+    // can also be controlled from the desktop's own app settings.
+    let general_group = adw::PreferencesGroup::builder().title("General").build();
+    let start_at_login_row = adw::SwitchRow::builder()
+        .title("Start Lookout at login")
+        .subtitle("Run in the background from login so mail and calendar notifications keep working (also manageable in the desktop's app settings)")
+        .build();
+    general_group.add(&start_at_login_row);
+    let close_to_background_row = adw::SwitchRow::builder()
+        .title("Keep running when the window is closed")
+        .subtitle("Continue syncing and notifying in the background; quit from the File menu")
+        .active(true)
+        .build();
+    general_group.add(&close_to_background_row);
+
     for section in PLACEHOLDER_SECTIONS {
-        // "Keyboard shortcuts" lives in the "General" section's place - the
-        // first group, matching the taxonomy order.
+        // "General" is a live group now (see `general_group` above);
+        // "Keyboard shortcuts" sits right below it, keeping the taxonomy
+        // order.
         if section == "General" {
+            page.add(&general_group);
             page.add(&keyboard_group);
             continue;
         }
@@ -412,6 +441,8 @@ pub fn build() -> ConfigView {
         google_tasks_client_row,
         keyboard_rows: RefCell::new(keyboard_rows),
         reset_shortcuts_row,
+        start_at_login_row,
+        close_to_background_row,
         mail_group,
         calendar_group,
         webcal_group,

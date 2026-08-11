@@ -19,6 +19,8 @@
 
         "--talk-name=org.gnome.OnlineAccounts",
 
+        "--talk-name=org.freedesktop.portal.Background",
+
         "--talk-name=org.gnome.Settings",
         "--talk-name=org.gnome.ControlCenter",
 

@@ -1,6 +1,7 @@
 //! GTK4/libadwaita application entry point.
 
 mod app_config;
+mod background;
 mod background_image;
 mod calendar_colors;
 mod calendar_view;
@@ -36,6 +37,7 @@ mod ui_state_db;
 mod window;
 mod worker;
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::glib;
@@ -49,12 +51,46 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     let worker = Rc::new(worker::Worker::new());
 
+    // The autostart entry launches `lookout --hidden`: build the window but
+    // don't present it, so mail/calendar sync and the reminder loop run from
+    // login without a window. Clicking the app icon or a notification's
+    // action (`app.open-mailbox`, `app.open-event`, `app.raise-window`)
+    // raises it.
+    let hidden = Rc::new(Cell::new(false));
+    {
+        let hidden = hidden.clone();
+        app.add_main_option("hidden", b'h'.into(), glib::OptionFlags::NONE, glib::OptionArg::None, "Start without showing the main window", None);
+        app.connect_handle_local_options(move |_app, options| {
+            // A `G_OPTION_ARG_NONE` option shows up in the parsed options
+            // dictionary as a true boolean; the env-args check covers any
+            // dispatch quirk, since the process argv is never rewritten.
+            if options.lookup_value("hidden", None).is_some() || std::env::args().any(|arg| arg == "--hidden") {
+                hidden.set(true);
+            }
+            std::ops::ControlFlow::<glib::ExitCode>::Continue(())
+        });
+    }
+
+    // Single window for the app's lifetime: an activation while one exists
+    // (an app-icon click, a second process's D-Bus activation) just presents
+    // it instead of building a duplicate.
+    let window: Rc<RefCell<Option<adw::ApplicationWindow>>> = Rc::new(RefCell::new(None));
     app.connect_activate(move |app| {
         let display = gtk::gdk::Display::default().expect("GTK initializes a display");
         crate::resources::register(&display);
 
+        let existing = window.borrow().clone();
+        if let Some(win) = existing {
+            win.present();
+            return;
+        }
         let win = window::build_window(app, worker.clone());
-        win.present();
+        *window.borrow_mut() = Some(win.clone());
+        if hidden.get() {
+            tracing::debug!("started with --hidden; window built but not presented");
+        } else {
+            win.present();
+        }
     });
 
     app.run()
