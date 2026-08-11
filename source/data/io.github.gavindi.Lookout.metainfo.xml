@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.29" date="2026-08-12">
+      <description>
+        <p>Fixed the mini-calendar overview pane getting clipped on the right edge when the main window is shrunk below the width needed to display it whole - the pane now auto-hides until a resize makes it fit again, and only comes back if the Calendar overview toggle is still enabled.</p>
+      </description>
+    </release>
     <release version="0.9.27" date="2026-08-12">
       <description>
         <p>Fixed the folder pane collapsing a non-primary account's tree a few seconds after clicking into it - the tree is rebuilt on every folder update, and the rebuild now preserves each account group's collapse state, the selected folder, and the scroll position, while an account that is still connecting stays expandable instead of rendering as a permanently-collapsed row.</p>
