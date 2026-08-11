@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.32 (2026-08-12)
+
+### Fixed
+
+- **Mail**: dragging a message - or, when the dragged row is part of one, the whole multi-selection - onto a folder in the folder pane didn't move it. The drag started (message rows are drag sources, with the folder rows carrying drop targets since 0.9.9) but the folder rows never accepted the drop: no highlight as the drag passed over them, and releasing did nothing. GTK's drop targets only accept a drop when a GType can be matched between the target's formats and the drag's formats (`gdk_content_formats_match_gtype`), and the internal payload was offered under a private mime type (`application/x-lookout-messages`) via `gdk_content_provider_new_for_bytes` - a mime-only `GdkContentFormats` carries no gtypes, and nothing ever registered a serializer/deserializer mapping that private mime to one, so the match came back `G_TYPE_INVALID` and the accept gate rejected every drop before the `drop` handler could run. The payload is now offered as a `G_TYPE_BYTES` *value* (`gdk_content_provider_new_for_value`), which rides GTK's built-in `application/octet-stream` ↔ `G_TYPE_BYTES` serializer/deserializer mapping, and the folder rows' drop targets are built from that same type - so the drop is accepted and the bytes are copied straight into the handler on a local drop, no stream round-trip. Dropping onto a tag row in the Categorize menu shared the same mime-only target and the same bug; it's fixed the same way. Everything else about the drop path is unchanged: same-folder drops are still ignored, cross-account drops are still refused, messages are grouped into one move per source mailbox, and the `.eml` drag-out to a file manager (its own `text/uri-list` payload) is untouched.
+
+### Testing
+
+- `lookout-app`: three new `window` tests cover the drop path's command side - a folder drop routing the dragged messages to the account session as one `MoveMessagesTo` per source mailbox with the other account's messages refused, foreign payloads (a text value, junk bytes) declined so GTK can pass the drop on to another target, and a tag drop issuing one `StoreKeywordsMany` per source mailbox.
+
 ## 0.9.31 (2026-08-12)
 
 ### Fixed

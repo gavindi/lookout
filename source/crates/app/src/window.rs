@@ -1230,7 +1230,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // into `drop_data`, since the drop can't read the model itself.
             let drop_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
             let drop_target = gtk::DropTarget::builder()
-                .formats(&gtk::gdk::ContentFormats::new(&[MESSAGE_DRAG_MIME]))
+                .formats(&gtk::gdk::ContentFormats::for_type(glib::Bytes::static_type()))
                 .actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE)
                 .build();
             {
@@ -1930,7 +1930,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         return None;
                     }
                 };
-                let internal_provider = gtk::gdk::ContentProvider::for_bytes(MESSAGE_DRAG_MIME, &bytes);
+                // The provider holds the payload as a `G_TYPE_BYTES` *value*
+                // (rather than exposing it under a private mime type), because
+                // GTK's drop targets only accept a drag when a GType can be
+                // matched between the two sides' formats - a mime-only
+                // `ContentFormats` has no gtypes, and an unregistered mime has
+                // no GType mapping, so the folder rows would reject every
+                // drop before `connect_drop` ever fired. The value is copied
+                // straight into the drop handler on a local drop, no stream
+                // round-trip needed.
+                let internal_provider = gtk::gdk::ContentProvider::for_value(&glib::Value::from(bytes));
                 Some(match write_external_drag_files(&state_for_drag, &summaries, &drag_temp_files_for_prepare) {
                     Some(files) => gtk::gdk::ContentProvider::new_union(&[internal_provider, files]),
                     None => internal_provider,
@@ -8980,11 +8989,6 @@ fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
     mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
 }
 
-/// The private mime type message rows expose for internal folder drops -
-/// an opaque token so a drop from any other source can't be misread as a
-/// message move.
-const MESSAGE_DRAG_MIME: &str = "application/x-lookout-messages";
-
 /// Which summaries a message-row drag carries: the whole current selection
 /// when the dragged row is part of one, otherwise just that row's message.
 fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefCell<Option<EmailSummary>>>) -> Vec<EmailSummary> {
@@ -9032,10 +9036,13 @@ fn write_external_drag_files(state: &Rc<RefCell<UiState>>, summaries: &[EmailSum
 }
 
 /// Handles a folder row's drop: deserializes the dragged `(mailbox, uid)`
-/// list, keeps only the messages belonging to the target folder's own
-/// account (messages can't move across accounts), and issues one
-/// `MoveMessagesTo` per source mailbox. `false` when the payload isn't ours
-/// (or empty), which lets GTK try other drop targets.
+/// list (the payload the message rows' drag source publishes as a
+/// `G_TYPE_BYTES` value - a JSON list, so a drop from any other source fails
+/// the parse and reads as "not ours" rather than a bogus move), keeps only
+/// the messages belonging to the target folder's own account (messages can't
+/// move across accounts), and issues one `MoveMessagesTo` per source mailbox.
+/// `false` when the payload isn't ours (or empty), which lets GTK try other
+/// drop targets.
 fn handle_message_drag_drop(state: &Rc<RefCell<UiState>>, target: &Mailbox, value: &glib::Value) -> bool {
     let Ok(bytes) = value.get::<glib::Bytes>() else {
         return false;
@@ -9417,7 +9424,7 @@ fn build_tag_menu(
                 let row_for_enter = row.clone();
                 let row_for_leave = row.clone();
                 let drop_target = gtk::DropTarget::builder()
-                    .formats(&gtk::gdk::ContentFormats::new(&[MESSAGE_DRAG_MIME]))
+                    .formats(&gtk::gdk::ContentFormats::for_type(glib::Bytes::static_type()))
                     .actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE)
                     .build();
                 drop_target.connect_drop(move |_target, value, _x, _y| handle_keyword_drag_drop(&drop_state, &drop_key, value));
@@ -12591,5 +12598,76 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert!(map.contains_key(&window[0]));
         assert!(map.contains_key(&window[1]));
+    }
+
+    /// A folder row's drop must reach the account session as one
+    /// `MoveMessagesTo` per source mailbox, keeping only the dragged
+    /// messages that belong to the target folder's own account - the whole
+    /// server side of drag-a-message-onto-a-folder, minus the GTK plumbing
+    /// (which is exercised manually). Regression guard for the drop path:
+    /// the payload arrives as a `G_TYPE_BYTES` value holding the JSON
+    /// `(mailbox, uid)` list.
+    #[test]
+    fn folder_drop_moves_payload_messages_to_the_target_folder() {
+        let acc = AccountId("acc".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 3), test_mailbox(&acc, "Archive", 0)])]);
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+
+        // Two messages from the target's account, one from a different one.
+        let payload = serde_json::to_vec(&vec![("acc:INBOX".to_string(), 7u32), ("acc:INBOX".to_string(), 9u32), ("other:INBOX".to_string(), 1u32)]).unwrap();
+        let value = glib::Value::from(glib::Bytes::from(payload.as_slice()));
+        let target = test_mailbox(&acc, "Archive", 0);
+
+        let handled = handle_message_drag_drop(&state, &target, &value);
+        assert!(handled, "a well-formed payload must be claimed by the folder's drop target");
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::MoveMessagesTo { mailbox, uids, target: got_target }) => {
+                assert_eq!(mailbox, MailboxId("acc:INBOX".into()));
+                assert_eq!(uids, vec![Uid(7), Uid(9)], "the other account's message is refused");
+                assert_eq!(got_target, MailboxId("acc:Archive".into()));
+            }
+            other => panic!("expected MoveMessagesTo, got {other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "cross-account messages are dropped, so only one command goes out");
+    }
+
+    /// Anything that isn't the message-drag payload must be declined so GTK
+    /// can pass the drop on to another target - a foreign app's bytes won't
+    /// parse as the JSON shape, and a non-bytes value (e.g. a text drop)
+    /// isn't ours at all.
+    #[test]
+    fn folder_drop_rejects_foreign_payloads() {
+        let acc = AccountId("acc".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 0)])]);
+        let target = test_mailbox(&acc, "Archive", 0);
+
+        assert!(!handle_message_drag_drop(&state, &target, &glib::Value::from("hello")), "a text drop is not our payload");
+        assert!(!handle_message_drag_drop(&state, &target, &glib::Value::from(glib::Bytes::from_static(b"not json"))), "junk bytes are not our payload");
+    }
+
+    /// The tag rows' drop side applies the tag to every dragged message of
+    /// that account, via one `StoreKeywordsMany` per source mailbox - the
+    /// batch counterpart of the Categorize menu's toggles.
+    #[test]
+    fn tag_drop_stores_the_keyword_on_payload_messages() {
+        let acc = AccountId("acc".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 3)])]);
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+
+        let payload = serde_json::to_vec(&vec![("acc:INBOX".to_string(), 7u32)]).unwrap();
+        let value = glib::Value::from(glib::Bytes::from(payload.as_slice()));
+        assert!(handle_keyword_drag_drop(&state, "work", &value));
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::StoreKeywordsMany { mailbox, uids, add, remove }) => {
+                assert_eq!(mailbox, MailboxId("acc:INBOX".into()));
+                assert_eq!(uids, vec![Uid(7)]);
+                assert_eq!(add, vec![lookout_core::tag_keyword("work")]);
+                assert!(remove.is_empty());
+            }
+            other => panic!("expected StoreKeywordsMany, got {other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "only one command goes out");
     }
 }

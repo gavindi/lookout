@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.32" date="2026-08-12">
+      <description>
+        <p>Fixed dragging a message onto a folder in the folder pane not moving it. The drag started but the folder rows never accepted the drop: the internal payload was offered under a private mime type, and GTK only accepts a drop when the two sides' formats share a data type - so every drop was rejected before the move could run. The payload now travels as a standard bytes value, and the same fix covers dropping messages onto a tag row in the Categorize menu, which used the same mechanism. Dragging messages out of the app as .eml files still works as before.</p>
+      </description>
+    </release>
     <release version="0.9.31" date="2026-08-12">
       <description>
         <p>Fixed invitations received from Outlook - a Teams meeting invite included - showing no way to respond. Outlook stamps its invites with Windows timezone IDs that the parser couldn't resolve, so the invitation banner never appeared; timezone resolution now falls back to a Windows-to-IANA mapping, so the invite parses with the correct DST-aware meeting time.</p>
