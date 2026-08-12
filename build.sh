@@ -9,14 +9,17 @@ WORKSPACE_DIR="$SCRIPT_DIR/source"
 WEBMAIL_DIR="$SCRIPT_DIR/webmail"
 
 RELEASE=true
+DEB=false
 for arg in "$@"; do
     case "$arg" in
         --release) RELEASE=true ;;
         --debug) RELEASE=false ;;
+        --deb) DEB=true ;;
         -h|--help)
-            echo "Usage: ./build.sh [--release|--debug]"
+            echo "Usage: ./build.sh [--release|--debug] [--deb]"
             echo "  --release   Build with optimizations (default)"
             echo "  --debug     Build without optimizations (cargo build)"
+            echo "  --deb       Package a .deb (implies --release; requires cargo-deb)"
             exit 0
             ;;
         *)
@@ -25,6 +28,10 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+if [ "$DEB" = true ]; then
+    RELEASE=true
+fi
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "error: cargo not found. Install Rust via https://rustup.rs and re-run." >&2
@@ -43,6 +50,11 @@ if [ "${#missing_libs[@]}" -gt 0 ]; then
     exit 1
 fi
 
+if [ "$DEB" = true ] && ! command -v cargo-deb >/dev/null 2>&1; then
+    echo "error: cargo-deb not found. Install it with: cargo install cargo-deb --locked" >&2
+    exit 1
+fi
+
 cd "$WORKSPACE_DIR"
 
 if [ "$RELEASE" = true ]; then
@@ -55,3 +67,9 @@ fi
 
 echo
 echo "Built binary: $BINARY_PATH"
+
+if [ "$DEB" = true ]; then
+    cargo deb --no-build -p lookout-app
+    DEB_PATH="$(ls -t "$WORKSPACE_DIR"/target/debian/*.deb | head -n1)"
+    echo "Built package: $DEB_PATH"
+fi

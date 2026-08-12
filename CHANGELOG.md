@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.33 (2026-08-12)
+
+### Added
+
+- **Packaging**: `./build.sh` gained a `--deb` flag (implies `--release`) that packages a `.deb` locally instead of only through the `deb-rpm` CI job on the `build` branch. It checks for `cargo-deb` up front (erroring with the `cargo install cargo-deb --locked` command if missing), builds the release binary as usual, then runs `cargo deb --no-build -p lookout-app` against the existing `[package.metadata.deb]` config in `lookout-app`'s `Cargo.toml` and prints the resulting package path (`source/target/debian/*.deb`).
+
 ## 0.9.32 (2026-08-12)
 
 ### Fixed
