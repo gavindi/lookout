@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.36 (2026-08-13)
+
+### Fixed
+
+- **Calendar**: dragging an event to a new time slot on the Day/Week grid moved it visually during the drag, but the instant it was dropped it snapped back to its original slot and sat there until the CalDAV round trip finished - up to three stale-data repaints (the drag gesture's own ghost-chip removal, then `sync_month`'s stale-while-revalidate cache-hit re-broadcast) before the real post-fetch data finally showed the moved event. Dropping an event now patches its occurrence into the on-screen model and repaints immediately, before `CalendarCommand::UpdateEvent`/`CreateEvent` is even sent; the patch is reapplied over every incoming `OccurrencesUpdated` set until the server's own data confirms it, self-clearing at that point. A save failure - surfaced by a new `CalendarSessionEvent::EventSaveFailed` carrying the failed occurrence's identity, mirroring the mail side's `MoveFailed` - rolls the patch back and shows an error toast instead of leaving the chip stuck in its unsaved position.
+- **Calendar**: the fix above initially crashed the app on every drag (`RefCell already borrowed`, aborting the process since the panic occurs inside a GTK signal trampoline that can't unwind). The drag gesture invokes its `on_drag` callback while holding that callback slot's own `RefCell` borrowed, and the immediate repaint reached `set_time_grid`, which unconditionally re-borrows the same slot to reassign it - two overlapping borrows of one `RefCell`. The repaint is now deferred one main-loop idle tick (`glib::idle_add_local_once`, the same deferral pattern already used elsewhere in `calendar_view.rs`), which runs after the gesture's handler has returned and released its borrow - an imperceptible, same-frame delay, not a reintroduction of the network-round-trip wait this change removes.
+
+### Testing
+
+- `lookout-app`: three new `window` tests cover `apply_pending_calendar_moves` directly - a pending move is reapplied onto stale incoming data, self-clears once the incoming data matches it, and leaves unrelated occurrences and an empty pending map untouched.
+
 ## 0.9.35 (2026-08-12)
 
 ### Fixed

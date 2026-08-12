@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.36" date="2026-08-13">
+      <description>
+        <p>Dragging an event to a new time slot on the Calendar tab's Day/Week grid now moves it instantly and keeps it there while the change saves, instead of snapping back to the old slot until the server confirms.</p>
+      </description>
+    </release>
     <release version="0.9.35" date="2026-08-12">
       <description>
         <p>Fixed the event editor's day-strip preview showing the event you're editing twice - once for the cached copy and again for the live preview of your unsaved edits. Editing now shows it once; other events on the same day, and creating a brand-new event, were never affected.</p>

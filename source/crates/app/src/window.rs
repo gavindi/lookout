@@ -857,6 +857,13 @@ struct CalendarUiState {
     /// loops call it so the dashboard stays live; `None` until then (a
     /// no-op, never an error).
     dashboard_refresh: Option<Rc<dyn Fn()>>,
+    /// Occurrences with a drag-reschedule in flight, keyed by `(uid,
+    /// recurrence_id)`, holding the occurrence with its new `start`/`end`
+    /// already applied. Reapplied onto every `refresh_displayed_calendar_view`
+    /// repaint until an incoming occurrence's own start/end already matches -
+    /// meaning the server has confirmed it - at which point the entry is
+    /// dropped. Rolled back (removed, no reapply) on `EventSaveFailed`.
+    pending_calendar_moves: HashMap<(EventUid, Option<chrono::DateTime<chrono::Utc>>), EventOccurrence>,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -4430,6 +4437,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         local_tasks,
         local_tasks_db,
         dashboard_refresh: None,
+        pending_calendar_moves: HashMap::new(),
     }));
 
     // --- Lookout dashboard refresh hook: the window registers one closure
@@ -6131,11 +6139,35 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // occurrence" scope): the instance moves without re-anchoring the series.
     {
         let calendar_state = calendar_state.clone();
+        let calendar_main_for_drag = calendar_main.clone();
         let toast_overlay = toast_overlay.clone();
         calendar_view::connect_event_dragged(&calendar_main, move |occ, new_start, new_end| {
             if calendar_state.borrow().is_read_only_calendar(&occ.calendar_id) {
                 toast_overlay.add_toast(adw::Toast::new("Events from calendar subscriptions are read-only."));
                 return;
+            }
+            // Patch the dropped occurrence into the on-screen model and
+            // repaint immediately, before the CalDAV round trip even starts -
+            // otherwise the chip snaps back to its pre-drag position the
+            // instant the drag gesture's own ghost-chip repaint runs, and
+            // stays there until the server confirms the move. The repaint
+            // itself is deferred one main-loop idle tick: this callback runs
+            // while the time grid's drag gesture still holds a borrow on its
+            // own `on_drag` slot to invoke it, and `set_time_grid` (which the
+            // repaint reaches) re-borrows that same slot - calling it
+            // synchronously here panics with "already borrowed". The defer
+            // is a same-frame, imperceptible delay, not the round-trip wait
+            // this fix removes.
+            let mut patched = occ.clone();
+            patched.start = new_start;
+            patched.end = new_end;
+            calendar_state.borrow_mut().pending_calendar_moves.insert((occ.uid.clone(), occ.recurrence_id), patched);
+            {
+                let calendar_state = calendar_state.clone();
+                let calendar_main_for_drag = calendar_main_for_drag.clone();
+                glib::idle_add_local_once(move || {
+                    refresh_displayed_calendar_view(&calendar_state, &calendar_main_for_drag);
+                });
             }
             let mut event = crate::event_editor::calendar_event_from_occurrence(
                 &occ,
@@ -7460,11 +7492,38 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
 /// accounts' latest snapshot" approach as Mail's
 /// `MessagesUpdated`/`rebuild_folder_tree`.
 fn refresh_displayed_calendar_view(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &CalendarMain) {
-    let st = calendar_state.borrow();
+    let mut st = calendar_state.borrow_mut();
     let month = st.displayed_month;
-    let merged: Vec<EventOccurrence> = st.checked_occurrences(month).into_iter().cloned().collect();
+    let mut merged: Vec<EventOccurrence> = st.checked_occurrences(month).into_iter().cloned().collect();
+    apply_pending_calendar_moves(&mut merged, &mut st.pending_calendar_moves);
     drop(st);
     calendar_view::set_occurrences(calendar_main, &merged);
+}
+
+/// Overwrites each occurrence in `occurrences` with its pending drag-move's
+/// `start`/`end`, if one exists for its `(uid, recurrence_id)` - unless the
+/// occurrence's own start/end already match the pending value, meaning the
+/// server has now confirmed the move, in which case the entry is dropped
+/// from `pending` instead (self-clearing).
+fn apply_pending_calendar_moves(occurrences: &mut [EventOccurrence], pending: &mut HashMap<(EventUid, Option<chrono::DateTime<chrono::Utc>>), EventOccurrence>) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut confirmed = Vec::new();
+    for occ in occurrences.iter_mut() {
+        let key = (occ.uid.clone(), occ.recurrence_id);
+        if let Some(patch) = pending.get(&key) {
+            if occ.start == patch.start && occ.end == patch.end {
+                confirmed.push(key);
+            } else {
+                occ.start = patch.start;
+                occ.end = patch.end;
+            }
+        }
+    }
+    for key in confirmed {
+        pending.remove(&key);
+    }
 }
 
 /// Prints the currently-displayed calendar month as an agenda: one section
@@ -7721,6 +7780,18 @@ fn connect_calendar_account(
                     }
                 }
                 CalendarSessionEvent::Error(message) => {
+                    let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
+                }
+                CalendarSessionEvent::EventSaveFailed { uid, recurrence_id, message } => {
+                    // The save actually failed server-side, so drop whatever
+                    // optimistic drag-move was pending for this occurrence (a
+                    // no-op if this failure didn't come from a drag) and
+                    // repaint - the chip must snap back to its real,
+                    // unmoved position rather than staying stuck showing the
+                    // unsaved drop location.
+                    calendar_state.borrow_mut().pending_calendar_moves.remove(&(uid, recurrence_id));
+                    refresh_displayed_calendar_view(&calendar_state, &calendar_main);
                     let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
                     toast_overlay.add_toast(adw::Toast::new(&title));
                 }
@@ -12742,6 +12813,74 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert!(map.contains_key(&window[0]));
         assert!(map.contains_key(&window[1]));
+    }
+
+    /// A pending drag-move is reapplied onto the incoming occurrence's
+    /// start/end for as long as the incoming data doesn't yet reflect it -
+    /// covers both the immediate post-drop repaint (still showing the
+    /// pre-drag time) and a `sync_month` cache-hit resync that re-broadcasts
+    /// stale pre-edit data before the live fetch lands.
+    #[test]
+    fn pending_calendar_move_is_reapplied_until_the_incoming_data_confirms_it() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::hours(1);
+        let mut moved = occ("evt-1", "cal");
+        moved.start = t1;
+        moved.end = t1 + chrono::Duration::hours(1);
+        let mut pending = HashMap::from([((moved.uid.clone(), moved.recurrence_id), moved.clone())]);
+
+        // Still-stale incoming data (the original pre-drag time) gets
+        // overwritten to the pending value.
+        let mut stale = occ("evt-1", "cal");
+        stale.start = t0;
+        stale.end = t0 + chrono::Duration::hours(1);
+        let mut incoming = vec![stale];
+        apply_pending_calendar_moves(&mut incoming, &mut pending);
+        assert_eq!(incoming[0].start, t1, "the chip must keep showing the dropped time, not the stale cached one");
+        assert!(
+            pending.contains_key(&(EventUid("evt-1".into()), None)),
+            "not yet confirmed by the server - the entry survives"
+        );
+    }
+
+    #[test]
+    fn pending_calendar_move_self_clears_once_the_server_confirms_it() {
+        let t1 = chrono::Utc::now();
+        let mut moved = occ("evt-1", "cal");
+        moved.start = t1;
+        moved.end = t1 + chrono::Duration::hours(1);
+        let mut pending = HashMap::from([((moved.uid.clone(), moved.recurrence_id), moved.clone())]);
+
+        // The live fetch's own data already matches what we optimistically
+        // set - the entry must be dropped rather than kept reapplying.
+        let mut incoming = vec![moved.clone()];
+        apply_pending_calendar_moves(&mut incoming, &mut pending);
+        assert_eq!(incoming[0].start, t1);
+        assert!(pending.is_empty(), "a confirmed move must clear the stash");
+    }
+
+    #[test]
+    fn pending_calendar_move_leaves_unrelated_occurrences_and_empty_pending_untouched() {
+        let t0 = chrono::Utc::now();
+        let mut other = occ("evt-2", "cal");
+        other.start = t0;
+        other.end = t0 + chrono::Duration::hours(1);
+        let mut incoming = vec![other.clone()];
+
+        // No pending entry for this occurrence's uid at all.
+        let mut pending = HashMap::new();
+        apply_pending_calendar_moves(&mut incoming, &mut pending);
+        assert_eq!(incoming[0].start, t0, "an occurrence with nothing pending must be untouched");
+
+        // A pending entry that belongs to a different occurrence entirely
+        // must not affect this one.
+        let mut moved = occ("evt-1", "cal");
+        moved.start = t0 + chrono::Duration::hours(5);
+        moved.end = moved.start + chrono::Duration::hours(1);
+        pending.insert((moved.uid.clone(), moved.recurrence_id), moved);
+        apply_pending_calendar_moves(&mut incoming, &mut pending);
+        assert_eq!(incoming[0].start, t0);
+        assert_eq!(pending.len(), 1, "the unrelated pending entry is untouched too - nothing in the incoming list matched it");
     }
 
     /// A folder row's drop must reach the account session as one

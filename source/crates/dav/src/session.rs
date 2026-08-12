@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{Datelike, NaiveDate, NaiveTime};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
 use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EventOccurrence, EventUid};
 
 use crate::cache::CalendarCache;
@@ -90,9 +90,21 @@ pub enum CalendarCommand {
 pub enum CalendarSessionEvent {
     ConnectionStateChanged(ConnectionState),
     CalendarsUpdated(Vec<CalendarInfo>),
-    OccurrencesUpdated { month: NaiveDate, occurrences: Vec<EventOccurrence> },
+    OccurrencesUpdated {
+        month: NaiveDate,
+        occurrences: Vec<EventOccurrence>,
+    },
     TasksUpdated(Vec<CalendarTask>),
     Error(String),
+    /// A `CreateEvent`/`UpdateEvent` request failed. Kept distinct from
+    /// `Error` so the UI can roll back exactly the occurrence it
+    /// optimistically moved (if any - harmless no-op otherwise), mirroring
+    /// `lookout_mail::session::AccountEvent::MoveFailed`.
+    EventSaveFailed {
+        uid: EventUid,
+        recurrence_id: Option<DateTime<Utc>>,
+        message: String,
+    },
 }
 
 /// Fetches a fresh credential immediately before each (re)connect attempt.
@@ -414,7 +426,13 @@ async fn write_event(
     cache: Option<&CalendarCache>,
 ) {
     let Some(calendar) = calendars.iter().find(|c| c.id == event.calendar_id) else {
-        let _ = events.send(CalendarSessionEvent::Error(format!("calendar for event \"{}\" not found", event.uid))).await;
+        let _ = events
+            .send(CalendarSessionEvent::EventSaveFailed {
+                uid: event.uid.clone(),
+                recurrence_id: event.recurrence_id,
+                message: format!("calendar for event \"{}\" not found", event.uid),
+            })
+            .await;
         return;
     };
 
@@ -436,7 +454,13 @@ async fn write_event(
             }
         }
         Err(e) => {
-            let _ = events.send(CalendarSessionEvent::Error(format!("failed to save event \"{}\": {e}", event.uid))).await;
+            let _ = events
+                .send(CalendarSessionEvent::EventSaveFailed {
+                    uid: event.uid.clone(),
+                    recurrence_id: event.recurrence_id,
+                    message: format!("failed to save event \"{}\": {e}", event.uid),
+                })
+                .await;
         }
     }
 }
