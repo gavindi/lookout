@@ -392,6 +392,16 @@ pub enum AccountEvent {
     /// for this specific send without also swallowing unrelated errors
     /// (sync, connection, etc.) that might land while a send is outstanding.
     SendFailed(String),
+    /// A `MoveMessage`/`MoveMessages`/`MoveMessagesTo` request failed. Kept
+    /// distinct from `Error` below, mirroring `SendFailed`, so the UI can
+    /// restore exactly the rows it optimistically removed from the message
+    /// list on send, without also swallowing unrelated errors.
+    MoveFailed {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        role: MailboxRole,
+        message: String,
+    },
     /// A `SaveDraft` request landed server-side; `message_id` is the draft's
     /// stable `Message-ID`, so only the compose session that owns that id
     /// acts on it.
@@ -1063,7 +1073,14 @@ async fn connect_and_run(
                             session_selected = current_mailbox_id.clone();
                         }
                         Err(e) => {
-                            let _ = events.send(AccountEvent::Error(format!("Couldn't move message: {e}"))).await;
+                            let _ = events
+                                .send(AccountEvent::MoveFailed {
+                                    mailbox,
+                                    uids: vec![uid],
+                                    role,
+                                    message: format!("Couldn't move message: {e}"),
+                                })
+                                .await;
                         }
                     }
                 }
@@ -1094,7 +1111,14 @@ async fn connect_and_run(
                             session_selected = current_mailbox_id.clone();
                         }
                         Err(e) => {
-                            let _ = events.send(AccountEvent::Error(format!("Couldn't move messages: {e}"))).await;
+                            let _ = events
+                                .send(AccountEvent::MoveFailed {
+                                    mailbox,
+                                    uids,
+                                    role,
+                                    message: format!("Couldn't move messages: {e}"),
+                                })
+                                .await;
                         }
                     }
                 }
@@ -1134,7 +1158,14 @@ async fn connect_and_run(
                             session_selected = current_mailbox_id.clone();
                         }
                         Err(e) => {
-                            let _ = events.send(AccountEvent::Error(format!("Couldn't move messages: {e}"))).await;
+                            let _ = events
+                                .send(AccountEvent::MoveFailed {
+                                    mailbox,
+                                    uids,
+                                    role: MailboxRole::Custom,
+                                    message: format!("Couldn't move messages: {e}"),
+                                })
+                                .await;
                         }
                     }
                 }

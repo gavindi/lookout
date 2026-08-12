@@ -385,6 +385,12 @@ pub(crate) struct UiState {
     /// `UnifiedInbox`. The visible list is the union of these, deduplicated
     /// by `(mailbox, uid)` and sorted newest-first.
     unified_snapshots: HashMap<MailboxId, Vec<EmailSummary>>,
+    /// Rows hidden from the message list on an optimistic delete/archive/
+    /// report-as-junk, keyed by source mailbox, kept around so a matching
+    /// `AccountEvent::MoveFailed` can restore exactly these rows. Cleared for
+    /// a mailbox the moment any `AccountEvent::MessagesUpdated` lands for it -
+    /// an authoritative sync always supersedes the optimistic stash.
+    pending_optimistic_removals: HashMap<MailboxId, Vec<EmailSummary>>,
     /// The most recently requested body fetch, used to ignore stale
     /// `BodyFetched` updates that arrive after the user has moved on to a
     /// different message.
@@ -1505,6 +1511,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         current_mailbox: None,
         mail_view: MailView::Single,
         unified_snapshots: HashMap::new(),
+        pending_optimistic_removals: HashMap::new(),
         pending_body_request: None,
         pending_attachment: None,
         pending_raw_message: None,
@@ -1978,14 +1985,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         {
             let state = state_clone.clone();
             let bound = bound.clone();
+            let message_list = message_list_for_rows.clone();
             archive_btn.connect_clicked(move |_| {
                 let Some((mailbox, uid)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid)) else {
                     return;
                 };
                 let Some(account_id) = mailbox_account_id(&mailbox) else { return };
-                let state = state.borrow();
-                if let Some(handle) = state.accounts.get(&account_id) {
-                    let _ = handle.cmd_tx.send_blocking(AccountCommand::MoveMessage {
+                let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
+                if let Some(cmd_tx) = cmd_tx {
+                    optimistic_remove_messages(&state, &message_list, &mailbox, &[uid]);
+                    let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage {
                         mailbox,
                         uid,
                         role: MailboxRole::Archive,
@@ -1996,14 +2005,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         {
             let state = state_clone.clone();
             let bound = bound.clone();
+            let message_list = message_list_for_rows.clone();
             delete_btn.connect_clicked(move |_| {
                 let Some((mailbox, uid)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid)) else {
                     return;
                 };
                 let Some(account_id) = mailbox_account_id(&mailbox) else { return };
-                let state = state.borrow();
-                if let Some(handle) = state.accounts.get(&account_id) {
-                    let _ = handle.cmd_tx.send_blocking(AccountCommand::MoveMessage {
+                let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
+                if let Some(cmd_tx) = cmd_tx {
+                    optimistic_remove_messages(&state, &message_list, &mailbox, &[uid]);
+                    let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage {
                         mailbox,
                         uid,
                         role: MailboxRole::Trash,
@@ -5827,6 +5838,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         button.connect_clicked(move |_| {
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
+                optimistic_remove_messages(&state, &message_list, &mailbox, &uids);
                 let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages { mailbox, uids, role });
             }
         });
@@ -6601,6 +6613,12 @@ fn connect_account(
                     refresh_message_loading_state(&state, &message_list, &message_list_stack);
                 }
                 AccountEvent::MessagesUpdated { mailbox, messages } => {
+                    // An authoritative sync for this mailbox supersedes
+                    // whatever's still sitting in the optimistic-removal
+                    // stash - the success path that led here already
+                    // dropped those rows from the server too, so there's
+                    // nothing left to reconcile.
+                    state.borrow_mut().pending_optimistic_removals.remove(&mailbox);
                     // The sync this mailbox was asked for (if any) has landed.
                     state.borrow_mut().syncing.remove(&mailbox);
                     refresh_message_loading_state(&state, &message_list, &message_list_stack);
@@ -6903,6 +6921,21 @@ fn connect_account(
                         _ => "Moved",
                     };
                     toast_overlay.add_toast(adw::Toast::new(label));
+                }
+                AccountEvent::MoveFailed { mailbox, uids, role, message } => {
+                    // The move actually failed server-side, so put back
+                    // exactly the rows `optimistic_remove_messages` hid for
+                    // this attempt - the row must not stay gone for a move
+                    // that never happened.
+                    restore_optimistic_removals(&state, &message_list, &mailbox, &uids);
+                    let verb = match role {
+                        MailboxRole::Trash => "delete",
+                        MailboxRole::Archive => "archive",
+                        MailboxRole::Junk => "report as junk",
+                        _ => "move",
+                    };
+                    let title = glib::markup_escape_text(&format!("Couldn't {verb}: {message}"));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
                 }
                 AccountEvent::MailboxExpunged { role } => {
                     let label = match role {
@@ -10015,6 +10048,63 @@ fn resort_message_list(state: &Rc<RefCell<UiState>>, message_list: &MessageListM
     message_list.repopulate(messages, key, descending);
 }
 
+/// Removes `uids` from `mailbox` in the message list immediately, ahead of
+/// the server-side move just sent for them actually completing - that move
+/// takes several sequential live IMAP round trips (`move_uids_to_path` in
+/// `lookout-mail`'s session actor), and waiting for it to finish before
+/// hiding the row is the ~2s lag a delete/archive/report used to have. The
+/// removed rows are stashed in `state.pending_optimistic_removals` so a
+/// matching `AccountEvent::MoveFailed` can restore them; a later
+/// `MessagesUpdated` for this mailbox (which the success path always
+/// eventually produces) clears the stash instead, since the authoritative
+/// sync already reflects reality.
+fn optimistic_remove_messages(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid]) {
+    let (kept, removed): (Vec<EmailSummary>, Vec<EmailSummary>) = message_list.all_messages().into_iter().partition(|m| !(m.mailbox == *mailbox && uids.contains(&m.uid)));
+    if removed.is_empty() {
+        return;
+    }
+    let (key, descending) = current_sort(state);
+    message_list.repopulate(kept, key, descending);
+    let mut st = state.borrow_mut();
+    if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
+        snapshot.retain(|m| !uids.contains(&m.uid));
+    }
+    st.pending_optimistic_removals.entry(mailbox.clone()).or_default().extend(removed);
+}
+
+/// Undoes `optimistic_remove_messages` for `mailbox`/`uids` after an
+/// `AccountEvent::MoveFailed` - puts the stashed rows back into both the
+/// visible list and the unified-view snapshot they were pulled from.
+fn restore_optimistic_removals(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid]) {
+    let restored: Vec<EmailSummary> = {
+        let mut st = state.borrow_mut();
+        let Some(pending) = st.pending_optimistic_removals.get_mut(mailbox) else { return };
+        let mut restored = Vec::new();
+        pending.retain(|m| {
+            if uids.contains(&m.uid) {
+                restored.push(m.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if pending.is_empty() {
+            st.pending_optimistic_removals.remove(mailbox);
+        }
+        restored
+    };
+    if restored.is_empty() {
+        return;
+    }
+    if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(mailbox) {
+        snapshot.extend(restored.iter().cloned());
+    }
+    let mut all = message_list.all_messages();
+    all.extend(restored);
+    let (key, descending) = current_sort(state);
+    message_list.repopulate(all, key, descending);
+}
+
 /// Groups every currently-selected message in `message_list` by the
 /// `(account, mailbox)` it lives in, for the batch Delete/Archive/Report/
 /// Snooze/Flag/Mark-read button handlers - mirrors the lookup already done
@@ -12272,6 +12362,7 @@ mod tests {
             current_mailbox: None,
             mail_view: MailView::Single,
             unified_snapshots: HashMap::new(),
+            pending_optimistic_removals: HashMap::new(),
             pending_body_request: None,
             pending_attachment: None,
             pending_raw_message: None,
@@ -12339,6 +12430,59 @@ mod tests {
         state.borrow_mut().syncing.insert(inbox.clone());
         state.borrow_mut().syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
         assert!(!state.borrow().syncing.contains(&inbox));
+    }
+
+    /// `optimistic_remove_messages` hides a row (and its unified-view
+    /// snapshot copy) the instant it's called, stashing it away; a matching
+    /// `restore_optimistic_removals` (the `MoveFailed` rollback path) puts it
+    /// straight back, in both places, and clears the stash. Same self-skip
+    /// convention as the other GTK-touching tests in this module.
+    #[test]
+    fn optimistic_remove_and_restore_round_trips_the_list_and_unified_snapshot() {
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let account_id = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(account_id, Vec::new())]);
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+        let three = summary(Uid(3), "acc:INBOX", 2026, 8, 1, 11);
+
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![one.clone(), two.clone(), three.clone()], SortKey::Date, true);
+        state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one.clone(), two.clone(), three.clone()]);
+
+        optimistic_remove_messages(&state, &message_list, &mailbox, &[Uid(2)]);
+        let uids_after_remove: HashSet<u32> = message_list.all_messages().iter().map(|m| m.uid.0).collect();
+        assert_eq!(uids_after_remove, HashSet::from([1, 3]), "the row must vanish immediately, before any server round trip");
+        assert_eq!(
+            state.borrow().unified_snapshots[&mailbox].iter().map(|m| m.uid.0).collect::<HashSet<_>>(),
+            HashSet::from([1, 3]),
+            "the unified-view snapshot must lose the row too, or a later merge would resurrect it"
+        );
+        assert_eq!(
+            state.borrow().pending_optimistic_removals[&mailbox].iter().map(|m| m.uid.0).collect::<Vec<_>>(),
+            vec![2],
+            "the hidden row must be stashed for a possible rollback"
+        );
+
+        restore_optimistic_removals(&state, &message_list, &mailbox, &[Uid(2)]);
+        let uids_after_restore: HashSet<u32> = message_list.all_messages().iter().map(|m| m.uid.0).collect();
+        assert_eq!(uids_after_restore, HashSet::from([1, 2, 3]), "a failed move must restore exactly the row it hid");
+        assert_eq!(
+            state.borrow().unified_snapshots[&mailbox].iter().map(|m| m.uid.0).collect::<HashSet<_>>(),
+            HashSet::from([1, 2, 3]),
+            "the unified-view snapshot must get the row back too"
+        );
+        assert!(
+            !state.borrow().pending_optimistic_removals.contains_key(&mailbox),
+            "the stash must be empty once its only entry is restored"
+        );
     }
 
     /// The depth-0 row for one account group in a freshly built tree.

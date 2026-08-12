@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.34 (2026-08-12)
+
+### Fixed
+
+- **Mail**: deleting, archiving, or reporting a message as junk left the row sitting in the list for a visible ~2 seconds before it disappeared. No code was actually sleeping - the row was only ever removed after `AccountEvent::MessagesUpdated` landed, and that event was gated behind a fully sequential chain of live IMAP round trips in `lookout-mail`'s session actor (`move_uids_to_path`): IDLE teardown, an uncached `CAPABILITY` call issued on every single move, then `MOVE` (or `COPY`+`STORE`+`EXPUNGE` on servers without RFC 6851 MOVE) - three to five round trips, unpipelined, before the UI ever heard back. The message list now removes the row the instant delete/archive/report is triggered - from the per-row hover icons and the shared toolbar button loop alike - stashing the hidden row (and pulling it out of the unified "All Inboxes" snapshot, so a same-mailbox merge racing the real removal can't resurrect it) rather than waiting on the network. If the server-side move actually fails, a new `AccountEvent::MoveFailed` (mirroring the existing `SendFailed` pattern) carries back exactly which rows to restore, and the row reappears with an error toast instead of staying gone; a later authoritative sync for that mailbox always clears the stash on its own, since it already reflects reality. Drag-to-folder shares the same underlying round-trip chain but isn't covered by this fix - `MessageListModel` isn't yet threaded into its drop-target closure - and mark-read/flag was already comparatively snappy (a single `STORE`, no `CAPABILITY` round trip) and untouched.
+
+### Testing
+
+- `lookout-app`: a new `window` test drives the optimistic remove/restore helpers directly - a hidden row (and its unified-snapshot copy) disappears immediately and is stashed, then a simulated `MoveFailed` restores it to both places and clears the stash.
+
 ## 0.9.33 (2026-08-12)
 
 ### Added
