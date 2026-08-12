@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.35" date="2026-08-12">
+      <description>
+        <p>Fixed the event editor's day-strip preview showing the event you're editing twice - once for the cached copy and again for the live preview of your unsaved edits. Editing now shows it once; other events on the same day, and creating a brand-new event, were never affected.</p>
+      </description>
+    </release>
     <release version="0.9.34" date="2026-08-12">
       <description>
         <p>Deleting, archiving, or reporting a message as junk now removes it from the list the instant you click - it no longer waits several seconds for the server-side move to finish. If the move actually fails, the message reappears with an error toast instead of staying gone.</p>

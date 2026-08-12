@@ -521,6 +521,7 @@ pub fn show_event_editor(
         let preview_mini = preview_mini.clone();
         let preview_day_strip = preview_day_strip.clone();
         let displayed_day = displayed_day.clone();
+        let existing = existing.clone();
         Rc::new(move || {
             let day = displayed_day.get();
             let all_day = all_day_switch.is_active();
@@ -530,11 +531,7 @@ pub fn show_event_editor(
             let selected = calendar_dropdown.selected() as usize;
             let calendar_id = calendar_ids.get(selected).cloned().unwrap_or_else(|| CalendarId(String::new()));
             let synthetic = synthetic_occurrence(calendar_id, &title_row.text(), local_to_utc(start_local), local_to_utc(model_end), all_day);
-            let mut occs: Vec<EventOccurrence> = month_occurrences
-                .iter()
-                .filter(|o| !crate::calendar_view::covered_local_dates(o, day, day).is_empty())
-                .cloned()
-                .collect();
+            let mut occs = occurrences_for_day(&month_occurrences, day, existing.as_ref());
             occs.push(synthetic);
             crate::calendar_view::set_mini_month(&preview_mini, day, &month_event_days);
             crate::calendar_view::set_time_grid(&preview_day_strip, day, &occs, &calendar_colors, None, None, None);
@@ -827,6 +824,21 @@ fn name_of(token: &str) -> Option<String> {
     let open = token.find('<')?;
     let name = token[..open].trim().trim_matches('"').trim();
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// `month_occurrences` filtered to whatever touches `day`, with the entry
+/// matching `existing` (if any) excluded - the caller pushes its own live
+/// `synthetic_occurrence` for `existing` instead, so leaving the stale
+/// cached copy in would render the event being edited twice.
+/// `recurrence_id` joins `uid` in the identity check since a recurring
+/// series' instances all share one `uid`.
+fn occurrences_for_day(month_occurrences: &[EventOccurrence], day: NaiveDate, existing: Option<&EventOccurrence>) -> Vec<EventOccurrence> {
+    month_occurrences
+        .iter()
+        .filter(|o| !crate::calendar_view::covered_local_dates(o, day, day).is_empty())
+        .filter(|o| existing.is_none_or(|e| o.uid != e.uid || o.recurrence_id != e.recurrence_id))
+        .cloned()
+        .collect()
 }
 
 /// A placeholder occurrence for the event currently being created/edited,
@@ -1269,6 +1281,75 @@ mod tests {
             owner_email: None,
             existing_meta: None,
         }
+    }
+
+    fn occ(uid: &str, day: NaiveDate, recurrence_id: Option<NaiveDateTime>) -> EventOccurrence {
+        let start = day.and_hms_opt(9, 0, 0).unwrap();
+        EventOccurrence {
+            uid: EventUid(uid.to_string()),
+            calendar_id: CalendarId("test".to_string()),
+            summary: Some(uid.to_string()),
+            description: None,
+            location: None,
+            start: local_to_utc(start),
+            end: local_to_utc(start + chrono::Duration::hours(1)),
+            all_day: false,
+            rrule: None,
+            recurrence_id: recurrence_id.map(local_to_utc),
+            exdates: Vec::new(),
+            master_start: None,
+            master_end: None,
+            href: None,
+            etag: None,
+            master_href: None,
+            master_etag: None,
+            attendees: Vec::new(),
+            organizer: None,
+            categories: Vec::new(),
+            sensitivity: EventSensitivity::default(),
+            transparency: EventTransparency::default(),
+            reminder_minutes_before: None,
+            conference_url: None,
+        }
+    }
+
+    #[test]
+    fn occurrences_for_day_excludes_the_event_being_edited() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let editing = occ("evt-1", day, None);
+        let other = occ("evt-2", day, None);
+        let result = occurrences_for_day(&[editing.clone(), other.clone()], day, Some(&editing));
+        let uids: Vec<&str> = result.iter().map(|o| o.uid.0.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec!["evt-2"],
+            "the cached copy of the event being edited must not appear - the caller adds its own live preview chip instead"
+        );
+    }
+
+    #[test]
+    fn occurrences_for_day_returns_everything_for_a_brand_new_event() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let a = occ("evt-1", day, None);
+        let b = occ("evt-2", day, None);
+        let result = occurrences_for_day(&[a.clone(), b.clone()], day, None);
+        let uids: Vec<&str> = result.iter().map(|o| o.uid.0.as_str()).collect();
+        assert_eq!(uids, vec!["evt-1", "evt-2"], "with nothing being edited yet, nothing should be excluded");
+    }
+
+    #[test]
+    fn occurrences_for_day_keeps_a_different_instance_of_the_same_recurring_series() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let recurrence_a = day.and_hms_opt(9, 0, 0).unwrap();
+        let recurrence_b = day.and_hms_opt(15, 0, 0).unwrap();
+        let editing = occ("series", day, Some(recurrence_a));
+        let sibling = occ("series", day, Some(recurrence_b));
+        let result = occurrences_for_day(&[editing.clone(), sibling.clone()], day, Some(&editing));
+        assert_eq!(
+            result.iter().map(|o| o.recurrence_id).collect::<Vec<_>>(),
+            vec![sibling.recurrence_id],
+            "a sibling instance sharing the series' uid but a different recurrence_id is a distinct occurrence and must survive"
+        );
     }
 
     #[test]

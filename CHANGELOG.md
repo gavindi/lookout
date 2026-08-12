@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.35 (2026-08-12)
+
+### Fixed
+
+- **Calendar**: editing an existing event showed it twice in the event editor's day-strip preview - the small timeline under the mini-month calendar that marks where the event sits on its day. The preview is assembled from two sources every time the form changes (`refresh_preview` in `event_editor.rs`): the day's cached occurrences (already containing the event being edited, since it existed before the dialog opened) and a synthetic "live preview" chip built fresh from the form's current, possibly-unsaved fields - the two were concatenated with no deduplication, so the event being edited rendered once from each source while every other event on the day, sourced only from the cache, rendered correctly. A new `occurrences_for_day` helper now excludes the cached entry matching the event being edited (by `uid` and `recurrence_id`, so a different instance of the same recurring series is correctly left alone) before the live preview chip is added in its place. Creating a brand-new event was never affected - there's no pre-existing cache entry to double up against.
+
+### Testing
+
+- `lookout-app`: three new `event_editor` tests cover `occurrences_for_day` directly - the event being edited is excluded while an unrelated same-day event survives, nothing is excluded when creating a new event, and a sibling instance of the same recurring series (same `uid`, different `recurrence_id`) is correctly kept rather than excluded alongside it.
+
 ## 0.9.34 (2026-08-12)
 
 ### Fixed
