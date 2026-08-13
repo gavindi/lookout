@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.40 (2026-08-14)
+
+### Changed
+
+- **Config**: the settings tab now splits its once-long, single-scroll list of sections into a two-pane "tab groups" layout - a left sidebar listing every section (Accounts, Mail accounts, Calendar accounts, Webcal subscriptions, Appearance, General, Layout, Mail, Calendar, Privacy, Apps, Advanced) and a right pane showing only the selected section's controls, mirroring the `gtk::Paned` + card-wrapped list shape already used by the Contacts and Mail sidebars. Each section is its own `adw::PreferencesPage` inside a `gtk::Stack`, switched by the sidebar `gtk::ListBox`'s selection; the first section is shown by default. No settings, wiring, or refresh behavior changed - only how the same controls are laid out and navigated.
+
 ## 0.9.39 (2026-08-14)
 
 ### Fixed

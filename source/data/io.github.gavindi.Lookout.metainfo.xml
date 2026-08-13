@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.40" date="2026-08-14">
+      <description>
+        <p>The Config tab now uses a two-pane "tab groups" layout: a sidebar lists every settings section, and the right pane shows only the selected section's controls, instead of one long scrolling list.</p>
+      </description>
+    </release>
     <release version="0.9.39" date="2026-08-14">
       <description>
         <p>Attachments in the Mail reading pane now open directly with their default app instead of showing a chooser dialog, double-clicking an attachment opens it, and attachment rows highlight on mouseover.</p>

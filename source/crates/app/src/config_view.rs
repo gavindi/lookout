@@ -171,18 +171,56 @@ pub struct ConfigView {
     contacts_cache_rows: RefCell<Vec<adw::ActionRow>>,
 }
 
-/// Phase 5 roadmap's settings taxonomy, each rendered as a disabled
-/// placeholder group until that work lands - same honest-disabled convention
-/// as the menu bar's Home/View ribbon tabs. "Appearance" is deliberately
-/// absent: it's a real, enabled group with the smooth-transitions preference
-/// (see `build`), as is "Advanced" below and the "Mail", "Calendar" and
-/// "Keyboard shortcuts" groups the loop's `Mail`, `Calendar` and `General`
-/// entries hand off to.
-const PLACEHOLDER_SECTIONS: [&str; 6] = ["General", "Layout", "Mail", "Calendar", "Privacy", "Apps"];
-pub fn build() -> ConfigView {
-    let page = adw::PreferencesPage::new();
-    page.set_vexpand(true);
+/// Builds a section's screen: a scrolling `adw::PreferencesPage` holding
+/// `groups` (in order), registered on `stack` under `name`. `sections`
+/// collects the `(label, name)` pair so the sidebar list can be built once
+/// every section has been registered.
+fn add_section(
+    stack: &gtk::Stack,
+    sections: &mut Vec<(&'static str, &'static str)>,
+    label: &'static str,
+    name: &'static str,
+    groups: &[&adw::PreferencesGroup],
+) {
+    let section_page = adw::PreferencesPage::new();
+    section_page.set_vexpand(true);
+    for group in groups {
+        section_page.add(*group);
+    }
+    stack.add_named(&section_page, Some(name));
+    sections.push((label, name));
+}
 
+/// A disabled "Not implemented yet" placeholder group for a not-yet-built
+/// section of the Phase 5 settings taxonomy - same honest-disabled
+/// convention as the menu bar's Home/View ribbon tabs.
+fn placeholder_group(title: &str) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title(title).build();
+    let row = adw::ActionRow::builder().title("Not implemented yet").build();
+    row.set_sensitive(false);
+    group.add(&row);
+    group
+}
+
+/// Wraps `content` in the app's rounded/bordered ".card" treatment (mirrors
+/// window.rs's private `card_section` helper - duplicated here rather than
+/// shared so this module stays decoupled from window.rs, per its own
+/// data-in/widget-out convention).
+fn card_section(content: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["card"])
+        .overflow(gtk::Overflow::Hidden)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    card.append(content);
+    card
+}
+
+pub fn build() -> ConfigView {
     let accounts_group = adw::PreferencesGroup::builder().title("Accounts").build();
     let add_account_row = adw::ActionRow::builder()
         .title("Add account…")
@@ -190,16 +228,12 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     accounts_group.add(&add_account_row);
-    page.add(&accounts_group);
 
     let mail_group = adw::PreferencesGroup::builder().title("Mail accounts").build();
-    page.add(&mail_group);
 
     let calendar_group = adw::PreferencesGroup::builder().title("Calendar accounts").build();
-    page.add(&calendar_group);
 
     let webcal_group = adw::PreferencesGroup::builder().title("Webcal subscriptions").build();
-    page.add(&webcal_group);
 
     let appearance_group = adw::PreferencesGroup::builder().title("Appearance").build();
     let animations_row = adw::SwitchRow::builder()
@@ -259,7 +293,6 @@ pub fn build() -> ConfigView {
         .sensitive(false)
         .build();
     appearance_group.add(&restore_background_row);
-    page.add(&appearance_group);
 
     // The real "Mail" group, replacing that section's placeholder: the
     // reading pane's remote-images toggle and the composer's rich-text
@@ -366,39 +399,8 @@ pub fn build() -> ConfigView {
         .build();
     general_group.add(&close_to_background_row);
 
-    for section in PLACEHOLDER_SECTIONS {
-        // "General" is a live group now (see `general_group` above);
-        // "Keyboard shortcuts" sits right below it, keeping the taxonomy
-        // order.
-        if section == "General" {
-            page.add(&general_group);
-            page.add(&keyboard_group);
-            continue;
-        }
-        // "Mail" is a live group (see `mail_settings_group` above), not a
-        // placeholder - add it in this section's place so the taxonomy order
-        // is preserved.
-        if section == "Mail" {
-            page.add(&mail_settings_group);
-            continue;
-        }
-        // "Calendar" is likewise a live group (see `calendar_settings_group`
-        // above), not a placeholder.
-        if section == "Calendar" {
-            page.add(&calendar_settings_group);
-            continue;
-        }
-        // "Apps" is a live group too - it holds the Google Tasks client id.
-        if section == "Apps" {
-            page.add(&google_tasks_group);
-            continue;
-        }
-        let group = adw::PreferencesGroup::builder().title(section).build();
-        let row = adw::ActionRow::builder().title("Not implemented yet").build();
-        row.set_sensitive(false);
-        group.add(&row);
-        page.add(&group);
-    }
+    let layout_group = placeholder_group("Layout");
+    let privacy_group = placeholder_group("Privacy");
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
 
@@ -417,10 +419,70 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     advanced_group.add(&clear_cache_row);
-    page.add(&advanced_group);
+
+    // -- assemble the sidebar (section list) + content (stack of per-section
+    // pages) layout --
+
+    let section_stack = gtk::Stack::new();
+    section_stack.set_vexpand(true);
+    section_stack.set_hexpand(true);
+
+    let mut sections: Vec<(&'static str, &'static str)> = Vec::new();
+    add_section(&section_stack, &mut sections, "Accounts", "accounts", &[&accounts_group]);
+    add_section(&section_stack, &mut sections, "Mail accounts", "mail-accounts", &[&mail_group]);
+    add_section(&section_stack, &mut sections, "Calendar accounts", "calendar-accounts", &[&calendar_group]);
+    add_section(&section_stack, &mut sections, "Webcal subscriptions", "webcal", &[&webcal_group]);
+    add_section(&section_stack, &mut sections, "Appearance", "appearance", &[&appearance_group]);
+    add_section(&section_stack, &mut sections, "General", "general", &[&general_group, &keyboard_group]);
+    add_section(&section_stack, &mut sections, "Layout", "layout", &[&layout_group]);
+    add_section(&section_stack, &mut sections, "Mail", "mail", &[&mail_settings_group]);
+    add_section(&section_stack, &mut sections, "Calendar", "calendar", &[&calendar_settings_group]);
+    add_section(&section_stack, &mut sections, "Privacy", "privacy", &[&privacy_group]);
+    add_section(&section_stack, &mut sections, "Apps", "apps", &[&google_tasks_group]);
+    add_section(&section_stack, &mut sections, "Advanced", "advanced", &[&advanced_group]);
+
+    let section_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).css_classes(["navigation-sidebar"]).build();
+    for (label, _) in &sections {
+        let row_label = gtk::Label::builder().label(*label).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        row_label.set_margin_start(12);
+        row_label.set_margin_end(8);
+        row_label.set_margin_top(8);
+        row_label.set_margin_bottom(8);
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&row_label));
+        section_list.append(&row);
+    }
+
+    let section_names: Rc<Vec<&'static str>> = Rc::new(sections.iter().map(|(_, name)| *name).collect());
+    let stack_for_selection = section_stack.clone();
+    section_list.connect_row_selected(move |_, row| {
+        let Some(row) = row else { return };
+        let Ok(index) = usize::try_from(row.index()) else { return };
+        if let Some(name) = section_names.get(index) {
+            stack_for_selection.set_visible_child_name(name);
+        }
+    });
+    if let Some(first_row) = section_list.row_at_index(0) {
+        section_list.select_row(Some(&first_row));
+    }
+
+    let section_scroller = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&section_list).build();
+
+    let paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(&card_section(&section_scroller))
+        .end_child(&card_section(&section_stack))
+        .resize_start_child(false)
+        .resize_end_child(true)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(200)
+        .vexpand(true)
+        .build();
+    paned.add_css_class("seamless-paned");
 
     ConfigView {
-        root: page.upcast(),
+        root: paned.upcast(),
         add_account_row,
         clear_cache_row,
         animations_row,
