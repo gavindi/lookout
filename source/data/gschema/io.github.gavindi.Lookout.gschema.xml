@@ -81,6 +81,11 @@
       <summary>Contacts sidebar pane width as a percentage of the window width</summary>
       <description>Last width the contacts sidebar pane was dragged to, as a percentage of the application window width; -1 means never set. Reapplied when the window is resized.</description>
     </key>
+    <key name="pane-config-sidebar-width-percent" type="d">
+      <default>-1</default>
+      <summary>Config sidebar pane width as a percentage of the window width</summary>
+      <description>Last width the Config sidebar pane was dragged to, as a percentage of the application window width; -1 means never set. Reapplied when the window is resized.</description>
+    </key>
 
     <!-- Mail list -->
     <key name="sort-key" enum="io.github.gavindi.Lookout.SortKey">

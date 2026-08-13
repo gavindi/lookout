@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.41 (2026-08-14)
+
+### Added
+
+- **Config**: the settings sidebar added in 0.9.40 now remembers its dragged width, the same way the Mail folder pane and the Calendar/Contacts sidebars already do - a new `pane-config-sidebar-width-percent` GSettings key stores the divider position as a percentage of the window width (150ms after a drag settles) and reapplies it on resize and whenever the Config tab is shown.
+
 ## 0.9.40 (2026-08-14)
 
 ### Changed

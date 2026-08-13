@@ -43,6 +43,7 @@ pub const PANE_FOLDER_WIDTH_PCT: &str = "pane-folder-width-percent";
 pub const PANE_MESSAGE_LIST_WIDTH_PCT: &str = "pane-message-list-width-percent";
 pub const PANE_CALENDAR_SIDEBAR_WIDTH_PCT: &str = "pane-calendar-sidebar-width-percent";
 pub const PANE_CONTACTS_SIDEBAR_WIDTH_PCT: &str = "pane-contacts-sidebar-width-percent";
+pub const PANE_CONFIG_SIDEBAR_WIDTH_PCT: &str = "pane-config-sidebar-width-percent";
 pub const SORT_KEY: &str = "sort-key";
 pub const SORT_DESCENDING: &str = "sort-descending";
 pub const MAIL_FAVORITES: &str = "mail-favorites";

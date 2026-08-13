@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.41" date="2026-08-14">
+      <description>
+        <p>The Config sidebar now remembers its dragged width across resizes and restarts, the same way the Mail, Calendar, and Contacts panes already do.</p>
+      </description>
+    </release>
     <release version="0.9.40" date="2026-08-14">
       <description>
         <p>The Config tab now uses a two-pane "tab groups" layout: a sidebar lists every settings section, and the right pane shows only the selected section's controls, instead of one long scrolling list.</p>

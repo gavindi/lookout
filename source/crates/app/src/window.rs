@@ -3287,6 +3287,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     root_stack.add_named(&contacts_status_page, Some("contacts-empty"));
     root_stack.add_named(&contacts_paned, Some("contacts"));
 
+    // Built here (rather than down by the rest of the Config wiring below)
+    // so `config_view.paned` exists in time to join the shared pane-width
+    // persistence closure right below.
+    let config_view = Rc::new(crate::config_view::build());
+
     // The one real title bar for the window - owns the actual
     // minimize/maximize/close buttons. The per-card header bars inside
     // `root_stack` are explicitly told not to show these (see
@@ -4232,6 +4237,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let messages_reading_paned = messages_reading_paned.clone();
         let calendar_paned = calendar_paned.clone();
         let contacts_paned = contacts_paned.clone();
+        let config_paned = config_view.paned.clone();
         let state = state.clone();
         move |window_width: i32| {
             if window_width <= 0 {
@@ -4273,6 +4279,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let max = contacts_paned.width().saturating_sub(end_min).max(min);
                 let target = (contacts_pct / 100.0 * window_width as f64) as i32;
                 contacts_paned.set_position(target.clamp(min, max));
+            }
+            let config_pct = settings.get_double(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT);
+            if config_pct > 0.0 && config_paned.is_mapped() {
+                let start_min = config_paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let end_min = config_paned.end_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let min = start_min;
+                let max = config_paned.width().saturating_sub(end_min).max(min);
+                let target = (config_pct / 100.0 * window_width as f64) as i32;
+                config_paned.set_position(target.clamp(min, max));
             }
         }
     };
@@ -4358,6 +4373,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 if window_width > 0 {
                     let pct = width as f64 * 100.0 / window_width as f64;
                     state_for_timeout.borrow().settings.set_double(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT, pct);
+                }
+            })));
+        });
+        let window_for_debug = window.clone();
+        let state_for_save = state.clone();
+        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        config_view.paned.connect_notify_local(Some("position"), move |paned, _| {
+            if let Some(id) = debounce.take() {
+                id.remove();
+            }
+            let width = paned.position();
+            let window_width = window_for_debug.width();
+            let state_for_timeout = state_for_save.clone();
+            let debounce_for_timeout = debounce.clone();
+            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                debounce_for_timeout.set(None);
+                if window_width > 0 {
+                    let pct = width as f64 * 100.0 / window_width as f64;
+                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT, pct);
                 }
             })));
         });
@@ -4749,8 +4783,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // an "Add account" entry that opens GOA settings - same invocation as the
     // empty-state page's button. The account groups are repopulated by
     // `refresh_config` on every activation and again whenever either
-    // discovery lands (`spawn_*_discovery` below).
-    let config_view = Rc::new(crate::config_view::build());
+    // discovery lands (`spawn_*_discovery` below). `config_view` itself is
+    // built earlier, alongside `contacts_paned` - see the comment there.
     let config_card = card_section(&config_view.root);
     config_card.add_css_class("folder-pane");
     root_stack.add_named(&config_card, Some("config"));

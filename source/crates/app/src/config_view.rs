@@ -74,6 +74,10 @@ pub struct ShortcutRow {
 /// place without rebuilding the whole page.
 pub struct ConfigView {
     pub root: gtk::Widget,
+    /// The sidebar/content split itself, exposed so the caller can wire its
+    /// `position` to the same persist-width-as-a-percentage mechanism used
+    /// by the Mail/Calendar/Contacts panes.
+    pub paned: gtk::Paned,
     /// "Add account…" entry row, exposed so the caller can wire its
     /// `activated` signal to the same GOA-settings invocation the empty-state
     /// page uses.
@@ -482,7 +486,8 @@ pub fn build() -> ConfigView {
     paned.add_css_class("seamless-paned");
 
     ConfigView {
-        root: paned.upcast(),
+        root: paned.clone().upcast(),
+        paned,
         add_account_row,
         clear_cache_row,
         animations_row,
