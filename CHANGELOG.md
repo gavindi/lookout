@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.38 (2026-08-14)
+
+### Fixed
+
+- **Mail**: the toolbar's Mark Read/Unread button worked, but felt slow and looked disabled. It was already fully wired (a complete `StoreFlagsMany` handler existed), but the row's bold/unbold only updated once the IMAP `STORE` round trip completed and the resulting `AccountEvent::MessagesUpdated` landed, and its icon resolved to `mail-read-symbolic` - a glyph with `fill-opacity: 0.5` baked directly into its own SVG (confirmed in both Adwaita's and Yaru's icon themes), which read as disabled next to the toolbar's other full-opacity icons, and never changed regardless of the selection's actual read/unread state. Clicking it now patches the selected messages' `\Seen` flag into the on-screen model and repaints immediately, the same optimistic-update pattern already used for delete/archive/report; a new `AccountEvent::StoreFlagsFailed` (mirroring `MoveFailed`) rolls the patch back with an error toast if the server-side `STORE` actually fails. The button's icon now also swaps between a full-opacity checkmark ("this will mark read", when the selection has any unread message) and a full-opacity envelope ("this will mark unread", when the selection is already all read), refreshed on every selection change and after every toggle/rollback - never the dimmed stock icon. Flag/Unflag, which shares the same underlying `StoreFlagsMany` command, is untouched - it isn't optimistic and its failures now surface through the new event too, but harmlessly, since nothing is ever stashed for it to roll back.
+
+### Testing
+
+- `lookout-app`: a new `window` test drives `optimistic_toggle_read`/`restore_optimistic_flag_changes` directly - toggling read patches the flag (and the unified-view snapshot's copy) immediately and stashes the pre-toggle summary, and restoring puts the original flags back in both places and clears the stash.
+
 ## 0.9.37 (2026-08-14)
 
 ### Changed

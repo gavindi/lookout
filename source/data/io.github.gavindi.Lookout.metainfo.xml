@@ -21,6 +21,16 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.38" date="2026-08-14">
+      <description>
+        <p>Marking a message read or unread from the Mail toolbar now updates instantly instead of waiting on the server; the button's icon is brighter and now shows a checkmark or an envelope depending on which action it will perform.</p>
+      </description>
+    </release>
+    <release version="0.9.37" date="2026-08-14">
+      <description>
+        <p>The mail-screen calendar overview pane's event list is easier to scan: each row now shows a calendar-colour dot, an aligned time (or "All Day") column, and the title, instead of a flat single-line row.</p>
+      </description>
+    </release>
     <release version="0.9.36" date="2026-08-13">
       <description>
         <p>Dragging an event to a new time slot on the Calendar tab's Day/Week grid now moves it instantly and keeps it there while the change saves, instead of snapping back to the old slot until the server confirms.</p>

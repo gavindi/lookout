@@ -391,6 +391,13 @@ pub(crate) struct UiState {
     /// a mailbox the moment any `AccountEvent::MessagesUpdated` lands for it -
     /// an authoritative sync always supersedes the optimistic stash.
     pending_optimistic_removals: HashMap<MailboxId, Vec<EmailSummary>>,
+    /// Pre-toggle summaries for an optimistic mark-read/unread, keyed by
+    /// source mailbox, kept around so a matching
+    /// `AccountEvent::StoreFlagsFailed` can restore exactly their original
+    /// flags. Cleared for a mailbox the moment any
+    /// `AccountEvent::MessagesUpdated` lands for it, same convention as
+    /// `pending_optimistic_removals`.
+    pending_optimistic_flag_changes: HashMap<MailboxId, Vec<EmailSummary>>,
     /// The most recently requested body fetch, used to ignore stale
     /// `BodyFetched` updates that arrive after the user has moved on to a
     /// different message.
@@ -1519,6 +1526,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mail_view: MailView::Single,
         unified_snapshots: HashMap::new(),
         pending_optimistic_removals: HashMap::new(),
+        pending_optimistic_flag_changes: HashMap::new(),
         pending_body_request: None,
         pending_attachment: None,
         pending_raw_message: None,
@@ -3369,8 +3377,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Same aggregate-direction policy as Flag/Unflag: any unread message in
     // the selection means the action marks everything read; only when every
     // selected message is already read does it become "mark all unread."
-    let mark_read_button = gtk::Button::from_icon_name(themed_icon_name(&["mail-mark-read-symbolic", "mail-read-symbolic", "emblem-ok-symbolic"]));
-    mark_read_button.set_tooltip_text(Some("Mark Read/Unread"));
+    let mark_read_button = gtk::Button::from_icon_name(themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]));
+    refresh_mark_read_button(&mark_read_button, &message_list);
     // Categorize: a menu of the defined color tags, toggle-checked against
     // the selected message. Its popover is rebuilt on every `show` so the
     // check states track whichever message is selected when it opens.
@@ -5692,7 +5700,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_multi_label = reading_multi_label.clone();
         let message_header = message_header.clone();
         let message_list_for_selection = message_list.clone();
+        let mark_read_button = mark_read_button.clone();
         message_list.selection.connect_selection_changed(move |_sel, _pos, _n_items| {
+            refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
             let summary = match message_list_for_selection.selection_kind() {
                 SelectionKind::Message(summary) => *summary,
                 // A date section header - unreachable via the mouse (headers
@@ -5892,17 +5902,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let message_list = message_list.clone();
         let state = state.clone();
+        let mark_read_button_for_click = mark_read_button.clone();
         mark_read_button.connect_clicked(move |_| {
             let summaries = message_list.selected_summaries();
             if summaries.is_empty() {
                 return;
             }
-            let (add, remove) = if summaries.iter().any(|s| s.is_unread()) {
+            let mark_read = summaries.iter().any(|s| s.is_unread());
+            let (add, remove) = if mark_read {
                 (vec![SystemFlagBit::Seen], Vec::new())
             } else {
                 (Vec::new(), vec![SystemFlagBit::Seen])
             };
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
+                optimistic_toggle_read(&state, &message_list, &mailbox, &uids, mark_read);
                 let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
                     mailbox,
                     uids,
@@ -5910,6 +5923,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     remove: remove.clone(),
                 });
             }
+            refresh_mark_read_button(&mark_read_button_for_click, &message_list);
         });
     }
     {
@@ -6305,6 +6319,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         current_lookout_page.clone(),
         lookout_view_button.clone(),
         dashboard_refresh.clone(),
+        mark_read_button.clone(),
     );
     spawn_contacts_discovery(
         worker.clone(),
@@ -6443,6 +6458,7 @@ fn spawn_account_discovery(
     current_lookout_page: Rc<Cell<&'static str>>,
     lookout_view_button: gtk::ToggleButton,
     dashboard_refresh: Rc<dyn Fn()>,
+    mark_read_button: gtk::Button,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -6499,6 +6515,7 @@ fn spawn_account_discovery(
                         list_header.clone(),
                         account,
                         dashboard_refresh.clone(),
+                        mark_read_button.clone(),
                     );
                 }
                 refresh_config();
@@ -6534,6 +6551,7 @@ fn connect_account(
     list_header: ListHeader,
     account: lookout_goa::GoaMailAccount,
     dashboard_refresh: Rc<dyn Fn()>,
+    mark_read_button: gtk::Button,
 ) {
     let account_id = AccountId(account.account_id.0.clone());
     let display_name = account.display_name.clone();
@@ -6659,6 +6677,7 @@ fn connect_account(
                     // dropped those rows from the server too, so there's
                     // nothing left to reconcile.
                     state.borrow_mut().pending_optimistic_removals.remove(&mailbox);
+                    state.borrow_mut().pending_optimistic_flag_changes.remove(&mailbox);
                     // The sync this mailbox was asked for (if any) has landed.
                     state.borrow_mut().syncing.remove(&mailbox);
                     refresh_message_loading_state(&state, &message_list, &message_list_stack);
@@ -6975,6 +6994,17 @@ fn connect_account(
                         _ => "move",
                     };
                     let title = glib::markup_escape_text(&format!("Couldn't {verb}: {message}"));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
+                }
+                AccountEvent::StoreFlagsFailed { mailbox, uids, message } => {
+                    // The flag change actually failed server-side, so put
+                    // back exactly the summaries `optimistic_toggle_read`
+                    // patched for this attempt - a no-op if this failure
+                    // wasn't from a mark-read/unread toggle to begin with
+                    // (e.g. a Flag/Unflag failure, which isn't optimistic).
+                    restore_optimistic_flag_changes(&state, &message_list, &mailbox, &uids);
+                    refresh_mark_read_button(&mark_read_button, &message_list);
+                    let title = glib::markup_escape_text(&format!("Couldn't update message flags: {message}"));
                     toast_overlay.add_toast(adw::Toast::new(&title));
                 }
                 AccountEvent::MailboxExpunged { role } => {
@@ -9299,6 +9329,30 @@ fn apply_favorite_visual(button: &gtk::ToggleButton, starred: bool) {
     button.set_tooltip_text(Some(if starred { "Remove from Favorites" } else { "Add to Favorites" }));
 }
 
+/// Sets `mark_read_button`'s icon/tooltip to reflect what clicking it would
+/// currently do, from the message list's live selection - full-opacity
+/// icons only (the stock `mail-read-symbolic` has `fill-opacity: 0.5` baked
+/// into its own SVG, which reads as disabled next to this toolbar's other
+/// solid icons): a checkmark when any selected message is unread (clicking
+/// marks everything read), an envelope when the selection is already all
+/// read (clicking marks everything unread) - matching the same aggregate
+/// direction the click handler itself computes. Mirrors
+/// `apply_favorite_visual`'s icon-swap convention.
+fn refresh_mark_read_button(button: &gtk::Button, message_list: &MessageListModel) {
+    let summaries = message_list.selected_summaries();
+    let mark_read = summaries.is_empty() || summaries.iter().any(|s| s.is_unread());
+    let (icon, tooltip) = if mark_read {
+        (themed_icon_name(&["mail-mark-read-symbolic", "object-select-symbolic", "emblem-ok-symbolic"]), "Mark Read")
+    } else {
+        (
+            themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]),
+            "Mark Unread",
+        )
+    };
+    button.set_icon_name(icon);
+    button.set_tooltip_text(Some(tooltip));
+}
+
 /// The first of `candidates` the current icon theme actually has. Icon names
 /// in this app resolve against the machine's theme rather than a bundled set
 /// (see `folder_icon_name`), and the header's sort/filter/star icons are names
@@ -10192,6 +10246,86 @@ fn restore_optimistic_removals(state: &Rc<RefCell<UiState>>, message_list: &Mess
     }
     let mut all = message_list.all_messages();
     all.extend(restored);
+    let (key, descending) = current_sort(state);
+    message_list.repopulate(all, key, descending);
+}
+
+/// Optimistically flips `SystemFlagBit::Seen` for `uids` in `mailbox` -
+/// added when marking read, removed when marking unread - and repaints
+/// immediately. The pre-toggle summaries are stashed in
+/// `pending_optimistic_flag_changes` so a matching `StoreFlagsFailed` can
+/// restore exactly them; a later `MessagesUpdated` for this mailbox clears
+/// the stash on its own, since the success path already patched the cache
+/// to match before emitting it.
+fn optimistic_toggle_read(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid], mark_read: bool) {
+    let mut before = Vec::new();
+    let all: Vec<EmailSummary> = message_list
+        .all_messages()
+        .into_iter()
+        .map(|mut m| {
+            if m.mailbox == *mailbox && uids.contains(&m.uid) {
+                before.push(m.clone());
+                if mark_read {
+                    m.flags.insert(SystemFlagBit::Seen);
+                } else {
+                    m.flags.remove(&SystemFlagBit::Seen);
+                }
+            }
+            m
+        })
+        .collect();
+    if before.is_empty() {
+        return;
+    }
+    let (key, descending) = current_sort(state);
+    message_list.repopulate(all, key, descending);
+    let mut st = state.borrow_mut();
+    if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
+        for m in snapshot.iter_mut().filter(|m| uids.contains(&m.uid)) {
+            if mark_read {
+                m.flags.insert(SystemFlagBit::Seen);
+            } else {
+                m.flags.remove(&SystemFlagBit::Seen);
+            }
+        }
+    }
+    st.pending_optimistic_flag_changes.entry(mailbox.clone()).or_default().extend(before);
+}
+
+/// Undoes `optimistic_toggle_read` for `mailbox`/`uids` after a
+/// `StoreFlagsFailed` - puts the stashed pre-toggle summaries back in place
+/// (by uid) in both the visible list and the unified-view snapshot.
+fn restore_optimistic_flag_changes(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid]) {
+    let restored: HashMap<Uid, EmailSummary> = {
+        let mut st = state.borrow_mut();
+        let Some(pending) = st.pending_optimistic_flag_changes.get_mut(mailbox) else { return };
+        let mut restored = HashMap::new();
+        pending.retain(|m| {
+            if uids.contains(&m.uid) {
+                restored.insert(m.uid, m.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if pending.is_empty() {
+            st.pending_optimistic_flag_changes.remove(mailbox);
+        }
+        restored
+    };
+    if restored.is_empty() {
+        return;
+    }
+    let mut st = state.borrow_mut();
+    if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
+        for m in snapshot.iter_mut() {
+            if let Some(orig) = restored.get(&m.uid) {
+                m.flags = orig.flags.clone();
+            }
+        }
+    }
+    drop(st);
+    let all: Vec<EmailSummary> = message_list.all_messages().into_iter().map(|m| restored.get(&m.uid).cloned().unwrap_or(m)).collect();
     let (key, descending) = current_sort(state);
     message_list.repopulate(all, key, descending);
 }
@@ -12454,6 +12588,7 @@ mod tests {
             mail_view: MailView::Single,
             unified_snapshots: HashMap::new(),
             pending_optimistic_removals: HashMap::new(),
+            pending_optimistic_flag_changes: HashMap::new(),
             pending_body_request: None,
             pending_attachment: None,
             pending_raw_message: None,
@@ -12572,6 +12707,60 @@ mod tests {
         );
         assert!(
             !state.borrow().pending_optimistic_removals.contains_key(&mailbox),
+            "the stash must be empty once its only entry is restored"
+        );
+    }
+
+    /// `optimistic_toggle_read` flips `SystemFlagBit::Seen` (and the
+    /// unified-view snapshot's copy) the instant it's called, stashing the
+    /// pre-toggle summary; a matching `restore_optimistic_flag_changes` (the
+    /// `StoreFlagsFailed` rollback path) puts the original flags straight
+    /// back and clears the stash. Same self-skip convention as the other
+    /// GTK-touching tests in this module.
+    #[test]
+    fn optimistic_toggle_read_and_restore_round_trips_flags_and_unified_snapshot() {
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let account_id = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(account_id, Vec::new())]);
+        // `summary()` defaults to no flags set, i.e. unread.
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
+        state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one.clone(), two.clone()]);
+
+        optimistic_toggle_read(&state, &message_list, &mailbox, &[Uid(2)], true);
+        let patched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        assert!(!patched.is_unread(), "the row must flip to read immediately, before any server round trip");
+        let untouched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(1)).unwrap();
+        assert!(untouched.is_unread(), "an uid not in the toggle set must be untouched");
+        assert!(
+            !state.borrow().unified_snapshots[&mailbox].iter().find(|m| m.uid == Uid(2)).unwrap().is_unread(),
+            "the unified-view snapshot must reflect the toggle too"
+        );
+        assert_eq!(
+            state.borrow().pending_optimistic_flag_changes[&mailbox].iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![Uid(2)],
+            "the pre-toggle summary must be stashed for a possible rollback"
+        );
+
+        restore_optimistic_flag_changes(&state, &message_list, &mailbox, &[Uid(2)]);
+        let restored = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        assert!(restored.is_unread(), "a failed flag update must restore the original unread state");
+        assert!(
+            state.borrow().unified_snapshots[&mailbox].iter().find(|m| m.uid == Uid(2)).unwrap().is_unread(),
+            "the unified-view snapshot must be restored too"
+        );
+        assert!(
+            !state.borrow().pending_optimistic_flag_changes.contains_key(&mailbox),
             "the stash must be empty once its only entry is restored"
         );
     }

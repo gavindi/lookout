@@ -402,6 +402,15 @@ pub enum AccountEvent {
         role: MailboxRole,
         message: String,
     },
+    /// A `StoreFlags`/`StoreFlagsMany` request failed. Kept distinct from
+    /// `Error` below, mirroring `MoveFailed`, so the UI can restore exactly
+    /// the summaries it optimistically flag-patched (if any - harmless
+    /// no-op otherwise), without also swallowing unrelated errors.
+    StoreFlagsFailed {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        message: String,
+    },
     /// A `SaveDraft` request landed server-side; `message_id` is the draft's
     /// stable `Message-ID`, so only the compose session that owns that id
     /// acts on it.
@@ -1289,7 +1298,13 @@ async fn connect_and_run(
                             }
                         }
                         Err(e) => {
-                            let _ = events.send(AccountEvent::Error(format!("Couldn't update message flags: {e}"))).await;
+                            let _ = events
+                                .send(AccountEvent::StoreFlagsFailed {
+                                    mailbox,
+                                    uids: vec![uid],
+                                    message: format!("Couldn't update message flags: {e}"),
+                                })
+                                .await;
                         }
                     }
                 }
@@ -1351,7 +1366,13 @@ async fn connect_and_run(
                             }
                         }
                         Err(e) => {
-                            let _ = events.send(AccountEvent::Error(format!("Couldn't update message flags: {e}"))).await;
+                            let _ = events
+                                .send(AccountEvent::StoreFlagsFailed {
+                                    mailbox,
+                                    uids,
+                                    message: format!("Couldn't update message flags: {e}"),
+                                })
+                                .await;
                         }
                     }
                 }
