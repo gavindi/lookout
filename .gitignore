@@ -9,3 +9,6 @@ target/
 *.lock
 *.tmp
 
+#IDE
+*.code-workspace
+

@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.9.36 (2026-08-13)
+## 0.9.37 (2026-08-14)
+
+### Changed
+
+- **Mail**: the mail-screen calendar overview pane's selected-day event list is easier to scan. Rows were flat, single-`Label` lines packed at 4px spacing with no visual distinction between all-day and timed events beyond the leading `HH:MM`; they're now laid out in a `Grid` (10px row spacing) with three aligned columns - a calendar-colour dot (the same colour used for that calendar's event chips elsewhere, keyed via `calendar_colors`), then a time-or-"All Day" caption, then the title - so every row's title starts at the same x regardless of whether its prefix is a 5-character time or the wider "All Day" label, and all-day events are now visibly labelled instead of showing only their summary. The pane's outer content box also gained 2px of margin on all sides so the mini-calendar and event list no longer sit flush against the card's rounded border.
 
 ### Fixed
 

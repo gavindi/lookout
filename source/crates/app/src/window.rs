@@ -3634,11 +3634,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the pane's real width - the `width_request` below is only a floor - so
     // narrowing the pane means narrowing the buttons.
     mail_calendar_overview.root.add_css_class("mini-calendar-compact");
-    let mail_overview_day_list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(8).build();
+    let mail_overview_day_list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).margin_top(8).build();
     // Matches `build_sidebar()`'s own width_request - without an explicit
     // cap here, the mini-calendar's day-button grid requests its natural
     // (much wider) size instead of a compact peek-pane width.
-    let mail_overview_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).width_request(140).build();
+    let mail_overview_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .width_request(140)
+        .margin_top(2)
+        .margin_bottom(2)
+        .margin_start(2)
+        .margin_end(2)
+        .build();
     mail_overview_box.append(&mail_calendar_overview.root);
     mail_overview_box.append(&mail_overview_day_list);
 
@@ -7640,24 +7648,36 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
         let placeholder = gtk::Label::builder().label("No events").css_classes(["dim-label", "caption"]).xalign(0.0).build();
         day_list_box.append(&placeholder);
     } else {
-        for occ in occurrences {
-            let text = if occ.all_day {
-                occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
-            } else {
-                format!(
-                    "{} {}",
-                    occ.start.with_timezone(&chrono::Local).format("%H:%M"),
-                    occ.summary.as_deref().unwrap_or("(untitled)")
-                )
-            };
-            let label = gtk::Label::builder()
-                .label(&text)
+        // A grid rather than one label per row: it auto-sizes the prefix
+        // column to fit "All Day" (wider than any "HH:MM"), so every row's
+        // title starts at the same x regardless of which prefix it has.
+        let grid = gtk::Grid::builder().row_spacing(10).column_spacing(6).build();
+        for (row, occ) in occurrences.into_iter().enumerate() {
+            let row = row as i32;
+            let color = st.calendar_colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR).to_string();
+            let dot = gtk::DrawingArea::builder().width_request(8).height_request(8).valign(gtk::Align::Center).build();
+            dot.set_draw_func(move |_, cr, width, height| {
+                let (r, g, b) = crate::tasks_view::parse_css_color(&color);
+                let radius = width.min(height) as f64 / 2.0 - 1.0;
+                cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius, 0.0, 2.0 * std::f64::consts::PI);
+                cr.set_source_rgba(r, g, b, 1.0);
+                let _ = cr.fill();
+            });
+            dot.set_tooltip_text(Some(&occ.calendar_id.0));
+            let prefix_text = if occ.all_day { "All Day".to_string() } else { occ.start.with_timezone(&chrono::Local).format("%H:%M").to_string() };
+            let prefix = gtk::Label::builder().label(&prefix_text).xalign(0.0).css_classes(["dim-label", "caption"]).build();
+            let title = gtk::Label::builder()
+                .label(occ.summary.as_deref().unwrap_or("(untitled)"))
                 .xalign(0.0)
+                .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["caption"])
                 .build();
-            day_list_box.append(&label);
+            grid.attach(&dot, 0, row, 1, 1);
+            grid.attach(&prefix, 1, row, 1, 1);
+            grid.attach(&title, 2, row, 1, 1);
         }
+        day_list_box.append(&grid);
     }
 }
 
