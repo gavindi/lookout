@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.39 (2026-08-14)
+
+### Fixed
+
+- **Mail**: clicking "Open" on an attachment in the reading pane always showed an app-chooser dialog (default app pre-selected, plus other choices) instead of silently launching it - even running the native debug build, outside any sandbox. `open_attachment_temp` already resolved the MIME type's default app via `gio::AppInfo::default_for_type` and launched it directly with no chooser, falling back to the portal-routed `gtk::FileLauncher` (which can show its own chooser) only when no default app was found. The lookup was failing every time because `BodyPart::content_type` was built straight from the raw IMAP `BODYSTRUCTURE`/MIME type tokens with no case normalization (`structure.rs`'s `format!("{ty}/{subtype}")`, and the `mail-parser` fallback in `body.rs`), and many IMAP servers (following RFC 3501's own uppercase grammar) emit atoms like `APPLICATION/PDF` rather than lowercase - `gio::content_type_from_mime_type`'s lookup against the XDG MIME database is case-sensitive, so it always silently failed to resolve a default app and fell through to the chooser. `content_type` is now lowercased at both construction sites, so "Open" launches the default app directly with no dialog; **Open With…**, which intentionally asks the portal for a chooser, is untouched.
+
+### Added
+
+- **Mail**: double-clicking anywhere on an attachment row in the reading pane now opens it, the same as choosing "Open" from its menu - previously only the menu button's "Open" item worked.
+- **Mail**: attachment rows in the reading pane now highlight on mouseover, matching the hover treatment already used elsewhere in the toolbar.
+
 ## 0.9.38 (2026-08-14)
 
 ### Fixed

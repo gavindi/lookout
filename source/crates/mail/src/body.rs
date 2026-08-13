@@ -43,7 +43,8 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
                     Some(sub) => format!("{}/{sub}", ct.ctype()),
                     None => ct.ctype().to_string(),
                 })
-                .unwrap_or_else(|| "application/octet-stream".to_string());
+                .unwrap_or_else(|| "application/octet-stream".to_string())
+                .to_ascii_lowercase();
             // The iMIP payload is body content, not an attachment: it never
             // surfaces in the strip's metadata list (matching the
             // partial-fetch assembly path's filter below).

@@ -102,7 +102,7 @@ fn leaf(common: &BodyContentCommon, other: &BodyContentSinglePart, path: &[u32],
 
     BodyPart {
         part_number: path.iter().map(u32::to_string).collect::<Vec<_>>().join("."),
-        content_type: format!("{ty}/{subtype}"),
+        content_type: format!("{ty}/{subtype}").to_ascii_lowercase(),
         charset: param("charset").map(str::to_string),
         transfer_encoding: Some(encoding_str(&other.transfer_encoding).to_string()),
         filename,

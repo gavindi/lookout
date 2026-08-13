@@ -1017,6 +1017,14 @@ fn install_paned_css() {
         .message-row {
             border-bottom: 1px solid @lookout-row-separator;
         }
+        .attachment-row {
+            padding: 4px 6px;
+            border-radius: 6px;
+        }
+        .attachment-row:hover {
+            background-color: @theme_selected_bg_color;
+            color: @theme_selected_fg_color;
+        }
         .message-accent-bar {
             background-color: transparent;
         }
@@ -11220,6 +11228,19 @@ fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::S
         open_item.connect_clicked(move |_| {
             start_attachment_fetch(&state_for_open, &mailbox_for_open, uid, &part_for_open, &button_for_open, PendingAttachmentAction::Open);
         });
+        // Double-clicking the row is the same as choosing "Open".
+        let gesture_open = gtk::GestureClick::new();
+        gesture_open.set_button(gtk::gdk::BUTTON_PRIMARY);
+        let button_for_dclick = menu_button.clone();
+        let state_for_dclick = state.clone();
+        let mailbox_for_dclick = mailbox.clone();
+        let part_for_dclick = part.clone();
+        gesture_open.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 2 {
+                start_attachment_fetch(&state_for_dclick, &mailbox_for_dclick, uid, &part_for_dclick, &button_for_dclick, PendingAttachmentAction::Open);
+            }
+        });
+        row.add_controller(gesture_open);
         let button_for_open_with = menu_button.clone();
         let state_for_open_with = state.clone();
         let mailbox_for_open_with = mailbox.clone();
