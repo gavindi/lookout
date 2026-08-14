@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.44 (2026-08-15)
+
+### Changed
+
+- **Mail**: the reading pane's "Switch message theme" button now reads its own state. Its icon starts as a moon (`weather-clear-night-symbolic`, with `night-light-symbolic` and finally the sun itself as fallbacks for icon themes with no moon glyph) and swaps to a sun (`weather-clear-symbolic` / `display-brightness-symbolic`) while the override is on, so the glyph says at a glance whether the current message is being shown theme-stripped; the tooltip likewise names what clicking will do next - "View in Dark Mode" while off (clicking strips the email's background and inverts its colours) and "View in Light Mode" while on. Both are updated in the toggle's handler *before* its idempotence guard, so they stay in sync even when `render_body` resets the button off for the next message rather than only on direct clicks.
+
 ## 0.9.43 (2026-08-15)
 
 ### Added

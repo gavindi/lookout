@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.44" date="2026-08-15">
+      <description>
+        <p>The reading pane's "Switch message theme" toggle now reads its state: a moon icon that becomes a sun while the override is on, with tooltips naming what clicking will do next - "View in Dark Mode" off, "View in Light Mode" on.</p>
+      </description>
+    </release>
     <release version="0.9.43" date="2026-08-15">
       <description>
         <p>The reading pane's "Switch message theme" toggle now works: for the email on screen it replaces the message's own background colour with the app theme's background, and inverts the text colours so the content still reads against it - a per-email override that resets when you move to the next message.</p>

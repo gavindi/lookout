@@ -5734,6 +5734,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let user_content_manager = user_content_manager.clone();
         let theme_override_sheet = theme_override_sheet.clone();
         message_header.theme_button.clone().connect_toggled(move |button| {
+            // The icon flips with the state - a moon while the override is
+            // off, a sun while it's on (the sun also trails the moon's
+            // candidate list as the no-moon fallback, see `message_header`).
+            // The tooltip names what clicking the button will do next, so it
+            // flips too - and both are set before the guard below so
+            // `render_body`'s sync-driven `set_active` (which also lands
+            // here) updates them.
+            button.set_icon_name(if button.is_active() {
+                crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
+            } else {
+                crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"])
+            });
+            button.set_tooltip_text(Some(if button.is_active() { "View in Light Mode" } else { "View in Dark Mode" }));
             if button.is_active() == state.borrow().message_theme_override {
                 return;
             }

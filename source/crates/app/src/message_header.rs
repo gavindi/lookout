@@ -95,9 +95,19 @@ pub fn build() -> MessageHeader {
     forward_button.set_tooltip_text(Some("Forward"));
 
     let theme_button = gtk::ToggleButton::builder()
-        .icon_name(crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic", "night-light-symbolic"]))
+        // A moon by default - the button is off - swapped for a sun while the
+        // override is on, by the toggle handler in `window.rs`. The moon list
+        // trails off into the sun so an icon theme with no moon glyph still
+        // gets something real rather than a missing-image box.
+        .icon_name(crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"]))
         .css_classes(["flat"])
-        .tooltip_text("Switch message theme")
+        // The tooltip names what the button *does* when clicked, so it flips
+        // with the toggle's state: off reads "View in Dark Mode" (clicking
+        // strips the email's background and inverts the text), on reads
+        // "View in Light Mode". The toggle handler in `window.rs` keeps it
+        // in sync, including when `render_body` resets the button off for
+        // the next message.
+        .tooltip_text("View in Dark Mode")
         .build();
     let contact_button = placeholder_button(
         crate::window::themed_icon_name(&["avatar-default-symbolic", "contact-new-symbolic", "system-users-symbolic"]),
