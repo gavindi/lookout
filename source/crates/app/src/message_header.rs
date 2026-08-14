@@ -7,7 +7,8 @@ pub const AVATAR_COLOR_CLASSES: [&str; 6] = ["avatar-color-0", "avatar-color-1",
 /// sender/action block (`widget`) - avatar, `Name<address>`, a flat labelled
 /// Reply/Reply All/Forward cluster (duplicating the top command toolbar's, by
 /// design - see the plan this shipped under), the live "Switch message theme"
-/// toggle, and disabled placeholders for contact/overflow - and a `To:`+date
+/// toggle, and the live "View contact" button (wired in `window.rs`) plus a
+/// disabled overflow placeholder - and a `To:`+date
 /// row - and a bottom action bar (`action_bar`) with its own Reply/Forward
 /// repeated below the body. The caller packs all three separately into the
 /// reading pane's stack page. Content is set via `update()` from whatever
@@ -28,6 +29,11 @@ pub struct MessageHeader {
     pub reply_button: gtk::Button,
     pub reply_all_button: gtk::Button,
     pub forward_button: gtk::Button,
+    /// The "View contact" button: looks up the sender in the connected
+    /// contacts accounts - opening the contact editor for the found card, or
+    /// a prefilled create dialog - wired up in `window.rs`, which owns the
+    /// contact state the lookup needs.
+    pub contact_button: gtk::Button,
     pub bottom_reply_button: gtk::Button,
     pub bottom_forward_button: gtk::Button,
     /// The "Switch message theme" toggle: when active, the message body's
@@ -110,10 +116,11 @@ pub fn build() -> MessageHeader {
         // the next message.
         .tooltip_text("View in Dark Mode")
         .build();
-    let contact_button = placeholder_button(
-        crate::window::themed_icon_name(&["avatar-default-symbolic", "contact-new-symbolic", "system-users-symbolic"]),
-        "View contact (coming soon)",
-    );
+    let contact_button = gtk::Button::builder()
+        .icon_name(crate::window::themed_icon_name(&["avatar-default-symbolic", "contact-new-symbolic", "system-users-symbolic"]))
+        .css_classes(["flat"])
+        .tooltip_text("View contact")
+        .build();
     let header_more_button = placeholder_button("view-more-symbolic", "More (coming soon)");
 
     let sender_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
@@ -171,6 +178,7 @@ pub fn build() -> MessageHeader {
         reply_button,
         reply_all_button,
         forward_button,
+        contact_button,
         bottom_reply_button,
         bottom_forward_button,
         theme_button,

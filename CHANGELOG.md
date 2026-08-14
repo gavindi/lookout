@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.46 (2026-08-15)
+
+### Added
+
+- **Mail**: the reading-pane header's "View contact" button - a disabled "coming soon" placeholder since the header shipped - is now live, and acts on the sender of the message on screen. Clicking it searches every connected contacts account's address books (the account the email lives in scans first, the rest in display-name order) for a card whose vCard carries that address, matched case-insensitively on the address string. If a contact is found, the contact editor opens for that card in edit mode, exactly as double-clicking the contact in the People list does - every field shown, save/delete routed to the card's own account. If no address book has the sender, the editor instead opens its blank "New contact" form **prefilled** with the sender's name (falling back to the address itself, so the form saves as-is when no display name came with the email) and an email row carrying the sender's address - the address-book picker lists **every** connected account's books, ordered with the email's own account's books first so the dropdown defaults to them (with the account's name prefixed onto each book's label when several accounts contribute, so the picker can tell books apart), and the created card is routed to whichever account owns the picked book, with a fresh UID per opened dialog so repeated creates land on distinct server hrefs. When no connected account has any writable address book at all, the click toasts "Connect a contacts account to create contacts." instead. Under the hood the contact editor's create mode gained a general prefill mechanism (`ContactEditorPrefill::prefill`), a seed card that populates the form without flipping it into edit mode, so future callers can open a pre-filled create form the same way.
+
 ## 0.9.45 (2026-08-15)
 
 ### Added

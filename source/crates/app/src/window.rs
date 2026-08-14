@@ -21,9 +21,9 @@ use webkit::prelude::*;
 use crate::calendar_colors;
 use crate::calendar_view::{self, CalendarMain};
 use crate::contacts_view::{
-    calendar_attendee_suggestions, export_current_contacts, merge_contact_suggestions, rebuild_contacts_list_ui, refresh_contacts_category_ui, show_contact_details_dialog,
-    show_contact_editor_for, show_contacts_import_dialog, show_manage_groups_dialog, show_new_contact_editor, spawn_contacts_discovery, ContactCommand, ContactsAccountSnapshot,
-    ContactsCategoryChoice, ContactsListEntry, SnapshotContactsProvider,
+    calendar_attendee_suggestions, export_current_contacts, find_contact_by_address, merge_contact_suggestions, rebuild_contacts_list_ui, refresh_contacts_category_ui,
+    show_contact_details_dialog, show_contact_editor_for, show_contacts_import_dialog, show_create_contact_for, show_manage_groups_dialog, show_new_contact_editor,
+    spawn_contacts_discovery, ContactCommand, ContactsAccountSnapshot, ContactsCategoryChoice, ContactsListEntry, SnapshotContactsProvider,
 };
 use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
@@ -5727,6 +5727,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 let rich_text_default = state.borrow().rich_text_default;
                 show_composer_in_reading_pane(&state, &reading_stack, "Forward", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
+            }
+        });
+    }
+
+    // --- "View contact" (reading-pane header): looks the selected message's
+    // sender up across every connected contacts account. Found - the contact
+    // editor opens for that card (edit mode, routed to its own account).
+    // Not found - the create editor opens prefilled with the sender, its
+    // address-book picker listing every account's books with the account the
+    // email lives in first. Silent no-op when nothing's selected or the
+    // message has no sender.
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let message_list = message_list.clone();
+        message_header.contact_button.connect_clicked(move |_| {
+            let summary = match message_list.selected_summary() {
+                Some(summary) => summary,
+                None => return,
+            };
+            let Some(sender) = summary.from.first() else { return };
+            let account_id = mailbox_account_id(&summary.mailbox);
+            match find_contact_by_address(&state, &sender.address, account_id.as_ref()) {
+                Some((_account_id, entry)) => show_contact_editor_for(&window, &state, &toast_overlay, &entry),
+                None => show_create_contact_for(&window, &state, &toast_overlay, sender, account_id),
             }
         });
     }
@@ -12794,6 +12820,79 @@ mod tests {
         );
         // No account prefix (an id not shaped "account:path").
         assert_eq!(mailbox_account_id(&MailboxId("INBOX".into())), None);
+    }
+
+    /// A minimal vCard with one email field, for contact-lookup tests.
+    fn test_contact(address: &str) -> VCard {
+        VCard {
+            version: "4.0".to_string(),
+            kind: None,
+            uid: Some("uid".into()),
+            full_name: Some("Ada Lovelace".into()),
+            name: None,
+            organization: None,
+            title: None,
+            emails: vec![lookout_core::EmailField {
+                types: vec!["work".into()],
+                address: address.to_string(),
+            }],
+            telephones: Vec::new(),
+            addresses: Vec::new(),
+            urls: Vec::new(),
+            note: None,
+            birthday: None,
+            categories: Vec::new(),
+            other: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn find_contact_by_address_matches_across_accounts_case_insensitively() {
+        let state = test_state(Vec::new());
+        {
+            let mut st = state.borrow_mut();
+            // The matching card lives in the alphabetically later account,
+            // so a match proves the search spans accounts rather than
+            // picking a lucky first.
+            st.contacts_by_account.insert(
+                AccountId("account_b".into()),
+                crate::contacts_view::test_snapshot(
+                    "Beta",
+                    vec![lookout_dav::ContactRecord {
+                        href: "/b/ada.vcf".into(),
+                        etag: Some("etag-b".into()),
+                        card: test_contact("Ada.Lovelace@Example.com"),
+                    }],
+                ),
+            );
+            st.contacts_by_account.insert(
+                AccountId("account_a".into()),
+                crate::contacts_view::test_snapshot(
+                    "Alpha",
+                    vec![lookout_dav::ContactRecord {
+                        href: "/a/grace.vcf".into(),
+                        etag: None,
+                        card: test_contact("grace@example.com"),
+                    }],
+                ),
+            );
+        }
+        // Case/whitespace-insensitive exact match on the address string.
+        let (account_id, entry) = find_contact_by_address(&state, "  ada.lovelace@example.com ", None).expect("found in an address book");
+        assert_eq!(account_id, AccountId("account_b".into()));
+        assert_eq!(entry.card.emails[0].address, "Ada.Lovelace@Example.com");
+        assert_eq!(entry.href, "/b/ada.vcf");
+        assert_eq!(entry.etag.as_deref(), Some("etag-b"));
+        // The email's own account is preferred when it also has the contact.
+        state.borrow_mut().contacts_by_account.get_mut(&AccountId("account_a".into())).unwrap().contacts.push(lookout_dav::ContactRecord {
+            href: "/a/ada.vcf".into(),
+            etag: None,
+            card: test_contact("ada.lovelace@example.com"),
+        });
+        let (preferred_id, _) = find_contact_by_address(&state, "ada.lovelace@example.com", Some(&AccountId("account_a".into()))).expect("found");
+        assert_eq!(preferred_id, AccountId("account_a".into()));
+        // No address book has the address - nothing found.
+        assert!(find_contact_by_address(&state, "nobody@example.com", None).is_none());
     }
 
     #[test]

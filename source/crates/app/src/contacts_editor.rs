@@ -31,6 +31,10 @@ pub struct ContactEditorPrefill<'a> {
     pub books: &'a [(String, String)],
     /// The contact being edited; `None` opens the blank "new contact" form.
     pub existing: Option<&'a VCard>,
+    /// Field values to seed a *create* form with (the sender's name/email
+    /// when the reading pane's "View contact" finds no match). Ignored when
+    /// `existing` is set - an edit always starts from the real card.
+    pub prefill: Option<&'a VCard>,
     /// The existing contact's server-side object href. Empty marks the entry
     /// as not writable (the Deleted bucket's display-only cards), which hides
     /// the Save/Delete actions.
@@ -75,6 +79,10 @@ pub fn show_contact_editor(
 
     let existing: Option<VCard> = prefill.existing.cloned();
     let has_existing = existing.is_some();
+    // The form's seed: the real card for an edit, the caller's create-mode
+    // prefill otherwise - so a prefilled "new contact" (the reading pane's
+    // "View contact" create path) opens with its name/email rows populated.
+    let seed: Option<VCard> = existing.clone().or_else(|| prefill.prefill.cloned());
     let href_owned = prefill.href.to_string();
     let etag_owned = prefill.etag.map(str::to_string);
     // Save is only possible when there's a write target: a real href for an
@@ -208,8 +216,8 @@ pub fn show_contact_editor(
         }
     };
 
-    // --- Repopulate from the existing card.
-    if let Some(card) = &existing {
+    // --- Repopulate from the existing card (or the create prefill).
+    if let Some(card) = &seed {
         name_row.set_text(card.full_name.as_deref().unwrap_or(""));
         org_row.set_text(card.organization.as_ref().and_then(|org| org.first()).map(String::as_str).unwrap_or(""));
         title_row.set_text(card.title.as_deref().unwrap_or(""));
@@ -341,11 +349,13 @@ pub fn show_contact_editor(
         cancel_button.connect_clicked(move |_| dialog.close());
     }
 
-    // --- Build the card from the form (clone of the existing card, only
-    // the exposed fields rewritten). `None` on invalid input (no name, bad
-    // birthday) - the Save handler just doesn't fire.
+    // --- Build the card from the form (clone of the existing/prefill card,
+    // only the exposed fields rewritten). `None` on invalid input (no name,
+    // bad birthday) - the Save handler just doesn't fire. A create seeded
+    // from a prefill keeps that card's own UID (the caller's prefilled cards
+    // carry one); the blank form generates a fresh one.
     let save_card: Rc<dyn Fn() -> Option<VCard>> = Rc::new(move || {
-        let mut card = existing.clone().unwrap_or_else(|| VCard {
+        let mut card = seed.clone().unwrap_or_else(|| VCard {
             version: "4.0".to_string(),
             kind: None,
             uid: Some(uuid::Uuid::new_v4().to_string()),

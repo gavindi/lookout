@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, ContactsProvider, EmailAddress, VCard};
+use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailField, VCard};
 use lookout_dav::{CardDavAccountConfig, ContactsCache, Credential, DavClient};
 use lookout_goa::{ContactsAuthMethod, GoaClient, GoaContactsAccount};
 
@@ -39,6 +39,18 @@ pub struct ContactsAccountSnapshot {
     /// set the People screen shows.
     pub(crate) contacts: Vec<lookout_dav::ContactRecord>,
     suggestions: Vec<EmailAddress>,
+}
+
+/// A bare snapshot for tests: no books (the write path's pickers aren't
+/// exercised), just the display name and the given contact records.
+#[cfg(test)]
+pub(crate) fn test_snapshot(display_name: &str, contacts: Vec<lookout_dav::ContactRecord>) -> ContactsAccountSnapshot {
+    ContactsAccountSnapshot {
+        display_name: display_name.to_string(),
+        books: Vec::new(),
+        contacts,
+        suggestions: Vec::new(),
+    }
 }
 
 /// Which bucket a left-pane row filters the right-hand contact list down to.
@@ -362,6 +374,7 @@ pub fn show_contact_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCe
         crate::contacts_editor::ContactEditorPrefill {
             books: &books,
             existing: Some(&entry.card),
+            prefill: None,
             href: &entry.href,
             etag: entry.etag.as_deref(),
         },
@@ -406,6 +419,7 @@ pub fn show_new_contact_editor(window: &adw::ApplicationWindow, state: &Rc<RefCe
         crate::contacts_editor::ContactEditorPrefill {
             books: &books,
             existing: None,
+            prefill: None,
             href: "",
             etag: None,
         },
@@ -414,6 +428,162 @@ pub fn show_new_contact_editor(window: &adw::ApplicationWindow, state: &Rc<RefCe
             let account_id = account_id.clone();
             let toast_overlay = toast_overlay.clone();
             move |book_href, card| route_contact_create(&state, account_id.clone(), book_href, card, &toast_overlay)
+        },
+        // Unreachable on the blank form; update/delete only fire for an edit.
+        move |_href, _etag, _card| {},
+        move |_href, _etag| {},
+    );
+}
+
+/// Finds the contact whose vCard carries `address` (case-insensitive exact
+/// match on the address string) across every connected account's snapshot,
+/// scanning `preferred_account` first and the rest in display-name order.
+/// Returns the owning account and a [`ContactsListEntry`] the editor flows
+/// can act on; `None` when no contact has that address.
+pub fn find_contact_by_address(
+    state: &Rc<RefCell<UiState>>,
+    address: &str,
+    preferred_account: Option<&AccountId>,
+) -> Option<(AccountId, ContactsListEntry)> {
+    let needle = address.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let st = state.borrow();
+    let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
+    accounts.sort_by_key(|(_, snapshot)| snapshot.display_name.to_lowercase());
+    // The email's own account scans first - its contacts are the most likely
+    // home for the sender - and the rest follow in display-name order.
+    if let Some(preferred) = preferred_account {
+        if let Some(pos) = accounts.iter().position(|(id, _)| *id == preferred) {
+            let (id, snapshot) = accounts.remove(pos);
+            accounts.insert(0, (id, snapshot));
+        }
+    }
+    for (account_id, snapshot) in accounts {
+        for record in &snapshot.contacts {
+            let matched = record.card.emails.iter().any(|email| email.address.trim().to_lowercase() == needle);
+            if matched {
+                return Some((
+                    account_id.clone(),
+                    ContactsListEntry {
+                        account_id: account_id.clone(),
+                        account_label: snapshot.display_name.clone(),
+                        category_label: contacts_bucket_label(&ContactsBucketKind::AllContacts),
+                        card: record.card.clone(),
+                        href: record.href.clone(),
+                        etag: record.etag.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Opens the contact editor's create form prefilled with `sender` - the
+/// reading pane's "View contact" path when no address book has that address.
+/// The address-book picker offers every connected account's books, ordered
+/// with `preferred_account`'s (the account the email lives in) first so the
+/// dropdown defaults to them; creating routes to whichever account owns the
+/// picked book.
+pub fn show_create_contact_for(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    sender: &EmailAddress,
+    preferred_account: Option<AccountId>,
+) {
+    let writable = {
+        let st = state.borrow();
+        st.contacts_by_account.values().any(|snapshot| !snapshot.books.is_empty())
+    };
+    if !writable {
+        toast_overlay.add_toast(adw::Toast::new("Connect a contacts account to create contacts."));
+        return;
+    }
+    let (books, book_accounts, fallback_account) = {
+        let st = state.borrow();
+        let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
+        accounts.sort_by_key(|(_, snapshot)| snapshot.display_name.to_lowercase());
+        // The email's own account's books come first, so the picker defaults
+        // to them (the dropdown opens on index 0); the rest follow in
+        // display-name order.
+        if let Some(preferred) = &preferred_account {
+            if let Some(pos) = accounts.iter().position(|(id, _)| *id == preferred) {
+                let (id, snapshot) = accounts.remove(pos);
+                accounts.insert(0, (id, snapshot));
+            }
+        }
+        accounts.retain(|(_, snapshot)| !snapshot.books.is_empty());
+        // Book labels get the account's name prefixed when several accounts
+        // contribute, so the picker tells books apart.
+        let multi_account = accounts.len() > 1;
+        let mut books: Vec<(String, String)> = Vec::new();
+        let mut book_accounts: HashMap<String, AccountId> = HashMap::new();
+        for (account_id, snapshot) in &accounts {
+            for book in &snapshot.books {
+                let label = if multi_account {
+                    format!("{} · {}", snapshot.display_name, book.display_name)
+                } else {
+                    book.display_name.clone()
+                };
+                books.push((label, book.href.clone()));
+                book_accounts.insert(book.href.clone(), (*account_id).clone());
+            }
+        }
+        let fallback_account = accounts[0].0.clone();
+        (books, book_accounts, fallback_account)
+    };
+    // The seed card: name from the sender (falling back to the address, so
+    // the form saves as-is when no display name came with it) and one email
+    // row carrying the sender's address. A fresh UID per opened dialog keeps
+    // repeated creates on distinct server hrefs.
+    let seed = VCard {
+        version: "4.0".to_string(),
+        kind: None,
+        uid: Some(uuid::Uuid::new_v4().to_string()),
+        full_name: Some(
+            sender
+                .name
+                .as_deref()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(&sender.address)
+                .to_string(),
+        ),
+        name: None,
+        organization: None,
+        title: None,
+        emails: vec![EmailField {
+            types: vec!["work".to_string()],
+            address: sender.address.clone(),
+        }],
+        telephones: Vec::new(),
+        addresses: Vec::new(),
+        urls: Vec::new(),
+        note: None,
+        birthday: None,
+        categories: Vec::new(),
+        other: Vec::new(),
+    };
+    let state = state.clone();
+    let toast_overlay = toast_overlay.clone();
+    crate::contacts_editor::show_contact_editor(
+        window,
+        crate::contacts_editor::ContactEditorPrefill {
+            books: &books,
+            existing: None,
+            prefill: Some(&seed),
+            href: "",
+            etag: None,
+        },
+        {
+            let state = state.clone();
+            let toast_overlay = toast_overlay.clone();
+            move |book_href, card| {
+                let account_id = book_accounts.get(&book_href).cloned().unwrap_or_else(|| fallback_account.clone());
+                route_contact_create(&state, account_id, book_href, card, &toast_overlay);
+            }
         },
         // Unreachable on the blank form; update/delete only fire for an edit.
         move |_href, _etag, _card| {},
