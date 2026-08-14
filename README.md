@@ -1,35 +1,37 @@
 # Lookout
 
-A native GNOME mail client written in Rust, built on GTK 4, libadwaita, and WebKitGTK. Lookout is a reimplementation of Microsoft Outlook as a desktop application, talking to your mail directly over IMAP/SMTP (and CalDAV for calendars), with accounts sourced from **GNOME Online Accounts**.
+A native GNOME mail client written in Rust, built on GTK 4, libadwaita, and WebKitGTK. Lookout is a reimplementation of Microsoft Outlook as a desktop application, talking to your mail directly over IMAP/SMTP (plus CalDAV for calendars and CardDAV for contacts), with accounts sourced from **GNOME Online Accounts**.
 
 ## Features
 
 - **Mail** — multi-account IMAP sync with IDLE live updates, folder tree with per-role icons, message list, and an HTML/plain-text reading pane rendered in a sandboxed WebKit view.
 - **Compose** — new/reply/reply-all/forward with correct threading headers, sent via SMTP (XOAUTH2 or password) and copied into your Sent mailbox.
 - **Mail actions** — delete (move-to-Trash), archive, report-as-junk, and client-side snooze, all backed by real IMAP MOVE/COPY+EXPUNGE.
-- **Calendar** — a CalDAV-backed, read-only Outlook-style month view with a mini-calendar sidebar and "My calendars" checklist, plus a day-agenda overview docked to the Mail screen.
-- **Config** — a nav-rail settings view showing your connected Mail/Calendar accounts and endpoints.
+- **Calendar** — a CalDAV-backed Outlook-style calendar: month/week/day/agenda views, mini-calendar sidebar, event create/edit with recurrence and invites, drag-to-reschedule, tasks (VTODO), iMIP invitations from the mail viewer, `.ics` import and webcal subscriptions, a synthesized birthday calendar, and event alerts.
+- **Config** — an in-window settings view: connected Mail/Calendar/Contacts accounts and endpoints, appearance (theming + accent color), Mail switches, keyboard shortcuts, and cache management.
 - Built around `GNOME Online Accounts` — add an account in system settings and it just shows up, no credential handling in Lookout itself.
 
-See [TODO.md](TODO.md) for the full roadmap (Phases 1–5) and what's shipped vs. planned.
+See [TODO.md](TODO.md) for the full, completed Phases 1–5 breakdown.
 
 ## Project layout
 
 ```
 .
-├── source/                  # Rust Cargo workspace (the desktop app)
+├── assets/                   # App icons and screenshots
+├── source/                   # Rust Cargo workspace (the desktop app)
 │   ├── crates/
-│   │   ├── core/            # Domain types, threading, mailbox roles
-│   │   ├── goa/             # GNOME Online Accounts D-Bus discovery + credentials
-│   │   ├── mail/            # IMAP/SMTP account-session actor + SQLite cache
-│   │   ├── dav/             # CalDAV client + iCalendar/recurrence handling
-│   │   └── app/             # GTK4/libadwaita UI (lookout binary)
-│   ├── data/                # .desktop file, AppStream metainfo, icons
-│   ├── test-fixtures/       # Sample .eml files for the debug viewer
-│   └── flatpak/             # Flatpak manifest spike (not yet buildable)
-├── webmail/                 # Bulwark webmail app (Next.js, separate repo)
-├── build.sh                 # Builds the Rust workspace and the webmail frontend
-└── CHANGELOG.md             # Version history
+│   │   ├── core/             # Domain types, threading, mailbox roles
+│   │   ├── goa/              # GNOME Online Accounts D-Bus discovery + credentials
+│   │   ├── mail/             # IMAP/SMTP account-session actor + SQLite cache
+│   │   ├── dav/              # CalDAV/CardDAV client + iCalendar/vCard/recurrence handling
+│   │   ├── imap-proto/       # Vendored imap-proto fork (UTF-8 envelope fix, patched via Cargo)
+│   │   └── app/              # GTK4/libadwaita UI (lookout binary)
+│   ├── data/                 # .desktop file, AppStream metainfo, icons, GSettings schema, GResource bundle, themes
+│   ├── test-fixtures/        # Sample .eml and .ics fixtures for the debug viewer
+│   ├── flatpak/              # Flatpak manifest (built by CI)
+│   └── snapcraft.yaml        # Snap packaging manifest
+├── build.sh                  # Builds the Rust workspace (optionally packages a .deb)
+└── CHANGELOG.md              # Version history
 ```
 
 ## Prerequisites
@@ -47,9 +49,10 @@ To run the app you also need a GNOME desktop session with at least one **mail-en
 ## Build and run
 
 ```bash
-# Build the whole repo (Rust workspace + webmail frontend)
-./build.sh                # debug build
-./build.sh --release      # optimized build
+# Build the Rust workspace
+./build.sh                # release build (default)
+./build.sh --debug        # debug build
+./build.sh --deb          # release build + .deb package (requires cargo-deb)
 
 # Or just the desktop app
 cd source
@@ -79,11 +82,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, unit tests, the fake-GOA D-Bus test, the Docker-gated GreenMail test, and a full build.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, unit tests, the fake-GOA D-Bus test, the Docker-gated GreenMail test, and a full build; `.github/workflows/build.yaml` packages `.deb`/`.rpm` artifacts and builds the Flatpak bundle.
 
 ## Roadmap
 
-See [TODO.md](TODO.md) for the phase-by-phase roadmap — Phase 1 (Mail MVP) is the current milestone, with Mail-advanced, Calendar, Contacts, and Settings/theming scoped as later phases.
+All five phases of the roadmap in [TODO.md](TODO.md) are complete: Mail MVP (Phase 1), Mail advanced (Phase 2), Calendar (Phase 3), Contacts (Phase 4), and Settings/theming (Phase 5).
 
 ## License
 
