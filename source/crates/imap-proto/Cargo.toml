@@ -1,0 +1,50 @@
+# Vendored copy of imap-proto 0.16.7 (crates.io), patched for Lookout.
+#
+# Upstream: https://github.com/djc/imap-proto (MIT OR Apache-2.0)
+# Local patch: `is_char` in src/parser/core.rs accepts 8-bit (UTF-8) bytes
+# inside quoted strings/literals, matching upstream's unreleased fix - see
+# the comment at that function. This lets real-world servers that send raw
+# UTF-8 in ENVELOPE fields (RFC 6855/9051) parse instead of failing the
+# whole response stream. Wired in via `[patch.crates.io]` in the workspace
+# Cargo.toml; the crates.io 0.16.7 archive it replaces is unpatched.
+
+[package]
+edition = "2021"
+rust-version = "1.61"
+name = "imap-proto"
+version = "0.16.7"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "IMAP protocol parser and data structures"
+homepage = "https://github.com/djc/tokio-imap"
+documentation = "https://docs.rs/imap-proto"
+readme = "README.md"
+keywords = [
+    "imap",
+    "email",
+]
+categories = [
+    "email",
+    "network-programming",
+    "parser-implementations",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/djc/tokio-imap"
+
+[badges.maintenance]
+status = "passively-maintained"
+
+[lib]
+name = "imap_proto"
+path = "src/lib.rs"
+
+[[example]]
+name = "parse_response"
+path = "examples/parse_response.rs"
+
+[dependencies.nom]
+version = "7"

@@ -8,8 +8,15 @@ members = [
     "crates/app",
 ]
 
+# Local copy of `imap-proto` 0.16.7 with one unreleased upstream fix (see
+# `crates/imap-proto/Cargo.toml`): `is_char` accepts 8-bit bytes so servers
+# sending raw UTF-8 in ENVELOPE fields parse instead of failing the whole
+# response stream.
+[patch.crates-io]
+imap-proto = { path = "crates/imap-proto" }
+
 [workspace.package]
-version = "0.9.41"
+version = "0.9.42"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gavindi/lookout"

@@ -241,4 +241,26 @@ mod tests {
         assert_eq!(SystemFlagBit::from_imap_flag(&imap_flag_to_string(&Flag::Seen)), Some(SystemFlagBit::Seen));
         assert_eq!(SystemFlagBit::from_imap_flag(&imap_flag_to_string(&Flag::Custom("$Lookout-tag-work".into()))), None);
     }
+
+    #[test]
+    fn envelope_subject_with_raw_utf8_parses() {
+        use async_imap::imap_proto::types::{AttributeValue, Response};
+        // A real-world server sending the ENVELOPE subject as raw UTF-8 (no
+        // MUTF-7, no RFC 2047 encoding). Before the vendored imap-proto fix
+        // (`is_char` accepting 8-bit bytes), the emoji's non-ASCII bytes made
+        // `quoted` fail with a `TakeWhile1` error, aborting the whole FETCH
+        // response - and with it the session, which reconnected and hit the
+        // same message forever. This is the exact response from the field.
+        let raw = b"* 4 FETCH (UID 4 FLAGS () ENVELOPE (\"Wed, 10 Jun 2026 19:30:00 +0000\" \"Weekend hike photos \xF0\x9F\x8F\x94\xEF\xB8\x8F\" ((\"Alex Tran\" NIL \"alex.tran\" \"freemail.example\")) ((\"Alex Tran\" NIL \"alex.tran\" \"freemail.example\")) ((\"Alex Tran\" NIL \"alex.tran\" \"freemail.example\")) ((\"Jordan Casey\" NIL \"jordan.casey\" \"freemail.example\")) NIL NIL NIL \"<0003.1786668429@freemail.example>\") RFC822.SIZE 33461 INTERNALDATE \"10-Jun-2026 19:30:00 +0000\" BODYSTRUCTURE ((\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"quoted-printable\" 212 8 \"b4df2420bff4d3ffcd08ff86388fd986\" NIL NIL NIL)(\"image\" \"jpeg\" NIL NIL NIL \"base64\" 32522 \"c01167c97548255f7311848b616b02bd\" (\"attachment\" (\"filename\" \"summit_view.jpg\")) NIL NIL) \"mixed\" (\"boundary\" \"===============5030118478018109776==\") NIL NIL NIL))\r\n";
+        let (remaining, response) = async_imap::imap_proto::parser::parse_response(raw).expect("UTF-8 ENVELOPE subject should parse");
+        assert!(remaining.is_empty());
+        let Response::Fetch(_, attrs) = response else {
+            panic!("expected a FETCH response, got {response:?}");
+        };
+        let subject = attrs.iter().find_map(|a| match a {
+            AttributeValue::Envelope(e) => e.subject.as_ref().map(|s| String::from_utf8_lossy(s).into_owned()),
+            _ => None,
+        });
+        assert_eq!(subject.as_deref(), Some("Weekend hike photos 🏔\u{fe0f}"));
+    }
 }

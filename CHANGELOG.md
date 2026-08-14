@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.42 (2026-08-14)
+
+### Fixed
+
+- **Mail**: an account whose server sends raw UTF-8 in IMAP `ENVELOPE` fields (a subject with an emoji, or a non-ASCII display name - servers like Dovecot/Cyrus and anything RFC 6855 / IMAP4rev2-compliant emit these as plain UTF-8 rather than MUTF-7) never loaded at all: the session logged in fine, then died on the very first fetch with `IMAP error: io: ... TakeWhile1`, and since the reconnect re-fetched the same unparseable message, the session looped forever on `account session error, will reconnect` and the folder list never appeared. The failure was in `imap-proto` 0.16.7 (the parser behind `async-imap`), whose `quoted` string parser only accepted 7-bit ASCII (`is_char` = `%x01-7F`), so a single 8-bit byte aborted the whole FETCH response. Upstream `djc/imap-proto` has fixed this on `main` (accept any non-NUL byte and let higher layers decode lossily) but has never released it, and the full upstream change set is a breaking API change `async-imap` 0.11.3 won't compile against. Lookout now vendors a local copy of `imap-proto` 0.16.7 (`crates/imap-proto`) carrying just that one-line parser fix - applied via `[patch.crates-io]` in the workspace `Cargo.toml`, so the crates.io version is replaced for every crate in the tree, with the exact upstream rationale documented at the patched function. Subjects, sender names, and message IDs containing raw UTF-8 now parse and display normally (the existing `from_utf8_lossy` decode paths were already lossy-safe); nothing else about the protocol stack changed.
+
+### Testing
+
+- `lookout-mail`: a new `envelope` test feeds the exact failing `FETCH` response from the field (an emoji subject, `"Weekend hike photos 🏔️"`, sent as raw UTF-8) through `imap_proto::parser::parse_response` and asserts the ENVELOPE subject parses intact - it fails against the unpatched crates.io parser and passes against the vendored one, so the regression is pinned to this fix.
+
 ## 0.9.41 (2026-08-14)
 
 ### Added
