@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.45 (2026-08-15)
+
+### Added
+
+- **Settings**: Config → Appearance gains a **Dark message theme** switch (the `mail-message-theme-dark` GSettings key, off by default) - the default state for the reading pane's "Switch message theme" override. Off (the default) is light mode: messages open with their original background and text untouched, exactly as before; on, every newly-opened HTML message starts dark - background stripped, colours inverted - against the app theme. It's a *default for new messages only*: the header's per-message moon/sun toggle still overrides the current email either way, and flipping the setting never re-renders (or yanks) the message on screen. Under the hood the per-email override state now resets to this default on every navigation instead of a hardcoded "off" - and the previous implementation only re-armed the physical override (the user stylesheet plus the WebView's canvas colour) in the toggle's own handler, so a message opened *after* a manual toggle could silently inherit the previous email's dark mode even though the header showed the toggle off; the physical arming now lives in one `set_message_theme_armed` helper called by the toggle handler and every navigation reset (single-message selection, multi-select, empty, close-pane), keeping the logical per-message state and the actually-applied sheet/canvas in lockstep.
+
 ## 0.9.44 (2026-08-15)
 
 ### Changed

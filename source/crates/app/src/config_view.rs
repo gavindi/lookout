@@ -93,6 +93,12 @@ pub struct ConfigView {
     /// "Theme" dropdown (Config → Appearance), exposed so the caller can wire
     /// its selection into the `ThemeManager` and seed it from GSettings.
     pub theme_row: adw::ComboRow,
+    /// "Dark message theme" switch (Config → Appearance), exposed so the
+    /// caller can seed it from GSettings. The default (off) is light mode -
+    /// messages keep their original background and text; when on,
+    /// newly-opened HTML messages start with the header's "Switch message
+    /// theme" override applied.
+    pub message_theme_dark_row: adw::SwitchRow,
     /// "Custom accent color" switch (Config → Appearance), exposed so the
     /// caller can arm the accent picker row and map its state to the
     /// `accent-color` GSettings key (off = follow the system accent).
@@ -253,6 +259,16 @@ pub fn build() -> ConfigView {
         .model(&theme_model)
         .build();
     appearance_group.add(&theme_row);
+    // The per-message "Switch message theme" default. Off (the default) is
+    // light mode: messages keep their original background and text; on,
+    // newly-opened HTML messages start dark - background stripped, colours
+    // inverted - while the header's moon/sun toggle still overrides the
+    // current message either way.
+    let message_theme_dark_row = adw::SwitchRow::builder()
+        .title("Dark message theme")
+        .subtitle("Open HTML messages in dark mode by default instead of their original colours")
+        .build();
+    appearance_group.add(&message_theme_dark_row);
     let accent_switch_row = adw::SwitchRow::builder()
         .title("Custom accent color")
         .subtitle("Use a Lookout-specific accent instead of the system one")
@@ -492,6 +508,7 @@ pub fn build() -> ConfigView {
         clear_cache_row,
         animations_row,
         theme_row,
+        message_theme_dark_row,
         accent_switch_row,
         accent_color_row,
         accent_color_button,

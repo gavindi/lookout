@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.45" date="2026-08-15">
+      <description>
+        <p>Config → Appearance gains a "Dark message theme" switch: a default for newly-opened HTML messages (light mode - the original colours - by default), with the reading pane's per-message moon/sun toggle still overriding the current email either way.</p>
+      </description>
+    </release>
     <release version="0.9.44" date="2026-08-15">
       <description>
         <p>The reading pane's "Switch message theme" toggle now reads its state: a moon icon that becomes a sun while the override is on, with tooltips naming what clicking will do next - "View in Dark Mode" off, "View in Light Mode" on.</p>

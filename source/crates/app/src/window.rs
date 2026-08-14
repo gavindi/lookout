@@ -634,9 +634,11 @@ pub(crate) struct UiState {
     /// colour is stripped and its colours inverted (see
     /// `MESSAGE_THEME_OVERRIDE_CSS`) so the app theme's background shows
     /// through with the content still readable against it. A per-email
-    /// override - cleared on every navigation like `load_once_images`, and
-    /// `render_body` syncs the header button from it so the next message
-    /// opens with the override off.
+    /// override - reset to the Config → Appearance "Dark message theme"
+    /// default on every navigation (alongside the other per-message state,
+    /// and always in lockstep with the physical `set_message_theme_armed`),
+    /// and `render_body` syncs the header button from it so the next message
+    /// opens in the configured default.
     message_theme_override: bool,
     /// The `(mailbox, uid)` of the message whose external-content banner the
     /// user acted on (trusted the sender or loaded once); while that message
@@ -4926,6 +4928,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Appearance → "Dark message theme": the default state for
+    // *newly-opened* messages only - the reading pane's per-message
+    // "Switch message theme" toggle still overrides the current message
+    // either way, so the change applies on the next navigation rather than
+    // re-rendering (and possibly yanking) the message on screen.
+    {
+        let state = state.clone();
+        config_view.message_theme_dark_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::MAIL_MESSAGE_THEME_DARK, row.is_active());
+        });
+    }
+
     // Config → Mail → "Load images from the web": flips the WebView's
     // remote-image veto live, then re-renders whatever's on the reading pane
     // so the change applies to the open message, not just the next selection.
@@ -5036,6 +5050,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let persisted = state.borrow().settings.clone();
         config_view.animations_row.set_active(persisted.get_bool(crate::settings::ANIMATE_TRANSITIONS));
+        config_view.message_theme_dark_row.set_active(persisted.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK));
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
         config_view.read_receipts_row.set_active(persisted.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS));
@@ -5274,31 +5289,40 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         Rc::new({
             let state = state.clone();
             let reading_stack = reading_stack.clone();
+            let web_view = web_view.clone();
+            let user_content_manager = user_content_manager.clone();
+            let theme_override_sheet = theme_override_sheet.clone();
             move || {
                 if reading_stack.visible_child_name().as_deref() == Some("compose") {
                     return;
                 }
-                let mut st = state.borrow_mut();
-                st.pending_body_request = None;
-                st.pending_html_reveal = false;
-                st.reveal_generation += 1;
-                st.pending_header = None;
-                st.pending_attachment = None;
-                st.pending_raw_message = None;
-                st.unsubscribe_info = None;
-                st.unsubscribe_dismissed = None;
-                st.imip = None;
-                st.imip_dismissed = None;
-                st.read_receipt_request = None;
-                st.read_receipt_dismissed = None;
-                st.read_receipt_context = None;
-                st.rendered_trust_sender = None;
-                st.load_once_images = false;
-                st.message_theme_override = false;
-                st.trust_banner_dismissed = None;
-                st.rendered_message = None;
-                drop(st);
+                // The message-theme override resets to the configured default
+                // and its physical sheet/canvas are re-armed to match, the
+                // same as every other navigation path.
+                let default_dark = {
+                    let mut st = state.borrow_mut();
+                    st.pending_body_request = None;
+                    st.pending_html_reveal = false;
+                    st.reveal_generation += 1;
+                    st.pending_header = None;
+                    st.pending_attachment = None;
+                    st.pending_raw_message = None;
+                    st.unsubscribe_info = None;
+                    st.unsubscribe_dismissed = None;
+                    st.imip = None;
+                    st.imip_dismissed = None;
+                    st.read_receipt_request = None;
+                    st.read_receipt_dismissed = None;
+                    st.read_receipt_context = None;
+                    st.rendered_trust_sender = None;
+                    st.load_once_images = false;
+                    st.message_theme_override = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
+                    st.trust_banner_dismissed = None;
+                    st.rendered_message = None;
+                    st.message_theme_override
+                };
                 drop_pending_cid(&state);
+                set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
                 reading_stack.set_visible_child_name("empty");
             }
         }),
@@ -5709,22 +5733,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- "Switch message theme" toggle: arms/removes the background-stripping
     // user stylesheet and re-renders the open message so the override applies
-    // to it, not just the next selection. A per-email override: the selection
-    // handler clears `message_theme_override` on every navigation, and
-    // `render_body` syncs this button from it, so the next message always
-    // opens with the override off. The idempotence guard up front makes the
-    // handler a no-op when state and button already agree - which is what
-    // happens when `render_body`'s sync flips the button off after a
-    // navigation, so that sync-driven `toggled` can't trigger a redundant
-    // re-render (or a loop). Re-rendering is skipped while a composer is up,
-    // the same as the "Load images" toggle - see `rerender_current_message`.
-    //
-    // Stripping the email's backgrounds alone is not enough: the WebView's
-    // own page canvas paints white behind the (now transparent) document,
-    // so the toggle also flips the canvas colour - transparent while armed
-    // (letting the reading card's theme background show through), white
-    // otherwise, matching WebKit's default so un-backgrounded emails look
-    // exactly as they did before the toggle existed.
+    // to it, not just the next selection. A per-email override: every
+    // navigation reset sets `message_theme_override` to the Config →
+    // Appearance "Dark message theme" default (see `set_message_theme_armed`
+    // for the physical side), and `render_body` syncs this button from it,
+    // so the next message always opens in the configured default rather than
+    // inheriting the previous message's manual override. The idempotence
+    // guard up front makes the handler a no-op when state and button already
+    // agree - which is what happens when `render_body`'s sync flips the
+    // button after a navigation, so that sync-driven `toggled` can't trigger
+    // a redundant re-render (or a loop). Re-rendering is skipped while a
+    // composer is up, the same as the "Load images" toggle - see
+    // `rerender_current_message`. Stripping the email's backgrounds alone is
+    // not enough: the WebView's own page canvas paints white behind the (now
+    // transparent) document, so the toggle also flips the canvas colour -
+    // transparent while armed (letting the reading card's theme background
+    // show through), white otherwise, matching WebKit's default so
+    // un-backgrounded emails look exactly as they did before the toggle
+    // existed.
     {
         let state = state.clone();
         let reading_stack = reading_stack.clone();
@@ -5750,13 +5776,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if button.is_active() == state.borrow().message_theme_override {
                 return;
             }
-            if button.is_active() {
-                user_content_manager.add_style_sheet(&theme_override_sheet);
-                web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
-            } else {
-                user_content_manager.remove_style_sheet(&theme_override_sheet);
-                web_view.set_background_color(&gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
-            }
+            set_message_theme_armed(button.is_active(), &web_view, &user_content_manager, &theme_override_sheet);
             state.borrow_mut().message_theme_override = button.is_active();
             rerender_current_message(&state, &reading_stack, &message_header, &message_list);
         });
@@ -5871,6 +5891,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_header = message_header.clone();
         let message_list_for_selection = message_list.clone();
         let mark_read_button = mark_read_button.clone();
+        let web_view = web_view.clone();
+        let user_content_manager = user_content_manager.clone();
+        let theme_override_sheet = theme_override_sheet.clone();
         message_list.selection.connect_selection_changed(move |_sel, _pos, _n_items| {
             refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
             let summary = match message_list_for_selection.selection_kind() {
@@ -5885,54 +5908,68 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     // both mean "the reading pane no longer shows a specific
                     // message." Leaving `rendered_message` set here would
                     // make a later re-selection of that same single message
-                    // look already-shown and skip re-rendering it.
-                    let mut st = state.borrow_mut();
-                    st.pending_body_request = None;
-                    st.pending_html_reveal = false;
-                    st.reveal_generation += 1;
-                    st.pending_header = None;
-                    st.pending_attachment = None;
-                    st.pending_raw_message = None;
-                    st.unsubscribe_info = None;
-                    st.unsubscribe_dismissed = None;
-                    st.imip = None;
-                    st.imip_dismissed = None;
-                    st.read_receipt_request = None;
-                    st.read_receipt_dismissed = None;
-                    st.read_receipt_context = None;
-                    st.rendered_trust_sender = None;
-                    st.load_once_images = false;
-                    st.message_theme_override = false;
-                    st.trust_banner_dismissed = None;
-                    st.rendered_message = None;
-                    drop(st);
+                    // look already-shown and skip re-rendering it. The
+                    // message-theme override resets to the configured default
+                    // (Config → Appearance → "Dark message theme") and its
+                    // physical sheet/canvas are re-armed to match.
+                    let default_dark = {
+                        let mut st = state.borrow_mut();
+                        st.pending_body_request = None;
+                        st.pending_html_reveal = false;
+                        st.reveal_generation += 1;
+                        st.pending_header = None;
+                        st.pending_attachment = None;
+                        st.pending_raw_message = None;
+                        st.unsubscribe_info = None;
+                        st.unsubscribe_dismissed = None;
+                        st.imip = None;
+                        st.imip_dismissed = None;
+                        st.read_receipt_request = None;
+                        st.read_receipt_dismissed = None;
+                        st.read_receipt_context = None;
+                        st.rendered_trust_sender = None;
+                        st.load_once_images = false;
+                        st.message_theme_override = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
+                        st.trust_banner_dismissed = None;
+                        st.rendered_message = None;
+                        st.message_theme_override
+                    };
                     drop_pending_cid(&state);
+                    set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
                     reading_multi_label.set_label(&format!("{} messages selected", summaries.len()));
                     reading_stack.set_visible_child_name("multi");
                     return;
                 }
                 SelectionKind::Empty => {
-                    let mut st = state.borrow_mut();
-                    st.pending_body_request = None;
-                    st.pending_html_reveal = false;
-                    st.reveal_generation += 1;
-                    st.pending_header = None;
-                    st.pending_attachment = None;
-                    st.pending_raw_message = None;
-                    st.unsubscribe_info = None;
-                    st.unsubscribe_dismissed = None;
-                    st.imip = None;
-                    st.imip_dismissed = None;
-                    st.read_receipt_request = None;
-                    st.read_receipt_dismissed = None;
-                    st.read_receipt_context = None;
-                    st.rendered_trust_sender = None;
-                    st.load_once_images = false;
-                    st.message_theme_override = false;
-                    st.trust_banner_dismissed = None;
-                    st.rendered_message = None;
-                    drop(st);
+                    // Nothing selected: show the "no message selected"
+                    // placeholder and drop every per-message state, including
+                    // the message-theme override (reset to the configured
+                    // default and its physical sheet/canvas re-armed to
+                    // match, so the next opened message starts clean).
+                    let default_dark = {
+                        let mut st = state.borrow_mut();
+                        st.pending_body_request = None;
+                        st.pending_html_reveal = false;
+                        st.reveal_generation += 1;
+                        st.pending_header = None;
+                        st.pending_attachment = None;
+                        st.pending_raw_message = None;
+                        st.unsubscribe_info = None;
+                        st.unsubscribe_dismissed = None;
+                        st.imip = None;
+                        st.imip_dismissed = None;
+                        st.read_receipt_request = None;
+                        st.read_receipt_dismissed = None;
+                        st.read_receipt_context = None;
+                        st.rendered_trust_sender = None;
+                        st.load_once_images = false;
+                        st.message_theme_override = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
+                        st.trust_banner_dismissed = None;
+                        st.rendered_message = None;
+                        st.message_theme_override
+                    };
                     drop_pending_cid(&state);
+                    set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
                     reading_stack.set_visible_child_name("empty");
                     return;
                 }
@@ -6009,6 +6046,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // pane, if one's open - no "discard draft?" prompt, consistent
             // with this app's existing no-confirmation-dialog convention.
             reading_stack.set_visible_child_name("empty");
+            // Every navigation resets the per-message override to the
+            // configured default (Config → Appearance → "Dark message
+            // theme"), so the next message opens in that default rather than
+            // inheriting the previous message's manual toggle - the physical
+            // sheet/canvas are re-armed to match before the new body renders
+            // (or while the pane sits on "empty" waiting for a fetch).
+            {
+                let mut st = state.borrow_mut();
+                let default_dark = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
+                st.message_theme_override = default_dark;
+                drop(st);
+                set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
+            }
             if body_is_cached {
                 let body = state.borrow_mut().body_cache.get(&mailbox, &uid);
                 if let Some(body) = body {
@@ -11853,6 +11903,29 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
     }
 }
 
+/// Arms or disarms the "Switch message theme" override's *physical* state on
+/// the reading pane's WebView: the user stylesheet that strips the message's
+/// backgrounds and inverts its colours, plus the canvas colour (transparent
+/// so the app theme shows through while armed, white otherwise, matching
+/// WebKit's default). Must be called whenever the logical per-message state
+/// (`UiState::message_theme_override`) changes, so the two never drift - the
+/// toggle handler, every navigation reset, and the close-pane reset all
+/// route through this.
+fn set_message_theme_armed(
+    enabled: bool,
+    web_view: &webkit::WebView,
+    user_content_manager: &webkit::UserContentManager,
+    theme_override_sheet: &webkit::UserStyleSheet,
+) {
+    if enabled {
+        user_content_manager.add_style_sheet(theme_override_sheet);
+        web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+    } else {
+        user_content_manager.remove_style_sheet(theme_override_sheet);
+        web_view.set_background_color(&gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
+    }
+}
+
 /// Re-renders the message currently selected in the message list onto the
 /// reading pane, routing through "empty" first so `render_body`'s
 /// already-shown guard doesn't treat the reload of the same message as a
@@ -12036,10 +12109,12 @@ fn render_body(
         }
     }
     // Sync the "Switch message theme" toggle with its per-email state: the
-    // selection handler clears `message_theme_override` on every navigation,
-    // so this flips the header button back off for the next message. A
-    // no-op `set_active` (same value) emits no `toggled` signal, so this
-    // can't feed back into the toggle's handler or its re-render.
+    // selection handler resets `message_theme_override` to the configured
+    // default on every navigation (with the physical sheet/canvas already
+    // re-armed to match), so this flips the header button accordingly for
+    // the next message. A no-op `set_active` (same value) emits no `toggled`
+    // signal, so this can't feed back into the toggle's handler or its
+    // re-render.
     message_header.theme_button.set_active(state.borrow().message_theme_override);
     // Rebuild the attachment strip from the body's part list; the body is
     // available regardless of which text path (html/text/none) renders below.

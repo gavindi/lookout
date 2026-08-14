@@ -2,13 +2,18 @@
 
 A native GNOME mail client written in Rust, built on GTK 4, libadwaita, and WebKitGTK. Lookout is a reimplementation of Microsoft Outlook as a desktop application, talking to your mail directly over IMAP/SMTP (plus CalDAV for calendars and CardDAV for contacts), with accounts sourced from **GNOME Online Accounts**.
 
+For the marketing story and a feature walkthrough, see [MARKETING.md](MARKETING.md).
+
 ## Features
 
-- **Mail** — multi-account IMAP sync with IDLE live updates, folder tree with per-role icons, message list, and an HTML/plain-text reading pane rendered in a sandboxed WebKit view.
-- **Compose** — new/reply/reply-all/forward with correct threading headers, sent via SMTP (XOAUTH2 or password) and copied into your Sent mailbox.
-- **Mail actions** — delete (move-to-Trash), archive, report-as-junk, and client-side snooze, all backed by real IMAP MOVE/COPY+EXPUNGE.
-- **Calendar** — a CalDAV-backed Outlook-style calendar: month/week/day/agenda views, mini-calendar sidebar, event create/edit with recurrence and invites, drag-to-reschedule, tasks (VTODO), iMIP invitations from the mail viewer, `.ics` import and webcal subscriptions, a synthesized birthday calendar, and event alerts.
-- **Config** — an in-window settings view: connected Mail/Calendar/Contacts accounts and endpoints, appearance (theming + accent color), Mail switches, keyboard shortcuts, and cache management.
+- **Mail** — multi-account IMAP sync with IDLE live updates, folder tree with per-role icons and Favorites, collapsible conversations, message list, and an HTML/plain-text reading pane rendered in a sandboxed WebKit view. Full-text search across every account from a local SQLite FTS5 index, per-message color tags, print, list-unsubscribe, and read receipts.
+- **Compose** — new/reply/reply-all/forward with correct threading headers, rich HTML editing with inline images and attachments, recipient chips with address-book autocomplete, multiple identities, draft autosave, and a pop-out window. Sent via SMTP (XOAUTH2 or password) and copied into your Sent mailbox.
+- **Mail actions** — delete (move-to-Trash), archive, report-as-junk, flag, mark read/unread, snooze, and batch actions on multi-selection, all backed by real IMAP MOVE/COPY+EXPUNGE. Drag messages onto folders or tags, or out of the window as `.eml` files.
+- **Calendar** — a CalDAV-backed Outlook-style calendar: month/week/day/agenda/split views, mini-calendar sidebar, event create/edit with recurrence (editable per occurrence) and attendee invites, drag-to-reschedule, iMIP invitations from the mail viewer, `.ics` import and webcal subscriptions, a synthesized birthday calendar, and event alerts.
+- **People** — CardDAV contacts with full create/edit/delete, groups, favorites, per-account buckets, a Deleted list, and `.vcf` import/export; autocomplete across the composer, invites, and the People tab.
+- **Tasks** — CalDAV to-dos (plus Google Tasks) grouped by Overdue / Today / This week / Later / Completed, with a full editor for due dates, priorities, and notes.
+- **Lookout dashboard** — most-contacted people, email volume by time of day, outstanding tasks, and upcoming events, live from your local caches.
+- **Config** — an in-window settings view: connected Mail/Calendar/Contacts accounts and endpoints, appearance (System / Flat Dark / Flat Light themes + accent color + window background), Mail switches, remappable keyboard shortcuts, trusted senders, and cache management.
 - Built around `GNOME Online Accounts` — add an account in system settings and it just shows up, no credential handling in Lookout itself.
 
 See [TODO.md](TODO.md) for the full, completed Phases 1–5 breakdown.
@@ -31,6 +36,7 @@ See [TODO.md](TODO.md) for the full, completed Phases 1–5 breakdown.
 │   ├── flatpak/              # Flatpak manifest (built by CI)
 │   └── snapcraft.yaml        # Snap packaging manifest
 ├── build.sh                  # Builds the Rust workspace (optionally packages a .deb)
+├── MARKETING.md              # Marketing copy and feature walkthrough
 └── CHANGELOG.md              # Version history
 ```
 

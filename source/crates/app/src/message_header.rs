@@ -33,9 +33,10 @@ pub struct MessageHeader {
     /// The "Switch message theme" toggle: when active, the message body's
     /// own background colour is removed - and its colours inverted - so the
     /// content reads against the app theme's background instead. A per-email
-    /// override - the selection handler clears the backing `UiState` flag on
-    /// every navigation and `render_body` syncs this button back off for the
-    /// next message.
+    /// override - the selection handler resets the backing `UiState` flag to
+    /// the Config → Appearance "Dark message theme" default on every
+    /// navigation and `render_body` syncs this button from it, so the next
+    /// message opens in that default.
     pub theme_button: gtk::ToggleButton,
 }
 

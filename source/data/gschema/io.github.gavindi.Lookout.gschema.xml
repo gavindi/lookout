@@ -117,6 +117,11 @@
       <default>true</default>
       <summary>Start new messages in the formatted editor</summary>
     </key>
+    <key name="mail-message-theme-dark" type="b">
+      <default>false</default>
+      <summary>Open HTML messages in dark mode</summary>
+      <description>When on, newly-opened HTML messages show with their own background removed and colours inverted instead of in their original light form. The reading pane's per-message "Switch message theme" toggle overrides this for the current message either way.</description>
+    </key>
     <key name="mail-send-read-receipts" type="b">
       <default>false</default>
       <summary>Send read receipts automatically</summary>

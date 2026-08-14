@@ -51,6 +51,12 @@ pub const MAIL_THREADED: &str = "mail-threaded";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
+/// Config → Appearance → "Dark message theme": whether newly-opened HTML
+/// messages start with the reading pane's "Switch message theme" override
+/// already on - background stripped, colours inverted - instead of in their
+/// original light form. A default for new messages only; the per-email
+/// toggle in the header still overrides the current message either way.
+pub const MAIL_MESSAGE_THEME_DARK: &str = "mail-message-theme-dark";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
 pub const MAIL_NOTIFICATIONS_ENABLED: &str = "mail-notifications-enabled";
 pub const SHORTCUTS: &str = "shortcuts";
@@ -136,6 +142,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
+    map.insert(MAIL_MESSAGE_THEME_DARK, Value::Bool(false));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(MAIL_NOTIFICATIONS_ENABLED, Value::Bool(true));
     map.insert(SHORTCUTS, Value::Strv(Vec::new()));
