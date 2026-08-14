@@ -214,6 +214,50 @@ const MAX_TAG_DOTS: usize = 3;
 /// attachments over slow connections legitimately take a while.
 const ATTACHMENT_FETCH_TIMEOUT_MS: u64 = 60_000;
 
+/// The "Switch message theme" toggle's stylesheet, injected as a WebKit
+/// *user* style sheet into the reading pane's WebView: it strips whatever
+/// background colour the email itself defines so the app theme's background
+/// shows through instead, and inverts the document's colours so the content
+/// still reads against that (mostly darker) theme background. `html`/`body`
+/// covers the page background proper (inline styles, `<style>` blocks, or
+/// `<body bgcolor>`), while the attribute selectors catch the legacy
+/// `bgcolor`/`background` attributes Outlook-style clients plaster onto
+/// wrapper tables and cells - the common full-bleed case that an
+/// `html, body` override alone would miss. Deliberate backgrounds on content
+/// (code blocks, quoted sections) are left alone. The `!important` is what
+/// wins: user-level `!important` outranks both author `!important` and
+/// inline styles in the cascade, so no email CSS can fight the override.
+/// Injected at the user level so it applies to the already loaded document
+/// the moment the toggle flips (plus a re-render, see the toggle's handler),
+/// and applies to every `load_html` while it's armed.
+///
+/// The inversion is the standard reader-mode trick: `filter: invert()`
+/// flips the whole document (dark text becomes light, coloured headings and
+/// links keep a readable hue via the compensating `hue-rotate`), then media
+/// elements are inverted a second time so photos and inline graphics render
+/// as themselves instead of negatives. Because the email's own backgrounds
+/// are gone above, only the text and any remaining accent colours invert -
+/// against the app theme's background, which is untouched by the page's
+/// filter.
+const MESSAGE_THEME_OVERRIDE_CSS: &str = "\
+html, body {
+    background-color: transparent !important;
+    background-image: none !important;
+}
+*[bgcolor] {
+    background-color: transparent !important;
+}
+*[background] {
+    background-image: none !important;
+}
+html {
+    filter: invert(1) hue-rotate(180deg);
+}
+html img, html picture, html video, html svg, html canvas {
+    filter: invert(1) hue-rotate(180deg);
+}
+";
+
 /// Which of an attachment row's actions a `PendingAttachment` fetch was for -
 /// decides what happens to the bytes once `AccountEvent::PartFetched` lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +629,15 @@ pub(crate) struct UiState {
     /// message currently on the reading pane - the external-content banner's
     /// transient action. Cleared on every navigation.
     load_once_images: bool,
+    /// The header's "Switch message theme" toggle for the message currently
+    /// on the reading pane: when true, the message body's own background
+    /// colour is stripped and its colours inverted (see
+    /// `MESSAGE_THEME_OVERRIDE_CSS`) so the app theme's background shows
+    /// through with the content still readable against it. A per-email
+    /// override - cleared on every navigation like `load_once_images`, and
+    /// `render_body` syncs the header button from it so the next message
+    /// opens with the override off.
+    message_theme_override: bool,
     /// The `(mailbox, uid)` of the message whose external-content banner the
     /// user acted on (trusted the sender or loaded once); while that message
     /// stays on screen the banner must not come back. Cleared on every
@@ -1567,6 +1620,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         trusted_senders,
         rendered_trust_sender: None,
         load_once_images: false,
+        message_theme_override: false,
         trust_banner_dismissed: None,
         draft_saved_tx: None,
         composer_identities_refresh: None,
@@ -2638,7 +2692,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let webkit_settings = webkit::Settings::new();
     webkit_settings.set_enable_javascript(false);
     webkit_settings.set_enable_developer_extras(false);
-    let web_view = webkit::WebView::builder().settings(&webkit_settings).hexpand(true).vexpand(true).build();
+    // The "Switch message theme" toggle lives on the user content manager:
+    // its override stylesheet is added/removed there so WebKit re-applies the
+    // style to the document already on screen the moment the toggle flips
+    // (the toggle handler also re-renders, see below). Built here, empty, so
+    // the toggle's closure can arm it later.
+    let user_content_manager = webkit::UserContentManager::new();
+    let theme_override_sheet = webkit::UserStyleSheet::new(
+        MESSAGE_THEME_OVERRIDE_CSS,
+        webkit::UserContentInjectedFrames::TopFrame,
+        webkit::UserStyleLevel::User,
+        &[],
+        &[],
+    );
+    let web_view = webkit::WebView::builder()
+        .settings(&webkit_settings)
+        .user_content_manager(&user_content_manager)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
     // Inline `cid:` image resolution: register a custom URI scheme so WebKit
     // asks us for the bytes behind `<img src="cid:...">` references instead
     // of failing the load. The handler callback fires on a WebKit worker
@@ -5222,6 +5294,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 st.read_receipt_context = None;
                 st.rendered_trust_sender = None;
                 st.load_once_images = false;
+                st.message_theme_override = false;
                 st.trust_banner_dismissed = None;
                 st.rendered_message = None;
                 drop(st);
@@ -5634,6 +5707,48 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // --- "Switch message theme" toggle: arms/removes the background-stripping
+    // user stylesheet and re-renders the open message so the override applies
+    // to it, not just the next selection. A per-email override: the selection
+    // handler clears `message_theme_override` on every navigation, and
+    // `render_body` syncs this button from it, so the next message always
+    // opens with the override off. The idempotence guard up front makes the
+    // handler a no-op when state and button already agree - which is what
+    // happens when `render_body`'s sync flips the button off after a
+    // navigation, so that sync-driven `toggled` can't trigger a redundant
+    // re-render (or a loop). Re-rendering is skipped while a composer is up,
+    // the same as the "Load images" toggle - see `rerender_current_message`.
+    //
+    // Stripping the email's backgrounds alone is not enough: the WebView's
+    // own page canvas paints white behind the (now transparent) document,
+    // so the toggle also flips the canvas colour - transparent while armed
+    // (letting the reading card's theme background show through), white
+    // otherwise, matching WebKit's default so un-backgrounded emails look
+    // exactly as they did before the toggle existed.
+    {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        let message_header = message_header.clone();
+        let message_list = message_list.clone();
+        let web_view = web_view.clone();
+        let user_content_manager = user_content_manager.clone();
+        let theme_override_sheet = theme_override_sheet.clone();
+        message_header.theme_button.clone().connect_toggled(move |button| {
+            if button.is_active() == state.borrow().message_theme_override {
+                return;
+            }
+            if button.is_active() {
+                user_content_manager.add_style_sheet(&theme_override_sheet);
+                web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+            } else {
+                user_content_manager.remove_style_sheet(&theme_override_sheet);
+                web_view.set_background_color(&gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
+            }
+            state.borrow_mut().message_theme_override = button.is_active();
+            rerender_current_message(&state, &reading_stack, &message_header, &message_list);
+        });
+    }
+
     // --- Debug: open a raw .eml fixture straight into the reading pane ---
     #[cfg(debug_assertions)]
     {
@@ -5774,6 +5889,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.read_receipt_context = None;
                     st.rendered_trust_sender = None;
                     st.load_once_images = false;
+                    st.message_theme_override = false;
                     st.trust_banner_dismissed = None;
                     st.rendered_message = None;
                     drop(st);
@@ -5799,6 +5915,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.read_receipt_context = None;
                     st.rendered_trust_sender = None;
                     st.load_once_images = false;
+                    st.message_theme_override = false;
                     st.trust_banner_dismissed = None;
                     st.rendered_message = None;
                     drop(st);
@@ -11905,6 +12022,12 @@ fn render_body(
             st.rendered_trust_sender = None;
         }
     }
+    // Sync the "Switch message theme" toggle with its per-email state: the
+    // selection handler clears `message_theme_override` on every navigation,
+    // so this flips the header button back off for the next message. A
+    // no-op `set_active` (same value) emits no `toggled` signal, so this
+    // can't feed back into the toggle's handler or its re-render.
+    message_header.theme_button.set_active(state.borrow().message_theme_override);
     // Rebuild the attachment strip from the body's part list; the body is
     // available regardless of which text path (html/text/none) renders below.
     rebuild_attachment_strip(state, reading_stack, &mailbox, uid, &body.parts);
@@ -12676,6 +12799,7 @@ mod tests {
             trusted_senders: HashMap::new(),
             rendered_trust_sender: None,
             load_once_images: false,
+            message_theme_override: false,
             trust_banner_dismissed: None,
             draft_saved_tx: None,
             composer_identities_refresh: None,

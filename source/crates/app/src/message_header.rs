@@ -6,14 +6,14 @@ pub const AVATAR_COLOR_CLASSES: [&str; 6] = ["avatar-color-0", "avatar-color-1",
 /// Reading-pane header: a full-bleed subject strip (`subject_bar`), the
 /// sender/action block (`widget`) - avatar, `Name<address>`, a flat labelled
 /// Reply/Reply All/Forward cluster (duplicating the top command toolbar's, by
-/// design - see the plan this shipped under) plus disabled placeholders for
-/// theme/contact/overflow, and a `To:`+date row - and a bottom action bar
-/// (`action_bar`) with its own Reply/Forward repeated below the body. The
-/// caller packs all three separately into the reading pane's stack page.
-/// Content is set via `update()` from whatever `EmailSummary` is selected -
-/// deliberately not from the (slower, async) `EmailBody` fetch, so the header
-/// appears the instant a message is selected rather than waiting on the body
-/// to load.
+/// design - see the plan this shipped under), the live "Switch message theme"
+/// toggle, and disabled placeholders for contact/overflow - and a `To:`+date
+/// row - and a bottom action bar (`action_bar`) with its own Reply/Forward
+/// repeated below the body. The caller packs all three separately into the
+/// reading pane's stack page. Content is set via `update()` from whatever
+/// `EmailSummary` is selected - deliberately not from the (slower, async)
+/// `EmailBody` fetch, so the header appears the instant a message is selected
+/// rather than waiting on the body to load.
 #[derive(Clone)]
 pub struct MessageHeader {
     pub subject_bar: gtk::Box,
@@ -30,6 +30,13 @@ pub struct MessageHeader {
     pub forward_button: gtk::Button,
     pub bottom_reply_button: gtk::Button,
     pub bottom_forward_button: gtk::Button,
+    /// The "Switch message theme" toggle: when active, the message body's
+    /// own background colour is removed - and its colours inverted - so the
+    /// content reads against the app theme's background instead. A per-email
+    /// override - the selection handler clears the backing `UiState` flag on
+    /// every navigation and `render_body` syncs this button back off for the
+    /// next message.
+    pub theme_button: gtk::ToggleButton,
 }
 
 /// A flat button with an icon + text label, via `adw::ButtonContent` - used
@@ -87,10 +94,11 @@ pub fn build() -> MessageHeader {
     let forward_button = action_button("mail-forward-symbolic", "Forward");
     forward_button.set_tooltip_text(Some("Forward"));
 
-    let theme_button = placeholder_button(
-        crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic", "night-light-symbolic"]),
-        "Switch message theme (coming soon)",
-    );
+    let theme_button = gtk::ToggleButton::builder()
+        .icon_name(crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic", "night-light-symbolic"]))
+        .css_classes(["flat"])
+        .tooltip_text("Switch message theme")
+        .build();
     let contact_button = placeholder_button(
         crate::window::themed_icon_name(&["avatar-default-symbolic", "contact-new-symbolic", "system-users-symbolic"]),
         "View contact (coming soon)",
@@ -154,6 +162,7 @@ pub fn build() -> MessageHeader {
         forward_button,
         bottom_reply_button,
         bottom_forward_button,
+        theme_button,
     }
 }
 
