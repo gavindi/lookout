@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.47 (2026-08-16)
+
+### Added
+
+- **Mail**: the command toolbar gains a flag-icon **Add as Task** button (distinct from the existing "Flag/Unflag" star toggle, which is unchanged) for the message selected in the list. Clicking it opens the task editor prefilled from that email: the Summary is the email's subject (falling back to "(no subject)"), and since a task has no url/link field, the Notes carry a "From: `<sender>` — `<date>`" line as the human-readable way back to the source message. The calendar/list picker defaults to the email's own account's task-capable CalDAV calendar or Google Tasks list when it has one, otherwise the same fallback order **New Task** already uses, and finally "Local (this device)" when no connected account supports tasks at all - the dialog is always editable before saving, same as every other create flow. No-op with nothing selected or a multi-selection. The button's own icon tracks state: an outline flag normally, switching to a filled flag whenever the selected message already has an associated task - detected via a hidden `Lookout-Message-Id:` marker line appended to the task's Notes, the only field that survives round-tripping through every backend (CalDAV, Google Tasks, and the local store), and re-checked live on selection change as well as whenever tasks are created, synced, or removed. Under the hood, `TaskEditorPrefill` gained a `prefill` seed field mirroring `ContactEditorPrefill::prefill`, so a create form can open pre-populated without being treated as an edit.
+
 ## 0.9.46 (2026-08-15)
 
 ### Added

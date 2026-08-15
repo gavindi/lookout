@@ -20,6 +20,11 @@ pub struct TaskEditorPrefill<'a> {
     /// The task being edited; `None` opens the blank "new task" form. While
     /// set, the calendar picker is locked to the task's own calendar.
     pub existing: Option<&'a CalendarTask>,
+    /// Field values to seed a *create* form with (e.g. the mail toolbar's
+    /// "Add as Task" button, prefilling summary/notes from the selected
+    /// email). Ignored when `existing` is set - an edit always starts from
+    /// the real task, never a caller-supplied seed.
+    pub prefill: Option<&'a CalendarTask>,
 }
 
 /// The delete callback's target: the calendar plus the task's identity and
@@ -43,6 +48,7 @@ pub fn show_task_editor(
 
     let existing: Option<CalendarTask> = prefill.existing.cloned();
     let has_existing = existing.is_some();
+    let seed: Option<CalendarTask> = existing.clone().or_else(|| prefill.prefill.cloned());
 
     let dialog = adw::Window::builder()
         .transient_for(window)
@@ -121,12 +127,12 @@ pub fn show_task_editor(
     let default_due = (Local::now() + Duration::days(1))
         .date_naive()
         .and_time(NaiveTime::from_hms_opt(9, 0, 0).unwrap_or(NaiveTime::MIN));
-    let initial_due: Option<NaiveDateTime> = existing.as_ref().and_then(|t| t.due.map(|d| d.with_timezone(&Local).naive_local())).or(Some(default_due));
+    let initial_due: Option<NaiveDateTime> = seed.as_ref().and_then(|t| t.due.map(|d| d.with_timezone(&Local).naive_local())).or(Some(default_due));
     let initial_due = initial_due.unwrap_or(default_due);
     set_calendar_date(&due_calendar, &due_date, initial_due.date());
     due_hour.set_value(f64::from(initial_due.hour()));
     due_minute.set_value(f64::from(initial_due.minute()));
-    due_switch_row.set_active(existing.as_ref().is_some_and(|t| t.due.is_some()));
+    due_switch_row.set_active(seed.as_ref().is_some_and(|t| t.due.is_some()));
 
     let due_date_label = gtk::Label::new(Some(&format!("{}", initial_due.date().format("%a, %b %-d"))));
     let due_popover = gtk::Popover::builder().child(&due_calendar).build();
@@ -166,7 +172,7 @@ pub fn show_task_editor(
     let priority_choices: &[(&str, u8)] = &[("None", 0), ("High", 1), ("Medium", 5), ("Low", 9)];
     let priority_model = gtk::StringList::new(&priority_choices.iter().map(|(label, _)| *label).collect::<Vec<_>>());
     let priority_dropdown = gtk::DropDown::builder().model(&priority_model).valign(gtk::Align::Center).build();
-    let existing_priority = existing.as_ref().map(|t| t.priority.0).unwrap_or(0);
+    let existing_priority = seed.as_ref().map(|t| t.priority.0).unwrap_or(0);
     let priority_index = priority_choices.iter().position(|(_, raw)| *raw == existing_priority).unwrap_or(0) as u32;
     priority_dropdown.set_selected(priority_index);
     let priority_row = adw::ActionRow::builder().title("Priority").build();
@@ -175,7 +181,7 @@ pub fn show_task_editor(
     let percent_spin = gtk::SpinButton::with_range(0.0, 100.0, 5.0);
     percent_spin.set_digits(0);
     percent_spin.set_width_chars(4);
-    percent_spin.set_value(f64::from(existing.as_ref().and_then(|t| t.percent_complete).unwrap_or(0)));
+    percent_spin.set_value(f64::from(seed.as_ref().and_then(|t| t.percent_complete).unwrap_or(0)));
     let percent_row = adw::ActionRow::builder().title("% complete").build();
     percent_row.add_suffix(&percent_spin);
 
@@ -230,8 +236,9 @@ pub fn show_task_editor(
     toolbar_view.set_content(Some(&form_scroller));
     dialog.set_content(Some(&toolbar_view));
 
-    // --- Prefill the text fields from the edited task.
-    if let Some(task) = &existing {
+    // --- Prefill the text fields from the edited task, or a caller-supplied
+    // create seed.
+    if let Some(task) = &seed {
         summary_row.set_text(task.summary.as_deref().unwrap_or(""));
         if let Some(description) = &task.description {
             notes_view.buffer().set_text(description);

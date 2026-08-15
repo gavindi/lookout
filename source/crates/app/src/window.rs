@@ -8,7 +8,7 @@ use chrono::{Datelike, Timelike};
 use gtk::{gio, glib};
 use lookout_core::{
     AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody, EmailSummary,
-    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskUid, Uid, VCard, WebcalSubscription, display_name,
+    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, VCard, WebcalSubscription, display_name,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
@@ -919,6 +919,12 @@ struct CalendarUiState {
     /// loops call it so the dashboard stays live; `None` until then (a
     /// no-op, never an error).
     dashboard_refresh: Option<Rc<dyn Fn()>>,
+    /// The mail toolbar's "Add as Task" flag button's own repaint hook,
+    /// registered by the window once `calendar_state` exists - same pattern
+    /// as `dashboard_refresh`. `refresh_tasks_view` calls it so the button's
+    /// filled/outline icon stays in sync with whichever message is selected
+    /// as tasks are created, synced, or removed; `None` until then.
+    task_button_refresh: Option<Rc<dyn Fn()>>,
     /// Occurrences with a drag-reschedule in flight, keyed by `(uid,
     /// recurrence_id)`, holding the occurrence with its new `start`/`end`
     /// already applied. Reapplied onto every `refresh_displayed_calendar_view`
@@ -3459,6 +3465,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     report_button.set_tooltip_text(Some("Report"));
     let flag_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
     flag_button.set_tooltip_text(Some("Flag/Unflag"));
+    // Add as Task: opens the task editor prefilled from the selected
+    // message (subject as title, sender/date in Notes - `CalendarTask` has
+    // no url field). Distinct from Flag/Unflag above, which only toggles the
+    // IMAP `\Flagged` bit. Its icon starts outline and is kept in sync with
+    // whether the selected message already has an associated task by
+    // `refresh_task_button`, registered once `calendar_state` exists below.
+    let task_button = gtk::Button::from_icon_name(themed_icon_name(&["flag-outline-thin-symbolic", "flag-outline-symbolic", "mail-mark-important-symbolic"]));
+    task_button.set_tooltip_text(Some("Follow-up"));
     // Mark read/unread: no explicit toolbar action for this existed before -
     // only the implicit mark-as-read that opening a message already does.
     // Same aggregate-direction policy as Flag/Unflag: any unread message in
@@ -3517,6 +3531,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&archive_button);
     command_toolbar.append(&report_button);
     command_toolbar.append(&flag_button);
+    command_toolbar.append(&task_button);
     command_toolbar.append(&mark_read_button);
     command_toolbar.append(&categorize_button);
     command_toolbar.append(&snooze_button);
@@ -4569,6 +4584,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         local_tasks,
         local_tasks_db,
         dashboard_refresh: None,
+        task_button_refresh: None,
         pending_calendar_moves: HashMap::new(),
     }));
 
@@ -4584,6 +4600,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         Rc::new(move || refresh_lookout_view(&state, &calendar_state, &lookout_view))
     };
     calendar_state.borrow_mut().dashboard_refresh = Some(dashboard_refresh.clone());
+
+    // --- "Add as Task" flag button's own repaint hook, same registration
+    // pattern as `dashboard_refresh` just above - `refresh_tasks_view` calls
+    // it so the button's icon tracks whether the *currently selected*
+    // message already has an associated task, even when that task was just
+    // created, synced in from the server, or removed.
+    let task_button_refresh: Rc<dyn Fn()> = {
+        let task_button = task_button.clone();
+        let message_list = message_list.clone();
+        let calendar_state = calendar_state.clone();
+        Rc::new(move || refresh_task_button(&task_button, &message_list, &calendar_state))
+    };
+    calendar_state.borrow_mut().task_button_refresh = Some(task_button_refresh.clone());
+    task_button_refresh();
 
     // --- Calendar event reminders. The engine accumulates every occurrence
     // the sessions report (via `connect_calendar_account`'s ingest) and the
@@ -5917,11 +5947,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_header = message_header.clone();
         let message_list_for_selection = message_list.clone();
         let mark_read_button = mark_read_button.clone();
+        let task_button = task_button.clone();
+        let calendar_state = calendar_state.clone();
         let web_view = web_view.clone();
         let user_content_manager = user_content_manager.clone();
         let theme_override_sheet = theme_override_sheet.clone();
         message_list.selection.connect_selection_changed(move |_sel, _pos, _n_items| {
             refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
+            refresh_task_button(&task_button, &message_list_for_selection, &calendar_state);
             let summary = match message_list_for_selection.selection_kind() {
                 SelectionKind::Message(summary) => *summary,
                 // A date section header - unreachable via the mouse (headers
@@ -6145,6 +6178,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     remove: remove.clone(),
                 });
             }
+        });
+    }
+    // --- Add as Task: opens the task editor prefilled from the selected
+    // message's subject (title) and sender/date (Notes - `CalendarTask` has
+    // no url/link field, so this is the only way back to the source email),
+    // defaulting the calendar/list picker to the email's own account when it
+    // has a task-capable one. Silent no-op with nothing selected or a
+    // multi-selection - `selected_summary()` is `None` for both, same
+    // convention as the reading pane's "View contact" button.
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        let message_list = message_list.clone();
+        task_button.connect_clicked(move |_| {
+            let Some(summary) = message_list.selected_summary() else { return };
+            let account_id = mailbox_account_id(&summary.mailbox);
+            let account_email = account_id.as_ref().and_then(|id| state.borrow().accounts.get(id).map(|h| h.email.clone()));
+            show_create_task_for_email(&window, &calendar_state, &tasks_view, &summary, account_id, account_email);
         });
     }
     {
@@ -8260,6 +8313,31 @@ fn default_pickable_task_calendar(calendar_state: &Rc<RefCell<CalendarUiState>>)
         .find_map(|handle| handle.task_lists.first().map(|l| google_tasks::google_task_calendar_id(&l.id)))
 }
 
+/// The "Add as Task" mail toolbar button's default target: the preferred
+/// account's own first task-capable CalDAV calendar (looked up by
+/// `AccountId`, the id space `CalendarUiState::accounts` shares with a
+/// GOA-connected mail account) or Google Tasks list (looked up by email,
+/// the id `CalendarUiState::google_tasks` is keyed by since a Google Tasks
+/// connection isn't necessarily tied to a GOA calendar account) - so a task
+/// created from an email defaults into that email's own account rather than
+/// an arbitrary one. Falls back to `default_pickable_task_calendar`'s
+/// ordering, then finally the local on-device list.
+fn default_task_calendar_preferring(calendar_state: &Rc<RefCell<CalendarUiState>>, preferred_account: Option<&AccountId>, preferred_email: Option<&str>) -> CalendarId {
+    let st = calendar_state.borrow();
+    if let Some(preferred_account) = preferred_account {
+        if let Some(calendar) = st.accounts.get(preferred_account).and_then(|h| h.calendars.iter().find(|c| c.supports_tasks)) {
+            return calendar.id.clone();
+        }
+    }
+    if let Some(preferred_email) = preferred_email {
+        if let Some(list) = st.google_tasks.get(preferred_email).and_then(|h| h.task_lists.first()) {
+            return google_tasks::google_task_calendar_id(&list.id);
+        }
+    }
+    drop(st);
+    default_pickable_task_calendar(calendar_state).unwrap_or_else(local_tasks_calendar_id)
+}
+
 /// The editor's default calendar for a new event: the first checked calendar
 /// (the one whose events are actually on screen), or any calendar if nothing
 /// is checked.
@@ -8580,8 +8658,10 @@ fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view:
     crate::tasks_view::set_tasks(tasks_view, &tasks, &colors);
     // Every task change funnels through here (CalDAV and Google Tasks
     // `TasksUpdated` events, local saves, checkbox flips), so this is the
-    // single point that keeps the Lookout dashboard's task section live.
+    // single point that keeps the Lookout dashboard's task section, and the
+    // mail toolbar's "Add as Task" flag button's icon, live.
     refresh_dashboard_hook(calendar_state);
+    refresh_task_button_hook(calendar_state);
 }
 
 /// Runs the Lookout dashboard's repaint hook if the window has registered
@@ -8589,6 +8669,16 @@ fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view:
 /// error.
 fn refresh_dashboard_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
     let hook = calendar_state.borrow().dashboard_refresh.clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Runs the mail toolbar's "Add as Task" flag button's repaint hook if the
+/// window has registered one - same no-op-until-wired convention as
+/// `refresh_dashboard_hook`.
+fn refresh_task_button_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
+    let hook = calendar_state.borrow().task_button_refresh.clone();
     if let Some(hook) = hook {
         hook();
     }
@@ -8713,6 +8803,113 @@ fn show_new_task_editor(window: &adw::ApplicationWindow, calendar_state: &Rc<Ref
             calendars: &calendars,
             default_calendar,
             existing: None,
+            prefill: None,
+        },
+        move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
+        move |_calendar_id, _uid, _href, _etag| {},
+    );
+}
+
+/// The hidden marker line appended to an "Add as Task" task's Notes so
+/// `email_has_task` can later recognize which email spawned it - the only
+/// channel that reliably round-trips through every task backend (CalDAV's
+/// `DESCRIPTION` and Google Tasks' `notes` both preserve free text as-is,
+/// but Google Tasks drops `categories` entirely - see `task_to_write` - so a
+/// tag stored there wouldn't survive a Google Tasks round trip).
+fn task_email_marker(message_id: &str) -> String {
+    format!("Lookout-Message-Id: {message_id}")
+}
+
+/// Whether any known task (local, CalDAV, or Google Tasks) was created from
+/// the email carrying `message_id` - drives the "Add as Task" flag button's
+/// filled/outline icon.
+fn email_has_task(calendar_state: &Rc<RefCell<CalendarUiState>>, message_id: &str) -> bool {
+    let marker = task_email_marker(message_id);
+    merged_tasks(calendar_state).iter().any(|task| task.description.as_deref().is_some_and(|d| d.contains(&marker)))
+}
+
+/// Sets the mail toolbar's "Add as Task" flag button's icon to reflect
+/// whether the currently selected message already has an associated task -
+/// filled/solid when `email_has_task` finds one, outline otherwise
+/// (including when nothing, or more than one message, is selected, since
+/// `selected_summary()` is `None` for both). Mirrors
+/// `refresh_mark_read_button`'s icon-swap convention.
+fn refresh_task_button(button: &gtk::Button, message_list: &MessageListModel, calendar_state: &Rc<RefCell<CalendarUiState>>) {
+    let has_task = message_list
+        .selected_summary()
+        .and_then(|summary| summary.message_id)
+        .is_some_and(|message_id| email_has_task(calendar_state, &message_id));
+    let icon = if has_task {
+        themed_icon_name(&["mail-flag-symbolic", "flag-filled-symbolic", "mail-mark-important-symbolic"])
+    } else {
+        themed_icon_name(&["flag-outline-thin-symbolic", "flag-outline-symbolic", "mail-mark-important-symbolic"])
+    };
+    button.set_icon_name(icon);
+}
+
+/// Opens the task editor's create form seeded from a mail message - the mail
+/// toolbar's "Add as Task" button. The title is the email's subject
+/// (falling back to "(no subject)"); since `CalendarTask` has no url/link
+/// field, the Notes field carries a "From: <sender> — <date>" line as the
+/// only way back to the source email. The calendar/list picker defaults to
+/// `preferred_account`'s own task-capable calendar or Google Tasks list when
+/// it has one, else the same fallback order `show_new_task_editor` uses,
+/// else "Local (this device)".
+fn show_create_task_for_email(
+    window: &adw::ApplicationWindow,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+    summary: &EmailSummary,
+    preferred_account: Option<AccountId>,
+    preferred_email: Option<String>,
+) {
+    let mut calendars = pickable_task_calendars(calendar_state);
+    if calendars.is_empty() {
+        calendars.push(("Local (this device)".to_string(), local_tasks_calendar_id()));
+    }
+    let default_calendar = default_task_calendar_preferring(calendar_state, preferred_account.as_ref(), preferred_email.as_deref());
+
+    let title = summary.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("(no subject)").to_string();
+    let sender_label = summary
+        .from
+        .first()
+        .map(|addr| addr.name.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or(&addr.address).to_string())
+        .unwrap_or_else(|| "unknown sender".to_string());
+    let mut description = format!("From: {sender_label} — {}", summary.date.with_timezone(&chrono::Local).format("%a, %b %-d, %Y at %-I:%M %p"));
+    // A hidden marker line so `email_has_task` can later recognize this task
+    // as belonging to this email, driving the flag button's filled icon -
+    // skipped when the message carries no Message-ID (rare, but then there's
+    // nothing stable to match against).
+    if let Some(message_id) = &summary.message_id {
+        description.push_str("\n\n");
+        description.push_str(&task_email_marker(message_id));
+    }
+
+    let seed = CalendarTask {
+        uid: TaskUid(uuid::Uuid::new_v4().to_string()),
+        calendar_id: default_calendar.clone(),
+        summary: Some(title),
+        description: Some(description),
+        due: None,
+        start: None,
+        completed: None,
+        status: TaskStatus::NeedsAction,
+        priority: TaskPriority(0),
+        percent_complete: None,
+        categories: Vec::new(),
+        href: None,
+        etag: None,
+    };
+
+    let calendar_state = calendar_state.clone();
+    let tasks_view = tasks_view.clone();
+    crate::task_editor::show_task_editor(
+        window,
+        crate::task_editor::TaskEditorPrefill {
+            calendars: &calendars,
+            default_calendar,
+            existing: None,
+            prefill: Some(&seed),
         },
         move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
         move |_calendar_id, _uid, _href, _etag| {},
@@ -8756,6 +8953,7 @@ fn open_task_editor_for(window: &adw::ApplicationWindow, calendar_state: &Rc<Ref
             calendars: &calendars,
             default_calendar: task.calendar_id.clone(),
             existing: Some(task),
+            prefill: None,
         },
         move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
         move |calendar_id, uid, href, etag| route_task_delete(&calendar_state_for_delete, &tasks_view_for_delete, calendar_id, uid, href, etag),
