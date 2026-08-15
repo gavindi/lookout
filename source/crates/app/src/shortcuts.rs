@@ -130,7 +130,7 @@ pub const DEFAULT_SHORTCUTS: &[DefaultShortcut] = &[
     },
     DefaultShortcut {
         action: ACTION_FLAG,
-        title: "Flag / unflag",
+        title: "Star / unstar",
         keyval: gdk::Key::g,
         modifiers: mods(&[CONTROL, SHIFT]),
     },

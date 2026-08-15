@@ -21,6 +21,16 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.48" date="2026-08-16">
+      <description>
+        <p>The mail toolbar's flag-toggle button is renamed "Star/Unstar" and its icon now reflects the selected message's actual starred state - filled when starred, outline otherwise - instead of a single static icon.</p>
+      </description>
+    </release>
+    <release version="0.9.47" date="2026-08-16">
+      <description>
+        <p>The mail toolbar gains a "Follow-up" button that opens the task editor prefilled from the selected message (subject as title, sender and date noted for reference), defaulting to that email's own account's task list when it has one, or the local on-device list otherwise. Its icon fills in once a task has been created for the selected message.</p>
+      </description>
+    </release>
     <release version="0.9.46" date="2026-08-15">
       <description>
         <p>The reading-pane header's "View contact" button now works: it looks the message's sender up across every connected contacts account - opening the contact editor for a found card, or a prefilled "New contact" form (sender name and email, address-book picker defaulting to the account the email lives in) when no address book has them.</p>

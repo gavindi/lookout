@@ -3448,7 +3448,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Command toolbar row. `compose_button`, `reply_button`,
     // `reply_all_button`, `forward_button`, `delete_button`,
-    // `archive_button`, `report_button`, `flag_button`, `snooze_button`, and
+    // `archive_button`, `report_button`, `star_button`, `snooze_button`, and
     // `more_button` (a menu of reading-pane extras like "Save as .eml…") are
     // backed by real functionality.
     let reply_button = gtk::Button::from_icon_name("mail-reply-sender-symbolic");
@@ -3463,11 +3463,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     archive_button.set_tooltip_text(Some("Archive"));
     let report_button = gtk::Button::from_icon_name("mail-mark-junk-symbolic");
     report_button.set_tooltip_text(Some("Report"));
-    let flag_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
-    flag_button.set_tooltip_text(Some("Flag/Unflag"));
+    let star_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
+    star_button.set_tooltip_text(Some("Star/Unstar"));
+    refresh_star_button(&star_button, &message_list);
     // Add as Task: opens the task editor prefilled from the selected
     // message (subject as title, sender/date in Notes - `CalendarTask` has
-    // no url field). Distinct from Flag/Unflag above, which only toggles the
+    // no url field). Distinct from Star/Unstar above, which only toggles the
     // IMAP `\Flagged` bit. Its icon starts outline and is kept in sync with
     // whether the selected message already has an associated task by
     // `refresh_task_button`, registered once `calendar_state` exists below.
@@ -3475,7 +3476,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     task_button.set_tooltip_text(Some("Follow-up"));
     // Mark read/unread: no explicit toolbar action for this existed before -
     // only the implicit mark-as-read that opening a message already does.
-    // Same aggregate-direction policy as Flag/Unflag: any unread message in
+    // Same aggregate-direction policy as Star/Unstar: any unread message in
     // the selection means the action marks everything read; only when every
     // selected message is already read does it become "mark all unread."
     let mark_read_button = gtk::Button::from_icon_name(themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]));
@@ -3530,7 +3531,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&delete_button);
     command_toolbar.append(&archive_button);
     command_toolbar.append(&report_button);
-    command_toolbar.append(&flag_button);
+    command_toolbar.append(&star_button);
     command_toolbar.append(&task_button);
     command_toolbar.append(&mark_read_button);
     command_toolbar.append(&categorize_button);
@@ -5276,7 +5277,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         (crate::shortcuts::ACTION_ARCHIVE, &archive_button),
         (crate::shortcuts::ACTION_REPORT_JUNK, &report_button),
         (crate::shortcuts::ACTION_SNOOZE, &snooze_button),
-        (crate::shortcuts::ACTION_FLAG, &flag_button),
+        (crate::shortcuts::ACTION_FLAG, &star_button),
         (crate::shortcuts::ACTION_MARK_READ, &mark_read_button),
     ] {
         let button = button.clone();
@@ -5947,6 +5948,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_header = message_header.clone();
         let message_list_for_selection = message_list.clone();
         let mark_read_button = mark_read_button.clone();
+        let star_button = star_button.clone();
         let task_button = task_button.clone();
         let calendar_state = calendar_state.clone();
         let web_view = web_view.clone();
@@ -5954,6 +5956,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let theme_override_sheet = theme_override_sheet.clone();
         message_list.selection.connect_selection_changed(move |_sel, _pos, _n_items| {
             refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
+            refresh_star_button(&star_button, &message_list_for_selection);
             refresh_task_button(&task_button, &message_list_for_selection, &calendar_state);
             let summary = match message_list_for_selection.selection_kind() {
                 SelectionKind::Message(summary) => *summary,
@@ -6150,7 +6153,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
-    // --- Flag/Unflag -> AccountCommand::StoreFlagsMany toggling `\Flagged`
+    // --- Star/Unstar -> AccountCommand::StoreFlagsMany toggling `\Flagged`
     // on every selected message. The direction is computed once over the
     // whole selection - Gmail/Outlook's convention: any unflagged message
     // selected means the action flags everything; only when every selected
@@ -6160,7 +6163,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let message_list = message_list.clone();
         let state = state.clone();
-        flag_button.connect_clicked(move |_| {
+        let star_button_for_click = star_button.clone();
+        star_button.connect_clicked(move |_| {
             let summaries = message_list.selected_summaries();
             if summaries.is_empty() {
                 return;
@@ -6170,6 +6174,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             } else {
                 (Vec::new(), vec![SystemFlagBit::Flagged])
             };
+            // Flag changes aren't patched into the message list model like
+            // Mark Read's are (see `restore_optimistic_flag_changes`'s
+            // comment), so the button flips its own icon immediately rather
+            // than waiting for the server's `MessagesUpdated` confirmation.
+            star_button_for_click.set_icon_name(star_icon_name(!add.is_empty()));
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
                 let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
                     mailbox,
@@ -6621,6 +6630,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         lookout_view_button.clone(),
         dashboard_refresh.clone(),
         mark_read_button.clone(),
+        star_button.clone(),
     );
     spawn_contacts_discovery(
         worker.clone(),
@@ -6760,6 +6770,7 @@ fn spawn_account_discovery(
     lookout_view_button: gtk::ToggleButton,
     dashboard_refresh: Rc<dyn Fn()>,
     mark_read_button: gtk::Button,
+    star_button: gtk::Button,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -6817,6 +6828,7 @@ fn spawn_account_discovery(
                         account,
                         dashboard_refresh.clone(),
                         mark_read_button.clone(),
+                        star_button.clone(),
                     );
                 }
                 refresh_config();
@@ -6853,6 +6865,7 @@ fn connect_account(
     account: lookout_goa::GoaMailAccount,
     dashboard_refresh: Rc<dyn Fn()>,
     mark_read_button: gtk::Button,
+    star_button: gtk::Button,
 ) {
     let account_id = AccountId(account.account_id.0.clone());
     let display_name = account.display_name.clone();
@@ -7302,9 +7315,13 @@ fn connect_account(
                     // back exactly the summaries `optimistic_toggle_read`
                     // patched for this attempt - a no-op if this failure
                     // wasn't from a mark-read/unread toggle to begin with
-                    // (e.g. a Flag/Unflag failure, which isn't optimistic).
+                    // (e.g. a Star/Unstar failure, which isn't optimistic).
                     restore_optimistic_flag_changes(&state, &message_list, &mailbox, &uids);
                     refresh_mark_read_button(&mark_read_button, &message_list);
+                    // Reverts the click handler's optimistic icon flip back
+                    // to whatever the (unpatched, so still correct) selected
+                    // summaries actually say.
+                    refresh_star_button(&star_button, &message_list);
                     let title = glib::markup_escape_text(&format!("Couldn't update message flags: {message}"));
                     toast_overlay.add_toast(adw::Toast::new(&title));
                 }
@@ -9773,6 +9790,31 @@ fn apply_favorite_visual(button: &gtk::ToggleButton, starred: bool) {
     };
     button.set_icon_name(icon);
     button.set_tooltip_text(Some(if starred { "Remove from Favorites" } else { "Add to Favorites" }));
+}
+
+/// The Star/Unstar button's icon for a given "is this starred" state -
+/// filled when `starred`, outline otherwise. Shared by `refresh_star_button`
+/// (recomputed from the message list's live data - selection change, and
+/// after a server-confirmed `MessagesUpdated`) and the click handler's own
+/// immediate flip (unlike Mark Read, starring isn't optimistically patched
+/// into the message list model, so the button updates itself right away
+/// rather than waiting on that confirmation).
+fn star_icon_name(starred: bool) -> &'static str {
+    if starred {
+        themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])
+    } else {
+        themed_icon_name(&["non-starred-symbolic", "starred-symbolic", "mail-mark-important-symbolic"])
+    }
+}
+
+/// Sets `star_button`'s icon to reflect whether the selected message(s) are
+/// starred (`\Flagged`) - filled only when every selected message is
+/// starred, outline otherwise (including nothing selected). Mirrors
+/// `apply_favorite_visual`'s icon-swap convention.
+fn refresh_star_button(button: &gtk::Button, message_list: &MessageListModel) {
+    let summaries = message_list.selected_summaries();
+    let starred = !summaries.is_empty() && summaries.iter().all(|s| s.is_starred());
+    button.set_icon_name(star_icon_name(starred));
 }
 
 /// Sets `mark_read_button`'s icon/tooltip to reflect what clicking it would
