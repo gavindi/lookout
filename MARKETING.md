@@ -27,6 +27,10 @@ on GNOME.
   a Google, Microsoft 365, or Nextcloud account in your system Settings and
   Lookout picks it up automatically. It never touches your passwords and never
   asks you to sign in twice.
+- **Or add any account yourself.** Running your own mail server, or with a
+  provider GNOME Online Accounts doesn't know about? Add it directly in
+  Lookout with your IMAP/SMTP settings — your password goes straight into the
+  GNOME keyring, never anywhere else.
 - **One workspace, not five apps.** Mail, calendar, contacts, and tasks are
   one application with one consistent interface. Your meeting invite is right
   in the email. Your contact's number is one click away. Your tasks are

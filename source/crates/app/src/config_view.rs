@@ -19,6 +19,12 @@ use gtk::glib;
 /// anchoring widget and the account id (opaque string).
 pub type ManageIdentities = Rc<dyn Fn(&gtk::Widget, &str)>;
 
+/// The caller's hook for one manual ("other") account's row actions: takes
+/// the anchoring widget and the account id. Used for both editing (opens the
+/// account dialog prefilled) and removing (confirms, then tears the account
+/// down) - the caller distinguishes the two by which closure it registers.
+pub type OtherAccountAction = Rc<dyn Fn(&gtk::Widget, &str)>;
+
 /// Plain display data for one mail account, decoupled from window.rs's
 /// private `AccountHandle` so this module has no dependency on the session
 /// types.
@@ -29,6 +35,11 @@ pub struct MailAccountInfo {
     /// manage-identities callback so it can route edits to the right
     /// account.
     pub account_id: String,
+    /// True for accounts Lookout manages itself (manual IMAP/SMTP, ids
+    /// prefixed `other:`); such rows get Edit/Remove actions since they're
+    /// owned by the app, unlike GOA accounts which are managed in system
+    /// settings.
+    pub is_other: bool,
     /// Every identity this account can send as, display-ready.
     pub identity_labels: Vec<String>,
     /// Preformatted `host:port`.
@@ -82,6 +93,10 @@ pub struct ConfigView {
     /// `activated` signal to the same GOA-settings invocation the empty-state
     /// page uses.
     pub add_account_row: adw::ActionRow,
+    /// "Add IMAP/SMTP account…" entry row - the entry point for the app's
+    /// own manually-managed mail accounts (see `other_accounts.rs`), wired
+    /// by the caller to the add-account dialog.
+    pub add_imap_row: adw::ActionRow,
     /// "Clear all caches…" row, exposed so the caller can wire its
     /// `activated` signal to the actual cache-clearing (the mail cache lives
     /// in the `lookout-mail` crate, out of this module's reach).
@@ -111,13 +126,11 @@ pub struct ConfigView {
     /// signal to a file chooser and update its subtitle to reflect the image
     /// currently in use.
     pub background_image_row: adw::ActionRow,
-    /// "Background dimming" row, exposed so the caller can arm it (and its
-    /// slider below) whenever a custom background is set and disarm it on
-    /// restore.
-    pub background_brightness_row: adw::ActionRow,
-    /// The brightness slider sitting inside `background_brightness_row`,
-    /// exposed so the caller can wire its `value-changed` signal into the
-    /// window background's brightness and seed it with the stored value.
+    /// The "Background dimming" slider, exposed so the caller can wire its
+    /// `value-changed` signal into the window background's brightness and
+    /// seed it with the stored value. Always enabled - dimming applies to
+    /// the bundled artwork as well as a custom background - so the row
+    /// itself needs no caller-side wiring beyond this.
     pub background_brightness_scale: gtk::Scale,
     /// "Restore default background" row, exposed so the caller can wire its
     /// `activated` signal back to the bundled artwork (and re-enable it only
@@ -238,6 +251,12 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     accounts_group.add(&add_account_row);
+    let add_imap_row = adw::ActionRow::builder()
+        .title("Add IMAP/SMTP account…")
+        .subtitle("Connect a mail account not managed by GNOME Online Accounts")
+        .activatable(true)
+        .build();
+    accounts_group.add(&add_imap_row);
 
     let mail_group = adw::PreferencesGroup::builder().title("Mail accounts").build();
 
@@ -293,16 +312,12 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     appearance_group.add(&background_image_row);
-    // The brightness slider only matters for a user-picked image (the bundled
-    // artwork is always shown in full), so it starts disabled and the caller
-    // arms it when a custom background is applied.
-    let background_brightness_row = adw::ActionRow::builder()
-        .title("Background dimming")
-        .subtitle("Reduce the background toward black")
-        .sensitive(false)
-        .build();
+    // Dimming applies to whichever background is currently shown - the
+    // bundled artwork included - so this row is always enabled; the caller
+    // just seeds it with the stored brightness at startup.
+    let background_brightness_row = adw::ActionRow::builder().title("Background dimming").subtitle("Reduce the background toward black").build();
     let background_brightness_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
-    background_brightness_scale.set_value(1.0);
+    background_brightness_scale.set_value(0.75);
     background_brightness_scale.set_draw_value(false);
     background_brightness_row.set_child(Some(&background_brightness_scale));
     appearance_group.add(&background_brightness_row);
@@ -505,6 +520,7 @@ pub fn build() -> ConfigView {
         root: paned.clone().upcast(),
         paned,
         add_account_row,
+        add_imap_row,
         clear_cache_row,
         animations_row,
         theme_row,
@@ -513,7 +529,6 @@ pub fn build() -> ConfigView {
         accent_color_row,
         accent_color_button,
         background_image_row,
-        background_brightness_row,
         background_brightness_scale,
         restore_background_row,
         remote_images_row,
@@ -548,7 +563,8 @@ pub fn build() -> ConfigView {
 /// a dim placeholder row per group while it has no entries. Each mail account
 /// gets an "Identities" row whose activation invokes `manage_identities`
 /// with the row's widget (as anchor) and the account's id - the caller owns
-/// the actual dialog.
+/// the actual dialog. Manual ("other") accounts additionally get Edit and
+/// Remove suffix buttons wired to `edit_other`/`remove_other`.
 #[allow(clippy::too_many_arguments)]
 pub fn refresh(
     view: &ConfigView,
@@ -562,6 +578,8 @@ pub fn refresh(
     contacts_cache_dir: &std::path::Path,
     contacts_cache_files: &[CacheFile],
     manage_identities: &ManageIdentities,
+    edit_other: &OtherAccountAction,
+    remove_other: &OtherAccountAction,
 ) {
     for row in view.mail_rows.borrow_mut().drain(..) {
         view.mail_group.remove(&row);
@@ -581,7 +599,31 @@ pub fn refresh(
     } else {
         for info in mail {
             let subtitle = format!("{} · IMAP {} · SMTP {}", info.email, info.imap, info.smtp);
-            push_row(&view.mail_group, &view.mail_rows, account_row(&info.display_name, &subtitle));
+            let row = account_row(&info.display_name, &subtitle);
+            if info.is_other {
+                let edit_button = gtk::Button::from_icon_name("document-edit-symbolic");
+                edit_button.set_tooltip_text(Some("Edit account"));
+                edit_button.add_css_class("flat");
+                let remove_button = gtk::Button::from_icon_name("user-trash-symbolic");
+                remove_button.set_tooltip_text(Some("Remove account"));
+                remove_button.add_css_class("flat");
+                let account_id = info.account_id.clone();
+                {
+                    let edit_other = edit_other.clone();
+                    let row_widget = row.clone();
+                    let account_id = account_id.clone();
+                    edit_button.connect_clicked(move |_| edit_other(row_widget.upcast_ref::<gtk::Widget>(), &account_id));
+                }
+                {
+                    let remove_other = remove_other.clone();
+                    let row_widget = row.clone();
+                    let account_id = account_id.clone();
+                    remove_button.connect_clicked(move |_| remove_other(row_widget.upcast_ref::<gtk::Widget>(), &account_id));
+                }
+                row.add_suffix(&edit_button);
+                row.add_suffix(&remove_button);
+            }
+            push_row(&view.mail_group, &view.mail_rows, row);
             let identities_subtitle = if info.identity_labels.is_empty() {
                 "Send as this account's own address".to_string()
             } else {

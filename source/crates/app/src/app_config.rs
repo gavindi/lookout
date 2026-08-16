@@ -1,17 +1,28 @@
 //! The relational-data config file (`$XDG_CONFIG_HOME/lookout/settings.json`).
 //!
 //! GSettings (see `settings.rs`) holds the scalar preferences; this file is
-//! for relational data with no natural GSettings key: sending identities and
-//! folder-role overrides. Identities are populated by the multi-identity
-//! feature (composer From selector + manage dialog); the role-override
-//! feature is still a roadmap item, but the structs are the on-disk contract
-//! it will fill in. Best-effort like `last_view.rs`: a missing or broken file
-//! reads back as defaults, never an error.
+//! for relational data with no natural GSettings key: sending identities,
+//! folder-role overrides, webcal subscriptions, and the app's own list of
+//! manually-configured IMAP/SMTP mail accounts ("other accounts" - ones not
+//! managed by GNOME Online Accounts). Identities are populated by the
+//! multi-identity feature (composer From selector + manage dialog); the
+//! role-override feature is still a roadmap item, but the structs are the
+//! on-disk contract it will fill in. Other accounts are created by the
+//! add-account dialog (`other_accounts.rs`); their passwords live in the
+//! GNOME keyring, never in this file. Best-effort like `last_view.rs`: a
+//! missing or broken file reads back as defaults, never an error.
 
 use std::path::PathBuf;
 
 use lookout_core::{AccountId, Identity, MailboxRole, WebcalSubscription};
 use serde::{Deserialize, Serialize};
+
+/// The id prefix distinguishing manually-added accounts (stored here) from
+/// GOA accounts (whose ids are D-Bus object paths like
+/// `/org/gnome/OnlineAccounts/Accounts/account_1234`). Everything in the app
+/// keys on the `AccountId` string, so the prefix is just the marker the
+/// account management UI greps for.
+pub const OTHER_ACCOUNT_ID_PREFIX: &str = "other:";
 
 /// A user override of a mailbox's special-use role (e.g. "this folder is my
 /// Archive"), winning over the server's `LIST (SPECIAL-USE)` attributes and
@@ -23,6 +34,32 @@ pub struct FolderRoleOverride {
     pub role: MailboxRole,
 }
 
+/// One manually-configured IMAP/SMTP mail account - a mail account Lookout
+/// manages itself rather than one sourced from GNOME Online Accounts (see
+/// `other_accounts.rs` for the UI and the keyring-backed password store).
+/// Never holds a secret: passwords are stored in the GNOME keyring under the
+/// account's `id`, and fetched fresh per connection attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtherAccount {
+    /// Stable `other:<uuid>` id. Filesystem-safe (the mail cache derives
+    /// filenames from it) and collision-free.
+    pub id: String,
+    pub display_name: String,
+    pub email: String,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_use_tls: bool,
+    pub imap_username: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_use_tls: bool,
+    pub smtp_username: String,
+    /// Whether the dialog stored one password for both protocols (the common
+    /// case) or distinct IMAP/SMTP passwords. The keyring always holds both
+    /// slots either way - the flag only drives the edit dialog's prefill.
+    pub use_same_password: bool,
+}
+
 /// The whole file's contents. All fields are additive: an older build's file
 /// (or a `{}` hand-edited file) deserializes into defaults for the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -30,6 +67,7 @@ pub struct AppConfig {
     pub identities: Vec<Identity>,
     pub folder_role_overrides: Vec<FolderRoleOverride>,
     pub webcal_subscriptions: Vec<WebcalSubscription>,
+    pub other_accounts: Vec<OtherAccount>,
 }
 
 impl AppConfig {
@@ -54,6 +92,21 @@ impl AppConfig {
             .collect();
         identities.insert(0, Identity::new(account_id.clone(), default_name, default_email));
         identities
+    }
+
+    /// The persisted other account with `id`, if any.
+    pub fn other_account(&self, id: &str) -> Option<OtherAccount> {
+        self.other_accounts.iter().find(|a| a.id == id).cloned()
+    }
+
+    /// Inserts `account`, replacing any existing entry with the same id
+    /// (the edit path) or appending it (the add path).
+    pub fn upsert_other_account(&mut self, account: OtherAccount) {
+        if let Some(existing) = self.other_accounts.iter_mut().find(|a| a.id == account.id) {
+            *existing = account;
+        } else {
+            self.other_accounts.push(account);
+        }
     }
 }
 
@@ -143,6 +196,20 @@ mod tests {
                 display_name: "Holidays".into(),
                 url: "https://example.com/holidays.ics".into(),
             }],
+            other_accounts: vec![OtherAccount {
+                id: format!("{OTHER_ACCOUNT_ID_PREFIX}abc"),
+                display_name: "Work Mail".into(),
+                email: "work@example.com".into(),
+                imap_host: "imap.example.com".into(),
+                imap_port: 993,
+                imap_use_tls: true,
+                imap_username: "work".into(),
+                smtp_host: "smtp.example.com".into(),
+                smtp_port: 587,
+                smtp_use_tls: true,
+                smtp_username: "work".into(),
+                use_same_password: true,
+            }],
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -167,6 +234,7 @@ mod tests {
             ],
             folder_role_overrides: Vec::new(),
             webcal_subscriptions: Vec::new(),
+            other_accounts: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -178,5 +246,47 @@ mod tests {
 
         // Other accounts' identities are never mixed in.
         assert!(config.identities_for(&other).iter().all(|i| i.email == "other@example.com"));
+    }
+
+    #[test]
+    fn other_accounts_round_trip_upsert_and_tolerance() {
+        let dir = std::env::temp_dir().join(format!("lookout-other-accounts-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `other_accounts` (no such key) loads as an empty
+        // list rather than failing.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        assert!(load_at(&path).other_accounts.is_empty());
+
+        let account = OtherAccount {
+            id: format!("{OTHER_ACCOUNT_ID_PREFIX}1234"),
+            display_name: "Self-hosted".into(),
+            email: "me@mydomain.example".into(),
+            imap_host: "mail.mydomain.example".into(),
+            imap_port: 993,
+            imap_use_tls: true,
+            imap_username: "me".into(),
+            smtp_host: "mail.mydomain.example".into(),
+            smtp_port: 587,
+            smtp_use_tls: true,
+            smtp_username: "me".into(),
+            use_same_password: false,
+        };
+        let mut config = AppConfig::default();
+        config.upsert_other_account(account.clone());
+        assert_eq!(config.other_account(&account.id), Some(account.clone()));
+        save_at(&path, &config);
+        assert_eq!(load_at(&path).other_accounts, vec![account.clone()]);
+
+        // Upsert replaces in place rather than appending a duplicate.
+        let mut edited = account.clone();
+        edited.display_name = "Renamed".into();
+        config.upsert_other_account(edited.clone());
+        assert_eq!(config.other_accounts.len(), 1);
+        assert_eq!(config.other_account(&account.id), Some(edited));
+        assert_eq!(config.other_account("other:nope"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

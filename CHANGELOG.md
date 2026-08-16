@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.50 (2026-08-17)
+
+### Added
+
+- **Accounts**: mail accounts no longer have to come from GNOME Online Accounts - Config → Accounts gains an **Add IMAP/SMTP account…** row that opens a form for host/port/username/password on both IMAP and SMTP (a "use the same server for SMTP"/"use the same password for sending" pair of switches covers the common single-server case without double entry). These "other" accounts persist in `settings.json` (`other:<uuid>` ids, distinguishing them from GOA's D-Bus-object-path ids) and connect, reconnect, and disconnect exactly like GOA accounts - same folder sync, same reading pane, same send path - through a new shared `connect_other_account`/`spawn_account_event_loop` pair in `window.rs` (the event-handling half was factored out of the existing GOA `connect_account` so both sources drive the identical reaction to every `AccountEvent`). Passwords never touch disk: they're stored in the GNOME keyring over the Secret Service D-Bus API (`other_accounts.rs`, one item per account/protocol slot), fetched fresh on every connection attempt the same way GOA credentials already are, and never read back into the UI - editing an account leaves the password fields blank, and blank means "keep what's stored." Config → Mail accounts' rows for these accounts (and only these; GOA rows are unchanged) gain Edit and Remove actions: editing always fully reconnects with the new settings, and removing tears down the live session, deletes the keyring entries, drops the account from `settings.json`, and purges its local mail cache (a new `lookout_mail::remove_account_cache`).
+
 ## 0.9.49 (2026-08-16)
 
 ### Changed

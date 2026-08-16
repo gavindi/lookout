@@ -125,7 +125,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(START_AT_LOGIN, Value::Bool(false));
     map.insert(CLOSE_TO_BACKGROUND, Value::Bool(true));
     map.insert(WINDOW_BACKGROUND_PATH, Value::String(String::new()));
-    map.insert(BACKGROUND_BRIGHTNESS, Value::Double(1.0));
+    map.insert(BACKGROUND_BRIGHTNESS, Value::Double(0.75));
     map.insert(THEME_ID, Value::String(crate::theme::DEFAULT_THEME.into()));
     map.insert(ACCENT_COLOR, Value::String(String::new()));
     map.insert(LAYOUT_FOLDER_PANE, Value::Bool(true));
@@ -296,7 +296,7 @@ mod tests {
         assert!(store.get_bool(CALENDAR_ALERTS_ENABLED));
         assert_eq!(store.get_string(LAST_VIEW_MAILBOX), "");
         assert_eq!(store.get_string(SORT_KEY), "date");
-        assert_eq!(store.get_double(BACKGROUND_BRIGHTNESS), 1.0);
+        assert_eq!(store.get_double(BACKGROUND_BRIGHTNESS), 0.75);
         assert_eq!(store.get_string(THEME_ID), "flat-dark");
         assert_eq!(store.get_string(ACCENT_COLOR), "");
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());

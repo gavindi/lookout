@@ -93,6 +93,27 @@ pub fn clear_all_caches() -> Result<()> {
     Ok(())
 }
 
+/// Removes one account's cached database and flat-file stores (on account
+/// removal). A missing path is not an error - the account may never have
+/// synced. Same "safe while the session is live" reasoning as
+/// [`clear_all_caches`]: POSIX unlink doesn't disturb an already-open fd, so
+/// this is safe to call even mid-teardown of the account's session actor.
+pub fn remove_account_cache(account_id: &AccountId) -> Result<()> {
+    let name = sanitize_filename(account_id);
+    let db_path = cache_dir().join(format!("{name}.sqlite3"));
+    match std::fs::remove_file(&db_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    for sidecar_ext in ["sqlite3-wal", "sqlite3-shm"] {
+        let _ = std::fs::remove_file(cache_dir().join(format!("{name}.{sidecar_ext}")));
+    }
+    let _ = std::fs::remove_dir_all(cache_dir().join("attachments").join(&name));
+    let _ = std::fs::remove_dir_all(cache_dir().join("messages").join(&name));
+    Ok(())
+}
+
 /// GOA account ids are D-Bus object paths (e.g.
 /// `/org/gnome/OnlineAccounts/Accounts/account_1234`); sanitize into a bare
 /// filename.

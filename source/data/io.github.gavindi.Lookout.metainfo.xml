@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.50" date="2026-08-17">
+      <description>
+        <p>Mail accounts no longer have to come from GNOME Online Accounts. Config → Accounts gains an "Add IMAP/SMTP account…" row for connecting a mail account by host, port, username, and password; these accounts sync, send, and appear in the sidebar exactly like GNOME Online Accounts ones, with their passwords kept in the GNOME keyring. Config → Mail accounts gains Edit and Remove actions for accounts added this way.</p>
+      </description>
+    </release>
     <release version="0.9.49" date="2026-08-16">
       <description>
         <p>The Mail screen's calendar overview pane now lists your outstanding tasks below the selected day's events: every uncompleted task from every source (CalDAV, Google Tasks, local) in the dashboard's Overdue/Today/This week/Later order, in rows captioned to match the event list - a click opens the shared task editor. The list stays live as tasks are created, synced, completed, or removed.</p>

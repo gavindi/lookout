@@ -22,6 +22,7 @@ mod message_header;
 mod message_list;
 mod microsoft_oauth;
 mod online_accounts;
+mod other_accounts;
 mod recipient_entry;
 mod recurrence;
 mod reminders;

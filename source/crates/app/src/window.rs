@@ -1250,8 +1250,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         worker.spawn(async { crate::background::request_background_approval().await });
     }
 
-    let bg_bytes = crate::resources::bytes("/io/github/gavindi/Lookout/backgrounds/background2.png")
-        .unwrap_or_else(|| glib::Bytes::from_static(include_bytes!("../../../data/resources/backgrounds/background2.png")));
+    let bg_bytes = crate::resources::bytes("/io/github/gavindi/Lookout/backgrounds/background2.jpg")
+        .unwrap_or_else(|| glib::Bytes::from_static(include_bytes!("../../../data/resources/backgrounds/background2.jpg")));
     let default_bg_texture = gtk::gdk::Texture::from_bytes(&bg_bytes).expect("bundled background image should decode");
     let background = gtk::Picture::for_paintable(&default_bg_texture);
     background.set_content_fit(gtk::ContentFit::Cover);
@@ -1591,6 +1591,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .flatten()
         .map(|(account, entry, level)| ((account, entry), level))
         .collect();
+    // Shared keyring handle for manually-added ("other") IMAP/SMTP accounts -
+    // see `other_accounts.rs`. Cloned into the add-account dialog, the
+    // startup connect loop, and the Config view's edit/remove actions.
+    let keyring = crate::other_accounts::SecretServiceKeyring::new();
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
         contacts_by_account: HashMap::new(),
@@ -4276,13 +4280,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // an opaque-black widget whose opacity (1 - brightness) darkens a
     // user-picked background toward black per Config → Appearance →
     // "Background dimming". `can_target(false)` keeps it click-through.
-    // It starts fully transparent: brightness only ever comes from a stored
-    // GSettings value applied below when a custom background is in use, so
-    // the bundled artwork (and no stored value) always shows undimmed.
+    // Starts at 50% opacity - the bundled artwork's default brightness. A
+    // custom background overrides this below with its own stored GSettings
+    // value once we know one is in use.
     let background_dim = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     background_dim.set_can_target(false);
     background_dim.set_css_classes(&["window-background-dim"]);
-    background_dim.set_opacity(0.0);
+    background_dim.set_opacity(0.75);
     window_overlay.add_overlay(&background_dim);
     window_overlay.add_overlay(&toast_overlay);
 
@@ -5154,28 +5158,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // Config → Appearance → "Window background": reflect a stored custom
-    // background (if one applied at startup) in the row subtitle, arm the
-    // restore row and the dimming slider (seeded with the stored brightness),
-    // then wire the picker to a file chooser, the dimming slider into the
-    // background's brightness, and "Restore default background" back to the
-    // bundled artwork (which also resets dimming). The slider only applies
-    // while a custom image is set: the bundled artwork always shows in full.
+    // background (if one applied at startup) in the row subtitle and arm the
+    // restore row, seed the (always-enabled) dimming slider with the stored
+    // brightness regardless of which background is in use, then wire the
+    // picker to a file chooser, the dimming slider into the background's
+    // brightness, and "Restore default background" back to the bundled
+    // artwork (which also resets dimming to its own default).
     let apply_background_brightness = {
         let background_dim = background_dim.clone();
         move |brightness: f64| background_dim.set_opacity(1.0 - brightness.clamp(0.0, 1.0))
     };
+    {
+        let brightness = settings.get_double(crate::settings::BACKGROUND_BRIGHTNESS);
+        config_view.background_brightness_scale.set_value(brightness);
+        apply_background_brightness(brightness);
+    }
     if let Some(name) = &custom_background_name {
         config_view.background_image_row.set_subtitle(name);
         config_view.restore_background_row.set_sensitive(true);
-        let brightness = settings.get_double(crate::settings::BACKGROUND_BRIGHTNESS);
-        config_view.background_brightness_scale.set_value(brightness);
-        config_view.background_brightness_row.set_sensitive(true);
-        apply_background_brightness(brightness);
     }
     {
         let background_image_row = config_view.background_image_row.clone();
         let restore_background_row = config_view.restore_background_row.clone();
-        let background_brightness_row = config_view.background_brightness_row.clone();
         let background_brightness_scale = config_view.background_brightness_scale.clone();
         let background = background.clone();
         let window = window.clone();
@@ -5187,7 +5191,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let background = background.clone();
             let toast_overlay = toast_overlay.clone();
             let restore_background_row = restore_background_row.clone();
-            let background_brightness_row = background_brightness_row.clone();
             let background_brightness_scale = background_brightness_scale.clone();
             let settings = settings.clone();
             glib::spawn_future_local(async move {
@@ -5211,7 +5214,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         // (the `value-changed` handler persists it and applies
                         // it to the overlay).
                         background_brightness_scale.set_value(0.5);
-                        background_brightness_row.set_sensitive(true);
                     }
                     Err(e) => {
                         let title = glib::markup_escape_text(&format!("Couldn't load background image: {e}"));
@@ -5234,7 +5236,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let restore_background_row = config_view.restore_background_row.clone();
         let background_image_row = config_view.background_image_row.clone();
-        let background_brightness_row = config_view.background_brightness_row.clone();
         let background_brightness_scale = config_view.background_brightness_scale.clone();
         let background = background.clone();
         let settings = settings.clone();
@@ -5243,13 +5244,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             crate::background_image::clear(&settings);
             background.set_paintable(Some(&default_bg_texture));
             background_image_row.set_subtitle("Default Lookout artwork");
-            // The bundled artwork always shows at full brightness: reset the
-            // stored dim value so the slider (and the next custom image)
-            // start at 100%.
-            settings.set_double(crate::settings::BACKGROUND_BRIGHTNESS, 1.0);
-            background_brightness_scale.set_value(1.0);
-            background_brightness_row.set_sensitive(false);
-            apply_background_brightness(1.0);
+            // The bundled artwork defaults to 75% brightness: reset the
+            // stored dim value so the slider reflects it too.
+            settings.set_double(crate::settings::BACKGROUND_BRIGHTNESS, 0.75);
+            background_brightness_scale.set_value(0.75);
+            apply_background_brightness(0.75);
             row.set_sensitive(false);
         });
     }
@@ -5537,6 +5536,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let calendar_state = calendar_state.clone();
         let config_view = config_view.clone();
+        // Captured purely so the Edit/Remove closures built below (for
+        // manual "other" accounts) can reconnect or tear down a session -
+        // everything `connect_other_account` needs, mirroring the set
+        // `spawn_account_discovery` already threads through to
+        // `connect_account`.
+        let worker = worker.clone();
+        let keyring = keyring.clone();
+        let window = window.clone();
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        let folder_selection = folder_selection.clone();
+        let folder_scroller = folder_scroller.clone();
+        let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
+        let message_header = message_header.clone();
+        let reading_stack = reading_stack.clone();
+        let list_header = list_header.clone();
+        let dashboard_refresh = dashboard_refresh.clone();
+        let mark_read_button = mark_read_button.clone();
+        let star_button = star_button.clone();
         move || {
             let st = state.borrow();
             let mut mail: Vec<crate::config_view::MailAccountInfo> = st
@@ -5546,6 +5565,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     display_name: h.display_name.clone(),
                     email: h.email.clone(),
                     account_id: account_id.0.clone(),
+                    is_other: account_id.0.starts_with(crate::app_config::OTHER_ACCOUNT_ID_PREFIX),
                     identity_labels: st
                         .app_config
                         .borrow()
@@ -5626,6 +5646,108 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     crate::identities::show_manage_dialog(anchor, app_config, account_id, on_changed);
                 })
             };
+            let edit_other: crate::config_view::OtherAccountAction = {
+                let state = state.clone();
+                let worker = worker.clone();
+                let keyring = keyring.clone();
+                let window = window.clone();
+                let app = app.clone();
+                let toast_overlay = toast_overlay.clone();
+                let folder_selection = folder_selection.clone();
+                let folder_scroller = folder_scroller.clone();
+                let message_list = message_list.clone();
+                let message_list_stack = message_list_stack.clone();
+                let message_header = message_header.clone();
+                let reading_stack = reading_stack.clone();
+                let list_header = list_header.clone();
+                let dashboard_refresh = dashboard_refresh.clone();
+                let mark_read_button = mark_read_button.clone();
+                let star_button = star_button.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |anchor, account_id: &str| {
+                    let Some(existing) = state.borrow().app_config.borrow().other_account(account_id) else { return };
+                    let app_config = state.borrow().app_config.clone();
+                    let on_saved = {
+                        let state = state.clone();
+                        let worker = worker.clone();
+                        let keyring = keyring.clone();
+                        let window = window.clone();
+                        let app = app.clone();
+                        let toast_overlay = toast_overlay.clone();
+                        let folder_selection = folder_selection.clone();
+                        let folder_scroller = folder_scroller.clone();
+                        let message_list = message_list.clone();
+                        let message_list_stack = message_list_stack.clone();
+                        let message_header = message_header.clone();
+                        let reading_stack = reading_stack.clone();
+                        let list_header = list_header.clone();
+                        let dashboard_refresh = dashboard_refresh.clone();
+                        let mark_read_button = mark_read_button.clone();
+                        let star_button = star_button.clone();
+                        let refresh_hook = refresh_hook.borrow().clone();
+                        Rc::new(move |account_id: &str| {
+                            // Editing always fully reconnects: the running
+                            // session's `AccountConfig` is immutable once
+                            // started, and a full reconnect is cheap and
+                            // always correct, unlike diffing which fields
+                            // actually changed. Dropping the old handle
+                            // closes its command channel, which
+                            // `run_account_session` treats as a clean
+                            // shutdown request.
+                            state.borrow_mut().accounts.remove(&AccountId(account_id.to_string()));
+                            let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else { return };
+                            connect_other_account(
+                                worker.clone(),
+                                state.clone(),
+                                folder_selection.clone(),
+                                folder_scroller.clone(),
+                                message_list.clone(),
+                                message_list_stack.clone(),
+                                message_header.clone(),
+                                reading_stack.clone(),
+                                toast_overlay.clone(),
+                                window.clone(),
+                                app.clone(),
+                                list_header.clone(),
+                                account,
+                                keyring.clone(),
+                                dashboard_refresh.clone(),
+                                mark_read_button.clone(),
+                                star_button.clone(),
+                            );
+                            refresh_hook();
+                        })
+                    };
+                    crate::other_accounts::show_add_account_dialog(anchor, worker.clone(), app_config, keyring.clone(), Some(existing), on_saved);
+                })
+            };
+            let remove_other: crate::config_view::OtherAccountAction = {
+                let state = state.clone();
+                let worker = worker.clone();
+                let keyring = keyring.clone();
+                let toast_overlay = toast_overlay.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |_anchor, account_id: &str| {
+                    let account_id = AccountId(account_id.to_string());
+                    state.borrow_mut().accounts.remove(&account_id);
+                    {
+                        let app_config = state.borrow().app_config.clone();
+                        app_config.borrow_mut().other_accounts.retain(|a| a.id != account_id.0);
+                        crate::app_config::save(&app_config.borrow());
+                    }
+                    let keyring = keyring.clone();
+                    let account_id_for_worker = account_id.clone();
+                    worker.spawn(async move {
+                        let _ = keyring.delete_account(&account_id_for_worker).await;
+                    });
+                    if let Err(e) = lookout_mail::remove_account_cache(&account_id) {
+                        tracing::warn!("could not remove cache for removed account {account_id}: {e}");
+                    }
+                    toast_overlay.add_toast(adw::Toast::new("Account removed"));
+                    let refresh = refresh_hook.borrow().clone();
+                    refresh();
+                })
+            };
             crate::config_view::refresh(
                 &config_view,
                 &mail,
@@ -5638,6 +5760,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &contacts_cache_dir,
                 &contacts_cache_files,
                 &manage_identities,
+                &edit_other,
+                &remove_other,
             );
         }
     });
@@ -5649,6 +5773,75 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     *refresh_hook.borrow_mut() = refresh_config.clone();
     // Populate the placeholder rows now (both groups are empty at startup).
     refresh_config();
+
+    // Config → Accounts → "Add IMAP/SMTP account…": the app's own manual
+    // account entry point, alongside the GOA-settings "Add account…" row.
+    {
+        let add_imap_row = config_view.add_imap_row.clone();
+        let worker = worker.clone();
+        let state = state.clone();
+        let keyring = keyring.clone();
+        let window = window.clone();
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        let folder_selection = folder_selection.clone();
+        let folder_scroller = folder_scroller.clone();
+        let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
+        let message_header = message_header.clone();
+        let reading_stack = reading_stack.clone();
+        let list_header = list_header.clone();
+        let dashboard_refresh = dashboard_refresh.clone();
+        let mark_read_button = mark_read_button.clone();
+        let star_button = star_button.clone();
+        let refresh_hook = refresh_hook.clone();
+        add_imap_row.connect_activated(move |row| {
+            let app_config = state.borrow().app_config.clone();
+            let on_saved = {
+                let state = state.clone();
+                let worker = worker.clone();
+                let keyring = keyring.clone();
+                let window = window.clone();
+                let app = app.clone();
+                let toast_overlay = toast_overlay.clone();
+                let folder_selection = folder_selection.clone();
+                let folder_scroller = folder_scroller.clone();
+                let message_list = message_list.clone();
+                let message_list_stack = message_list_stack.clone();
+                let message_header = message_header.clone();
+                let reading_stack = reading_stack.clone();
+                let list_header = list_header.clone();
+                let dashboard_refresh = dashboard_refresh.clone();
+                let mark_read_button = mark_read_button.clone();
+                let star_button = star_button.clone();
+                let refresh_hook = refresh_hook.borrow().clone();
+                Rc::new(move |account_id: &str| {
+                    let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else { return };
+                    connect_other_account(
+                        worker.clone(),
+                        state.clone(),
+                        folder_selection.clone(),
+                        folder_scroller.clone(),
+                        message_list.clone(),
+                        message_list_stack.clone(),
+                        message_header.clone(),
+                        reading_stack.clone(),
+                        toast_overlay.clone(),
+                        window.clone(),
+                        app.clone(),
+                        list_header.clone(),
+                        account,
+                        keyring.clone(),
+                        dashboard_refresh.clone(),
+                        mark_read_button.clone(),
+                        star_button.clone(),
+                    );
+                    refresh_hook();
+                })
+            };
+            crate::other_accounts::show_add_account_dialog(row.upcast_ref::<gtk::Widget>(), worker.clone(), app_config, keyring.clone(), None, on_saved);
+        });
+    }
 
     {
         let root_stack = root_stack.clone();
@@ -6644,6 +6837,40 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         toast_overlay.clone(),
     );
 
+    // Manually-added ("other") IMAP/SMTP accounts - see `other_accounts.rs`.
+    // Unlike GOA there's no D-Bus round trip needed to know the list (it's
+    // already persisted in `settings.json`), so these connect synchronously,
+    // before `spawn_account_discovery` below kicks off GOA's async discovery.
+    // `spawn_account_discovery`'s own "no accounts at all" empty-state check
+    // accounts for accounts already connected here.
+    {
+        let other_accounts = state.borrow().app_config.borrow().other_accounts.clone();
+        if !other_accounts.is_empty() {
+            for account in other_accounts {
+                connect_other_account(
+                    worker.clone(),
+                    state.clone(),
+                    folder_selection.clone(),
+                    folder_scroller.clone(),
+                    message_list.clone(),
+                    message_list_stack.clone(),
+                    message_header.clone(),
+                    reading_stack.clone(),
+                    toast_overlay.clone(),
+                    window.clone(),
+                    app.clone(),
+                    list_header.clone(),
+                    account,
+                    keyring.clone(),
+                    dashboard_refresh.clone(),
+                    mark_read_button.clone(),
+                    star_button.clone(),
+                );
+            }
+            refresh_config();
+        }
+    }
+
     spawn_account_discovery(
         worker.clone(),
         state.clone(),
@@ -6868,13 +7095,28 @@ fn spawn_account_discovery(
                 }
                 refresh_config();
             }
+            // GOA itself reported no (or zero usable) accounts - but manual
+            // "other" accounts are connected synchronously, before this async
+            // D-Bus round trip can land, so `state.accounts` may already be
+            // non-empty by the time this branch runs. Only show the empty
+            // state if nothing at all is connected.
             Ok(_) => {
-                show_page("empty");
-                show_lookout_page("lookout-empty");
+                if state.borrow().accounts.is_empty() {
+                    show_page("empty");
+                    show_lookout_page("lookout-empty");
+                } else {
+                    show_page("mail");
+                    show_lookout_page("lookout");
+                }
             }
             Err(e) => {
-                show_page("empty");
-                show_lookout_page("lookout-empty");
+                if state.borrow().accounts.is_empty() {
+                    show_page("empty");
+                    show_lookout_page("lookout-empty");
+                } else {
+                    show_page("mail");
+                    show_lookout_page("lookout");
+                }
                 let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
                 toast_overlay.add_toast(adw::Toast::new(&title));
             }
@@ -6981,6 +7223,50 @@ fn connect_account(
 
     worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
 
+    spawn_account_event_loop(
+        evt_rx,
+        state,
+        account_id,
+        folder_selection,
+        folder_scroller,
+        message_list,
+        message_list_stack,
+        message_header,
+        reading_stack,
+        toast_overlay,
+        window,
+        app,
+        list_header,
+        dashboard_refresh,
+        mark_read_button,
+        star_button,
+    );
+}
+
+/// Drives one connected account's `AccountEvent` stream for the rest of the
+/// session, repainting whichever UI surface each event affects. Shared
+/// between GOA accounts (`connect_account`) and manually-added accounts
+/// (`connect_other_account`) - the event vocabulary and every reaction to it
+/// is identical regardless of where the account's credentials come from.
+#[allow(clippy::too_many_arguments)]
+fn spawn_account_event_loop(
+    evt_rx: async_channel::Receiver<AccountEvent>,
+    state: Rc<RefCell<UiState>>,
+    account_id: AccountId,
+    folder_selection: gtk::SingleSelection,
+    folder_scroller: gtk::ScrolledWindow,
+    message_list: MessageListModel,
+    message_list_stack: gtk::Stack,
+    message_header: crate::message_header::MessageHeader,
+    reading_stack: gtk::Stack,
+    toast_overlay: adw::ToastOverlay,
+    window: adw::ApplicationWindow,
+    app: adw::Application,
+    list_header: ListHeader,
+    dashboard_refresh: Rc<dyn Fn()>,
+    mark_read_button: gtk::Button,
+    star_button: gtk::Button,
+) {
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
             match event {
@@ -7408,6 +7694,107 @@ fn connect_account(
             }
         }
     });
+}
+
+/// Connects one manually-added ("other") IMAP/SMTP account - the
+/// non-GOA counterpart to `connect_account`. Builds the session's
+/// `AccountConfig` directly from the persisted `OtherAccount` fields instead
+/// of a `GoaMailAccount`, and its credentials come from the GNOME keyring
+/// (`OtherCredentialProvider`) rather than GOA/Microsoft OAuth - everything
+/// past that point (the `AccountHandle`, the session actor, the event loop)
+/// is identical, so it's shared via `spawn_account_event_loop`.
+#[allow(clippy::too_many_arguments)]
+fn connect_other_account(
+    worker: Rc<Worker>,
+    state: Rc<RefCell<UiState>>,
+    folder_selection: gtk::SingleSelection,
+    folder_scroller: gtk::ScrolledWindow,
+    message_list: MessageListModel,
+    message_list_stack: gtk::Stack,
+    message_header: crate::message_header::MessageHeader,
+    reading_stack: gtk::Stack,
+    toast_overlay: adw::ToastOverlay,
+    window: adw::ApplicationWindow,
+    app: adw::Application,
+    list_header: ListHeader,
+    account: crate::app_config::OtherAccount,
+    keyring: std::sync::Arc<dyn crate::other_accounts::KeyringStore>,
+    dashboard_refresh: Rc<dyn Fn()>,
+    mark_read_button: gtk::Button,
+    star_button: gtk::Button,
+) {
+    let account_id = AccountId(account.id.clone());
+    let display_name = account.display_name.clone();
+    let config = AccountConfig {
+        account_id: account_id.clone(),
+        display_name: account.display_name.clone(),
+        email: account.email.clone(),
+        imap: EndpointConfig {
+            host: account.imap_host.clone(),
+            port: account.imap_port,
+            use_tls: account.imap_use_tls,
+            username: account.imap_username.clone(),
+        },
+        smtp: EndpointConfig {
+            host: account.smtp_host.clone(),
+            port: account.smtp_port,
+            use_tls: account.smtp_use_tls,
+            username: account.smtp_username.clone(),
+        },
+    };
+    // Unlike the GOA/Microsoft providers, `OtherCredentialProvider` holds no
+    // `Rc`s (only an `Arc<dyn KeyringStore>`), so it's already `Send + Sync`
+    // and needs no `SendWrapper` shim to satisfy `run_account_session`'s
+    // `Arc<dyn CredentialProvider>` bound.
+    let credentials: std::sync::Arc<dyn lookout_mail::session::CredentialProvider> =
+        std::sync::Arc::new(crate::other_accounts::OtherCredentialProvider::new(account_id.clone(), keyring));
+
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    state.borrow_mut().accounts.insert(
+        account_id.clone(),
+        AccountHandle {
+            cmd_tx,
+            email: config.email.clone(),
+            display_name,
+            imap_host: config.imap.host.clone(),
+            imap_port: config.imap.port,
+            smtp_host: config.smtp.host.clone(),
+            smtp_port: config.smtp.port,
+            folders: Vec::new(),
+            // Opened eagerly so the first composer already has completions.
+            // The session opens (and creates) the same file; whichever gets
+            // there first wins, and a failure here only costs suggestions.
+            address_cache: match lookout_mail::Cache::open(&account_id) {
+                Ok(cache) => Some(Rc::new(cache)),
+                Err(e) => {
+                    tracing::warn!("no address-book cache for {account_id}, recipient autocomplete disabled: {e}");
+                    None
+                }
+            },
+        },
+    );
+
+    worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
+
+    spawn_account_event_loop(
+        evt_rx,
+        state,
+        account_id,
+        folder_selection,
+        folder_scroller,
+        message_list,
+        message_list_stack,
+        message_header,
+        reading_stack,
+        toast_overlay,
+        window,
+        app,
+        list_header,
+        dashboard_refresh,
+        mark_read_button,
+        star_button,
+    );
 }
 
 /// Mirrors `spawn_account_discovery` 1:1 for Calendar - a fully independent
