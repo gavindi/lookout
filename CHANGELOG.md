@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.49 (2026-08-16)
+
+### Changed
+
+- **Mail**: the calendar overview pane (the mini-calendar + day list docked to the right of the Mail screen) now doubles as a to-do list: below the selected day's events it shows an **Outstanding tasks** section listing every uncompleted task from every source - CalDAV calendars, Google Tasks, and the local on-device store - in the same Overdue / Today / This week / Later bucket order the Lookout dashboard's task section uses. Tasks aren't day-scoped like the events above them (most have no due date at all, so no day selection could ever surface them), so the whole outstanding set appears regardless of which day the mini-calendar shows, headed by its own dim caption and with a "No outstanding tasks" placeholder when the set is empty. Rows are the Tasks view's own rows - calendar-colour dot, summary, due-date caption - rendered at the same `.caption` text size as the event rows and without the completion checkbox, since a completion action hidden in a narrow peek-pane is more annoying than useful; clicking a row opens the shared task editor, so the pane's list stays editable rather than read-only. The pane stays live without any per-site wiring: it repaints from `refresh_tasks_view`, the single funnel every task change already passes through (`TasksUpdated` events from CalDAV and Google Tasks sessions, local saves and deletions, checkbox flips on the Tasks tab), and a new repaint hook registered on `calendar_state` in the same pattern as the dashboard's - so a task completed on the Tasks tab, created from an email via Follow-up, or synced in from another device appears in (or leaves) the pane's list on its own. Under the hood `tasks_view::task_row` gained two optional knobs (`summary_classes` and `show_check`) so the overview can render the shared row captioned and checkbox-free while the Tasks view and dashboard stay exactly as they were.
+
 ## 0.9.48 (2026-08-16)
 
 ### Changed

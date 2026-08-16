@@ -234,7 +234,7 @@ pub fn set_data(view: &LookoutView, data: &LookoutData) {
         append_empty(&view.tasks_list, "No outstanding tasks.");
     } else {
         for task in outstanding {
-            view.tasks_list.append(&tasks_view::task_row(&task, &data.colors, toggle.clone(), activate.clone()));
+            view.tasks_list.append(&tasks_view::task_row(&task, &data.colors, toggle.clone(), activate.clone(), &[], true));
         }
     }
 

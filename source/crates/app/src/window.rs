@@ -932,6 +932,16 @@ struct CalendarUiState {
     /// meaning the server has confirmed it - at which point the entry is
     /// dropped. Rolled back (removed, no reapply) on `EventSaveFailed`.
     pending_calendar_moves: HashMap<(EventUid, Option<chrono::DateTime<chrono::Utc>>), EventOccurrence>,
+    /// The Mail-screen overview pane's task rows' click-to-edit handler,
+    /// registered by the window once `calendar_state` exists -
+    /// `refresh_mail_overview_day_list` reads it to build rows that open the
+    /// shared task editor (the overview's rows carry no completion checkbox).
+    mail_overview_activate: Option<crate::tasks_view::ActivateHandler>,
+    /// The Mail-screen overview pane's repaint hook, registered by the window
+    /// once `calendar_state` exists - same pattern as `dashboard_refresh`.
+    /// `refresh_tasks_view` calls it so the pane's task rows stay live as
+    /// tasks are created, synced, toggled, or removed; `None` until then.
+    mail_overview_refresh: Option<Rc<dyn Fn()>>,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -3735,10 +3745,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
 
     // --- Mail-screen calendar overview pane: a mini month-picker + a list
-    // of the clicked day's events, docked to the far right of the window,
-    // spanning the same full height as `nav_rail` (it's a sibling in
-    // `window_body`, not nested inside `root_stack`). Mail-only - the
-    // Calendar view already has its own full sidebar with a mini-calendar.
+    // of the clicked day's events and every outstanding task, docked to the
+    // far right of the window, spanning the same full height as `nav_rail`
+    // (it's a sibling in `window_body`, not nested inside `root_stack`).
+    // Mail-only - the Calendar view already has its own full sidebar with a
+    // mini-calendar.
     let mail_calendar_overview = calendar_view::build_mini();
     // Half-width day cells (see `.mini-calendar-compact` in
     // `install_calendar_css`). The day buttons' own natural size is what set
@@ -4587,6 +4598,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         dashboard_refresh: None,
         task_button_refresh: None,
         pending_calendar_moves: HashMap::new(),
+        mail_overview_activate: None,
+        mail_overview_refresh: None,
     }));
 
     // --- Lookout dashboard refresh hook: the window registers one closure
@@ -4773,11 +4786,33 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
-    // Which single day the Mail-screen overview pane's event list is
+    // Which single day the Mail-screen overview pane's day list is
     // currently showing - separate from `calendar_state.displayed_month`
     // (that's the main Calendar view's own concern).
     let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(chrono::Utc::now().date_naive()));
     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+
+    // --- Mail-screen overview pane's task rows + repaint hook, registered
+    // here (same pattern as `dashboard_refresh`/`task_button_refresh` just
+    // above) so `refresh_mail_overview_day_list` can build task rows - a row
+    // click opens the shared task editor, reusing the Tasks view's session
+    // paths (the overview's rows carry no completion checkbox). The pane's
+    // repaint hook fires from `refresh_tasks_view`, so every task change
+    // (synced, saved, toggled, deleted) updates the pane.
+    {
+        let calendar_state_for_activate = calendar_state.clone();
+        let tasks_view_for_activate = tasks_view.clone();
+        let mail_overview_refresh: Rc<dyn Fn()> = {
+            let calendar_state = calendar_state.clone();
+            let mail_overview_day = mail_overview_day.clone();
+            let mail_overview_day_list = mail_overview_day_list.clone();
+            Rc::new(move || refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list))
+        };
+        let mut st = calendar_state.borrow_mut();
+        st.mail_overview_refresh = Some(mail_overview_refresh);
+        let window_for_activate = window.clone();
+        st.mail_overview_activate = Some(Rc::new(move |task| open_task_editor_for(&window_for_activate, &calendar_state_for_activate, &tasks_view_for_activate, &task)));
+    }
 
     let contacts_categories: Rc<RefCell<Vec<ContactsCategoryChoice>>> = Rc::new(RefCell::new(Vec::new()));
     let contacts_entries: Rc<RefCell<Vec<ContactsListEntry>>> = Rc::new(RefCell::new(Vec::new()));
@@ -7964,26 +7999,51 @@ fn print_calendar_month<T: IsA<gtk::Window>>(calendar_state: &Rc<RefCell<Calenda
     print_html_once(&html, window);
 }
 
-/// Fills the Mail-screen overview pane's event list with every checked
-/// calendar's occurrences (from whatever's currently cached - no new fetch
-/// here) whose local date matches `day`, sorted by start time. The list is
-/// headed by `day`'s date ("Today"/"Tomorrow"/"Tue 12 Aug") and shows a
-/// "No events" placeholder when there are none. Unlike
-/// `refresh_displayed_calendar_view`, this filters by exact day rather than
-/// by the main Calendar view's own displayed month - the overview pane can
-/// be showing a day from a different month entirely.
+/// Fills the Mail-screen overview pane's day list with two sections: every
+/// checked calendar's occurrences (from whatever's currently cached - no new
+/// fetch here) whose local date matches `day`, sorted by start time, and
+/// every uncompleted task from every source (CalDAV, Google Tasks, local) -
+/// tasks aren't day-scoped, since most have no due date at all, so the whole
+/// outstanding set appears regardless of which day the mini-calendar shows,
+/// in the same bucket order the Lookout dashboard's task section uses. The
+/// event section is headed by `day`'s date ("Today"/"Tomorrow"/"Tue 12 Aug")
+/// and shows a "No events" placeholder when there are none; the task section
+/// shows a "No outstanding tasks" placeholder when the set is empty. Task
+/// rows are the Tasks view's own rows, captioned to match the event list
+/// and without the completion checkbox - clicking a row opens the shared
+/// task editor - with the click handler `build_window` registered on
+/// `calendar_state`. Unlike
+/// `refresh_displayed_calendar_view`, the event filter is by exact day
+/// rather than by the main Calendar view's own displayed month - the
+/// overview pane can be showing a day from a different month entirely.
 fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>, day: chrono::NaiveDate, day_list_box: &gtk::Box) {
     while let Some(child) = day_list_box.first_child() {
         day_list_box.remove(&child);
     }
 
-    let st = calendar_state.borrow();
-    let mut occurrences: Vec<&EventOccurrence> = st
-        .checked_occurrences_all_months()
-        .into_iter()
-        .filter(|occ| !calendar_view::covered_local_dates(occ, day, day).is_empty())
-        .collect();
-    occurrences.sort_by_key(|occ| occ.start);
+    let (occurrences, tasks, colors, activate) = {
+        let st = calendar_state.borrow();
+        let occurrences: Vec<EventOccurrence> = st
+            .checked_occurrences_all_months()
+            .into_iter()
+            .filter(|occ| !calendar_view::covered_local_dates(occ, day, day).is_empty())
+            .cloned()
+            .collect();
+        let mut occurrences = occurrences;
+        occurrences.sort_by_key(|occ| occ.start);
+        // The `merged_tasks` union, inlined here so everything reads from
+        // one borrow of `calendar_state`.
+        let tasks: Vec<CalendarTask> = st
+            .accounts
+            .values()
+            .flat_map(|h| h.last_tasks.iter().cloned())
+            .chain(st.google_tasks.values().flat_map(|h| h.last_tasks.iter().cloned()))
+            .chain(st.local_tasks.iter().cloned())
+            .collect();
+        let colors = st.calendar_colors.clone();
+        let activate = st.mail_overview_activate.clone().unwrap_or_else(|| Rc::new(|_t| {}));
+        (occurrences, tasks, colors, activate)
+    };
 
     let header = gtk::Label::builder()
         .label(calendar_view::agenda_day_header(day, chrono::Utc::now().date_naive()))
@@ -8002,7 +8062,7 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
         let grid = gtk::Grid::builder().row_spacing(10).column_spacing(6).build();
         for (row, occ) in occurrences.into_iter().enumerate() {
             let row = row as i32;
-            let color = st.calendar_colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR).to_string();
+            let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR).to_string();
             let dot = gtk::DrawingArea::builder().width_request(8).height_request(8).valign(gtk::Align::Center).build();
             dot.set_draw_func(move |_, cr, width, height| {
                 let (r, g, b) = crate::tasks_view::parse_css_color(&color);
@@ -8026,6 +8086,24 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
             grid.attach(&title, 2, row, 1, 1);
         }
         day_list_box.append(&grid);
+    }
+
+    let tasks_header = gtk::Label::builder()
+        .label("Outstanding tasks")
+        .css_classes(["caption-heading"])
+        .xalign(0.0)
+        .margin_top(8)
+        .build();
+    day_list_box.append(&tasks_header);
+
+    let outstanding = crate::lookout_view::outstanding_tasks(&tasks, chrono::Local::now().naive_local(), usize::MAX);
+    if outstanding.is_empty() {
+        let placeholder = gtk::Label::builder().label("No outstanding tasks").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+        day_list_box.append(&placeholder);
+    } else {
+        for task in outstanding {
+            day_list_box.append(&crate::tasks_view::task_row(&task, &colors, Rc::new(|_t, _c| {}), activate.clone(), &["caption"], false));
+        }
     }
 }
 
@@ -8675,10 +8753,12 @@ fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view:
     crate::tasks_view::set_tasks(tasks_view, &tasks, &colors);
     // Every task change funnels through here (CalDAV and Google Tasks
     // `TasksUpdated` events, local saves, checkbox flips), so this is the
-    // single point that keeps the Lookout dashboard's task section, and the
-    // mail toolbar's "Add as Task" flag button's icon, live.
+    // single point that keeps the Lookout dashboard's task section, the
+    // mail toolbar's "Add as Task" flag button's icon, and the Mail-screen
+    // overview pane's task list live.
     refresh_dashboard_hook(calendar_state);
     refresh_task_button_hook(calendar_state);
+    refresh_mail_overview_hook(calendar_state);
 }
 
 /// Runs the Lookout dashboard's repaint hook if the window has registered
@@ -8696,6 +8776,16 @@ fn refresh_dashboard_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
 /// `refresh_dashboard_hook`.
 fn refresh_task_button_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
     let hook = calendar_state.borrow().task_button_refresh.clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Runs the Mail-screen overview pane's repaint hook if the window has
+/// registered one - same no-op-until-wired convention as
+/// `refresh_dashboard_hook`.
+fn refresh_mail_overview_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
+    let hook = calendar_state.borrow().mail_overview_refresh.clone();
     if let Some(hook) = hook {
         hook();
     }

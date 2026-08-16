@@ -215,7 +215,7 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
             .build();
         view.list.append(&header);
         for task in bucket_tasks {
-            view.list.append(&task_row(&task, colors, toggle.clone(), activate.clone()));
+            view.list.append(&task_row(&task, colors, toggle.clone(), activate.clone(), &[], true));
         }
     }
 }
@@ -223,14 +223,22 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
 /// One task row: a completion checkbox, a calendar colour dot, the summary,
 /// and a right-aligned due-date caption. Completed rows render dimmed and
 /// struck through. Clicking the row body (not the checkbox) activates the
-/// row's edit callback. `pub(crate)` for the Lookout dashboard, whose
-/// outstanding-tasks section reuses the same row.
-pub(crate) fn task_row(task: &CalendarTask, colors: &CalendarColorMap, toggle: ToggleHandler, activate: ActivateHandler) -> gtk::Button {
+/// row's edit callback. `summary_classes` are extra CSS classes for the
+/// summary label - the Mail-screen overview pane passes `["caption"]` so its
+/// rows match the event list's text size, the Tasks view and the dashboard
+/// pass none. `show_check` omits the completion checkbox - the Mail-screen
+/// overview pane hides it, leaving click-to-edit as the row's only action.
+/// `pub(crate)` for the Lookout dashboard, whose outstanding-tasks section
+/// reuses the same row.
+pub(crate) fn task_row(task: &CalendarTask, colors: &CalendarColorMap, toggle: ToggleHandler, activate: ActivateHandler, summary_classes: &[&str], show_check: bool) -> gtk::Button {
     let task = task.clone();
     let completed = task.status == TaskStatus::Completed || task.percent_complete == Some(100);
 
-    let check = gtk::CheckButton::new();
-    check.set_active(completed);
+    let check = show_check.then(|| {
+        let check = gtk::CheckButton::new();
+        check.set_active(completed);
+        check
+    });
 
     // The calendar colour dot is cairo-painted (the same trick the "My
     // calendars" checklist uses for its indicators) because a stock GTK
@@ -252,6 +260,7 @@ pub(crate) fn task_row(task: &CalendarTask, colors: &CalendarColorMap, toggle: T
 
     let summary = gtk::Label::builder()
         .label(task.summary.clone().unwrap_or_else(|| "(untitled)".to_string()))
+        .css_classes(summary_classes)
         .xalign(0.0)
         .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -281,7 +290,9 @@ pub(crate) fn task_row(task: &CalendarTask, colors: &CalendarColorMap, toggle: T
         .margin_start(4)
         .margin_end(4)
         .build();
-    row_box.append(&check);
+    if let Some(check) = &check {
+        row_box.append(check);
+    }
     row_box.append(&dot);
     row_box.append(&summary);
     row_box.append(&due);
@@ -291,7 +302,7 @@ pub(crate) fn task_row(task: &CalendarTask, colors: &CalendarColorMap, toggle: T
     }
 
     let button = gtk::Button::builder().child(&row_box).css_classes(["flat"]).hexpand(true).build();
-    {
+    if let Some(check) = &check {
         let task = task.clone();
         check.connect_toggled(move |_| {
             let mut updated = task.clone();
