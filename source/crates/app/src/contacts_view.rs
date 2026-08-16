@@ -1270,11 +1270,36 @@ pub fn spawn_contacts_discovery(
             Ok((client, accounts)) if !accounts.is_empty() => {
                 show_page("contacts");
                 for account in accounts {
+                    let id = account.account_id.clone();
+                    // Record the account in the GOA union (disabled ones
+                    // included - Config's account list needs them), then
+                    // sync only the enabled ones. A disabled account's
+                    // contacts stay cached on disk, just unprocessed and
+                    // hidden, ready for a re-enable.
+                    let enabled = {
+                        let mut st = state.borrow_mut();
+                        let entry = st.goa_accounts.entry(id.clone()).or_insert(crate::window::DiscoveredGoaAccount {
+                            display_name: String::new(),
+                            email: String::new(),
+                            provider_type: None,
+                            mail: None,
+                            calendar: None,
+                            contacts: None,
+                        });
+                        entry.display_name = account.display_name.clone();
+                        entry.email = account.display_name.clone();
+                        entry.provider_type = account.provider_type.clone();
+                        entry.contacts = Some(account.clone());
+                        st.account_enabled(&id)
+                    };
+                    if !enabled {
+                        continue;
+                    }
                     // Each account's session gets its own command channel,
                     // stored so the People screen's editor/import/group flows
                     // can route writes to the right account.
                     let (cmd_tx, cmd_rx) = async_channel::unbounded();
-                    state.borrow_mut().contact_cmd_tx.insert(account.account_id.clone(), cmd_tx);
+                    state.borrow_mut().contact_cmd_tx.insert(id, cmd_tx);
                     sync_contacts_account(
                         worker.clone(),
                         state.clone(),

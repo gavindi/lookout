@@ -23,7 +23,7 @@ use crate::calendar_view::{self, CalendarMain};
 use crate::contacts_view::{
     calendar_attendee_suggestions, export_current_contacts, find_contact_by_address, merge_contact_suggestions, rebuild_contacts_list_ui, refresh_contacts_category_ui,
     show_contact_details_dialog, show_contact_editor_for, show_contacts_import_dialog, show_create_contact_for, show_manage_groups_dialog, show_new_contact_editor,
-    spawn_contacts_discovery, ContactCommand, ContactsAccountSnapshot, ContactsCategoryChoice, ContactsListEntry, SnapshotContactsProvider,
+    spawn_contacts_discovery, sync_contacts_account, ContactCommand, ContactsAccountSnapshot, ContactsCategoryChoice, ContactsListEntry, SnapshotContactsProvider,
 };
 use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
@@ -63,6 +63,22 @@ pub(crate) struct AccountHandle {
     /// `contacts_view`'s attendee autocomplete, which unions the mail-history
     /// caches across every connected account.
     pub(crate) address_cache: Option<Rc<lookout_mail::Cache>>,
+}
+
+/// One GNOME Online Accounts account as discovered at startup, keeping the
+/// raw GOA structs so a disabled account can be reconnected from Config
+/// without re-running discovery. Each of the three services the account
+/// advertises (Mail/Calendar/Contacts) is stored under its own field;
+/// Google Tasks keys off the calendar entry's display name (the email).
+/// `pub(crate)` because `contacts_view` inserts contacts entries into it.
+#[derive(Clone)]
+pub(crate) struct DiscoveredGoaAccount {
+    pub display_name: String,
+    pub email: String,
+    pub provider_type: Option<String>,
+    pub mail: Option<lookout_goa::GoaMailAccount>,
+    pub calendar: Option<GoaCalendarAccount>,
+    pub contacts: Option<lookout_goa::GoaContactsAccount>,
 }
 
 /// What the message list is currently showing - either a single mailbox (the
@@ -413,6 +429,16 @@ pub(crate) struct UiState {
     /// create/edit/delete/import flows. Keyed by account, inserted as each
     /// account's session starts in `spawn_contacts_discovery`.
     pub(crate) contact_cmd_tx: HashMap<AccountId, async_channel::Sender<ContactCommand>>,
+    /// Every GOA account discovered at startup, keyed by account id -
+    /// including disabled ones, so Config's account list (and a re-enable)
+    /// can refer to them without re-running discovery. Populated by the
+    /// mail/calendar/contacts discovery passes; the config view reads it and
+    /// the enable toggle reconnects from the stored structs.
+    pub(crate) goa_accounts: HashMap<AccountId, DiscoveredGoaAccount>,
+    /// One GOA D-Bus handle kept from the mail discovery pass, reused to
+    /// reconnect a re-enabled account without opening another session-bus
+    /// connection. `None` until mail discovery runs (or fails).
+    pub(crate) goa_client: Option<GoaClient>,
     /// Which account owns the currently-open mailbox - drives command
     /// routing (FetchBody, compose "From") and which account's
     /// `MessagesUpdated` events are allowed to update the message list (a
@@ -707,6 +733,26 @@ pub(crate) struct UiState {
     /// (always, even for an empty match set - see the session docs), removing
     /// its entry; an empty set means the live pass is done.
     search_pending: HashSet<(AccountId, MailboxId)>,
+}
+
+impl UiState {
+    /// Whether a GOA account is enabled: everything is enabled unless its id
+    /// sits in the `accounts-disabled` preference (Config → Accounts).
+    /// `pub(crate)` for `contacts_view`'s discovery filtering.
+    pub(crate) fn account_enabled(&self, id: &AccountId) -> bool {
+        !self.settings.get_strv(crate::settings::ACCOUNTS_DISABLED).iter().any(|disabled| disabled == &id.0)
+    }
+
+    /// Marks a GOA account enabled/disabled, persisting the whole disabled
+    /// set through the `accounts-disabled` preference.
+    pub fn set_account_enabled(&self, id: &AccountId, enabled: bool) {
+        let mut disabled = self.settings.get_strv(crate::settings::ACCOUNTS_DISABLED);
+        disabled.retain(|existing| existing != &id.0);
+        if !enabled {
+            disabled.push(id.0.clone());
+        }
+        self.settings.set_strv(crate::settings::ACCOUNTS_DISABLED, disabled);
+    }
 }
 
 /// Per-calendar-account state, kept separate from `UiState`/`AccountHandle`
@@ -1604,6 +1650,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         app_config: Rc::new(RefCell::new(crate::app_config::load())),
         deleted_contacts: HashMap::new(),
         contact_cmd_tx: HashMap::new(),
+        goa_accounts: HashMap::new(),
+        goa_client: None,
         current_account: None,
         current_mailbox: None,
         mail_view: MailView::Single,
@@ -5556,8 +5604,42 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let dashboard_refresh = dashboard_refresh.clone();
         let mark_read_button = mark_read_button.clone();
         let star_button = star_button.clone();
+        // Everything the GOA enable/disable toggle needs beyond the mail
+        // set above: the calendar/tasks/contacts wiring, and the page-state
+        // cells the re-enable path flips back from their empty states.
+        let root_stack = root_stack.clone();
+        let current_mail_page = current_mail_page.clone();
+        let mail_view_button = mail_view_button.clone();
+        let current_calendar_page = current_calendar_page.clone();
+        let calendar_view_button = calendar_view_button.clone();
+        let current_tasks_page = current_tasks_page.clone();
+        let tasks_view_button = tasks_view_button.clone();
+        let current_lookout_page = current_lookout_page.clone();
+        let lookout_view_button = lookout_view_button.clone();
+        let calendar_main = calendar_main.clone();
+        let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        let reminders_engine = reminders_engine.clone();
+        let tasks_view = tasks_view.clone();
+        let refresh_contacts_ui = refresh_contacts_ui.clone();
         move || {
             let st = state.borrow();
+            // The GOA enable/disable list - every account the discoveries
+            // saw, disabled ones included (a disabled account must stay
+            // visible here so it can be turned back on).
+            let mut goa: Vec<crate::config_view::GoaAccountInfo> = st
+                .goa_accounts
+                .iter()
+                .map(|(account_id, a)| crate::config_view::GoaAccountInfo {
+                    display_name: a.display_name.clone(),
+                    email: a.email.clone(),
+                    account_id: account_id.0.clone(),
+                    enabled: st.account_enabled(account_id),
+                })
+                .collect();
+            goa.sort_by_key(|a| a.display_name.to_lowercase());
             let mut mail: Vec<crate::config_view::MailAccountInfo> = st
                 .accounts
                 .iter()
@@ -5748,8 +5830,117 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     refresh();
                 })
             };
+            // The GOA enable/disable switches: persist the preference, then
+            // connect the account's services back up (enable) or tear them
+            // down and hide everything (disable).
+            let toggle_goa: crate::config_view::AccountToggle = {
+                let state = state.clone();
+                let calendar_state = calendar_state.clone();
+                let worker = worker.clone();
+                let window = window.clone();
+                let app = app.clone();
+                let toast_overlay = toast_overlay.clone();
+                let folder_selection = folder_selection.clone();
+                let folder_scroller = folder_scroller.clone();
+                let message_list = message_list.clone();
+                let message_list_stack = message_list_stack.clone();
+                let message_header = message_header.clone();
+                let reading_stack = reading_stack.clone();
+                let list_header = list_header.clone();
+                let dashboard_refresh = dashboard_refresh.clone();
+                let mark_read_button = mark_read_button.clone();
+                let star_button = star_button.clone();
+                let root_stack = root_stack.clone();
+                let current_mail_page = current_mail_page.clone();
+                let mail_view_button = mail_view_button.clone();
+                let current_calendar_page = current_calendar_page.clone();
+                let calendar_view_button = calendar_view_button.clone();
+                let current_tasks_page = current_tasks_page.clone();
+                let tasks_view_button = tasks_view_button.clone();
+                let current_lookout_page = current_lookout_page.clone();
+                let lookout_view_button = lookout_view_button.clone();
+                let calendar_main = calendar_main.clone();
+                let calendar_list_box = calendar_list_box.clone();
+                let mini_calendar = mini_calendar.clone();
+                let mail_overview_day = mail_overview_day.clone();
+                let mail_overview_day_list = mail_overview_day_list.clone();
+                let reminders_engine = reminders_engine.clone();
+                let tasks_view = tasks_view.clone();
+                let refresh_contacts_ui = refresh_contacts_ui.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |account_id: &str, enabled: bool| {
+                    let id = AccountId(account_id.to_string());
+                    state.borrow().set_account_enabled(&id, enabled);
+                    if enabled {
+                        let discovered = state.borrow().goa_accounts.get(&id).cloned();
+                        if let Some(discovered) = discovered {
+                            connect_goa_account(
+                                worker.clone(),
+                                state.clone(),
+                                calendar_state.clone(),
+                                &id,
+                                &discovered,
+                                root_stack.clone(),
+                                current_mail_page.clone(),
+                                mail_view_button.clone(),
+                                current_calendar_page.clone(),
+                                calendar_view_button.clone(),
+                                current_tasks_page.clone(),
+                                tasks_view_button.clone(),
+                                current_lookout_page.clone(),
+                                lookout_view_button.clone(),
+                                folder_selection.clone(),
+                                folder_scroller.clone(),
+                                message_list.clone(),
+                                message_list_stack.clone(),
+                                message_header.clone(),
+                                reading_stack.clone(),
+                                toast_overlay.clone(),
+                                window.clone(),
+                                app.clone(),
+                                list_header.clone(),
+                                dashboard_refresh.clone(),
+                                mark_read_button.clone(),
+                                star_button.clone(),
+                                calendar_main.clone(),
+                                calendar_list_box.clone(),
+                                mini_calendar.clone(),
+                                mail_overview_day.clone(),
+                                mail_overview_day_list.clone(),
+                                reminders_engine.clone(),
+                                tasks_view.clone(),
+                                refresh_contacts_ui.clone(),
+                            );
+                        }
+                    } else {
+                        let email = state.borrow().goa_accounts.get(&id).map(|a| a.email.clone());
+                        teardown_goa_account(
+                            &state,
+                            &calendar_state,
+                            &id,
+                            email.as_deref(),
+                            &folder_selection,
+                            &folder_scroller,
+                            &message_list,
+                            &message_list_stack,
+                            &list_header,
+                            &calendar_main,
+                            &calendar_list_box,
+                            &reminders_engine,
+                            &tasks_view,
+                            &refresh_contacts_ui,
+                            &dashboard_refresh,
+                        );
+                    }
+                    // Repaint the Config account list so the switch's new
+                    // state and the service lists underneath stay current.
+                    let refresh = refresh_hook.borrow().clone();
+                    refresh();
+                })
+            };
             crate::config_view::refresh(
                 &config_view,
+                &goa,
                 &mail,
                 &calendar,
                 &webcal,
@@ -5762,6 +5953,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &manage_identities,
                 &edit_other,
                 &remove_other,
+                &toggle_goa,
             );
         }
     });
@@ -6903,9 +7095,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contacts_view_button,
         refresh_contacts_ui,
     );
-    spawn_google_tasks_discovery(worker.clone(), calendar_state.clone(), tasks_view.clone(), toast_overlay.clone());
+    spawn_google_tasks_discovery(worker.clone(), state.clone(), calendar_state.clone(), tasks_view.clone(), toast_overlay.clone());
     spawn_calendar_discovery(
         worker,
+        state,
         calendar_state,
         root_stack,
         toast_overlay,
@@ -7064,44 +7257,74 @@ fn spawn_account_discovery(
             }
         };
         match result {
-            Ok((client, accounts)) if !accounts.is_empty() => {
-                show_page("mail");
-                show_lookout_page("lookout");
-                // One AccountSession actor per connected account, all
-                // running concurrently on the worker thread. `GoaClient` is
-                // a cheap Arc-backed handle (see its doc comment), so
-                // cloning it per account reuses the one D-Bus connection
-                // rather than opening a redundant one each time.
+            Ok((client, accounts)) => {
+                // Record every discovered account (disabled ones included -
+                // Config's account list and a later re-enable need them),
+                // then connect only the enabled ones. An account list of
+                // nothing-but-disabled accounts therefore falls through to
+                // the same empty/fallback handling as GOA reporting none at
+                // all - the disabled accounts stay visible in Config.
+                let mut enabled_accounts = Vec::new();
                 for account in accounts {
-                    connect_account(
-                        worker.clone(),
-                        state.clone(),
-                        folder_selection.clone(),
-                        folder_scroller.clone(),
-                        message_list.clone(),
-                        message_list_stack.clone(),
-                        message_header.clone(),
-                        reading_stack.clone(),
-                        toast_overlay.clone(),
-                        window.clone(),
-                        app.clone(),
-                        client.clone(),
-                        list_header.clone(),
-                        account,
-                        dashboard_refresh.clone(),
-                        mark_read_button.clone(),
-                        star_button.clone(),
-                    );
+                    let id = AccountId(account.account_id.0.clone());
+                    let enabled = {
+                        let mut st = state.borrow_mut();
+                        st.goa_client = Some(client.clone());
+                        let entry = st.goa_accounts.entry(id.clone()).or_insert(DiscoveredGoaAccount {
+                            display_name: String::new(),
+                            email: String::new(),
+                            provider_type: None,
+                            mail: None,
+                            calendar: None,
+                            contacts: None,
+                        });
+                        entry.display_name = account.display_name.clone();
+                        entry.email = account.email.clone();
+                        entry.provider_type = account.provider_type.clone();
+                        entry.mail = Some(account.clone());
+                        st.account_enabled(&id)
+                    };
+                    if enabled {
+                        enabled_accounts.push(account);
+                    }
                 }
-                refresh_config();
-            }
-            // GOA itself reported no (or zero usable) accounts - but manual
-            // "other" accounts are connected synchronously, before this async
-            // D-Bus round trip can land, so `state.accounts` may already be
-            // non-empty by the time this branch runs. Only show the empty
-            // state if nothing at all is connected.
-            Ok(_) => {
-                if state.borrow().accounts.is_empty() {
+                if !enabled_accounts.is_empty() {
+                    show_page("mail");
+                    show_lookout_page("lookout");
+                    // One AccountSession actor per connected account, all
+                    // running concurrently on the worker thread. `GoaClient` is
+                    // a cheap Arc-backed handle (see its doc comment), so
+                    // cloning it per account reuses the one D-Bus connection
+                    // rather than opening a redundant one each time.
+                    for account in enabled_accounts {
+                        connect_account(
+                            worker.clone(),
+                            state.clone(),
+                            folder_selection.clone(),
+                            folder_scroller.clone(),
+                            message_list.clone(),
+                            message_list_stack.clone(),
+                            message_header.clone(),
+                            reading_stack.clone(),
+                            toast_overlay.clone(),
+                            window.clone(),
+                            app.clone(),
+                            client.clone(),
+                            list_header.clone(),
+                            account,
+                            dashboard_refresh.clone(),
+                            mark_read_button.clone(),
+                            star_button.clone(),
+                        );
+                    }
+                    refresh_config();
+                }
+                // GOA itself reported no (or zero usable) accounts - but manual
+                // "other" accounts are connected synchronously, before this async
+                // D-Bus round trip can land, so `state.accounts` may already be
+                // non-empty by the time this branch runs. Only show the empty
+                // state if nothing at all is connected.
+                else if state.borrow().accounts.is_empty() {
                     show_page("empty");
                     show_lookout_page("lookout-empty");
                 } else {
@@ -7797,12 +8020,225 @@ fn connect_other_account(
     );
 }
 
+/// Tears a GOA account down after the user disables it in Config → Accounts:
+/// every running service (mail, calendar, Google Tasks, contacts) stops by
+/// dropping its handle - which closes the session's command channel, the
+/// same clean-shutdown convention the other-account Remove path relies on -
+/// per-account state is pruned, and every view is repainted so nothing from
+/// the account remains visible. The on-disk caches are deliberately kept: a
+/// re-enable reconnects to them immediately (see `connect_goa_account`).
+#[allow(clippy::too_many_arguments)]
+fn teardown_goa_account(
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    account_id: &AccountId,
+    email: Option<&str>,
+    folder_selection: &gtk::SingleSelection,
+    folder_scroller: &gtk::ScrolledWindow,
+    message_list: &MessageListModel,
+    message_list_stack: &gtk::Stack,
+    list_header: &ListHeader,
+    calendar_main: &Rc<CalendarMain>,
+    calendar_list_box: &gtk::Box,
+    reminders_engine: &Rc<RefCell<crate::reminders::ReminderEngine>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+    refresh_contacts_ui: &Rc<dyn Fn(Option<i32>)>,
+    dashboard_refresh: &Rc<dyn Fn()>,
+) {
+    // -- mail -- Prune every per-mailbox piece of state the account feeds so
+    // no stale data survives, and note whether the open mailbox belonged to
+    // it (the view must navigate away or the messages stay on screen).
+    let open_mailbox_was_this_account = {
+        let mut st = state.borrow_mut();
+        st.accounts.remove(account_id);
+        let belongs = |mailbox: &MailboxId| mailbox_account_id(mailbox).as_ref() == Some(account_id);
+        st.unified_snapshots.retain(|mailbox, _| !belongs(mailbox));
+        st.syncing.retain(|mailbox| !belongs(mailbox));
+        st.pending_optimistic_removals.retain(|mailbox, _| !belongs(mailbox));
+        st.pending_optimistic_flag_changes.retain(|mailbox, _| !belongs(mailbox));
+        st.search_results.retain(|summary| !belongs(&summary.mailbox));
+        st.search_pending.retain(|(_, mailbox)| !belongs(mailbox));
+        st.current_mailbox.as_ref().is_some_and(belongs)
+    };
+    if open_mailbox_was_this_account {
+        enter_unified_inbox(state, message_list, message_list_stack);
+    }
+    // A unified-view list drawn from the disabled account's inbox snapshots
+    // must repopulate even when no mailbox was open.
+    if matches!(state.borrow().mail_view, MailView::UnifiedInbox) {
+        let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
+        let (key, descending) = current_sort(state);
+        message_list.repopulate(all, key, descending);
+        refresh_message_loading_state(state, message_list, message_list_stack);
+    }
+    rebuild_folder_tree(state, folder_selection, folder_scroller);
+    refresh_list_header(state, list_header);
+    dashboard_refresh();
+
+    // -- calendar, Google Tasks, reminders --
+    {
+        let mut st = calendar_state.borrow_mut();
+        st.accounts.remove(account_id);
+        // Calendar ids embed their account's id as a prefix; drop every
+        // checked entry belonging to the disabled account.
+        let prefix = format!("{}:", account_id.0);
+        st.checked_calendar_ids.retain(|id| !id.0.starts_with(&prefix));
+        if let Some(email) = email {
+            st.google_tasks.remove(email);
+            st.google_account_emails.retain(|e| e != email);
+        }
+    }
+    reminders_engine.borrow_mut().remove_account(account_id);
+    refresh_calendar_checklist(calendar_state, calendar_list_box, calendar_main);
+    refresh_displayed_calendar_view(calendar_state, calendar_main);
+    refresh_tasks_view(calendar_state, tasks_view);
+
+    // -- contacts --
+    {
+        let mut st = state.borrow_mut();
+        st.contacts_by_account.remove(account_id);
+        st.deleted_contacts.remove(account_id);
+        st.contact_cmd_tx.remove(account_id);
+    }
+    refresh_contacts_ui(None);
+}
+
+/// Reconnects every service a GOA account advertises after the user
+/// re-enables it in Config → Accounts, from the account's stored discovery
+/// structs (`UiState::goa_accounts`) - no discovery re-run needed. Also
+/// flips the relevant pages back from their empty states, since a re-enabled
+/// account is live again the moment its sessions spawn.
+#[allow(clippy::too_many_arguments)]
+fn connect_goa_account(
+    worker: Rc<Worker>,
+    state: Rc<RefCell<UiState>>,
+    calendar_state: Rc<RefCell<CalendarUiState>>,
+    account_id: &AccountId,
+    account: &DiscoveredGoaAccount,
+    root_stack: gtk::Stack,
+    current_mail_page: Rc<Cell<&'static str>>,
+    mail_view_button: gtk::ToggleButton,
+    current_calendar_page: Rc<Cell<&'static str>>,
+    calendar_view_button: gtk::ToggleButton,
+    current_tasks_page: Rc<Cell<&'static str>>,
+    tasks_view_button: gtk::ToggleButton,
+    current_lookout_page: Rc<Cell<&'static str>>,
+    lookout_view_button: gtk::ToggleButton,
+    folder_selection: gtk::SingleSelection,
+    folder_scroller: gtk::ScrolledWindow,
+    message_list: MessageListModel,
+    message_list_stack: gtk::Stack,
+    message_header: crate::message_header::MessageHeader,
+    reading_stack: gtk::Stack,
+    toast_overlay: adw::ToastOverlay,
+    window: adw::ApplicationWindow,
+    app: adw::Application,
+    list_header: ListHeader,
+    dashboard_refresh: Rc<dyn Fn()>,
+    mark_read_button: gtk::Button,
+    star_button: gtk::Button,
+    calendar_main: Rc<CalendarMain>,
+    calendar_list_box: gtk::Box,
+    mini_calendar: calendar_view::MiniCalendar,
+    mail_overview_day: Rc<Cell<chrono::NaiveDate>>,
+    mail_overview_day_list: gtk::Box,
+    reminders_engine: Rc<RefCell<crate::reminders::ReminderEngine>>,
+    tasks_view: Rc<crate::tasks_view::TasksView>,
+    refresh_contacts_ui: Rc<dyn Fn(Option<i32>)>,
+) {
+    let Some(goa_client) = state.borrow().goa_client.clone() else {
+        tracing::warn!("no GOA client available to reconnect {account_id}");
+        return;
+    };
+    let account_id = account_id.clone();
+    if let Some(mail) = &account.mail {
+        connect_account(
+            worker.clone(),
+            state.clone(),
+            folder_selection.clone(),
+            folder_scroller.clone(),
+            message_list.clone(),
+            message_list_stack.clone(),
+            message_header.clone(),
+            reading_stack.clone(),
+            toast_overlay.clone(),
+            window.clone(),
+            app.clone(),
+            goa_client.clone(),
+            list_header.clone(),
+            mail.clone(),
+            dashboard_refresh.clone(),
+            mark_read_button.clone(),
+            star_button.clone(),
+        );
+        current_mail_page.set("mail");
+        if mail_view_button.is_active() {
+            root_stack.set_visible_child_name("mail");
+        }
+    }
+    if let Some(calendar) = &account.calendar {
+        connect_calendar_account(
+            worker.clone(),
+            calendar_state.clone(),
+            calendar_main.clone(),
+            calendar_list_box.clone(),
+            mini_calendar.clone(),
+            mail_overview_day.clone(),
+            mail_overview_day_list.clone(),
+            reminders_engine.clone(),
+            toast_overlay.clone(),
+            goa_client.clone(),
+            calendar.clone(),
+            tasks_view.clone(),
+        );
+        current_calendar_page.set("calendar");
+        if calendar_view_button.is_active() {
+            root_stack.set_visible_child_name("calendar");
+        }
+        current_tasks_page.set("tasks");
+        if tasks_view_button.is_active() {
+            root_stack.set_visible_child_name("tasks");
+        }
+    }
+    if let Some(contacts) = &account.contacts {
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        state.borrow_mut().contact_cmd_tx.insert(account_id.clone(), cmd_tx);
+        sync_contacts_account(
+            worker.clone(),
+            state.clone(),
+            toast_overlay.clone(),
+            goa_client.clone(),
+            contacts.clone(),
+            cmd_rx,
+            refresh_contacts_ui.clone(),
+        );
+    }
+    // Google Tasks needs a stored OAuth token to connect silently; without
+    // one it just reappears as a "Connect Google Tasks" button target.
+    if account.provider_type.as_deref() == Some("google") {
+        if !calendar_state.borrow().google_account_emails.contains(&account.email) {
+            calendar_state.borrow_mut().google_account_emails.push(account.email.clone());
+        }
+        if google_tasks::has_stored_token(&account.email) && !calendar_state.borrow().google_tasks.contains_key(&account.email) {
+            connect_google_tasks_account(worker.clone(), calendar_state.clone(), tasks_view.clone(), toast_overlay.clone(), account.email.clone());
+        }
+    }
+    // The Lookout dashboard goes live as soon as any account set exists.
+    if !state.borrow().accounts.is_empty() || !calendar_state.borrow().accounts.is_empty() {
+        current_lookout_page.set("lookout");
+        if lookout_view_button.is_active() {
+            root_stack.set_visible_child_name("lookout");
+        }
+    }
+}
+
 /// Mirrors `spawn_account_discovery` 1:1 for Calendar - a fully independent
 /// GOA account set, discovered and connected the same worker-spawn +
 /// `glib::spawn_future_local` way.
 #[allow(clippy::too_many_arguments)]
 fn spawn_calendar_discovery(
     worker: Rc<Worker>,
+    state: Rc<RefCell<UiState>>,
     calendar_state: Rc<RefCell<CalendarUiState>>,
     root_stack: gtk::Stack,
     toast_overlay: adw::ToastOverlay,
@@ -7857,31 +8293,61 @@ fn spawn_calendar_discovery(
             }
         };
         match result {
-            Ok((client, accounts)) if !accounts.is_empty() => {
-                show_page("calendar");
-                show_tasks_page("tasks");
-                show_lookout_page("lookout");
+            Ok((client, accounts)) => {
+                // Record every discovered calendar account into `state`'s GOA
+                // union (disabled ones included - see the mail discovery's
+                // note), then connect only the enabled ones. A nothing-but-
+                // disabled result falls through to the same empty handling
+                // as GOA reporting no calendar accounts at all.
+                let mut enabled_accounts = Vec::new();
                 for account in accounts {
-                    connect_calendar_account(
-                        worker.clone(),
-                        calendar_state.clone(),
-                        calendar_main.clone(),
-                        calendar_list_box.clone(),
-                        mini_calendar.clone(),
-                        mail_overview_day.clone(),
-                        mail_overview_day_list.clone(),
-                        reminders_engine.clone(),
-                        toast_overlay.clone(),
-                        client.clone(),
-                        account,
-                        tasks_view.clone(),
-                    );
+                    let id = account.account_id.clone();
+                    let enabled = {
+                        let mut st = state.borrow_mut();
+                        st.goa_client = Some(client.clone());
+                        let entry = st.goa_accounts.entry(id.clone()).or_insert(DiscoveredGoaAccount {
+                            display_name: String::new(),
+                            email: String::new(),
+                            provider_type: None,
+                            mail: None,
+                            calendar: None,
+                            contacts: None,
+                        });
+                        entry.display_name = account.display_name.clone();
+                        entry.email = account.display_name.clone();
+                        entry.provider_type = account.provider_type.clone();
+                        entry.calendar = Some(account.clone());
+                        st.account_enabled(&id)
+                    };
+                    if enabled {
+                        enabled_accounts.push(account);
+                    }
                 }
-                refresh_config();
-            }
-            Ok(_) => {
-                show_page("calendar-empty");
-                show_tasks_page("tasks-empty");
+                if !enabled_accounts.is_empty() {
+                    show_page("calendar");
+                    show_tasks_page("tasks");
+                    show_lookout_page("lookout");
+                    for account in enabled_accounts {
+                        connect_calendar_account(
+                            worker.clone(),
+                            calendar_state.clone(),
+                            calendar_main.clone(),
+                            calendar_list_box.clone(),
+                            mini_calendar.clone(),
+                            mail_overview_day.clone(),
+                            mail_overview_day_list.clone(),
+                            reminders_engine.clone(),
+                            toast_overlay.clone(),
+                            client.clone(),
+                            account,
+                            tasks_view.clone(),
+                        );
+                    }
+                    refresh_config();
+                } else {
+                    show_page("calendar-empty");
+                    show_tasks_page("tasks-empty");
+                }
             }
             Err(e) => {
                 show_page("calendar-empty");
@@ -7904,7 +8370,13 @@ fn ensure_checked_calendars(checked: &mut HashSet<CalendarId>, calendars: &[Cale
 /// emails for the "Connect Google Tasks" button, and auto-connects those
 /// with a stored refresh token - the non-interactive path, since a stored
 /// token means the user authorized once already.
-fn spawn_google_tasks_discovery(worker: Rc<Worker>, calendar_state: Rc<RefCell<CalendarUiState>>, tasks_view: Rc<crate::tasks_view::TasksView>, toast_overlay: adw::ToastOverlay) {
+fn spawn_google_tasks_discovery(
+    worker: Rc<Worker>,
+    state: Rc<RefCell<UiState>>,
+    calendar_state: Rc<RefCell<CalendarUiState>>,
+    tasks_view: Rc<crate::tasks_view::TasksView>,
+    toast_overlay: adw::ToastOverlay,
+) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
         let result = async {
@@ -7920,9 +8392,12 @@ fn spawn_google_tasks_discovery(worker: Rc<Worker>, calendar_state: Rc<RefCell<C
         let Ok(result) = goa_rx.recv().await else { return };
         match result {
             Ok(accounts) => {
+                // Disabled accounts are excluded here too - a disabled Google
+                // account must neither auto-connect nor appear as a "Connect
+                // Google Tasks" target.
                 let emails: Vec<String> = accounts
                     .iter()
-                    .filter(|a| a.provider_type.as_deref() == Some("google"))
+                    .filter(|a| a.provider_type.as_deref() == Some("google") && state.borrow().account_enabled(&a.account_id))
                     .map(|a| a.display_name.clone())
                     .collect();
                 {
@@ -13376,6 +13851,21 @@ mod tests {
         assert_ne!(before, after, "a changed count must rebuild the tree - it's what the row draws");
     }
 
+    #[test]
+    fn goa_accounts_are_enabled_by_default_and_toggle_persists() {
+        let state = test_state(Vec::new());
+        let id = AccountId("/org/gnome/OnlineAccounts/Accounts/account_1".into());
+        let other = AccountId("/org/gnome/OnlineAccounts/Accounts/account_2".into());
+        assert!(state.borrow().account_enabled(&id), "accounts are enabled by default");
+        state.borrow().set_account_enabled(&id, false);
+        assert!(!state.borrow().account_enabled(&id));
+        // Disabling one account leaves the others enabled.
+        assert!(state.borrow().account_enabled(&other));
+        // Re-enabling works.
+        state.borrow().set_account_enabled(&id, true);
+        assert!(state.borrow().account_enabled(&id));
+    }
+
     fn attachment(part_number: &str, filename: Option<&str>) -> BodyPart {
         BodyPart {
             part_number: part_number.to_string(),
@@ -13665,6 +14155,8 @@ mod tests {
             app_config: Rc::new(RefCell::new(crate::app_config::AppConfig::default())),
             deleted_contacts: HashMap::new(),
             contact_cmd_tx: HashMap::new(),
+            goa_accounts: HashMap::new(),
+            goa_client: None,
             current_account: None,
             current_mailbox: None,
             mail_view: MailView::Single,

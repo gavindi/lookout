@@ -101,6 +101,11 @@
       <summary>Favorite mailboxes</summary>
       <description>MailboxIds of folders pinned to the top of the folder tree.</description>
     </key>
+    <key name="accounts-disabled" type="as">
+      <default>[]</default>
+      <summary>Disabled GNOME Online Accounts accounts</summary>
+      <description>AccountIds of GOA accounts whose mail, calendars, tasks and contacts Lookout must not process; everything else is enabled by default.</description>
+    </key>
     <key name="mail-threaded" type="b">
       <default>true</default>
       <summary>Group replies into conversations</summary>

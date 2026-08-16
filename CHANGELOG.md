@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.51 (2026-08-17)
+
+### Added
+
+- **Accounts**: Config → Accounts gains a **GNOME Online Accounts** list with one on/off switch per discovered GOA account (all of them - mail-, calendar-, contacts- and contacts-only accounts alike - enabled by default). Flipping an account off stops Lookout from processing it entirely: its IMAP/CalDAV/CardDAV sessions and Google Tasks sync shut down cleanly (the same drop-the-handle teardown the other-account Remove path uses), its folders leave the folder tree, its inboxes leave the unified view, its events leave the calendar checklist and reminders (with their persisted alert rows cleared via a new `ReminderEngine::remove_account`), its tasks leave the Tasks view and the dashboard, its contacts leave the People view, its identities leave the composer's From list, and an open mailbox belonging to it navigates away to the unified view - so nothing from a disabled account is visible anywhere. Flipping it back on reconnects everything the account advertises from the account structs the startup discoveries already cached (no re-discovery needed), including Google Tasks when a token is stored, and flips the Mail/Calendar/Tasks/Lookout pages back from their empty states. The choice persists across restarts in the new `accounts-disabled` GSettings key (a strv of account ids, empty by default); on-disk caches are deliberately kept, so re-enabling is instant. Discovery in all four startup passes (mail, calendar, Google Tasks, contacts) now filters through this preference before connecting, and an all-disabled result is treated exactly like no accounts - the empty state shows, but the accounts stay listed and toggleable in Config.
+
 ## 0.9.50 (2026-08-17)
 
 ### Added

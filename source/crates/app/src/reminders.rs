@@ -195,6 +195,19 @@ impl ReminderEngine {
         self.store.insert(key, ("fired".to_string(), None));
     }
 
+    /// Drops every occurrence ingested from `account_id` (a disabled GOA
+    /// account): their alerts must not fire, and their index/database rows
+    /// are removed so a re-enable starts clean.
+    pub fn remove_account(&mut self, account_id: &AccountId) {
+        let removed: Vec<String> = self.index.iter().filter(|(_, (account, _))| account == account_id).map(|(key, _)| key.clone()).collect();
+        for key in removed {
+            if let Some((_, occ)) = self.index.remove(&key) {
+                self.clear_db_row(&occ);
+                self.store.remove(&key);
+            }
+        }
+    }
+
     /// Best-effort write of `(state, snooze_until)` for `occ` to the
     /// UI-state db, mirroring the store's primary key exactly. A failed
     /// write only means the state won't survive a restart.
@@ -553,5 +566,33 @@ mod tests {
         // And its persisted row is cleared from the database.
         assert!(persisted_row(&db.borrow(), &stale).is_none());
         assert!(persisted_row(&db.borrow(), &fresh).is_none());
+    }
+
+    #[test]
+    fn remove_account_prunes_its_alerts_and_persisted_rows() {
+        let now = chrono::Local::now();
+        let event = occ("removed", &(now + Duration::minutes(30)).with_timezone(&Utc).to_rfc3339(), Some(15));
+        let other = occ("other", &(now + Duration::minutes(30)).with_timezone(&Utc).to_rfc3339(), Some(15));
+        let (mut engine, db) = engine_with("remove-account", &[event.clone()]);
+        engine.ingest(&AccountId("other-account".into()), &[other.clone()]);
+        // A previous session had fired the disabled account's alert; its
+        // persisted row must not survive the teardown.
+        let event_start = event.start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        db.borrow().set_reminder_state("cal-test", "removed", &event_start, "fired", None).unwrap();
+
+        engine.remove_account(&AccountId("test-account".into()));
+
+        // The disabled account's alert is gone - index, store, and database.
+        assert_eq!(engine.index.len(), 1);
+        assert!(engine.index.contains_key(&alert_key(&other)));
+        assert!(!engine.index.contains_key(&alert_key(&event)));
+        assert!(!engine.store.contains_key(&alert_key(&event)));
+        assert!(persisted_row(&db.borrow(), &event).is_none());
+        // The other account's alert still fires normally; the removed one
+        // never does.
+        let due = engine.tick(now + Duration::minutes(16));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].occurrence.uid.0, "other");
+        assert!(engine.tick(now + Duration::minutes(20)).is_empty());
     }
 }

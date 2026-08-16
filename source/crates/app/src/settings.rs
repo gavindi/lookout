@@ -47,6 +47,9 @@ pub const PANE_CONFIG_SIDEBAR_WIDTH_PCT: &str = "pane-config-sidebar-width-perce
 pub const SORT_KEY: &str = "sort-key";
 pub const SORT_DESCENDING: &str = "sort-descending";
 pub const MAIL_FAVORITES: &str = "mail-favorites";
+/// AccountIds (GOA object paths) of accounts the user disabled in Config →
+/// Accounts; everything else is enabled by default.
+pub const ACCOUNTS_DISABLED: &str = "accounts-disabled";
 pub const MAIL_THREADED: &str = "mail-threaded";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
@@ -138,6 +141,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(SORT_KEY, Value::String("date".into()));
     map.insert(SORT_DESCENDING, Value::Bool(true));
     map.insert(MAIL_FAVORITES, Value::Strv(Vec::new()));
+    map.insert(ACCOUNTS_DISABLED, Value::Strv(Vec::new()));
     map.insert(MAIL_THREADED, Value::Bool(true));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
@@ -300,6 +304,7 @@ mod tests {
         assert_eq!(store.get_string(THEME_ID), "flat-dark");
         assert_eq!(store.get_string(ACCENT_COLOR), "");
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());
+        assert!(store.get_strv(ACCOUNTS_DISABLED).is_empty());
         assert!(store.get_strv(SHORTCUTS).is_empty());
     }
 }

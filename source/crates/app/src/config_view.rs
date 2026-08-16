@@ -25,6 +25,25 @@ pub type ManageIdentities = Rc<dyn Fn(&gtk::Widget, &str)>;
 /// down) - the caller distinguishes the two by which closure it registers.
 pub type OtherAccountAction = Rc<dyn Fn(&gtk::Widget, &str)>;
 
+/// The caller's hook for a GOA account row's switch: takes the account id
+/// (opaque string) and the switch's new state. The caller owns the actual
+/// connect/teardown and persistence.
+pub type AccountToggle = Rc<dyn Fn(&str, bool)>;
+
+/// Plain display data for one GOA account in the Accounts section's
+/// enable/disable list - the union of every account the discoveries saw,
+/// disabled ones included, so a disabled account stays toggleable.
+pub struct GoaAccountInfo {
+    pub display_name: String,
+    pub email: String,
+    /// The account's id, as an opaque string - handed back to the caller's
+    /// toggle callback so it can route the change to the right account.
+    pub account_id: String,
+    /// Whether the account is currently enabled (all accounts are, unless
+    /// the user disabled one).
+    pub enabled: bool,
+}
+
 /// Plain display data for one mail account, decoupled from window.rs's
 /// private `AccountHandle` so this module has no dependency on the session
 /// types.
@@ -97,6 +116,10 @@ pub struct ConfigView {
     /// own manually-managed mail accounts (see `other_accounts.rs`), wired
     /// by the caller to the add-account dialog.
     pub add_imap_row: adw::ActionRow,
+    /// The GOA accounts enable/disable list, rebuilt by `refresh` like the
+    /// mail/calendar groups.
+    goa_group: adw::PreferencesGroup,
+    goa_rows: RefCell<Vec<adw::SwitchRow>>,
     /// "Clear all caches…" row, exposed so the caller can wire its
     /// `activated` signal to the actual cache-clearing (the mail cache lives
     /// in the `lookout-mail` crate, out of this module's reach).
@@ -257,6 +280,11 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     accounts_group.add(&add_imap_row);
+
+    // The enable/disable list for GNOME Online Accounts accounts, alongside
+    // the add rows above. Repopulated by `refresh` with one switch row per
+    // discovered account.
+    let goa_group = adw::PreferencesGroup::builder().title("GNOME Online Accounts").build();
 
     let mail_group = adw::PreferencesGroup::builder().title("Mail accounts").build();
 
@@ -463,7 +491,7 @@ pub fn build() -> ConfigView {
     section_stack.set_hexpand(true);
 
     let mut sections: Vec<(&'static str, &'static str)> = Vec::new();
-    add_section(&section_stack, &mut sections, "Accounts", "accounts", &[&accounts_group]);
+    add_section(&section_stack, &mut sections, "Accounts", "accounts", &[&accounts_group, &goa_group]);
     add_section(&section_stack, &mut sections, "Mail accounts", "mail-accounts", &[&mail_group]);
     add_section(&section_stack, &mut sections, "Calendar accounts", "calendar-accounts", &[&calendar_group]);
     add_section(&section_stack, &mut sections, "Webcal subscriptions", "webcal", &[&webcal_group]);
@@ -521,6 +549,8 @@ pub fn build() -> ConfigView {
         paned,
         add_account_row,
         add_imap_row,
+        goa_group,
+        goa_rows: RefCell::new(Vec::new()),
         clear_cache_row,
         animations_row,
         theme_row,
@@ -568,6 +598,7 @@ pub fn build() -> ConfigView {
 #[allow(clippy::too_many_arguments)]
 pub fn refresh(
     view: &ConfigView,
+    goa: &[GoaAccountInfo],
     mail: &[MailAccountInfo],
     calendar: &[CalendarAccountInfo],
     webcal: &[WebcalSubscriptionInfo],
@@ -580,7 +611,33 @@ pub fn refresh(
     manage_identities: &ManageIdentities,
     edit_other: &OtherAccountAction,
     remove_other: &OtherAccountAction,
+    toggle_goa: &AccountToggle,
 ) {
+    for row in view.goa_rows.borrow_mut().drain(..) {
+        view.goa_group.remove(&row);
+    }
+    if goa.is_empty() {
+        let row = adw::SwitchRow::builder().title("No GNOME Online Accounts accounts").sensitive(false).build();
+        view.goa_group.add(&row);
+        view.goa_rows.borrow_mut().push(row);
+    } else {
+        for info in goa {
+            let row = adw::SwitchRow::builder()
+                .title(glib::markup_escape_text(&info.display_name))
+                .subtitle(glib::markup_escape_text(&info.email))
+                .active(info.enabled)
+                .build();
+            // Wired per refresh rather than once at build: `active` is set
+            // above before the callback attaches, so a rebuild can't fire
+            // the handler for the rows it just created.
+            let toggle_goa = toggle_goa.clone();
+            let account_id = info.account_id.clone();
+            row.connect_active_notify(move |row| toggle_goa(&account_id, row.is_active()));
+            view.goa_group.add(&row);
+            view.goa_rows.borrow_mut().push(row);
+        }
+    }
+
     for row in view.mail_rows.borrow_mut().drain(..) {
         view.mail_group.remove(&row);
     }

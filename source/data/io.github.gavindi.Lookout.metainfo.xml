@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.51" date="2026-08-17">
+      <description>
+        <p>Config → Accounts gains a GNOME Online Accounts list with one on/off switch per discovered account, enabled by default. Flipping an account off stops Lookout from processing it entirely - its mail, calendars, reminders, tasks, and contacts disappear from every view and its sessions shut down; flipping it back on reconnects everything instantly. The choice persists across restarts, and a disabled account's local caches are kept so re-enabling needs no full resync.</p>
+      </description>
+    </release>
     <release version="0.9.50" date="2026-08-17">
       <description>
         <p>Mail accounts no longer have to come from GNOME Online Accounts. Config → Accounts gains an "Add IMAP/SMTP account…" row for connecting a mail account by host, port, username, and password; these accounts sync, send, and appear in the sidebar exactly like GNOME Online Accounts ones, with their passwords kept in the GNOME keyring. Config → Mail accounts gains Edit and Remove actions for accounts added this way.</p>
