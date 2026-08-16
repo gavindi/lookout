@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icons/lookout-logo.svg" alt="Lookout" width="256">
+</p>
+
 # Lookout
 
 A native GNOME mail client written in Rust, built on GTK 4, libadwaita, and WebKitGTK. Lookout is a reimplementation of Microsoft Outlook as a desktop application, talking to your mail directly over IMAP/SMTP (plus CalDAV for calendars and CardDAV for contacts), with accounts sourced from **GNOME Online Accounts**.
@@ -17,6 +21,8 @@ For the marketing story and a feature walkthrough, see [MARKETING.md](MARKETING.
 - Built around `GNOME Online Accounts` — add an account in system settings and it just shows up, no credential handling in Lookout itself.
 
 See [TODO.md](TODO.md) for the full, completed Phases 1–5 breakdown.
+
+![Reading a message in dark mode](assets/screenshots/mail_read_dark_1.png)
 
 ## Project layout
 
