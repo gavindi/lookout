@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.66 (2026-08-18)
+
+### Changed
+
+- **Mail**: the IMAP connection is now DEFLATE-compressed (RFC 4978) after login on servers that advertise `COMPRESS=DEFLATE`, cutting 4–10× off the wire bytes for the first sync of a large folder, the background body prefetch, and the per-IDLE-wake flag fetch. `login` sends `COMPRESS DEFLATE` right after `ENABLE CONDSTORE`, gated on the capability read from the same post-login `CAPABILITY` fetch that already caches `MOVE`/`CONDSTORE`/`QRESYNC` — Gmail, which doesn't advertise it, keeps the plain path untouched. Unlike async-imap's stock `compress` (which consumes the session and loses the connection if the server answers BAD/NO), the command goes through the borrowing `run_command_and_check_ok`, so a rejection is a non-fatal downgrade to an uncompressed session, matching how `ENABLE` failures are already tolerated; on success the stream is re-wrapped in a DEFLATE codec before anything else is read, with the codec sitting inside TLS (compression is an IMAP-layer concern, RFC 4978 §2.1). To make that possible, `async-imap` 0.11.3 is now vendored alongside `imap-proto` (`crates/async-imap`, wired via `[patch.crates-io]`) with one local addition — `Session::map_stream`, an in-place stream swap that sends no command — plus `DeflateStream::new` widened to `pub`. The session's stream is type-erased into a shared boxed `SessionStream` at `login`, so the ~25 `Session<ImapStream>` call sites and every command path (IDLE, LIST-STATUS, QRESYNC SELECT, MOVE/STORE batches, previews) are untouched by which transport is underneath.
+
 ## 0.9.65 (2026-08-18)
 
 ### Added

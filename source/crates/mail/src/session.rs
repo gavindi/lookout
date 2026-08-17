@@ -13,7 +13,7 @@ use lookout_core::{AccountId, BodyPart, EmailBody, EmailSummary, Mailbox, Mailbo
 use crate::auth::XOAuth2Authenticator;
 use crate::body::{parse_body, preview_from_raw};
 use crate::config::{AccountConfig, Credential};
-use crate::connection::{connect_tls, ImapStream};
+use crate::connection::{connect_tls, SessionStream};
 use crate::envelope::{flags_from_fetch, summary_from_fetch};
 use crate::error::{Error, Result};
 use crate::send::{build_raw_message, send_smtp, ComposedMessage};
@@ -2193,7 +2193,7 @@ fn uid_set_chunks(uids: &[Uid]) -> Vec<String> {
 /// Add and remove are two separate STOREs because IMAP has no combined form;
 /// an empty side is skipped rather than sent as an empty flag list, which
 /// servers are entitled to reject.
-async fn store_raw_flags(session: &mut Session<ImapStream>, uids: &[Uid], add: &[String], remove: &[String]) -> Result<()> {
+async fn store_raw_flags(session: &mut Session<SessionStream>, uids: &[Uid], add: &[String], remove: &[String]) -> Result<()> {
     let uid_chunks = uid_set_chunks(uids);
     for (op, flags) in [('+', add), ('-', remove)] {
         if flags.is_empty() {
@@ -2210,7 +2210,7 @@ async fn store_raw_flags(session: &mut Session<ImapStream>, uids: &[Uid], add: &
 
 /// `store_raw_flags` for system flags: maps each `SystemFlagBit` to its IMAP
 /// atom and delegates.
-async fn store_flags(session: &mut Session<ImapStream>, uids: &[Uid], add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<()> {
+async fn store_flags(session: &mut Session<SessionStream>, uids: &[Uid], add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<()> {
     let add = add.iter().map(|f| f.as_imap_flag().to_string()).collect::<Vec<_>>();
     let remove = remove.iter().map(|f| f.as_imap_flag().to_string()).collect::<Vec<_>>();
     store_raw_flags(session, uids, &add, &remove).await
@@ -2233,7 +2233,7 @@ fn valid_keyword_atom(keyword: &str) -> bool {
 /// Moves `uids` (one or many) from the currently selected mailbox into the
 /// account's mailbox with special-use role `role`, via IMAP MOVE (RFC 6851)
 /// if the server advertises it, else COPY + STORE `\Deleted` + EXPUNGE.
-async fn move_message_to_role(session: &mut Session<ImapStream>, folders: &[Mailbox], account_id: &AccountId, uids: &[Uid], role: MailboxRole, has_move: bool) -> Result<()> {
+async fn move_message_to_role(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, uids: &[Uid], role: MailboxRole, has_move: bool) -> Result<()> {
     let Some(target) = folders.iter().find(|m| m.role == role) else {
         return Err(Error::NoSuchFolder(role));
     };
@@ -2248,7 +2248,7 @@ async fn move_message_to_role(session: &mut Session<ImapStream>, folders: &[Mail
 /// set (RFC 6851) when the server advertises it, else COPY + STORE
 /// `\Deleted` + EXPUNGE. `has_move` comes from the single post-login
 /// `CAPABILITY` fetch, never a per-batch round trip.
-async fn move_uids_to_path(session: &mut Session<ImapStream>, uids: &[Uid], path: &str, has_move: bool) -> Result<()> {
+async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], path: &str, has_move: bool) -> Result<()> {
     let uid_chunks = uid_set_chunks(uids);
     if has_move {
         for uid_set in &uid_chunks {
@@ -2279,7 +2279,7 @@ async fn move_uids_to_path(session: &mut Session<ImapStream>, uids: &[Uid], path
 async fn send_message(
     config: &AccountConfig,
     credentials: &dyn CredentialProvider,
-    session: &mut Session<ImapStream>,
+    session: &mut Session<SessionStream>,
     folders: &[Mailbox],
     msg: ComposedMessage,
 ) -> Result<Option<MailboxId>> {
@@ -2317,7 +2317,7 @@ fn drafts_path<'a>(folders: &'a [Mailbox], account_id: &AccountId) -> Option<&'a
 /// crate sets `\Deleted` inside the folder being emptied. Returns how many
 /// messages were removed (0 when the folder is already empty, with no round
 /// trips beyond the search).
-async fn empty_mailbox(session: &mut Session<ImapStream>) -> Result<u32> {
+async fn empty_mailbox(session: &mut Session<SessionStream>) -> Result<u32> {
     let uids = session.uid_search("ALL").await?;
     let count = uids.len() as u32;
     if uids.is_empty() {
@@ -2337,7 +2337,7 @@ async fn empty_mailbox(session: &mut Session<ImapStream>) -> Result<u32> {
 /// on servers without RFC 6851; the EXPUNGE-everything-`\Deleted` caveat
 /// from `move_message_to_role` applies, and is harmless here because this
 /// crate only ever sets `\Deleted` on the very uids it just flagged.
-async fn purge_by_message_id(session: &mut Session<ImapStream>, message_id: &str) -> Result<()> {
+async fn purge_by_message_id(session: &mut Session<SessionStream>, message_id: &str) -> Result<()> {
     let uids: Vec<Uid> = session.uid_search(format!("HEADER Message-Id <{message_id}>")).await?.into_iter().map(Uid).collect();
     if uids.is_empty() {
         return Ok(());
@@ -2358,7 +2358,7 @@ async fn purge_by_message_id(session: &mut Session<ImapStream>, message_id: &str
 /// such an account would be a worse surprise than a new folder. Leaves the
 /// session SELECTed on the Drafts mailbox; the caller re-selects the
 /// user's folder. Returns the draft's `Message-ID`.
-async fn save_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], account_id: &AccountId, msg: ComposedMessage, replace: bool) -> Result<String> {
+async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, msg: ComposedMessage, replace: bool) -> Result<String> {
     let path = match drafts_path(folders, account_id) {
         Some(path) => path.to_string(),
         None => {
@@ -2385,7 +2385,7 @@ async fn save_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], acco
 /// mailbox (a no-op when the account has no Drafts mailbox or the draft
 /// isn't there). Leaves the session SELECTed on the Drafts mailbox; the
 /// caller re-selects the user's folder.
-async fn delete_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], account_id: &AccountId, message_id: &str) -> Result<()> {
+async fn delete_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, message_id: &str) -> Result<()> {
     let Some(path) = drafts_path(folders, account_id) else {
         return Ok(());
     };
@@ -2393,7 +2393,7 @@ async fn delete_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], ac
     purge_by_message_id(session, message_id).await
 }
 
-async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<ImapStream>, bool, bool, bool, bool)> {
+async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, bool, bool, bool, bool)> {
     let stream = connect_tls(&config.imap.host, config.imap.port).await?;
     tracing::debug!("login: creating client, reading greeting");
     let mut client = async_imap::Client::new(stream);
@@ -2454,6 +2454,35 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
             }
         }
     }
+
+    // COMPRESS=DEFLATE (RFC 4978): switch the whole connection to DEFLATE,
+    // cutting 4-10x off the first sync of a large folder and the per-wake
+    // flag fetch. Gated on the capability (servers that don't advertise it -
+    // Gmail among them - keep the plain path). Rejection is a non-fatal
+    // downgrade: `run_command_and_check_ok` borrows the session, so unlike
+    // async-imap's stock `compress` (which consumes the session and loses the
+    // connection on error), a BAD/NO answer leaves the uncompressed session
+    // intact. On success the server starts compressing immediately after its
+    // OK, so the stream is re-wrapped before anything else is read; the
+    // DEFLATE wrapper goes inside the TLS session (compression is an IMAP-
+    // layer concern, RFC 4978 §2.1).
+    //
+    // Both branches end on the same boxed `SessionStream` type so the
+    // session's callers never see which transport is underneath.
+    let session = if capabilities.has_str("COMPRESS=DEFLATE") {
+        match session.run_command_and_check_ok("COMPRESS DEFLATE").await {
+            Ok(()) => {
+                tracing::debug!("COMPRESS DEFLATE enabled for connection");
+                session.map_stream(|stream| Box::new(async_imap::DeflateStream::new(stream)) as SessionStream)
+            }
+            Err(e) => {
+                tracing::debug!("server rejected COMPRESS DEFLATE, continuing uncompressed: {e}");
+                session.map_stream(|stream| Box::new(stream) as SessionStream)
+            }
+        }
+    } else {
+        session.map_stream(|stream| Box::new(stream) as SessionStream)
+    };
     Ok((session, has_move, condstore, has_list_status, qresync))
 }
 
@@ -2511,7 +2540,7 @@ fn apply_status_items(mailbox: &mut Mailbox, status: &[StatusAttribute]) {
 /// STATUS response for `\NoSelect` mailboxes (RFC 5819 §2), so those keep
 /// LIST-only defaults - the same way `refresh_folder_counts` leaves a failed
 /// STATUS alone.
-async fn list_mailboxes_with_status(session: &mut Session<ImapStream>, account_id: &AccountId, condstore: bool) -> Result<Vec<Mailbox>> {
+async fn list_mailboxes_with_status(session: &mut Session<SessionStream>, account_id: &AccountId, condstore: bool) -> Result<Vec<Mailbox>> {
     let query = format!("LIST \"\" \"*\" RETURN (STATUS {})", status_count_query(condstore));
     session.run_command(query).await?;
     let mut mailboxes: Vec<Mailbox> = Vec::new();
@@ -2555,7 +2584,7 @@ async fn list_mailboxes_with_status(session: &mut Session<ImapStream>, account_i
 /// whether the LIST answered the counts; when false the caller queues the
 /// per-folder STATUS drain as before. Any server rejection - or a response
 /// that can't be decoded - falls back to the plain LIST and the drain.
-async fn list_mailboxes(session: &mut Session<ImapStream>, account_id: &AccountId, condstore: bool, has_list_status: bool) -> Result<(Vec<Mailbox>, bool)> {
+async fn list_mailboxes(session: &mut Session<SessionStream>, account_id: &AccountId, condstore: bool, has_list_status: bool) -> Result<(Vec<Mailbox>, bool)> {
     if has_list_status {
         match list_mailboxes_with_status(session, account_id, condstore).await {
             Ok(mailboxes) => return Ok((mailboxes, true)),
@@ -2600,7 +2629,7 @@ fn status_count_query(condstore: bool) -> &'static str {
 /// `HIGHESTMODSEQ` (RFC 7162 §3.2.1: a CONDSTORE server MUST support it as
 /// a STATUS data item) - the STATUS drain is the one pass that touches every
 /// folder, so it's how folders that never get SELECTed still learn a modseq.
-async fn refresh_folder_counts(session: &mut Session<ImapStream>, folder: &mut Mailbox, account_id: &AccountId, condstore: bool) -> bool {
+async fn refresh_folder_counts(session: &mut Session<SessionStream>, folder: &mut Mailbox, account_id: &AccountId, condstore: bool) -> bool {
     let Some(path) = folder.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
         return false;
     };
@@ -2753,7 +2782,7 @@ async fn publish_folders(folders: &[Mailbox], account_id: &AccountId, cache: &Ca
 // LIST-STATUS path skip the whole STATUS drain, so the count is worth it.
 #[allow(clippy::too_many_arguments)]
 async fn relist_folders(
-    session: &mut Session<ImapStream>,
+    session: &mut Session<SessionStream>,
     folders: &mut Vec<Mailbox>,
     counts_pending: &mut VecDeque<MailboxId>,
     account_id: &AccountId,
@@ -2796,7 +2825,7 @@ fn imap_quote(s: &str) -> String {
 /// answer; `sync_mailbox`'s whole-folder strategy is not used here because
 /// the server already did the filtering (and re-fetching a whole folder to
 /// filter locally would defeat the fallback's purpose).
-async fn search_mailbox(session: &mut Session<ImapStream>, account_id: &AccountId, mailbox: &MailboxId, query: &str) -> Result<Vec<EmailSummary>> {
+async fn search_mailbox(session: &mut Session<SessionStream>, account_id: &AccountId, mailbox: &MailboxId, query: &str) -> Result<Vec<EmailSummary>> {
     let search_query = format!("TEXT {}", imap_quote(query));
     let uids = session.uid_search(&search_query).await?;
     if uids.is_empty() {
@@ -2851,7 +2880,7 @@ async fn search_mailbox(session: &mut Session<ImapStream>, account_id: &AccountI
 /// the folder's actual counts come from the fetch the caller already ran.
 /// Any `Err` means the caller should downgrade to the plain CONDSTORE delta.
 async fn select_with_qresync(
-    session: &mut Session<ImapStream>,
+    session: &mut Session<SessionStream>,
     folder_path: &str,
     uidvalidity: UidValidity,
     modseq: u64,
@@ -2893,7 +2922,7 @@ async fn select_with_qresync(
 // for the session-critical helper.
 #[allow(clippy::too_many_arguments)]
 async fn sync_mailbox(
-    session: &mut Session<ImapStream>,
+    session: &mut Session<SessionStream>,
     account_id: &AccountId,
     folder_path: &str,
     mailbox_id: &MailboxId,
@@ -3340,7 +3369,7 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
 /// A no-op (no round trip, no second event) when every message already has a
 /// preview, which is the steady state once a mailbox has been synced once.
 async fn fetch_previews(
-    session: &mut Session<ImapStream>,
+    session: &mut Session<SessionStream>,
     mailbox_id: &MailboxId,
     uidvalidity: UidValidity,
     mut messages: Vec<EmailSummary>,
@@ -3390,7 +3419,7 @@ async fn fetch_previews(
 /// `BODY[]`/`RFC822` so reading a message doesn't implicitly set `\Seen`
 /// server-side - the UI layer decides if/when to mark as read, matching
 /// Bulwark's configurable mark-as-read-delay behavior.
-async fn fetch_body(session: &mut Session<ImapStream>, uid: Uid) -> Result<Option<Vec<u8>>> {
+async fn fetch_body(session: &mut Session<SessionStream>, uid: Uid) -> Result<Option<Vec<u8>>> {
     let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
     let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {
         return Ok(None);
@@ -3407,7 +3436,7 @@ async fn fetch_body(session: &mut Session<ImapStream>, uid: Uid) -> Result<Optio
 /// the whole-message fallback inside `fetch_body_cached` - which already
 /// downloads the full `BODY.PEEK[]` when a partial fetch isn't possible, so
 /// persisting those bytes to the export cache costs nothing extra.
-async fn fetch_raw_message_cached(cache: &CacheHandle, session: &mut Session<ImapStream>, mailbox: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<Option<Vec<u8>>> {
+async fn fetch_raw_message_cached(cache: &CacheHandle, session: &mut Session<SessionStream>, mailbox: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<Option<Vec<u8>>> {
     if let Some(cached) = cache_op(cache, {
         let mailbox = mailbox.clone();
         move |c| c.load_raw_message(&mailbox, uid, uidvalidity)
@@ -3484,7 +3513,7 @@ fn body_from_fetch(uid: Uid, fetch: &Fetch, parts: &[BodyPart]) -> Option<EmailB
 /// Returns `None` (rather than an error) when the message has no text parts
 /// to fetch or the server didn't return the requested sections; the caller
 /// falls back to a whole-message fetch rather than showing an empty pane.
-async fn fetch_body_partial(session: &mut Session<ImapStream>, uid: Uid, parts: &[BodyPart]) -> Result<Option<EmailBody>> {
+async fn fetch_body_partial(session: &mut Session<SessionStream>, uid: Uid, parts: &[BodyPart]) -> Result<Option<EmailBody>> {
     let text_parts: Vec<&BodyPart> = parts.iter().filter(|p| p.is_text() || p.is_calendar()).collect();
     if text_parts.is_empty() {
         return Ok(None);
@@ -3520,7 +3549,7 @@ async fn fetch_body_partial(session: &mut Session<ImapStream>, uid: Uid, parts: 
 /// `fetch_body_cached` applies. Returns the number of bodies stored.
 async fn fetch_bodies_batch(
     cache: &CacheHandle,
-    session: &mut Session<ImapStream>,
+    session: &mut Session<SessionStream>,
     mailbox: &MailboxId,
     uidvalidity: UidValidity,
     batch: &[Uid],
@@ -3616,7 +3645,7 @@ async fn fetch_bodies_batch(
 /// via `transfer_part_bytes`). An embedded `message/rfc822` attachment is
 /// returned whole, not re-parsed. Returns `None` if the server didn't return
 /// the section (rather than erroring), so the caller can no-op gracefully.
-async fn fetch_attachment_part(session: &mut Session<ImapStream>, uid: Uid, part: &BodyPart) -> Result<Option<Vec<u8>>> {    // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part` the
+async fn fetch_attachment_part(session: &mut Session<SessionStream>, uid: Uid, part: &BodyPart) -> Result<Option<Vec<u8>>> {    // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part` the
     // server's response carries, exactly as `fetch_body_partial` relies on.
     let path = part_section_path(&part.part_number);
     let query = format!("(BODY.PEEK[{}])", part.part_number);
@@ -3642,7 +3671,7 @@ async fn fetch_attachment_part(session: &mut Session<ImapStream>, uid: Uid, part
 /// caller reports as a missing part.
 async fn fetch_stale_part_fallback(
     cache: &CacheHandle,
-    session: &mut Session<ImapStream>,
+    session: &mut Session<SessionStream>,
     mailbox: &MailboxId,
     uid: Uid,
     uidvalidity: UidValidity,
@@ -3671,7 +3700,7 @@ async fn fetch_stale_part_fallback(
 /// either way.
 async fn fetch_body_cached(
     cache: &CacheHandle,
-    session: &mut Session<ImapStream>,
+    session: &mut Session<SessionStream>,
     mailbox: &MailboxId,
     uid: Uid,
     uidvalidity: UidValidity,

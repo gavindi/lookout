@@ -13,7 +13,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 
-async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio", "compress"] }
 futures = "0.3"
 base64 = "0.22"
 
@@ -44,7 +44,7 @@ anyhow = "1"
 # Same version/features as the regular dependency: the integration test opens
 # its own plain-TCP IMAP session to APPEND a crafted message with an
 # attachment, which `run_account_session`'s public API has no way to do.
-async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio", "compress"] }
 futures = "0.3"
 lookout-goa.workspace = true
 lookout-mail = { path = ".", features = ["test-utils"] }

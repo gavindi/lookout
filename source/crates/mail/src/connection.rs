@@ -54,6 +54,20 @@ fn enable_keepalive(stream: &TcpStream) {
 /// can be handed over as-is, with no `futures-io` compat shim needed.
 pub type ImapStream = TlsStream<TcpStream>;
 
+/// The combined stream bounds an `async_imap::Session` needs, as a single
+/// trait: a trait object can only name one non-auto trait, so the boxed
+/// stream below is typed as `dyn AsyncStream` (whose supertraits the `dyn`
+/// object itself implements).
+pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug> AsyncStream for T {}
+
+/// The stream type a logged-in `async_imap::Session` runs on once the
+/// connection is up: a type-erased stream, because the concrete type depends
+/// on whether `COMPRESS DEFLATE` was enabled after login (a `DeflateStream`
+/// wrapping the TLS stream) or not (the bare TLS stream). Boxed so every
+/// `Session<SessionStream>` signature is one type either way.
+pub type SessionStream = Box<dyn AsyncStream>;
+
 /// Rustls 0.23 refuses to pick a default `CryptoProvider` automatically when
 /// more than one backend is linked into the binary - which happens here
 /// because `lettre`'s `tokio1-rustls-tls` feature pulls in `aws-lc-rs`
