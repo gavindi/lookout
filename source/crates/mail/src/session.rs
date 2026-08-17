@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use async_imap::imap_proto::types::{MailboxDatum, NameAttribute, Response, Status, StatusAttribute};
+use async_imap::imap_proto::types::{MailboxDatum, MessageSection, NameAttribute, Response, SectionPath, Status, StatusAttribute};
+use async_imap::types::Fetch;
 use async_imap::Session;
 use futures::TryStreamExt;
 use lookout_core::mailbox::role_from_special_use;
@@ -2046,41 +2047,32 @@ async fn connect_and_run(
                     did_prefetch_work = true;
                 }
 
-                // Fetch up to PREFETCH_BATCH_SIZE bodies, yielding to user
-                // commands between each fetch so they are never blocked for
-                // more than one body download.
+                // Fetch up to PREFETCH_BATCH_SIZE bodies in **one** `UID
+                // FETCH` round trip (see `fetch_bodies_batch`), yielding to
+                // user commands between batches so they are never blocked for
+                // more than one batch's transfer.
                 if !pf.pending_uids.is_empty() {
-                    // Check before starting body fetches.
+                    // Check before starting the batch fetch.
                     if !commands.is_empty() {
                         continue;
                     }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(PREFETCH_BATCH_SIZE)).collect();
-                    let mut fetched = 0usize;
-                    for (i, uid) in batch.iter().enumerate() {
-                        // A user command may have arrived during the previous
-                        // body fetch. If so, put back the remaining UIDs and
-                        // break out so the command is processed promptly.
-                        if i > 0 && !commands.is_empty() {
-                            pf.pending_uids.splice(0..0, batch[i..].iter().cloned());
-                            break;
+                    let fetched = match fetch_bodies_batch(
+                        cache,
+                        &mut session,
+                        &pf.mailboxes[pf.current],
+                        pf.uidvalidity,
+                        &batch,
+                        &pf.structures,
+                    )
+                    .await
+                    {
+                        Ok(fetched) => fetched,
+                        Err(e) => {
+                            tracing::warn!(?e, "prefetch: batch fetch failed");
+                            0
                         }
-                        match fetch_body_cached(
-                            cache,
-                            &mut session,
-                            &pf.mailboxes[pf.current],
-                            *uid,
-                            pf.uidvalidity,
-                            pf.structures.get(uid).map(Vec::as_slice),
-                        )
-                        .await
-                        {
-                            Ok(Some(_)) => fetched += 1,
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(?uid, "prefetch: body fetch failed: {e}");
-                            }
-                        }
-                    }
+                    };
                     if fetched > 0 {
                         tracing::debug!(
                             mailbox = %pf.mailboxes[pf.current],
@@ -3276,6 +3268,41 @@ async fn fetch_raw_message_cached(cache: &CacheHandle, session: &mut Session<Ima
     Ok(Some(raw))
 }
 
+/// The `SectionPath` that a `BODY.PEEK[<part_number>]` request resolves to in
+/// the `FETCH` response. `BODY.PEEK[1.2]` parses back into the same
+/// `SectionPath::Part` value the server's response carries, so `Fetch::section`
+/// can match it by equality.
+fn part_section_path(part_number: &str) -> SectionPath {
+    SectionPath::Part(part_number.split('.').filter_map(|n| n.parse().ok()).collect(), None)
+}
+
+/// Assembles one message's [`EmailBody`] from its `FETCH` response, given the
+/// message's `BODYSTRUCTURE`-derived part list: the raw `BODY.PEEK[HEADER]`
+/// bytes become `EmailBody::headers`, and each text/calendar part's section
+/// that the server returned becomes the body's decoded text. Shared by the
+/// single-message `fetch_body_partial` and the prefetch's batched fetch.
+///
+/// Returns `None` (rather than an error) when the response carries no text
+/// part for the message; the caller falls back to a whole-message fetch
+/// rather than showing an empty pane.
+fn body_from_fetch(uid: Uid, fetch: &Fetch, parts: &[BodyPart]) -> Option<EmailBody> {
+    let headers = fetch
+        .section(&SectionPath::Full(MessageSection::Header))
+        .map(crate::body::parse_headers_section)
+        .unwrap_or_default();
+
+    let mut fetched: Vec<(String, Vec<u8>)> = Vec::new();
+    for part in parts.iter().filter(|p| p.is_text() || p.is_calendar()) {
+        if let Some(bytes) = fetch.section(&part_section_path(&part.part_number)) {
+            fetched.push((part.part_number.clone(), bytes.to_vec()));
+        }
+    }
+    if fetched.is_empty() {
+        return None;
+    }
+    Some(crate::body::assemble_body_from_parts(uid, headers, parts, &fetched))
+}
+
 /// Fetches just the parts a message viewer needs: the full header block and
 /// the bytes of every `text/plain`/`text/html` part, each by its
 /// `BODYSTRUCTURE`-derived section path, plus the `text/calendar` part (the
@@ -3303,27 +3330,114 @@ async fn fetch_body_partial(session: &mut Session<ImapStream>, uid: Uid, parts: 
     let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {
         return Ok(None);
     };
+    Ok(body_from_fetch(uid, &fetch, parts))
+}
 
-    let headers = fetch
-        .section(&async_imap::imap_proto::types::SectionPath::Full(async_imap::imap_proto::types::MessageSection::Header))
-        .map(crate::body::parse_headers_section)
-        .unwrap_or_default();
+/// Fetches the text parts of a whole prefetch batch in **one** `UID FETCH`
+/// round trip: the full header block and every text/calendar part's bytes for
+/// each message, by the `BODYSTRUCTURE`-derived section paths the envelope
+/// pass learned (`pf.structures`). The query's part list is the *union* of
+/// the batch's part numbers - a message that lacks a part the union mentions
+/// simply gets no section back for it. Responses are matched back to their
+/// messages by the (explicitly requested) UID data item, so no per-message
+/// ordering is assumed.
+///
+/// Bodies that landed in the cache since the envelope pass (a user click, a
+/// previous run) are skipped with one `has_bodies` query rather than
+/// re-downloaded - a single blocking-pool hop, where the per-message path
+/// paid a `load_body` JSON decode per uid. A message whose response carries
+/// no text part degrades to a whole-message fetch, the same fallback
+/// `fetch_body_cached` applies. Returns the number of bodies stored.
+async fn fetch_bodies_batch(
+    cache: &CacheHandle,
+    session: &mut Session<ImapStream>,
+    mailbox: &MailboxId,
+    uidvalidity: UidValidity,
+    batch: &[Uid],
+    structures: &HashMap<Uid, Vec<BodyPart>>,
+) -> Result<usize> {
+    if batch.is_empty() {
+        return Ok(0);
+    }
 
-    let mut fetched: Vec<(String, Vec<u8>)> = Vec::new();
-    for part in &text_parts {
-        // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part`
-        // value the server's response carries, so `Fetch::section` can match
-        // it by equality.
-        let path = async_imap::imap_proto::types::SectionPath::Part(part.part_number.split('.').filter_map(|n| n.parse().ok()).collect(), None);
-        if let Some(bytes) = fetch.section(&path) {
-            fetched.push((part.part_number.clone(), bytes.to_vec()));
+    // Drop uids whose body landed in the cache since the envelope pass.
+    let have = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let batch = batch.to_vec();
+        move |c| c.has_bodies(&mailbox, &batch, uidvalidity)
+    })
+    .await
+    .and_then(|r| r.ok())
+    .unwrap_or_default();
+    let batch: Vec<Uid> = batch.iter().copied().filter(|uid| !have.contains(uid)).collect();
+    if batch.is_empty() {
+        return Ok(0);
+    }
+
+    // Union of the batch's text/calendar part numbers - one query item per
+    // distinct part path. A message without any text part never matches a
+    // section and falls back to a whole-message fetch below.
+    let mut part_numbers: Vec<&str> = Vec::new();
+    for parts in batch.iter().filter_map(|uid| structures.get(uid)) {
+        for part in parts.iter().filter(|p| p.is_text() || p.is_calendar()) {
+            if !part_numbers.contains(&part.part_number.as_str()) {
+                part_numbers.push(part.part_number.as_str());
+            }
         }
     }
-    if fetched.is_empty() {
-        return Ok(None);
+    if part_numbers.is_empty() {
+        return Ok(0);
+    }
+    let mut query = String::from("(UID BODY.PEEK[HEADER]");
+    for number in &part_numbers {
+        query.push_str(" BODY.PEEK[");
+        query.push_str(number);
+        query.push(']');
+    }
+    query.push(')');
+
+    // The batch is at most `PREFETCH_BATCH_SIZE` uids, so `uid_set_chunks`
+    // yields a single (range-compressed) chunk, keeping the command line well
+    // under servers' length limits.
+    let set = uid_set_chunks(&batch)[0].clone();
+    let fetches: Vec<_> = session.uid_fetch(&set, &query).await?.try_collect().await?;
+
+    let mut bodies: Vec<(Uid, EmailBody)> = Vec::new();
+    for fetch in &fetches {
+        let Some(uid) = fetch.uid.map(Uid) else { continue };
+        let Some(parts) = structures.get(&uid) else { continue };
+        if let Some(body) = body_from_fetch(uid, fetch, parts) {
+            bodies.push((uid, body));
+        }
     }
 
-    Ok(Some(crate::body::assemble_body_from_parts(uid, headers, parts, &fetched)))
+    // Messages the batch response carried no text part for degrade to the
+    // whole-message fetch, exactly as the per-message path does.
+    let missing: HashSet<Uid> = batch.iter().copied().filter(|uid| !bodies.iter().any(|(u, _)| u == uid)).collect();
+    for uid in &missing {
+        match fetch_raw_message_cached(cache, session, mailbox, *uid, uidvalidity).await {
+            Ok(Some(raw)) => {
+                if let Some(body) = parse_body(*uid, &raw) {
+                    bodies.push((*uid, body));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(?uid, "prefetch: whole-message fallback failed: {e}"),
+        }
+    }
+
+    let stored = bodies.len();
+    if stored > 0 {
+        if let Some(Err(e)) = cache_op(cache, {
+            let mailbox = mailbox.clone();
+            move |c| c.store_bodies(&mailbox, uidvalidity, &bodies)
+        })
+        .await
+        {
+            tracing::warn!(?mailbox, "prefetch: failed to cache bodies: {e}");
+        }
+    }
+    Ok(stored)
 }
 
 /// Fetches one attachment part's wire bytes for the on-demand
@@ -3335,7 +3449,7 @@ async fn fetch_body_partial(session: &mut Session<ImapStream>, uid: Uid, parts: 
 async fn fetch_attachment_part(session: &mut Session<ImapStream>, uid: Uid, part: &BodyPart) -> Result<Option<Vec<u8>>> {
     // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part` the
     // server's response carries, exactly as `fetch_body_partial` relies on.
-    let path = async_imap::imap_proto::types::SectionPath::Part(part.part_number.split('.').filter_map(|n| n.parse().ok()).collect(), None);
+    let path = part_section_path(&part.part_number);
     let query = format!("(BODY.PEEK[{}])", part.part_number);
     let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), &query).await?.try_collect().await?;
     let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {

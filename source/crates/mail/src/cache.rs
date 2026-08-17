@@ -683,6 +683,43 @@ impl Cache {
         Ok(())
     }
 
+    /// Stores assembled bodies for a whole prefetch batch in one transaction -
+    /// the batch counterpart of `store_body`, which cost one transaction per
+    /// message. Replaces any earlier bodies for the same `(mailbox, uid)`
+    /// pairs and upgrades each row's search-index text from the preview to
+    /// the full text, exactly as `store_body` does per message.
+    pub fn store_bodies(&self, mailbox_id: &MailboxId, uidvalidity: UidValidity, bodies: &[(Uid, EmailBody)]) -> Result<()> {
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO bodies (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)")?;
+            for (uid, body) in bodies {
+                let data = serde_json::to_vec(body)?;
+                stmt.execute(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0, data])?;
+            }
+        }
+        for (uid, body) in bodies {
+            // Re-index the message with its full text, but only if the
+            // envelope is cached (a stray body for a wiped envelope has no
+            // subject/sender to index against), mirroring `store_body`.
+            if let Some(summary) = load_summary_row(&tx, mailbox_id, *uid)? {
+                let mut indexed = body_index_text(body).unwrap_or_default();
+                if let Some(preview) = &summary.preview {
+                    if !indexed.is_empty() {
+                        indexed.push(' ');
+                    }
+                    indexed.push_str(preview);
+                }
+                index_upsert_message(&tx, &summary, &indexed)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns `true` if a body for `(mailbox_id, uid, uidvalidity)` exists
     /// in the on-disk cache, without loading the (potentially large) payload.
     pub fn has_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<bool> {
@@ -2015,6 +2052,44 @@ mod tests {
         assert_eq!(cache.search("confidential", 10).unwrap().len(), 1);
         // The preview term still matches after the body replaces it.
         assert_eq!(cache.search("numbers", 10).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `store_bodies` caches a whole prefetch batch in one transaction and
+    /// upgrades each row's search index to its full text, exactly as
+    /// `store_body` does per message.
+    #[test]
+    fn store_bodies_upgrades_the_whole_batchs_index() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let msgs: Vec<EmailSummary> = [1u32, 2]
+            .into_iter()
+            .map(|uid| searchable_summary(&mailbox_id, uid, &format!("Subject {uid}"), "ada@example.com", Some("preview")))
+            .collect();
+        cache.replace_messages(&mailbox_id, UidValidity(1), &msgs).unwrap();
+
+        // Only the previews are indexed before the bodies arrive.
+        assert_eq!(cache.search("preview", 10).unwrap().len(), 2);
+        assert_eq!(cache.search("confidential", 10).unwrap().len(), 0);
+
+        let bodies = vec![
+            (Uid(1), sample_body("confidential earnings")),
+            (Uid(2), sample_body("confidential roadmap")),
+        ];
+        cache.store_bodies(&mailbox_id, UidValidity(1), &bodies).unwrap();
+
+        assert_eq!(cache.search("confidential", 10).unwrap().len(), 2);
+        // The preview terms still match after the bodies replace them.
+        assert_eq!(cache.search("preview", 10).unwrap().len(), 2);
+        // Each body round-trips out of the cache.
+        assert!(cache.load_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap().is_some());
+        assert!(cache.load_body(&mailbox_id, Uid(2), UidValidity(1)).unwrap().is_some());
+        // An empty batch is a cheap no-op.
+        cache.store_bodies(&mailbox_id, UidValidity(1), &[]).unwrap();
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

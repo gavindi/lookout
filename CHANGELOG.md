@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.63 (2026-08-18)
+
+### Changed
+
+- **Mail**: the background body prefetch now downloads a whole batch of message bodies in **one** `UID FETCH` round trip instead of one per message. Each prefetch batch of `PREFETCH_BATCH_SIZE` (10) messages used to cost a separate round trip per uid - 10 messages, 10 round trips, on the first warm-up of every unopened folder - each fetching that message's header and its `BODYSTRUCTURE`-derived text parts. The batch now sends a single `UID FETCH <set> (UID BODY.PEEK[HEADER] BODY.PEEK[<union of the batch's part numbers>])`: the query's part list is the union of every message's text/calendar sections (a message lacking a part the union mentions just gets no section back for it), each response is matched back to its message by the explicitly-requested UID data item, and each is assembled into its `EmailBody` by the same code path the single-message fetch uses (factored into a shared `body_from_fetch` helper, so on-demand `FetchBody` behavior is unchanged). Two per-message cache costs are batched too: uids whose bodies landed in the cache since the envelope pass are filtered with one `has_bodies` query (the per-message path paid a `load_body` JSON decode per uid for the same check), and the assembled bodies are written through a new `store_bodies` cache method - one transaction with prepared-statement reuse instead of one transaction per message. Messages the batch response carries no text part for still degrade to the per-message whole-message fallback fetch, exactly as before, and the yield-to-user-commands check now sits between batches rather than between messages - a command arriving mid-batch is handled as soon as the batch's single round trip completes, never starved.
+
+### Testing
+
+- `lookout-mail`: a new cache test pins `store_bodies`' contract - a whole batch stores in one call, each row's search index upgrades from preview to full text, each body round-trips back out of the cache, and an empty batch is a cheap no-op.
+
 ## 0.9.62 (2026-08-18)
 
 ### Changed
