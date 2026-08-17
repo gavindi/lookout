@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.62 (2026-08-18)
+
+### Changed
+
+- **Mail**: folder counts now arrive with the folder list in one round trip on servers that support it. On a **LIST-STATUS** (RFC 5819) connection - the `STATUS` return option to the LIST-EXTENDED command - the session sends `LIST "" "*" RETURN (STATUS (MESSAGES UNSEEN UIDNEXT UIDVALIDITY[ HIGHESTMODSEQ]))` and pairs each LIST entry with the STATUS response that follows it, so every folder's sidebar count - and its `uidvalidity`/`uidnext`, normally only learnable per-SELECT - is known the instant the list lands, instead of ~1 STATUS round trip per folder spread across the cooperative drain. The STATUS drain itself stays intact as the fallback: `login` reads the `LIST-STATUS` capability from the same post-login fetch that already caches `MOVE`/`CONDSTORE`, and any server rejection (a BAD/NO done, or a response that can't be decoded) falls back to the plain LIST + the drain exactly as before - Gmail, which lacks the capability, is untouched. The response stream is drained via the same raw `run_command`/`read_response` surface `ENABLE CONDSTORE` already uses, and the LIST/STATUS pairing reuses the existing STATUS-response parser, so no vendored-parser change was needed. The drain's two roles are preserved at list time: `mark_count_changes` compares each mailbox's `total`/`unread`/`highest_modseq` against the pre-list state and marks moved off-screen mailboxes `dirty` (so the cache-hit shortcut can't serve a stale envelope list) and flags the open folder, which the send/draft-create paths now resync just as the drain did; and `carry_counts_forward` gained a `list_supplied_counts` flag so a fresh LIST-STATUS count - including a real 0 for a mailbox emptied since the last run - is never overwritten by a stale carried value, filling only unreported `highest_modseq` gaps so the CONDSTORE baseline survives re-lists.
+
+### Testing
+
+- `lookout-mail`: seven new/updated `session` tests - a LIST-STATUS re-list keeps its fresh counts (and a real emptied-zero) while still carrying an unreported modseq, `mark_count_changes` flags moved off-screen mailboxes and reports the open folder (with a modseq advance counting as a change, matching `refresh_folder_counts`), `apply_status_items` maps every STATUS item onto the count fields, `mailbox_from_list_parts` skips `\NoSelect` names and maps the rest, and the two `carry_counts_forward` tests now pass the new flag.
+
 ## 0.9.61 (2026-08-18)
 
 ### Changed

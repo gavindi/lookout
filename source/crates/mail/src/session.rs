@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use async_imap::imap_proto::types::{MailboxDatum, NameAttribute, Response, Status, StatusAttribute};
 use async_imap::Session;
 use futures::TryStreamExt;
 use lookout_core::mailbox::role_from_special_use;
@@ -620,27 +621,32 @@ async fn connect_and_run(
     mut carried_command: Option<AccountCommand>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
-    let (mut session, has_move, condstore) = login(config, credential).await?;
+    let (mut session, has_move, condstore, has_list_status) = login(config, credential).await?;
 
     let account_id = config.account_id.clone();
-    let mut folders = list_mailboxes(&mut session, &account_id).await?;
+    let (mut folders, list_counts_supplied) = list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?;
     // Fast first paint: the folder tree shows immediately and the INBOX sync
-    // that fills the message list starts right away. The per-folder STATUS
-    // counts are queued for the main loop's cooperative drain (see below)
-    // rather than issued here, so a large account's count pass never stalls
-    // the session for commands.
+    // that fills the message list starts right away. On a LIST-STATUS (RFC
+    // 5819) connection the list just answered every folder's counts in that
+    // one round trip, so the sidebar paints them instantly and no per-folder
+    // STATUS pass is queued; otherwise the counts are queued for the main
+    // loop's cooperative drain (see below) rather than issued here, so a
+    // large account's count pass never stalls the session for commands.
     //
-    // LIST reports no counts at all, so the ones learned last run are carried
-    // over from the cache first - otherwise this emit would visibly blank
-    // every count the pre-connect cache replay just painted, and the sidebar
-    // would flash counts -> zeros -> counts on every launch.
+    // A LIST that carried no counts arrives all-zero, so the ones learned
+    // last run are carried over from the cache first - otherwise this emit
+    // would visibly blank every count the pre-connect cache replay just
+    // painted, and the sidebar would flash counts -> zeros -> counts on every
+    // launch. A LIST-STATUS list keeps its fresh values and fills only gaps.
+    let mut known_folders: Option<Vec<Mailbox>> = None;
     if let Some(Ok(known)) = cache_op(cache, {
         let account_id = account_id.clone();
         move |c| c.load_mailboxes(&account_id)
     })
     .await
     {
-        carry_counts_forward(&mut folders, &known);
+        carry_counts_forward(&mut folders, &known, list_counts_supplied);
+        known_folders = Some(known);
     }
     publish_folders(&folders, &account_id, cache, events).await;
 
@@ -651,22 +657,36 @@ async fn connect_and_run(
     // Folders still awaiting their STATUS count, drained cooperatively below.
     // Held as ids rather than indices so a re-list that reorders (or shortens)
     // the folder list can't leave the queue pointing at the wrong mailbox.
-    // Re-filled by `relist_folders` whenever the list changes.
-    let mut counts_pending: VecDeque<MailboxId> = queue_folder_counts(&folders, &inbox_id);
+    // Re-filled by `relist_folders` whenever the list changes. Empty when the
+    // LIST-STATUS path already supplied the counts in one round trip.
+    let mut counts_pending: VecDeque<MailboxId> = if list_counts_supplied {
+        VecDeque::new()
+    } else {
+        queue_folder_counts(&folders, &inbox_id)
+    };
 
     // Mailboxes *other than the one currently on screen* whose server-side
     // counts have moved since their message cache was last synced - new mail
-    // landing in a folder that isn't selected/IDLE'd, discovered by the
-    // STATUS drain below rather than an unsolicited IMAP notification (plain
-    // IDLE only reports the selected mailbox, and even a freshly re-entered
-    // IDLE never reports a change that happened before it started).
-    // `SyncMailbox`'s cache-hit shortcut consults this so a folder switch
-    // doesn't repaint a stale envelope list just because the cache happens to
-    // be non-empty; a real sync clears the entry once it runs. The
-    // currently-open mailbox never lives in this set - the same STATUS drain
-    // resyncs it immediately instead of waiting for a switch away and back,
-    // since the user is looking at it right now.
+    // landing in a folder that isn't selected/IDLE'd. Plain IDLE only reports
+    // the selected mailbox, and even a freshly re-entered IDLE never reports
+    // a change that happened before it started; the STATUS drain (or, on a
+    // LIST-STATUS connection, the fresh counts of the last LIST) is what
+    // notices. `SyncMailbox`'s cache-hit shortcut consults this so a folder
+    // switch doesn't repaint a stale envelope list just because the cache
+    // happens to be non-empty; a real sync clears the entry once it runs. The
+    // currently-open mailbox never lives in this set - the drain (or the
+    // caller's post-re-list resync) refreshes it immediately since the user
+    // is looking at it right now.
     let mut dirty_mailboxes: HashSet<MailboxId> = HashSet::new();
+    // With LIST-STATUS there is no drain pass to notice count moves later -
+    // the comparison runs now, against the pre-list state just carried over
+    // from the cache. The open folder (INBOX) is synced above regardless, so
+    // only off-screen mailboxes are marked.
+    if list_counts_supplied {
+        if let Some(known) = &known_folders {
+            mark_count_changes(known, &folders, &inbox_id, &mut dirty_mailboxes);
+        }
+    }
 
     let mut current_mailbox_name = "INBOX".to_string();
     let mut current_mailbox_id = inbox_id.clone();
@@ -824,7 +844,19 @@ async fn connect_and_run(
                     return Ok(ShutdownReason::Requested);
                 }
                 AccountCommand::Refresh => {
-                    relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                    relist_folders(
+                        &mut session,
+                        &mut folders,
+                        &mut counts_pending,
+                        &account_id,
+                        &current_mailbox_id,
+                        cache,
+                        events,
+                        condstore,
+                        has_list_status,
+                        &mut dirty_mailboxes,
+                    )
+                    .await?;
                     sync_mailbox(
                         &mut session,
                         &account_id,
@@ -1116,12 +1148,45 @@ async fn connect_and_run(
                         // mutation pattern `MoveMessage` uses below.
                         if let Some(sent_id) = sent_mailbox {
                             if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
-                                relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                                let open_changed = relist_folders(
+                                    &mut session,
+                                    &mut folders,
+                                    &mut counts_pending,
+                                    &account_id,
+                                    &current_mailbox_id,
+                                    cache,
+                                    events,
+                                    condstore,
+                                    has_list_status,
+                                    &mut dirty_mailboxes,
+                                )
+                                .await?;
                                 sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache, &mut folders, Some(&session_selected), condstore).await?;
                                 dirty_mailboxes.remove(&sent_id);
-                                session_selected = sent_id;
+                                session_selected = sent_id.clone();
                                 if session_selected != current_mailbox_id {
                                     session.select(&current_mailbox_name).await?;
+                                    session_selected = current_mailbox_id.clone();
+                                }
+                                // The re-list's LIST-STATUS counts said the
+                                // open folder changed and the Sent sync above
+                                // didn't cover it - resync so the sidebar and
+                                // the list on screen agree (the STATUS drain's
+                                // immediate-resync counterpart).
+                                if open_changed && sent_id != current_mailbox_id {
+                                    sync_mailbox(
+                                        &mut session,
+                                        &account_id,
+                                        &current_mailbox_name,
+                                        &current_mailbox_id,
+                                        events,
+                                        cache,
+                                        &mut folders,
+                                        Some(&session_selected),
+                                        condstore,
+                                    )
+                                    .await?;
+                                    dirty_mailboxes.remove(&current_mailbox_id);
                                     session_selected = current_mailbox_id.clone();
                                 }
                             }
@@ -1152,7 +1217,39 @@ async fn connect_and_run(
                     // and the folder tree shows it. Same pattern as
                     // `MoveMessage`.
                     if !had_drafts_folder {
-                        relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                        let open_changed = relist_folders(
+                            &mut session,
+                            &mut folders,
+                            &mut counts_pending,
+                            &account_id,
+                            &current_mailbox_id,
+                            cache,
+                            events,
+                            condstore,
+                            has_list_status,
+                            &mut dirty_mailboxes,
+                        )
+                        .await?;
+                        // The re-list's LIST-STATUS counts said the open
+                        // folder changed while the draft save had the session
+                        // elsewhere - resync it (the STATUS drain's
+                        // immediate-resync counterpart).
+                        if open_changed {
+                            sync_mailbox(
+                                &mut session,
+                                &account_id,
+                                &current_mailbox_name,
+                                &current_mailbox_id,
+                                events,
+                                cache,
+                                &mut folders,
+                                Some(&session_selected),
+                                condstore,
+                            )
+                            .await?;
+                            dirty_mailboxes.remove(&current_mailbox_id);
+                            session_selected = current_mailbox_id.clone();
+                        }
                     }
                 }
                 AccountCommand::DeleteDraft { message_id } => {
@@ -1202,7 +1299,19 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop moved message from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &mailbox, events).await;
-                            relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                            relist_folders(
+                                &mut session,
+                                &mut folders,
+                                &mut counts_pending,
+                                &account_id,
+                                &current_mailbox_id,
+                                cache,
+                                events,
+                                condstore,
+                                has_list_status,
+                                &mut dirty_mailboxes,
+                            )
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -1253,7 +1362,19 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop moved messages from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &mailbox, events).await;
-                            relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                            relist_folders(
+                                &mut session,
+                                &mut folders,
+                                &mut counts_pending,
+                                &account_id,
+                                &current_mailbox_id,
+                                cache,
+                                events,
+                                condstore,
+                                has_list_status,
+                                &mut dirty_mailboxes,
+                            )
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -1313,7 +1434,19 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop moved messages from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &mailbox, events).await;
-                            relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                            relist_folders(
+                                &mut session,
+                                &mut folders,
+                                &mut counts_pending,
+                                &account_id,
+                                &current_mailbox_id,
+                                cache,
+                                events,
+                                condstore,
+                                has_list_status,
+                                &mut dirty_mailboxes,
+                            )
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -1365,7 +1498,19 @@ async fn connect_and_run(
                                     }
                                 }
                             }
-                            relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
+                            relist_folders(
+                                &mut session,
+                                &mut folders,
+                                &mut counts_pending,
+                                &account_id,
+                                &current_mailbox_id,
+                                cache,
+                                events,
+                                condstore,
+                                has_list_status,
+                                &mut dirty_mailboxes,
+                            )
+                            .await?;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -2216,7 +2361,7 @@ async fn delete_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], ac
     purge_by_message_id(session, message_id).await
 }
 
-async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<ImapStream>, bool, bool)> {
+async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<ImapStream>, bool, bool, bool)> {
     let stream = connect_tls(&config.imap.host, config.imap.port).await?;
     tracing::debug!("login: creating client, reading greeting");
     let mut client = async_imap::Client::new(stream);
@@ -2239,7 +2384,8 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     // trip to re-answer the same question.
     let capabilities = session.capabilities().await?;
     let has_move = capabilities.has_str("MOVE");
-    tracing::debug!(has_move, "cached server capabilities after login");
+    let has_list_status = capabilities.has_str("LIST-STATUS");
+    tracing::debug!(has_move, has_list_status, "cached server capabilities after login");
 
     // CONDSTORE (RFC 7162): enables the per-mailbox `highest_modseq` bookkeeping
     // that incremental sync (`CHANGEDSINCE`) builds on. `ENABLE` applies to the
@@ -2262,39 +2408,124 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
             }
         }
     }
-    Ok((session, has_move, condstore))
+    Ok((session, has_move, condstore, has_list_status))
 }
 
-async fn list_mailboxes(session: &mut Session<ImapStream>, account_id: &AccountId) -> Result<Vec<Mailbox>> {
-    let names: Vec<_> = session.list(Some(""), Some("*")).await?.try_collect().await?;
+/// Builds a `Mailbox` from one LIST response entry, minus the count fields
+/// (filled from the STATUS items a LIST-STATUS response pairs with it, or by
+/// a later SELECT/STATUS). `None` for a `\NoSelect` name - those aren't
+/// selectable mailboxes and get no STATUS items (RFC 5819 §2).
+fn mailbox_from_list_parts(account_id: &AccountId, name: &str, delimiter: Option<&str>, attributes: &[NameAttribute]) -> Option<Mailbox> {
+    let attrs: Vec<String> = attributes.iter().map(|a| format!("{a:?}")).collect();
+    if attrs.iter().any(|a| a.contains("NoSelect")) {
+        return None;
+    }
+    let delimiter = delimiter.and_then(|d| d.chars().next()).unwrap_or('/');
+    let display_name = name.rsplit(delimiter).next().unwrap_or(name).to_string();
+    let role = role_from_special_use(&attrs, &display_name);
 
-    let mut mailboxes = Vec::with_capacity(names.len());
-    for name in &names {
-        let attrs: Vec<String> = name.attributes().iter().map(|a| format!("{a:?}")).collect();
-        if attrs.iter().any(|a| a.contains("NoSelect")) {
-            continue;
+    Some(Mailbox {
+        id: MailboxId::new(account_id, name),
+        account_id: account_id.clone(),
+        name: display_name,
+        parent: None, // Populated by the caller from the flat list via delimiter splitting (UI-layer concern).
+        delimiter,
+        role,
+        uidvalidity: UidValidity(0), // Filled in by sync_mailbox() once the folder is SELECTed, or by STATUS below.
+        uidnext: 0,
+        highest_modseq: None,
+        total: 0,
+        unread: 0,
+        flags: attrs,
+        subscribed: true,
+    })
+}
+
+/// Applies one mailbox's `STATUS` items to `mailbox` - the fields
+/// `refresh_folder_counts` reads from a `STATUS` reply, mapped the same way.
+fn apply_status_items(mailbox: &mut Mailbox, status: &[StatusAttribute]) {
+    for item in status {
+        match item {
+            StatusAttribute::Messages(n) => mailbox.total = *n,
+            StatusAttribute::Unseen(n) => mailbox.unread = *n,
+            StatusAttribute::UidNext(n) => mailbox.uidnext = *n,
+            StatusAttribute::UidValidity(n) => mailbox.uidvalidity = UidValidity(*n),
+            StatusAttribute::HighestModSeq(n) => mailbox.highest_modseq = Some(*n),
+            StatusAttribute::Recent(_) => {}
+            _ => {}
         }
-        let delimiter = name.delimiter().and_then(|d| d.chars().next()).unwrap_or('/');
-        let display_name = name.name().rsplit(delimiter).next().unwrap_or(name.name()).to_string();
-        let role = role_from_special_use(&attrs, &display_name);
+    }
+}
 
-        mailboxes.push(Mailbox {
-            id: MailboxId::new(account_id, name.name()),
-            account_id: account_id.clone(),
-            name: display_name,
-            parent: None, // Populated by the caller from the flat list via delimiter splitting (UI-layer concern).
-            delimiter,
-            role,
-            uidvalidity: UidValidity(0), // Filled in by sync_mailbox() once the folder is SELECTed, or by STATUS below.
-            uidnext: 0,
-            highest_modseq: None,
-            total: 0,
-            unread: 0,
-            flags: attrs,
-            subscribed: true,
-        });
+/// The LIST-STATUS (RFC 5819) path: one `LIST "" "*" RETURN (STATUS ...)`
+/// round trip whose response stream pairs each LIST entry with a `STATUS`
+/// response carrying that mailbox's items - every folder's counts (and its
+/// `uidvalidity`/`uidnext`, normally only learnable per-SELECT) arrive in one
+/// command instead of ~1 STATUS round trip per folder. The server skips the
+/// STATUS response for `\NoSelect` mailboxes (RFC 5819 §2), so those keep
+/// LIST-only defaults - the same way `refresh_folder_counts` leaves a failed
+/// STATUS alone.
+async fn list_mailboxes_with_status(session: &mut Session<ImapStream>, account_id: &AccountId, condstore: bool) -> Result<Vec<Mailbox>> {
+    let query = format!("LIST \"\" \"*\" RETURN (STATUS {})", status_count_query(condstore));
+    session.run_command(query).await?;
+    let mut mailboxes: Vec<Mailbox> = Vec::new();
+    let mut statuses: Vec<(String, Vec<StatusAttribute>)> = Vec::new();
+    while let Some(response) = session.read_response().await? {
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::List { name_attributes, delimiter, name }) => {
+                if let Some(mailbox) = mailbox_from_list_parts(account_id, name, delimiter.as_deref(), name_attributes) {
+                    mailboxes.push(mailbox);
+                }
+            }
+            Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
+                statuses.push((mailbox.to_string(), status.clone()));
+            }
+            Response::Done { status: Status::Ok, .. } => break,
+            Response::Done {
+                status: done, code, information, ..
+            } => {
+                let message = format!("code: {code:?}, info: {information:?}");
+                return Err(Error::Imap(match done {
+                    Status::Bad => async_imap::error::Error::Bad(message),
+                    _ => async_imap::error::Error::No(message),
+                }));
+            }
+            _ => {}
+        }
+    }
+    for (mailbox_name, status) in statuses {
+        if let Some(mailbox) = mailboxes.iter_mut().find(|m| m.name == mailbox_name) {
+            apply_status_items(mailbox, &status);
+        }
     }
     Ok(mailboxes)
+}
+
+/// Lists the account's mailboxes. On a LIST-STATUS (RFC 5819) connection the
+/// `STATUS (MESSAGES UNSEEN UIDNEXT UIDVALIDITY[ HIGHESTMODSEQ])` return
+/// option rides the single LIST round trip, so the counts (and
+/// `uidvalidity`/`uidnext`) for every folder arrive in one response stream
+/// instead of ~1 STATUS round trip per folder. Returns `counts_supplied` =
+/// whether the LIST answered the counts; when false the caller queues the
+/// per-folder STATUS drain as before. Any server rejection - or a response
+/// that can't be decoded - falls back to the plain LIST and the drain.
+async fn list_mailboxes(session: &mut Session<ImapStream>, account_id: &AccountId, condstore: bool, has_list_status: bool) -> Result<(Vec<Mailbox>, bool)> {
+    if has_list_status {
+        match list_mailboxes_with_status(session, account_id, condstore).await {
+            Ok(mailboxes) => return Ok((mailboxes, true)),
+            Err(e) => {
+                tracing::debug!("LIST RETURN (STATUS) failed, falling back to the per-folder STATUS drain: {e}");
+            }
+        }
+    }
+    let names: Vec<_> = session.list(Some(""), Some("*")).await?.try_collect().await?;
+    let mut mailboxes = Vec::with_capacity(names.len());
+    for name in &names {
+        if let Some(mailbox) = mailbox_from_list_parts(account_id, name.name(), name.delimiter(), name.attributes()) {
+            mailboxes.push(mailbox);
+        }
+    }
+    Ok((mailboxes, false))
 }
 
 /// The STATUS data items a folder-count refresh asks for. `HIGHESTMODSEQ`
@@ -2382,13 +2613,27 @@ fn queue_folder_counts(folders: &[Mailbox], current: &MailboxId) -> VecDeque<Mai
 
 /// Copies the count fields a `LIST` can't report (`total`, `unread`, and the
 /// `uidnext`/`uidvalidity` that come free with a STATUS) from a previously
+/// Copies the count fields a `LIST` can't report (`total`, `unread`, and the
+/// `uidnext`/`uidvalidity` that come free with a STATUS) from a previously
 /// known folder list onto a freshly listed one, matching by id. A folder
-/// that's new since the last list keeps its zeros until the drain reaches it.
-/// Without this, every re-list - on connect, on Refresh, after a message move
-/// - would reset the whole sidebar to no counts and then fill it back in.
-fn carry_counts_forward(folders: &mut [Mailbox], known: &[Mailbox]) {
+/// list that arrived with counts already (the LIST-STATUS path, RFC 5819)
+/// must keep them - its values are authoritative, and overwriting a real 0
+/// (a mailbox emptied since the last run) with a stale old count would undo
+/// the very freshness the one-round-trip list exists to provide - so with
+/// `list_supplied_counts` only the gaps are filled: a `highest_modseq` the
+/// server didn't report.
+fn carry_counts_forward(folders: &mut [Mailbox], known: &[Mailbox], list_supplied_counts: bool) {
     for folder in folders {
         if let Some(known) = known.iter().find(|m| m.id == folder.id) {
+            if list_supplied_counts {
+                // A re-list can't always report a modseq either; carry the
+                // last learned one so the persisted folder list never loses
+                // its incremental-sync baseline just because LIST ran.
+                if folder.highest_modseq.is_none() {
+                    folder.highest_modseq = known.highest_modseq;
+                }
+                continue;
+            }
             folder.total = known.total;
             folder.unread = known.unread;
             folder.uidnext = known.uidnext;
@@ -2399,6 +2644,29 @@ fn carry_counts_forward(folders: &mut [Mailbox], known: &[Mailbox]) {
             folder.highest_modseq = known.highest_modseq;
         }
     }
+}
+
+/// The LIST-STATUS (RFC 5819) counterpart of the STATUS drain's change
+/// detection: marks every mailbox whose `total`/`unread`/`highest_modseq`
+/// moved against `previous` (the pre-list state), so a later folder switch
+/// can't serve a stale cached envelope list through the cache-hit shortcut.
+/// Returns whether the open folder's counts moved - the caller decides what
+/// to resync, mirroring the drain's immediate resync of the folder on screen.
+fn mark_count_changes(previous: &[Mailbox], listed: &[Mailbox], current: &MailboxId, dirty: &mut HashSet<MailboxId>) -> bool {
+    let mut open_changed = false;
+    for mailbox in listed {
+        let Some(old) = previous.iter().find(|m| m.id == mailbox.id) else { continue };
+        let changed = old.total != mailbox.total || old.unread != mailbox.unread || old.highest_modseq != mailbox.highest_modseq;
+        if !changed {
+            continue;
+        }
+        if mailbox.id == *current {
+            open_changed = true;
+        } else {
+            dirty.insert(mailbox.id.clone());
+        }
+    }
+    open_changed
 }
 
 /// Persists the folder list to the cache and emits it to the UI - the one
@@ -2422,12 +2690,22 @@ async fn publish_folders(folders: &[Mailbox], account_id: &AccountId, cache: &Ca
 /// every folder's STATUS count for the main loop's cooperative drain. The
 /// drain runs these one round trip at a time, yielding to the command queue
 /// before each, so these paths never block the session on a whole
-/// STATUS-per-folder pass.
+/// STATUS-per-folder pass. On a LIST-STATUS (RFC 5819) connection the LIST
+/// already carried every folder's counts, so nothing is queued and the
+/// count-change detection the drain would have done runs inline instead.
 ///
 /// The re-list resets every folder to its LIST-only zero counts, so the
 /// counts already learned are carried across by id - otherwise a Refresh (or
 /// any message move) would visibly blank the whole sidebar until the new pass
 /// caught up.
+///
+/// Returns whether the open folder's counts moved at this re-list (only
+/// meaningful on the LIST-STATUS path); most callers sync the open folder
+/// right after the re-list anyway, and the two that don't (send, draft-create)
+/// resync it on `true` - the drain's immediate-resync counterpart.
+// The extra `has_list_status`/`dirty_mailboxes` arguments are what let the
+// LIST-STATUS path skip the whole STATUS drain, so the count is worth it.
+#[allow(clippy::too_many_arguments)]
 async fn relist_folders(
     session: &mut Session<ImapStream>,
     folders: &mut Vec<Mailbox>,
@@ -2436,13 +2714,23 @@ async fn relist_folders(
     current: &MailboxId,
     cache: &CacheHandle,
     events: &async_channel::Sender<AccountEvent>,
-) -> Result<()> {
-    let mut relisted = list_mailboxes(session, account_id).await?;
-    carry_counts_forward(&mut relisted, folders);
+    condstore: bool,
+    has_list_status: bool,
+    dirty_mailboxes: &mut HashSet<MailboxId>,
+) -> Result<bool> {
+    let previous = has_list_status.then(|| folders.clone());
+    let (mut relisted, list_counts_supplied) = list_mailboxes(session, account_id, condstore, has_list_status).await?;
+    carry_counts_forward(&mut relisted, folders, list_counts_supplied);
+    let mut open_changed = false;
+    if list_counts_supplied {
+        if let Some(previous) = &previous {
+            open_changed = mark_count_changes(previous, &relisted, current, dirty_mailboxes);
+        }
+    }
     *folders = relisted;
-    *counts_pending = queue_folder_counts(folders, current);
+    *counts_pending = if list_counts_supplied { VecDeque::new() } else { queue_folder_counts(folders, current) };
     publish_folders(folders, account_id, cache, events).await;
-    Ok(())
+    Ok(open_changed)
 }
 
 /// Quotes an IMAP search criterion's argument per RFC 3501 §9 (quoted string):
@@ -3245,11 +3533,36 @@ mod tests {
         let account = AccountId("acc".into());
         let known = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 7)];
         let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0), mailbox(&account, "New", MailboxRole::Custom, 0)];
-        carry_counts_forward(&mut relisted, &known);
+        carry_counts_forward(&mut relisted, &known, false);
         assert_eq!(relisted[0].unread, 7);
         // A folder that's new since the last list has nothing to carry over
         // and keeps its zeros until the drain reaches it.
         assert_eq!(relisted[1].unread, 0);
+    }
+
+    #[test]
+    fn a_list_status_relist_keeps_its_fresh_counts() {
+        // A LIST-STATUS list carries authoritative counts and must not be
+        // overwritten by the carry-over - a mailbox emptied since the last
+        // run reads a real 0, and the stale old count must not come back.
+        let account = AccountId("acc".into());
+        let mut known = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 7)];
+        let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 3), mailbox(&account, "New", MailboxRole::Custom, 0)];
+        relisted[0].total = 3;
+        carry_counts_forward(&mut relisted, &known, true);
+        assert_eq!(relisted[0].unread, 3, "the fresh LIST-STATUS count wins");
+        assert_eq!(relisted[0].total, 3, "the fresh LIST-STATUS total wins");
+        // A modseq the server didn't report is still carried - the incremental
+        // sync baseline must survive a re-list.
+        known[0].highest_modseq = Some(4_200_000_000);
+        let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 3)];
+        carry_counts_forward(&mut relisted, &known, true);
+        assert_eq!(relisted[0].highest_modseq, Some(4_200_000_000));
+        // ... but a reported one wins.
+        let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 3)];
+        relisted[0].highest_modseq = Some(5_000_000_000);
+        carry_counts_forward(&mut relisted, &known, true);
+        assert_eq!(relisted[0].highest_modseq, Some(5_000_000_000));
     }
 
     #[test]
@@ -3260,12 +3573,12 @@ mod tests {
         let mut known = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0)];
         let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0)];
         relisted[0].highest_modseq = Some(4_200_000_000);
-        carry_counts_forward(&mut relisted, &known);
+        carry_counts_forward(&mut relisted, &known, false);
         assert_eq!(relisted[0].highest_modseq, None);
 
         let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0)];
         known[0].highest_modseq = Some(4_200_000_000);
-        carry_counts_forward(&mut relisted, &known);
+        carry_counts_forward(&mut relisted, &known, false);
         assert_eq!(relisted[0].highest_modseq, Some(4_200_000_000));
     }
 
@@ -3317,5 +3630,87 @@ mod tests {
     #[test]
     fn uid_set_chunks_empty_input_sends_no_command() {
         assert!(uid_set_chunks(&[]).is_empty());
+    }
+
+    #[test]
+    fn mark_count_changes_flags_moved_counts_and_skips_unchanged() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let archive = MailboxId::new(&account, "Archive");
+        let current = inbox.clone();
+        let previous = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 2), mailbox(&account, "Archive", MailboxRole::Archive, 5)];
+        let mut listed = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 2), mailbox(&account, "Archive", MailboxRole::Archive, 6)];
+        listed[0].total = 9; // the open folder's total moved too
+        let mut dirty = HashSet::new();
+        let open_changed = mark_count_changes(&previous, &listed, &current, &mut dirty);
+        assert!(open_changed, "the open folder's count moved");
+        assert_eq!(dirty, HashSet::from([archive]), "only the off-screen moved mailbox is marked");
+
+        // Unchanged counts mark nothing.
+        let mut dirty = HashSet::new();
+        let open_changed = mark_count_changes(&previous, &previous, &current, &mut dirty);
+        assert!(!open_changed);
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn mark_count_changes_treats_a_modseq_advance_as_a_change() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let previous = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 2)];
+        let mut listed = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 2)];
+        listed[0].highest_modseq = Some(4_200_000_000);
+        let mut dirty = HashSet::new();
+        // The open folder changed -> reported, not dirtied.
+        assert!(mark_count_changes(&previous, &listed, &inbox, &mut dirty));
+        assert!(dirty.is_empty());
+        // An off-screen folder with a fresh modseq is dirtied - the same
+        // `changed` semantics as `refresh_folder_counts`.
+        let work = MailboxId::new(&account, "Work");
+        let previous = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 2), mailbox(&account, "Work", MailboxRole::Custom, 2)];
+        let mut listed = vec![mailbox(&account, "Work", MailboxRole::Custom, 2)];
+        listed[0].highest_modseq = Some(4_200_000_000);
+        let mut dirty = HashSet::new();
+        assert!(!mark_count_changes(&previous, &listed, &inbox, &mut dirty));
+        assert_eq!(dirty, HashSet::from([work]));
+    }
+
+    #[test]
+    fn apply_status_items_fills_the_count_fields() {
+        let account = AccountId("acc".into());
+        let mut m = mailbox(&account, "INBOX", MailboxRole::Inbox, 0);
+        apply_status_items(
+            &mut m,
+            &[
+                StatusAttribute::Messages(42),
+                StatusAttribute::Unseen(7),
+                StatusAttribute::UidNext(100),
+                StatusAttribute::UidValidity(1),
+                StatusAttribute::HighestModSeq(12345),
+            ],
+        );
+        assert_eq!(m.total, 42);
+        assert_eq!(m.unread, 7);
+        assert_eq!(m.uidnext, 100);
+        assert_eq!(m.uidvalidity, UidValidity(1));
+        assert_eq!(m.highest_modseq, Some(12345));
+        // Items not requested leave the LIST-only defaults alone.
+        let mut m = mailbox(&account, "INBOX", MailboxRole::Inbox, 0);
+        apply_status_items(&mut m, &[StatusAttribute::Messages(3)]);
+        assert_eq!(m.total, 3);
+        assert_eq!(m.unread, 0);
+        assert_eq!(m.highest_modseq, None);
+    }
+
+    #[test]
+    fn mailbox_from_list_parts_skips_noselect_and_maps_the_rest() {
+        let account = AccountId("acc".into());
+        assert!(mailbox_from_list_parts(&account, "INBOX", Some("/"), &[]).is_some());
+        assert!(mailbox_from_list_parts(&account, "NoAccess", Some("/"), &[NameAttribute::NoSelect]).is_none());
+        let m = mailbox_from_list_parts(&account, "Work/Sent", Some("/"), &[NameAttribute::Sent]).unwrap();
+        assert_eq!(m.id, MailboxId::new(&account, "Work/Sent"));
+        assert_eq!(m.name, "Sent");
+        assert_eq!(m.delimiter, '/');
+        assert_eq!(m.role, MailboxRole::Sent);
     }
 }
