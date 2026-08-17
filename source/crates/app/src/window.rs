@@ -2827,13 +2827,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Block navigation *away* from the loaded message body (e.g. clicking a
     // link) - but NOT the initial programmatic `load_html()` call itself,
     // which also fires a NavigationAction decision. Distinguish the two via
-    // `is_user_gesture()`: a real click is a user gesture, `load_html()` is
-    // not. Getting this wrong (blocking unconditionally) silently vetoes
-    // every load, which is exactly the "reading pane always blank" bug this
-    // fixes - the WebView was never rendering anything because its own
-    // initial content load was being cancelled before it started. External
-    // links should ideally open in the system browser instead of just being
-    // dropped - full "open externally" handling is a Phase 2 refinement.
+    // `is_user_gesture()` (and `NavigationType::LinkClicked`, which is more
+    // reliable across WebKitGTK versions): a real click is a user gesture,
+    // `load_html()` is not. Getting this wrong (blocking unconditionally)
+    // silently vetoes every load, which is exactly the "reading pane always
+    // blank" bug this fixes - the WebView was never rendering anything
+    // because its own initial content load was being cancelled before it
+    // started. A clicked link is handed off to the system's default browser
+    // instead of being dropped, and `target="_blank"` links - which WebKit
+    // reports as a *new-window* decision rather than a navigation - are
+    // routed to the browser by the `create` handler below.
     //
     // Remote *subresources* (tracker pixels, remote images/fonts, `<iframe>`s
     // pointing at outside URLs) are vetoed outright: they'd let external
@@ -2859,6 +2862,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // bar to the entry's `TrustLevel`. State is re-read on every decision
     // too, so trusting a sender while a message is open applies on the
     // next render.
+    // Opens an `http(s)` URI in the system's default browser. Other schemes
+    // are deliberately ignored - `data:`/`cid:`/`about:`/`file:` are local to
+    // the pane, and `mailto:` is itself a mail client's business (a
+    // compose-from-link flow is the later refinement).
+    fn open_uri_in_default_browser(uri: &str) {
+        let scheme = uri.split(':').next().unwrap_or("");
+        if matches!(scheme, "http" | "https") {
+            if let Err(e) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
+                tracing::warn!("failed to open link {uri} in the default browser: {e}");
+            }
+        }
+    }
     let state_for_policy = state.clone();
     web_view.connect_decide_policy(move |_view, decision, decision_type| {
         let uri_is_local = |uri: &str| -> bool {
@@ -2868,10 +2883,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         match decision_type {
             webkit::PolicyDecisionType::NavigationAction => {
                 let navigation = decision.downcast_ref::<webkit::NavigationPolicyDecision>().and_then(|d| d.navigation_action());
+                // A real click on a link: block the in-pane navigation so the
+                // message body stays on screen, but hand the target off to the
+                // system's default browser instead of dropping it. Keyed on
+                // the navigation type (`LinkClicked`) rather than
+                // `is_user_gesture()` alone, which is unreliable across
+                // WebKitGTK versions. `target="_blank"` links never arrive
+                // here at all - WebKit reports them as a *new-window*
+                // decision, handled below via the `create` signal.
+                let is_link_click = navigation.as_ref().map(|a| a.navigation_type() == webkit::NavigationType::LinkClicked).unwrap_or(false);
                 let is_user_gesture = navigation.as_ref().map(|a| a.is_user_gesture()).unwrap_or(false);
-                if is_user_gesture {
-                    // A real click on a link: block it so we don't navigate
-                    // away from the loaded message body.
+                if is_link_click || is_user_gesture {
+                    if let Some(uri) = navigation.as_ref().and_then(|a| a.request()).and_then(|r| r.uri()) {
+                        open_uri_in_default_browser(&uri);
+                    }
                     decision.ignore();
                     return true;
                 }
@@ -2884,6 +2909,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         return true;
                     }
                 }
+            }
+            webkit::PolicyDecisionType::NewWindowAction => {
+                // `target="_blank"` links (and middle-click opens) arrive as
+                // a new-window request, not a navigation. These bindings
+                // can't read the target URL off a new-window decision, so
+                // allow it through and let the `create` handler - connected
+                // below - route the URL to the default browser and swallow
+                // the window request.
+                return false;
             }
             webkit::PolicyDecisionType::Response => {
                 // Veto remote subresource responses (images, fonts, scripts)
@@ -2929,6 +2963,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             _ => {}
         }
         false
+    });
+
+    // `target="_blank"` links (and middle-click / modifier-click opens) reach
+    // this handler: the `NewWindowAction` decision above allowed them so the
+    // URL - unreadable off the decision in these bindings - arrives here on
+    // the navigation action. A link click routes the URL to the default
+    // browser; the window request is swallowed either way (returning `None`
+    // aborts the new-window creation, so nothing opens inside the pane).
+    web_view.connect_create(move |_view, navigation_action| {
+        let is_link_click = navigation_action.navigation_type() == webkit::NavigationType::LinkClicked;
+        let is_user_gesture = navigation_action.is_user_gesture();
+        if is_link_click || is_user_gesture {
+            if let Some(uri) = navigation_action.request().and_then(|r| r.uri()) {
+                open_uri_in_default_browser(&uri);
+            }
+        }
+        None
     });
 
     let text_view = gtk::TextView::builder()

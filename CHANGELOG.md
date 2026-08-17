@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.54 (2026-08-17)
+
+### Added
+
+- **Mail**: clicking a link in the email reading pane now opens it in the system's default browser instead of doing nothing. The reading pane's WebView vetoed every user-triggered navigation to keep the message body on screen, so a click simply vanished. A user-gesture navigation now hands the target URL to the OS's default handler (`gio::AppInfo::launch_default_for_uri`, the same call the account-connect OAuth flows already use) and blocks the in-pane navigation, so the message stays put while the browser opens the link. This covers both ways a link click can arrive: plain links come as a `NavigationAction` policy decision, keyed on `NavigationType::LinkClicked` (not just the user-gesture flag, which is unreliable across WebKitGTK versions); and `target="_blank"` links - which WebKit reports as a new-window request rather than a navigation, so they previously vanished no matter what - are allowed through that decision and arrive on the WebView's `create` signal, which reads the target URL and routes it to the browser before swallowing the window request. Only `http`/`https` go external; `file:` and other schemes stay vetoed, and `mailto:` links remain blocked for now - Lookout is itself the mail handler, so routing those to the OS could loop back into the app (a compose-from-link flow is the later refinement).
+
+### Fixed
+
+- **Console noise**: clicking anything in the email reading pane printed `Gtk-Message: Not loading module "atk-bridge": The functionality is provided by GTK natively. Please try to not load it.` The message came from GTK, not Lookout: the environment's `GTK_MODULES` commonly carries `gail:atk-bridge`, GTK3-era accessibility modules GTK4 ignores - its AT-SPI support is built in - and GTK warns about them every time accessibility comes up, which a click on the reading pane's WebView triggers. `main.rs` now strips `gail`/`atk-bridge` from `GTK_MODULES` before GTK initializes, keeping any other modules the user configured.
+
 ## 0.9.53 (2026-08-17)
 
 ### Fixed

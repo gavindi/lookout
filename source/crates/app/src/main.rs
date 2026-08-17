@@ -49,6 +49,19 @@ use gtk::prelude::*;
 const APP_ID: &str = "io.github.gavindi.Lookout";
 
 fn main() -> glib::ExitCode {
+    // GTK3-era accessibility modules (`gail`, `atk-bridge`) sometimes linger
+    // in the environment's `GTK_MODULES`; GTK4 ships AT-SPI support natively,
+    // so it ignores them but warns "Not loading module ... Please try to not
+    // load it." every time accessibility comes up (first render, a click on
+    // the reading pane's WebView). Strip them before GTK reads the variable.
+    if let Ok(value) = std::env::var("GTK_MODULES") {
+        let kept: Vec<&str> = value
+            .split(':')
+            .filter(|m| !matches!(*m, "gail" | "atk-bridge"))
+            .collect();
+        std::env::set_var("GTK_MODULES", kept.join(":"));
+    }
+
     tracing_subscriber::fmt::init();
 
     let app = adw::Application::builder().application_id(APP_ID).build();
