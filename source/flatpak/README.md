@@ -1,26 +1,27 @@
 # Flatpak packaging
 
-`io.github.gavindi.Lookout.json` is a **spike**, not yet a working build - see the plan's own flagged risk item: "Flatpak D-Bus permission wiring needed for GOA to be reachable from a sandboxed build - verify early since it affects distributability." This resolves the permissions question; it does not yet produce a runnable Flatpak.
+`io.github.gavindi.Lookout.json` is the Flatpak manifest, built by the `flatpak` job of `.github/workflows/build.yaml` (pushed to the `build` branch). This document records what's confirmed and what's still needed to build the bundle locally.
 
 ## What's confirmed
 
 The `finish-args` GOA permission (`--talk-name=org.gnome.OnlineAccounts`) is verified against [Geary's own Flatpak manifest](https://github.com/flathub/org.gnome.Geary) (a real, shipping GOA-based mail client), not guessed. Geary also talks to `--talk-name=org.gnome.ControlCenter` to deep-link into account settings, which this manifest includes too.
 
-## What's missing before this builds
+The manifest installs the desktop file, AppStream metainfo, icon, and GSettings schema (compiled with `glib-compile-schemas`), and the GOA settings deep-link works sandboxed: `online_accounts.rs` activates `org.gnome.Settings`' `launch-panel` action (GNOME 48+) or `org.gnome.ControlCenter`'s `ActivatePanel` (≤47) over D-Bus, only falling back to spawning `gnome-control-center` when neither answers - the Flatpak build is granted `--talk-name` for both.
 
-1. **`cargo-sources.json`** - Flatpak builds offline, so every crate dependency needs to be pre-vendored and checksummed. Generate it with Flathub's [`flatpak-cargo-generator.py`](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo) against `source/Cargo.lock`:
-   ```
-   python3 flatpak-cargo-generator.py /path/to/source/Cargo.lock -o flatpak/cargo-sources.json
-   ```
-   Not run yet in this environment (no network-capable Python tooling available here). Given ~150 transitive dependencies (rustls, tokio, gtk4-rs, webkit6-rs, zbus, ...), expect a large generated file.
-2. **`flatpak-builder` isn't installed** in this environment (`sudo apt-get install flatpak-builder`), and building also needs the `org.gnome.Sdk//49` + `org.freedesktop.Sdk.Extension.rust-stable` runtimes installed (`flatpak install org.gnome.Sdk//49 org.freedesktop.Sdk.Extension.rust-stable//49`). Neither has been attempted here.
-3. **The "Open Online Accounts Settings" button won't work sandboxed as currently written.** `lookout-app/src/window.rs` spawns `gnome-control-center` via `std::process::Command`, which only works unsandboxed - a Flatpak app can't exec arbitrary host binaries. Under Flatpak this needs to go through `org.gnome.ControlCenter`'s D-Bus activation instead (hence that `--talk-name` above). Not yet implemented; the current code path is untested inside a sandbox.
+## What's generated
 
-## Once the above is done
+1. **`cargo-sources.json`** - Flatpak builds offline, so every crate dependency needs to be pre-vendored and checksummed. CI generates it from the tracked `source/Cargo.lock` with Flathub's [`flatpak-cargo-generator.py`](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo) (`build.yaml`'s flatpak job), the same way it's done locally:
+   ```
+   python3 flatpak-cargo-generator.py /path/to/source/Cargo.lock -o source/flatpak/cargo-sources.json
+   ```
+
+## To build the bundle locally
+
+`flatpak-builder` is not part of this repo's dev environment, and building also needs the `org.gnome.Sdk//49` + `org.freedesktop.Sdk.Extension.rust-stable` runtimes installed (`flatpak install org.gnome.Sdk//49 org.freedesktop.Sdk.Extension.rust-stable//49`). Once those exist:
 
 ```
-flatpak-builder --user --install build-dir flatpak/io.github.gavindi.Lookout.json
+flatpak-builder --user --install build-dir source/flatpak/io.github.gavindi.Lookout.json
 flatpak run io.github.gavindi.Lookout
 ```
 
-Then confirm GOA accounts are actually visible from inside the sandbox (the real point of this spike) - if `--talk-name=org.gnome.OnlineAccounts` isn't sufficient in practice, account discovery will fail silently or with a D-Bus `AccessDenied`/`ServiceUnknown` error at the `GoaClient::connect()`/`list_mail_accounts()` call in `lookout-goa`.
+Then confirm GOA accounts are actually visible from inside the sandbox (the real point of this packaging): if `--talk-name=org.gnome.OnlineAccounts` isn't sufficient in practice, account discovery will fail silently or with a D-Bus `AccessDenied`/`ServiceUnknown` error at the `GoaClient::connect()`/`list_mail_accounts()` call in `lookout-goa`.

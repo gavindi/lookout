@@ -9,6 +9,11 @@ target/
 *.lock
 *.tmp
 
+# The workspace lockfile IS tracked: the Flatpak CI job generates
+# `cargo-sources.json` from it (and committed lockfiles make builds
+# reproducible), so the blanket `*.lock` rule above is lifted for it.
+!source/Cargo.lock
+
 #IDE
 *.code-workspace
 

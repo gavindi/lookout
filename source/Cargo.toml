@@ -16,7 +16,7 @@ members = [
 imap-proto = { path = "crates/imap-proto" }
 
 [workspace.package]
-version = "0.9.52"
+version = "0.9.53"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gavindi/lookout"

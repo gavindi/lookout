@@ -38,7 +38,7 @@ jobs:
       # pointing back at the shared workspace target (where cargo already
       # put the release binary).
       - name: Build .rpm
-        working-directory: crates/app
+        working-directory: source/crates/app
         env:
           CARGO_TARGET_DIR: ../..
         run: cargo generate-rpm
