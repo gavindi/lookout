@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.57 (2026-08-18)
+
+### Changed
+
+- **Mail**: the session now enables IMAP **CONDSTORE** (RFC 7162) after login when the server advertises it, the first step of the incremental-sync roadmap: from here on every SELECT reports the folder's current `HIGHESTMODSEQ`, so a subsequent sync can ask the server for `CHANGEDSINCE <modseq>` deltas instead of re-fetching the whole mailbox's flags on every IDLE wake. The `ENABLE CONDSTORE` command is sent once right after authentication - gated on the server advertising `CONDSTORE` or `QRESYNC` (a QRESYNC server must support CONDSTORE too), and a server that rejects it is treated as non-CONDSTORE rather than a connection error, so the session simply falls back to full syncs. The per-mailbox `highest_modseq` field, which existed on the cached `Mailbox` struct but was never populated, is now captured wherever the connection learns it: the pre-IDLE re-select and `sync_mailbox`'s SELECT (the two paths that already write `uidvalidity`/`uidnext` back onto the folder list), the background prefetch's SELECT (the first SELECT most folders ever get, so it's the primary place their modseq is learned), and the cooperative STATUS count drain, whose query now asks for `HIGHESTMODSEQ` on CONDSTORE connections - the drain is the one pass that visits every folder, so folders that never get SELECTed still gain a baseline. The value survives re-lists (`carry_counts_forward` no longer wipes it) and persists through the existing mailbox-list cache write, so the incremental baseline is in place across restarts. Nothing uses it yet - the `CHANGEDSINCE` delta fetch that consumes it is the next step - and a stale baseline is always safe, since it only ever makes a later delta fetch wider, never wrong.
+
+### Testing
+
+- `lookout-mail`: three new `session` tests - a re-list carries a learned modseq forward while a folder with none learned keeps `None`, and the STATUS data-item query includes `HIGHESTMODSEQ` only on CONDSTORE connections (a non-CONDSTORE server must never be asked for it).
+
 ## 0.9.56 (2026-08-17)
 
 ### Changed

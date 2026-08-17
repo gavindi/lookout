@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.57" date="2026-08-18">
+      <description>
+        <p>IMAP CONDSTORE is now enabled after login when the server advertises it, the first step of the incremental-sync roadmap: the per-mailbox highest-modseq baseline is captured from every SELECT (including the background prefetch, which selects most folders first) and from the STATUS count drain, survives re-lists, and is persisted in the cache - ready for CHANGEDSINCE delta fetches that will replace full-mailbox re-fetches on IDLE wakes. Servers without CONDSTORE are unaffected and keep syncing fully.</p>
+      </description>
+    </release>
     <release version="0.9.56" date="2026-08-17">
       <description>
         <p>More of the optimisation roadmap: the SQLite cache layer's per-uid N+1s are gone. The background prefetch asks once which bodies are already cached instead of querying per UID; moving several messages deletes them all in one transaction; joined mark-read and tag-toggling batches patch every cached summary in one transaction with the same all-or-nothing contract as before; and snoozing a batch records all rows at once. Search results now load every hit's envelope in a single FTS-to-messages join instead of one query per hit, which matters on the UI thread where a keystroke can match hundreds of messages. A full audit of the rfc5464 path-name validator found its claimed quadratic rescan was already a linear single pass, so no change was needed there.</p>

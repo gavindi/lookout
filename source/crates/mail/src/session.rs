@@ -569,7 +569,7 @@ async fn connect_and_run(
     mut carried_command: Option<AccountCommand>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
-    let (mut session, has_move) = login(config, credential).await?;
+    let (mut session, has_move, condstore) = login(config, credential).await?;
 
     let account_id = config.account_id.clone();
     let mut folders = list_mailboxes(&mut session, &account_id).await?;
@@ -685,6 +685,9 @@ async fn connect_and_run(
                             }
                             if let Some(next) = meta.uid_next {
                                 f.uidnext = next;
+                            }
+                            if let Some(modseq) = meta.highest_modseq {
+                                f.highest_modseq = Some(modseq);
                             }
                         }
                     }
@@ -1623,7 +1626,7 @@ async fn connect_and_run(
                 // The folder may have vanished from a re-list between being
                 // queued and being drained; skip it rather than miscounting.
                 let Some(index) = folders.iter().position(|m| m.id == mailbox_id) else { continue };
-                let changed = refresh_folder_counts(&mut session, &mut folders[index], &account_id).await;
+                let changed = refresh_folder_counts(&mut session, &mut folders[index], &account_id, condstore).await;
                 dirty |= changed;
                 if changed {
                     if mailbox_id == current_mailbox_id {
@@ -1713,6 +1716,16 @@ async fn connect_and_run(
                     let folder_name = pf.current_folder_name.clone();
                     let mailbox_meta = session.select(&folder_name).await?;
                     session_selected = pf.mailboxes[pf.current].clone();
+                    // The prefetch is the first SELECT most folders ever get
+                    // (only the open folder and STATUS-dirty ones go through
+                    // `sync_mailbox`), so it's the primary place their
+                    // `highest_modseq` gets learned - CONDSTORE-enabled
+                    // SELECTs report it in the OK response.
+                    if let Some(f) = folders.iter_mut().find(|f| f.id == pf.mailboxes[pf.current]) {
+                        if let Some(modseq) = mailbox_meta.highest_modseq {
+                            f.highest_modseq = Some(modseq);
+                        }
+                    }
                     let fetch_from = mailbox_meta.exists.saturating_sub(INITIAL_FETCH_LIMIT - 1).max(1);
                     let seq_range = format!("{fetch_from}:*");
                     let fetches: Vec<_> = session.fetch(&seq_range, "(UID BODYSTRUCTURE)").await?.try_collect().await?;
@@ -2021,7 +2034,7 @@ async fn delete_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], ac
     purge_by_message_id(session, message_id).await
 }
 
-async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<ImapStream>, bool)> {
+async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<ImapStream>, bool, bool)> {
     let stream = connect_tls(&config.imap.host, config.imap.port).await?;
     tracing::debug!("login: creating client, reading greeting");
     let mut client = async_imap::Client::new(stream);
@@ -2042,9 +2055,28 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     // Capabilities are stable for the connection's lifetime; read them once
     // after auth so every move batch doesn't re-issue a `CAPABILITY` round
     // trip to re-answer the same question.
-    let has_move = session.capabilities().await?.has_str("MOVE");
+    let capabilities = session.capabilities().await?;
+    let has_move = capabilities.has_str("MOVE");
     tracing::debug!(has_move, "cached server capabilities after login");
-    Ok((session, has_move))
+
+    // CONDSTORE (RFC 7162): enables the per-mailbox `highest_modseq` bookkeeping
+    // that incremental sync (`CHANGEDSINCE`) builds on. `ENABLE` applies to the
+    // whole connection, so one post-auth command covers every later SELECT -
+    // once enabled, each SELECT's OK response carries the folder's current
+    // HIGHESTMODSEQ (parsed into `Mailbox::highest_modseq` by async-imap).
+    // QRESYNC servers must support CONDSTORE too (RFC 7162 §4), so advertising
+    // either capability is enough to ask. A rejection is not fatal: we just
+    // fall back to full syncs.
+    let condstore = capabilities.has_str("CONDSTORE") || capabilities.has_str("QRESYNC");
+    if condstore {
+        match session.run_command_and_check_ok("ENABLE CONDSTORE").await {
+            Ok(()) => tracing::debug!("CONDSTORE enabled for connection"),
+            Err(e) => {
+                tracing::debug!("server rejected ENABLE CONDSTORE, continuing without incremental sync: {e}");
+            }
+        }
+    }
+    Ok((session, has_move, condstore))
 }
 
 async fn list_mailboxes(session: &mut Session<ImapStream>, account_id: &AccountId) -> Result<Vec<Mailbox>> {
@@ -2079,6 +2111,19 @@ async fn list_mailboxes(session: &mut Session<ImapStream>, account_id: &AccountI
     Ok(mailboxes)
 }
 
+/// The STATUS data items a folder-count refresh asks for. `HIGHESTMODSEQ`
+/// (RFC 7162 §3.2.1) rides along on CONDSTORE connections - it's the one
+/// pass that visits every folder, so folders that never get SELECTed still
+/// learn a modseq from it - but is a protocol error on servers that don't
+/// advertise the capability, hence the per-connection selection.
+fn status_count_query(condstore: bool) -> &'static str {
+    if condstore {
+        "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)"
+    } else {
+        "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY)"
+    }
+}
+
 /// One folder's best-effort STATUS count refresh (RFC 3501 §6.3.10): fills
 /// `total`/`unread` (and, for free, `uidnext`/`uidvalidity`) from the server
 /// and reports whether anything changed. Never fatal: a folder whose STATUS
@@ -2087,13 +2132,27 @@ async fn list_mailboxes(session: &mut Session<ImapStream>, account_id: &AccountI
 /// without a useful STATUS. Note the crate's `Mailbox` type reports the
 /// STATUS `unseen` as a *count*, unlike SELECT's "sequence number of the
 /// first unseen message", so it maps straight onto `Mailbox::unread`.
-async fn refresh_folder_counts(session: &mut Session<ImapStream>, folder: &mut Mailbox, account_id: &AccountId) -> bool {
+///
+/// When the server supports CONDSTORE, the query also asks for
+/// `HIGHESTMODSEQ` (RFC 7162 §3.2.1: a CONDSTORE server MUST support it as
+/// a STATUS data item) - the STATUS drain is the one pass that touches every
+/// folder, so it's how folders that never get SELECTed still learn a modseq.
+async fn refresh_folder_counts(
+    session: &mut Session<ImapStream>,
+    folder: &mut Mailbox,
+    account_id: &AccountId,
+    condstore: bool,
+) -> bool {
     let Some(path) = folder.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
         return false;
     };
-    match session.status(path, "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY)").await {
+    // HIGHESTMODSEQ is only legal to *ask* for when the capability is
+    // advertised; on a non-CONDSTORE server the data item is a protocol
+    // error, so the query is built per-connection.
+    let query = status_count_query(condstore);
+    match session.status(path, query).await {
         Ok(meta) => {
-            let changed = meta.exists != folder.total || meta.unseen.unwrap_or(0) != folder.unread;
+            let mut changed = meta.exists != folder.total || meta.unseen.unwrap_or(0) != folder.unread;
             folder.total = meta.exists;
             if let Some(unseen) = meta.unseen {
                 folder.unread = unseen;
@@ -2103,6 +2162,10 @@ async fn refresh_folder_counts(session: &mut Session<ImapStream>, folder: &mut M
             }
             if let Some(validity) = meta.uid_validity {
                 folder.uidvalidity = UidValidity(validity);
+            }
+            if meta.highest_modseq.is_some() {
+                changed |= folder.highest_modseq != meta.highest_modseq;
+                folder.highest_modseq = meta.highest_modseq;
             }
             changed
         }
@@ -2149,6 +2212,10 @@ fn carry_counts_forward(folders: &mut [Mailbox], known: &[Mailbox]) {
             folder.unread = known.unread;
             folder.uidnext = known.uidnext;
             folder.uidvalidity = known.uidvalidity;
+            // A re-list can't report a modseq either; carry the last learned
+            // one so the persisted folder list never loses its incremental-
+            // sync baseline just because LIST ran.
+            folder.highest_modseq = known.highest_modseq;
         }
     }
 }
@@ -2403,6 +2470,15 @@ async fn sync_mailbox(
             }
             changed |= folder.uidvalidity != uidvalidity;
             folder.uidvalidity = uidvalidity;
+            // `highest_modseq` is only populated when CONDSTORE is enabled
+            // (each SELECT then reports the folder's current modseq); with no
+            // SELECT - the IDLE-wake skip path - it keeps its prior value,
+            // which is safe: a stale baseline makes a later `CHANGEDSINCE`
+            // delta fetch wider, never wrong.
+            if let Some(modseq) = meta.highest_modseq {
+                changed |= folder.highest_modseq != Some(modseq);
+                folder.highest_modseq = Some(modseq);
+            }
         }
         if changed {
             publish_folders(folders, account_id, cache, events).await;
@@ -2845,5 +2921,31 @@ mod tests {
         // A folder that's new since the last list has nothing to carry over
         // and keeps its zeros until the drain reaches it.
         assert_eq!(relisted[1].unread, 0);
+    }
+
+    #[test]
+    fn a_relist_carries_the_learned_modseq_forward() {
+        // LIST can't report `highest_modseq`, so a re-list must not wipe the
+        // baseline the incremental-sync paths persist per folder.
+        let account = AccountId("acc".into());
+        let mut known = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0)];
+        let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0)];
+        relisted[0].highest_modseq = Some(4_200_000_000);
+        carry_counts_forward(&mut relisted, &known);
+        assert_eq!(relisted[0].highest_modseq, None);
+
+        let mut relisted = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0)];
+        known[0].highest_modseq = Some(4_200_000_000);
+        carry_counts_forward(&mut relisted, &known);
+        assert_eq!(relisted[0].highest_modseq, Some(4_200_000_000));
+    }
+
+    #[test]
+    fn status_query_asks_for_modseq_only_on_condstore_connections() {
+        assert_eq!(
+            status_count_query(true),
+            "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)"
+        );
+        assert_eq!(status_count_query(false), "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY)");
     }
 }
