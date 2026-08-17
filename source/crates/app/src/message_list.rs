@@ -540,9 +540,21 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
     )
 }
 
+/// The `message_row_key` fingerprint of every message in `messages`, in
+/// order - the precomputed form `repopulate` compares against `displayed`,
+/// so the no-op check is one `Vec` equality instead of rebuilding both
+/// sides' keys (≈6 allocations per message) on every event.
+fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
+    messages.iter().map(message_row_key).collect()
+}
+
 /// The list's contents as last rendered, plus the sort, filter, and threading
 /// mode that produced them - the comparison `repopulate` skips a rebuild on.
-type DisplayedMessages = Option<(SortKey, bool, ListFilter, bool, Vec<EmailSummary>)>;
+/// Holds each row's `MessageRowKey` fingerprint rather than the summaries
+/// themselves: the fingerprint is the only thing the comparison needs, and
+/// key vectors make it a plain `Vec` equality (allocation-free) instead of a
+/// per-message key rebuild on both sides of every event.
+type DisplayedMessages = Option<(SortKey, bool, ListFilter, bool, Vec<MessageRowKey>)>;
 
 /// What the message list's selection currently points at. The cases are
 /// genuinely distinct to the reading pane: nothing selected clears it, a
@@ -618,10 +630,10 @@ pub struct MessageListModel {
     /// one way in.
     threaded: Rc<RefCell<bool>>,
     /// What's currently on screen, in display order, and the sort + filter
-    /// that produced it. Kept here rather than in `UiState` so `repopulate`
-    /// never has to hold a `UiState` borrow across a `splice` - which
-    /// synchronously re-enters the selection handler, and would panic on the
-    /// re-borrow.
+    /// that produced it, stored as each row's `MessageRowKey` fingerprint.
+    /// Kept here rather than in `UiState` so `repopulate` never has to hold a
+    /// `UiState` borrow across a `splice` - which synchronously re-enters the
+    /// selection handler, and would panic on the re-borrow.
     displayed: Rc<RefCell<DisplayedMessages>>,
     /// The *unfiltered* message set from the last `repopulate` - the source
     /// of truth a filter change re-renders from. `displayed` is derived from
@@ -775,14 +787,20 @@ impl MessageListModel {
     pub fn repopulate(&self, messages: Vec<EmailSummary>, sort_key: SortKey, sort_descending: bool) {
         // Remember the full, unfiltered set first - a filter toggle
         // re-renders from this, so messages hidden by the filter aren't lost.
-        *self.truth.borrow_mut() = messages.clone();
+        // Moved in rather than cloned: the no-op check below compares only
+        // the filtered subset, but `truth` must still see every incoming
+        // change - including one the filter hides - or a later filter toggle
+        // would render stale data.
+        *self.truth.borrow_mut() = messages;
 
         // Apply the active filter, then sort the surviving subset. Filtering
         // first keeps the no-op check comparing like with like: the subset
-        // this rebuild produced against the subset already displayed.
-        let mut messages = messages;
+        // this rebuild produced against the subset already displayed. The
+        // subset itself is cloned out of `truth` (one clone of the surviving
+        // messages; the old code's second full-set clone into `displayed` is
+        // gone - `displayed` now keeps just the row keys).
         let filter = *self.filter.borrow();
-        messages.retain(|m| filter.matches(m));
+        let mut messages: Vec<EmailSummary> = self.truth.borrow().iter().filter(|m| filter.matches(m)).cloned().collect();
         sort_messages(&mut messages, sort_key, sort_descending);
 
         // The sort is part of the comparison, not just the contents: a list
@@ -794,14 +812,14 @@ impl MessageListModel {
         // conversations than under bare messages, and flipping the View-tab
         // toggle must rebuild even when nothing else moved.
         let threaded = *self.threaded.borrow();
-        let unchanged = self.displayed.borrow().as_ref().is_some_and(|(key, descending, shown_filter, shown_threaded, current)| {
-            *key == sort_key
-                && *descending == sort_descending
-                && *shown_filter == filter
-                && *shown_threaded == threaded
-                && current.len() == messages.len()
-                && current.iter().zip(messages.iter()).all(|(a, b)| message_row_key(a) == message_row_key(b))
-        });
+        let keys = message_row_keys(&messages);
+        let unchanged = self
+            .displayed
+            .borrow()
+            .as_ref()
+            .is_some_and(|(key, descending, shown_filter, shown_threaded, current_keys)| {
+                *key == sort_key && *descending == sort_descending && *shown_filter == filter && *shown_threaded == threaded && *current_keys == keys
+            });
         if unchanged {
             return;
         }
@@ -824,7 +842,7 @@ impl MessageListModel {
             gtk::INVALID_LIST_POSITION
         };
 
-        *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, threaded, messages.clone()));
+        *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, threaded, keys));
 
         match build_layout(messages, sort_key, Local::now(), threaded, sort_descending) {
             ListLayout::Flat(messages) => {
@@ -1730,6 +1748,25 @@ mod tests {
         let mut with_preview = a.clone();
         with_preview[0].preview = Some("Truffle Security Co. says it scanned...".into());
         assert!(!same_message_list(&a, &with_preview));
+    }
+
+    #[test]
+    fn message_row_keys_match_the_same_list_and_differ_on_any_rendered_change() {
+        let a = vec![at(2, "a:INBOX", 2024, 1, 10, 10), at(1, "a:INBOX", 2024, 1, 10, 9)];
+        // The keys repopulate now compares: a Vec equality, so the identical
+        // set must key identically.
+        assert_eq!(message_row_keys(&a), message_row_keys(&a));
+
+        // A preview arriving (the two-phase sync's second emit) must change
+        // the keys, or the rebuild that shows the snippet would be skipped.
+        let mut with_preview = a.clone();
+        with_preview[0].preview = Some("snippet".into());
+        assert_ne!(message_row_keys(&a), message_row_keys(&with_preview));
+
+        // Order is part of the comparison: repopulate keys *after* sorting,
+        // so a different display order must read as a change.
+        let reordered = vec![a[1].clone(), a[0].clone()];
+        assert_ne!(message_row_keys(&a), message_row_keys(&reordered));
     }
 
     fn uids(messages: &[EmailSummary]) -> Vec<u32> {

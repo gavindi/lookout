@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.60 (2026-08-18)
+
+### Changed
+
+- **UI**: every account/session event channel is now bounded (64 events) instead of unbounded, and each UI event loop drains its channel in batches, collapsing whole-snapshot events into the last copy of each - the startup burst no longer repopulates the same surface once per queued copy (cache replay + live sync + previews = three full message-list rebuilds per mailbox). The mail loop keeps only the last `FoldersUpdated` and the last `MessagesUpdated` per mailbox; the calendar loop keeps the last `CalendarsUpdated`, the last `TasksUpdated`, and the last `OccurrencesUpdated` per month; the Google Tasks loop keeps the last `ListsUpdated`/`TasksUpdated`; the webcal loop keeps the last `SubscriptionsUpdated` per month. Non-snapshot events (new-mail notifications, body/part fetches, move/flag failures, errors, connection state) are never dropped and keep their queue position, so a `MoveFailed` still rolls back before the authoritative resync repaints. The session side now genuinely backs off under a flood - its `send().await` stalls instead of growing memory without bound - while the UI-to-session *command* channels stay unbounded on purpose: commands are sent with `send_blocking` from the GTK main thread and the session can be mid-fetch for seconds, so a bounded command channel would freeze the UI on click.
+- **UI**: the message list's "nothing changed" check is now allocation-free. `repopulate` ran on every message event and rebuilt each row's 10-field fingerprint (`message_row_key`, ≈6 heap allocations per message) for *both* the incoming set and the displayed set before bailing; it now precomputes the key vector once per call and stores that in `displayed` - the check is a plain `Vec` equality - and `displayed` holds keys instead of a second deep clone of the summaries. The full, unfiltered set is moved into the model's `truth` rather than cloned, so a `repopulate` allocates one filtered-subset clone instead of two full clones. The rebuild-skipping semantics are unchanged: sort, filter, and threading mode still force a rebuild, `truth` still sees filter-hidden changes (a filter toggle can't render stale data), and `refresh()` still bypasses the check for tag edits.
+
+### Testing
+
+- `lookout-app`: seven new tests pin the collapse helpers' contracts - the mail loop keeps the last `MessagesUpdated` per mailbox and the last `FoldersUpdated` while non-snapshot events keep their queue position and nothing is dropped when no key repeats, the calendar loop keeps one `OccurrencesUpdated` per month (different months both survive) plus one `CalendarsUpdated`/`TasksUpdated`, the tasks loop keeps one `ListsUpdated`/`TasksUpdated`, and the webcal loop keeps one `SubscriptionsUpdated` per month; plus a `message_row_keys` test pinning the new no-op comparison - identical lists key identically, while preview arrival and re-ordering both change the keys.
+
 ## 0.9.59 (2026-08-18)
 
 ### Changed

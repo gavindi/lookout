@@ -232,6 +232,17 @@ const MAX_TAG_DOTS: usize = 3;
 /// attachments over slow connections legitimately take a while.
 const ATTACHMENT_FETCH_TIMEOUT_MS: u64 = 60_000;
 
+/// How many session events may queue before the session stalls on send. The
+/// UI drains each loop's channel in batches and collapses whole-snapshot
+/// events into the last copy of each (see `collapse_last_wins`), so a full
+/// channel is a transient burst - and backpressure is the point: an unbounded
+/// channel lets a sync storm grow memory without bound while the UI serially
+/// repopulates. The UI -> session *command* channels stay unbounded on
+/// purpose: commands are sent with `send_blocking` from the GTK main thread,
+/// and the session can be mid-fetch for seconds, so a bounded command channel
+/// would freeze the UI on click.
+const EVENT_CHANNEL_CAPACITY: usize = 64;
+
 /// The "Switch message theme" toggle's stylesheet, injected as a WebKit
 /// *user* style sheet into the reading pane's WebView: it strips whatever
 /// background colour the email itself defines so the app theme's background
@@ -7488,8 +7499,11 @@ fn connect_account(
     }
     let credentials: std::sync::Arc<dyn lookout_mail::session::CredentialProvider> = std::sync::Arc::new(SendWrapper(credentials));
 
+    // Commands stay unbounded (sent via `send_blocking` from the main thread);
+    // events are bounded so the drain coalesces a batch and stalls the session
+    // under a flood instead of queueing unboundedly - see `EVENT_CHANNEL_CAPACITY`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
-    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     state.borrow_mut().accounts.insert(
         account_id.clone(),
         AccountHandle {
@@ -7536,6 +7550,83 @@ fn connect_account(
     );
 }
 
+/// The identity of a whole-snapshot session event: the one value a later copy
+/// of the same event supersedes. An earlier snapshot of a key is dropped by
+/// `collapse_last_wins` - replaying both would repaint the same surface twice
+/// with the later, strictly-newer data.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum SnapshotKey {
+    /// `AccountEvent::FoldersUpdated` - the whole folder list.
+    Folders,
+    /// `AccountEvent::MessagesUpdated` - one mailbox's full message set.
+    Mailbox(MailboxId),
+    /// `CalendarSessionEvent::CalendarsUpdated` - the whole calendar list.
+    Calendars,
+    /// `CalendarSessionEvent::OccurrencesUpdated` - one month's occurrences.
+    Occurrences(chrono::NaiveDate),
+    /// `TasksUpdated` from a calendar account or Google Tasks.
+    Tasks,
+    /// `GoogleTasksEvent::ListsUpdated`.
+    TaskLists,
+    /// `SubscriptionSessionEvent::SubscriptionsUpdated` - one month's feeds.
+    Subscriptions(chrono::NaiveDate),
+}
+
+/// Keeps the events of one drained batch in order, minus the superseded
+/// copies: each event for which `supersedable` returns a key survives only in
+/// its last occurrence, everything else is untouched in its original position.
+/// The startup burst queues the same snapshot several times in a row (cache
+/// replay, live sync, previews), and without this the UI would repopulate the
+/// same surface once per queued copy.
+fn collapse_last_wins<T>(events: Vec<T>, supersedable: impl Fn(&T) -> Option<SnapshotKey>) -> Vec<T> {
+    let mut last: HashMap<SnapshotKey, usize> = HashMap::new();
+    for (i, event) in events.iter().enumerate() {
+        if let Some(key) = supersedable(event) {
+            last.insert(key, i);
+        }
+    }
+    let mut collapsed = Vec::with_capacity(events.len());
+    for (i, event) in events.into_iter().enumerate() {
+        match supersedable(&event) {
+            Some(key) if last.get(&key) == Some(&i) => collapsed.push(event),
+            Some(_) => {}
+            None => collapsed.push(event),
+        }
+    }
+    collapsed
+}
+
+fn collapse_account_events(events: Vec<AccountEvent>) -> Vec<AccountEvent> {
+    collapse_last_wins(events, |event| match event {
+        AccountEvent::FoldersUpdated(_) => Some(SnapshotKey::Folders),
+        AccountEvent::MessagesUpdated { mailbox, .. } => Some(SnapshotKey::Mailbox(mailbox.clone())),
+        _ => None,
+    })
+}
+
+fn collapse_calendar_events(events: Vec<CalendarSessionEvent>) -> Vec<CalendarSessionEvent> {
+    collapse_last_wins(events, |event| match event {
+        CalendarSessionEvent::CalendarsUpdated(_) => Some(SnapshotKey::Calendars),
+        CalendarSessionEvent::OccurrencesUpdated { month, .. } => Some(SnapshotKey::Occurrences(*month)),
+        CalendarSessionEvent::TasksUpdated(_) => Some(SnapshotKey::Tasks),
+        _ => None,
+    })
+}
+
+fn collapse_google_tasks_events(events: Vec<GoogleTasksEvent>) -> Vec<GoogleTasksEvent> {
+    collapse_last_wins(events, |event| match event {
+        GoogleTasksEvent::ListsUpdated(_) => Some(SnapshotKey::TaskLists),
+        GoogleTasksEvent::TasksUpdated(_) => Some(SnapshotKey::Tasks),
+        GoogleTasksEvent::Error(_) => None,
+    })
+}
+
+fn collapse_subscription_events(events: Vec<SubscriptionSessionEvent>) -> Vec<SubscriptionSessionEvent> {
+    collapse_last_wins(events, |event| match event {
+        SubscriptionSessionEvent::SubscriptionsUpdated { month, .. } => Some(SnapshotKey::Subscriptions(*month)),
+    })
+}
+
 /// Drives one connected account's `AccountEvent` stream for the rest of the
 /// session, repainting whichever UI surface each event affects. Shared
 /// between GOA accounts (`connect_account`) and manually-added accounts
@@ -7562,87 +7653,74 @@ fn spawn_account_event_loop(
 ) {
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
-            match event {
-                AccountEvent::ConnectionStateChanged(ConnectionState::Error { message, retryable }) => {
-                    // Retryable failures are warnings: the session reconnects
-                    // itself with backoff, so they must not pop a toast on
-                    // every attempt. Only non-retryable (fatal) errors surface.
-                    if !retryable {
-                        let title = glib::markup_escape_text(&format!("{}: {message}", account_label(&state, &account_id)));
-                        toast_overlay.add_toast(adw::Toast::new(&title));
-                    }
-                }
-                AccountEvent::ConnectionStateChanged(_) => {}
-                AccountEvent::FoldersUpdated(folders) => {
-                    {
-                        let mut st = state.borrow_mut();
-                        if let Some(handle) = st.accounts.get_mut(&account_id) {
-                            handle.folders = folders;
+            // Drain the whole queued batch before handling, collapsing
+            // whole-snapshot events (folders, message lists) into the last
+            // copy of each - the startup burst queues the same envelope set
+            // several times in a row (cache replay, live sync, previews), and
+            // the UI must repaint once per batch, not once per queued copy.
+            let mut batch = vec![event];
+            while let Ok(next) = evt_rx.try_recv() {
+                batch.push(next);
+            }
+            for event in collapse_account_events(batch) {
+                match event {
+                    AccountEvent::ConnectionStateChanged(ConnectionState::Error { message, retryable }) => {
+                        // Retryable failures are warnings: the session reconnects
+                        // itself with backoff, so they must not pop a toast on
+                        // every attempt. Only non-retryable (fatal) errors surface.
+                        if !retryable {
+                            let title = glib::markup_escape_text(&format!("{}: {message}", account_label(&state, &account_id)));
+                            toast_overlay.add_toast(adw::Toast::new(&title));
                         }
-                        // Fresh folder list means the account just (re)connected;
-                        // any sync requests it left unanswered are dead - clear
-                        // them so a later request for the same mailbox isn't
-                        // wrongly suppressed by an entry that'll never resolve.
-                        st.syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
                     }
-                    rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
-                    // Folder names and account labels only exist once this
-                    // event lands, so a view restored before it (or adopted by
-                    // the race below) gets its header filled in here.
-                    refresh_list_header(&state, &list_header);
-                    // The dashboard's mail stats follow the folder syncs.
-                    dashboard_refresh();
-                    // A reconnect can clear the open mailbox's `syncing` entry
-                    // (its old request is dead) without ever answering it -
-                    // don't leave the spinner running for a request that will
-                    // never land.
-                    refresh_message_loading_state(&state, &message_list, &message_list_stack);
-                }
-                AccountEvent::MessagesUpdated { mailbox, messages } => {
-                    // An authoritative sync for this mailbox supersedes
-                    // whatever's still sitting in the optimistic-removal
-                    // stash - the success path that led here already
-                    // dropped those rows from the server too, so there's
-                    // nothing left to reconcile.
-                    state.borrow_mut().pending_optimistic_removals.remove(&mailbox);
-                    state.borrow_mut().pending_optimistic_flag_changes.remove(&mailbox);
-                    // The sync this mailbox was asked for (if any) has landed.
-                    state.borrow_mut().syncing.remove(&mailbox);
-                    refresh_message_loading_state(&state, &message_list, &message_list_stack);
-                    // A sync means the envelope cache this dashboard reads
-                    // changed - repaint its mail sections. (The calendar
-                    // sections repaint via their own event loops.)
-                    dashboard_refresh();
-                    // While a search is active the results list owns the
-                    // pane: a background sync repopulating it would clobber
-                    // the results with the folder's full set. Still fold
-                    // inbox syncs into the unified snapshot so exiting search
-                    // restores fresh data.
-                    if state.borrow().search_active {
-                        let mut st = state.borrow_mut();
-                        let in_unified_set = st
-                            .accounts
-                            .values()
-                            .any(|h| h.folders.iter().any(|m| m.id == mailbox && matches!(m.role, MailboxRole::Inbox)));
-                        if in_unified_set {
-                            st.unified_snapshots.insert(mailbox, messages);
+                    AccountEvent::ConnectionStateChanged(_) => {}
+                    AccountEvent::FoldersUpdated(folders) => {
+                        {
+                            let mut st = state.borrow_mut();
+                            if let Some(handle) = st.accounts.get_mut(&account_id) {
+                                handle.folders = folders;
+                            }
+                            // Fresh folder list means the account just (re)connected;
+                            // any sync requests it left unanswered are dead - clear
+                            // them so a later request for the same mailbox isn't
+                            // wrongly suppressed by an entry that'll never resolve.
+                            st.syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
                         }
-                        continue;
+                        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+                        // Folder names and account labels only exist once this
+                        // event lands, so a view restored before it (or adopted by
+                        // the race below) gets its header filled in here.
+                        refresh_list_header(&state, &list_header);
+                        // The dashboard's mail stats follow the folder syncs.
+                        dashboard_refresh();
+                        // A reconnect can clear the open mailbox's `syncing` entry
+                        // (its old request is dead) without ever answering it -
+                        // don't leave the spinner running for a request that will
+                        // never land.
+                        refresh_message_loading_state(&state, &message_list, &message_list_stack);
                     }
-                    // Decide whether this mailbox belongs to the view on
-                    // screen, folding its payload into the unified snapshot
-                    // when in "All Inboxes" mode. On fresh startup (nothing
-                    // selected yet) the first inbox sync is still adopted as
-                    // the default single-mailbox view, matching the old
-                    // race-first behavior.
-                    let (display, single_messages, adopted) = {
-                        let mut st = state.borrow_mut();
-                        if matches!(st.mail_view, MailView::UnifiedInbox) {
-                            // Only accept mailboxes that are actually part
-                            // of the unified set (each account's Inbox) - a
-                            // stale resync from a mailbox the user last had
-                            // open in single-view must not leak into the
-                            // merged list.
+                    AccountEvent::MessagesUpdated { mailbox, messages } => {
+                        // An authoritative sync for this mailbox supersedes
+                        // whatever's still sitting in the optimistic-removal
+                        // stash - the success path that led here already
+                        // dropped those rows from the server too, so there's
+                        // nothing left to reconcile.
+                        state.borrow_mut().pending_optimistic_removals.remove(&mailbox);
+                        state.borrow_mut().pending_optimistic_flag_changes.remove(&mailbox);
+                        // The sync this mailbox was asked for (if any) has landed.
+                        state.borrow_mut().syncing.remove(&mailbox);
+                        refresh_message_loading_state(&state, &message_list, &message_list_stack);
+                        // A sync means the envelope cache this dashboard reads
+                        // changed - repaint its mail sections. (The calendar
+                        // sections repaint via their own event loops.)
+                        dashboard_refresh();
+                        // While a search is active the results list owns the
+                        // pane: a background sync repopulating it would clobber
+                        // the results with the folder's full set. Still fold
+                        // inbox syncs into the unified snapshot so exiting search
+                        // restores fresh data.
+                        if state.borrow().search_active {
+                            let mut st = state.borrow_mut();
                             let in_unified_set = st
                                 .accounts
                                 .values()
@@ -7650,339 +7728,363 @@ fn spawn_account_event_loop(
                             if in_unified_set {
                                 st.unified_snapshots.insert(mailbox, messages);
                             }
-                            (in_unified_set, None, false)
-                        } else {
-                            // Nothing selected yet: adopt whichever account's
-                            // initial inbox sync lands first as the default
-                            // view, rather than leaving the message list empty
-                            // until the user clicks a folder. Unless a
-                            // remembered view is still pending restore - that
-                            // takes priority over the race, so a slow account
-                            // can't steal the pane away from the user's last
-                            // folder. Whichever connected account happens to
-                            // finish its first sync first wins this race - an
-                            // acceptable, benign nondeterminism for Phase 1.
-                            let adopted = st.current_mailbox.is_none() && !st.restore_pending;
-                            if adopted {
-                                st.current_account = Some(account_id.clone());
-                                st.current_mailbox = Some(mailbox.clone());
-                            }
-                            let is_current = st.current_mailbox.as_ref() == Some(&mailbox);
-                            (is_current, is_current.then_some(messages), adopted)
+                            continue;
                         }
-                    };
-                    // The adopt-first path picked a default view; name it in
-                    // the list header.
-                    if adopted {
-                        refresh_list_header(&state, &list_header);
-                    }
-                    if display {
-                        let all = match single_messages {
-                            Some(messages) => messages,
-                            None => merge_unified_snapshots(&state.borrow().unified_snapshots),
+                        // Decide whether this mailbox belongs to the view on
+                        // screen, folding its payload into the unified snapshot
+                        // when in "All Inboxes" mode. On fresh startup (nothing
+                        // selected yet) the first inbox sync is still adopted as
+                        // the default single-mailbox view, matching the old
+                        // race-first behavior.
+                        let (display, single_messages, adopted) = {
+                            let mut st = state.borrow_mut();
+                            if matches!(st.mail_view, MailView::UnifiedInbox) {
+                                // Only accept mailboxes that are actually part
+                                // of the unified set (each account's Inbox) - a
+                                // stale resync from a mailbox the user last had
+                                // open in single-view must not leak into the
+                                // merged list.
+                                let in_unified_set = st
+                                    .accounts
+                                    .values()
+                                    .any(|h| h.folders.iter().any(|m| m.id == mailbox && matches!(m.role, MailboxRole::Inbox)));
+                                if in_unified_set {
+                                    st.unified_snapshots.insert(mailbox, messages);
+                                }
+                                (in_unified_set, None, false)
+                            } else {
+                                // Nothing selected yet: adopt whichever account's
+                                // initial inbox sync lands first as the default
+                                // view, rather than leaving the message list empty
+                                // until the user clicks a folder. Unless a
+                                // remembered view is still pending restore - that
+                                // takes priority over the race, so a slow account
+                                // can't steal the pane away from the user's last
+                                // folder. Whichever connected account happens to
+                                // finish its first sync first wins this race - an
+                                // acceptable, benign nondeterminism for Phase 1.
+                                let adopted = st.current_mailbox.is_none() && !st.restore_pending;
+                                if adopted {
+                                    st.current_account = Some(account_id.clone());
+                                    st.current_mailbox = Some(mailbox.clone());
+                                }
+                                let is_current = st.current_mailbox.as_ref() == Some(&mailbox);
+                                (is_current, is_current.then_some(messages), adopted)
+                            }
                         };
-                        let (key, descending) = current_sort(&state);
-                        message_list.repopulate(all, key, descending);
+                        // The adopt-first path picked a default view; name it in
+                        // the list header.
+                        if adopted {
+                            refresh_list_header(&state, &list_header);
+                        }
+                        if display {
+                            let all = match single_messages {
+                                Some(messages) => messages,
+                                None => merge_unified_snapshots(&state.borrow().unified_snapshots),
+                            };
+                            let (key, descending) = current_sort(&state);
+                            message_list.repopulate(all, key, descending);
+                        }
                     }
-                }
-                AccountEvent::NewMessages { mailbox, messages } => {
-                    // Desktop notification for genuinely-new unread mail
-                    // (`session.rs` already excludes a mailbox's first-ever
-                    // sync). Gated by the settings toggle and the mailbox's
-                    // role (only Inbox/Custom are worth notifying about - see
-                    // `should_notify_role`). Fires even if the window is
-                    // already focused on this exact mailbox - the message
-                    // just arrived and the list may not have repainted yet,
-                    // so the notification is still useful.
-                    if state.borrow().settings.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED) {
-                        let mailbox_info = state.borrow().accounts.get(&account_id).and_then(|h| h.folders.iter().find(|f| f.id == mailbox).cloned());
-                        if let Some(mailbox_info) = mailbox_info {
-                            if crate::mail_notifications::should_notify_role(mailbox_info.role) {
-                                crate::mail_notifications::show_new_mail_notification(&app, &mailbox_info.name, &mailbox, &messages);
+                    AccountEvent::NewMessages { mailbox, messages } => {
+                        // Desktop notification for genuinely-new unread mail
+                        // (`session.rs` already excludes a mailbox's first-ever
+                        // sync). Gated by the settings toggle and the mailbox's
+                        // role (only Inbox/Custom are worth notifying about - see
+                        // `should_notify_role`). Fires even if the window is
+                        // already focused on this exact mailbox - the message
+                        // just arrived and the list may not have repainted yet,
+                        // so the notification is still useful.
+                        if state.borrow().settings.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED) {
+                            let mailbox_info = state.borrow().accounts.get(&account_id).and_then(|h| h.folders.iter().find(|f| f.id == mailbox).cloned());
+                            if let Some(mailbox_info) = mailbox_info {
+                                if crate::mail_notifications::should_notify_role(mailbox_info.role) {
+                                    crate::mail_notifications::show_new_mail_notification(&app, &mailbox_info.name, &mailbox, &messages);
+                                }
+                            }
+                        }
+                    }
+                    AccountEvent::BodyFetched { mailbox, uid, body } => {
+                        let should_render = {
+                            let mut st = state.borrow_mut();
+                            let is_current = body_request_matches(&mailbox, &uid, st.pending_body_request.as_ref());
+                            // Cache the body regardless of whether the user is
+                            // still looking at this message - a fetch that
+                            // completed after they moved on is still worth
+                            // keeping for when they come back.
+                            st.body_cache.insert(mailbox.clone(), uid, body.clone());
+                            is_current
+                        };
+                        if should_render {
+                            tracing::debug!(?mailbox, uid = uid.0, "FetchBody: body arrived on UI thread");
+                            render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
+                        }
+                    }
+                    AccountEvent::PartFetched { mailbox, uid, part, bytes } => {
+                        // An inline `cid:` image request for this part (separate
+                        // from the strip's one-at-a-time row actions): finish the
+                        // WebKit request with the bytes. Keyed by part number and
+                        // dropped on every message change, so a hit is
+                        // authoritative - a stale part for the same number can't
+                        // linger because the map only ever holds the current
+                        // message's requests. Runs first so the strip closures
+                        // below can move `part`/`bytes` into their futures.
+                        let cid_request = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_cid.get(&part.part_number) {
+                                Some(p) if p.mailbox == mailbox && p.uid == uid => Some(st.pending_cid.remove(&part.part_number).expect("present").request),
+                                _ => None,
+                            }
+                        };
+                        if let Some(cid_request) = cid_request {
+                            tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, bytes = bytes.len(), "cid: image bytes arrived; finishing WebKit request");
+                            let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
+                            cid_request.finish(&stream, bytes.len() as i64, Some(&part.content_type));
+                        }
+                        // An attachment part's bytes arrived. Only act if they
+                        // belong to the message currently on the reading pane and
+                        // to the outstanding row action - a response that lands
+                        // after the user moved on (or for a different part of the
+                        // same message) is stale and dropped with its in-flight
+                        // bookkeeping.
+                        let pending = {
+                            let mut st = state.borrow_mut();
+                            let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
+                            if !on_screen {
+                                st.pending_attachment = None;
+                                None
+                            } else {
+                                st.pending_attachment.take()
+                            }
+                        };
+                        if let Some(p) = pending {
+                            if p.mailbox == mailbox && p.uid == uid && p.part_number == part.part_number {
+                                p.button.set_sensitive(true);
+                                match p.action {
+                                    PendingAttachmentAction::Open => {
+                                        let window_for_open = window.clone();
+                                        let state_for_open = state.clone();
+                                        let toast_for_open = toast_overlay.clone();
+                                        glib::spawn_future_local(async move {
+                                            open_attachment_temp(&window_for_open, &state_for_open, toast_for_open, &part, &bytes).await;
+                                        });
+                                    }
+                                    PendingAttachmentAction::OpenWith => {
+                                        let state_for_open_with = state.clone();
+                                        let toast_for_open_with = toast_overlay.clone();
+                                        glib::spawn_future_local(async move {
+                                            open_attachment_with(&state_for_open_with, toast_for_open_with, &part, &bytes).await;
+                                        });
+                                    }
+                                    PendingAttachmentAction::Save => {
+                                        let window_for_save = window.clone();
+                                        let toast_for_save = toast_overlay.clone();
+                                        glib::spawn_future_local(async move {
+                                            save_attachment_to_disk(&window_for_save, toast_for_save, &part, &bytes).await;
+                                        });
+                                    }
+                                }
+                            } else {
+                                // Mismatched request (shouldn't happen with the
+                                // one-at-a-time guard, but be safe).
+                                state.borrow_mut().pending_attachment = Some(p);
                             }
                         }
                     }
-                }
-                AccountEvent::BodyFetched { mailbox, uid, body } => {
-                    let should_render = {
-                        let mut st = state.borrow_mut();
-                        let is_current = body_request_matches(&mailbox, &uid, st.pending_body_request.as_ref());
-                        // Cache the body regardless of whether the user is
-                        // still looking at this message - a fetch that
-                        // completed after they moved on is still worth
-                        // keeping for when they come back.
-                        st.body_cache.insert(mailbox.clone(), uid, body.clone());
-                        is_current
-                    };
-                    if should_render {
-                        tracing::debug!(?mailbox, uid = uid.0, "FetchBody: body arrived on UI thread");
-                        render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
-                    }
-                }
-                AccountEvent::PartFetched { mailbox, uid, part, bytes } => {
-                    // An inline `cid:` image request for this part (separate
-                    // from the strip's one-at-a-time row actions): finish the
-                    // WebKit request with the bytes. Keyed by part number and
-                    // dropped on every message change, so a hit is
-                    // authoritative - a stale part for the same number can't
-                    // linger because the map only ever holds the current
-                    // message's requests. Runs first so the strip closures
-                    // below can move `part`/`bytes` into their futures.
-                    let cid_request = {
-                        let mut st = state.borrow_mut();
-                        match st.pending_cid.get(&part.part_number) {
-                            Some(p) if p.mailbox == mailbox && p.uid == uid => Some(st.pending_cid.remove(&part.part_number).expect("present").request),
-                            _ => None,
+                    AccountEvent::PartFetchFailed {
+                        mailbox,
+                        uid,
+                        part_number,
+                        message,
+                    } => {
+                        // The session couldn't produce this attachment's bytes.
+                        // Restore the row's button if this is still the outstanding
+                        // request and tell the user what went wrong - never leave
+                        // it stuck.
+                        let pending = {
+                            let mut st = state.borrow_mut();
+                            let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
+                            if !on_screen {
+                                st.pending_attachment = None;
+                                None
+                            } else {
+                                st.pending_attachment.take()
+                            }
+                        };
+                        if let Some(p) = pending {
+                            if p.mailbox == mailbox && p.uid == uid && p.part_number == part_number {
+                                p.button.set_sensitive(true);
+                                toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
+                            } else {
+                                state.borrow_mut().pending_attachment = Some(p);
+                            }
                         }
-                    };
-                    if let Some(cid_request) = cid_request {
-                        tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, bytes = bytes.len(), "cid: image bytes arrived; finishing WebKit request");
-                        let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
-                        cid_request.finish(&stream, bytes.len() as i64, Some(&part.content_type));
-                    }
-                    // An attachment part's bytes arrived. Only act if they
-                    // belong to the message currently on the reading pane and
-                    // to the outstanding row action - a response that lands
-                    // after the user moved on (or for a different part of the
-                    // same message) is stale and dropped with its in-flight
-                    // bookkeeping.
-                    let pending = {
-                        let mut st = state.borrow_mut();
-                        let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
-                        if !on_screen {
-                            st.pending_attachment = None;
-                            None
-                        } else {
-                            st.pending_attachment.take()
+                        // The same failure for an inline `cid:` image request:
+                        // finish the WebKit request with an error so the browser
+                        // draws a broken image rather than waiting forever.
+                        let cid_request = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_cid.get(&part_number) {
+                                Some(p) if p.mailbox == mailbox && p.uid == uid => Some(st.pending_cid.remove(&part_number).expect("present").request),
+                                _ => None,
+                            }
+                        };
+                        if let Some(cid_request) = cid_request {
+                            tracing::warn!(?mailbox, uid = uid.0, part = %part_number, "cid: inline image fetch failed: {message}");
+                            finish_cid_request_error(&cid_request, "the inline image could not be fetched");
                         }
-                    };
-                    if let Some(p) = pending {
-                        if p.mailbox == mailbox && p.uid == uid && p.part_number == part.part_number {
-                            p.button.set_sensitive(true);
-                            match p.action {
-                                PendingAttachmentAction::Open => {
-                                    let window_for_open = window.clone();
-                                    let state_for_open = state.clone();
-                                    let toast_for_open = toast_overlay.clone();
-                                    glib::spawn_future_local(async move {
-                                        open_attachment_temp(&window_for_open, &state_for_open, toast_for_open, &part, &bytes).await;
-                                    });
-                                }
-                                PendingAttachmentAction::OpenWith => {
-                                    let state_for_open_with = state.clone();
-                                    let toast_for_open_with = toast_overlay.clone();
-                                    glib::spawn_future_local(async move {
-                                        open_attachment_with(&state_for_open_with, toast_for_open_with, &part, &bytes).await;
-                                    });
-                                }
-                                PendingAttachmentAction::Save => {
-                                    let window_for_save = window.clone();
-                                    let toast_for_save = toast_overlay.clone();
-                                    glib::spawn_future_local(async move {
-                                        save_attachment_to_disk(&window_for_save, toast_for_save, &part, &bytes).await;
-                                    });
+                    }
+                    AccountEvent::RawMessageFetched { mailbox, uid, bytes } => {
+                        // The .eml export's whole raw message arrived. Only act if
+                        // it belongs to the outstanding export request; a response
+                        // that lands after the user selected a different message
+                        // (or triggered a newer export) is stale and dropped with
+                        // its bookkeeping.
+                        let pending = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_raw_message.take() {
+                                Some(p) if p.mailbox == mailbox && p.uid == uid => Some(p),
+                                other => {
+                                    st.pending_raw_message = other;
+                                    None
                                 }
                             }
-                        } else {
-                            // Mismatched request (shouldn't happen with the
-                            // one-at-a-time guard, but be safe).
-                            state.borrow_mut().pending_attachment = Some(p);
+                        };
+                        if let Some(pending) = pending {
+                            let window_for_save = window.clone();
+                            let toast_for_save = toast_overlay.clone();
+                            glib::spawn_future_local(async move {
+                                save_raw_message_to_disk(&window_for_save, toast_for_save, &pending.initial_name, &bytes).await;
+                            });
                         }
                     }
-                }
-                AccountEvent::PartFetchFailed {
-                    mailbox,
-                    uid,
-                    part_number,
-                    message,
-                } => {
-                    // The session couldn't produce this attachment's bytes.
-                    // Restore the row's button if this is still the outstanding
-                    // request and tell the user what went wrong - never leave
-                    // it stuck.
-                    let pending = {
-                        let mut st = state.borrow_mut();
-                        let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
-                        if !on_screen {
-                            st.pending_attachment = None;
-                            None
-                        } else {
-                            st.pending_attachment.take()
-                        }
-                    };
-                    if let Some(p) = pending {
-                        if p.mailbox == mailbox && p.uid == uid && p.part_number == part_number {
-                            p.button.set_sensitive(true);
+                    AccountEvent::RawMessageFetchFailed { mailbox, uid, message } => {
+                        // The session couldn't produce the raw message. Clear the
+                        // pending export (so a later click can retry) and tell the
+                        // user what went wrong - never leave it stuck.
+                        let pending = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_raw_message.take() {
+                                Some(p) if p.mailbox == mailbox && p.uid == uid => Some(p),
+                                other => {
+                                    st.pending_raw_message = other;
+                                    None
+                                }
+                            }
+                        };
+                        if pending.is_some() {
                             toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
-                        } else {
-                            state.borrow_mut().pending_attachment = Some(p);
                         }
                     }
-                    // The same failure for an inline `cid:` image request:
-                    // finish the WebKit request with an error so the browser
-                    // draws a broken image rather than waiting forever.
-                    let cid_request = {
-                        let mut st = state.borrow_mut();
-                        match st.pending_cid.get(&part_number) {
-                            Some(p) if p.mailbox == mailbox && p.uid == uid => Some(st.pending_cid.remove(&part_number).expect("present").request),
-                            _ => None,
+                    AccountEvent::SendCompleted => {
+                        if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
+                            toast.dismiss();
                         }
-                    };
-                    if let Some(cid_request) = cid_request {
-                        tracing::warn!(?mailbox, uid = uid.0, part = %part_number, "cid: inline image fetch failed: {message}");
-                        finish_cid_request_error(&cid_request, "the inline image could not be fetched");
+                        toast_overlay.add_toast(adw::Toast::new("Message sent"));
                     }
-                }
-                AccountEvent::RawMessageFetched { mailbox, uid, bytes } => {
-                    // The .eml export's whole raw message arrived. Only act if
-                    // it belongs to the outstanding export request; a response
-                    // that lands after the user selected a different message
-                    // (or triggered a newer export) is stale and dropped with
-                    // its bookkeeping.
-                    let pending = {
-                        let mut st = state.borrow_mut();
-                        match st.pending_raw_message.take() {
-                            Some(p) if p.mailbox == mailbox && p.uid == uid => Some(p),
-                            other => {
-                                st.pending_raw_message = other;
-                                None
-                            }
+                    AccountEvent::SendFailed(message) => {
+                        if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
+                            toast.dismiss();
                         }
-                    };
-                    if let Some(pending) = pending {
-                        let window_for_save = window.clone();
-                        let toast_for_save = toast_overlay.clone();
-                        glib::spawn_future_local(async move {
-                            save_raw_message_to_disk(&window_for_save, toast_for_save, &pending.initial_name, &bytes).await;
-                        });
-                    }
-                }
-                AccountEvent::RawMessageFetchFailed { mailbox, uid, message } => {
-                    // The session couldn't produce the raw message. Clear the
-                    // pending export (so a later click can retry) and tell the
-                    // user what went wrong - never leave it stuck.
-                    let pending = {
-                        let mut st = state.borrow_mut();
-                        match st.pending_raw_message.take() {
-                            Some(p) if p.mailbox == mailbox && p.uid == uid => Some(p),
-                            other => {
-                                st.pending_raw_message = other;
-                                None
-                            }
-                        }
-                    };
-                    if pending.is_some() {
                         toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
-                    }
-                }
-                AccountEvent::SendCompleted => {
-                    if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
-                        toast.dismiss();
-                    }
-                    toast_overlay.add_toast(adw::Toast::new("Message sent"));
-                }
-                AccountEvent::SendFailed(message) => {
-                    if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
-                        toast.dismiss();
-                    }
-                    toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
-                    // The toast above is enough while the window is focused;
-                    // a desktop notification is for when the user isn't
-                    // looking, so a failed send doesn't go unnoticed.
-                    if !window.is_active() && state.borrow().settings.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED) {
-                        crate::mail_notifications::show_send_failed_notification(&app, &account_id, &message);
-                    }
-                }
-                AccountEvent::DraftSaved { message_id } => {
-                    // Relay the confirmation to whichever composer is open;
-                    // it decides whether the id is its own.
-                    if let Some(tx) = state.borrow().draft_saved_tx.clone() {
-                        let _ = tx.try_send(message_id);
-                    }
-                }
-                AccountEvent::MessageMoved { role } => {
-                    let label = match role {
-                        MailboxRole::Trash => "Deleted",
-                        MailboxRole::Archive => "Archived",
-                        MailboxRole::Junk => "Reported as junk",
-                        _ => "Moved",
-                    };
-                    toast_overlay.add_toast(adw::Toast::new(label));
-                }
-                AccountEvent::MoveFailed { mailbox, uids, role, message } => {
-                    // The move actually failed server-side, so put back
-                    // exactly the rows `optimistic_remove_messages` hid for
-                    // this attempt - the row must not stay gone for a move
-                    // that never happened.
-                    restore_optimistic_removals(&state, &message_list, &mailbox, &uids);
-                    let verb = match role {
-                        MailboxRole::Trash => "delete",
-                        MailboxRole::Archive => "archive",
-                        MailboxRole::Junk => "report as junk",
-                        _ => "move",
-                    };
-                    let title = glib::markup_escape_text(&format!("Couldn't {verb}: {message}"));
-                    toast_overlay.add_toast(adw::Toast::new(&title));
-                }
-                AccountEvent::StoreFlagsFailed { mailbox, uids, message } => {
-                    // The flag change actually failed server-side, so put
-                    // back exactly the summaries `optimistic_toggle_read`
-                    // patched for this attempt - a no-op if this failure
-                    // wasn't from a mark-read/unread toggle to begin with
-                    // (e.g. a Star/Unstar failure, which isn't optimistic).
-                    restore_optimistic_flag_changes(&state, &message_list, &mailbox, &uids);
-                    refresh_mark_read_button(&mark_read_button, &message_list);
-                    // Reverts the click handler's optimistic icon flip back
-                    // to whatever the (unpatched, so still correct) selected
-                    // summaries actually say.
-                    refresh_star_button(&star_button, &message_list);
-                    let title = glib::markup_escape_text(&format!("Couldn't update message flags: {message}"));
-                    toast_overlay.add_toast(adw::Toast::new(&title));
-                }
-                AccountEvent::MailboxExpunged { role } => {
-                    let label = match role {
-                        MailboxRole::Trash => "Trash emptied",
-                        MailboxRole::Junk => "Junk emptied",
-                        _ => "Folder emptied",
-                    };
-                    toast_overlay.add_toast(adw::Toast::new(label));
-                }
-                AccountEvent::MessageSnoozed => {
-                    toast_overlay.add_toast(adw::Toast::new("Snoozed until tomorrow 9:00 AM"));
-                }
-                AccountEvent::SearchResults { mailbox, query, messages } => {
-                    // An answer to the live IMAP pass. `mailbox` matches a
-                    // `search_pending` entry (the session always answers, even
-                    // with an empty match set); a result whose folder is no
-                    // longer pending - or whose query isn't the one on screen,
-                    // for the same-folder re-search race where an old answer
-                    // lands after the folder is pending again - belongs to a
-                    // stale search and is dropped.
-                    let account_id = mailbox_account_id(&mailbox);
-                    let pending_key = account_id.as_ref().map(|id| (id.clone(), mailbox.clone()));
-                    let wanted = pending_key.as_ref().is_some_and(|key| {
-                        let mut st = state.borrow_mut();
-                        st.search_pending.remove(key)
-                    });
-                    if !wanted || state.borrow().search_query != query {
-                        continue;
-                    }
-                    // Merge the answer into the accumulated results - a
-                    // search can also have surfaced this message in the cache
-                    // pass, so dedupe by `(mailbox, uid)`.
-                    let mut seen: HashSet<(MailboxId, Uid)> = state.borrow().search_results.iter().map(|m| (m.mailbox.clone(), m.uid)).collect();
-                    let mut st = state.borrow_mut();
-                    for m in messages {
-                        if seen.insert((m.mailbox.clone(), m.uid)) {
-                            st.search_results.push(m);
+                        // The toast above is enough while the window is focused;
+                        // a desktop notification is for when the user isn't
+                        // looking, so a failed send doesn't go unnoticed.
+                        if !window.is_active() && state.borrow().settings.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED) {
+                            crate::mail_notifications::show_send_failed_notification(&app, &account_id, &message);
                         }
                     }
-                    drop(st);
-                    repopulate_search_results(&state, &message_list);
-                }
-                AccountEvent::Error(message) => {
-                    let title = glib::markup_escape_text(&format!("{}: {message}", account_label(&state, &account_id)));
-                    toast_overlay.add_toast(adw::Toast::new(&title));
+                    AccountEvent::DraftSaved { message_id } => {
+                        // Relay the confirmation to whichever composer is open;
+                        // it decides whether the id is its own.
+                        if let Some(tx) = state.borrow().draft_saved_tx.clone() {
+                            let _ = tx.try_send(message_id);
+                        }
+                    }
+                    AccountEvent::MessageMoved { role } => {
+                        let label = match role {
+                            MailboxRole::Trash => "Deleted",
+                            MailboxRole::Archive => "Archived",
+                            MailboxRole::Junk => "Reported as junk",
+                            _ => "Moved",
+                        };
+                        toast_overlay.add_toast(adw::Toast::new(label));
+                    }
+                    AccountEvent::MoveFailed { mailbox, uids, role, message } => {
+                        // The move actually failed server-side, so put back
+                        // exactly the rows `optimistic_remove_messages` hid for
+                        // this attempt - the row must not stay gone for a move
+                        // that never happened.
+                        restore_optimistic_removals(&state, &message_list, &mailbox, &uids);
+                        let verb = match role {
+                            MailboxRole::Trash => "delete",
+                            MailboxRole::Archive => "archive",
+                            MailboxRole::Junk => "report as junk",
+                            _ => "move",
+                        };
+                        let title = glib::markup_escape_text(&format!("Couldn't {verb}: {message}"));
+                        toast_overlay.add_toast(adw::Toast::new(&title));
+                    }
+                    AccountEvent::StoreFlagsFailed { mailbox, uids, message } => {
+                        // The flag change actually failed server-side, so put
+                        // back exactly the summaries `optimistic_toggle_read`
+                        // patched for this attempt - a no-op if this failure
+                        // wasn't from a mark-read/unread toggle to begin with
+                        // (e.g. a Star/Unstar failure, which isn't optimistic).
+                        restore_optimistic_flag_changes(&state, &message_list, &mailbox, &uids);
+                        refresh_mark_read_button(&mark_read_button, &message_list);
+                        // Reverts the click handler's optimistic icon flip back
+                        // to whatever the (unpatched, so still correct) selected
+                        // summaries actually say.
+                        refresh_star_button(&star_button, &message_list);
+                        let title = glib::markup_escape_text(&format!("Couldn't update message flags: {message}"));
+                        toast_overlay.add_toast(adw::Toast::new(&title));
+                    }
+                    AccountEvent::MailboxExpunged { role } => {
+                        let label = match role {
+                            MailboxRole::Trash => "Trash emptied",
+                            MailboxRole::Junk => "Junk emptied",
+                            _ => "Folder emptied",
+                        };
+                        toast_overlay.add_toast(adw::Toast::new(label));
+                    }
+                    AccountEvent::MessageSnoozed => {
+                        toast_overlay.add_toast(adw::Toast::new("Snoozed until tomorrow 9:00 AM"));
+                    }
+                    AccountEvent::SearchResults { mailbox, query, messages } => {
+                        // An answer to the live IMAP pass. `mailbox` matches a
+                        // `search_pending` entry (the session always answers, even
+                        // with an empty match set); a result whose folder is no
+                        // longer pending - or whose query isn't the one on screen,
+                        // for the same-folder re-search race where an old answer
+                        // lands after the folder is pending again - belongs to a
+                        // stale search and is dropped.
+                        let account_id = mailbox_account_id(&mailbox);
+                        let pending_key = account_id.as_ref().map(|id| (id.clone(), mailbox.clone()));
+                        let wanted = pending_key.as_ref().is_some_and(|key| {
+                            let mut st = state.borrow_mut();
+                            st.search_pending.remove(key)
+                        });
+                        if !wanted || state.borrow().search_query != query {
+                            continue;
+                        }
+                        // Merge the answer into the accumulated results - a
+                        // search can also have surfaced this message in the cache
+                        // pass, so dedupe by `(mailbox, uid)`.
+                        let mut seen: HashSet<(MailboxId, Uid)> = state.borrow().search_results.iter().map(|m| (m.mailbox.clone(), m.uid)).collect();
+                        let mut st = state.borrow_mut();
+                        for m in messages {
+                            if seen.insert((m.mailbox.clone(), m.uid)) {
+                                st.search_results.push(m);
+                            }
+                        }
+                        drop(st);
+                        repopulate_search_results(&state, &message_list);
+                    }
+                    AccountEvent::Error(message) => {
+                        let title = glib::markup_escape_text(&format!("{}: {message}", account_label(&state, &account_id)));
+                        toast_overlay.add_toast(adw::Toast::new(&title));
+                    }
                 }
             }
         }
@@ -8042,8 +8144,11 @@ fn connect_other_account(
     let credentials: std::sync::Arc<dyn lookout_mail::session::CredentialProvider> =
         std::sync::Arc::new(crate::other_accounts::OtherCredentialProvider::new(account_id.clone(), keyring));
 
+    // Commands stay unbounded (sent via `send_blocking` from the main thread);
+    // events are bounded so the drain coalesces a batch and stalls the session
+    // under a flood instead of queueing unboundedly - see `EVENT_CHANNEL_CAPACITY`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
-    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     state.borrow_mut().accounts.insert(
         account_id.clone(),
         AccountHandle {
@@ -8541,8 +8646,11 @@ fn connect_google_tasks_account(
     toast_overlay: adw::ToastOverlay,
     email: String,
 ) {
+    // Commands stay unbounded (sent via `send_blocking` from the main thread);
+    // events are bounded so the drain coalesces a batch and stalls the session
+    // under a flood instead of queueing unboundedly - see `EVENT_CHANNEL_CAPACITY`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
-    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     calendar_state.borrow_mut().google_tasks.insert(
         email.clone(),
         GoogleTasksHandle {
@@ -8557,41 +8665,51 @@ fn connect_google_tasks_account(
 
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
-            match event {
-                GoogleTasksEvent::ListsUpdated(lists) => {
-                    {
-                        let mut st = calendar_state.borrow_mut();
-                        if let Some(handle) = st.google_tasks.get_mut(&email) {
-                            handle.task_lists = lists.clone();
+            // Drain the whole queued batch before handling, collapsing
+            // whole-snapshot events (lists, tasks) into the last copy of each
+            // - the cache fast-paint and the first live poll queue the same
+            // snapshots back to back.
+            let mut batch = vec![event];
+            while let Ok(next) = evt_rx.try_recv() {
+                batch.push(next);
+            }
+            for event in collapse_google_tasks_events(batch) {
+                match event {
+                    GoogleTasksEvent::ListsUpdated(lists) => {
+                        {
+                            let mut st = calendar_state.borrow_mut();
+                            if let Some(handle) = st.google_tasks.get_mut(&email) {
+                                handle.task_lists = lists.clone();
+                                handle.error = None;
+                            }
+                            let infos: Vec<CalendarInfo> = lists
+                                .iter()
+                                .map(|list| CalendarInfo {
+                                    id: google_tasks::google_task_calendar_id(&list.id),
+                                    account_id: AccountId(format!("googletasks:{email}")),
+                                    display_name: list.title.clone(),
+                                    color: None,
+                                    href: String::new(),
+                                    supports_tasks: true,
+                                })
+                                .collect();
+                            calendar_colors::assign_missing(&mut st.calendar_colors, &infos);
+                        }
+                        refresh_tasks_view(&calendar_state, &tasks_view);
+                    }
+                    GoogleTasksEvent::TasksUpdated(tasks) => {
+                        if let Some(handle) = calendar_state.borrow_mut().google_tasks.get_mut(&email) {
+                            handle.last_tasks = tasks;
                             handle.error = None;
                         }
-                        let infos: Vec<CalendarInfo> = lists
-                            .iter()
-                            .map(|list| CalendarInfo {
-                                id: google_tasks::google_task_calendar_id(&list.id),
-                                account_id: AccountId(format!("googletasks:{email}")),
-                                display_name: list.title.clone(),
-                                color: None,
-                                href: String::new(),
-                                supports_tasks: true,
-                            })
-                            .collect();
-                        calendar_colors::assign_missing(&mut st.calendar_colors, &infos);
+                        refresh_tasks_view(&calendar_state, &tasks_view);
                     }
-                    refresh_tasks_view(&calendar_state, &tasks_view);
-                }
-                GoogleTasksEvent::TasksUpdated(tasks) => {
-                    if let Some(handle) = calendar_state.borrow_mut().google_tasks.get_mut(&email) {
-                        handle.last_tasks = tasks;
-                        handle.error = None;
+                    GoogleTasksEvent::Error(message) => {
+                        if let Some(handle) = calendar_state.borrow_mut().google_tasks.get_mut(&email) {
+                            handle.error = Some(message.clone());
+                        }
+                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                     }
-                    refresh_tasks_view(&calendar_state, &tasks_view);
-                }
-                GoogleTasksEvent::Error(message) => {
-                    if let Some(handle) = calendar_state.borrow_mut().google_tasks.get_mut(&email) {
-                        handle.error = Some(message.clone());
-                    }
-                    toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                 }
             }
         }
@@ -9090,8 +9208,11 @@ fn connect_calendar_account(
     }
     let credentials: std::sync::Arc<dyn lookout_dav::session::CalendarCredentialProvider> = std::sync::Arc::new(SendWrapper(credentials));
 
+    // Commands stay unbounded (sent via `send_blocking` from the main thread);
+    // events are bounded so the drain coalesces a batch and stalls the session
+    // under a flood instead of queueing unboundedly - see `EVENT_CHANNEL_CAPACITY`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
-    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     calendar_state.borrow_mut().accounts.insert(
         account_id.clone(),
         CalendarAccountHandle {
@@ -9111,81 +9232,91 @@ fn connect_calendar_account(
 
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
-            match event {
-                CalendarSessionEvent::ConnectionStateChanged(state) => {
-                    if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
-                        handle.connection_state = state.clone();
+            // Drain the whole queued batch before handling, collapsing
+            // whole-snapshot events (calendars, a month's occurrences, tasks)
+            // into the last copy of each - the fast-paint cache replay and
+            // the first live sync queue the same snapshots back to back.
+            let mut batch = vec![event];
+            while let Ok(next) = evt_rx.try_recv() {
+                batch.push(next);
+            }
+            for event in collapse_calendar_events(batch) {
+                match event {
+                    CalendarSessionEvent::ConnectionStateChanged(state) => {
+                        if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                            handle.connection_state = state.clone();
+                        }
+                        if let CalConnectionState::Error { message, retryable } = &state {
+                            // Retryable failures are warnings (the session
+                            // reconnects itself with backoff); the account's
+                            // sidebar status text still shows the message, but no
+                            // toast spams on every attempt. Only non-retryable
+                            // (fatal) errors surface.
+                            if !retryable {
+                                let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
+                                toast_overlay.add_toast(adw::Toast::new(&title));
+                            }
+                        }
+                        refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
                     }
-                    if let CalConnectionState::Error { message, retryable } = &state {
-                        // Retryable failures are warnings (the session
-                        // reconnects itself with backoff); the account's
-                        // sidebar status text still shows the message, but no
-                        // toast spams on every attempt. Only non-retryable
-                        // (fatal) errors surface.
-                        if !retryable {
-                            let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
-                            toast_overlay.add_toast(adw::Toast::new(&title));
+                    CalendarSessionEvent::CalendarsUpdated(calendars) => {
+                        if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                            handle.calendars = calendars.clone();
+                        }
+                        refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
+                        if let Some(handle) = calendar_state.borrow().accounts.get(&account_id) {
+                            if !handle.calendars.is_empty() {
+                                let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(calendar_state.borrow().displayed_month));
+                            }
                         }
                     }
-                    refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
-                }
-                CalendarSessionEvent::CalendarsUpdated(calendars) => {
-                    if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
-                        handle.calendars = calendars.clone();
-                    }
-                    refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
-                    if let Some(handle) = calendar_state.borrow().accounts.get(&account_id) {
-                        if !handle.calendars.is_empty() {
-                            let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(calendar_state.borrow().displayed_month));
+                    CalendarSessionEvent::OccurrencesUpdated { month, occurrences } => {
+                        // Feed the reminder engine before `occurrences` moves into
+                        // the handle below - the engine keeps its own copy of
+                        // every month it's been shown, since `last_occurrences`
+                        // only holds whatever month synced last.
+                        reminders_engine.borrow_mut().ingest(&account_id, &occurrences);
+                        if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                            handle.last_occurrences = occurrences;
+                            handle.last_synced_month = Some(month);
+                            insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, handle.last_occurrences.clone());
+                        }
+                        refresh_displayed_calendar_view(&calendar_state, &calendar_main);
+                        refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+                        // The dashboard's upcoming-events section follows the
+                        // synced occurrences.
+                        refresh_dashboard_hook(&calendar_state);
+                        // The sidebar mini-calendar's bold event-day numerals track
+                        // the currently-displayed month - refresh them when a fetch
+                        // for that month lands (navigating to an uncached month
+                        // marks its days bold the moment the sync completes).
+                        if calendar_view::mini_month(&mini_calendar) == month {
+                            let event_days = calendar_event_days(&calendar_state, month);
+                            calendar_view::set_mini_event_days(&mini_calendar, &event_days);
                         }
                     }
-                }
-                CalendarSessionEvent::OccurrencesUpdated { month, occurrences } => {
-                    // Feed the reminder engine before `occurrences` moves into
-                    // the handle below - the engine keeps its own copy of
-                    // every month it's been shown, since `last_occurrences`
-                    // only holds whatever month synced last.
-                    reminders_engine.borrow_mut().ingest(&account_id, &occurrences);
-                    if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
-                        handle.last_occurrences = occurrences;
-                        handle.last_synced_month = Some(month);
-                        insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, handle.last_occurrences.clone());
+                    CalendarSessionEvent::Error(message) => {
+                        let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
+                        toast_overlay.add_toast(adw::Toast::new(&title));
                     }
-                    refresh_displayed_calendar_view(&calendar_state, &calendar_main);
-                    refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
-                    // The dashboard's upcoming-events section follows the
-                    // synced occurrences.
-                    refresh_dashboard_hook(&calendar_state);
-                    // The sidebar mini-calendar's bold event-day numerals track
-                    // the currently-displayed month - refresh them when a fetch
-                    // for that month lands (navigating to an uncached month
-                    // marks its days bold the moment the sync completes).
-                    if calendar_view::mini_month(&mini_calendar) == month {
-                        let event_days = calendar_event_days(&calendar_state, month);
-                        calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+                    CalendarSessionEvent::EventSaveFailed { uid, recurrence_id, message } => {
+                        // The save actually failed server-side, so drop whatever
+                        // optimistic drag-move was pending for this occurrence (a
+                        // no-op if this failure didn't come from a drag) and
+                        // repaint - the chip must snap back to its real,
+                        // unmoved position rather than staying stuck showing the
+                        // unsaved drop location.
+                        calendar_state.borrow_mut().pending_calendar_moves.remove(&(uid, recurrence_id));
+                        refresh_displayed_calendar_view(&calendar_state, &calendar_main);
+                        let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
+                        toast_overlay.add_toast(adw::Toast::new(&title));
                     }
-                }
-                CalendarSessionEvent::Error(message) => {
-                    let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
-                    toast_overlay.add_toast(adw::Toast::new(&title));
-                }
-                CalendarSessionEvent::EventSaveFailed { uid, recurrence_id, message } => {
-                    // The save actually failed server-side, so drop whatever
-                    // optimistic drag-move was pending for this occurrence (a
-                    // no-op if this failure didn't come from a drag) and
-                    // repaint - the chip must snap back to its real,
-                    // unmoved position rather than staying stuck showing the
-                    // unsaved drop location.
-                    calendar_state.borrow_mut().pending_calendar_moves.remove(&(uid, recurrence_id));
-                    refresh_displayed_calendar_view(&calendar_state, &calendar_main);
-                    let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
-                    toast_overlay.add_toast(adw::Toast::new(&title));
-                }
-                CalendarSessionEvent::TasksUpdated(tasks) => {
-                    if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
-                        handle.last_tasks = tasks;
+                    CalendarSessionEvent::TasksUpdated(tasks) => {
+                        if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                            handle.last_tasks = tasks;
+                        }
+                        refresh_tasks_view(&calendar_state, &tasks_view);
                     }
-                    refresh_tasks_view(&calendar_state, &tasks_view);
                 }
             }
         }
@@ -9218,8 +9349,11 @@ fn spawn_webcal_session(
     toast_overlay: adw::ToastOverlay,
 ) {
     let subscriptions = app_config.borrow().webcal_subscriptions.clone();
+    // Commands stay unbounded (sent via `send_blocking` from the main thread);
+    // events are bounded so the drain coalesces a batch and stalls the session
+    // under a flood instead of queueing unboundedly - see `EVENT_CHANNEL_CAPACITY`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
-    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     {
         let mut st = calendar_state.borrow_mut();
         st.webcal_cmd_tx = Some(cmd_tx);
@@ -9243,35 +9377,44 @@ fn spawn_webcal_session(
 
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
-            let SubscriptionSessionEvent::SubscriptionsUpdated { month, feeds } = event;
-            let mut error_toasts: Vec<String> = Vec::new();
-            {
-                let mut st = calendar_state.borrow_mut();
-                for feed in feeds {
-                    let Some(handle) = st.webcal_handles.get_mut(&feed.subscription_id) else { continue };
-                    handle.last_occurrences = feed.occurrences;
-                    handle.last_synced_month = Some(month);
-                    insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, handle.last_occurrences.clone());
-                    // Toast on the *transition* into an error (or the first
-                    // error for a fresh handle), not on every 5-minute poll.
-                    if handle.error.is_none() && feed.error.is_some() {
-                        error_toasts.push(handle.display_name.clone());
+            // Drain the whole queued batch before handling, collapsing each
+            // month's feeds into the last update - the poll can queue several
+            // months back to back, and each one repaints the calendar.
+            let mut batch = vec![event];
+            while let Ok(next) = evt_rx.try_recv() {
+                batch.push(next);
+            }
+            for event in collapse_subscription_events(batch) {
+                let SubscriptionSessionEvent::SubscriptionsUpdated { month, feeds } = event;
+                let mut error_toasts: Vec<String> = Vec::new();
+                {
+                    let mut st = calendar_state.borrow_mut();
+                    for feed in feeds {
+                        let Some(handle) = st.webcal_handles.get_mut(&feed.subscription_id) else { continue };
+                        handle.last_occurrences = feed.occurrences;
+                        handle.last_synced_month = Some(month);
+                        insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, handle.last_occurrences.clone());
+                        // Toast on the *transition* into an error (or the first
+                        // error for a fresh handle), not on every 5-minute poll.
+                        if handle.error.is_none() && feed.error.is_some() {
+                            error_toasts.push(handle.display_name.clone());
+                        }
+                        handle.error = feed.error;
                     }
-                    handle.error = feed.error;
                 }
-            }
-            for name in error_toasts {
-                let title = glib::markup_escape_text(&format!("Calendar feed \"{name}\" could not be fetched"));
-                toast_overlay.add_toast(adw::Toast::new(&title));
-            }
-            refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
-            refresh_displayed_calendar_view(&calendar_state, &calendar_main);
-            refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
-            // The dashboard's upcoming-events section follows webcal feeds too.
-            refresh_dashboard_hook(&calendar_state);
-            if calendar_view::mini_month(&mini_calendar) == month {
-                let event_days = calendar_event_days(&calendar_state, month);
-                calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+                for name in error_toasts {
+                    let title = glib::markup_escape_text(&format!("Calendar feed \"{name}\" could not be fetched"));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
+                }
+                refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
+                refresh_displayed_calendar_view(&calendar_state, &calendar_main);
+                refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+                // The dashboard's upcoming-events section follows webcal feeds too.
+                refresh_dashboard_hook(&calendar_state);
+                if calendar_view::mini_month(&mini_calendar) == month {
+                    let event_days = calendar_event_days(&calendar_state, month);
+                    calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+                }
             }
         }
     });
@@ -14859,5 +15002,139 @@ mod tests {
             other => panic!("expected StoreKeywordsMany, got {other:?}"),
         }
         assert!(cmd_rx.try_recv().is_err(), "only one command goes out");
+    }
+
+    /// Coalescing is the point of the bounded event channels: the startup
+    /// burst queues the same whole-folder snapshot several times in a row
+    /// (cache replay, live sync, previews), and only the last copy of each
+    /// snapshot must survive the drain - the UI repaints once per batch, not
+    /// once per queued copy.
+    #[test]
+    fn collapse_account_events_keeps_only_the_last_copy_of_each_snapshot() {
+        let a = MailboxId("a:INBOX".into());
+        let inbox = |unread: u32| vec![test_mailbox(&AccountId("a".into()), "INBOX", unread)];
+        let collapsed = collapse_account_events(vec![
+            AccountEvent::FoldersUpdated(inbox(1)),
+            AccountEvent::MessagesUpdated {
+                mailbox: a.clone(),
+                messages: Vec::new(),
+            },
+            AccountEvent::FoldersUpdated(inbox(2)),
+        ]);
+        assert_eq!(collapsed.len(), 2, "the earlier folder list is superseded");
+        assert!(matches!(&collapsed[0], AccountEvent::MessagesUpdated { mailbox, .. } if mailbox == &a));
+        let AccountEvent::FoldersUpdated(folders) = &collapsed[1] else {
+            panic!("expected the surviving FoldersUpdated last, got {collapsed:?}");
+        };
+        assert_eq!(folders[0].unread, 2, "only the newest folder list survives, in its original position");
+    }
+
+    #[test]
+    fn collapse_account_events_keeps_the_last_messages_updated_per_mailbox_in_order() {
+        let a = MailboxId("a:INBOX".into());
+        let b = MailboxId("a:Archive".into());
+        let msg = |m: MailboxId| AccountEvent::MessagesUpdated { mailbox: m, messages: Vec::new() };
+        let collapsed = collapse_account_events(vec![
+            AccountEvent::NewMessages {
+                mailbox: a.clone(),
+                messages: Vec::new(),
+            },
+            msg(a.clone()),
+            msg(b.clone()),
+            msg(a.clone()),
+        ]);
+        assert_eq!(collapsed.len(), 3, "the superseded first copy of A is dropped, the rest stay");
+        assert!(matches!(&collapsed[0], AccountEvent::NewMessages { .. }), "non-snapshot events keep their position");
+        let mailboxes: Vec<&MailboxId> = collapsed
+            .iter()
+            .filter_map(|event| match event {
+                AccountEvent::MessagesUpdated { mailbox, .. } => Some(mailbox),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mailboxes, vec![&b, &a], "last copy per mailbox, in original order");
+    }
+
+    #[test]
+    fn collapse_account_events_keeps_everything_when_nothing_is_superseded() {
+        let a = MailboxId("a:INBOX".into());
+        let collapsed = collapse_account_events(vec![
+            AccountEvent::MessagesUpdated {
+                mailbox: a.clone(),
+                messages: Vec::new(),
+            },
+            AccountEvent::MoveFailed {
+                mailbox: a.clone(),
+                uids: vec![Uid(7)],
+                role: MailboxRole::Custom,
+                message: "nope".into(),
+            },
+            AccountEvent::StoreFlagsFailed {
+                mailbox: a.clone(),
+                uids: vec![Uid(7)],
+                message: "nope".into(),
+            },
+        ]);
+        assert_eq!(collapsed.len(), 3, "no repeated snapshot key, nothing is dropped");
+        assert!(matches!(&collapsed[1], AccountEvent::MoveFailed { .. }));
+        assert!(matches!(&collapsed[2], AccountEvent::StoreFlagsFailed { .. }));
+    }
+
+    #[test]
+    fn collapse_calendar_events_keeps_the_last_occurrences_per_month() {
+        let m1 = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let m2 = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let occ = |month: chrono::NaiveDate| CalendarSessionEvent::OccurrencesUpdated { month, occurrences: Vec::new() };
+        let collapsed = collapse_calendar_events(vec![CalendarSessionEvent::CalendarsUpdated(Vec::new()), occ(m1), occ(m2), occ(m1)]);
+        assert_eq!(collapsed.len(), 3, "the earlier August copy is superseded");
+        assert!(matches!(&collapsed[0], CalendarSessionEvent::CalendarsUpdated(_)));
+        let months: Vec<&chrono::NaiveDate> = collapsed
+            .iter()
+            .filter_map(|event| match event {
+                CalendarSessionEvent::OccurrencesUpdated { month, .. } => Some(month),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(months, vec![&m2, &m1], "one copy per month, in original order");
+    }
+
+    #[test]
+    fn collapse_calendar_events_keeps_one_calendars_and_tasks_copy() {
+        let collapsed = collapse_calendar_events(vec![
+            CalendarSessionEvent::CalendarsUpdated(Vec::new()),
+            CalendarSessionEvent::TasksUpdated(Vec::new()),
+            CalendarSessionEvent::CalendarsUpdated(Vec::new()),
+        ]);
+        assert_eq!(collapsed.len(), 2);
+        assert!(matches!(&collapsed[0], CalendarSessionEvent::TasksUpdated(_)));
+        assert!(matches!(&collapsed[1], CalendarSessionEvent::CalendarsUpdated(_)));
+    }
+
+    #[test]
+    fn collapse_google_tasks_events_keeps_one_list_and_task_snapshot() {
+        let collapsed = collapse_google_tasks_events(vec![
+            GoogleTasksEvent::ListsUpdated(Vec::new()),
+            GoogleTasksEvent::TasksUpdated(Vec::new()),
+            GoogleTasksEvent::ListsUpdated(Vec::new()),
+        ]);
+        assert_eq!(collapsed.len(), 2);
+        assert!(matches!(&collapsed[0], GoogleTasksEvent::TasksUpdated(_)));
+        assert!(matches!(&collapsed[1], GoogleTasksEvent::ListsUpdated(_)));
+    }
+
+    #[test]
+    fn collapse_subscription_events_keeps_the_last_update_per_month() {
+        let m1 = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let m2 = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let feeds = |month: chrono::NaiveDate| SubscriptionSessionEvent::SubscriptionsUpdated { month, feeds: Vec::new() };
+        let collapsed = collapse_subscription_events(vec![feeds(m1), feeds(m2), feeds(m1)]);
+        assert_eq!(collapsed.len(), 2, "the earlier August update is superseded");
+        let months: Vec<chrono::NaiveDate> = collapsed
+            .iter()
+            .map(|event| match event {
+                SubscriptionSessionEvent::SubscriptionsUpdated { month, .. } => *month,
+            })
+            .collect();
+        assert_eq!(months, vec![m2, m1]);
     }
 }
