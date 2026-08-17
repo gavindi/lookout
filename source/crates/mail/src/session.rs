@@ -22,8 +22,10 @@ use crate::send::{build_raw_message, send_smtp, ComposedMessage};
 /// `sync_mailbox`) - so a folder's newest N get bodies downloaded in batches
 /// while anything older fetches on demand. Since the prefetch learns each
 /// message's `BODYSTRUCTURE` in its envelope pass, "download" here means the
-/// text parts only - attachments are never fetched for the cache. Full
-/// CONDSTORE/QRESYNC incremental sync is Phase 2 - see the module docs.
+/// text parts only - attachments are never fetched for the cache. On
+/// CONDSTORE connections the steady-state sync is itself a `CHANGEDSINCE`
+/// delta (see `sync_mailbox`); QRESYNC, which would also report expunged
+/// UIDs directly, is a later phase.
 const INITIAL_FETCH_LIMIT: u32 = 200;
 
 /// How long a single IDLE wait runs before we re-enter it purely as a
@@ -592,7 +594,7 @@ async fn connect_and_run(
 
     let inbox_id = MailboxId::new(&account_id, "INBOX");
     // Fresh session: no mailbox is SELECTed yet, so the sync must select INBOX.
-    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, None).await?;
+    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, None, condstore).await?;
 
     // Folders still awaiting their STATUS count, drained cooperatively below.
     // Held as ids rather than indices so a re-list that reorders (or shortens)
@@ -732,9 +734,9 @@ async fn connect_and_run(
         let mut woke_on_command = None;
         match wake {
             // A server notification during IDLE (EXISTS/EXPUNGE/etc) means
-            // the currently-selected mailbox changed; re-fetch its envelope
-            // set. This is a full re-fetch rather than a CONDSTORE delta -
-            // see `sync_mailbox` and the module docs.
+            // the currently-selected mailbox changed; re-sync it. When
+            // CONDSTORE is enabled this is a `CHANGEDSINCE` delta, not a
+            // full flag re-fetch - see `sync_mailbox`.
             Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
             Wake::Idle(Ok(_)) => {
                 // `sync_mailbox` derives the open folder's count fields from what
@@ -750,6 +752,7 @@ async fn connect_and_run(
                     cache,
                     &mut folders,
                     Some(&session_selected),
+                    condstore,
                 )
                 .await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
@@ -779,6 +782,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         Some(&session_selected),
+                        condstore,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -835,6 +839,7 @@ async fn connect_and_run(
                             cache,
                             &mut folders,
                             Some(&session_selected),
+                            condstore,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -1044,7 +1049,7 @@ async fn connect_and_run(
                         if let Some(sent_id) = sent_mailbox {
                             if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
                                 relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
-                                sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache, &mut folders, Some(&session_selected)).await?;
+                                sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache, &mut folders, Some(&session_selected), condstore).await?;
                                 dirty_mailboxes.remove(&sent_id);
                                 session_selected = sent_id;
                                 if session_selected != current_mailbox_id {
@@ -1136,6 +1141,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 Some(&session_selected),
+                                condstore,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -1182,6 +1188,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 Some(&session_selected),
+                                condstore,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -1237,6 +1244,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 Some(&session_selected),
+                                condstore,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -1284,6 +1292,7 @@ async fn connect_and_run(
                                 cache,
                                 &mut folders,
                                 Some(&session_selected),
+                                condstore,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -1309,6 +1318,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         Some(&session_selected),
+                        condstore,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -1329,6 +1339,7 @@ async fn connect_and_run(
                         cache,
                         &mut folders,
                         Some(&session_selected),
+                        condstore,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -1380,6 +1391,7 @@ async fn connect_and_run(
                                     cache,
                                     &mut folders,
                                     Some(&session_selected),
+                                    condstore,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -1456,6 +1468,7 @@ async fn connect_and_run(
                                     cache,
                                     &mut folders,
                                     Some(&session_selected),
+                                    condstore,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -1544,6 +1557,7 @@ async fn connect_and_run(
                                     cache,
                                     &mut folders,
                                     Some(&session_selected),
+                                    condstore,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -1587,6 +1601,7 @@ async fn connect_and_run(
                                     cache,
                                     &mut folders,
                                     Some(&session_selected),
+                                    condstore,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -1650,6 +1665,7 @@ async fn connect_and_run(
                             cache,
                             &mut folders,
                             Some(&session_selected),
+                            condstore,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -2066,13 +2082,17 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     // HIGHESTMODSEQ (parsed into `Mailbox::highest_modseq` by async-imap).
     // QRESYNC servers must support CONDSTORE too (RFC 7162 §4), so advertising
     // either capability is enough to ask. A rejection is not fatal: we just
-    // fall back to full syncs.
-    let condstore = capabilities.has_str("CONDSTORE") || capabilities.has_str("QRESYNC");
+    // fall back to full syncs - and crucially, `condstore` then reads *false*,
+    // because a server that refuses `ENABLE CONDSTORE` must never be sent
+    // `CHANGEDSINCE` or asked for `HIGHESTMODSEQ` (both are protocol errors on
+    // a non-CONDSTORE connection).
+    let mut condstore = capabilities.has_str("CONDSTORE") || capabilities.has_str("QRESYNC");
     if condstore {
         match session.run_command_and_check_ok("ENABLE CONDSTORE").await {
             Ok(()) => tracing::debug!("CONDSTORE enabled for connection"),
             Err(e) => {
                 tracing::debug!("server rejected ENABLE CONDSTORE, continuing without incremental sync: {e}");
+                condstore = false;
             }
         }
     }
@@ -2316,6 +2336,7 @@ async fn sync_mailbox(
     cache: Option<&crate::cache::Cache>,
     folders: &mut Vec<Mailbox>,
     session_selected: Option<&MailboxId>,
+    condstore: bool,
 ) -> Result<()> {
     let is_sent = folders.iter().find(|f| f.id == *mailbox_id).is_some_and(|f| matches!(f.role, MailboxRole::Sent));
     // `None` = a fresh session with nothing SELECTed yet (the connect-time
@@ -2340,30 +2361,86 @@ async fn sync_mailbox(
     // still-present messages outright). But `ENVELOPE`/`BODYSTRUCTURE` never
     // change once a message exists - only `FLAGS` does - so a UID already
     // cached under the mailbox's current `uidvalidity` doesn't need either
-    // refetched, just its flags refreshed. This first fetch is deliberately
-    // cheap (`UID FLAGS` only) so it also doubles as the full-mailbox
-    // liveness/membership check.
+    // refetched, just its flags refreshed.
+    //
+    // On the IDLE-wake path (this sync skipped its SELECT) with CONDSTORE
+    // enabled and a baseline modseq known, the flag refresh can itself be a
+    // delta: `FETCH 1:* (UID FLAGS MODSEQ) (CHANGEDSINCE <baseline>)` (RFC
+    // 7162 §3.2.5.1) returns only messages whose flags changed since the
+    // baseline - a steady-state wake costs O(changed) instead of O(mailbox).
+    // New arrivals are reported too (their modseq exceeds the baseline), so
+    // the delta doubles as the new-mail check. A stale baseline is safe: it
+    // only makes the delta wider, never wrong.
+    //
+    // The one thing `CHANGEDSINCE` cannot report is an expunge - a deleted
+    // message is no longer there to be fetched - and expunges are only
+    // discovered by UID-set diff (QRESYNC's `VANISHED`, which reports them
+    // directly, is a later phase). So the delta path separately learns the
+    // full UID set with `UID SEARCH ALL`: a bare list of numbers, far cheaper
+    // than the full flag fetch it replaces, and it doubles as the folder's
+    // exists count. The full path needs no extra pass - the full flag fetch
+    // *is* the membership set.
     let cached: HashMap<Uid, EmailSummary> = match cache {
         Some(cache) => cache.load_messages_by_uid(mailbox_id, uidvalidity).unwrap_or_default(),
         None => HashMap::new(),
     };
-    let flag_fetches: Vec<_> = session.fetch("1:*", "(UID FLAGS)").await?.try_collect().await?;
+    let baseline = folders.iter().find(|f| f.id == *mailbox_id).and_then(|f| f.highest_modseq);
+    let delta = already_selected && condstore && baseline.is_some();
+    let flag_fetches: Vec<_> = if delta {
+        // The `MODSEQ` data item rides along so the fetch's responses carry
+        // each message's modseq - the baseline can then advance without an
+        // extra SELECT/STATUS round trip (see the folder update below).
+        let bound = baseline.expect("delta requires a baseline, checked above");
+        session
+            .fetch("1:*", &format!("(UID FLAGS MODSEQ) (CHANGEDSINCE {bound})"))
+            .await?
+            .try_collect()
+            .await?
+    } else {
+        session.fetch("1:*", "(UID FLAGS)").await?.try_collect().await?
+    };
+    // The full current UID set. On the delta path it comes from `UID SEARCH
+    // ALL`, run *after* the fetch: a message arriving between the two lands
+    // in both (its modseq exceeds the baseline, so the fetch reports it too),
+    // while one expunged between the two is caught by the search. The other
+    // ordering would let an arrival slip through both passes and vanish from
+    // this sync's output until the next wake.
+    let present_uids: HashSet<Uid> = if delta {
+        session.uid_search("ALL").await?.into_iter().map(Uid).collect()
+    } else {
+        flag_fetches.iter().filter_map(|f| f.uid.map(Uid)).collect()
+    };
 
-    let mut messages: Vec<EmailSummary> = Vec::with_capacity(flag_fetches.len());
-    let mut new_uids: Vec<Uid> = Vec::new();
+    let mut messages: Vec<EmailSummary> = Vec::with_capacity(flag_fetches.len() + cached.len());
     for fetch in &flag_fetches {
         let Some(uid) = fetch.uid.map(Uid) else { continue };
-        match cached.get(&uid) {
-            Some(cached_summary) => {
-                let (flags, keywords) = flags_from_fetch(fetch);
-                let mut msg = cached_summary.clone();
-                msg.flags = flags;
-                msg.keywords = keywords;
-                messages.push(msg);
-            }
-            None => new_uids.push(uid),
+        if let Some(cached_summary) = cached.get(&uid) {
+            let (flags, keywords) = flags_from_fetch(fetch);
+            let mut msg = cached_summary.clone();
+            msg.flags = flags;
+            msg.keywords = keywords;
+            messages.push(msg);
         }
     }
+    if delta {
+        // Cached messages the delta didn't report are unchanged - carry them
+        // over as-is, or the diff below would treat them as expunged. New
+        // arrivals are everything the membership set has that the cache
+        // doesn't (on the delta path that's authoritative, not the fetch).
+        let changed: HashSet<Uid> = flag_fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
+        let mut untouched: Vec<&EmailSummary> = cached.values().filter(|m| !changed.contains(&m.uid)).collect();
+        untouched.sort_by_key(|m| m.uid);
+        messages.extend(untouched.into_iter().cloned());
+        // Drop anything the membership search no longer sees - a message
+        // expunged between the delta fetch and the search would otherwise
+        // linger as a phantom row in this sync's output (and the cache) until
+        // the next wake's membership pass.
+        messages.retain(|m| present_uids.contains(&m.uid));
+    }
+    let new_uids: Vec<Uid> = {
+        let cached_uids: HashSet<Uid> = cached.keys().copied().collect();
+        present_uids.difference(&cached_uids).copied().collect()
+    };
     // Full `ENVELOPE`/`BODYSTRUCTURE` fetch, but only for UIDs this mailbox
     // hasn't cached yet - new arrivals, or the first sync since a
     // `UIDVALIDITY` change invalidated everything cached. `BODYSTRUCTURE`
@@ -2471,13 +2548,26 @@ async fn sync_mailbox(
             changed |= folder.uidvalidity != uidvalidity;
             folder.uidvalidity = uidvalidity;
             // `highest_modseq` is only populated when CONDSTORE is enabled
-            // (each SELECT then reports the folder's current modseq); with no
-            // SELECT - the IDLE-wake skip path - it keeps its prior value,
-            // which is safe: a stale baseline makes a later `CHANGEDSINCE`
-            // delta fetch wider, never wrong.
+            // (each SELECT then reports the folder's current modseq).
             if let Some(modseq) = meta.highest_modseq {
                 changed |= folder.highest_modseq != Some(modseq);
                 folder.highest_modseq = Some(modseq);
+            }
+        } else if delta {
+            // The delta path learns no SELECT meta (its SELECT was skipped),
+            // so the baseline advances from the fetched `MODSEQ`s instead:
+            // every message the delta reported carries its own modseq, and
+            // the highest of them is a safe next baseline - any message with
+            // a modseq above it was returned by this very fetch, so its state
+            // is known; a message expunged meanwhile is caught by the
+            // membership diff next wake. A fetch that returned nothing
+            // advances nothing: the next wake's delta is wider, never wrong.
+            if let Some(folder_modseq) = folder.highest_modseq {
+                let advanced = flag_fetches.iter().filter_map(|f| f.modseq).fold(folder_modseq, u64::max);
+                if advanced > folder_modseq {
+                    changed = true;
+                    folder.highest_modseq = Some(advanced);
+                }
             }
         }
         if changed {
@@ -2560,8 +2650,8 @@ async fn emit_messages(
         }
         // Feeds the composer's recipient autocomplete. Kept here rather than
         // in `replace_messages` because the address book is cumulative -
-        // `replace_messages` wipes and rewrites a mailbox's window each sync,
-        // and addresses must survive that.
+        // `replace_messages` syncs a mailbox's window to the server's set,
+        // and addresses must accumulate across those syncs.
         if let Err(e) = cache.record_addresses(&messages) {
             tracing::warn!("failed to record addresses for {mailbox_id}: {e}");
         }

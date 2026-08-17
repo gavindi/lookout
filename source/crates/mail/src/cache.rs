@@ -147,10 +147,9 @@ fn index_addresses<'a>(addrs: impl IntoIterator<Item = &'a EmailAddress>) -> Str
 }
 
 /// Writes a new search-index row for `msg`, carrying `body` as the searchable
-/// body text. INSERT-only on purpose: callers either cleared the row first
-/// (`replace_messages` deletes the whole mailbox before inserting) or route
-/// through `index_upsert_message`, because FTS5 has no `UPDATE` - and
-/// `INSERT OR REPLACE` replaces by rowid, while the implicit autoincrement
+/// body text. INSERT-only on purpose: callers route through
+/// `index_upsert_message` (delete-then-insert), because FTS5 has no `UPDATE` -
+/// and `INSERT OR REPLACE` replaces by rowid, while the implicit autoincrement
 /// rowid would let re-indexing a `(mailbox_id, uid)` accumulate a duplicate.
 fn index_message(conn: &rusqlite::Connection, msg: &EmailSummary, body: &str) -> Result<()> {
     conn.execute(
@@ -356,9 +355,10 @@ impl Cache {
             -- recipients (to/cc), and body (preview, upgraded to the full
             -- cached text once a body is fetched). `mailbox_id`/`uid` are
             -- UNINDEXED so they're usable as filter keys without being
-            -- tokenized. Rows are keyed by `(mailbox_id, uid)` and rewritten
-            -- wholesale by the callers below (`replace_messages`/`store_body`
-            -- delete-then-insert), so FTS5's autoincrement rowid never leaks
+            -- tokenized. Rows are keyed by `(mailbox_id, uid)` and every
+            -- write goes through delete-then-insert (`index_upsert_message`,
+            -- used by `replace_messages` for changed envelopes and by
+            -- `store_body`), so FTS5's autoincrement rowid never leaks
             -- duplicates.
             CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
                 mailbox_id UNINDEXED,
@@ -508,30 +508,76 @@ impl Cache {
         Ok(mailboxes)
     }
 
-    /// Replaces the cached envelope window for one mailbox with `messages` -
-    /// the mailbox's full current set, as assembled by `sync_mailbox`
-    /// (itself an incremental fetch: unchanged UIDs' `ENVELOPE`/`BODYSTRUCTURE`
-    /// come straight from this same cache rather than the network - see that
-    /// function's doc comment). The wholesale delete-and-reinsert here is
-    /// just how the *storage* is kept in sync with that already-merged list,
-    /// so a message missing from `messages` (expunged since last sync)
-    /// naturally drops out of the cache too.
+    /// Keeps the cached envelope window for one mailbox in sync with `messages`
+    /// - the mailbox's full current set, as assembled by `sync_mailbox` (itself
+    ///   an incremental fetch: unchanged UIDs' `ENVELOPE`/`BODYSTRUCTURE` come
+    ///   straight from this same cache rather than the network - see that
+    ///   function's doc comment).
+    ///
+    /// The write is diff-based rather than wholesale: UIDs present are upserted
+    /// (new rows inserted, changed envelopes updated in place), UIDs absent
+    /// (expunged server-side, or an emptied mailbox) are deleted along with
+    /// their search-index rows, and the index is re-indexed only for messages
+    /// whose envelope actually changed. In steady state a sync changes little,
+    /// so a wake that changed nothing rewrites nothing - instead of the former
+    /// `DELETE FROM messages` + `DELETE FROM search_fts` + full re-INSERT that
+    /// cost O(mailbox) on every IDLE wake.
     pub fn replace_messages(&self, mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM messages WHERE mailbox_id = ?1", [&mailbox_id.0])?;
-        tx.execute("DELETE FROM search_fts WHERE mailbox_id = ?1", [&mailbox_id.0])?;
+        // The stored membership, from the key column alone - no JSON parses,
+        // so the diff is cheap relative to the data it's diffing against.
+        let mut stored_uids: HashSet<u32> = HashSet::new();
+        {
+            let mut stmt = tx.prepare("SELECT uid FROM messages WHERE mailbox_id = ?1")?;
+            let rows = stmt.query_map([&mailbox_id.0], |row| row.get::<_, u32>(0))?;
+            for row in rows {
+                stored_uids.insert(row?);
+            }
+        }
+        // Upsert the new set. The `WHERE data IS NOT excluded.data` guard makes
+        // the statement report zero changed rows when the stored envelope is
+        // already byte-identical, so the search index is only rewritten for
+        // messages that actually changed - and, crucially, a message's full-body
+        // index text (the `store_body` upgrade) survives a re-sync of an
+        // unchanged envelope instead of being downgraded back to the preview.
+        let mut upsert = tx.prepare_cached(
+            "INSERT INTO messages (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(mailbox_id, uid) DO UPDATE SET uidvalidity = excluded.uidvalidity, data = excluded.data \
+             WHERE messages.data IS NOT excluded.data",
+        )?;
         for msg in messages {
             let data = serde_json::to_string(msg)?;
-            tx.execute(
-                "INSERT INTO messages (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![mailbox_id.0, msg.uid.0, uidvalidity.0, data],
-            )?;
-            // The body column starts as the preview (the only text a fresh
-            // envelope fetch carries); `store_body` upgrades it in place once
-            // the full message is cached.
-            index_message(&tx, msg, msg.preview.as_deref().unwrap_or(""))?;
+            let modified = upsert.execute(rusqlite::params![mailbox_id.0, msg.uid.0, uidvalidity.0, data])?;
+            if modified > 0 {
+                // A new row, or a genuinely changed envelope (flags, preview, ...).
+                // The envelope change never carries the body text `store_body`
+                // indexed, so keep the existing index row's text - a flag-only
+                // rewrite must not downgrade a full-body index back to the
+                // preview. New messages index their preview.
+                let existing_body: Option<String> = tx
+                    .query_row(
+                        "SELECT body FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2",
+                        rusqlite::params![mailbox_id.0, msg.uid.0],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                let body = match existing_body.as_deref() {
+                    Some(existing) if !existing.is_empty() => existing.to_string(),
+                    _ => msg.preview.as_deref().unwrap_or("").to_string(),
+                };
+                index_upsert_message(&tx, msg, &body)?;
+            }
         }
+        // Delete the UIDs absent from the new set - expunged server-side, or
+        // the whole-mailbox clear (`EmptyMailbox` passes an empty set) - and
+        // their search rows with them.
+        let present: HashSet<u32> = messages.iter().map(|m| m.uid.0).collect();
+        for uid in stored_uids.difference(&present) {
+            delete_index_row(&tx, mailbox_id, Uid(*uid))?;
+            tx.execute("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid])?;
+        }
+        drop(upsert);
         tx.commit()?;
         Ok(())
     }
@@ -2034,6 +2080,120 @@ mod tests {
         // Deleting a message drops it from the index.
         cache.delete_message(&mailbox_id, Uid(2)).unwrap();
         assert!(cache.search("subject", 10).unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The diff-based `replace_messages` contract: a re-sync that rewrites an
+    /// envelope must not downgrade the message's search body text back from
+    /// the full cached body to the preview - `store_body`'s upgrade survives
+    /// the sync (and its `WHERE data IS NOT excluded.data` guard means an
+    /// unchanged envelope isn't re-indexed at all).
+    #[test]
+    fn a_resync_keeps_the_full_body_index_text() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let msg = searchable_summary(&mailbox_id, 1, "Quarterly report", "ada@example.com", Some("The numbers"));
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[msg.clone()]).unwrap();
+        cache
+            .store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("This document is confidential."))
+            .unwrap();
+        assert_eq!(cache.search("confidential", 10).unwrap().len(), 1);
+
+        // A resync with only a flag changed (what a mark-as-read elsewhere
+        // produces) rewrites the envelope but must leave the body text alone.
+        let mut flag_changed = msg.clone();
+        flag_changed.flags.insert(SystemFlagBit::Seen);
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[flag_changed]).unwrap();
+        assert_eq!(cache.search("confidential", 10).unwrap().len(), 1, "full body text survives a resync");
+        assert_eq!(cache.search("numbers", 10).unwrap().len(), 1, "preview phrasing stays findable");
+        assert!(!cache.load_messages(&mailbox_id).unwrap()[0].is_unread(), "the flag change itself stuck");
+
+        // An *identical* envelope is not re-indexed at all - the steady-state
+        // wake case, where the data guard reports zero changed rows.
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[msg]).unwrap();
+        assert_eq!(cache.search("confidential", 10).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A preview that arrives on a later sync (the first sync indexes the new
+    /// envelope with no snippet; `fetch_previews`' second emit carries one)
+    /// becomes searchable - the changed envelope is re-indexed with it.
+    #[test]
+    fn a_resync_with_a_fresh_preview_indexes_the_preview() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let msg = searchable_summary(&mailbox_id, 1, "Quarterly report", "ada@example.com", None);
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[msg.clone()]).unwrap();
+        assert!(cache.search("snippetword", 10).unwrap().is_empty());
+
+        let mut with_preview = msg.clone();
+        with_preview.preview = Some("snippetword first".to_string());
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[with_preview]).unwrap();
+        assert_eq!(cache.search("snippetword", 10).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The diff's scope: re-replacing one mailbox's window leaves every other
+    /// mailbox's rows and index entries alone, and a UID absent from the new
+    /// set (expunged server-side) is dropped from both the table and the index.
+    #[test]
+    fn replace_messages_diffs_only_the_target_mailbox() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let other = MailboxId::new(&account_id, "Archive");
+
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[
+                    searchable_summary(&mailbox_id, 1, "Vanishing subject", "ada@example.com", None),
+                    searchable_summary(&mailbox_id, 2, "Keeping subject", "bob@elsewhere.org", None),
+                    searchable_summary(&mailbox_id, 3, "Staying subject", "carol@example.org", None),
+                ],
+            )
+            .unwrap();
+        cache
+            .replace_messages(&other, UidValidity(1), &[searchable_summary(&other, 9, "Archival notes", "dave@example.com", None)])
+            .unwrap();
+
+        // The resync drops uid 1 (expunged) and keeps 2 + 3.
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[
+                    searchable_summary(&mailbox_id, 2, "Keeping subject", "bob@elsewhere.org", None),
+                    searchable_summary(&mailbox_id, 3, "Staying subject", "carol@example.org", None),
+                ],
+            )
+            .unwrap();
+
+        let in_inbox = cache.load_messages(&mailbox_id).unwrap();
+        assert_eq!(in_inbox.len(), 2);
+        assert!(!in_inbox.iter().any(|m| m.uid == Uid(1)));
+        // The other mailbox is untouched by the diff.
+        let in_archive = cache.load_messages(&other).unwrap();
+        assert_eq!(in_archive.len(), 1);
+        assert_eq!(in_archive[0].uid, Uid(9));
+
+        // Index rows follow the envelope rows: uid 1's hit is gone, the rest
+        // (including the untouched other mailbox) still match.
+        assert!(cache.search("vanishing", 10).unwrap().is_empty());
+        assert_eq!(cache.search("keeping", 10).unwrap().len(), 1);
+        assert_eq!(cache.search("staying", 10).unwrap().len(), 1);
+        assert_eq!(cache.search("archival", 10).unwrap().len(), 1);
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

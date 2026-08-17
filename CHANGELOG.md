@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.58 (2026-08-18)
+
+### Changed
+
+- **Mail**: an IDLE wake no longer re-fetches the whole mailbox's flags. On a CONDSTORE connection, the steady-state sync (the IDLE-wake path that skips its re-SELECT) now issues `FETCH 1:* (UID FLAGS MODSEQ) (CHANGEDSINCE <baseline>)` - RFC 7162's incremental flag refresh, O(changed) instead of O(mailbox) - plus a `UID SEARCH ALL` for the full UID set, the cheapest membership pass there is, because `CHANGEDSINCE` cannot report expunged messages (a deleted message is no longer there to be fetched) and expunges are found by UID-set diff until QRESYNC's `VANISHED` lands. The search runs after the fetch so a message arriving between the two commands is caught by both passes, and the output is retained against the membership set so one expunged in that window can't linger as a phantom. The per-mailbox `highest_modseq` baseline now advances on this path too - without the SELECT/STATUS round trip that would otherwise be needed - by taking the highest `MODSEQ` the delta fetch reported (safe, because every message at or above that value was returned by the very fetch that learned it). The `ENABLE CONDSTORE` rejection path now reads `condstore = false`, so a server that refuses the command is never sent `CHANGEDSINCE` or asked for a `HIGHESTMODSEQ` STATUS item, either of which would be a protocol error on a non-CONDSTORE connection.
+- **Mail**: the envelope cache's `replace_messages` write is now a diff instead of a whole-table rewrite. It used to `DELETE FROM messages` + `DELETE FROM search_fts` + re-INSERT and re-index every row of a mailbox on every sync - O(mailbox) SQLite writes per IDLE wake. It now reads the stored UID set (key column only, no JSON parses), upserts the new set with `INSERT ... ON CONFLICT(mailbox_id, uid) DO UPDATE ... WHERE data IS NOT excluded.data` (an upsert that finds a byte-identical envelope reports zero changed rows, so steady-state rewrites nothing), and deletes only the UIDs absent from the new set - the expunged ones - along with their search rows. The search index is rewritten only for envelopes that actually changed, and a changed envelope re-indexes with the *existing* index text when it's non-empty, so `store_body`'s full-body text now survives later syncs (a flag-only resync used to downgrade a full-body index back to the preview). Preview arrival on a later sync still becomes searchable, and `EmptyMailbox`'s empty-set call now simply deletes the window.
+
+### Testing
+
+- `lookout-mail`: three new cache tests pin the diff's contracts - a flag-only resync keeps a cached body's full-text index (and an identical envelope isn't re-indexed at all), a preview that arrives on a later sync becomes searchable, and a re-replace of one mailbox leaves every other mailbox's rows and index entries untouched while dropping the expunged UID from both.
+
 ## 0.9.57 (2026-08-18)
 
 ### Changed
