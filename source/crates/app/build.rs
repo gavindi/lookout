@@ -10,6 +10,8 @@
 //! `resources.rs` falls back to the `include_bytes!` constants in
 //! `window.rs` when the registered bundle isn't a real GResource.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::Command;

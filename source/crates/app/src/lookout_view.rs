@@ -7,6 +7,8 @@
 //! unit-tested functions so the layout is testable independent of a
 //! running GTK main loop.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;

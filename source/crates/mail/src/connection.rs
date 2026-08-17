@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::sync::Arc;
 use std::time::Duration;
 

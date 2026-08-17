@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.52" date="2026-08-17">
+      <description>
+        <p>The project is now formally licensed GPL-3.0-or-later: a canonical LICENSE file sits at the repository root and every Rust source file carries a copyright header naming Gavin Graham &amp; Contributors. The README now leads with the Lookout logo and shows a message-reading screenshot below the feature list. Also fixes a build warning: the GResource bundle referenced two window-background files that no longer exist, so the stale entry was removed and the remaining one now names the real file - the bundle compiles cleanly again.</p>
+      </description>
+    </release>
     <release version="0.9.51" date="2026-08-17">
       <description>
         <p>Config → Accounts gains a GNOME Online Accounts list with one on/off switch per discovered account, enabled by default. Flipping an account off stops Lookout from processing it entirely - its mail, calendars, reminders, tasks, and contacts disappear from every view and its sessions shut down; flipping it back on reconnects everything instantly. The choice persists across restarts, and a disabled account's local caches are kept so re-enabling needs no full resync.</p>

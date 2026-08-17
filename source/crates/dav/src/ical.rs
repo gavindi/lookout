@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use icalendar::{
     Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, PartStat, Property, Role, TodoStatus, Trigger,

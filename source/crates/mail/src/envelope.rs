@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::BTreeSet;
 
 use async_imap::types::Fetch;

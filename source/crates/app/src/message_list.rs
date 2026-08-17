@@ -8,6 +8,8 @@
 //! re-entrancy discipline (see `MessageListModel::repopulate`) is easier to
 //! keep honest when it isn't interleaved with 3000 lines of widget wiring.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

@@ -12,6 +12,8 @@
 //! colours. Once assigned, an entry is never re-coloured automatically - the
 //! stored value is treated as the user's choice.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 use std::path::PathBuf;
 

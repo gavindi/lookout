@@ -12,6 +12,8 @@
 //! transitions, so a summer invitation with `TZID=W. Europe Standard Time`
 //! resolves to CEST, a winter one to CET).
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 /// Resolves a Windows timezone ID to its IANA-equivalent name, matched
 /// case-insensitively like every other header/parameter lookup in this
 /// crate. Unknown IDs return `None` - the caller treats that like any other

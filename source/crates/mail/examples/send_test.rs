@@ -4,6 +4,8 @@
 //! Sent mailbox and checks the message landed there via `APPEND`. Run with:
 //!   cargo run -p lookout-mail --example send_test
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::sync::Arc;
 use std::time::Duration;
 

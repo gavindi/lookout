@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use base64::Engine;
 use lookout_core::{BodyPart, EmailBody, Uid};
 use mail_parser::{Message, MessageParser, MimeHeaders, PartType};

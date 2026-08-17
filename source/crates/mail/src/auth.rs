@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use async_imap::Authenticator;
 
 /// SASL XOAUTH2 (used by Google, Microsoft, and other OAuth2 mail providers).

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.52 (2026-08-17)
+
+### Added
+
+- **Licensing**: the project is now formally licensed GPL-3.0-or-later, matching the SPDX expression already declared in `Cargo.toml` and the AppStream metainfo. A canonical `LICENSE` file (the GNU GPL v3 text) now sits at the repository root, and every one of the 103 Rust source files in the workspace carries a short copyright header at its top - `/// Copyright (C) <2026>  <Gavin Graham & Contributors>` plus the GPL3 note - so provenance is visible in every file regardless of how it's redistributed. Files that open with `//!` module docs (or `#![...]` attributes) keep those first, per Rust's requirement that inner attributes precede items; the header sits right after the doc block in those.
+- **Docs**: the README now opens with the Lookout logo - the rounded blue "Lookout" badge, saved as an SVG under `assets/icons/` - centered above the title, and a dark-mode message-reading screenshot (`assets/screenshots/mail_read_dark_1.png`) appears right below the Features list so the app's look is visible at a glance.
+
+### Fixed
+
+- **Build**: every dev build printed `glib-compile-resources failed: Failed to locate "resources/backgrounds/background1.jpg"` and fell back to including the bundled window background via `include_bytes!`. The GResource manifest referenced two background files that no longer exist in `data/resources/backgrounds/` - the old `background1.jpg` (removed) and a `background2.png` whose actual file is a `.jpg`. The stale `background1.jpg` entry is gone from `data/resources.gresource.xml` and the `background2` reference now names the real `background2.jpg`, so the resource bundle compiles cleanly and the window background ships through GResource as the code already expected.
+
 ## 0.9.51 (2026-08-17)
 
 ### Added

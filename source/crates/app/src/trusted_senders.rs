@@ -7,6 +7,8 @@
 //! keyed per receiving account (a sender trusted on one account is not
 //! trusted on another), so each account gets its own section and add row.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::rc::Rc;
 

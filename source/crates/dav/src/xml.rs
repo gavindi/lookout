@@ -2,6 +2,8 @@
 //! for the handful of PROPFIND/REPORT queries this crate needs, and a
 //! namespace-aware parser for the responses.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};

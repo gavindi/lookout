@@ -14,6 +14,8 @@
 //! password is fetched on every (re)connect attempt and SMTP send, and never
 //! cached by the mail engine.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

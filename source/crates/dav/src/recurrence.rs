@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use chrono::{DateTime, Utc};
 use lookout_core::{CalendarEvent, EventOccurrence, RecurrenceRange};
 use rrule::{RRule, RRuleSet, Unvalidated};

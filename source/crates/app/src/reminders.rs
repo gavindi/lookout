@@ -12,6 +12,8 @@
 //! never re-fires an alert the user already saw. Alerts only fire while the
 //! app is running - reminders while Lookout is closed are out of scope.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::rc::Rc;
 

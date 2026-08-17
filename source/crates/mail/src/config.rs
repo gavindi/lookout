@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 /// Static connection parameters for one protocol endpoint (IMAP or SMTP).
 /// Deliberately protocol-agnostic w.r.t. credentials - see [`Credential`].
 #[derive(Debug, Clone)]

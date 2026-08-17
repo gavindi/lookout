@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::fmt;
 
 /// Derived from a GOA account object path, e.g. `/org/gnome/OnlineAccounts/Accounts/account_1234`.

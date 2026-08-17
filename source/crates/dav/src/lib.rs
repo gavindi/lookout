@@ -4,6 +4,8 @@
 //! [`session::CalendarCredentialProvider`] trait, keeping this crate free of
 //! D-Bus concerns.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 pub mod birthdays;
 pub mod cache;
 mod client;

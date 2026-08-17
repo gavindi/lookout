@@ -13,6 +13,8 @@
 //! `Option<String>` error, and its last-good occurrences stay visible while
 //! it's down (stale-while-revalidate, same convention as the CalDAV cache).
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, NaiveTime};

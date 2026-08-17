@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use crate::ids::{AccountId, MailboxId, UidValidity};
 
 /// The special-use role of a mailbox, derived from `LIST (SPECIAL-USE)` attributes

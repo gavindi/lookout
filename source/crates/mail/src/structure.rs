@@ -4,6 +4,8 @@
 //! section paths, so "fetch only the text parts" is a simple filter over the
 //! flattened list, and attachment parts are never downloaded at all.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use async_imap::imap_proto::types::{BodyContentCommon, BodyContentSinglePart, BodyStructure, ContentEncoding};
 use lookout_core::BodyPart;
 

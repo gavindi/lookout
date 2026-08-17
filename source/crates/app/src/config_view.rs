@@ -9,6 +9,8 @@
 //! `calendar_view.rs` and `folder_tree.rs`: the caller (window.rs) owns the
 //! session state and feeds plain display structs into `refresh`.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::rc::Rc;
 

@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 /// Static connection parameters for one CalDAV account. Deliberately its own
 /// type rather than a reuse of `lookout_mail::config::AccountConfig` - this
 /// crate is D-Bus- and IMAP/SMTP-free by the same convention.

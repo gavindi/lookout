@@ -3,6 +3,8 @@
 //! callback-out, no network access). The caller routes the finished task to
 //! the owning account's session via `on_save`/`on_delete`.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::Cell;
 use std::rc::Rc;
 

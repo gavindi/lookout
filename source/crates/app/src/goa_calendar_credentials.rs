@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use lookout_dav::session::CalendarCredentialProvider;
 use lookout_dav::Credential;
 use lookout_goa::{CalendarAuthMethod, GoaCalendarAccount, GoaClient};

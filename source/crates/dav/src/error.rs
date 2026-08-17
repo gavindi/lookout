@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("HTTP error: {0}")]

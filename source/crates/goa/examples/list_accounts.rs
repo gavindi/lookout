@@ -3,6 +3,8 @@
 //! password-based code paths against whatever accounts are actually
 //! configured on this machine. Run with `cargo run -p lookout-goa --example list_accounts`.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use lookout_goa::{AuthMethod, GoaClient};
 
 #[tokio::main]

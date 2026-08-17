@@ -12,6 +12,8 @@
 //! GNOME keyring, never in this file. Best-effort like `last_view.rs`: a
 //! missing or broken file reads back as defaults, never an error.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::path::PathBuf;
 
 use lookout_core::{AccountId, Identity, MailboxRole, WebcalSubscription};

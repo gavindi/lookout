@@ -9,6 +9,8 @@
 //! against a real IMAP server (e.g. in `tests/imap_integration.rs`) without
 //! any GNOME/D-Bus session present.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 mod auth;
 pub mod body;
 mod cache;

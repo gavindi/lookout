@@ -18,6 +18,8 @@
 //! are pure and unit-tested; everything keymap-dependent is resolved lazily
 //! on the UI thread where the display exists.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 
 use gtk::gdk;

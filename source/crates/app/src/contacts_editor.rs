@@ -11,6 +11,8 @@
 //! rewrites the fields it exposes, so properties the form doesn't know about
 //! (custom `X-` props, `KIND:group` membership, URLs, ...) survive an edit.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::rc::Rc;
 

@@ -20,6 +20,8 @@
 //! window code decides *when* to call in (the Config toggles, the window's
 //! close request) - nothing here touches the UI.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

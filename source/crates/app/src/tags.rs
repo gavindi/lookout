@@ -9,6 +9,8 @@
 //! calendar colours: a missing or unreadable file just means no tags, never an
 //! error.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 

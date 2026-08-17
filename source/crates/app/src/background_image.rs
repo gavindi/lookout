@@ -1,6 +1,6 @@
 //! Persistence for the user's window-background image choice.
 //!
-//! The main window normally shows bundled artwork (`background2.png`); this
+//! The main window normally shows bundled artwork (`background2.jpg`); this
 //! module stores an optional path to an image the user picked under
 //! Config → Appearance → "Window background". The path lives in the GSettings
 //! `window-background-path` key (see `settings.rs`): a missing or stale entry
@@ -9,6 +9,8 @@
 //! Runs that predate GSettings left the path in a plain file; the first load
 //! after the migration imports it once and drops the file.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::path::{Path, PathBuf};
 
 use crate::settings::WINDOW_BACKGROUND_PATH;

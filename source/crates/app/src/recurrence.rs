@@ -10,6 +10,8 @@
 //! nothing about `CalendarEvent` or the network, only the raw `rrule` string
 //! `CalendarEvent::rrule` already carries.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use chrono::{Datelike, NaiveDate, Weekday};
 use gtk::prelude::*;
 

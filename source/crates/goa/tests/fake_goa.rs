@@ -10,6 +10,8 @@
 //! Run with:
 //!   dbus-run-session -- cargo test -p lookout-goa --test fake_goa
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 
 use lookout_goa::{AuthMethod, CalendarAuthMethod, ContactsAuthMethod, GoaClient};

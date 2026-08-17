@@ -5,6 +5,8 @@
 //! The IMAP QRESYNC Extensions
 //!
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use nom::{
     bytes::streaming::tag_no_case, character::streaming::space1, combinator::opt, sequence::tuple,
     IResult,

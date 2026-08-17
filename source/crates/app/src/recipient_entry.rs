@@ -8,6 +8,8 @@
 //! Chips are recreated from the canonical address list on every change, the
 //! same repopulate-from-truth approach the message list uses.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::rc::Rc;
 

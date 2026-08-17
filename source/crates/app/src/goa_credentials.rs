@@ -1,3 +1,5 @@
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use lookout_goa::{AuthMethod, GoaClient, GoaMailAccount};
 use lookout_mail::session::CredentialProvider;
 use lookout_mail::Credential;

@@ -3,6 +3,8 @@
 //! wire-level shape is easy to audit against GNOME's published D-Bus
 //! reference independently of our own account-model mapping.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 
 use zbus::proxy;

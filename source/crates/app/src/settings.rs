@@ -18,6 +18,8 @@
 //! single-threaded, so a plain `Rc` held by `UiState` and the widgets'
 //! closures is all the sharing that's needed).
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

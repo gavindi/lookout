@@ -12,6 +12,8 @@
 //! Both are tried in turn, with the plain spawn kept as a last resort (dev
 //! runs outside any sandbox, where it still works).
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 
 use zbus::zvariant::Value;

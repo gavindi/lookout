@@ -35,6 +35,8 @@
 //! unwritable database just means favourites don't persist and reminders can
 //! fire again.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 

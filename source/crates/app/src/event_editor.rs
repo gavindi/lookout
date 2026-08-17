@@ -12,6 +12,8 @@
 //! which the dialog never talks to the network to fulfil itself; the caller
 //! routes the produced [`CalendarEvent`] to the owning account's session.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;

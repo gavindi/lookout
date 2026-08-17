@@ -9,6 +9,8 @@
 //! window is already focused on it) and only calls into this module once it
 //! has - everything here just builds and sends.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::rc::Rc;
 
 use gtk::gio;

@@ -7,6 +7,8 @@
 //! ourselves: passwords and OAuth2 access tokens are fetched fresh from GOA
 //! per connection attempt and held only in memory for the session.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 mod discovery;
 mod error;
 mod proxies;

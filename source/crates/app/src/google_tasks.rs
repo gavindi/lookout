@@ -20,6 +20,8 @@
 //! permissions; the last synced lists/tasks cache under
 //! `$XDG_CACHE_HOME/lookout/googletasks/<email>.json` for a fast first paint.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;

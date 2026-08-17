@@ -16,6 +16,8 @@
 //! connect refreshes the access token silently. Access tokens are cached in
 //! memory and re-fetched only when near expiry.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;

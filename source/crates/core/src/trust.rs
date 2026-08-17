@@ -8,6 +8,8 @@
 //! only decides which stored entries match a sender and whether the
 //! reading pane's external-content banner is worth showing.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 /// How much remote content a trusted sender may load.
 ///
 /// `Images` is the conservative default - it relaxes exactly the same

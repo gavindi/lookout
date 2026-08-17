@@ -17,6 +17,8 @@
 //! Feb 29 birthdays, which land on Feb 28 in non-leap years (Google and
 //! Apple both do this) instead of silently vanishing.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use lookout_core::{AccountId, CalendarId, EventOccurrence, EventUid, VCard};
 

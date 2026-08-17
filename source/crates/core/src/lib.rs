@@ -3,6 +3,8 @@
 //! Deliberately has no I/O dependencies (no tokio, no zbus, no gtk) so it can
 //! be exercised with plain `cargo test` and reused by any future front end.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 pub mod calendar;
 pub mod email;
 pub mod identity;

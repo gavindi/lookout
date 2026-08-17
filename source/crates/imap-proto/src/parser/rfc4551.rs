@@ -5,6 +5,8 @@
 //! or Quick Flag Changes Resynchronization
 //!
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use nom::{bytes::streaming::tag_no_case, sequence::tuple, IResult};
 
 use crate::{

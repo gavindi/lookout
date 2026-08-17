@@ -1,5 +1,7 @@
 //! GTK4/libadwaita application entry point.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 mod app_config;
 mod background;
 mod background_image;

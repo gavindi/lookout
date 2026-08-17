@@ -11,6 +11,8 @@
 //! GSettings left their choice in `$XDG_CONFIG_HOME/lookout/last-view.json`;
 //! the first load after the migration imports it once and drops the file.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};

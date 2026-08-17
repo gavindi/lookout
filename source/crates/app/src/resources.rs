@@ -4,6 +4,8 @@
 //! produce a real bundle (missing `glib-compile-resources`), the bundle isn't
 //! registered and callers fall back to their `include_bytes!` constants.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use gtk::gio;
 use gtk::glib;
 

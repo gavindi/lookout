@@ -5,6 +5,8 @@
 //! any open composer's From dropdown) can re-render - the same write-through
 //! pattern as the Manage-tags dialog.
 
+/// Copyright (C) <2026>  <Gavin Graham & Contributors>
+/// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::rc::Rc;
 
