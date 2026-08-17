@@ -155,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::PartFetchFailed { part_number, message, .. } => println!("part {part_number} fetch failed: {message}"),
                     AccountEvent::RawMessageFetched { uid, bytes, .. } => println!("raw message {} fetched ({} bytes)", uid.0, bytes.len()),
                     AccountEvent::RawMessageFetchFailed { uid, message, .. } => println!("raw message {} fetch failed: {message}", uid.0),
+                    AccountEvent::MoveFailed { .. } => println!("move failed"),
+                    AccountEvent::StoreFlagsFailed { .. } => println!("store flags failed"),
                     AccountEvent::Error(e) => println!("ERROR: {e}"),
                 }
                 if got_folders && got_messages && got_body {

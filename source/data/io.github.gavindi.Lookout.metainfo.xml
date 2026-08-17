@@ -21,7 +21,7 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
-    <release version="0.9.64" date="2026-08-18">
+    <release version="0.9.65" date="2026-08-18">
       <description>
         <p>Inline cid: images that failed with &quot;the server didn't return this attachment's part&quot; now recover when the parts still exist. A part structure can go stale when a message is rewritten server-side after its body or summary was cached (mailing-list/gateway rewraps), so FetchAttachment now falls back to fetching the whole message and re-derives the part from the message's actual bytes - matched by Content-ID for inline images, else filename, else content type - and re-wrapped messages render their images and attachments again instead of broken placeholders. Parts genuinely gone still answer with the error toast, exactly as before.</p>
       </description>

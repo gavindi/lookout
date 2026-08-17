@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.65 (2026-08-18)
+
+### Added
+
+- **Mail**: QRESYNC (RFC 7162 §4) fast-re-sync. The session now sends `ENABLE CONDSTORE QRESYNC` after login when the server advertises the capability (a rejection is a non-fatal downgrade to plain CONDSTORE, and both flags read false so a server that refuses is never sent anything it can't answer), and the IDLE-wake delta path - already a `FETCH ... (CHANGEDSINCE <baseline>)` flag delta on CONDSTORE connections - now replaces its `UID SEARCH ALL` membership pass with a `SELECT "<folder>" (QRESYNC (<uidvalidity> <modseq> <known-uids>))`. The server diffs the client's known (cached) UID set against its own and reports which are gone via untagged `VANISHED` responses, so `present = cached ∪ changed − vanished` with no full-UID-set round trip and an expunge window closed exactly as the search closed it (the SELECT reports every expunge since the baseline, including one that raced in between). The QRESYNC SELECT goes through the same raw `run_command`/`read_response` surface `ENABLE CONDSTORE` and LIST-STATUS already use - the vendored `imap-proto` parser already understood `VANISHED` (no vendored change needed) - and any failure, or a known-UID set too large for one command line, falls back to the plain `UID SEARCH` delta. A server whose `UIDVALIDITY` doesn't match the parameter treats the client as knowing nothing per RFC 7162, which only widens one delta, never wrong.
+- **Mail**: thread keys are no longer recomputed on every sync. `sync_mailbox` now skips the O(mailbox) union-find `compute_thread_keys` pass when the sync changed nothing that could rethread the set - no new UIDs were fetched, the message count matches the cache, and every message's `Message-ID` still equals its cached value - keeping each message's already-serialized cached thread key instead. A steady-state IDLE wake (flags-only `CHANGEDSINCE`) now pays no thread computation at all; a new arrival, an expunge, or a Message-ID edit still recomputes as before.
+- **Mail**: expunged messages are now purged from every cache layer, not just the envelope table. `replace_messages` reads each stored row's `uidvalidity` alongside its UID and, for UIDs absent from the new set (expunged server-side, or an emptied mailbox), deletes the `messages`, `search_fts`, `bodies`, and `snoozed` rows **and** the message's flat files - every attachment `.bin` sidecar (a single directory sweep matching the filename's first three fields against the purge set, so a whole-mailbox clear removes every row in one pass rather than O(n²) per-uid reads) and the raw `.eml` export. The filename hash was factored into a shared `mailbox_filename_hash` helper so the purge derives exactly the paths the store/load paths wrote. Bodies and flat files are validity-keyed, so a recycled UID under a newer `uidvalidity` is never purged.
+- **Mail**: the address book is bounded. `record_addresses` had grown every `From`/`To`/`Cc` address ever synced with no cap; the table is now pruned to `ADDRESSES_CAP` (20,000) in the same transaction once it passes the cap, dropping the lowest-ranked overflow (fewest lifetime appearances, ties broken by least-recent contact) so the composer autocomplete and the dashboard's "most contacted" feed keep their top ranks.
+
+### Fixed
+
+- **Mail**: the `send_test` and `smoke_test` example binaries no longer fail to compile - both had non-exhaustive `AccountEvent` matches that predated this release (the `MoveFailed`/`StoreFlagsFailed` variants added in 0.9.34/0.9.38 were never added to their match arms), so `cargo test -p lookout-mail` was broken at the examples step.
+
 ## 0.9.64 (2026-08-18)
 
 ### Fixed

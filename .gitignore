@@ -16,4 +16,6 @@ target/
 
 #IDE
 *.code-workspace
+.cline/
+
 

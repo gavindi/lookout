@@ -26,8 +26,9 @@ use crate::send::{build_raw_message, send_smtp, ComposedMessage};
 /// message's `BODYSTRUCTURE` in its envelope pass, "download" here means the
 /// text parts only - attachments are never fetched for the cache. On
 /// CONDSTORE connections the steady-state sync is itself a `CHANGEDSINCE`
-/// delta (see `sync_mailbox`); QRESYNC, which would also report expunged
-/// UIDs directly, is a later phase.
+/// delta (see `sync_mailbox`); with QRESYNC enabled the wake's `SELECT
+/// (QRESYNC ...)` additionally reports expunged UIDs via `VANISHED`,
+/// replacing the delta path's `UID SEARCH ALL` membership pass.
 const INITIAL_FETCH_LIMIT: u32 = 200;
 
 /// How long a single IDLE wait runs before we re-enter it purely as a
@@ -622,7 +623,7 @@ async fn connect_and_run(
     mut carried_command: Option<AccountCommand>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
-    let (mut session, has_move, condstore, has_list_status) = login(config, credential).await?;
+    let (mut session, has_move, condstore, has_list_status, qresync) = login(config, credential).await?;
 
     let account_id = config.account_id.clone();
     let (mut folders, list_counts_supplied) = list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?;
@@ -653,7 +654,7 @@ async fn connect_and_run(
 
     let inbox_id = MailboxId::new(&account_id, "INBOX");
     // Fresh session: no mailbox is SELECTed yet, so the sync must select INBOX.
-    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, None, condstore).await?;
+    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, None, condstore, qresync).await?;
 
     // Folders still awaiting their STATUS count, drained cooperatively below.
     // Held as ids rather than indices so a re-list that reorders (or shortens)
@@ -826,6 +827,7 @@ async fn connect_and_run(
                     &mut folders,
                     Some(&session_selected),
                     condstore,
+                    qresync,
                 )
                 .await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
@@ -868,6 +870,7 @@ async fn connect_and_run(
                         &mut folders,
                         Some(&session_selected),
                         condstore,
+                        qresync,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -932,6 +935,7 @@ async fn connect_and_run(
                             &mut folders,
                             Some(&session_selected),
                             condstore,
+                            qresync,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -1185,7 +1189,7 @@ async fn connect_and_run(
                                     &mut dirty_mailboxes,
                                 )
                                 .await?;
-                                sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache, &mut folders, Some(&session_selected), condstore).await?;
+                                sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache, &mut folders, Some(&session_selected), condstore, qresync).await?;
                                 dirty_mailboxes.remove(&sent_id);
                                 session_selected = sent_id.clone();
                                 if session_selected != current_mailbox_id {
@@ -1208,6 +1212,7 @@ async fn connect_and_run(
                                         &mut folders,
                                         Some(&session_selected),
                                         condstore,
+                                        qresync,
                                     )
                                     .await?;
                                     dirty_mailboxes.remove(&current_mailbox_id);
@@ -1269,6 +1274,7 @@ async fn connect_and_run(
                                 &mut folders,
                                 Some(&session_selected),
                                 condstore,
+                                qresync,
                             )
                             .await?;
                             dirty_mailboxes.remove(&current_mailbox_id);
@@ -1346,6 +1352,7 @@ async fn connect_and_run(
                                 &mut folders,
                                 Some(&session_selected),
                                 condstore,
+                                qresync,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -1409,6 +1416,7 @@ async fn connect_and_run(
                                 &mut folders,
                                 Some(&session_selected),
                                 condstore,
+                                qresync,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -1481,6 +1489,7 @@ async fn connect_and_run(
                                 &mut folders,
                                 Some(&session_selected),
                                 condstore,
+                                qresync,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -1545,6 +1554,7 @@ async fn connect_and_run(
                                 &mut folders,
                                 Some(&session_selected),
                                 condstore,
+                                qresync,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -1574,6 +1584,7 @@ async fn connect_and_run(
                         &mut folders,
                         Some(&session_selected),
                         condstore,
+                        qresync,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -1599,6 +1610,7 @@ async fn connect_and_run(
                         &mut folders,
                         Some(&session_selected),
                         condstore,
+                        qresync,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -1656,6 +1668,7 @@ async fn connect_and_run(
                                     &mut folders,
                                     Some(&session_selected),
                                     condstore,
+                                    qresync,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -1740,6 +1753,7 @@ async fn connect_and_run(
                                     &mut folders,
                                     Some(&session_selected),
                                     condstore,
+                                    qresync,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -1834,6 +1848,7 @@ async fn connect_and_run(
                                     &mut folders,
                                     Some(&session_selected),
                                     condstore,
+                                    qresync,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -1885,6 +1900,7 @@ async fn connect_and_run(
                                     &mut folders,
                                     Some(&session_selected),
                                     condstore,
+                                    qresync,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -1949,6 +1965,7 @@ async fn connect_and_run(
                             &mut folders,
                             Some(&session_selected),
                             condstore,
+                            qresync,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -2376,7 +2393,7 @@ async fn delete_draft(session: &mut Session<ImapStream>, folders: &[Mailbox], ac
     purge_by_message_id(session, message_id).await
 }
 
-async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<ImapStream>, bool, bool, bool)> {
+async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<ImapStream>, bool, bool, bool, bool)> {
     let stream = connect_tls(&config.imap.host, config.imap.port).await?;
     tracing::debug!("login: creating client, reading greeting");
     let mut client = async_imap::Client::new(stream);
@@ -2413,17 +2430,31 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     // because a server that refuses `ENABLE CONDSTORE` must never be sent
     // `CHANGEDSINCE` or asked for `HIGHESTMODSEQ` (both are protocol errors on
     // a non-CONDSTORE connection).
-    let mut condstore = capabilities.has_str("CONDSTORE") || capabilities.has_str("QRESYNC");
+    //
+    // QRESYNC (RFC 7162 §4): when the server advertises it, also `ENABLE`
+    // it so the delta sync's `SELECT ... (QRESYNC (modseq))` is legal. That
+    // SELECT reports expunged UIDs via `VANISHED`, replacing the delta path's
+    // `UID SEARCH ALL` membership pass. A rejection is a non-fatal downgrade:
+    // `qresync` reads *false* and the delta path keeps using the search.
+    // RFC 7162 §4 requires QRESYNC servers to support CONDSTORE too, so a
+    // server that accepts QRESYNC but refuses CONDSTORE is a protocol
+    // violation - `condstore` must stay false in that case (VANISHED and
+    // `CHANGEDSINCE` are both CONDSTORE-only), so QRESYNC is only offered
+    // once CONDSTORE actually enabled.
+    let mut qresync = capabilities.has_str("QRESYNC");
+    let mut condstore = capabilities.has_str("CONDSTORE") || qresync;
     if condstore {
-        match session.run_command_and_check_ok("ENABLE CONDSTORE").await {
-            Ok(()) => tracing::debug!("CONDSTORE enabled for connection"),
+        let enabled = if qresync { "ENABLE CONDSTORE QRESYNC" } else { "ENABLE CONDSTORE" };
+        match session.run_command_and_check_ok(enabled).await {
+            Ok(()) => tracing::debug!(qresync, "CONDSTORE enabled for connection"),
             Err(e) => {
-                tracing::debug!("server rejected ENABLE CONDSTORE, continuing without incremental sync: {e}");
+                tracing::debug!("server rejected ENABLE {enabled}, continuing without incremental sync: {e}");
                 condstore = false;
+                qresync = false;
             }
         }
     }
-    Ok((session, has_move, condstore, has_list_status))
+    Ok((session, has_move, condstore, has_list_status, qresync))
 }
 
 /// Builds a `Mailbox` from one LIST response entry, minus the count fields
@@ -2796,8 +2827,70 @@ async fn search_mailbox(session: &mut Session<ImapStream>, account_id: &AccountI
     Ok(messages)
 }
 
-// The extra `session_selected` argument is what lets the IDLE-wake path skip
-// its re-SELECT, so the count is worth it for the session-critical helper.
+/// SELECTs `folder_path` with the RFC 7162 §3.2.9.2 QRESYNC parameter on a
+/// connection where `ENABLE QRESYNC` succeeded, asking the server to report -
+/// via untagged `VANISHED` responses - which of the client's *known* UIDs
+/// (`known_set`, spelling out the cached set) have been expunged since
+/// `modseq`. Returns the expunged UIDs. Once the server has the known list,
+/// it does the expunge diff itself, which is what makes this the replacement
+/// for the delta path's `UID SEARCH ALL` membership pass.
+///
+/// `known_set` must fit on one command line: the caller renders it through
+/// [`uid_set_chunks`] and only invokes this when it comes back as a single
+/// chunk (a dense folder compresses to `1:<n>`; only a pathological sparse
+/// set exceeds the budget, in which case the caller falls back to the
+/// `UID SEARCH` delta instead). A server whose UIDVALIDITY doesn't match the
+/// parameter treats the client as knowing nothing (an empty VANISHED set,
+/// RFC 7162 §3.2.9.2) - the caller's `cached ∪ changed − vanished` diff then
+/// simply keeps every cached row for one sync, and the next full-sync pass
+/// (or a UIDVALIDITY mismatch elsewhere) corrects it, the same way a stale
+/// baseline only ever widens a delta.
+///
+/// The response stream also carries the untagged `EXISTS`/`FLAGS`/OK-code
+/// responses that accompany any SELECT; they're drained and discarded here -
+/// the folder's actual counts come from the fetch the caller already ran.
+/// Any `Err` means the caller should downgrade to the plain CONDSTORE delta.
+async fn select_with_qresync(
+    session: &mut Session<ImapStream>,
+    folder_path: &str,
+    uidvalidity: UidValidity,
+    modseq: u64,
+    known_set: &str,
+) -> Result<HashSet<Uid>> {
+    // `SELECT` goes through `run_command` rather than `Session::select` -
+    // async-imap's select only supports the `(CONDSTORE)` parameter, and
+    // QRESYNC's expunge reporting is exactly what this session needs. The
+    // raw response loop mirrors `list_mailboxes_with_status`.
+    let query = format!("SELECT {} (QRESYNC ({} {modseq} {known_set}))", imap_quote(folder_path), uidvalidity.0);
+    session.run_command(query).await?;
+    let mut vanished = HashSet::new();
+    while let Some(response) = session.read_response().await? {
+        match response.parsed() {
+            Response::Vanished { uids, .. } => {
+                for range in uids {
+                    // The server reports expunges as a sequence set of UID
+                    // ranges; expand each range into the wanted set. Bounded
+                    // by what was actually expunged, never the folder size.
+                    vanished.extend((*range.start()..=*range.end()).map(Uid));
+                }
+            }
+            Response::Done { status: Status::Ok, .. } => break,
+            Response::Done { status, code, information, .. } => {
+                let message = format!("code: {code:?}, info: {information:?}");
+                return Err(Error::Imap(match status {
+                    Status::Bad => async_imap::error::Error::Bad(message),
+                    _ => async_imap::error::Error::No(message),
+                }));
+            }
+            _ => {}
+        }
+    }
+    Ok(vanished)
+}
+
+// The extra `session_selected`/`qresync` arguments are what let the IDLE-wake
+// path skip its re-SELECT and use the QRESYNC SELECT, so the count is worth it
+// for the session-critical helper.
 #[allow(clippy::too_many_arguments)]
 async fn sync_mailbox(
     session: &mut Session<ImapStream>,
@@ -2809,6 +2902,7 @@ async fn sync_mailbox(
     folders: &mut Vec<Mailbox>,
     session_selected: Option<&MailboxId>,
     condstore: bool,
+    qresync: bool,
 ) -> Result<()> {
     let is_sent = folders.iter().find(|f| f.id == *mailbox_id).is_some_and(|f| matches!(f.role, MailboxRole::Sent));
     // `None` = a fresh session with nothing SELECTed yet (the connect-time
@@ -2845,13 +2939,13 @@ async fn sync_mailbox(
     // only makes the delta wider, never wrong.
     //
     // The one thing `CHANGEDSINCE` cannot report is an expunge - a deleted
-    // message is no longer there to be fetched - and expunges are only
-    // discovered by UID-set diff (QRESYNC's `VANISHED`, which reports them
-    // directly, is a later phase). So the delta path separately learns the
-    // full UID set with `UID SEARCH ALL`: a bare list of numbers, far cheaper
-    // than the full flag fetch it replaces, and it doubles as the folder's
-    // exists count. The full path needs no extra pass - the full flag fetch
-    // *is* the membership set.
+    // message is no longer there to be fetched. On a QRESYNC connection the
+    // `SELECT (QRESYNC ...)` below reports expunges directly via `VANISHED`;
+    // otherwise they're discovered by UID-set diff, and the delta path
+    // separately learns the full UID set with `UID SEARCH ALL` - a bare list
+    // of numbers, far cheaper than the full flag fetch it replaces, and it
+    // doubles as the folder's exists count. The full path needs no extra
+    // pass - the full flag fetch *is* the membership set.
     let cached: HashMap<Uid, EmailSummary> = cache_op(cache, {
         let mailbox_id = mailbox_id.clone();
         move |c| c.load_messages_by_uid(&mailbox_id, uidvalidity)
@@ -2870,13 +2964,49 @@ async fn sync_mailbox(
     } else {
         session.fetch("1:*", "(UID FLAGS)").await?.try_collect().await?
     };
-    // The full current UID set. On the delta path it comes from `UID SEARCH
-    // ALL`, run *after* the fetch: a message arriving between the two lands
-    // in both (its modseq exceeds the baseline, so the fetch reports it too),
-    // while one expunged between the two is caught by the search. The other
-    // ordering would let an arrival slip through both passes and vanish from
-    // this sync's output until the next wake.
-    let present_uids: HashSet<Uid> = if delta {
+    // The full current UID set. On the plain-CONDSTORE delta it comes from
+    // `UID SEARCH ALL`, run *after* the fetch: a message arriving between the
+    // two lands in both (its modseq exceeds the baseline, so the fetch
+    // reports it too), while one expunged between the two is caught by the
+    // search. The other ordering would let an arrival slip through both
+    // passes and vanish from this sync's output until the next wake.
+    //
+    // With QRESYNC the SELECT below replaces that search: the server diffs
+    // the client's known (cached) UID set against its own and reports which
+    // are gone via `VANISHED`, so `present = cached ∪ changed − vanished` -
+    // no full-UID-set round trip, and the ordering is the same fetch-first,
+    // which closes the expunge window exactly as the search did (the SELECT
+    // reports every expunge since the baseline, including one that raced in
+    // between). An arrival that races in between the fetch and the SELECT
+    // isn't in this sync's output, but its modseq exceeds the conservative
+    // baseline this sync keeps (see the folder update below), so the next
+    // wake's `CHANGEDSINCE` reports it - never permanently lost.
+    let present_uids: HashSet<Uid> = if delta && qresync {
+        let bound = baseline.expect("QRESYNC delta requires a baseline, checked above");
+        let known_uids: Vec<Uid> = cached.keys().copied().collect();
+        let known = uid_set_chunks(&known_uids);
+        // The known list must fit one SELECT command line (uid_set_chunks
+        // returns multiple chunks only once the byte budget is exhausted);
+        // a set too large for one line falls back to the UID SEARCH delta.
+        if known.len() == 1 {
+            match select_with_qresync(session, folder_path, uidvalidity, bound, &known[0]).await {
+                Ok(vanished) => {
+                    let mut present: HashSet<Uid> = cached.keys().copied().collect();
+                    present.extend(flag_fetches.iter().filter_map(|f| f.uid.map(Uid)));
+                    for &uid in &vanished {
+                        present.remove(&uid);
+                    }
+                    present
+                }
+                Err(e) => {
+                    tracing::debug!("QRESYNC SELECT failed for {folder_path}, falling back to the UID SEARCH delta: {e}");
+                    session.uid_search("ALL").await?.into_iter().map(Uid).collect()
+                }
+            }
+        } else {
+            session.uid_search("ALL").await?.into_iter().map(Uid).collect()
+        }
+    } else if delta {
         session.uid_search("ALL").await?.into_iter().map(Uid).collect()
     } else {
         flag_fetches.iter().filter_map(|f| f.uid.map(Uid)).collect()
@@ -2983,10 +3113,27 @@ async fn sync_mailbox(
         messages.extend(new_messages);
     }
 
-    let keys = lookout_core::thread::compute_thread_keys(&messages);
-    for msg in &mut messages {
-        if let Some(key) = keys.get(&msg.uid) {
-            msg.thread_key = key.clone();
+    // Thread keys only change when the message set's membership changes (a
+    // new arrival, an expunge, or a UIDVALIDITY-invalidated re-fetch) or a
+    // message's Message-ID changes (a server-side rewrite). On a steady-state
+    // sync - the delta path carrying unchanged cached messages - every
+    // message keeps the key already serialized into its cached summary, so
+    // recomputing the whole O(mailbox) union-find pass would be wasted work.
+    // The stability checks: no new UIDs fetched this sync, the same count as
+    // the cache (an expunge paired with an arrival keeps the count, so the
+    // Message-ID mapping below catches that case), and every message's
+    // Message-ID still matching its cached value.
+    let keys_are_stable = new_uids.is_empty()
+        && messages.len() == cached.len()
+        && messages
+            .iter()
+            .all(|m| cached.get(&m.uid).is_some_and(|c| c.message_id == m.message_id));
+    if !keys_are_stable {
+        let keys = lookout_core::thread::compute_thread_keys(&messages);
+        for msg in &mut messages {
+            if let Some(key) = keys.get(&msg.uid) {
+                msg.thread_key = key.clone();
+            }
         }
     }
 
