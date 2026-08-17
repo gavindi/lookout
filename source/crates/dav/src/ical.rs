@@ -1073,7 +1073,10 @@ END:VCALENDAR\r\n";
         // (CEST, UTC+2), so 10:00 local is 08:00 UTC - not 10:00.
         assert_eq!(invitation.start, "2026-08-10T08:00:00Z".parse::<DateTime<Utc>>().unwrap());
         assert_eq!(invitation.end, "2026-08-10T08:30:00Z".parse::<DateTime<Utc>>().unwrap());
-        assert_eq!(invitation.location.as_deref(), Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc123%40thread.v2/0"));
+        assert_eq!(
+            invitation.location.as_deref(),
+            Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc123%40thread.v2/0")
+        );
         assert_eq!(invitation.rrule, None);
     }
 

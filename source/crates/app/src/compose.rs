@@ -465,7 +465,11 @@ impl PartialEq for PendingAttachment {
 
 impl PendingAttachment {
     fn to_mail_attachment(&self) -> Attachment {
-        Attachment { filename: self.filename.clone(), content_type: self.content_type.clone(), bytes: (*self.bytes).clone() }
+        Attachment {
+            filename: self.filename.clone(),
+            content_type: self.content_type.clone(),
+            bytes: (*self.bytes).clone(),
+        }
     }
 }
 
@@ -853,7 +857,12 @@ fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
                 filters.append(&filter);
                 let dialog = gtk::FileDialog::builder().title("Insert image").filters(&filters).build();
                 let Ok(file) = dialog.open_future(Some(&window)).await else { return };
-                let Ok(info) = file.query_info_future("standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT).await else { return };
+                let Ok(info) = file
+                    .query_info_future("standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
+                    .await
+                else {
+                    return;
+                };
                 let content_type = info
                     .content_type()
                     .and_then(|ct| gio::functions::content_type_get_mime_type(&ct))
@@ -1741,7 +1750,11 @@ mod tests {
         assert!(!draft_is_trivial(&with_attachment));
 
         let mut with_image = snapshot("", "", "");
-        with_image.inline_images = vec![InlineImage { cid: "img-1@lookout.local".to_string(), content_type: "image/png".to_string(), bytes: vec![0u8; 4] }];
+        with_image.inline_images = vec![InlineImage {
+            cid: "img-1@lookout.local".to_string(),
+            content_type: "image/png".to_string(),
+            bytes: vec![0u8; 4],
+        }];
         assert!(!draft_is_trivial(&with_image));
     }
 

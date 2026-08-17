@@ -19,10 +19,7 @@
 /// crate. Unknown IDs return `None` - the caller treats that like any other
 /// unresolvable event rather than guessing an offset.
 pub fn windows_to_iana(tzid: &str) -> Option<&'static str> {
-    WINDOWS_TO_IANA
-        .iter()
-        .find(|(windows, _)| windows.eq_ignore_ascii_case(tzid))
-        .map(|(_, iana)| *iana)
+    WINDOWS_TO_IANA.iter().find(|(windows, _)| windows.eq_ignore_ascii_case(tzid)).map(|(_, iana)| *iana)
 }
 
 /// `(Windows ID, IANA name)` pairs, Windows IDs as emitted by Outlook,

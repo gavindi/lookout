@@ -1308,10 +1308,7 @@ mod tests {
         let now = Utc::now();
 
         cache.snooze_messages(&mailbox_id, &[Uid(1), Uid(2), Uid(3)], now + chrono::Duration::hours(1)).unwrap();
-        assert_eq!(
-            cache.active_snoozed_uids(&mailbox_id, now).unwrap(),
-            HashSet::from([Uid(1), Uid(2), Uid(3)])
-        );
+        assert_eq!(cache.active_snoozed_uids(&mailbox_id, now).unwrap(), HashSet::from([Uid(1), Uid(2), Uid(3)]));
 
         cache.snooze_messages(&mailbox_id, &[Uid(1), Uid(4)], now - chrono::Duration::hours(1)).unwrap();
         assert_eq!(cache.active_snoozed_uids(&mailbox_id, now).unwrap(), HashSet::from([Uid(2), Uid(3)]));
@@ -1367,7 +1364,11 @@ mod tests {
             .replace_messages(
                 &mailbox_id,
                 UidValidity(1),
-                &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None), sample_summary(&mailbox_id, 3, None)],
+                &[
+                    sample_summary(&mailbox_id, 1, None),
+                    sample_summary(&mailbox_id, 2, None),
+                    sample_summary(&mailbox_id, 3, None),
+                ],
             )
             .unwrap();
         cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("one")).unwrap();
@@ -1668,11 +1669,17 @@ mod tests {
             .replace_messages(
                 &mailbox_id,
                 UidValidity(1),
-                &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None), sample_summary(&mailbox_id, 3, None)],
+                &[
+                    sample_summary(&mailbox_id, 1, None),
+                    sample_summary(&mailbox_id, 2, None),
+                    sample_summary(&mailbox_id, 3, None),
+                ],
             )
             .unwrap();
 
-        assert!(cache.update_flags_many(&mailbox_id, &[Uid(1), Uid(2)], &[SystemFlagBit::Seen, SystemFlagBit::Flagged], &[]).unwrap());
+        assert!(cache
+            .update_flags_many(&mailbox_id, &[Uid(1), Uid(2)], &[SystemFlagBit::Seen, SystemFlagBit::Flagged], &[])
+            .unwrap());
         let loaded = cache.load_messages(&mailbox_id).unwrap();
         assert!(!loaded.iter().find(|m| m.uid == Uid(1)).unwrap().is_unread());
         assert!(!loaded.iter().find(|m| m.uid == Uid(2)).unwrap().is_unread());
@@ -1733,11 +1740,7 @@ mod tests {
         let red = lookout_core::tag_keyword("red");
 
         cache
-            .replace_messages(
-                &mailbox_id,
-                UidValidity(1),
-                &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)],
-            )
+            .replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)])
             .unwrap();
         cache.update_flags_many(&mailbox_id, &[Uid(1)], &[SystemFlagBit::Seen], &[]).unwrap();
 

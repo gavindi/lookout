@@ -55,10 +55,7 @@ fn main() -> glib::ExitCode {
     // load it." every time accessibility comes up (first render, a click on
     // the reading pane's WebView). Strip them before GTK reads the variable.
     if let Ok(value) = std::env::var("GTK_MODULES") {
-        let kept: Vec<&str> = value
-            .split(':')
-            .filter(|m| !matches!(*m, "gail" | "atk-bridge"))
-            .collect();
+        let kept: Vec<&str> = value.split(':').filter(|m| !matches!(*m, "gail" | "atk-bridge")).collect();
         std::env::set_var("GTK_MODULES", kept.join(":"));
     }
 
@@ -75,7 +72,14 @@ fn main() -> glib::ExitCode {
     let hidden = Rc::new(Cell::new(false));
     {
         let hidden = hidden.clone();
-        app.add_main_option("hidden", b'h'.into(), glib::OptionFlags::NONE, glib::OptionArg::None, "Start without showing the main window", None);
+        app.add_main_option(
+            "hidden",
+            b'h'.into(),
+            glib::OptionFlags::NONE,
+            glib::OptionArg::None,
+            "Start without showing the main window",
+            None,
+        );
         app.connect_handle_local_options(move |_app, options| {
             // A `G_OPTION_ARG_NONE` option shows up in the parsed options
             // dictionary as a true boolean; the env-args check covers any

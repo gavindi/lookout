@@ -9,8 +9,8 @@ use adw::prelude::*;
 use chrono::{Datelike, Timelike};
 use gtk::{gio, glib};
 use lookout_core::{
-    AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody, EmailSummary,
-    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, VCard, WebcalSubscription, display_name,
+    display_name, AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody,
+    EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, VCard, WebcalSubscription,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
@@ -3528,10 +3528,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // state survives a round-trip through the Calendar/Config views. Like
     // Home/View, it goes honest-disabled while another module is active
     // (see the nav-rail handlers).
-    let header_calendar_overview_toggle = gtk::ToggleButton::builder()
-        .icon_name("x-office-calendar-symbolic")
-        .css_classes(["flat"])
-        .build();
+    let header_calendar_overview_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").css_classes(["flat"]).build();
     header_calendar_overview_toggle.set_tooltip_text(Some("Calendar overview"));
     window_header.pack_end(&header_calendar_overview_toggle);
     #[cfg(debug_assertions)]
@@ -4924,7 +4921,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mut st = calendar_state.borrow_mut();
         st.mail_overview_refresh = Some(mail_overview_refresh);
         let window_for_activate = window.clone();
-        st.mail_overview_activate = Some(Rc::new(move |task| open_task_editor_for(&window_for_activate, &calendar_state_for_activate, &tasks_view_for_activate, &task)));
+        st.mail_overview_activate = Some(Rc::new(move |task| {
+            open_task_editor_for(&window_for_activate, &calendar_state_for_activate, &tasks_view_for_activate, &task)
+        }));
     }
 
     let contacts_categories: Rc<RefCell<Vec<ContactsCategoryChoice>>> = Rc::new(RefCell::new(Vec::new()));
@@ -5206,7 +5205,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let enabled = row.is_active();
             state.borrow().settings.set_bool(crate::settings::START_AT_LOGIN, enabled);
             if enabled {
-                worker.spawn(async { let _ = crate::background::enable_login_autostart().await; });
+                worker.spawn(async {
+                    let _ = crate::background::enable_login_autostart().await;
+                });
             } else {
                 crate::background::disable_login_autostart();
             }
@@ -5233,7 +5234,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
         config_view.read_receipts_row.set_active(persisted.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS));
-        config_view.mail_notifications_row.set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
+        config_view
+            .mail_notifications_row
+            .set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
         config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
         // "Start Lookout at login": the setting is the source of truth for
         // the portal path; the managed XDG file is the fallback, so an
@@ -5808,7 +5811,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let star_button = star_button.clone();
                 let refresh_hook = refresh_hook.clone();
                 Rc::new(move |anchor, account_id: &str| {
-                    let Some(existing) = state.borrow().app_config.borrow().other_account(account_id) else { return };
+                    let Some(existing) = state.borrow().app_config.borrow().other_account(account_id) else {
+                        return;
+                    };
                     let app_config = state.borrow().app_config.clone();
                     let on_saved = {
                         let state = state.clone();
@@ -5838,7 +5843,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             // `run_account_session` treats as a clean
                             // shutdown request.
                             state.borrow_mut().accounts.remove(&AccountId(account_id.to_string()));
-                            let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else { return };
+                            let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else {
+                                return;
+                            };
                             connect_other_account(
                                 worker.clone(),
                                 state.clone(),
@@ -6069,7 +6076,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let star_button = star_button.clone();
                 let refresh_hook = refresh_hook.borrow().clone();
                 Rc::new(move |account_id: &str| {
-                    let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else { return };
+                    let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else {
+                        return;
+                    };
                     connect_other_account(
                         worker.clone(),
                         state.clone(),
@@ -8995,7 +9004,11 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
                 let _ = cr.fill();
             });
             dot.set_tooltip_text(Some(&occ.calendar_id.0));
-            let prefix_text = if occ.all_day { "All Day".to_string() } else { occ.start.with_timezone(&chrono::Local).format("%H:%M").to_string() };
+            let prefix_text = if occ.all_day {
+                "All Day".to_string()
+            } else {
+                occ.start.with_timezone(&chrono::Local).format("%H:%M").to_string()
+            };
             let prefix = gtk::Label::builder().label(&prefix_text).xalign(0.0).css_classes(["dim-label", "caption"]).build();
             let title = gtk::Label::builder()
                 .label(occ.summary.as_deref().unwrap_or("(untitled)"))
@@ -9021,7 +9034,11 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
 
     let outstanding = crate::lookout_view::outstanding_tasks(&tasks, chrono::Local::now().naive_local(), usize::MAX);
     if outstanding.is_empty() {
-        let placeholder = gtk::Label::builder().label("No outstanding tasks").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+        let placeholder = gtk::Label::builder()
+            .label("No outstanding tasks")
+            .css_classes(["dim-label", "caption"])
+            .xalign(0.0)
+            .build();
         day_list_box.append(&placeholder);
     } else {
         for task in outstanding {
@@ -9855,7 +9872,9 @@ fn task_email_marker(message_id: &str) -> String {
 /// filled/outline icon.
 fn email_has_task(calendar_state: &Rc<RefCell<CalendarUiState>>, message_id: &str) -> bool {
     let marker = task_email_marker(message_id);
-    merged_tasks(calendar_state).iter().any(|task| task.description.as_deref().is_some_and(|d| d.contains(&marker)))
+    merged_tasks(calendar_state)
+        .iter()
+        .any(|task| task.description.as_deref().is_some_and(|d| d.contains(&marker)))
 }
 
 /// Sets the mail toolbar's "Add as Task" flag button's icon to reflect
@@ -9905,7 +9924,10 @@ fn show_create_task_for_email(
         .first()
         .map(|addr| addr.name.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or(&addr.address).to_string())
         .unwrap_or_else(|| "unknown sender".to_string());
-    let mut description = format!("From: {sender_label} — {}", summary.date.with_timezone(&chrono::Local).format("%a, %b %-d, %Y at %-I:%M %p"));
+    let mut description = format!(
+        "From: {sender_label} — {}",
+        summary.date.with_timezone(&chrono::Local).format("%a, %b %-d, %Y at %-I:%M %p")
+    );
     // A hidden marker line so `email_has_task` can later recognize this task
     // as belonging to this email, driving the flag button's filled icon -
     // skipped when the message carries no Message-ID (rare, but then there's
@@ -12730,7 +12752,14 @@ fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::S
         let part_for_dclick = part.clone();
         gesture_open.connect_pressed(move |_, n_press, _, _| {
             if n_press == 2 {
-                start_attachment_fetch(&state_for_dclick, &mailbox_for_dclick, uid, &part_for_dclick, &button_for_dclick, PendingAttachmentAction::Open);
+                start_attachment_fetch(
+                    &state_for_dclick,
+                    &mailbox_for_dclick,
+                    uid,
+                    &part_for_dclick,
+                    &button_for_dclick,
+                    PendingAttachmentAction::Open,
+                );
             }
         });
         row.add_controller(gesture_open);
@@ -13190,12 +13219,7 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
 /// (`UiState::message_theme_override`) changes, so the two never drift - the
 /// toggle handler, every navigation reset, and the close-pane reset all
 /// route through this.
-fn set_message_theme_armed(
-    enabled: bool,
-    web_view: &webkit::WebView,
-    user_content_manager: &webkit::UserContentManager,
-    theme_override_sheet: &webkit::UserStyleSheet,
-) {
+fn set_message_theme_armed(enabled: bool, web_view: &webkit::WebView, user_content_manager: &webkit::UserContentManager, theme_override_sheet: &webkit::UserStyleSheet) {
     if enabled {
         user_content_manager.add_style_sheet(theme_override_sheet);
         web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
@@ -14176,11 +14200,17 @@ mod tests {
         assert_eq!(entry.href, "/b/ada.vcf");
         assert_eq!(entry.etag.as_deref(), Some("etag-b"));
         // The email's own account is preferred when it also has the contact.
-        state.borrow_mut().contacts_by_account.get_mut(&AccountId("account_a".into())).unwrap().contacts.push(lookout_dav::ContactRecord {
-            href: "/a/ada.vcf".into(),
-            etag: None,
-            card: test_contact("ada.lovelace@example.com"),
-        });
+        state
+            .borrow_mut()
+            .contacts_by_account
+            .get_mut(&AccountId("account_a".into()))
+            .unwrap()
+            .contacts
+            .push(lookout_dav::ContactRecord {
+                href: "/a/ada.vcf".into(),
+                etag: None,
+                card: test_contact("ada.lovelace@example.com"),
+            });
         let (preferred_id, _) = find_contact_by_address(&state, "ada.lovelace@example.com", Some(&AccountId("account_a".into()))).expect("found");
         assert_eq!(preferred_id, AccountId("account_a".into()));
         // No address book has the address - nothing found.
@@ -14775,7 +14805,11 @@ mod tests {
         let handled = handle_message_drag_drop(&state, &target, &value);
         assert!(handled, "a well-formed payload must be claimed by the folder's drop target");
         match cmd_rx.try_recv() {
-            Ok(AccountCommand::MoveMessagesTo { mailbox, uids, target: got_target }) => {
+            Ok(AccountCommand::MoveMessagesTo {
+                mailbox,
+                uids,
+                target: got_target,
+            }) => {
                 assert_eq!(mailbox, MailboxId("acc:INBOX".into()));
                 assert_eq!(uids, vec![Uid(7), Uid(9)], "the other account's message is refused");
                 assert_eq!(got_target, MailboxId("acc:Archive".into()));
@@ -14796,7 +14830,10 @@ mod tests {
         let target = test_mailbox(&acc, "Archive", 0);
 
         assert!(!handle_message_drag_drop(&state, &target, &glib::Value::from("hello")), "a text drop is not our payload");
-        assert!(!handle_message_drag_drop(&state, &target, &glib::Value::from(glib::Bytes::from_static(b"not json"))), "junk bytes are not our payload");
+        assert!(
+            !handle_message_drag_drop(&state, &target, &glib::Value::from(glib::Bytes::from_static(b"not json"))),
+            "junk bytes are not our payload"
+        );
     }
 
     /// The tag rows' drop side applies the tag to every dragged message of

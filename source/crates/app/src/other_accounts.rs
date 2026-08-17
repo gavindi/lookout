@@ -99,9 +99,7 @@ fn keyring_error(e: secret_service::Error) -> String {
         secret_service::Error::Unavailable => {
             "No GNOME keyring is available - start the keyring service (e.g. install and run gnome-keyring) to store account passwords.".to_string()
         }
-        secret_service::Error::NoResult => {
-            "The keyring has no default collection - create one (for example with Seahorse) to store account passwords.".to_string()
-        }
+        secret_service::Error::NoResult => "The keyring has no default collection - create one (for example with Seahorse) to store account passwords.".to_string(),
         secret_service::Error::Prompt => "The keyring unlock prompt was dismissed.".to_string(),
         secret_service::Error::Locked => "The keyring is locked - unlock it to access stored passwords.".to_string(),
         other => format!("Keyring error: {other}"),
@@ -317,7 +315,11 @@ pub fn show_add_account_dialog(
     row += 1;
 
     let same_password_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).hexpand(true).build();
-    let same_password_label = gtk::Label::builder().label("Use the same password for sending").hexpand(true).halign(gtk::Align::Start).build();
+    let same_password_label = gtk::Label::builder()
+        .label("Use the same password for sending")
+        .hexpand(true)
+        .halign(gtk::Align::Start)
+        .build();
     same_password_row.append(&same_password_label);
     same_password_row.append(&same_password_switch);
     form.attach(&same_password_row, 1, row, 3, 1);
@@ -375,7 +377,10 @@ pub fn show_add_account_dialog(
         .margin_end(12)
         .build();
     let cancel_button = gtk::Button::builder().label("Cancel").build();
-    let save_button = gtk::Button::builder().label(if is_edit { "Save" } else { "Add account" }).css_classes(["suggested-action"]).build();
+    let save_button = gtk::Button::builder()
+        .label(if is_edit { "Save" } else { "Add account" })
+        .css_classes(["suggested-action"])
+        .build();
     footer.append(&cancel_button);
     footer.append(&save_button);
 
@@ -408,10 +413,18 @@ pub fn show_add_account_dialog(
             let same_server = same_server_switch.is_active();
             let smtp_host = if same_server { imap_host.clone() } else { smtp_host_entry.text().trim().to_string() };
             let smtp_port = smtp_port_spin.value_as_int().clamp(1, 65535) as u16;
-            let smtp_username = if same_server { imap_username.clone() } else { smtp_username_entry.text().trim().to_string() };
+            let smtp_username = if same_server {
+                imap_username.clone()
+            } else {
+                smtp_username_entry.text().trim().to_string()
+            };
             let use_same_password = same_password_switch.is_active();
             let imap_password = imap_password_entry.text().to_string();
-            let smtp_password = if use_same_password { imap_password.clone() } else { smtp_password_entry.text().to_string() };
+            let smtp_password = if use_same_password {
+                imap_password.clone()
+            } else {
+                smtp_password_entry.text().to_string()
+            };
 
             // -- validate --
             let mut problems: Vec<String> = Vec::new();
@@ -486,8 +499,10 @@ pub fn show_add_account_dialog(
             let account_for_worker = account.clone();
             let (result_tx, result_rx) = async_channel::bounded(1);
             let account_id = account.id.clone();
-            let secrets: (Option<String>, Option<String>) =
-                (if imap_password.is_empty() { None } else { Some(imap_password) }, if smtp_password.is_empty() { None } else { Some(smtp_password) });
+            let secrets: (Option<String>, Option<String>) = (
+                if imap_password.is_empty() { None } else { Some(imap_password) },
+                if smtp_password.is_empty() { None } else { Some(smtp_password) },
+            );
             worker.spawn(async move {
                 let result = async {
                     if let Some(password) = &secrets.0 {
@@ -572,10 +587,7 @@ mod tests {
         }
 
         async fn store_password(&self, account_id: &AccountId, protocol: &str, password: &str) -> Result<(), String> {
-            self.secrets
-                .lock()
-                .unwrap()
-                .insert((account_id.0.clone(), protocol.to_string()), password.to_string());
+            self.secrets.lock().unwrap().insert((account_id.0.clone(), protocol.to_string()), password.to_string());
             Ok(())
         }
 

@@ -223,13 +223,7 @@ pub struct ConfigView {
 /// `groups` (in order), registered on `stack` under `name`. `sections`
 /// collects the `(label, name)` pair so the sidebar list can be built once
 /// every section has been registered.
-fn add_section(
-    stack: &gtk::Stack,
-    sections: &mut Vec<(&'static str, &'static str)>,
-    label: &'static str,
-    name: &'static str,
-    groups: &[&adw::PreferencesGroup],
-) {
+fn add_section(stack: &gtk::Stack, sections: &mut Vec<(&'static str, &'static str)>, label: &'static str, name: &'static str, groups: &[&adw::PreferencesGroup]) {
     let section_page = adw::PreferencesPage::new();
     section_page.set_vexpand(true);
     for group in groups {
@@ -506,7 +500,10 @@ pub fn build() -> ConfigView {
     add_section(&section_stack, &mut sections, "Apps", "apps", &[&google_tasks_group]);
     add_section(&section_stack, &mut sections, "Advanced", "advanced", &[&advanced_group]);
 
-    let section_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).css_classes(["navigation-sidebar"]).build();
+    let section_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .css_classes(["navigation-sidebar"])
+        .build();
     for (label, _) in &sections {
         let row_label = gtk::Label::builder().label(*label).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
         row_label.set_margin_start(12);
@@ -531,7 +528,11 @@ pub fn build() -> ConfigView {
         section_list.select_row(Some(&first_row));
     }
 
-    let section_scroller = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&section_list).build();
+    let section_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&section_list)
+        .build();
 
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)

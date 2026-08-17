@@ -442,11 +442,7 @@ pub fn show_new_contact_editor(window: &adw::ApplicationWindow, state: &Rc<RefCe
 /// scanning `preferred_account` first and the rest in display-name order.
 /// Returns the owning account and a [`ContactsListEntry`] the editor flows
 /// can act on; `None` when no contact has that address.
-pub fn find_contact_by_address(
-    state: &Rc<RefCell<UiState>>,
-    address: &str,
-    preferred_account: Option<&AccountId>,
-) -> Option<(AccountId, ContactsListEntry)> {
+pub fn find_contact_by_address(state: &Rc<RefCell<UiState>>, address: &str, preferred_account: Option<&AccountId>) -> Option<(AccountId, ContactsListEntry)> {
     let needle = address.trim().to_lowercase();
     if needle.is_empty() {
         return None;
@@ -545,14 +541,7 @@ pub fn show_create_contact_for(
         version: "4.0".to_string(),
         kind: None,
         uid: Some(uuid::Uuid::new_v4().to_string()),
-        full_name: Some(
-            sender
-                .name
-                .as_deref()
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or(&sender.address)
-                .to_string(),
-        ),
+        full_name: Some(sender.name.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or(&sender.address).to_string()),
         name: None,
         organization: None,
         title: None,

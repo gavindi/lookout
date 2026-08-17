@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.59 (2026-08-18)
+
+### Changed
+
+- **Mail**: joined UID sets are now chunked into server-safe command lines. Every `UID FETCH`/`STORE`/`MOVE`/`COPY` site used to join its UIDs into one comma-separated sequence set; the first sync of a big folder could render a line past a server's command-line cap (Dovecot's default `imap_max_line_length` is 64 KiB) and tear the connection down. A new `uid_set_chunks` helper sorts and dedups the set, range-compresses contiguous runs into `a:b` pairs (RFC 3501 §6.4.8), and flushes a chunk before it exceeds a 40 KiB budget - a dense folder's 100k UIDs collapse to one short `1:100000` command while a sparse set still splits into lines servers accept. It covers the new-arrival envelope fetch in `sync_mailbox` (which also now uses plain `1:*` when the cache was empty, i.e. the first sync or a UIDVALIDITY change - the same form the flag fetch already uses), the search-hits `UID FETCH`, the joined `STORE` flag batches, `MOVE`/`COPY`+`STORE` batches, the draft-replace purge, and the preview fetch; emptying a mailbox now flags via `UID STORE 1:*` instead of spelling out every UID. Semantics are unchanged - `.SILENT` stores, ordering, error propagation, and the cache batch contracts all behave as before.
+
+### Testing
+
+- `lookout-mail`: five new `uid_set_chunks` unit tests pin the chunker's contracts - sort/dedup/range-compression, sparse sets staying comma-joined, a 100k-UUID dense folder rendering as one `1:100000` chunk, oversized sparse sets splitting into chunks that stay under the byte budget and cover exactly the input, and empty input issuing no command.
+
 ## 0.9.58 (2026-08-18)
 
 ### Changed

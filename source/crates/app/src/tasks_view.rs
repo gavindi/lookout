@@ -232,7 +232,14 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
 /// overview pane hides it, leaving click-to-edit as the row's only action.
 /// `pub(crate)` for the Lookout dashboard, whose outstanding-tasks section
 /// reuses the same row.
-pub(crate) fn task_row(task: &CalendarTask, colors: &CalendarColorMap, toggle: ToggleHandler, activate: ActivateHandler, summary_classes: &[&str], show_check: bool) -> gtk::Button {
+pub(crate) fn task_row(
+    task: &CalendarTask,
+    colors: &CalendarColorMap,
+    toggle: ToggleHandler,
+    activate: ActivateHandler,
+    summary_classes: &[&str],
+    show_check: bool,
+) -> gtk::Button {
     let task = task.clone();
     let completed = task.status == TaskStatus::Completed || task.percent_complete == Some(100);
 

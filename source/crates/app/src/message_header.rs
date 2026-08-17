@@ -108,7 +108,11 @@ pub fn build() -> MessageHeader {
         // override is on, by the toggle handler in `window.rs`. The moon list
         // trails off into the sun so an icon theme with no moon glyph still
         // gets something real rather than a missing-image box.
-        .icon_name(crate::window::themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"]))
+        .icon_name(crate::window::themed_icon_name(&[
+            "weather-clear-night-symbolic",
+            "night-light-symbolic",
+            "weather-clear-symbolic",
+        ]))
         .css_classes(["flat"])
         // The tooltip names what the button *does* when clicked, so it flips
         // with the toggle's state: off reads "View in Dark Mode" (clicking
@@ -119,7 +123,11 @@ pub fn build() -> MessageHeader {
         .tooltip_text("View in Dark Mode")
         .build();
     let contact_button = gtk::Button::builder()
-        .icon_name(crate::window::themed_icon_name(&["avatar-default-symbolic", "contact-new-symbolic", "system-users-symbolic"]))
+        .icon_name(crate::window::themed_icon_name(&[
+            "avatar-default-symbolic",
+            "contact-new-symbolic",
+            "system-users-symbolic",
+        ]))
         .css_classes(["flat"])
         .tooltip_text("View contact")
         .build();

@@ -70,6 +70,15 @@ const PREVIEW_FETCH_BYTES: u32 = 16384;
 /// enough to make progress across hundreds of messages.
 const PREFETCH_BATCH_SIZE: usize = 10;
 
+/// How many bytes of sequence-set syntax one `UID`-prefixed command line may
+/// carry before it is split into further commands. Servers cap command-line
+/// length - Dovecot's default `imap_max_line_length` is 64 KiB, and a line
+/// beyond it tears the connection down, which is exactly the failure this
+/// chunking exists to prevent. 40 KiB leaves room for the command prefix
+/// (`UID FETCH ... (query)`) and for servers with tighter limits, while a
+/// dense 7-digit UID space still packs ~5k uids per chunk.
+const UID_SET_BYTE_BUDGET: usize = 40 * 1024;
+
 /// Tracks progress of the background body prefetch across all mailboxes.
 struct PrefetchState {
     /// Mailbox IDs to prefetch, in processing order. INBOX is typically first.
@@ -1850,11 +1859,40 @@ async fn connect_and_run(
     }
 }
 
-/// Joins a UID set into the comma-separated sequence-set syntax IMAP's
-/// `UID`-prefixed commands accept in place of a single UID - a batch of N
-/// messages costs one `STORE`/`MOVE`/`COPY` round trip instead of N.
-fn join_uids(uids: &[Uid]) -> String {
-    uids.iter().map(|u| u.0.to_string()).collect::<Vec<_>>().join(",")
+/// Splits `uids` into one or more IMAP sequence-set strings (`1,3,5` or
+/// `1:5,9:12`) that are safe to put on a single command line. Sorts and
+/// dedups first (callers hand over `HashSet`-derived data), then range-
+/// compresses contiguous runs into `a:b` pairs (RFC 3501 §6.4.8) and flushes
+/// a chunk before its rendered length would exceed `UID_SET_BYTE_BUDGET` - so
+/// a dense big folder collapses to one short `1:<n>` command while a sparse
+/// UID space still chunks into lines servers will accept. Returns nothing
+/// for an empty input; callers loop over zero chunks and send no command.
+fn uid_set_chunks(uids: &[Uid]) -> Vec<String> {
+    let mut sorted: Vec<u32> = uids.iter().map(|u| u.0).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut iter = sorted.into_iter().peekable();
+    while let Some(first) = iter.next() {
+        let mut run_end = first;
+        while iter.peek().is_some_and(|&next| next == run_end.saturating_add(1)) {
+            run_end = iter.next().expect("peeked value is present");
+        }
+        let token = if run_end > first { format!("{first}:{run_end}") } else { first.to_string() };
+        if !current.is_empty() && current.len() + token.len() + 1 > UID_SET_BYTE_BUDGET {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(',');
+        }
+        current.push_str(&token);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Issues `STORE +FLAGS.SILENT` / `STORE -FLAGS.SILENT` for raw flag atoms
@@ -1868,14 +1906,16 @@ fn join_uids(uids: &[Uid]) -> String {
 /// an empty side is skipped rather than sent as an empty flag list, which
 /// servers are entitled to reject.
 async fn store_raw_flags(session: &mut Session<ImapStream>, uids: &[Uid], add: &[String], remove: &[String]) -> Result<()> {
-    let uid_set = join_uids(uids);
+    let uid_chunks = uid_set_chunks(uids);
     for (op, flags) in [('+', add), ('-', remove)] {
         if flags.is_empty() {
             continue;
         }
         let list = flags.join(" ");
         let query = format!("{op}FLAGS.SILENT ({list})");
-        let _: Vec<_> = session.uid_store(uid_set.clone(), &query).await?.try_collect().await?;
+        for uid_set in &uid_chunks {
+            let _: Vec<_> = session.uid_store(uid_set, &query).await?.try_collect().await?;
+        }
     }
     Ok(())
 }
@@ -1921,12 +1961,18 @@ async fn move_message_to_role(session: &mut Session<ImapStream>, folders: &[Mail
 /// `\Deleted` + EXPUNGE. `has_move` comes from the single post-login
 /// `CAPABILITY` fetch, never a per-batch round trip.
 async fn move_uids_to_path(session: &mut Session<ImapStream>, uids: &[Uid], path: &str, has_move: bool) -> Result<()> {
-    let uid_set = join_uids(uids);
+    let uid_chunks = uid_set_chunks(uids);
     if has_move {
-        session.uid_mv(uid_set, path).await?;
+        for uid_set in &uid_chunks {
+            session.uid_mv(uid_set, path).await?;
+        }
     } else {
-        session.uid_copy(uid_set.clone(), path).await?;
-        let _: Vec<_> = session.uid_store(uid_set, "+FLAGS (\\Deleted)").await?.try_collect().await?;
+        for uid_set in &uid_chunks {
+            session.uid_copy(uid_set, path).await?;
+        }
+        for uid_set in &uid_chunks {
+            let _: Vec<_> = session.uid_store(uid_set, "+FLAGS (\\Deleted)").await?.try_collect().await?;
+        }
         // NB: expunges every \Deleted-flagged message in the currently
         // selected mailbox, not just this batch - a documented, accepted
         // simplification since nothing else in this crate ever sets \Deleted.
@@ -1942,7 +1988,13 @@ async fn move_uids_to_path(session: &mut Session<ImapStream>, uids: &[Uid], path
 /// the APPEND actually landed, so the caller can resync it - archiving is
 /// best-effort, but the resync must not run against a mailbox nothing was
 /// appended to.
-async fn send_message(config: &AccountConfig, credentials: &dyn CredentialProvider, session: &mut Session<ImapStream>, folders: &[Mailbox], msg: ComposedMessage) -> Result<Option<MailboxId>> {
+async fn send_message(
+    config: &AccountConfig,
+    credentials: &dyn CredentialProvider,
+    session: &mut Session<ImapStream>,
+    folders: &[Mailbox],
+    msg: ComposedMessage,
+) -> Result<Option<MailboxId>> {
     let (raw, _message_id, recipients) = build_raw_message(&msg);
 
     let smtp_credential = credentials.smtp_credential().await.map_err(Error::LoginFailed)?;
@@ -1983,8 +2035,10 @@ async fn empty_mailbox(session: &mut Session<ImapStream>) -> Result<u32> {
     if uids.is_empty() {
         return Ok(count);
     }
-    let uid_set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    // `UID STORE 1:*` covers the whole selected mailbox in one short command
+    // (RFC 3501 §6.4.8: `*` is the largest UID in use), where spelling out
+    // every uid could exceed the server's command-line limit on a big folder.
+    let _: Vec<_> = session.uid_store("1:*", "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
     let _: Vec<_> = session.expunge().await?.try_collect().await?;
     Ok(count)
 }
@@ -1996,12 +2050,13 @@ async fn empty_mailbox(session: &mut Session<ImapStream>) -> Result<u32> {
 /// from `move_message_to_role` applies, and is harmless here because this
 /// crate only ever sets `\Deleted` on the very uids it just flagged.
 async fn purge_by_message_id(session: &mut Session<ImapStream>, message_id: &str) -> Result<()> {
-    let uids = session.uid_search(format!("HEADER Message-Id <{message_id}>")).await?;
+    let uids: Vec<Uid> = session.uid_search(format!("HEADER Message-Id <{message_id}>")).await?.into_iter().map(Uid).collect();
     if uids.is_empty() {
         return Ok(());
     }
-    let uid_set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    for uid_set in &uid_set_chunks(&uids) {
+        let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    }
     let _: Vec<_> = session.expunge().await?.try_collect().await?;
     Ok(())
 }
@@ -2157,12 +2212,7 @@ fn status_count_query(condstore: bool) -> &'static str {
 /// `HIGHESTMODSEQ` (RFC 7162 §3.2.1: a CONDSTORE server MUST support it as
 /// a STATUS data item) - the STATUS drain is the one pass that touches every
 /// folder, so it's how folders that never get SELECTed still learn a modseq.
-async fn refresh_folder_counts(
-    session: &mut Session<ImapStream>,
-    folder: &mut Mailbox,
-    account_id: &AccountId,
-    condstore: bool,
-) -> bool {
+async fn refresh_folder_counts(session: &mut Session<ImapStream>, folder: &mut Mailbox, account_id: &AccountId, condstore: bool) -> bool {
     let Some(path) = folder.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
         return false;
     };
@@ -2304,15 +2354,19 @@ async fn search_mailbox(session: &mut Session<ImapStream>, account_id: &AccountI
         return Ok(Vec::new());
     }
     // A sorted UID set gives the fetch (and the summaries) a stable order
-    // rather than the HashSet's arbitrary iteration order.
-    let mut uid_list: Vec<u32> = uids.into_iter().collect();
-    uid_list.sort_unstable();
-    let uid_set = uid_list.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-    let fetches: Vec<_> = session
-        .uid_fetch(&uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
-        .await?
-        .try_collect()
-        .await?;
+    // rather than the HashSet's arbitrary iteration order; `uid_set_chunks`
+    // preserves it across the chunked `UID FETCH`es a large match needs.
+    let mut uid_list: Vec<Uid> = uids.into_iter().map(Uid).collect();
+    uid_list.sort_by_key(|u| u.0);
+    let mut fetches: Vec<_> = Vec::new();
+    for uid_set in &uid_set_chunks(&uid_list) {
+        let chunk: Vec<_> = session
+            .uid_fetch(uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
+            .await?
+            .try_collect()
+            .await?;
+        fetches.extend(chunk);
+    }
     let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox, f)).collect();
     let keys = lookout_core::thread::compute_thread_keys(&messages);
     for msg in &mut messages {
@@ -2391,11 +2445,7 @@ async fn sync_mailbox(
         // each message's modseq - the baseline can then advance without an
         // extra SELECT/STATUS round trip (see the folder update below).
         let bound = baseline.expect("delta requires a baseline, checked above");
-        session
-            .fetch("1:*", &format!("(UID FLAGS MODSEQ) (CHANGEDSINCE {bound})"))
-            .await?
-            .try_collect()
-            .await?
+        session.fetch("1:*", &format!("(UID FLAGS MODSEQ) (CHANGEDSINCE {bound})")).await?.try_collect().await?
     } else {
         session.fetch("1:*", "(UID FLAGS)").await?.try_collect().await?
     };
@@ -2448,12 +2498,30 @@ async fn sync_mailbox(
     // `has_attachment` without any body fetch - it's what lets opening a
     // message download only its text parts.
     if !new_uids.is_empty() {
-        let uid_set = new_uids.iter().map(|u| u.0.to_string()).collect::<Vec<_>>().join(",");
-        let fetches: Vec<_> = session
-            .uid_fetch(&uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
-            .await?
-            .try_collect()
-            .await?;
+        // An empty pre-sync cache means this is the folder's first sync (or a
+        // UIDVALIDITY change wiped everything cached), so the new set *is* the
+        // whole folder - `1:*` then covers it in one short command line where
+        // spelling out every uid could exceed the server's command-line limit
+        // (the same `1:*` the flag fetch above already uses). Otherwise the
+        // new arrivals are chunked into server-safe sequence-set lines.
+        let fetches: Vec<_> = if cached.is_empty() {
+            session
+                .uid_fetch("1:*", "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
+                .await?
+                .try_collect()
+                .await?
+        } else {
+            let mut fetches = Vec::new();
+            for uid_set in &uid_set_chunks(&new_uids) {
+                let chunk: Vec<_> = session
+                    .uid_fetch(uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
+                    .await?
+                    .try_collect()
+                    .await?;
+                fetches.extend(chunk);
+            }
+            fetches
+        };
         let mut new_messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox_id, f)).collect();
 
         // A Sent folder is never supposed to carry unread mail, regardless of
@@ -2688,9 +2756,12 @@ async fn fetch_previews(
     wanted.sort_by_key(|uid| std::cmp::Reverse(uid.0));
     wanted.truncate(PREVIEW_FETCH_LIMIT);
 
-    let uid_set = wanted.iter().map(|u| u.0.to_string()).collect::<Vec<_>>().join(",");
     let query = format!("(UID BODY.PEEK[]<0.{PREVIEW_FETCH_BYTES}>)");
-    let fetches: Vec<_> = session.uid_fetch(&uid_set, &query).await?.try_collect().await?;
+    let mut fetches: Vec<_> = Vec::new();
+    for uid_set in &uid_set_chunks(&wanted) {
+        let chunk: Vec<_> = session.uid_fetch(uid_set, &query).await?.try_collect().await?;
+        fetches.extend(chunk);
+    }
 
     let mut previews = std::collections::HashMap::new();
     for fetch in &fetches {
@@ -3032,10 +3103,51 @@ mod tests {
 
     #[test]
     fn status_query_asks_for_modseq_only_on_condstore_connections() {
-        assert_eq!(
-            status_count_query(true),
-            "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)"
-        );
+        assert_eq!(status_count_query(true), "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY HIGHESTMODSEQ)");
         assert_eq!(status_count_query(false), "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY)");
+    }
+
+    #[test]
+    fn uid_set_chunks_sorts_dedups_and_compresses_contiguous_runs() {
+        let chunks = uid_set_chunks(&[Uid(3), Uid(1), Uid(2), Uid(2), Uid(7), Uid(5), Uid(6)]);
+        assert_eq!(chunks, vec!["1:3,5:7"]);
+    }
+
+    #[test]
+    fn uid_set_chunks_sparse_uids_stay_comma_joined() {
+        assert_eq!(uid_set_chunks(&[Uid(1), Uid(3), Uid(5)]), vec!["1,3,5"]);
+    }
+
+    #[test]
+    fn uid_set_chunks_a_dense_big_folder_is_one_short_line() {
+        // 100k contiguous uids must compress to a single tiny sequence set,
+        // not 100k comma-joined numbers on one doomed command line.
+        let uids: Vec<Uid> = (1..=100_000).map(Uid).collect();
+        assert_eq!(uid_set_chunks(&uids), vec!["1:100000"]);
+    }
+
+    #[test]
+    fn uid_set_chunks_splits_oversized_sparse_sets_below_the_byte_budget() {
+        // 9-digit uids every other number: no run compresses, and 5000 of
+        // them render past `UID_SET_BYTE_BUDGET`, so the set must split into
+        // multiple lines, each under the budget and together covering exactly
+        // the input.
+        let uids: Vec<Uid> = (0..5000).map(|i| Uid(10_000_001 + i * 2)).collect();
+        let chunks = uid_set_chunks(&uids);
+        assert!(chunks.len() > 1, "expected the set to split, got {} chunk(s)", chunks.len());
+        for chunk in &chunks {
+            assert!(chunk.len() <= UID_SET_BYTE_BUDGET, "chunk of {} bytes exceeds the budget", chunk.len());
+            for part in chunk.split(',') {
+                let parsed: u32 = part.parse().unwrap_or_else(|_| panic!("chunk holds a non-UID token: {part:?}"));
+                assert_eq!(parsed % 2, 1, "chunk lost a uid or gained one: {parsed}");
+            }
+        }
+        let union: Vec<u32> = chunks.iter().flat_map(|chunk| chunk.split(',')).map(|part| part.parse().unwrap()).collect();
+        assert_eq!(union, uids.iter().map(|u| u.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn uid_set_chunks_empty_input_sends_no_command() {
+        assert!(uid_set_chunks(&[]).is_empty());
     }
 }
