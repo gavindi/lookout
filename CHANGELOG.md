@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.64 (2026-08-18)
+
+### Fixed
+
+- **Mail**: inline `cid:` images that failed to load with "the server didn't return this attachment's part - it may no longer exist" are now recovered when the parts still exist. The reading pane's `cid:` requests and the attachment strip fetch parts by the `BODYSTRUCTURE`-derived part number stored in the message's body/summary cache, and a server answering `BODY.PEEK[<part>]` with no section means that structure went stale - the message was rewritten server-side (mailing-list/gateway/antivirus rewraps, provider proxies) after its body or summary was cached, so the parts are still there but no longer at the remembered section paths. `FetchAttachment` now falls back, before answering the UI with a failure, to a whole-message fetch (serving the raw-message cache when one is already stored) and re-derives the part from the message's actual bytes - matched by `Content-ID` for inline images (a cid survives a re-wrap), else by filename, else by content type - so a re-wrapped message's images and attachments render again instead of drawing broken placeholders. Re-derived bytes are cached under the original part number, so re-opening the same cached body is a plain cache hit. A part that genuinely isn't in the message still answers `PartFetchFailed` with the toast exactly as before.
+
+### Testing
+
+- `lookout-mail`: four new `find_part_in_raw` tests pin the re-derive's contracts - a cid part with a stale part number is re-found in the raw message and returned transfer-decoded, angle-bracketed Content-IDs match (the `cid_matches` ladder), a non-cid attachment is re-found by filename, and a part genuinely absent from the message answers `None`.
+
 ## 0.9.63 (2026-08-18)
 
 ### Changed

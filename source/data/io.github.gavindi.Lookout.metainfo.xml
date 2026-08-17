@@ -21,6 +21,41 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.64" date="2026-08-18">
+      <description>
+        <p>Inline cid: images that failed with &quot;the server didn't return this attachment's part&quot; now recover when the parts still exist. A part structure can go stale when a message is rewritten server-side after its body or summary was cached (mailing-list/gateway rewraps), so FetchAttachment now falls back to fetching the whole message and re-derives the part from the message's actual bytes - matched by Content-ID for inline images, else filename, else content type - and re-wrapped messages render their images and attachments again instead of broken placeholders. Parts genuinely gone still answer with the error toast, exactly as before.</p>
+      </description>
+    </release>
+    <release version="0.9.63" date="2026-08-18">
+      <description>
+        <p>The background body prefetch now downloads a whole batch of message bodies in one UID FETCH round trip instead of one per message - the query's part list is the union of the batch's text/calendar sections, each response is matched back to its message by UID, and the per-message cache checks and writes are batched too. A message the batch carries no text part for still degrades to the per-message whole-message fallback.</p>
+      </description>
+    </release>
+    <release version="0.9.62" date="2026-08-18">
+      <description>
+        <p>Folder counts now arrive with the folder list in one round trip on servers that support LIST-STATUS (RFC 5819): every folder's sidebar count - and its uidvalidity/uidnext, normally only learnable per-SELECT - is known the instant the list lands, instead of ~1 STATUS round trip per folder. Servers without the capability fall back to the plain LIST plus the STATUS drain exactly as before.</p>
+      </description>
+    </release>
+    <release version="0.9.61" date="2026-08-18">
+      <description>
+        <p>Every cache operation in the IMAP session now runs on tokio's blocking thread pool instead of the session's async worker, so a multi-second whole-folder write no longer stalls that account's actor (IDLE waits, command replies) or holds the shared worker against every other account's session. The one-time search-index backfill also no longer sits between startup and the first connection attempt - it now runs concurrently with the connect.</p>
+      </description>
+    </release>
+    <release version="0.9.60" date="2026-08-18">
+      <description>
+        <p>Every account/session event channel is now bounded (64 events) instead of unbounded, and each UI event loop drains its channel in batches, collapsing whole-snapshot events into the last copy of each - the startup burst no longer rebuilds the same surfaces once per queued copy, while non-snapshot events (new-mail notifications, body/part fetches, move/flag failures) are never dropped. The message list's &quot;nothing changed&quot; check is now allocation-free too.</p>
+      </description>
+    </release>
+    <release version="0.9.59" date="2026-08-18">
+      <description>
+        <p>Joined UID sets are now chunked into server-safe command lines: every UID FETCH/STORE/MOVE/COPY set is sorted, deduped, range-compressed (a dense folder's 100k UIDs collapse to one short 1:100000 command), and flushed before it exceeds a 40 KiB budget, so the first sync of a big folder can no longer tear the connection down with an over-long command line.</p>
+      </description>
+    </release>
+    <release version="0.9.58" date="2026-08-18">
+      <description>
+        <p>On CONDSTORE connections an IDLE wake no longer re-fetches the whole mailbox's flags: the steady-state sync issues a CHANGEDSINCE delta fetch - O(changed) instead of O(mailbox) - plus a UID SEARCH ALL to catch expunged messages. The envelope cache's per-sync write is now a diff instead of a whole-table rewrite: an upsert that rewrites nothing when nothing changed, deleting only expunged UIDs, so full-body search text survives later flag-only resyncs.</p>
+      </description>
+    </release>
     <release version="0.9.57" date="2026-08-18">
       <description>
         <p>IMAP CONDSTORE is now enabled after login when the server advertises it, the first step of the incremental-sync roadmap: the per-mailbox highest-modseq baseline is captured from every SELECT (including the background prefetch, which selects most folders first) and from the STATUS count drain, survives re-lists, and is persisted in the cache - ready for CHANGEDSINCE delta fetches that will replace full-mailbox re-fetches on IDLE wakes. Servers without CONDSTORE are unaffected and keep syncing fully.</p>

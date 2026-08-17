@@ -1016,19 +1016,42 @@ async fn connect_and_run(
                         Ok(Some(bytes)) => Some(bytes),
                         // `None` means the server didn't return the requested
                         // section - a part number that doesn't match the
-                        // server's view of the message.
-                        Ok(None) => {
-                            tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: server returned no such section");
-                            let _ = events
-                                .send(AccountEvent::PartFetchFailed {
-                                    mailbox: mailbox.clone(),
-                                    uid,
-                                    part_number: part.part_number.clone(),
-                                    message: "the server didn't return this attachment's part - it may no longer exist".to_string(),
-                                })
-                                .await;
-                            None
-                        }
+                        // server's view of the message. That's usually a
+                        // structure that went stale after the message was
+                        // rewritten server-side (mailing-list/gateway/proxy
+                        // rewrites after the body or summary was cached): the
+                        // part is still there, just not at the old section
+                        // path. Re-derive it from the whole message before
+                        // giving up.
+                        Ok(None) => match fetch_stale_part_fallback(cache, &mut session, &mailbox, uid, uidvalidity, &part).await {
+                            Ok(Some(bytes)) => Some(bytes),
+                            // The re-derive found no such part either - the
+                            // part genuinely no longer exists.
+                            Ok(None) => {
+                                tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: server returned no such section");
+                                let _ = events
+                                    .send(AccountEvent::PartFetchFailed {
+                                        mailbox: mailbox.clone(),
+                                        uid,
+                                        part_number: part.part_number.clone(),
+                                        message: "the server didn't return this attachment's part - it may no longer exist".to_string(),
+                                    })
+                                    .await;
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: stale-structure fallback failed: {e}");
+                                let _ = events
+                                    .send(AccountEvent::PartFetchFailed {
+                                        mailbox: mailbox.clone(),
+                                        uid,
+                                        part_number: part.part_number.clone(),
+                                        message: format!("couldn't fetch this attachment: {e}"),
+                                    })
+                                    .await;
+                                None
+                            }
+                        },
                         Err(e) => {
                             tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: fetch failed: {e}");
                             let _ = events
@@ -3446,8 +3469,7 @@ async fn fetch_bodies_batch(
 /// via `transfer_part_bytes`). An embedded `message/rfc822` attachment is
 /// returned whole, not re-parsed. Returns `None` if the server didn't return
 /// the section (rather than erroring), so the caller can no-op gracefully.
-async fn fetch_attachment_part(session: &mut Session<ImapStream>, uid: Uid, part: &BodyPart) -> Result<Option<Vec<u8>>> {
-    // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part` the
+async fn fetch_attachment_part(session: &mut Session<ImapStream>, uid: Uid, part: &BodyPart) -> Result<Option<Vec<u8>>> {    // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part` the
     // server's response carries, exactly as `fetch_body_partial` relies on.
     let path = part_section_path(&part.part_number);
     let query = format!("(BODY.PEEK[{}])", part.part_number);
@@ -3459,6 +3481,34 @@ async fn fetch_attachment_part(session: &mut Session<ImapStream>, uid: Uid, part
         return Ok(None);
     };
     Ok(Some(crate::body::transfer_part_bytes(part, bytes)))
+}
+
+/// Fallback for an attachment part whose section no longer exists on the
+/// server: fetch the whole message (serving the raw-message cache when one
+/// is already stored) and re-derive the part from its actual bytes via
+/// `find_part_in_raw`, which matches by `cid` (inline images), filename, or
+/// content type instead of the stale section path. A part structure can go
+/// stale when the message is rewritten server-side after its body or
+/// summary was cached (mailing-list/gateway/proxy rewrites) - the part is
+/// still there, just not at the `BODY[<n>]` path the cache remembers.
+/// Returns `Ok(None)` when the part genuinely can't be found, which the
+/// caller reports as a missing part.
+async fn fetch_stale_part_fallback(
+    cache: &CacheHandle,
+    session: &mut Session<ImapStream>,
+    mailbox: &MailboxId,
+    uid: Uid,
+    uidvalidity: UidValidity,
+    part: &BodyPart,
+) -> Result<Option<Vec<u8>>> {
+    let Some(raw) = fetch_raw_message_cached(cache, session, mailbox, uid, uidvalidity).await? else {
+        return Ok(None);
+    };
+    let Some(bytes) = crate::body::find_part_in_raw(&raw, part) else {
+        return Ok(None);
+    };
+    tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: stale part structure - re-derived the part from the whole message");
+    Ok(Some(bytes))
 }
 
 /// Resolves the body of `uid` in the currently SELECTed mailbox, serving a

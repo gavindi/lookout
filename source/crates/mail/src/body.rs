@@ -85,6 +85,34 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
     })
 }
 
+/// Finds the part of a raw RFC 5322 message that corresponds to a requested
+/// part whose `BODYSTRUCTURE`-derived part number went stale - the message
+/// was rewritten server-side after its body or summary was cached
+/// (mailing-list/gateway/proxy rewrites), so the cached structure's section
+/// paths no longer match the live message while the parts themselves are
+/// still there. Matches by `cid` when the request carries one (inline
+/// images: a Content-ID survives a re-wrap), else by filename, else by
+/// content type, and returns the part's transfer-decoded bytes - the same
+/// form `transfer_part_bytes` produces for a fresh section fetch. `None`
+/// when no part matches.
+pub fn find_part_in_raw(raw: &[u8], requested: &BodyPart) -> Option<Vec<u8>> {
+    let message = MessageParser::default().parse(raw)?;
+    let found = message.attachments().find(|part| match requested.cid.as_deref() {
+        Some(cid) => part.content_id().is_some_and(|candidate| lookout_core::cid_matches(cid, candidate)),
+        None => match requested.filename.as_deref() {
+            Some(name) => part.attachment_name().is_some_and(|candidate| candidate.eq_ignore_ascii_case(name)),
+            None => part.content_type().is_some_and(|candidate| {
+                let candidate_type = match candidate.subtype() {
+                    Some(sub) => format!("{}/{}", candidate.ctype(), sub),
+                    None => candidate.ctype().to_string(),
+                };
+                candidate_type.eq_ignore_ascii_case(&requested.content_type)
+            }),
+        },
+    })?;
+    Some(found.contents().to_vec())
+}
+
 /// Dev-only helper for the debug ".eml viewer": rewrites every `cid:` image
 /// reference in `html` to a `data:` URI carrying the referenced part's
 /// already-transfer-decoded bytes from `raw`. The debug viewer has no
@@ -891,5 +919,51 @@ mod tests {
         // tolerated (mail_parser is deliberately lenient) rather than panic.
         assert!(parse_headers_section(b"").is_empty());
         let _ = parse_headers_section(b"\x00\x01\x02");
+    }
+
+    /// A stale structure's part number must not matter: the inline image is
+    /// re-found by its `Content-ID` (which survives a server-side re-wrap)
+    /// and returned transfer-decoded.
+    #[test]
+    fn find_part_in_raw_matches_a_stale_numbered_cid_part() {
+        let raw = fixture("html-cid-image.eml");
+        let mut part = text_part("9.9", "image/png", None, "base64");
+        part.cid = Some("logo123".to_string());
+        let bytes = find_part_in_raw(&raw, &part).expect("cid part re-found in the raw message");
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']), "decoded PNG magic, got: {bytes:?}");
+    }
+
+    /// The requested part's stored cid may be the `id@host` form of a raw
+    /// message whose Content-ID is written `<id@host>` - `cid_matches`
+    /// trims the angle brackets, so the re-derive must still hit.
+    #[test]
+    fn find_part_in_raw_tolerates_angle_bracketed_content_ids() {
+        let raw = fixture("html-cid-image.eml");
+        let mut part = text_part("2", "image/png", None, "base64");
+        part.cid = Some("<logo123>".to_string());
+        assert!(find_part_in_raw(&raw, &part).is_some());
+    }
+
+    /// A non-cid attachment (a user-clicked strip item) is re-found by its
+    /// filename when the structure went stale.
+    #[test]
+    fn find_part_in_raw_matches_a_stale_numbered_named_attachment() {
+        let raw = fixture("with-attachment.eml");
+        let mut pdf = text_part("7", "application/pdf", None, "base64");
+        pdf.filename = Some("doc.pdf".to_string());
+        let bytes = find_part_in_raw(&raw, &pdf).expect("named part re-found in the raw message");
+        assert!(bytes.starts_with(b"%PDF-"), "decoded pdf bytes, got: {bytes:?}");
+    }
+
+    /// A part that genuinely isn't in the message answers `None` - the
+    /// caller then reports it as missing rather than serving a wrong part.
+    #[test]
+    fn find_part_in_raw_returns_none_for_a_foreign_part() {
+        let raw = fixture("html-cid-image.eml");
+        let part = text_part("3", "image/gif", None, "base64");
+        assert!(find_part_in_raw(&raw, &part).is_none());
+        let mut wrong_cid = text_part("2", "image/png", None, "base64");
+        wrong_cid.cid = Some("some-other-id".to_string());
+        assert!(find_part_in_raw(&raw, &wrong_cid).is_none());
     }
 }
