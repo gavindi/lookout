@@ -196,6 +196,13 @@ fn body_index_text(body: &EmailBody) -> Option<String> {
     let html = body.html_body.as_deref().unwrap_or("");
     let mut out = String::with_capacity(text.len() + html.len());
     out.push_str(text);
+    // Size check before the expensive HTML strip: `strip_html_for_index`
+    // parses the whole markup, and a body whose plain-text part alone is
+    // already over the limit could never produce an index row - the text is
+    // always included verbatim, so the result would exceed the limit too.
+    if out.len() > FULL_BODY_INDEX_BYTES {
+        return None;
+    }
     if !html.is_empty() {
         out.push(' ');
         out.push_str(&crate::body::strip_html_for_index(html));
@@ -299,6 +306,13 @@ impl Cache {
         // so this also upgrades databases created before it was set.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // `synchronous=FULL` (the default) fsyncs on every autocommit
+        // commit, and this file is rewritten wholesale by every mailbox sync.
+        // The data is disposable - it's rebuilt from the server - so NORMAL
+        // (sync only at WAL checkpoints, not per commit) is the right
+        // durability point: a crash loses at worst the last sync's window,
+        // which the next sync repopulates anyway.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS mailboxes (

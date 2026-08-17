@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.55" date="2026-08-17">
+      <description>
+        <p>An optimisation pass over the IMAP pipeline, SQLite cache, and UI hot paths. IDLE wakes no longer re-SELECT the open folder or run a post-sync STATUS - the sync skips both when the session is already on that folder and derives the sidebar counts from the flags it just fetched. Server capabilities are read once after login instead of once per move batch. The mail cache runs with synchronous=NORMAL (the data is disposable and rebuilt from the server) and the calendar cache gains WAL plus a busy timeout. Search indexing skips the HTML strip for over-limit bodies, the reading pane's remote-content scan is cached per render, and the vendored imap-proto parser drops per-part-path Vec shifts, format!-and-to_string command-building temps, and complete-mode parsers that failed responses split across TCP segments - while a METADATA value with non-UTF-8 bytes now yields a parse error instead of a client crash.</p>
+      </description>
+    </release>
     <release version="0.9.54" date="2026-08-17">
       <description>
         <p>Links in the email reading pane now open in the system's default browser instead of doing nothing - plain links and target=&quot;_blank&quot; links alike (the latter were previously dropped as new-window requests), while the message body stays on screen. Only http/https go external; mailto: links remain blocked for now. Also silences the &quot;Not loading module atk-bridge&quot; console warning: GTK3-era accessibility modules are stripped from GTK_MODULES at startup, since GTK4 ships AT-SPI support natively.</p>

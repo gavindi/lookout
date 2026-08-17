@@ -11,8 +11,8 @@ use std::{borrow::Cow, collections::HashMap};
 
 use nom::{
     branch::alt,
-    bytes::complete::tag_no_case,
-    character::complete::{char, space0, space1},
+    bytes::streaming::tag_no_case,
+    character::streaming::{char, space0, space1},
     combinator::map,
     multi::many0,
     sequence::{preceded, separated_pair, tuple},

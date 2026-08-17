@@ -115,14 +115,24 @@ fn check_entry_name(i: &[u8]) -> IResult<&[u8], &[u8]> {
     }
 }
 
-fn entry_name(i: &[u8]) -> IResult<&[u8], &[u8]> {
+fn entry_name(i: &[u8]) -> IResult<&[u8], &str> {
     let astring_res = astring(i)?;
     check_entry_name(astring_res.1)?;
-    Ok(astring_res)
+    Ok((astring_res.0, to_utf8(astring_res.1)?))
 }
 
-fn slice_to_str(i: &[u8]) -> &str {
-    std::str::from_utf8(i).unwrap()
+/// UTF-8 validation with a parse error instead of a panic: quoted strings and
+/// literals in METADATA values may contain arbitrary bytes, and the previous
+/// `slice_to_str().unwrap()` turned a non-UTF-8 server response into a client
+/// crash. The error kind is `Verify` because the bytes may be valid data that
+/// simply isn't UTF-8, not a malformed response.
+fn to_utf8(i: &[u8]) -> Result<&str, nom::Err<nom::error::Error<&[u8]>>> {
+    std::str::from_utf8(i).map_err(|e| {
+        nom::Err::Error(nom::error::Error::new(
+            &i[..e.valid_up_to()],
+            nom::error::ErrorKind::Verify,
+        ))
+    })
 }
 
 fn nil_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
@@ -130,18 +140,13 @@ fn nil_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
 }
 
 fn string_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
-    map(alt((quoted, literal)), |s| {
-        Some(slice_to_str(s).to_string())
-    })(i)
+    let (rest, s) = alt((quoted, literal))(i)?;
+    Ok((rest, Some(to_utf8(s)?.to_string())))
 }
 
 fn keyval_list(i: &[u8]) -> IResult<&[u8], Vec<Metadata>> {
     parenthesized_nonempty_list(map(
-        tuple((
-            map(entry_name, slice_to_str),
-            tag(" "),
-            alt((nil_value, string_value)),
-        )),
+        tuple((entry_name, tag(" "), alt((nil_value, string_value)))),
         |(key, _, value)| Metadata {
             entry: key.to_string(),
             value,
@@ -150,7 +155,7 @@ fn keyval_list(i: &[u8]) -> IResult<&[u8], Vec<Metadata>> {
 }
 
 fn entry_list(i: &[u8]) -> IResult<&[u8], Vec<Cow<'_, str>>> {
-    separated_list0(tag(" "), map(map(entry_name, slice_to_str), Cow::Borrowed))(i)
+    separated_list0(tag(" "), map(entry_name, Cow::Borrowed))(i)
 }
 
 fn metadata_common(i: &[u8]) -> IResult<&[u8], &[u8]> {
@@ -164,7 +169,7 @@ pub(crate) fn metadata_solicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     Ok((
         i,
         Response::MailboxData(MailboxDatum::MetadataSolicited {
-            mailbox: Cow::Borrowed(slice_to_str(mailbox)),
+            mailbox: Cow::Borrowed(to_utf8(mailbox)?),
             values,
         }),
     ))
@@ -176,7 +181,7 @@ pub(crate) fn metadata_unsolicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     Ok((
         i,
         Response::MailboxData(MailboxDatum::MetadataUnsolicited {
-            mailbox: Cow::Borrowed(slice_to_str(mailbox)),
+            mailbox: Cow::Borrowed(to_utf8(mailbox)?),
             values,
         }),
     ))

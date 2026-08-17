@@ -1,6 +1,5 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::{RangeFrom, RangeInclusive};
 use std::str;
@@ -27,7 +26,9 @@ impl CommandBuilder {
     }
 
     pub fn examine(mailbox: &str) -> SelectCommand<select::NoParams> {
-        let args = format!("EXAMINE \"{}\"", quoted_string(mailbox).unwrap()).into_bytes();
+        let mut args = b"EXAMINE \"".to_vec();
+        push_quoted(&mut args, mailbox).expect("mailbox name must not contain CR or LF");
+        args.push(b'"');
         SelectCommand {
             args,
             state: PhantomData,
@@ -42,12 +43,11 @@ impl CommandBuilder {
     }
 
     pub fn list(reference: &str, glob: &str) -> Command {
-        let args = format!(
-            "LIST \"{}\" \"{}\"",
-            quoted_string(reference).unwrap(),
-            quoted_string(glob).unwrap()
-        )
-        .into_bytes();
+        let mut args = b"LIST \"".to_vec();
+        push_quoted(&mut args, reference).expect("reference must not contain CR or LF");
+        args.extend(b"\" \"");
+        push_quoted(&mut args, glob).expect("glob must not contain CR or LF");
+        args.push(b'"');
         Command {
             args,
             next_state: None,
@@ -55,12 +55,11 @@ impl CommandBuilder {
     }
 
     pub fn login(user_name: &str, password: &str) -> Command {
-        let args = format!(
-            "LOGIN \"{}\" \"{}\"",
-            quoted_string(user_name).unwrap(),
-            quoted_string(password).unwrap()
-        )
-        .into_bytes();
+        let mut args = b"LOGIN \"".to_vec();
+        push_quoted(&mut args, user_name).expect("user name must not contain CR or LF");
+        args.extend(b"\" \"");
+        push_quoted(&mut args, password).expect("password must not contain CR or LF");
+        args.push(b'"');
         Command {
             args,
             next_state: Some(State::Authenticated),
@@ -68,7 +67,9 @@ impl CommandBuilder {
     }
 
     pub fn select(mailbox: &str) -> SelectCommand<select::NoParams> {
-        let args = format!("SELECT \"{}\"", quoted_string(mailbox).unwrap()).into_bytes();
+        let mut args = b"SELECT \"".to_vec();
+        push_quoted(&mut args, mailbox).expect("mailbox name must not contain CR or LF");
+        args.push(b'"');
         SelectCommand {
             args,
             state: PhantomData,
@@ -212,17 +213,17 @@ impl FetchCommand<fetch::Messages> {
 }
 
 fn sequence_num(cmd: &mut Vec<u8>, num: u32) {
-    cmd.extend(num.to_string().as_bytes());
+    push_decimal(cmd, num);
 }
 
 fn sequence_range(cmd: &mut Vec<u8>, range: RangeInclusive<u32>) {
-    cmd.extend(range.start().to_string().as_bytes());
+    push_decimal(cmd, *range.start());
     cmd.push(b':');
-    cmd.extend(range.end().to_string().as_bytes());
+    push_decimal(cmd, *range.end());
 }
 
 fn range_from(cmd: &mut Vec<u8>, range: RangeFrom<u32>) {
-    cmd.extend(range.start.to_string().as_bytes());
+    push_decimal(cmd, range.start);
     cmd.extend(b":*");
 }
 
@@ -291,13 +292,34 @@ impl FetchCommand<fetch::Modifiers> {
 
 fn changed_since(cmd: &mut Vec<u8>, seq: u64) {
     cmd.extend(b" (CHANGEDSINCE ");
-    cmd.extend(seq.to_string().as_bytes());
+    push_decimal(cmd, seq);
     cmd.push(b')');
 }
 
-/// Returns an escaped string if necessary for use as a "quoted" string per
-/// the IMAPv4 RFC. Return value does not include surrounding quote characters.
-/// Will return Err if the argument contains illegal characters.
+/// Appends `num`'s decimal representation to `cmd` without a temporary
+/// `String` allocation (itoa-style). Builders call this once per sequence
+/// number in a joined UID/sequence set, where a folder's whole mailbox can
+/// mean thousands of numbers in one command line.
+fn push_decimal<T: Into<u64>>(cmd: &mut Vec<u8>, num: T) {
+    // Longest form is 20 digits (u64::MAX); writing backwards into the stack
+    // buffer avoids the reverse afterwards.
+    let mut num = num.into();
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (num % 10) as u8;
+        num /= 10;
+        if num == 0 {
+            break;
+        }
+    }
+    cmd.extend_from_slice(&buf[i..]);
+}
+
+/// Appends `s` to `cmd`, escaped for use as the *body* of a quoted string per
+/// the IMAPv4 RFC (the surrounding DQUOTEs are the caller's). Returns an
+/// error if the argument contains characters a quoted string can't carry.
 ///
 /// Relevant definitions from RFC 3501 formal syntax:
 ///
@@ -306,41 +328,25 @@ fn changed_since(cmd: &mut Vec<u8>, seq: u64) {
 /// QUOTED-CHAR = <any TEXT-CHAR except quoted-specials> / "\" quoted-specials
 /// quoted-specials = DQUOTE / "\"
 /// TEXT-CHAR = <any CHAR except CR and LF>
-fn quoted_string(s: &str) -> Result<Cow<'_, str>, &'static str> {
-    let bytes = s.as_bytes();
-    let (mut start, mut new) = (0, Vec::<u8>::new());
-    for (i, b) in bytes.iter().enumerate() {
-        match *b {
+fn push_quoted(cmd: &mut Vec<u8>, s: &str) -> Result<(), &'static str> {
+    for b in s.bytes() {
+        match b {
             b'\r' | b'\n' => {
                 return Err("CR and LF not allowed in quoted strings");
             }
             b'\\' | b'"' => {
-                if start < i {
-                    new.extend(&bytes[start..i]);
-                }
-                new.push(b'\\');
-                new.push(*b);
-                start = i + 1;
+                cmd.push(b'\\');
+                cmd.push(b);
             }
-            _ => {}
-        };
-    }
-    if start == 0 {
-        Ok(Cow::Borrowed(s))
-    } else {
-        if start < bytes.len() {
-            new.extend(&bytes[start..]);
+            _ => cmd.push(b),
         }
-        // Since the argument is a str, it must contain valid UTF-8. Since
-        // this function's transformation preserves the UTF-8 validity,
-        // unwrapping here should be okay.
-        Ok(Cow::Owned(String::from_utf8(new).unwrap()))
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{quoted_string, Attribute, Command, CommandBuilder};
+    use super::{push_quoted, Attribute, Command, CommandBuilder};
 
     #[test]
     fn login() {
@@ -383,10 +389,19 @@ mod tests {
 
     #[test]
     fn test_quoted_string() {
-        assert_eq!(quoted_string("a").unwrap(), "a");
-        assert_eq!(quoted_string("").unwrap(), "");
-        assert_eq!(quoted_string("a\"b\\c").unwrap(), "a\\\"b\\\\c");
-        assert_eq!(quoted_string("\"foo\\").unwrap(), "\\\"foo\\\\");
-        assert!(quoted_string("\n").is_err());
+        let mut buf = Vec::new();
+        push_quoted(&mut buf, "a").unwrap();
+        assert_eq!(buf, b"a");
+        buf.clear();
+        push_quoted(&mut buf, "").unwrap();
+        assert_eq!(buf, b"");
+        buf.clear();
+        push_quoted(&mut buf, "a\"b\\c").unwrap();
+        assert_eq!(buf, br#"a\"b\\c"#);
+        buf.clear();
+        push_quoted(&mut buf, "\"foo\\").unwrap();
+        assert_eq!(buf, br#"\"foo\\"#);
+        buf.clear();
+        assert!(push_quoted(&mut buf, "\n").is_err());
     }
 }

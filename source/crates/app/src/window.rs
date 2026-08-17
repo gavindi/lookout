@@ -673,6 +673,13 @@ pub(crate) struct UiState {
     /// stays on screen the banner must not come back. Cleared on every
     /// navigation, like `unsubscribe_dismissed`.
     trust_banner_dismissed: Option<(MailboxId, Uid)>,
+    /// The last `html_remote_content_scan` result, keyed by the message it
+    /// was computed for. The scan re-parses the rendered message's whole HTML
+    /// (`window.rs`'s trust banner), which is unchanged across re-renders of
+    /// the same message, so the banner block reuses the cached scan instead
+    /// of rescanning on every render. Only the current message is retained -
+    /// a single-slot cache, sized to what `render_body` actually re-visits.
+    rendered_remote_scan: Option<(MailboxId, Uid, lookout_core::RemoteContentScan)>,
     /// Relay to the currently-open composer for its draft-autosave
     /// confirmations: the account event loops forward `DraftSaved`
     /// Message-Ids here, and the composer flips its "Saving draft…" label to
@@ -1694,6 +1701,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         load_once_images: false,
         message_theme_override: false,
         trust_banner_dismissed: None,
+        rendered_remote_scan: None,
         draft_saved_tx: None,
         composer_identities_refresh: None,
         composer_relay_generation: 0,
@@ -13352,6 +13360,20 @@ fn render_body(
     // message (see the selection handler's `already_shown` guard) can be
     // recognized as a no-op instead of another crossfade.
     state.borrow_mut().rendered_message = Some((mailbox.clone(), uid));
+    // The trust banner's `html_remote_content_scan` re-parses the message's
+    // whole HTML, which is unchanged across re-renders of the same message
+    // (theme toggle, list repopulate keeping the selection). Compute it once
+    // per render into a single-slot cache keyed by this message; the banner
+    // block reads the cache instead of rescanning.
+    {
+        let mut st = state.borrow_mut();
+        let cached = st.rendered_remote_scan.as_ref().filter(|(m, u, _)| m == &mailbox && u == &uid).map(|(_, _, s)| *s);
+        st.rendered_remote_scan = Some((
+            mailbox.clone(),
+            uid,
+            cached.unwrap_or_else(|| body.html_body.as_deref().map(lookout_core::html_remote_content_scan).unwrap_or_default()),
+        ));
+    }
     // The pane is about to show a new message: any inline `cid:` image
     // requests still in flight belong to the one being replaced, so finish
     // them with an error (WebKit re-requests if the same images come up
@@ -13459,7 +13481,17 @@ fn render_body(
                 None => banner.set_revealed(false),
                 Some((account, sender)) => {
                     let level = st.trusted_senders.get(&(account, sender.clone())).copied();
-                    let scan = body.html_body.as_deref().map(lookout_core::html_remote_content_scan).unwrap_or_default();
+                    // `html_remote_content_scan` re-parses the whole rendered
+                    // HTML; `render_body` computed it once per render and
+                    // cached it keyed by this message (see below), so a
+                    // re-render of the same message reuses the scan instead of
+                    // rescanning.
+                    let scan = st
+                        .rendered_remote_scan
+                        .as_ref()
+                        .filter(|(m, u, _)| m == &mailbox && u == &uid)
+                        .map(|(_, _, s)| *s)
+                        .unwrap_or_default();
                     let images_blocked = scan.has_images && !(st.load_remote_images || st.load_once_images || level.is_some_and(|l| l >= lookout_core::TrustLevel::Images));
                     let other_blocked = scan.has_other && !level.is_some_and(|l| l >= lookout_core::TrustLevel::AllContent);
                     banner.set_title(&format!("Remote content from {sender} is blocked"));
@@ -14250,6 +14282,7 @@ mod tests {
             load_once_images: false,
             message_theme_override: false,
             trust_banner_dismissed: None,
+            rendered_remote_scan: None,
             draft_saved_tx: None,
             composer_identities_refresh: None,
             composer_relay_generation: 0,

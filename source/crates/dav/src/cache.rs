@@ -112,6 +112,14 @@ impl CalendarCache {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.sqlite3", sanitize_filename(account_id)));
         let conn = Connection::open(path)?;
+        // WAL + busy timeout + `synchronous=NORMAL`, the same tuning as the
+        // mail cache: this file is written in full-table chunks (`store_month`)
+        // and read from other threads (the calendar UI while the session
+        // writes), so a per-commit fsync and the rollback journal both cost
+        // real latency for data that is always rebuilt from the server.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS occurrences (

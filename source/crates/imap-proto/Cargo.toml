@@ -48,3 +48,6 @@ path = "examples/parse_response.rs"
 
 [dependencies.nom]
 version = "7"
+
+[dev-dependencies]
+assert_matches = "1"

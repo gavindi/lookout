@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use nom::{
     bytes::streaming::tag_no_case,
-    character::complete::{space0, space1},
+    character::streaming::{space0, space1},
     combinator::map,
     multi::separated_list0,
     sequence::{preceded, separated_pair, tuple},

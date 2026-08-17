@@ -14,9 +14,10 @@ use std::borrow::Cow;
 use crate::{parser::core::*, types::*};
 
 pub fn section_part(i: &[u8]) -> IResult<&[u8], Vec<u32>> {
-    let (i, (part, mut rest)) = tuple((number, many0(preceded(char('.'), number))))(i)?;
-    rest.insert(0, part);
-    Ok((i, rest))
+    let (i, (part, rest)) = tuple((number, many0(preceded(char('.'), number))))(i)?;
+    // Prepend the first part without shifting the rest in place: `insert(0, …)`
+    // is O(n) per call, and this runs once per part path on every BODYSTRUCTURE.
+    Ok((i, std::iter::once(part).chain(rest).collect()))
 }
 
 pub fn section_msgtext(i: &[u8]) -> IResult<&[u8], MessageSection> {
