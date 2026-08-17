@@ -462,6 +462,30 @@ pub trait CredentialProvider: Send + Sync {
     async fn smtp_credential(&self) -> std::result::Result<Credential, String>;
 }
 
+/// The session's optional on-disk cache, shared with the blocking thread pool.
+/// `Cache` is already `Sync` (its connection is `Mutex`-guarded - see
+/// `cache.rs`), so a plain `Arc` makes it shareable: every cache touch runs on
+/// the blocking pool via `cache_op`, keeping SQLite reads/writes, JSON
+/// parse/serialize, and FTS index work off the session's async worker - the
+/// same worker every account's session runs on, where a multi-second
+/// whole-folder write would stall this account's actor and hold the worker
+/// against every other account's session too.
+type CacheHandle = std::sync::Arc<Option<crate::cache::Cache>>;
+
+/// Runs `op` against the on-disk cache on the blocking thread pool, returning
+/// `None` when no cache is open (or the task was cancelled) and `Some(result)`
+/// otherwise. Every cache call in the session goes through here so no SQLite
+/// or JSON work ever executes on the async worker; `op` must own all its
+/// inputs (it is `'static`, so callers clone arguments the closure needs).
+async fn cache_op<T, F>(cache: &CacheHandle, op: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&crate::cache::Cache) -> T + Send + 'static,
+{
+    let cache = cache.clone();
+    tokio::task::spawn_blocking(move || (*cache).as_ref().map(op)).await.ok().flatten()
+}
+
 /// Runs one account's IMAP connection lifecycle on the calling task (spawn
 /// this onto the shared tokio worker thread - see the crate docs). Reconnects
 /// with backoff on any connection error; re-fetches credentials from
@@ -472,41 +496,57 @@ pub async fn run_account_session(
     commands: async_channel::Receiver<AccountCommand>,
     events: async_channel::Sender<AccountEvent>,
 ) {
-    let cache = match crate::cache::Cache::open(&config.account_id) {
+    let cache: CacheHandle = std::sync::Arc::new(match crate::cache::Cache::open(&config.account_id) {
         Ok(cache) => Some(cache),
         Err(e) => {
             tracing::warn!("couldn't open local cache, continuing without it: {e}");
             None
         }
-    };
+    });
 
     // Fast first paint: emit whatever's cached from the previous session
     // before the network connection even starts. This is immediately
     // superseded by live data once the connection succeeds - the cache is
     // never treated as authoritative (see `Cache`'s doc comment).
-    if let Some(cache) = &cache {
-        if let Ok(folders) = cache.load_mailboxes(&config.account_id) {
-            if !folders.is_empty() {
-                let _ = events.send(AccountEvent::FoldersUpdated(folders)).await;
-            }
-        }
-        let inbox_id = MailboxId::new(&config.account_id, "INBOX");
-        if let Ok(messages) = cache.load_messages(&inbox_id) {
-            if !messages.is_empty() {
-                let _ = events.send(AccountEvent::MessagesUpdated { mailbox: inbox_id, messages }).await;
-            }
-        }
-        // One-time FTS backfill, on this worker thread rather than the UI
-        // thread: `Cache::open` deliberately doesn't do it (see that method's
-        // note), because the app also opens a read-side handle from the main
-        // thread at connect time and backfilling a large pre-search cache -
-        // re-parsing every cached body - would block startup. This runs
-        // before the connection is attempted, so it doesn't delay the cached
-        // first paint above, and it's a cheap no-op once the index exists.
-        if let Err(e) = cache.backfill_search_index() {
-            tracing::warn!("failed to backfill the search index: {e}");
+    if let Some(Ok(folders)) = cache_op(&cache, {
+        let account_id = config.account_id.clone();
+        move |c| c.load_mailboxes(&account_id)
+    })
+    .await
+    {
+        if !folders.is_empty() {
+            let _ = events.send(AccountEvent::FoldersUpdated(folders)).await;
         }
     }
+    let inbox_id = MailboxId::new(&config.account_id, "INBOX");
+    if let Some(Ok(messages)) = cache_op(&cache, {
+        let inbox_id = inbox_id.clone();
+        move |c| c.load_messages(&inbox_id)
+    })
+    .await
+    {
+        if !messages.is_empty() {
+            let _ = events.send(AccountEvent::MessagesUpdated { mailbox: inbox_id, messages }).await;
+        }
+    }
+
+    // One-time FTS backfill, fired off to the blocking pool *without*
+    // awaiting. It used to run inline before the connection was even
+    // attempted - re-parsing every cached row and body on the async worker -
+    // which delayed login on every launch. It now runs concurrently with the
+    // connect attempt; the search index is incremental either way (rows are
+    // indexed as they sync), and the pass is a cheap no-op once the index
+    // exists. `Cache::open` deliberately doesn't do this itself (see that
+    // method's note), because the app also opens a read-side handle from the
+    // main thread at connect time.
+    let backfill_cache = cache.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(c) = backfill_cache.as_ref() {
+            if let Err(e) = c.backfill_search_index() {
+                tracing::warn!("failed to backfill the search index: {e}");
+            }
+        }
+    });
 
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -519,7 +559,7 @@ pub async fn run_account_session(
 
     loop {
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
-        match connect_and_run(&config, credentials.as_ref(), &commands, &events, cache.as_ref(), carried_command.take()).await {
+        match connect_and_run(&config, credentials.as_ref(), &commands, &events, &cache, carried_command.take()).await {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
                 return;
@@ -576,7 +616,7 @@ async fn connect_and_run(
     credentials: &dyn CredentialProvider,
     commands: &async_channel::Receiver<AccountCommand>,
     events: &async_channel::Sender<AccountEvent>,
-    cache: Option<&crate::cache::Cache>,
+    cache: &CacheHandle,
     mut carried_command: Option<AccountCommand>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
@@ -594,10 +634,13 @@ async fn connect_and_run(
     // over from the cache first - otherwise this emit would visibly blank
     // every count the pre-connect cache replay just painted, and the sidebar
     // would flash counts -> zeros -> counts on every launch.
-    if let Some(cache) = cache {
-        if let Ok(known) = cache.load_mailboxes(&account_id) {
-            carry_counts_forward(&mut folders, &known);
-        }
+    if let Some(Ok(known)) = cache_op(cache, {
+        let account_id = account_id.clone();
+        move |c| c.load_mailboxes(&account_id)
+    })
+    .await
+    {
+        carry_counts_forward(&mut folders, &known);
     }
     publish_folders(&folders, &account_id, cache, events).await;
 
@@ -833,7 +876,14 @@ async fn connect_and_run(
                         // that makes the cached envelope list stale even
                         // though it's non-empty, so the shortcut below must
                         // not apply to it.
-                        let cached = !dirty_mailboxes.contains(&current_mailbox_id) && cache.is_some_and(|c| c.has_messages(&current_mailbox_id).unwrap_or(false));
+                        let cached = !dirty_mailboxes.contains(&current_mailbox_id)
+                            && cache_op(cache, {
+                                let mailbox = current_mailbox_id.clone();
+                                move |c| c.has_messages(&mailbox)
+                            })
+                            .await
+                            .and_then(|r| r.ok())
+                            .unwrap_or(false);
                         if cached {
                             tracing::debug!(mailbox = %current_mailbox_id, "SyncMailbox: cache hit, emitting cached messages without IMAP sync");
                             emit_cached_messages(cache, &current_mailbox_id, events).await;
@@ -911,18 +961,22 @@ async fn connect_and_run(
                     // A failed part fetch must answer the UI with
                     // `PartFetchFailed` rather than kill the whole session via
                     // `?` - one bad section shouldn't cost the connection.
-                    let fetched = match cache {
-                        Some(c) => match c.load_attachment(&mailbox, uid, uidvalidity, &part.part_number) {
-                            Ok(Some(bytes)) => {
-                                tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: served from disk cache");
-                                Ok(Some(bytes))
-                            }
-                            Ok(None) => fetch_attachment_part(&mut session, uid, &part).await,
-                            Err(e) => {
-                                tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "failed to read cached attachment: {e}");
-                                fetch_attachment_part(&mut session, uid, &part).await
-                            }
-                        },
+                    let fetched = match cache_op(cache, {
+                        let mailbox = mailbox.clone();
+                        let part_number = part.part_number.clone();
+                        move |c| c.load_attachment(&mailbox, uid, uidvalidity, &part_number)
+                    })
+                    .await
+                    {
+                        Some(Ok(Some(bytes))) => {
+                            tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: served from disk cache");
+                            Ok(Some(bytes))
+                        }
+                        Some(Ok(None)) => fetch_attachment_part(&mut session, uid, &part).await,
+                        Some(Err(e)) => {
+                            tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "failed to read cached attachment: {e}");
+                            fetch_attachment_part(&mut session, uid, &part).await
+                        }
                         None => fetch_attachment_part(&mut session, uid, &part).await,
                     };
                     let bytes = match fetched {
@@ -956,10 +1010,15 @@ async fn connect_and_run(
                         }
                     };
                     if let Some(bytes) = bytes {
-                        if let Some(cache) = cache {
-                            if let Err(e) = cache.store_attachment(&mailbox, uid, uidvalidity, &part.part_number, &bytes) {
-                                tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "failed to cache attachment bytes: {e}");
-                            }
+                        if let Some(Err(e)) = cache_op(cache, {
+                            let mailbox = mailbox.clone();
+                            let part_number = part.part_number.clone();
+                            let bytes = bytes.clone();
+                            move |c| c.store_attachment(&mailbox, uid, uidvalidity, &part_number, &bytes)
+                        })
+                        .await
+                        {
+                            tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "failed to cache attachment bytes: {e}");
                         }
                         tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, bytes = bytes.len(), elapsed_ms = started.elapsed().as_millis(), "FetchAttachment: part ready");
                         let _ = events.send(AccountEvent::PartFetched { mailbox, uid, part, bytes }).await;
@@ -1134,12 +1193,15 @@ async fn connect_and_run(
                             // The subsequent `sync_mailbox` emit is byte-identical
                             // (the message is gone from the server too), so the UI
                             // rebuilds once and the list never flickers.
-                            if let Some(cache) = cache {
-                                if let Err(e) = cache.delete_messages(&mailbox, &[uid]) {
-                                    tracing::warn!("failed to drop moved message from cache: {e}");
-                                }
-                                emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                            if let Some(Err(e)) = cache_op(cache, {
+                                let mailbox = mailbox.clone();
+                                move |c| c.delete_messages(&mailbox, &[uid])
+                            })
+                            .await
+                            {
+                                tracing::warn!("failed to drop moved message from cache: {e}");
                             }
+                            emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
                             sync_mailbox(
                                 &mut session,
@@ -1181,12 +1243,16 @@ async fn connect_and_run(
                     match move_message_to_role(&mut session, &folders, &account_id, &uids, role, has_move).await {
                         Ok(()) => {
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
-                            if let Some(cache) = cache {
-                                if let Err(e) = cache.delete_messages(&mailbox, &uids) {
-                                    tracing::warn!("failed to drop moved messages from cache: {e}");
-                                }
-                                emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                            if let Some(Err(e)) = cache_op(cache, {
+                                let mailbox = mailbox.clone();
+                                let uids = uids.clone();
+                                move |c| c.delete_messages(&mailbox, &uids)
+                            })
+                            .await
+                            {
+                                tracing::warn!("failed to drop moved messages from cache: {e}");
                             }
+                            emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
                             sync_mailbox(
                                 &mut session,
@@ -1237,12 +1303,16 @@ async fn connect_and_run(
                             // "Moved" toast - the target was an arbitrary
                             // folder, not a special-use role.
                             let _ = events.send(AccountEvent::MessageMoved { role: MailboxRole::Custom }).await;
-                            if let Some(cache) = cache {
-                                if let Err(e) = cache.delete_messages(&mailbox, &uids) {
-                                    tracing::warn!("failed to drop moved messages from cache: {e}");
-                                }
-                                emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                            if let Some(Err(e)) = cache_op(cache, {
+                                let mailbox = mailbox.clone();
+                                let uids = uids.clone();
+                                move |c| c.delete_messages(&mailbox, &uids)
+                            })
+                            .await
+                            {
+                                tracing::warn!("failed to drop moved messages from cache: {e}");
                             }
+                            emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             relist_folders(&mut session, &mut folders, &mut counts_pending, &account_id, &current_mailbox_id, cache, events).await?;
                             sync_mailbox(
                                 &mut session,
@@ -1283,11 +1353,15 @@ async fn connect_and_run(
                             let role = folders.iter().find(|m| m.id == mailbox).map(|m| m.role).unwrap_or(MailboxRole::Custom);
                             let _ = events.send(AccountEvent::MailboxExpunged { role }).await;
                             if count > 0 {
-                                if let Some(cache) = cache {
-                                    if let Some(folder) = folders.iter().find(|m| m.id == mailbox) {
-                                        if let Err(e) = cache.replace_messages(&mailbox, folder.uidvalidity, &[]) {
-                                            tracing::warn!("failed to clear emptied mailbox from cache: {e}");
-                                        }
+                                if let Some(folder) = folders.iter().find(|m| m.id == mailbox) {
+                                    let uidvalidity = folder.uidvalidity;
+                                    if let Some(Err(e)) = cache_op(cache, {
+                                        let mailbox = mailbox.clone();
+                                        move |c| c.replace_messages(&mailbox, uidvalidity, &[])
+                                    })
+                                    .await
+                                    {
+                                        tracing::warn!("failed to clear emptied mailbox from cache: {e}");
                                     }
                                 }
                             }
@@ -1312,10 +1386,13 @@ async fn connect_and_run(
                     }
                 }
                 AccountCommand::SnoozeMessage { mailbox, uid, until } => {
-                    if let Some(cache) = cache {
-                        if let Err(e) = cache.snooze_message(&mailbox, uid, until) {
-                            tracing::warn!("failed to record snooze: {e}");
-                        }
+                    if let Some(Err(e)) = cache_op(cache, {
+                        let mailbox = mailbox.clone();
+                        move |c| c.snooze_message(&mailbox, uid, until)
+                    })
+                    .await
+                    {
+                        tracing::warn!("failed to record snooze: {e}");
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
                     sync_mailbox(
@@ -1333,10 +1410,14 @@ async fn connect_and_run(
                     session_selected = current_mailbox_id.clone();
                 }
                 AccountCommand::SnoozeMessages { mailbox, uids, until } => {
-                    if let Some(cache) = cache {
-                        if let Err(e) = cache.snooze_messages(&mailbox, &uids, until) {
-                            tracing::warn!("failed to record snooze: {e}");
-                        }
+                    if let Some(Err(e)) = cache_op(cache, {
+                        let mailbox = mailbox.clone();
+                        let uids = uids.clone();
+                        move |c| c.snooze_messages(&mailbox, &uids, until)
+                    })
+                    .await
+                    {
+                        tracing::warn!("failed to record snooze: {e}");
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
                     sync_mailbox(
@@ -1375,14 +1456,19 @@ async fn connect_and_run(
                             // repaints from cache without a re-fetch (and so
                             // a restart before the next sync doesn't show the
                             // message unread again).
-                            let patched = match cache {
-                                Some(cache) => match cache.update_flags(&mailbox, uid, &add, &remove) {
-                                    Ok(patched) => patched,
-                                    Err(e) => {
-                                        tracing::warn!("failed to update cached flags: {e}");
-                                        false
-                                    }
-                                },
+                            let patched = match cache_op(cache, {
+                                let mailbox = mailbox.clone();
+                                let add = add.clone();
+                                let remove = remove.clone();
+                                move |c| c.update_flags(&mailbox, uid, &add, &remove)
+                            })
+                            .await
+                            {
+                                Some(Ok(patched)) => patched,
+                                Some(Err(e)) => {
+                                    tracing::warn!("failed to update cached flags: {e}");
+                                    false
+                                }
                                 None => false,
                             };
                             if patched {
@@ -1461,10 +1547,17 @@ async fn connect_and_run(
                             // a full resync is already the correct, cheap
                             // fallback path for a single message, and stays
                             // so for a batch.
-                            let all_patched = match cache {
-                                Some(cache) => cache.update_flags_many(&mailbox, &uids, &add, &remove).unwrap_or(false),
-                                None => false,
-                            };
+                            let all_patched = matches!(
+                                cache_op(cache, {
+                                    let mailbox = mailbox.clone();
+                                    let uids = uids.clone();
+                                    let add = add.clone();
+                                    let remove = remove.clone();
+                                    move |c| c.update_flags_many(&mailbox, &uids, &add, &remove)
+                                })
+                                .await,
+                                Some(Ok(true))
+                            );
                             if all_patched {
                                 emit_cached_messages(cache, &mailbox, events).await;
                             } else if mailbox == current_mailbox_id {
@@ -1541,14 +1634,19 @@ async fn connect_and_run(
                     let remove: Vec<String> = remove.into_iter().filter(|k| valid_keyword_atom(k)).collect();
                     match store_raw_flags(&mut session, &[uid], &add, &remove).await {
                         Ok(()) => {
-                            let patched = match cache {
-                                Some(cache) => match cache.update_keywords(&mailbox, uid, &add, &remove) {
-                                    Ok(patched) => patched,
-                                    Err(e) => {
-                                        tracing::warn!("failed to update cached keywords: {e}");
-                                        false
-                                    }
-                                },
+                            let patched = match cache_op(cache, {
+                                let mailbox = mailbox.clone();
+                                let add = add.clone();
+                                let remove = remove.clone();
+                                move |c| c.update_keywords(&mailbox, uid, &add, &remove)
+                            })
+                            .await
+                            {
+                                Some(Ok(patched)) => patched,
+                                Some(Err(e)) => {
+                                    tracing::warn!("failed to update cached keywords: {e}");
+                                    false
+                                }
                                 None => false,
                             };
                             if patched {
@@ -1594,10 +1692,17 @@ async fn connect_and_run(
                         Ok(()) => {
                             // Same all-or-resync contract as `StoreFlagsMany`:
                             // patch the cache for every uid, or resync once.
-                            let all_patched = match cache {
-                                Some(cache) => cache.update_keywords_many(&mailbox, &uids, &add, &remove).unwrap_or(false),
-                                None => false,
-                            };
+                            let all_patched = matches!(
+                                cache_op(cache, {
+                                    let mailbox = mailbox.clone();
+                                    let uids = uids.clone();
+                                    let add = add.clone();
+                                    let remove = remove.clone();
+                                    move |c| c.update_keywords_many(&mailbox, &uids, &add, &remove)
+                                })
+                                .await,
+                                Some(Ok(true))
+                            );
                             if all_patched {
                                 emit_cached_messages(cache, &mailbox, events).await;
                             } else if mailbox == current_mailbox_id {
@@ -1762,10 +1867,16 @@ async fn connect_and_run(
                     // Filter out already-cached bodies. One query for the whole
                     // envelope batch rather than a SELECT per UID - on a first
                     // sync of a big folder that's thousands of statements.
-                    if let Some(cache) = cache {
-                        let have = cache.has_bodies(&pf.mailboxes[pf.current], &uids, pf.uidvalidity).unwrap_or_default();
-                        uids.retain(|uid| !have.contains(uid));
-                    }
+                    let have = cache_op(cache, {
+                        let mailbox = pf.mailboxes[pf.current].clone();
+                        let uidvalidity = pf.uidvalidity;
+                        let uids = uids.clone();
+                        move |c| c.has_bodies(&mailbox, &uids, uidvalidity)
+                    })
+                    .await
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default();
+                    uids.retain(|uid| !have.contains(uid));
 
                     // Remember each still-wanted uid's part structure (only
                     // the newest `INITIAL_FETCH_LIMIT`'s worth) so its body
@@ -2293,11 +2404,15 @@ fn carry_counts_forward(folders: &mut [Mailbox], known: &[Mailbox]) {
 /// Persists the folder list to the cache and emits it to the UI - the one
 /// place a mutated `folders` becomes visible. Every count update funnels
 /// through here so the on-disk copy and the sidebar can never disagree.
-async fn publish_folders(folders: &[Mailbox], account_id: &AccountId, cache: Option<&crate::cache::Cache>, events: &async_channel::Sender<AccountEvent>) {
-    if let Some(cache) = cache {
-        if let Err(e) = cache.replace_mailboxes(account_id, folders) {
-            tracing::warn!("failed to cache mailbox list: {e}");
-        }
+async fn publish_folders(folders: &[Mailbox], account_id: &AccountId, cache: &CacheHandle, events: &async_channel::Sender<AccountEvent>) {
+    if let Some(Err(e)) = cache_op(cache, {
+        let account_id = account_id.clone();
+        let owned = folders.to_vec();
+        move |c| c.replace_mailboxes(&account_id, &owned)
+    })
+    .await
+    {
+        tracing::warn!("failed to cache mailbox list: {e}");
     }
     let _ = events.send(AccountEvent::FoldersUpdated(folders.to_vec())).await;
 }
@@ -2319,7 +2434,7 @@ async fn relist_folders(
     counts_pending: &mut VecDeque<MailboxId>,
     account_id: &AccountId,
     current: &MailboxId,
-    cache: Option<&crate::cache::Cache>,
+    cache: &CacheHandle,
     events: &async_channel::Sender<AccountEvent>,
 ) -> Result<()> {
     let mut relisted = list_mailboxes(session, account_id).await?;
@@ -2387,7 +2502,7 @@ async fn sync_mailbox(
     folder_path: &str,
     mailbox_id: &MailboxId,
     events: &async_channel::Sender<AccountEvent>,
-    cache: Option<&crate::cache::Cache>,
+    cache: &CacheHandle,
     folders: &mut Vec<Mailbox>,
     session_selected: Option<&MailboxId>,
     condstore: bool,
@@ -2434,10 +2549,13 @@ async fn sync_mailbox(
     // than the full flag fetch it replaces, and it doubles as the folder's
     // exists count. The full path needs no extra pass - the full flag fetch
     // *is* the membership set.
-    let cached: HashMap<Uid, EmailSummary> = match cache {
-        Some(cache) => cache.load_messages_by_uid(mailbox_id, uidvalidity).unwrap_or_default(),
-        None => HashMap::new(),
-    };
+    let cached: HashMap<Uid, EmailSummary> = cache_op(cache, {
+        let mailbox_id = mailbox_id.clone();
+        move |c| c.load_messages_by_uid(&mailbox_id, uidvalidity)
+    })
+    .await
+    .and_then(|r| r.ok())
+    .unwrap_or_default();
     let baseline = folders.iter().find(|f| f.id == *mailbox_id).and_then(|f| f.highest_modseq);
     let delta = already_selected && condstore && baseline.is_some();
     let flag_fetches: Vec<_> = if delta {
@@ -2664,21 +2782,32 @@ fn new_unread_for_notification(cached_is_empty: bool, new_messages: &[EmailSumma
 /// instant paint on folder switch - both when `SyncMailbox` wakes the session
 /// (pre-IDLE teardown) and when it's processed out of the drain queue with a
 /// cache hit. A no-op when nothing is cached.
-async fn emit_cached_messages(cache: Option<&crate::cache::Cache>, mailbox_id: &MailboxId, events: &async_channel::Sender<AccountEvent>) {
-    let Some(cache) = cache else { return };
-    if let Ok(cached) = cache.load_messages(mailbox_id) {
-        if !cached.is_empty() {
-            let snoozed = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()).unwrap_or_default();
-            let filtered: Vec<_> = cached.iter().filter(|m| !snoozed.contains(&m.uid)).cloned().collect();
-            if !filtered.is_empty() {
-                tracing::debug!(mailbox = %mailbox_id, count = filtered.len(), "emitting cached messages for instant display");
-                let _ = events
-                    .send(AccountEvent::MessagesUpdated {
-                        mailbox: mailbox_id.clone(),
-                        messages: filtered,
-                    })
-                    .await;
-            }
+async fn emit_cached_messages(cache: &CacheHandle, mailbox_id: &MailboxId, events: &async_channel::Sender<AccountEvent>) {
+    let Some(Ok(cached)) = cache_op(cache, {
+        let mailbox_id = mailbox_id.clone();
+        move |c| c.load_messages(&mailbox_id)
+    })
+    .await
+    else {
+        return;
+    };
+    if !cached.is_empty() {
+        let snoozed = cache_op(cache, {
+            let mailbox_id = mailbox_id.clone();
+            move |c| c.active_snoozed_uids(&mailbox_id, chrono::Utc::now())
+        })
+        .await
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+        let filtered: Vec<_> = cached.iter().filter(|m| !snoozed.contains(&m.uid)).cloned().collect();
+        if !filtered.is_empty() {
+            tracing::debug!(mailbox = %mailbox_id, count = filtered.len(), "emitting cached messages for instant display");
+            let _ = events
+                .send(AccountEvent::MessagesUpdated {
+                    mailbox: mailbox_id.clone(),
+                    messages: filtered,
+                })
+                .await;
         }
     }
 }
@@ -2688,9 +2817,20 @@ async fn emit_cached_messages(cache: Option<&crate::cache::Cache>, mailbox_id: &
 /// `emit_cached_messages`'s no-op-on-empty, the empty set is meaningful here:
 /// the caller has just removed a message, so "no cached rows left" means the
 /// list should be cleared, not "nothing cached yet, don't blank the list".
-async fn emit_cached_messages_after_removal(cache: &crate::cache::Cache, mailbox_id: &MailboxId, events: &async_channel::Sender<AccountEvent>) {
-    if let Ok(cached) = cache.load_messages(mailbox_id) {
-        let snoozed = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()).unwrap_or_default();
+async fn emit_cached_messages_after_removal(cache: &CacheHandle, mailbox_id: &MailboxId, events: &async_channel::Sender<AccountEvent>) {
+    if let Some(Ok(cached)) = cache_op(cache, {
+        let mailbox_id = mailbox_id.clone();
+        move |c| c.load_messages(&mailbox_id)
+    })
+    .await
+    {
+        let snoozed = cache_op(cache, {
+            let mailbox_id = mailbox_id.clone();
+            move |c| c.active_snoozed_uids(&mailbox_id, chrono::Utc::now())
+        })
+        .await
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
         let filtered: Vec<_> = cached.iter().filter(|m| !snoozed.contains(&m.uid)).cloned().collect();
         let _ = events
             .send(AccountEvent::MessagesUpdated {
@@ -2704,26 +2844,35 @@ async fn emit_cached_messages_after_removal(cache: &crate::cache::Cache, mailbox
 /// Caches `messages` and publishes them to the UI, minus anything currently
 /// snoozed. Snoozed messages are still fetched and cached normally - only
 /// what's emitted is filtered, so a snooze is purely a display concern.
-async fn emit_messages(
-    mailbox_id: &MailboxId,
-    uidvalidity: UidValidity,
-    messages: &[EmailSummary],
-    events: &async_channel::Sender<AccountEvent>,
-    cache: Option<&crate::cache::Cache>,
-) {
+async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary], events: &async_channel::Sender<AccountEvent>, cache: &CacheHandle) {
     let mut messages = messages.to_vec();
-    if let Some(cache) = cache {
-        if let Err(e) = cache.replace_messages(mailbox_id, uidvalidity, &messages) {
+    // The write, the address-book feed, and the snooze read in one blocking
+    // hop: `replace_messages` is the session's heaviest cache write (a
+    // whole-folder diff), and this function runs at the end of every sync.
+    let cached = cache_op(cache, {
+        let mailbox_id = mailbox_id.clone();
+        let messages = messages.clone();
+        move |c| {
+            (
+                c.replace_messages(&mailbox_id, uidvalidity, &messages),
+                c.record_addresses(&messages),
+                c.active_snoozed_uids(&mailbox_id, chrono::Utc::now()),
+            )
+        }
+    })
+    .await;
+    if let Some((replace, addresses, snoozed)) = cached {
+        if let Err(e) = replace {
             tracing::warn!("failed to cache messages for {mailbox_id}: {e}");
         }
         // Feeds the composer's recipient autocomplete. Kept here rather than
         // in `replace_messages` because the address book is cumulative -
         // `replace_messages` syncs a mailbox's window to the server's set,
         // and addresses must accumulate across those syncs.
-        if let Err(e) = cache.record_addresses(&messages) {
+        if let Err(e) = addresses {
             tracing::warn!("failed to record addresses for {mailbox_id}: {e}");
         }
-        if let Ok(snoozed) = cache.active_snoozed_uids(mailbox_id, chrono::Utc::now()) {
+        if let Ok(snoozed) = snoozed {
             messages.retain(|m| !snoozed.contains(&m.uid));
         }
     }
@@ -2746,7 +2895,7 @@ async fn fetch_previews(
     uidvalidity: UidValidity,
     mut messages: Vec<EmailSummary>,
     events: &async_channel::Sender<AccountEvent>,
-    cache: Option<&crate::cache::Cache>,
+    cache: &CacheHandle,
 ) -> Result<()> {
     let mut wanted: Vec<Uid> = messages.iter().filter(|m| m.preview.is_none()).map(|m| m.uid).collect();
     if wanted.is_empty() {
@@ -2808,15 +2957,14 @@ async fn fetch_body(session: &mut Session<ImapStream>, uid: Uid) -> Result<Optio
 /// the whole-message fallback inside `fetch_body_cached` - which already
 /// downloads the full `BODY.PEEK[]` when a partial fetch isn't possible, so
 /// persisting those bytes to the export cache costs nothing extra.
-async fn fetch_raw_message_cached(
-    cache: Option<&crate::cache::Cache>,
-    session: &mut Session<ImapStream>,
-    mailbox: &MailboxId,
-    uid: Uid,
-    uidvalidity: UidValidity,
-) -> Result<Option<Vec<u8>>> {
-    if let Some(cache) = cache {
-        match cache.load_raw_message(mailbox, uid, uidvalidity) {
+async fn fetch_raw_message_cached(cache: &CacheHandle, session: &mut Session<ImapStream>, mailbox: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<Option<Vec<u8>>> {
+    if let Some(cached) = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        move |c| c.load_raw_message(&mailbox, uid, uidvalidity)
+    })
+    .await
+    {
+        match cached {
             Ok(Some(bytes)) => {
                 tracing::debug!(?mailbox, uid = uid.0, "FetchRawMessage: served from disk cache");
                 return Ok(Some(bytes));
@@ -2828,10 +2976,14 @@ async fn fetch_raw_message_cached(
     let Some(raw) = fetch_body(session, uid).await? else {
         return Ok(None);
     };
-    if let Some(cache) = cache {
-        if let Err(e) = cache.store_raw_message(mailbox, uid, uidvalidity, &raw) {
-            tracing::warn!(?mailbox, uid = uid.0, "failed to cache raw message: {e}");
-        }
+    if let Some(Err(e)) = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let raw = raw.clone();
+        move |c| c.store_raw_message(&mailbox, uid, uidvalidity, &raw)
+    })
+    .await
+    {
+        tracing::warn!(?mailbox, uid = uid.0, "failed to cache raw message: {e}");
     }
     Ok(Some(raw))
 }
@@ -2919,15 +3071,20 @@ async fn fetch_attachment_part(session: &mut Session<ImapStream>, uid: Uid, part
 /// `BODY.PEEK[]` fetch otherwise. The result is an assembled [`EmailBody`]
 /// either way.
 async fn fetch_body_cached(
-    cache: Option<&crate::cache::Cache>,
+    cache: &CacheHandle,
     session: &mut Session<ImapStream>,
     mailbox: &MailboxId,
     uid: Uid,
     uidvalidity: UidValidity,
     known_structure: Option<&[BodyPart]>,
 ) -> Result<Option<EmailBody>> {
-    if let Some(cache) = cache {
-        match cache.load_body(mailbox, uid, uidvalidity) {
+    if let Some(cached) = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        move |c| c.load_body(&mailbox, uid, uidvalidity)
+    })
+    .await
+    {
+        match cached {
             Ok(Some(body)) => {
                 tracing::debug!(?mailbox, uid = uid.0, "FetchBody: served from disk cache");
                 return Ok(Some(body));
@@ -2943,7 +3100,14 @@ async fn fetch_body_cached(
     // returned one - fall back to the whole-message fetch below.
     let structure = match known_structure {
         Some(structure) => Some(structure.to_vec()),
-        None => cache.and_then(|c| c.load_summary(mailbox, uid).ok().flatten()).and_then(|s| s.structure),
+        None => cache_op(cache, {
+            let mailbox = mailbox.clone();
+            move |c| c.load_summary(&mailbox, uid)
+        })
+        .await
+        .and_then(|r| r.ok())
+        .flatten()
+        .and_then(|s| s.structure),
     };
     let body = match &structure {
         Some(parts) => match fetch_body_partial(session, uid, parts).await {
@@ -2960,11 +3124,15 @@ async fn fetch_body_cached(
             .await?
             .and_then(|raw| parse_body(uid, &raw)),
     };
-    if let Some(cache) = cache {
-        if let Some(body) = &body {
-            if let Err(e) = cache.store_body(mailbox, uid, uidvalidity, body) {
-                tracing::warn!(?mailbox, uid = uid.0, "failed to cache message body: {e}");
-            }
+    if let Some(body) = &body {
+        if let Some(Err(e)) = cache_op(cache, {
+            let mailbox = mailbox.clone();
+            let body = body.clone();
+            move |c| c.store_body(&mailbox, uid, uidvalidity, &body)
+        })
+        .await
+        {
+            tracing::warn!(?mailbox, uid = uid.0, "failed to cache message body: {e}");
         }
     }
     Ok(body)

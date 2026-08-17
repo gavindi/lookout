@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.61 (2026-08-18)
+
+### Changed
+
+- **Mail**: every cache operation in the IMAP session now runs on tokio's blocking thread pool instead of the session's async worker - the same worker every account's session shares, where a multi-second whole-folder write used to stall that account's actor (IDLE waits, command replies) and hold the worker against every other account's session. The session's cache is now a `CacheHandle` (`Arc<Option<Cache>>` - the `Cache` connection was already `Mutex`-wrapped for `Sync`, so the Arc alone makes it shareable with the pool), and all ~30 call sites dispatch through a new `cache_op` helper: `sync_mailbox`'s cached-window load, `emit_messages`' whole-folder diff-write + address-book feed + snooze read (one blocking hop), the move/flag/keyword/snooze batch writes, the attachment/raw-message/body cache reads and writes, the background prefetch's `has_bodies` check, `publish_folders`' mailbox-list write, and the cache-hit shortcut's `has_messages` probe. Error handling and semantics are unchanged - a missing cache still behaves as no-cache, and the moved-message delete still completes before the remaining-set emit reads it back.
+- **Mail**: the one-time search-index backfill no longer sits between startup and the first connection attempt. It used to run inline on the async worker before connecting - re-parsing every cached row and body - delaying login on every launch for accounts with large pre-search caches. It's now fired off to the blocking pool without awaiting, running concurrently with the connect attempt; the index is incremental either way (rows are indexed as they sync) and the pass remains a cheap no-op once the index exists.
+
+### Testing
+
+- `lookout-mail`: all 124 unit tests still pass; the cache round-trip and batch-contract suites are untouched (the `Cache` API is unchanged, only the session's dispatch around it moved to the blocking pool).
+
 ## 0.9.60 (2026-08-18)
 
 ### Changed

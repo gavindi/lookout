@@ -31,9 +31,11 @@ use crate::error::Result;
 /// `&Cache: Send`) - `rusqlite::Connection` itself isn't `Sync` because its
 /// internal statement cache uses a `RefCell`, which otherwise poisons the
 /// `Send`-ness of the whole `run_account_session` future wherever a `&Cache`
-/// is held across an `.await` point. There's never actual cross-thread
-/// contention (one account session owns its cache), so the lock is
-/// uncontended in practice.
+/// is held across an `.await` point. The lock now also serves the session's
+/// blocking-pool dispatch (see `session::cache_op`): each cache call runs on
+/// a `spawn_blocking` thread, so the guard is genuinely contended there -
+/// but only briefly, per operation, and it keeps SQLite work off the shared
+/// async worker where a heavy write would stall every account's session.
 pub struct Cache {
     conn: Mutex<Connection>,
     /// Per-account directory holding fetched attachment bytes as flat files
