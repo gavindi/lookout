@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.56 (2026-08-17)
+
+### Changed
+
+- **Mail**: the cache layer's per-uid SQLite N+1s are gone. The prefetch pass used to ask `SELECT 1 FROM bodies` once per UID while planning which bodies to download - on a first sync of a big folder, thousands of statements - and now asks once for the whole envelope batch (`has_bodies` returns the wanted subset that already has a body). The move handlers issued a `DELETE` (envelope, body, snooze entry, and search row) per moved message; `delete_messages` now does all of that in one transaction, prepared statements reused per uid, safe for batches of any size (no `IN (...)` variable-count limits). Joined `STORE` batches - "mark read" across a selection, and the multi-message tag toggle - patched the cache once per uid and now go through `update_flags_many`/`update_keywords_many`, one transaction, same all-or-nothing contract: any uid outside the cached window still reports failure and falls back to a resync. `SnoozeMessages` got the matching `snooze_messages` batch. The single-message variants stay for single-uid commands.
+- **Mail**: the search path no longer loads each FTS hit with its own SELECT + JSON parse. `search` used to collect `(mailbox_id, uid)` pairs from the index and then round-trip the `messages` table once per hit - up to 300 statements on the UI thread per keystroke against a full-page result set. It now fetches every hit's envelope in one `search_fts JOIN messages` statement; hits whose envelope row has been wiped fall out of the join instead of being skipped one by one, and snoozed hits are still filtered after, from the same single read of the active set.
+
+### Testing
+
+- `lookout-mail`: five new cache tests pin the batch methods' contracts - `delete_messages` dropping every listed uid's envelope/body/snooze row in one call (unknown uids harmless), `update_flags_many`/`update_keywords_many` patching exactly the targeted uids while failing the whole batch on a uid outside the cached window, `snooze_messages` recording and re-snoozing a batch, and `has_bodies` answering only for wanted uids under the right `uidvalidity`.
+- The roadmap's `rfc5464` `check_path` "O(n²) rescan" claim was investigated and **disproven** before any change was made: the parser's state machine advances monotonically (every path offset is strictly increasing), so each byte is examined at most twice. Measured empirically - 29, 389, 4 889, 58 889 and 688 889 byte-examinations for 10, 100, 1 000, 10 000 and 100 000 path components (each ≈ input length − 14) - it is a linear single pass, not quadratic, and was left alone.
+
 ## 0.9.55 (2026-08-17)
 
 ### Changed

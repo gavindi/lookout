@@ -638,10 +638,29 @@ impl Cache {
     /// Returns `true` if a body for `(mailbox_id, uid, uidvalidity)` exists
     /// in the on-disk cache, without loading the (potentially large) payload.
     pub fn has_body(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity) -> Result<bool> {
+        Ok(self.has_bodies(mailbox_id, std::slice::from_ref(&uid), uidvalidity)?.contains(&uid))
+    }
+
+    /// Returns the subset of `uids` that already have a cached body for
+    /// `uidvalidity`. The prefetch pass filters its envelope batch against
+    /// this before queuing body downloads; the per-uid `has_body` variant
+    /// cost one SELECT per UID on a first sync of a big folder.
+    pub fn has_bodies(&self, mailbox_id: &MailboxId, uids: &[Uid], uidvalidity: UidValidity) -> Result<HashSet<Uid>> {
+        if uids.is_empty() {
+            return Ok(HashSet::new());
+        }
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT 1 FROM bodies WHERE mailbox_id = ?1 AND uid = ?2 AND uidvalidity = ?3")?;
-        let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0], |_| Ok(()))?;
-        Ok(rows.next().is_some())
+        let wanted: HashSet<u32> = uids.iter().map(|u| u.0).collect();
+        let mut stmt = conn.prepare("SELECT uid FROM bodies WHERE mailbox_id = ?1 AND uidvalidity = ?2")?;
+        let rows = stmt.query_map(rusqlite::params![mailbox_id.0, uidvalidity.0], |row| row.get::<_, u32>(0))?;
+        let mut found = HashSet::new();
+        for row in rows {
+            let uid = row?;
+            if wanted.contains(&uid) {
+                found.insert(Uid(uid));
+            }
+        }
+        Ok(found)
     }
 
     /// The per-account flat-file path an attachment's *decoded* bytes are
@@ -886,14 +905,28 @@ impl Cache {
             return Ok(Vec::new());
         };
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT mailbox_id, uid FROM search_fts WHERE search_fts MATCH ?1 ORDER BY rank LIMIT ?2")?;
-        let rows = stmt.query_map(rusqlite::params![match_query, limit as i64], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
-        let mut hits = Vec::new();
+
+        // Single FTS→messages JOIN instead of one SELECT + JSON parse per
+        // hit: a keystroke-driven search can surface hundreds of hits, and
+        // the UI thread runs this on every keystroke. Hits whose envelope row
+        // is gone (e.g. the migration wiped the messages table once) fall out
+        // of the JOIN rather than being skipped one by one.
+        let mut stmt = conn.prepare(
+            "SELECT messages.data FROM search_fts \
+             JOIN messages ON messages.mailbox_id = search_fts.mailbox_id \
+              AND messages.uid = search_fts.uid \
+             WHERE search_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![match_query, limit as i64], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        let mut data_by_key: Vec<(String, u32, String)> = Vec::new();
         for row in rows {
-            let (mailbox, uid) = row?;
-            hits.push((MailboxId(mailbox), Uid(uid)));
+            let data = row?;
+            let Ok(msg) = serde_json::from_str::<EmailSummary>(&data) else {
+                continue;
+            };
+            data_by_key.push((msg.mailbox.0.clone(), msg.uid.0, data));
         }
-        drop(stmt);
 
         // Snoozed messages stay hidden from the list, so they don't surface in
         // search either. Read the active set once rather than per hit.
@@ -907,16 +940,11 @@ impl Cache {
             }
         }
 
-        let mut out = Vec::new();
-        for (mailbox, uid) in hits {
-            if snoozed.contains(&(mailbox.0.clone(), uid.0)) {
+        for (mailbox, uid, data) in data_by_key {
+            if snoozed.contains(&(mailbox, uid)) {
                 continue;
             }
-            // A hit whose envelope row is gone (the migration wiped the
-            // messages table once, on the version bump) is skipped, not fatal.
-            if let Some(msg) = load_summary_row(&conn, &mailbox, uid)? {
-                out.push(msg);
-            }
+            out.push(serde_json::from_str(&data)?);
         }
         Ok(out)
     }
@@ -955,6 +983,45 @@ impl Cache {
         Ok(true)
     }
 
+    /// Applies a flag change to every cached summary in `uids` at once,
+    /// mirroring a joined `STORE` against the server. Same contract as
+    /// `update_flags` per uid: returns `false` if any uid is missing from the
+    /// cached window, so the caller's all-or-resync fallback still triggers.
+    ///
+    /// All the row reads and writes run inside one transaction (and prepared
+    /// statements are reused), so the per-uid variant's autocommit-per-message
+    /// cost is paid once for the whole batch instead of once per message.
+    pub fn update_flags_many(&self, mailbox_id: &MailboxId, uids: &[Uid], add: &[SystemFlagBit], remove: &[SystemFlagBit]) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut all_found = true;
+        {
+            let mut select = tx.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut update = tx.prepare("UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3")?;
+            for uid in uids {
+                let mut rows = select.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
+                let Some(data) = rows.next().transpose()? else {
+                    all_found = false;
+                    continue;
+                };
+                let Ok(mut summary) = serde_json::from_str::<EmailSummary>(&data) else {
+                    all_found = false;
+                    continue;
+                };
+                for flag in add {
+                    summary.flags.insert(*flag);
+                }
+                for flag in remove {
+                    summary.flags.remove(flag);
+                }
+                let data = serde_json::to_string(&summary)?;
+                update.execute(rusqlite::params![data, mailbox_id.0, uid.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(all_found)
+    }
+
     /// Applies a keyword change to one cached summary, mirroring the `STORE`
     /// the session just issued - the same contract as `update_flags`, for the
     /// custom-flag atoms (e.g. `$Lookout-tag-<key>`) that carry color tags.
@@ -986,6 +1053,40 @@ impl Cache {
         Ok(true)
     }
 
+    /// Applies a keyword change to every cached summary in `uids` at once -
+    /// the batch counterpart of `update_keywords`, same all-or-nothing
+    /// contract as `update_flags_many` and the same one-transaction shape.
+    pub fn update_keywords_many(&self, mailbox_id: &MailboxId, uids: &[Uid], add: &[String], remove: &[String]) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut all_found = true;
+        {
+            let mut select = tx.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut update = tx.prepare("UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3")?;
+            for uid in uids {
+                let mut rows = select.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
+                let Some(data) = rows.next().transpose()? else {
+                    all_found = false;
+                    continue;
+                };
+                let Ok(mut summary) = serde_json::from_str::<EmailSummary>(&data) else {
+                    all_found = false;
+                    continue;
+                };
+                for keyword in add {
+                    summary.keywords.insert(keyword.clone());
+                }
+                for keyword in remove {
+                    summary.keywords.remove(keyword);
+                }
+                let data = serde_json::to_string(&summary)?;
+                update.execute(rusqlite::params![data, mailbox_id.0, uid.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(all_found)
+    }
+
     /// Removes a single message (plus its cached body and any snooze entry)
     /// from the cache. Used right after a successful MOVE so the deleted or
     /// archived message drops out of the next `MessagesUpdated` immediately
@@ -1003,6 +1104,29 @@ impl Cache {
         Ok(())
     }
 
+    /// Removes several messages (plus their cached bodies, snooze entries and
+    /// search-index rows) in one transaction - the batch counterpart of
+    /// `delete_message`, used by the move paths so a multi-message move pays
+    /// one commit instead of one per message.
+    pub fn delete_messages(&self, mailbox_id: &MailboxId, uids: &[Uid]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut messages = tx.prepare("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut bodies = tx.prepare("DELETE FROM bodies WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut snoozed = tx.prepare("DELETE FROM snoozed WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut fts = tx.prepare("DELETE FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2")?;
+            for uid in uids {
+                messages.execute(rusqlite::params![mailbox_id.0, uid.0])?;
+                bodies.execute(rusqlite::params![mailbox_id.0, uid.0])?;
+                snoozed.execute(rusqlite::params![mailbox_id.0, uid.0])?;
+                fts.execute(rusqlite::params![mailbox_id.0, uid.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Records that `uid` (in `mailbox_id`) should be hidden from
     /// `MessagesUpdated` until `until` - purely client-side state, IMAP has
     /// no native snooze concept. `INSERT OR REPLACE` so re-snoozing an
@@ -1013,6 +1137,21 @@ impl Cache {
             "INSERT OR REPLACE INTO snoozed (mailbox_id, uid, snoozed_until) VALUES (?1, ?2, ?3)",
             rusqlite::params![mailbox_id.0, uid.0, until.timestamp()],
         )?;
+        Ok(())
+    }
+
+    /// Records a snooze for every uid in `uids` in one transaction - the batch
+    /// counterpart of `snooze_message` for `SnoozeMessages`.
+    pub fn snooze_messages(&self, mailbox_id: &MailboxId, uids: &[Uid], until: DateTime<Utc>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO snoozed (mailbox_id, uid, snoozed_until) VALUES (?1, ?2, ?3)")?;
+            for uid in uids {
+                stmt.execute(rusqlite::params![mailbox_id.0, uid.0, until.timestamp()])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1112,6 +1251,29 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The `SnoozeMessages` contract: one `snooze_messages` call records every
+    /// listed uid, and re-snoozing any of them updates the wake time instead
+    /// of erroring or duplicating rows.
+    #[test]
+    fn snoozes_a_batch_of_messages_at_once() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let now = Utc::now();
+
+        cache.snooze_messages(&mailbox_id, &[Uid(1), Uid(2), Uid(3)], now + chrono::Duration::hours(1)).unwrap();
+        assert_eq!(
+            cache.active_snoozed_uids(&mailbox_id, now).unwrap(),
+            HashSet::from([Uid(1), Uid(2), Uid(3)])
+        );
+
+        cache.snooze_messages(&mailbox_id, &[Uid(1), Uid(4)], now - chrono::Duration::hours(1)).unwrap();
+        assert_eq!(cache.active_snoozed_uids(&mailbox_id, now).unwrap(), HashSet::from([Uid(2), Uid(3)]));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The move path's instant-update relies on this: after a `delete_message`
     /// the remaining cached set no longer contains the moved uid, its body is
     /// gone, and a delete of a non-cached uid is a harmless no-op.
@@ -1141,6 +1303,39 @@ mod tests {
         // message fell outside the cached window.
         cache.delete_message(&mailbox_id, Uid(99)).unwrap();
         assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The batch counterpart of `deleting_a_message_drops_it_and_its_body_from_the_cache`:
+    /// one `delete_messages` call drops every listed uid's envelope, body and
+    /// snooze entry, and mixed-in unknown uids are harmless no-ops.
+    #[test]
+    fn deleting_messages_drops_them_in_one_batch() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None), sample_summary(&mailbox_id, 3, None)],
+            )
+            .unwrap();
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("one")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("three")).unwrap();
+        cache.snooze_message(&mailbox_id, Uid(3), Utc::now() + chrono::Duration::hours(1)).unwrap();
+
+        cache.delete_messages(&mailbox_id, &[Uid(1), Uid(3), Uid(99)]).unwrap();
+
+        let remaining = cache.load_messages(&mailbox_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].uid, Uid(2));
+        assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap());
+        assert!(!cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap());
+        assert!(cache.active_snoozed_uids(&mailbox_id, Utc::now()).unwrap().is_empty());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
@@ -1413,6 +1608,39 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The joined `STORE` contract: `update_flags_many` patches every listed
+    /// uid in one transaction, leaves an untargeted uid alone, and reports
+    /// `false` when any uid is outside the cached window so the session's
+    /// all-or-resync fallback still fires.
+    #[test]
+    fn patches_flags_on_many_cached_summaries_at_once() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None), sample_summary(&mailbox_id, 3, None)],
+            )
+            .unwrap();
+
+        assert!(cache.update_flags_many(&mailbox_id, &[Uid(1), Uid(2)], &[SystemFlagBit::Seen, SystemFlagBit::Flagged], &[]).unwrap());
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(!loaded.iter().find(|m| m.uid == Uid(1)).unwrap().is_unread());
+        assert!(!loaded.iter().find(|m| m.uid == Uid(2)).unwrap().is_unread());
+        assert!(loaded.iter().find(|m| m.uid == Uid(3)).unwrap().is_unread());
+        assert!(loaded.iter().find(|m| m.uid == Uid(1)).unwrap().is_starred());
+        assert!(!loaded.iter().find(|m| m.uid == Uid(3)).unwrap().is_starred());
+
+        // One uid outside the cached window fails the whole batch.
+        assert!(!cache.update_flags_many(&mailbox_id, &[Uid(2), Uid(99)], &[SystemFlagBit::Flagged], &[]).unwrap());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The tag-toggle contract: an `update_keywords` add/remove round-trips
     /// through a reload (so a restart before the next sync keeps showing the
     /// tag), and it leaves the summary's other fields - flags in particular -
@@ -1441,6 +1669,43 @@ mod tests {
         assert!(!loaded.keywords.contains(&red));
 
         assert!(!cache.update_keywords(&mailbox_id, Uid(99), &[work], &[]).unwrap());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The batch counterpart of `patches_keywords_on_a_cached_summary`:
+    /// keywords applied to many uids at once land on exactly the targeted
+    /// uids, leave the others (and their flags) untouched, and a uid outside
+    /// the cached window fails the whole batch.
+    #[test]
+    fn patches_keywords_on_many_cached_summaries_at_once() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let work = lookout_core::tag_keyword("work");
+        let red = lookout_core::tag_keyword("red");
+
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)],
+            )
+            .unwrap();
+        cache.update_flags_many(&mailbox_id, &[Uid(1)], &[SystemFlagBit::Seen], &[]).unwrap();
+
+        assert!(cache.update_keywords_many(&mailbox_id, &[Uid(1), Uid(2)], &[work.clone(), red.clone()], &[]).unwrap());
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(loaded.iter().find(|m| m.uid == Uid(1)).unwrap().keywords.contains(&work));
+        assert!(loaded.iter().find(|m| m.uid == Uid(2)).unwrap().keywords.contains(&red));
+        assert!(!loaded.iter().find(|m| m.uid == Uid(1)).unwrap().is_unread(), "the keyword patch must not disturb flags");
+
+        assert!(cache.update_keywords_many(&mailbox_id, &[Uid(2)], &[], std::slice::from_ref(&red)).unwrap());
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(!loaded.iter().find(|m| m.uid == Uid(2)).unwrap().keywords.contains(&red));
+
+        assert!(!cache.update_keywords_many(&mailbox_id, &[Uid(1), Uid(99)], &[work], &[]).unwrap());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
@@ -1699,6 +1964,31 @@ mod tests {
         assert_eq!(cache.search("confidential", 10).unwrap().len(), 1);
         // The preview term still matches after the body replaces it.
         assert_eq!(cache.search("numbers", 10).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The prefetch pass's contract: `has_bodies` answers for a whole envelope
+    /// batch in one query - reporting exactly the wanted uids that have cached
+    /// bodies, ignoring others' bodies, and honoring `uidvalidity`.
+    #[test]
+    fn reports_which_wanted_uids_have_cached_bodies() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("one")).unwrap();
+        cache.store_body(&mailbox_id, Uid(2), UidValidity(1), &sample_body("two")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(2), &sample_body("other validity")).unwrap();
+
+        // Only the wanted subset comes back; a different uidvalidity never
+        // leaks in.
+        let have = cache.has_bodies(&mailbox_id, &[Uid(1), Uid(3), Uid(9)], UidValidity(1)).unwrap();
+        assert_eq!(have, HashSet::from([Uid(1)]));
+
+        // Empty want-list is a cheap empty answer, not a full-table scan.
+        assert!(cache.has_bodies(&mailbox_id, &[], UidValidity(1)).unwrap().is_empty());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

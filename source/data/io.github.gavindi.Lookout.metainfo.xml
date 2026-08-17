@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.56" date="2026-08-17">
+      <description>
+        <p>More of the optimisation roadmap: the SQLite cache layer's per-uid N+1s are gone. The background prefetch asks once which bodies are already cached instead of querying per UID; moving several messages deletes them all in one transaction; joined mark-read and tag-toggling batches patch every cached summary in one transaction with the same all-or-nothing contract as before; and snoozing a batch records all rows at once. Search results now load every hit's envelope in a single FTS-to-messages join instead of one query per hit, which matters on the UI thread where a keystroke can match hundreds of messages. A full audit of the rfc5464 path-name validator found its claimed quadratic rescan was already a linear single pass, so no change was needed there.</p>
+      </description>
+    </release>
     <release version="0.9.55" date="2026-08-17">
       <description>
         <p>An optimisation pass over the IMAP pipeline, SQLite cache, and UI hot paths. IDLE wakes no longer re-SELECT the open folder or run a post-sync STATUS - the sync skips both when the session is already on that folder and derives the sidebar counts from the flags it just fetched. Server capabilities are read once after login instead of once per move batch. The mail cache runs with synchronous=NORMAL (the data is disposable and rebuilt from the server) and the calendar cache gains WAL plus a busy timeout. Search indexing skips the HTML strip for over-limit bodies, the reading pane's remote-content scan is cached per render, and the vendored imap-proto parser drops per-part-path Vec shifts, format!-and-to_string command-building temps, and complete-mode parsers that failed responses split across TCP segments - while a METADATA value with non-UTF-8 bytes now yields a parse error instead of a client crash.</p>

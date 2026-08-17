@@ -1118,7 +1118,7 @@ async fn connect_and_run(
                             // (the message is gone from the server too), so the UI
                             // rebuilds once and the list never flickers.
                             if let Some(cache) = cache {
-                                if let Err(e) = cache.delete_message(&mailbox, uid) {
+                                if let Err(e) = cache.delete_messages(&mailbox, &[uid]) {
                                     tracing::warn!("failed to drop moved message from cache: {e}");
                                 }
                                 emit_cached_messages_after_removal(cache, &mailbox, events).await;
@@ -1164,10 +1164,8 @@ async fn connect_and_run(
                         Ok(()) => {
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
                             if let Some(cache) = cache {
-                                for uid in &uids {
-                                    if let Err(e) = cache.delete_message(&mailbox, *uid) {
-                                        tracing::warn!("failed to drop moved message from cache: {e}");
-                                    }
+                                if let Err(e) = cache.delete_messages(&mailbox, &uids) {
+                                    tracing::warn!("failed to drop moved messages from cache: {e}");
                                 }
                                 emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             }
@@ -1221,10 +1219,8 @@ async fn connect_and_run(
                             // folder, not a special-use role.
                             let _ = events.send(AccountEvent::MessageMoved { role: MailboxRole::Custom }).await;
                             if let Some(cache) = cache {
-                                for uid in &uids {
-                                    if let Err(e) = cache.delete_message(&mailbox, *uid) {
-                                        tracing::warn!("failed to drop moved message from cache: {e}");
-                                    }
+                                if let Err(e) = cache.delete_messages(&mailbox, &uids) {
+                                    tracing::warn!("failed to drop moved messages from cache: {e}");
                                 }
                                 emit_cached_messages_after_removal(cache, &mailbox, events).await;
                             }
@@ -1316,10 +1312,8 @@ async fn connect_and_run(
                 }
                 AccountCommand::SnoozeMessages { mailbox, uids, until } => {
                     if let Some(cache) = cache {
-                        for uid in &uids {
-                            if let Err(e) = cache.snooze_message(&mailbox, *uid, until) {
-                                tracing::warn!("failed to record snooze: {e}");
-                            }
+                        if let Err(e) = cache.snooze_messages(&mailbox, &uids, until) {
+                            tracing::warn!("failed to record snooze: {e}");
                         }
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
@@ -1444,7 +1438,7 @@ async fn connect_and_run(
                             // fallback path for a single message, and stays
                             // so for a batch.
                             let all_patched = match cache {
-                                Some(cache) => uids.iter().all(|uid| cache.update_flags(&mailbox, *uid, &add, &remove).unwrap_or(false)),
+                                Some(cache) => cache.update_flags_many(&mailbox, &uids, &add, &remove).unwrap_or(false),
                                 None => false,
                             };
                             if all_patched {
@@ -1575,7 +1569,7 @@ async fn connect_and_run(
                             // Same all-or-resync contract as `StoreFlagsMany`:
                             // patch the cache for every uid, or resync once.
                             let all_patched = match cache {
-                                Some(cache) => uids.iter().all(|uid| cache.update_keywords(&mailbox, *uid, &add, &remove).unwrap_or(false)),
+                                Some(cache) => cache.update_keywords_many(&mailbox, &uids, &add, &remove).unwrap_or(false),
                                 None => false,
                             };
                             if all_patched {
@@ -1727,9 +1721,12 @@ async fn connect_and_run(
                     let mut uids: Vec<Uid> = fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
                     uids.sort_by_key(|u| std::cmp::Reverse(u.0));
 
-                    // Filter out already-cached bodies.
+                    // Filter out already-cached bodies. One query for the whole
+                    // envelope batch rather than a SELECT per UID - on a first
+                    // sync of a big folder that's thousands of statements.
                     if let Some(cache) = cache {
-                        uids.retain(|uid| !cache.has_body(&pf.mailboxes[pf.current], *uid, pf.uidvalidity).unwrap_or(false));
+                        let have = cache.has_bodies(&pf.mailboxes[pf.current], &uids, pf.uidvalidity).unwrap_or_default();
+                        uids.retain(|uid| !have.contains(uid));
                     }
 
                     // Remember each still-wanted uid's part structure (only
