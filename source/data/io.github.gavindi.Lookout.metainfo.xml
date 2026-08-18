@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.71" date="2026-08-19">
+      <description>
+        <p>Browsing a very large mailbox (tens of thousands of messages) no longer briefly freezes the window while the list re-sorts and re-groups - that work now happens in the background for big mailboxes, with typical mailboxes unaffected.</p>
+      </description>
+    </release>
     <release version="0.9.70" date="2026-08-19">
       <description>
         <p>Moving a message no longer leaves its attachments and raw copy behind in the local cache forever - those are now cleaned up immediately, with a background sweep and periodic disk reclaim to catch anything left over from before this fix.</p>

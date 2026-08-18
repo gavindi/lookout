@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.71 (2026-08-19)
+
+### Changed
+
+- **App**: sorting and grouping a large mailbox no longer stalls the GTK main thread. A release-build timing probe found `repopulate`'s sort/fingerprint/bucket pass imperceptible for typical mailboxes (~1ms at 1,000 messages) but a real stall on a long-lived inbox or a Gmail "All Mail" folder (~9ms at 10,000, ~40ms at 50,000, ~74ms at 100,000). `repopulate` is now split into `compute_layout` (a new pure function: filter, sort, fingerprint, bucket - no GTK types) and `apply_layout` (the existing no-op check, collapse/selection snapshot, and `gio::ListStore` splicing). Above a new 5,000-message threshold, `compute_layout` is dispatched to the app's `Worker` via `tokio::task::spawn_blocking` and applied back on the main thread through `glib::spawn_future_local`; below it, everything still runs inline exactly as before, so typical mailboxes are unaffected. A new per-model generation counter (the same idiom as `RecipientEntry::suggestion_generation`) discards a background reply that a newer call - a rapid filter toggle, a mailbox switch, another sync - has already superseded, so a stale layout can never land over what's already on screen.
+
+### Testing
+
+- `lookout-app`: a pure `compute_layout` test at just-above-threshold scale, and a real-`Worker` + `glib::MainLoop` scenario (with a timeout safety net) appended to the existing `tree_model_expansion_and_layout` test - appended rather than a new `#[test]` since GTK can only be initialized once per process. The dispatch's first end-to-end run caught a real bug: `compute_layout` initially called `Local::now()` internally instead of taking it as a parameter the way `build_layout` already does, which would have bucketed a background-computed layout against whatever moment the blocking pool got around to it rather than when `repopulate` was actually called.
+
 ## 0.9.70 (2026-08-19)
 
 ### Fixed

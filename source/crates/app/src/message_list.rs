@@ -10,7 +10,7 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -19,6 +19,8 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::{EmailSummary, MailboxId, ThreadKey, Uid};
+
+use crate::worker::Worker;
 
 /// Which field the message list is ordered by. Paired with
 /// `UiState::sort_descending`, this is the whole of the list's ordering
@@ -549,6 +551,27 @@ fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
     messages.iter().map(message_row_key).collect()
 }
 
+/// `repopulate`'s pure-data prefix: filter, sort, fingerprint, then bucket
+/// into a `ListLayout` - everything up to (but not including) the point
+/// where a result gets wrapped into a `glib::BoxedAnyObject` and spliced into
+/// a `gio::ListStore`. No GTK type appears anywhere in this function or
+/// anything it calls, which is what makes it safe to run on
+/// `tokio::task::spawn_blocking` for a mailbox large enough that this is
+/// worth doing off the main thread (see `BACKGROUND_REPOPULATE_THRESHOLD`).
+///
+/// `now` is captured by the caller rather than read here with `Local::now()`,
+/// the same reason `build_layout` already takes it as a parameter: a
+/// deterministic input makes this testable, and it means a background
+/// dispatch buckets relative to the moment `repopulate` was called, not
+/// whenever the blocking pool happened to get around to it.
+fn compute_layout(truth: Vec<EmailSummary>, filter: ListFilter, sort_key: SortKey, sort_descending: bool, threaded: bool, now: DateTime<Local>) -> (ListLayout, Vec<MessageRowKey>) {
+    let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m)).collect();
+    sort_messages(&mut messages, sort_key, sort_descending);
+    let keys = message_row_keys(&messages);
+    let layout = build_layout(messages, sort_key, now, threaded, sort_descending);
+    (layout, keys)
+}
+
 /// A `SectionRow` fingerprint: bucket identity plus its label, so a relabel
 /// (e.g. `LastMonth`'s label crossing a month boundary between rebuilds)
 /// still counts as a change even though the bucket itself didn't move.
@@ -753,10 +776,54 @@ pub struct MessageListModel {
     /// sort), so every caller that rebuilds the list gets the same subset
     /// without threading the filter through each call site.
     filter: Rc<RefCell<ListFilter>>,
+    /// Bumped on every `repopulate` call (both the inline and background
+    /// paths), and captured at the start of a background dispatch. When that
+    /// dispatch's reply lands, it's discarded unless this still reads the
+    /// same value - otherwise a newer call (a rapid filter toggle, mailbox
+    /// switch, or another sync) has already superseded it. Same idiom as
+    /// `RecipientEntry::suggestion_generation`.
+    generation: Rc<Cell<u64>>,
+    /// The background dispatcher for `repopulate`'s pure compute prefix on a
+    /// mailbox large enough for it to matter (see `BACKGROUND_REPOPULATE_THRESHOLD`).
+    /// `None` for a model built via the plain `build()` (every test) - those
+    /// always take the inline path, so no test needs a real `Worker` (an OS
+    /// thread plus a tokio runtime) just to construct a model.
+    worker: Option<Rc<Worker>>,
 }
 
+/// Above this many messages, `repopulate`'s pure-data prefix (filter + sort +
+/// row-key fingerprinting + `build_layout`) is dispatched to the `Worker`'s
+/// blocking pool instead of running inline. Below it, the cost is
+/// imperceptible and dispatching would only add latency and complexity for
+/// nothing.
+///
+/// Chosen from a release-build timing probe (`repopulate_cost_at_scale`):
+/// 1,000 messages cost ~1.0ms total, 10,000 ~9.2ms (the first point close to
+/// a 16ms frame budget), 50,000 ~40ms, 100,000 ~74ms. 5,000 leaves headroom
+/// under that budget once the still-inline splice/`capture_collapsed`/
+/// `restore_selection` cost is added on top.
+const BACKGROUND_REPOPULATE_THRESHOLD: usize = 5_000;
+
 impl MessageListModel {
+    /// Builds a model that always computes `repopulate`'s layout inline,
+    /// regardless of size - used by every test (all of which use fixture
+    /// lists far under `BACKGROUND_REPOPULATE_THRESHOLD` anyway) so no test
+    /// needs a real `Worker` just to construct a model. The app itself always
+    /// has a `Worker` and uses `build_with_worker`.
+    #[cfg(test)]
     pub fn build() -> Self {
+        Self::build_internal(None)
+    }
+
+    /// Builds a model that dispatches `repopulate`'s pure-compute prefix to
+    /// `worker`'s blocking pool once the incoming message set exceeds
+    /// `BACKGROUND_REPOPULATE_THRESHOLD`. Used at the app's one real
+    /// construction site (`window.rs`'s `build_window`).
+    pub fn build_with_worker(worker: Rc<Worker>) -> Self {
+        Self::build_internal(Some(worker))
+    }
+
+    fn build_internal(worker: Option<Rc<Worker>>) -> Self {
         let root = gio::ListStore::new::<glib::BoxedAnyObject>();
         let sections: Rc<RefCell<HashMap<DateBucket, TrackedStore>>> = Rc::new(RefCell::new(HashMap::new()));
         let threads: Rc<RefCell<HashMap<ThreadId, TrackedStore>>> = Rc::new(RefCell::new(HashMap::new()));
@@ -796,6 +863,8 @@ impl MessageListModel {
             displayed: Rc::new(RefCell::new(None)),
             truth: Rc::new(RefCell::new(Vec::new())),
             filter: Rc::new(RefCell::new(ListFilter::All)),
+            generation: Rc::new(Cell::new(0)),
+            worker,
         }
     }
 
@@ -880,30 +949,74 @@ impl MessageListModel {
     /// reading pane even though the selection ultimately restores to the
     /// same place.
     ///
-    /// Every model mutation below - each `splice`, each `set_expanded` -
-    /// synchronously fires `items-changed`, which reaches the selection
-    /// handler and thence `UiState`. So no `RefCell` borrow may be held
-    /// across one; each step snapshots what it needs and drops the borrow
-    /// first.
+    /// Every model mutation in `apply_layout` below - each `splice`, each
+    /// `set_expanded` - synchronously fires `items-changed`, which reaches
+    /// the selection handler and thence `UiState`. So no `RefCell` borrow may
+    /// be held across one; each step snapshots what it needs and drops the
+    /// borrow first.
+    ///
+    /// Above `BACKGROUND_REPOPULATE_THRESHOLD` messages, the pure compute
+    /// (`compute_layout`: filter, sort, fingerprint, bucket) is dispatched to
+    /// `self.worker`'s blocking pool instead of running inline, so a large
+    /// mailbox's sync doesn't stall the GTK main thread. `self.generation` is
+    /// bumped on every call (both paths) and captured before a background
+    /// dispatch; if a newer call - a rapid filter toggle, a mailbox switch,
+    /// another sync - starts before that dispatch's reply lands, the reply is
+    /// discarded as stale instead of applying an out-of-date layout over
+    /// whatever the newer call already rendered (same idiom as
+    /// `RecipientEntry::suggestion_generation`).
     pub fn repopulate(&self, messages: Vec<EmailSummary>, sort_key: SortKey, sort_descending: bool) {
         // Remember the full, unfiltered set first - a filter toggle
         // re-renders from this, so messages hidden by the filter aren't lost.
-        // Moved in rather than cloned: the no-op check below compares only
-        // the filtered subset, but `truth` must still see every incoming
-        // change - including one the filter hides - or a later filter toggle
-        // would render stale data.
+        // Moved in rather than cloned: `compute_layout` only ever sees the
+        // filtered subset, but `truth` must still see every incoming change -
+        // including one the filter hides - or a later filter toggle would
+        // render stale data.
         *self.truth.borrow_mut() = messages;
 
-        // Apply the active filter, then sort the surviving subset. Filtering
-        // first keeps the no-op check comparing like with like: the subset
-        // this rebuild produced against the subset already displayed. The
-        // subset itself is cloned out of `truth` (one clone of the surviving
-        // messages; the old code's second full-set clone into `displayed` is
-        // gone - `displayed` now keeps just the row keys).
         let filter = *self.filter.borrow();
-        let mut messages: Vec<EmailSummary> = self.truth.borrow().iter().filter(|m| filter.matches(m)).cloned().collect();
-        sort_messages(&mut messages, sort_key, sort_descending);
+        let threaded = *self.threaded.borrow();
+        let now = Local::now();
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
 
+        // One clone of the full (unfiltered) truth to hand to `compute_layout`
+        // - inline or on the blocking pool, either way `compute_layout` needs
+        // an owned `Vec` to filter/sort/consume.
+        let truth_snapshot = self.truth.borrow().clone();
+
+        let worker = if truth_snapshot.len() > BACKGROUND_REPOPULATE_THRESHOLD { self.worker.as_ref() } else { None };
+        let Some(worker) = worker else {
+            // Small enough to be imperceptible inline (or no worker - every
+            // test-built model), or under the threshold: compute and apply
+            // in the same call, exactly as before this split existed.
+            let (layout, keys) = compute_layout(truth_snapshot, filter, sort_key, sort_descending, threaded, now);
+            self.apply_layout(sort_key, sort_descending, filter, threaded, keys, layout);
+            return;
+        };
+
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        worker.spawn(async move {
+            if let Ok(result) = tokio::task::spawn_blocking(move || compute_layout(truth_snapshot, filter, sort_key, sort_descending, threaded, now)).await {
+                let _ = reply_tx.send(result).await;
+            }
+        });
+        let model = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok((layout, keys)) = reply_rx.recv().await else { return };
+            if model.generation.get() != generation {
+                return;
+            }
+            model.apply_layout(sort_key, sort_descending, filter, threaded, keys, layout);
+        });
+    }
+
+    /// The GTK-touching half of `repopulate`: given an already-computed
+    /// layout (either just now, inline, or from a background
+    /// `compute_layout` dispatch), does the no-op check, snapshots collapse
+    /// and selection state, and splices the result into the tree. See
+    /// `repopulate`'s doc comment for the two ways this gets called.
+    fn apply_layout(&self, sort_key: SortKey, sort_descending: bool, filter: ListFilter, threaded: bool, keys: Vec<MessageRowKey>, layout: ListLayout) {
         // The sort is part of the comparison, not just the contents: a list
         // can be element-identical under ascending and descending order yet
         // still need re-grouping, because the sections come out mirrored. So
@@ -912,8 +1025,6 @@ impl MessageListModel {
         // mode: the same message set renders a different tree under
         // conversations than under bare messages, and flipping the View-tab
         // toggle must rebuild even when nothing else moved.
-        let threaded = *self.threaded.borrow();
-        let keys = message_row_keys(&messages);
         let unchanged = self
             .displayed
             .borrow()
@@ -945,7 +1056,7 @@ impl MessageListModel {
 
         *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, threaded, keys));
 
-        match build_layout(messages, sort_key, Local::now(), threaded, sort_descending) {
+        match layout {
             ListLayout::Flat(messages) => {
                 // No sections, no threads: every child store drains, so a
                 // later threaded rebuild can't resurrect rows from a layout
@@ -1595,6 +1706,44 @@ mod tests {
         partial.repopulate(vec![summary(1, today), summary(4, today), summary(2, yesterday), summary(3, older)], SortKey::Date, true);
         assert!(!partial.tree.child_row(2).expect("Older row").is_expanded(), "an untouched section's collapse must survive a partial diff");
         assert_eq!(partial.selected_summary().map(|s| s.uid), Some(Uid(1)), "selection must survive a partial diff");
+
+        // --- Above BACKGROUND_REPOPULATE_THRESHOLD, repopulate dispatches to
+        // a real Worker instead of computing inline - the splice must still
+        // land, once the background job answers, exactly as the inline path
+        // would have produced it. Appended here rather than a separate
+        // `#[test]` for the same reason this whole test is one function: GTK
+        // may only be `gtk::init()`'d once per process. ---
+        let big = MessageListModel::build_with_worker(Rc::new(Worker::new()));
+        let n = BACKGROUND_REPOPULATE_THRESHOLD + 1;
+        big.repopulate((0..n as u32).map(|uid| summary(uid, today)).collect(), SortKey::Date, true);
+        // The dispatch must not block or apply synchronously - nothing is
+        // spliced until the background reply lands.
+        assert_eq!(big.selection.n_items(), 0, "a background dispatch must return immediately, before its reply lands");
+
+        let main_loop = glib::MainLoop::new(Some(&glib::MainContext::default()), false);
+        // Safety net: a wiring bug (a dropped channel, a generation-guard
+        // that never matches) must fail the assertion below instead of
+        // hanging the test suite.
+        glib::timeout_add_local_once(std::time::Duration::from_secs(10), {
+            let main_loop = main_loop.clone();
+            move || main_loop.quit()
+        });
+        glib::timeout_add_local(std::time::Duration::from_millis(5), {
+            let main_loop = main_loop.clone();
+            let big = big.clone();
+            move || {
+                if big.selection.n_items() > 0 {
+                    main_loop.quit();
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            }
+        });
+        main_loop.run();
+
+        // One "Today" section header plus every message.
+        assert_eq!(big.selection.n_items() as usize, n + 1, "the background-computed layout must splice exactly as the inline path would");
     }
 
     #[test]
@@ -1655,6 +1804,45 @@ mod tests {
         }
     }
 
+    /// Manual timing probe (not a regression test) for OPT_TODO's "move the
+    /// sort/group off the main thread" item - measures whether `repopulate`'s
+    /// pure-data prefix (sort + build_layout + row-key fingerprinting) is
+    /// actually expensive enough at realistic-to-extreme mailbox sizes to
+    /// justify a `spawn_blocking` redesign, before committing to the extra
+    /// complexity (channel plumbing, staleness guards, a re-entrancy window
+    /// while a background job is in flight). Run with:
+    /// `cargo test -p lookout-app --release message_list::tests::repopulate_cost_at_scale -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual timing probe, not a regression test"]
+    fn repopulate_cost_at_scale() {
+        let now = local(2026, 8, 4, 8);
+        for n in [1_000usize, 10_000, 50_000, 100_000] {
+            let messages: Vec<EmailSummary> = (0..n).map(|i| summary(i as u32, utc_on(now, 2026, 8, (i % 28 + 1) as u32))).collect();
+
+            let start = std::time::Instant::now();
+            let mut sorted = messages.clone();
+            sort_messages(&mut sorted, SortKey::Date, true);
+            let sort_time = start.elapsed();
+
+            let start = std::time::Instant::now();
+            let keys = message_row_keys(&sorted);
+            let keys_time = start.elapsed();
+
+            let start = std::time::Instant::now();
+            let layout = build_layout(sorted, SortKey::Date, now, false, true);
+            let layout_time = start.elapsed();
+
+            let sections = match &layout {
+                ListLayout::Grouped(s) => s.len(),
+                ListLayout::Threaded(s) => s.len(),
+                ListLayout::Flat(_) => 0,
+            };
+            let total = sort_time + keys_time + layout_time;
+            println!("n={n:>7}: sort={sort_time:>9?}  keys={keys_time:>9?}  build_layout={layout_time:>9?}  total={total:>9?}  sections={sections}");
+            let _ = keys;
+        }
+    }
+
     #[test]
     fn non_date_sorts_render_flat() {
         let now = local(2026, 8, 4, 8);
@@ -1711,6 +1899,35 @@ mod tests {
                 (DateBucket::Year(2024), "2024", 1),
                 (DateBucket::Year(2023), "2023", 1),
             ]
+        );
+    }
+
+    /// `compute_layout` (the pure prefix `repopulate` dispatches to a
+    /// background thread once the incoming set exceeds
+    /// `BACKGROUND_REPOPULATE_THRESHOLD`) must bucket, sort, and fingerprint
+    /// a set above that threshold exactly as `build_layout` does for a small
+    /// one - scaling up doesn't change the logic, only where it runs.
+    #[test]
+    fn compute_layout_buckets_and_fingerprints_a_set_above_the_background_threshold() {
+        let now = local(2026, 8, 4, 8);
+        let dates = [utc_on(now, 2026, 8, 4), utc_on(now, 2026, 7, 15), utc_on(now, 2026, 2, 22)];
+        let n = BACKGROUND_REPOPULATE_THRESHOLD + 1;
+        let messages: Vec<EmailSummary> = (0..n as u32).map(|uid| summary(uid, dates[uid as usize % 3])).collect();
+
+        let (layout, keys) = compute_layout(messages, ListFilter::All, SortKey::Date, true, false, now);
+        assert_eq!(keys.len(), n, "every message produced one row-key fingerprint");
+
+        let ListLayout::Grouped(sections) = layout else {
+            panic!("expected a grouped layout");
+        };
+        let shape: Vec<(DateBucket, usize)> = sections.iter().map(|(b, _, m)| (*b, m.len())).collect();
+        // n is a multiple of 3 (BACKGROUND_REPOPULATE_THRESHOLD + 1 = 5001),
+        // so the three buckets split evenly.
+        assert_eq!(n % 3, 0);
+        assert_eq!(
+            shape,
+            vec![(DateBucket::Today, n / 3), (DateBucket::LastMonth, n / 3), (DateBucket::Older, n / 3)],
+            "the same three buckets `build_layout` produces for this exact date mix at small scale (see date_sort_cuts_one_section_per_run), just at scale"
         );
     }
 

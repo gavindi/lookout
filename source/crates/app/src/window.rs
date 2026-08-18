@@ -1634,7 +1634,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     folder_card.set_size_request(FOLDER_PANE_MIN_WIDTH, -1);
 
     // --- Message list ---
-    let message_list = MessageListModel::build();
+    let message_list = MessageListModel::build_with_worker(worker.clone());
     let last_selection = last_view::load(&settings);
     // Phase 5: the scalars that used to be hardcoded here now come from the
     // GSettings-backed store (see `settings`), so the session starts where
