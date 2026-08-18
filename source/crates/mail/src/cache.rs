@@ -690,6 +690,30 @@ impl Cache {
         load_summary_row(&conn, mailbox_id, uid)
     }
 
+    /// The batch counterpart of `load_summary` - one connection lock and one
+    /// prepared statement reused per uid instead of one `load_summary` call
+    /// per uid. Used by the session's coalesced on-demand body fetch to learn
+    /// every queued message's `BODYSTRUCTURE`-derived part structure in a
+    /// single pass. A uid with no cached summary is simply absent from the
+    /// result, exactly as `load_summary` reports it as `None`.
+    pub fn load_summaries(&self, mailbox_id: &MailboxId, uids: &[Uid]) -> Result<HashMap<Uid, EmailSummary>> {
+        if uids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+        let mut out = HashMap::new();
+        for &uid in uids {
+            let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
+            if let Some(Ok(data)) = rows.next() {
+                if let Ok(summary) = serde_json::from_str::<EmailSummary>(&data) {
+                    out.insert(uid, summary);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Returns the previously-fetched body of a message, or `None` if it
     /// isn't cached. `uidvalidity` guards the cache against serving a body
     /// for a recycled uid after its mailbox was re-created (RFC 3501
@@ -800,6 +824,30 @@ impl Cache {
             }
         }
         Ok(found)
+    }
+
+    /// The batch counterpart of `load_body` - one prepared statement reused
+    /// per uid instead of one `load_body` call per uid. Used by the
+    /// session's coalesced on-demand body fetch to serve whatever's already
+    /// cached for a batch of requested messages with no network round trip
+    /// at all. A uid with nothing cached (or cached under a different
+    /// `uidvalidity`) is simply absent from the result.
+    pub fn load_bodies(&self, mailbox_id: &MailboxId, uids: &[Uid], uidvalidity: UidValidity) -> Result<HashMap<Uid, EmailBody>> {
+        if uids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT data FROM bodies WHERE mailbox_id = ?1 AND uid = ?2 AND uidvalidity = ?3")?;
+        let mut out = HashMap::new();
+        for &uid in uids {
+            let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0], |row| row.get::<_, Vec<u8>>(0))?;
+            if let Some(Ok(data)) = rows.next() {
+                if let Ok(body) = serde_json::from_slice::<EmailBody>(&data) {
+                    out.insert(uid, body);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The per-account flat-file path an attachment's *decoded* bytes are
@@ -2458,6 +2506,68 @@ mod tests {
 
         // Empty want-list is a cheap empty answer, not a full-table scan.
         assert!(cache.has_bodies(&mailbox_id, &[], UidValidity(1)).unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The session's coalesced on-demand body fetch relies on this: every
+    /// wanted uid's summary comes back keyed for lookup, a uid with nothing
+    /// cached is simply absent rather than an error, and an unrelated
+    /// mailbox's rows never leak in.
+    #[test]
+    fn load_summaries_returns_exactly_the_requested_subset() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let other_mailbox = MailboxId::new(&account_id, "Archive");
+
+        cache
+            .replace_messages(
+                &mailbox_id,
+                UidValidity(1),
+                &[
+                    sample_summary(&mailbox_id, 1, Some("preview one")),
+                    sample_summary(&mailbox_id, 2, None),
+                    sample_summary(&mailbox_id, 3, None),
+                ],
+            )
+            .unwrap();
+        cache.replace_messages(&other_mailbox, UidValidity(1), &[sample_summary(&other_mailbox, 1, None)]).unwrap();
+
+        let summaries = cache.load_summaries(&mailbox_id, &[Uid(1), Uid(2), Uid(99)]).unwrap();
+        assert_eq!(summaries.len(), 2, "uid 3 wasn't asked for, uid 99 isn't cached");
+        assert_eq!(summaries.get(&Uid(1)).and_then(|s| s.preview.as_deref()), Some("preview one"));
+        assert!(summaries.contains_key(&Uid(2)));
+        assert!(!summaries.contains_key(&Uid(99)), "an uncached uid is simply absent");
+
+        // The other mailbox's uid 1 must never answer for this mailbox's uid 1.
+        assert_eq!(summaries.get(&Uid(1)).map(|s| s.mailbox.clone()), Some(mailbox_id.clone()));
+
+        assert!(cache.load_summaries(&mailbox_id, &[]).unwrap().is_empty(), "empty want-list is a cheap empty answer");
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The batch counterpart of `reports_which_wanted_uids_have_cached_bodies`
+    /// for `load_bodies`: the actual bodies come back, not just presence, and
+    /// the same uidvalidity/want-list guards apply.
+    #[test]
+    fn load_bodies_returns_exactly_the_requested_subset() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("one")).unwrap();
+        cache.store_body(&mailbox_id, Uid(2), UidValidity(1), &sample_body("two")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(2), &sample_body("other validity")).unwrap();
+
+        let bodies = cache.load_bodies(&mailbox_id, &[Uid(1), Uid(3), Uid(9)], UidValidity(1)).unwrap();
+        assert_eq!(bodies.keys().copied().collect::<HashSet<_>>(), HashSet::from([Uid(1)]));
+        assert_eq!(bodies[&Uid(1)].text_body.as_deref(), Some("one"));
+
+        assert!(cache.load_bodies(&mailbox_id, &[], UidValidity(1)).unwrap().is_empty());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

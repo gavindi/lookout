@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.72 (2026-08-19)
+
+### Fixed
+
+- **App**: switching folders no longer shows the loading spinner over an already-correct, cache-painted message list. Since folder-switch and exit-search cache reads moved off the GTK main thread (0.9.69), the reply that repopulates the list from cache never told the loading-spinner stack to flip back to `"list"` - it only cleared once the separate, slower live-IMAP `MessagesUpdated` event arrived from the account session, so every folder switch showed a spinner for the full round trip to the server even when the correct rows were already on screen underneath it. `select_mailbox` and `exit_search`'s deferred cache-reply closures now call the existing `refresh_message_loading_state` right after painting the cached list, exactly restoring the pre-0.9.69 behavior where a cached folder's switch never showed a spinner at all.
+
+### Changed
+
+- **Mail**: the background body prefetch's batch size dropped from 10 to 3 full message bodies per `UID FETCH`. A prefetch batch's round trip can't be interrupted once sent - the IMAP connection is one-command-at-a-time - so it's also the worst-case delay a queued user command (a folder switch, an open message) can be stuck behind; the old target of "a few seconds" per batch was long enough to read as a UI stall. Added `elapsed_ms` timing to the prefetch's envelope/`BODYSTRUCTURE` fetch, each body batch fetch (now logged unconditionally, not just when bodies were actually fetched - a mostly-cached batch still pays the round trip), and the main loop's SELECT+IDLE-init sequence when it resolves to a command, so a future stall of this kind shows exactly which round trip is responsible instead of requiring another investigation from scratch.
+
 ## 0.9.71 (2026-08-19)
 
 ### Changed

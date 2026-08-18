@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.72" date="2026-08-19">
+      <description>
+        <p>Switching folders no longer shows a loading spinner over a message list that's already correctly loaded from cache. Background mail prefetching is also more considerate now, checking in with the app more often so it never keeps a folder switch or an opened message waiting as long as it used to.</p>
+      </description>
+    </release>
     <release version="0.9.71" date="2026-08-19">
       <description>
         <p>Browsing a very large mailbox (tens of thousands of messages) no longer briefly freezes the window while the list re-sorts and re-groups - that work now happens in the background for big mailboxes, with typical mailboxes unaffected.</p>

@@ -69,9 +69,14 @@ const PREVIEW_FETCH_LIMIT: usize = 50;
 const PREVIEW_FETCH_BYTES: u32 = 16384;
 
 /// How many full message bodies to fetch per IDLE cycle during background
-/// prefetch. Small enough to keep each batch fast (a few seconds), large
-/// enough to make progress across hundreds of messages.
-const PREFETCH_BATCH_SIZE: usize = 10;
+/// prefetch. A batch's `UID FETCH` round trip can't be interrupted once sent,
+/// since the connection is one-command-at-a-time, so this is also the
+/// worst-case delay a user command (a folder switch, an open message) can
+/// queue behind. Was 10 ("a few seconds" per batch by the old target), which
+/// reads as a UI stall; this is small enough to keep each batch close to a
+/// second, still large enough to make real progress across hundreds of
+/// messages.
+const PREFETCH_BATCH_SIZE: usize = 3;
 
 /// How many bytes of sequence-set syntax one `UID`-prefixed command line may
 /// carry before it is split into further commands. Servers cap command-line
@@ -752,6 +757,7 @@ async fn connect_and_run(
                 Ok(cmd) => Wake::Command(cmd),
                 Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
                 Err(async_channel::TryRecvError::Empty) => {
+                    let idle_entry_started = std::time::Instant::now();
                     let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
                     // A cache-served folder switch (or an interrupted prefetch) can
@@ -803,6 +809,16 @@ async fn connect_and_run(
                         },
                     };
 
+                    // How long a command that arrived while we were entering
+                    // IDLE (the SELECT-if-needed above, plus `handle.init()`'s
+                    // own round trip) had to wait before it was even noticed -
+                    // independent of any background prefetch batch, which has
+                    // its own elapsed logging. Not logged for an `Idle`/
+                    // `ChannelClosed` wake since nothing was waiting on those.
+                    if let Wake::Command(_) = &wake {
+                        tracing::debug!(elapsed_ms = idle_entry_started.elapsed().as_millis(), "idle-entry: command noticed after SELECT+IDLE-init");
+                    }
+
                     // Emit cached messages for instant display the instant a folder
                     // switch arrives, *before* the IDLE teardown (handle.done().await)
                     // so the UI paints from disk while we wait for the network round-trip.
@@ -853,8 +869,14 @@ async fn connect_and_run(
         }
 
         // Process the command that woke us (if any), then drain any further
-        // commands queued up while we were mid-teardown.
-        for command in woke_on_command.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
+        // commands queued up while we were mid-teardown. `pending` (rather
+        // than a plain `for`-over-`try_recv()`) exists so `FetchBody`'s arm
+        // below can peek further ahead in the queue to coalesce same-mailbox
+        // requests (`coalesce_fetch_body`) and push back whatever it decided
+        // not to coalesce - it needs somewhere to put that back other than
+        // the channel itself.
+        let mut pending: VecDeque<AccountCommand> = woke_on_command.into_iter().collect();
+        while let Some(command) = pending.pop_front().or_else(|| commands.try_recv().ok()) {
             match command {
                 AccountCommand::Shutdown => {
                     let _ = session.logout().await;
@@ -969,6 +991,12 @@ async fn connect_and_run(
                     let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
                         continue;
                     };
+                    // Answer every other `FetchBody` already queued for this
+                    // same mailbox with the same round trip - paging quickly
+                    // through several uncached messages queues one per
+                    // selection change well before the first one's fetch
+                    // even starts.
+                    let uids = coalesce_fetch_body(&mailbox, uid, &mut pending, commands);
                     if session_selected != mailbox {
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
@@ -980,14 +1008,10 @@ async fn connect_and_run(
                     // a deliberate cache-miss sentinel: no row can match 0.
                     let uidvalidity = folders.iter().find(|m| m.id == mailbox).map(|m| m.uidvalidity).unwrap_or(UidValidity(0));
                     let started = std::time::Instant::now();
-                    // `None` for the structure: the partial-fetch path reads
-                    // the message's summary (with its BODYSTRUCTURE-derived
-                    // part list) from the cache, and falls back to a
-                    // whole-message fetch when there isn't one.
-                    let body = fetch_body_cached(cache, &mut session, &mailbox, uid, uidvalidity, None).await?;
-                    tracing::debug!(?mailbox, uid = uid.0, elapsed_ms = started.elapsed().as_millis(), "FetchBody: body ready");
-                    if let Some(body) = body {
-                        let _ = events.send(AccountEvent::BodyFetched { mailbox, uid, body }).await;
+                    let bodies = fetch_bodies_on_demand(cache, &mut session, &mailbox, uidvalidity, &uids).await?;
+                    tracing::debug!(?mailbox, count = uids.len(), elapsed_ms = started.elapsed().as_millis(), "FetchBody: batch ready");
+                    for (uid, body) in bodies {
+                        let _ = events.send(AccountEvent::BodyFetched { mailbox: mailbox.clone(), uid, body }).await;
                     }
                 }
                 AccountCommand::FetchAttachment { mailbox, uid, part } => {
@@ -2065,7 +2089,9 @@ async fn connect_and_run(
                     }
                     let fetch_from = mailbox_meta.exists.saturating_sub(INITIAL_FETCH_LIMIT - 1).max(1);
                     let seq_range = format!("{fetch_from}:*");
+                    let started = std::time::Instant::now();
                     let fetches: Vec<_> = session.fetch(&seq_range, "(UID BODYSTRUCTURE)").await?.try_collect().await?;
+                    let envelope_fetch_elapsed_ms = started.elapsed().as_millis();
 
                     // Collect UIDs, newest first.
                     let mut uids: Vec<Uid> = fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
@@ -2101,6 +2127,7 @@ async fn connect_and_run(
                     tracing::debug!(
                         mailbox = %pf.mailboxes[pf.current],
                         total = uids.len(),
+                        elapsed_ms = envelope_fetch_elapsed_ms,
                         "prefetch: queued UIDs for body download"
                     );
                     pf.pending_uids = uids;
@@ -2118,6 +2145,8 @@ async fn connect_and_run(
                         continue;
                     }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(PREFETCH_BATCH_SIZE)).collect();
+                    let batch_len = batch.len();
+                    let started = std::time::Instant::now();
                     let fetched = match fetch_bodies_batch(
                         cache,
                         &mut session,
@@ -2128,19 +2157,27 @@ async fn connect_and_run(
                     )
                     .await
                     {
-                        Ok(fetched) => fetched,
+                        Ok(bodies) => bodies.len(),
                         Err(e) => {
                             tracing::warn!(?e, "prefetch: batch fetch failed");
                             0
                         }
                     };
+                    // Logged unconditionally, not just when `fetched > 0`: a
+                    // batch that's mostly (or entirely) already cached still
+                    // pays the round trip - `elapsed_ms` here is exactly the
+                    // window a queued user command (a folder switch, an open
+                    // message) can be stuck behind, since one IMAP connection
+                    // can't service two commands at once.
+                    tracing::debug!(
+                        mailbox = %pf.mailboxes[pf.current],
+                        batch = batch_len,
+                        fetched,
+                        remaining = pf.pending_uids.len(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "prefetch: batch complete"
+                    );
                     if fetched > 0 {
-                        tracing::debug!(
-                            mailbox = %pf.mailboxes[pf.current],
-                            fetched,
-                            remaining = pf.pending_uids.len(),
-                            "prefetch: batch complete"
-                        );
                         did_prefetch_work = true;
                     }
                 }
@@ -2732,6 +2769,31 @@ fn queue_folder_counts(folders: &[Mailbox], current: &MailboxId) -> VecDeque<Mai
         queue.extend(folders.iter().filter(|m| rank(m) == wanted).map(|m| m.id.clone()));
     }
     queue
+}
+
+/// Pulls every already-queued `FetchBody` command for `mailbox` out of
+/// `pending`/`commands` into one uid batch, so the main loop's `FetchBody`
+/// handler can answer them all with a single `UID FETCH` instead of one round
+/// trip per message - the common case when a user pages quickly through
+/// several uncached messages, each selection change queuing its own
+/// `FetchBody` before the previous one's fetch has even started.
+///
+/// Preserves arrival order for everything else: the first command that
+/// doesn't coalesce - a different mailbox, or a different command entirely -
+/// is put back on the *front* of `pending` so it's the very next thing the
+/// main loop processes, exactly as if it had never been peeked at.
+fn coalesce_fetch_body(mailbox: &MailboxId, first_uid: Uid, pending: &mut VecDeque<AccountCommand>, commands: &async_channel::Receiver<AccountCommand>) -> Vec<Uid> {
+    let mut uids = vec![first_uid];
+    while let Some(next) = pending.pop_front().or_else(|| commands.try_recv().ok()) {
+        match next {
+            AccountCommand::FetchBody { mailbox: m, uid } if &m == mailbox => uids.push(uid),
+            other => {
+                pending.push_front(other);
+                break;
+            }
+        }
+    }
+    uids
 }
 
 /// Copies the count fields a `LIST` can't report (`total`, `unread`, and the
@@ -3663,7 +3725,10 @@ async fn fetch_body_partial(session: &mut Session<SessionStream>, uid: Uid, part
 /// re-downloaded - a single blocking-pool hop, where the per-message path
 /// paid a `load_body` JSON decode per uid. A message whose response carries
 /// no text part degrades to a whole-message fetch, the same fallback
-/// `fetch_body_cached` applies. Returns the number of bodies stored.
+/// `fetch_body_cached` applies. Returns every body actually fetched (a uid
+/// already cached, or with nothing readable to fetch, is simply absent) -
+/// the prefetch caller only needs the count, but `fetch_bodies_on_demand`
+/// needs the bodies themselves to answer its callers.
 async fn fetch_bodies_batch(
     cache: &CacheHandle,
     session: &mut Session<SessionStream>,
@@ -3671,9 +3736,9 @@ async fn fetch_bodies_batch(
     uidvalidity: UidValidity,
     batch: &[Uid],
     structures: &HashMap<Uid, Vec<BodyPart>>,
-) -> Result<usize> {
+) -> Result<Vec<(Uid, EmailBody)>> {
     if batch.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // Drop uids whose body landed in the cache since the envelope pass.
@@ -3687,7 +3752,7 @@ async fn fetch_bodies_batch(
     .unwrap_or_default();
     let batch: Vec<Uid> = batch.iter().copied().filter(|uid| !have.contains(uid)).collect();
     if batch.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // Union of the batch's text/calendar part numbers - one query item per
@@ -3702,7 +3767,7 @@ async fn fetch_bodies_batch(
         }
     }
     if part_numbers.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let mut query = String::from("(UID BODY.PEEK[HEADER]");
     for number in &part_numbers {
@@ -3712,11 +3777,15 @@ async fn fetch_bodies_batch(
     }
     query.push(')');
 
-    // The batch is at most `PREFETCH_BATCH_SIZE` uids, so `uid_set_chunks`
-    // yields a single (range-compressed) chunk, keeping the command line well
-    // under servers' length limits.
-    let set = uid_set_chunks(&batch)[0].clone();
-    let fetches: Vec<_> = session.uid_fetch(&set, &query).await?.try_collect().await?;
+    // The prefetch caller's batch is at most `PREFETCH_BATCH_SIZE` uids, so
+    // this is always a single (range-compressed) chunk there; the on-demand
+    // caller's batch has no such fixed cap, so every chunk `uid_set_chunks`
+    // produces gets its own round trip rather than assuming there's only one.
+    let mut fetches = Vec::new();
+    for set in uid_set_chunks(&batch) {
+        let chunk_fetches: Vec<_> = session.uid_fetch(&set, &query).await?.try_collect().await?;
+        fetches.extend(chunk_fetches);
+    }
 
     let mut bodies: Vec<(Uid, EmailBody)> = Vec::new();
     for fetch in &fetches {
@@ -3742,10 +3811,10 @@ async fn fetch_bodies_batch(
         }
     }
 
-    let stored = bodies.len();
-    if stored > 0 {
+    if !bodies.is_empty() {
         if let Some(Err(e)) = cache_op(cache, {
             let mailbox = mailbox.clone();
+            let bodies = bodies.clone();
             move |c| c.store_bodies(&mailbox, uidvalidity, &bodies)
         })
         .await
@@ -3753,7 +3822,79 @@ async fn fetch_bodies_batch(
             tracing::warn!(?mailbox, "prefetch: failed to cache bodies: {e}");
         }
     }
-    Ok(stored)
+    Ok(bodies)
+}
+
+/// The on-demand counterpart of `fetch_bodies_batch`: answers a batch of
+/// `AccountCommand::FetchBody` requests gathered from the command queue
+/// (`coalesce_fetch_body`) rather than the prefetch's own known set, so
+/// paging quickly through several uncached messages costs one round trip for
+/// the whole batch instead of one per message.
+///
+/// Mirrors `fetch_body_cached`'s per-uid steps, batched: a cached body is
+/// served with no round trip at all (`load_bodies`), and every remaining
+/// uid's `BODYSTRUCTURE`-derived part structure is learned in one query
+/// (`load_summaries`) rather than one cache read per uid. Uids a structure is
+/// known for are answered by `fetch_bodies_batch` in a single `UID FETCH`;
+/// a uid with no known structure at all - never learned a BODYSTRUCTURE, or
+/// its summary isn't cached - is rare enough to fall back to
+/// `fetch_body_cached`'s existing per-uid whole-message path, exactly as the
+/// single-uid handler already did for that case.
+async fn fetch_bodies_on_demand(
+    cache: &CacheHandle,
+    session: &mut Session<SessionStream>,
+    mailbox: &MailboxId,
+    uidvalidity: UidValidity,
+    uids: &[Uid],
+) -> Result<Vec<(Uid, EmailBody)>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let cached = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let uids = uids.to_vec();
+        move |c| c.load_bodies(&mailbox, &uids, uidvalidity)
+    })
+    .await
+    .and_then(|r| r.ok())
+    .unwrap_or_default();
+
+    let mut results: Vec<(Uid, EmailBody)> = cached.iter().map(|(&uid, body)| (uid, body.clone())).collect();
+    let remaining: Vec<Uid> = uids.iter().copied().filter(|uid| !cached.contains_key(uid)).collect();
+    if remaining.is_empty() {
+        return Ok(results);
+    }
+
+    let summaries = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let remaining = remaining.clone();
+        move |c| c.load_summaries(&mailbox, &remaining)
+    })
+    .await
+    .and_then(|r| r.ok())
+    .unwrap_or_default();
+
+    let mut structures: HashMap<Uid, Vec<BodyPart>> = HashMap::new();
+    let mut unstructured: Vec<Uid> = Vec::new();
+    for uid in remaining {
+        match summaries.get(&uid).and_then(|s| s.structure.clone()) {
+            Some(structure) => {
+                structures.insert(uid, structure);
+            }
+            None => unstructured.push(uid),
+        }
+    }
+
+    let structured_uids: Vec<Uid> = structures.keys().copied().collect();
+    results.extend(fetch_bodies_batch(cache, session, mailbox, uidvalidity, &structured_uids, &structures).await?);
+
+    for uid in unstructured {
+        if let Some(body) = fetch_body_cached(cache, session, mailbox, uid, uidvalidity, None).await? {
+            results.push((uid, body));
+        }
+    }
+    Ok(results)
 }
 
 /// Fetches one attachment part's wire bytes for the on-demand
@@ -3929,6 +4070,60 @@ mod tests {
         let folders = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 0), mailbox(&account, "Work", MailboxRole::Custom, 0)];
         let queue: Vec<MailboxId> = queue_folder_counts(&folders, &MailboxId::new(&account, "INBOX")).into();
         assert_eq!(queue, vec![MailboxId::new(&account, "INBOX"), MailboxId::new(&account, "Work")]);
+    }
+
+    /// Paging quickly through several uncached messages queues one
+    /// `FetchBody` per selection change - `coalesce_fetch_body` must gather
+    /// all of them (draining `pending` before the channel, both in arrival
+    /// order) so the main loop answers them with a single round trip, and
+    /// stop cleanly the moment it hits a different mailbox's request.
+    #[test]
+    fn coalesce_fetch_body_gathers_same_mailbox_requests_in_order() {
+        let account = AccountId("acc".into());
+        let mailbox_a = MailboxId::new(&account, "INBOX");
+        let mailbox_b = MailboxId::new(&account, "Archive");
+
+        let (tx, rx) = async_channel::unbounded();
+        // Already sitting in the channel: two more same-mailbox requests,
+        // then a different mailbox's request that must stop the coalesce.
+        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(2) }).unwrap();
+        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(3) }).unwrap();
+        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_b.clone(), uid: Uid(9) }).unwrap();
+
+        // Already sitting in `pending`, as if peeked by an earlier call and
+        // not consumed - must drain before the channel is even touched.
+        let mut pending: VecDeque<AccountCommand> = VecDeque::from([AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(1) }]);
+
+        let uids = coalesce_fetch_body(&mailbox_a, Uid(0), &mut pending, &rx);
+        assert_eq!(uids, vec![Uid(0), Uid(1), Uid(2), Uid(3)], "pending drains before the channel, both in arrival order");
+
+        // The different-mailbox request that stopped the coalesce is back at
+        // the front of `pending`, unchanged - the very next thing to process.
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending.front(), Some(AccountCommand::FetchBody { mailbox, uid }) if *mailbox == mailbox_b && *uid == Uid(9)));
+    }
+
+    /// A non-`FetchBody` command must stop the coalesce and land back at the
+    /// front of `pending` untouched, leaving whatever's still behind it in
+    /// the channel exactly where it was - order is preserved for everything
+    /// this function didn't fold into the batch.
+    #[test]
+    fn coalesce_fetch_body_stops_at_a_non_fetch_body_command_and_puts_it_back() {
+        let account = AccountId("acc".into());
+        let mailbox_a = MailboxId::new(&account, "INBOX");
+
+        let (tx, rx) = async_channel::unbounded();
+        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(2) }).unwrap();
+        tx.send_blocking(AccountCommand::Refresh).unwrap();
+        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(3) }).unwrap();
+
+        let mut pending: VecDeque<AccountCommand> = VecDeque::new();
+        let uids = coalesce_fetch_body(&mailbox_a, Uid(1), &mut pending, &rx);
+        assert_eq!(uids, vec![Uid(1), Uid(2)], "a non-FetchBody command stops the coalesce");
+
+        assert!(matches!(pending.front(), Some(AccountCommand::Refresh)), "the stopping command is put back at the front");
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(rx.try_recv(), Ok(AccountCommand::FetchBody { uid, .. }) if uid == Uid(3)), "the channel's remaining item is untouched");
     }
 
     fn summary(uid: u32, mailbox: &MailboxId, seen: bool) -> EmailSummary {

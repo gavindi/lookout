@@ -11655,6 +11655,7 @@ fn select_mailbox(
         });
         let state = state.clone();
         let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
         glib::spawn_future_local(async move {
             let Ok(Some(cached)) = reply_rx.recv().await else { return };
             // Discard a reply for a mailbox the user has since switched away
@@ -11664,6 +11665,13 @@ fn select_mailbox(
             }
             let (key, descending) = current_sort(&state);
             message_list.repopulate(cached, key, descending);
+            // The list just painted from cache - clear the spinner now rather
+            // than leaving it up until the separate live IMAP sync's
+            // `MessagesUpdated` arrives. Without this, a cache hit still shows
+            // "loading" for the full round trip to the account session and
+            // back, even though the correct rows are already on screen
+            // underneath it.
+            refresh_message_loading_state(&state, &message_list, &message_list_stack);
         });
     }
 }
@@ -11919,6 +11927,7 @@ fn exit_search(
                 });
                 let state = state.clone();
                 let message_list = message_list.clone();
+                let message_list_stack = message_list_stack.clone();
                 glib::spawn_future_local(async move {
                     let Ok(Some(messages)) = reply_rx.recv().await else { return };
                     // Discard a reply for a mailbox the user has since
@@ -11928,6 +11937,11 @@ fn exit_search(
                     }
                     let (key, descending) = current_sort(&state);
                     message_list.repopulate(messages, key, descending);
+                    // See `select_mailbox`'s identical call: without this the
+                    // spinner set below (before this reply lands) only clears
+                    // once the live IMAP sync's `MessagesUpdated` arrives,
+                    // even though the cache already painted the real rows.
+                    refresh_message_loading_state(&state, &message_list, &message_list_stack);
                 });
             }
         }
