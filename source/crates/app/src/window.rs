@@ -3317,9 +3317,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         if event != webkit::LoadEvent::Finished {
             return;
         }
-        let armed = state_for_reveal.borrow_mut().pending_html_reveal;
-        if armed {
-            tracing::debug!("WebKit load finished; revealing reading pane");
+        let (armed, stuck_on_empty) = {
+            let st = state_for_reveal.borrow();
+            (st.pending_html_reveal, st.rendered_message.is_some() && reading_stack_for_reveal.visible_child_name().as_deref() == Some("empty"))
+        };
+        // `stuck_on_empty` is a backstop for a scenario the selection
+        // handler's same-message guard is meant to prevent, not the normal
+        // path: `pending_html_reveal` disarmed by something other than a
+        // genuine navigation to a different message, leaving this load's
+        // `Finished` with nowhere to reveal to. If the pane is still on
+        // "empty" and `rendered_message` (set by `render_body` right before
+        // this load was issued) hasn't been overwritten by a newer render,
+        // this Finished event is still the one worth revealing - the
+        // alternative is a permanently blank pane, since WebKit only fires
+        // `Finished` once per load.
+        if armed || stuck_on_empty {
+            tracing::debug!(armed, stuck_on_empty, "WebKit load finished; revealing reading pane");
             state_for_reveal.borrow_mut().pending_html_reveal = false;
             reveal_message_page(&reading_stack_for_reveal, &content_stack_for_reveal, "html");
         }
@@ -6498,7 +6511,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let web_view = web_view.clone();
         let user_content_manager = user_content_manager.clone();
         let theme_override_sheet = theme_override_sheet.clone();
-        message_list.selection.connect_selection_changed(move |_sel, _pos, _n_items| {
+        message_list.selection.connect_selection_changed(move |_sel, pos, n_items| {
+            let kind = match message_list_for_selection.selection_kind() {
+                SelectionKind::Empty => "Empty",
+                SelectionKind::Section => "Section",
+                SelectionKind::Message(_) => "Message",
+                SelectionKind::Multiple(_) => "Multiple",
+            };
+            tracing::debug!(pos, n_items, kind, "selection-changed fired");
             refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
             refresh_star_button(&star_button, &message_list_for_selection);
             refresh_task_button(&task_button, &message_list_for_selection, &calendar_state);
@@ -6548,35 +6568,55 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 SelectionKind::Empty => {
                     // Nothing selected: show the "no message selected"
-                    // placeholder and drop every per-message state, including
-                    // the message-theme override (reset to the configured
-                    // default and its physical sheet/canvas re-armed to
-                    // match, so the next opened message starts clean).
-                    let default_dark = {
-                        let mut st = state.borrow_mut();
-                        st.pending_body_request = None;
-                        st.pending_html_reveal = false;
-                        st.reveal_generation += 1;
-                        st.pending_header = None;
-                        st.pending_attachment = None;
-                        st.pending_raw_message = None;
-                        st.unsubscribe_info = None;
-                        st.unsubscribe_dismissed = None;
-                        st.imip = None;
-                        st.imip_dismissed = None;
-                        st.read_receipt_request = None;
-                        st.read_receipt_dismissed = None;
-                        st.read_receipt_context = None;
-                        st.rendered_trust_sender = None;
-                        st.load_once_images = false;
-                        st.message_theme_override = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
-                        st.trust_banner_dismissed = None;
-                        st.rendered_message = None;
-                        st.message_theme_override
-                    };
-                    drop_pending_cid(&state);
-                    set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
-                    reading_stack.set_visible_child_name("empty");
+                    // placeholder and drop every per-message state - but only
+                    // once this is confirmed to persist. A list repopulate's
+                    // splice can transiently shrink the selection to nothing
+                    // before `restore_selection` (moments later, same
+                    // synchronous call) puts it right back on the same
+                    // message - acting on that blip immediately would clear
+                    // `pending_body_request` before the `Message` arm's
+                    // re-fire ever gets a chance to recognize it as the same
+                    // request (see that arm's same-request guard), stranding
+                    // any fetch or WebKit load already in flight for it.
+                    // Deferring to the next main-loop idle callback lets that
+                    // resettle first; the reset below only actually applies
+                    // if the selection is still empty by then.
+                    let state = state.clone();
+                    let message_list_for_selection = message_list_for_selection.clone();
+                    let web_view = web_view.clone();
+                    let user_content_manager = user_content_manager.clone();
+                    let theme_override_sheet = theme_override_sheet.clone();
+                    let reading_stack = reading_stack.clone();
+                    glib::idle_add_local_once(move || {
+                        if !matches!(message_list_for_selection.selection_kind(), SelectionKind::Empty) {
+                            return;
+                        }
+                        let default_dark = {
+                            let mut st = state.borrow_mut();
+                            st.pending_body_request = None;
+                            st.pending_html_reveal = false;
+                            st.reveal_generation += 1;
+                            st.pending_header = None;
+                            st.pending_attachment = None;
+                            st.pending_raw_message = None;
+                            st.unsubscribe_info = None;
+                            st.unsubscribe_dismissed = None;
+                            st.imip = None;
+                            st.imip_dismissed = None;
+                            st.read_receipt_request = None;
+                            st.read_receipt_dismissed = None;
+                            st.read_receipt_context = None;
+                            st.rendered_trust_sender = None;
+                            st.load_once_images = false;
+                            st.message_theme_override = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
+                            st.trust_banner_dismissed = None;
+                            st.rendered_message = None;
+                            st.message_theme_override
+                        };
+                        drop_pending_cid(&state);
+                        set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
+                        reading_stack.set_visible_child_name("empty");
+                    });
                     return;
                 }
             };
@@ -6625,19 +6665,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let body_is_cached = state.borrow_mut().body_cache.get(&mailbox, &uid).is_some();
             let should_request = {
                 let mut st = state.borrow_mut();
+                let is_same_request = st.pending_body_request.as_ref() == Some(&request);
                 // Disarm any body load still in flight for the previously
                 // selected message, so its `Finished` can't reveal a stale
                 // email once the user has moved on. The reveal-fallback
                 // timeouts capture `reveal_generation` at arm time, so the
                 // bump here also invalidates any timeout from an earlier
                 // selection whose load hasn't finished yet.
-                st.pending_html_reveal = false;
-                st.reveal_generation += 1;
-                let should_request = !body_is_cached && st.pending_body_request.as_ref() != Some(&request);
-                if should_request || st.pending_body_request.as_ref() != Some(&request) {
+                //
+                // Only when the selection is actually changing to a
+                // *different* message, though: this handler can re-fire for
+                // the message that's already selected - a list repaint
+                // (e.g. the resync that follows marking this very message
+                // read) can transiently touch its row during a splice, which
+                // `restore_selection` corrects moments later, but not before
+                // this signal fires again for the same `(mailbox, uid)`.
+                // Disarming on that re-fire would strand the pane on "empty"
+                // forever - WebKit only fires `Finished` once per load, so a
+                // load that's still genuinely in flight for this exact
+                // message must not be cancelled here.
+                if !is_same_request {
+                    st.pending_html_reveal = false;
+                    st.reveal_generation += 1;
                     st.pending_body_request = Some(request.clone());
                 }
-                should_request
+                !body_is_cached && !is_same_request
             };
             if should_request {
                 let st = state.borrow();
@@ -7862,6 +7914,13 @@ fn spawn_account_event_loop(
                         let should_render = {
                             let mut st = state.borrow_mut();
                             let is_current = body_request_matches(&mailbox, &uid, st.pending_body_request.as_ref());
+                            tracing::debug!(
+                                ?mailbox,
+                                uid = uid.0,
+                                is_current,
+                                pending = ?st.pending_body_request,
+                                "FetchBody: BodyFetched event received"
+                            );
                             // Cache the body regardless of whether the user is
                             // still looking at this message - a fetch that
                             // completed after they moved on is still worth
@@ -13904,10 +13963,19 @@ fn render_body(
             let state_for_timeout = state.clone();
             let reading_stack_for_timeout = reading_stack.clone();
             let content_stack_for_timeout = content_stack.clone();
+            let mailbox_for_timeout = mailbox.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(HTML_REVEAL_TIMEOUT_MS), move || {
                 let mut st = state_for_timeout.borrow_mut();
                 let still_armed = st.pending_html_reveal && st.reveal_generation == generation;
-                if still_armed {
+                // Backstop for the same scenario the `load-changed` handler
+                // guards against: `pending_html_reveal`/`reveal_generation`
+                // disarmed by something other than a genuine navigation away
+                // from this message, stranding the pane on "empty" with
+                // nothing left to reveal it. If `rendered_message` still
+                // names this exact message, revealing now is still correct.
+                let stuck_on_empty = st.rendered_message.as_ref() == Some(&(mailbox_for_timeout.clone(), uid))
+                    && reading_stack_for_timeout.visible_child_name().as_deref() == Some("empty");
+                if still_armed || stuck_on_empty {
                     st.pending_html_reveal = false;
                     drop(st);
                     reveal_message_page(&reading_stack_for_timeout, &content_stack_for_timeout, "html");

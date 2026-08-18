@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.73 (2026-08-19)
+
+### Fixed
+
+- **Mail**: opening a message could silently show nothing in the reading pane, with no error, whenever its `BODYSTRUCTURE` was known but declared no `text`/`html`/`calendar` part. `fetch_bodies_batch` computed the union of a batch's text/calendar part numbers and returned early with nothing at all when that union was empty, skipping the whole-message fallback fetch that exists lower in the same function for the "the server answered but the response carried no matching section" case - a message whose structure has no such part today never even reaches that fetch. This gap predates this release (the background body prefetch has always called `fetch_bodies_batch` too) but stayed invisible there since a prefetch miss is silent and gets fetched on demand later; 0.9.71's `FetchBody` coalescing started routing on-demand, user-visible fetches through the same function for the first time, surfacing it as messages that just never load. Every uid in a batch with no requestable part now falls through to the same whole-message fallback the "no matching section in the response" case already used, instead of the function giving up before ever trying.
+- **App**: hardened the reading pane's WebKit-reveal guard (`pending_html_reveal`/`reveal_generation`) against being disarmed by something other than a genuine navigation to a different message - a list repopulate's splice can transiently fire `selection-changed` for the currently-open message (most commonly the resync that follows marking it read moments after opening it), which used to unconditionally cancel any in-flight reveal with no way to recover, since WebKit only fires `Finished` once per load. The `Message` selection arm now skips the reset when the incoming selection is unchanged from what's already tracked, the `Empty` arm defers its state-clearing reset to the next main-loop idle callback (only applying it if the selection is *still* empty by then, since `restore_selection` typically corrects a transient blip within the same synchronous call), and both the `Finished` handler and the reveal-fallback timeout now also reveal if the pane is stuck on the empty placeholder with a `rendered_message` that still matches - a backstop against this same class of race in general. This didn't turn out to be the cause of the message above, but is a real hardening against a genuine, if narrower, class of race in the same area.
+
+### Testing
+
+- `lookout-mail`: added `elapsed_ms`/count diagnostics to `fetch_bodies_on_demand`'s cache/structure split and `fetch_bodies_batch`'s result, and corrected the misleading `FetchBody: batch ready` log (it reported the requested count, not the fetched count, which would have read as a success even when nothing was actually fetched). `lookout-app`: added logging for every `selection-changed` firing and every `BodyFetched` event's arrival/match outcome. Left in place - low-noise at debug level, and this is exactly the kind of interaction that's impractical to unit test (no WebKit/live-session mocking exists in this suite) but was essential to actually diagnosing this one.
+
 ## 0.9.72 (2026-08-19)
 
 ### Fixed

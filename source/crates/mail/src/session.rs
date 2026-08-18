@@ -1009,7 +1009,13 @@ async fn connect_and_run(
                     let uidvalidity = folders.iter().find(|m| m.id == mailbox).map(|m| m.uidvalidity).unwrap_or(UidValidity(0));
                     let started = std::time::Instant::now();
                     let bodies = fetch_bodies_on_demand(cache, &mut session, &mailbox, uidvalidity, &uids).await?;
-                    tracing::debug!(?mailbox, count = uids.len(), elapsed_ms = started.elapsed().as_millis(), "FetchBody: batch ready");
+                    tracing::debug!(
+                        ?mailbox,
+                        requested = uids.len(),
+                        fetched = bodies.len(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "FetchBody: batch ready"
+                    );
                     for (uid, body) in bodies {
                         let _ = events.send(AccountEvent::BodyFetched { mailbox: mailbox.clone(), uid, body }).await;
                     }
@@ -3766,39 +3772,48 @@ async fn fetch_bodies_batch(
             }
         }
     }
-    if part_numbers.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut query = String::from("(UID BODY.PEEK[HEADER]");
-    for number in &part_numbers {
-        query.push_str(" BODY.PEEK[");
-        query.push_str(number);
-        query.push(']');
-    }
-    query.push(')');
-
-    // The prefetch caller's batch is at most `PREFETCH_BATCH_SIZE` uids, so
-    // this is always a single (range-compressed) chunk there; the on-demand
-    // caller's batch has no such fixed cap, so every chunk `uid_set_chunks`
-    // produces gets its own round trip rather than assuming there's only one.
-    let mut fetches = Vec::new();
-    for set in uid_set_chunks(&batch) {
-        let chunk_fetches: Vec<_> = session.uid_fetch(&set, &query).await?.try_collect().await?;
-        fetches.extend(chunk_fetches);
-    }
 
     let mut bodies: Vec<(Uid, EmailBody)> = Vec::new();
-    for fetch in &fetches {
-        let Some(uid) = fetch.uid.map(Uid) else { continue };
-        let Some(parts) = structures.get(&uid) else { continue };
-        if let Some(body) = body_from_fetch(uid, fetch, parts) {
-            bodies.push((uid, body));
+    // If nothing in the batch has a text/calendar part to ask for, there's no
+    // `UID FETCH` worth sending - every uid needs the whole-message fallback
+    // below regardless (previously this returned early here, skipping that
+    // fallback entirely: a known but text-less `BODYSTRUCTURE` - not merely
+    // absent, which the `None`-structure path already routes straight to the
+    // fallback - silently produced no body at all instead of degrading).
+    let missing: HashSet<Uid> = if part_numbers.is_empty() {
+        batch.iter().copied().collect()
+    } else {
+        let mut query = String::from("(UID BODY.PEEK[HEADER]");
+        for number in &part_numbers {
+            query.push_str(" BODY.PEEK[");
+            query.push_str(number);
+            query.push(']');
         }
-    }
+        query.push(')');
 
-    // Messages the batch response carried no text part for degrade to the
-    // whole-message fetch, exactly as the per-message path does.
-    let missing: HashSet<Uid> = batch.iter().copied().filter(|uid| !bodies.iter().any(|(u, _)| u == uid)).collect();
+        // The prefetch caller's batch is at most `PREFETCH_BATCH_SIZE` uids,
+        // so this is always a single (range-compressed) chunk there; the
+        // on-demand caller's batch has no such fixed cap, so every chunk
+        // `uid_set_chunks` produces gets its own round trip rather than
+        // assuming there's only one.
+        let mut fetches = Vec::new();
+        for set in uid_set_chunks(&batch) {
+            let chunk_fetches: Vec<_> = session.uid_fetch(&set, &query).await?.try_collect().await?;
+            fetches.extend(chunk_fetches);
+        }
+
+        for fetch in &fetches {
+            let Some(uid) = fetch.uid.map(Uid) else { continue };
+            let Some(parts) = structures.get(&uid) else { continue };
+            if let Some(body) = body_from_fetch(uid, fetch, parts) {
+                bodies.push((uid, body));
+            }
+        }
+
+        // Messages the batch response carried no text part for degrade to the
+        // whole-message fetch, exactly as the per-message path does.
+        batch.iter().copied().filter(|uid| !bodies.iter().any(|(u, _)| u == uid)).collect()
+    };
     for uid in &missing {
         match fetch_raw_message_cached(cache, session, mailbox, *uid, uidvalidity).await {
             Ok(Some(raw)) => {
@@ -3862,6 +3877,7 @@ async fn fetch_bodies_on_demand(
 
     let mut results: Vec<(Uid, EmailBody)> = cached.iter().map(|(&uid, body)| (uid, body.clone())).collect();
     let remaining: Vec<Uid> = uids.iter().copied().filter(|uid| !cached.contains_key(uid)).collect();
+    tracing::debug!(?mailbox, requested = ?uids, cached = ?cached.keys().collect::<Vec<_>>(), remaining = ?remaining, "fetch_bodies_on_demand: cache split");
     if remaining.is_empty() {
         return Ok(results);
     }
@@ -3885,12 +3901,23 @@ async fn fetch_bodies_on_demand(
             None => unstructured.push(uid),
         }
     }
+    tracing::debug!(
+        ?mailbox,
+        have_summary = ?summaries.keys().collect::<Vec<_>>(),
+        structured = ?structures.keys().collect::<Vec<_>>(),
+        unstructured = ?unstructured,
+        "fetch_bodies_on_demand: structure split"
+    );
 
     let structured_uids: Vec<Uid> = structures.keys().copied().collect();
-    results.extend(fetch_bodies_batch(cache, session, mailbox, uidvalidity, &structured_uids, &structures).await?);
+    let structured_results = fetch_bodies_batch(cache, session, mailbox, uidvalidity, &structured_uids, &structures).await?;
+    tracing::debug!(?mailbox, requested = ?structured_uids, got = ?structured_results.iter().map(|(u, _)| *u).collect::<Vec<_>>(), "fetch_bodies_on_demand: fetch_bodies_batch result");
+    results.extend(structured_results);
 
     for uid in unstructured {
-        if let Some(body) = fetch_body_cached(cache, session, mailbox, uid, uidvalidity, None).await? {
+        let body = fetch_body_cached(cache, session, mailbox, uid, uidvalidity, None).await?;
+        tracing::debug!(?mailbox, uid = uid.0, got_body = body.is_some(), "fetch_bodies_on_demand: unstructured fallback result");
+        if let Some(body) = body {
             results.push((uid, body));
         }
     }
