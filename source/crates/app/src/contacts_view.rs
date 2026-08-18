@@ -13,6 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -890,23 +891,34 @@ impl ContactsProvider for SnapshotContactsProvider {
 /// suggestions across *every* connected account (same source data as
 /// `search_cached_results`/the composer's own suggestion source, just
 /// unioned instead of scoped).
-pub fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>) -> crate::recipient_entry::SuggestionSource {
+pub fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>) -> crate::recipient_entry::SuggestionSource {
     let state = state.clone();
+    let worker = worker.clone();
     let carddav_provider = SnapshotContactsProvider {
         state: state.clone(),
         account: None,
     };
-    Rc::new(move |prefix: &str| {
+    Rc::new(move |prefix: &str, complete: Box<dyn FnOnce(Vec<EmailAddress>)>| {
         let prefix = prefix.trim();
-        let st = state.borrow();
-        let mail_history: Vec<EmailAddress> = st
-            .accounts
-            .values()
-            .filter_map(|h| h.address_cache.as_ref())
-            .flat_map(|cache| cache.search_contacts(prefix, 8))
+        let carddav = carddav_provider.search_contacts(prefix, 8);
+        let caches: Vec<Arc<lookout_mail::Cache>> = state.borrow().accounts.values().filter_map(|h| h.address_cache.clone()).collect();
+        let receivers: Vec<async_channel::Receiver<Vec<EmailAddress>>> = caches
+            .into_iter()
+            .map(|cache| {
+                let prefix = prefix.to_string();
+                crate::window::spawn_cache_read(&worker, cache, move |cache| cache.search_contacts(&prefix, 8))
+            })
             .collect();
-        drop(st);
-        merge_contact_suggestions(mail_history, &carddav_provider.search_contacts(prefix, 8), prefix, 8)
+        let prefix = prefix.to_string();
+        glib::spawn_future_local(async move {
+            let mut mail_history = Vec::new();
+            for rx in receivers {
+                if let Ok(hits) = rx.recv().await {
+                    mail_history.extend(hits);
+                }
+            }
+            complete(merge_contact_suggestions(mail_history, &carddav, &prefix, 8));
+        });
     })
 }
 

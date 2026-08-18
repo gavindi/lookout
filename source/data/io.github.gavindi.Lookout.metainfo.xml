@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.69" date="2026-08-18">
+      <description>
+        <p>The dashboard no longer repaints on every sync event - it's debounced and skipped entirely while its tab isn't visible, though opening it or hitting Refresh still repaints right away. Folder switching, live search, and recipient/attendee autocomplete no longer briefly freeze the interface while reading from the local cache - those reads now happen in the background instead of blocking the window.</p>
+      </description>
+    </release>
     <release version="0.9.68" date="2026-08-18">
       <description>
         <p>The message list no longer rebuilds every row when something changes - it now diffs the old and new content and updates only the rows that actually differ, instead of tearing down and rebuilding the whole visible list on every sync. Collapsed sections and conversations, and the current selection, are preserved exactly as before.</p>

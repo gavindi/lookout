@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use chrono::{Datelike, Timelike};
@@ -56,15 +57,18 @@ pub(crate) struct AccountHandle {
     smtp_host: String,
     smtp_port: u16,
     folders: Vec<Mailbox>,
-    /// Read-side handle on this account's cache, used only for the
-    /// composer's recipient autocomplete. Deliberately a second connection
+    /// Read-side handle on this account's cache, used for folder-switch/
+    /// search/composer-autocomplete reads. Deliberately a second connection
     /// to the file the session writes: routing a lookup through
     /// `AccountCommand` would put every keystroke behind whatever IMAP round
     /// trip the session is mid-way through. The cache opens WAL for exactly
     /// this, and a failed open just means no suggestions. `pub(crate)` for
     /// `contacts_view`'s attendee autocomplete, which unions the mail-history
-    /// caches across every connected account.
-    pub(crate) address_cache: Option<Rc<lookout_mail::Cache>>,
+    /// caches across every connected account. `Arc` rather than `Rc`: reads
+    /// off it are dispatched onto the `Worker`'s thread pool via
+    /// `spawn_cache_read`, and `Cache` is already `Send + Sync` (its
+    /// connection is `Mutex`-guarded), so `Arc` is what makes that possible.
+    pub(crate) address_cache: Option<Arc<lookout_mail::Cache>>,
 }
 
 /// One GNOME Online Accounts account as discovered at startup, keeping the
@@ -1770,6 +1774,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .valign(gtk::Align::Center)
         .build();
     let select_mode_button_for_rows = select_mode_button.clone();
+    let worker_for_rows = worker.clone();
     let message_factory = gtk::SignalListItemFactory::new();
     message_factory.connect_setup(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -2192,6 +2197,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
         {
             let state = state_clone.clone();
+            let worker = worker_for_rows.clone();
             let reading_stack = reading_stack_clone.clone();
             let bound = bound.clone();
             reply_btn.connect_clicked(move |_| {
@@ -2218,7 +2224,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // in the pane (so its autosave loop stops), restores the
                 // previous page on close, and owns the `draft_saved_tx` slot.
                 if let Some((_from_email, cmd_tx, prefill, rich_text_default)) = opened {
-                    show_composer_in_reading_pane(&state, &reading_stack, "Reply", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
+                    show_composer_in_reading_pane(&state, &worker, &reading_stack, "Reply", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
                 }
             });
         }
@@ -3151,6 +3157,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // it visible so the user can try again.
     {
         let state = state.clone();
+        let worker = worker.clone();
         let reading_stack = reading_stack.clone();
         unsubscribe_banner.connect_button_clicked(move |banner| {
             let (mailbox, uid, list, cmd_tx) = {
@@ -3173,6 +3180,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     // double-click can't send twice.
                     banner.set_sensitive(false);
                     let state_for_post = state.clone();
+                    let worker_for_post = worker.clone();
                     let reading_stack_for_post = reading_stack.clone();
                     let banner_for_post = banner.clone();
                     glib::spawn_future_local(async move {
@@ -3197,7 +3205,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 if let Some(mailto) = list.mailto.clone() {
                                     dismiss(&state_for_post, &mailbox, uid);
                                     banner_for_post.set_revealed(false);
-                                    open_mailto_unsubscribe(&state_for_post, &reading_stack_for_post, mailto, cmd_tx, mailbox_account_id(&mailbox));
+                                    open_mailto_unsubscribe(&state_for_post, &worker_for_post, &reading_stack_for_post, mailto, cmd_tx, mailbox_account_id(&mailbox));
                                 }
                             }
                         }
@@ -3208,7 +3216,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some(mailto) = list.mailto.clone() {
                 dismiss(&state, &mailbox, uid);
                 banner.set_revealed(false);
-                open_mailto_unsubscribe(&state, &reading_stack, mailto, cmd_tx, mailbox_account_id(&mailbox));
+                open_mailto_unsubscribe(&state, &worker, &reading_stack, mailto, cmd_tx, mailbox_account_id(&mailbox));
             }
         });
     }
@@ -4229,6 +4237,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // itself is built above, next to the state it searches. ---
     {
         let state = state.clone();
+        let worker = worker.clone();
         let message_list = message_list.clone();
         let message_list_stack = message_list_stack.clone();
         let list_header = list_header.clone();
@@ -4242,7 +4251,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // needed. Bumping the token also invalidates any timeout armed
                 // for a query still being typed.
                 search_debounce.set(search_debounce.get() + 1);
-                exit_search(&state, &message_list, &message_list_stack, &list_header, entry);
+                exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, entry);
                 return;
             }
             let token = search_debounce.get() + 1;
@@ -4251,6 +4260,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // and fires again on the next keystroke, so the timeout's own
             // `move` closure can't borrow from it.
             let state = state.clone();
+            let worker = worker.clone();
             let message_list = message_list.clone();
             let list_header = list_header.clone();
             let search_debounce = search_debounce.clone();
@@ -4259,7 +4269,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 if search_debounce.get() != token {
                     return;
                 }
-                start_search(&state, &message_list, &list_header, query.as_str());
+                start_search(&state, &worker, &message_list, &list_header, query.as_str());
                 // Land the results on screen: if the user started typing from
                 // another module, activate Mail (no-op if already active).
                 mail_view_button.set_active(true);
@@ -4268,6 +4278,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     {
         let state = state.clone();
+        let worker = worker.clone();
         let message_list = message_list.clone();
         let message_list_stack = message_list_stack.clone();
         let list_header = list_header.clone();
@@ -4282,7 +4293,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // and re-enter a search for the (already-cleared) query.
                 search_debounce.set(search_debounce.get() + 1);
             }
-            exit_search(&state, &message_list, &message_list_stack, &list_header, entry);
+            exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, entry);
         });
     }
 
@@ -4727,12 +4738,38 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // that repaints the whole dashboard, and hands it to the mail sessions
     // (which refresh it on folder/message syncs) and into `calendar_state`
     // (where `refresh_tasks_view` and the calendar event loops reach it).
-    // The tab-open and toolbar-Refresh handlers call it directly too.
+    // The tab-open and toolbar-Refresh handlers call `refresh_lookout_view`
+    // directly instead (see below) - they represent the dashboard becoming
+    // visible or an explicit user ask, so they must run immediately, not
+    // wait out this hook's debounce or bail out on its visibility check.
+    //
+    // Debounced (500ms trailing edge, the pane-resize save's idiom at
+    // `main_paned.connect_notify_local` above) and skipped entirely while
+    // the dashboard isn't the visible tab - a sync burst across several
+    // accounts would otherwise repaint the (per-account, whole-`messages`-
+    // table) histogram/top-contacts scan once per event, on screen or not.
     let dashboard_refresh: Rc<dyn Fn()> = {
         let state = state.clone();
         let calendar_state = calendar_state.clone();
         let lookout_view = lookout_view.clone();
-        Rc::new(move || refresh_lookout_view(&state, &calendar_state, &lookout_view))
+        let lookout_view_button = lookout_view_button.clone();
+        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        Rc::new(move || {
+            if !lookout_view_button.is_active() {
+                return;
+            }
+            if let Some(id) = debounce.take() {
+                id.remove();
+            }
+            let state = state.clone();
+            let calendar_state = calendar_state.clone();
+            let lookout_view = lookout_view.clone();
+            let debounce_for_timeout = debounce.clone();
+            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                debounce_for_timeout.set(None);
+                refresh_lookout_view(&state, &calendar_state, &lookout_view);
+            })));
+        })
     };
     calendar_state.borrow_mut().dashboard_refresh = Some(dashboard_refresh.clone());
 
@@ -4766,12 +4803,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     crate::reminders::spawn_reminder_loop(app, reminders_engine.clone(), settings.clone(), {
         let window = window.clone();
         let state = state.clone();
+        let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let calendar_view_button = calendar_view_button.clone();
         Rc::new(move |occ: EventOccurrence| {
             window.present();
             calendar_view_button.set_active(true);
-            open_event_editor_for(&window, &state, &calendar_state, &occ);
+            open_event_editor_for(&window, &state, &worker, &calendar_state, &occ);
         })
     });
     // --- Mail notification actions. `app.raise-window` and `app.open-mailbox`
@@ -6198,6 +6236,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // currently-open mailbox's account, then any connected account) ---
     {
         let state = state.clone();
+        let worker = worker.clone();
         let reading_stack = reading_stack.clone();
         let message_list = message_list.clone();
         compose_button.connect_clicked(move |_| {
@@ -6215,6 +6254,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             drop(st);
             show_composer_in_reading_pane(
                 &state,
+                &worker,
                 &reading_stack,
                 "New Message",
                 cmd_tx,
@@ -6241,24 +6281,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     ] {
         let message_list = message_list.clone();
         let state = state.clone();
+        let worker = worker.clone();
         let reading_stack = reading_stack.clone();
         button.connect_clicked(move |_| {
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&state, &reading_stack, title, cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
+                show_composer_in_reading_pane(&state, &worker, &reading_stack, title, cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
             }
         });
     }
     for button in [&forward_button, &message_header.forward_button, &message_header.bottom_forward_button] {
         let message_list = message_list.clone();
         let state = state.clone();
+        let worker = worker.clone();
         let reading_stack = reading_stack.clone();
         button.connect_clicked(move |_| {
             if let Some((summary, body, _from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&state, &reading_stack, "Forward", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
+                show_composer_in_reading_pane(&state, &worker, &reading_stack, "Forward", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
             }
         });
     }
@@ -6406,6 +6448,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // changes funnel through. ---
     {
         let state = state.clone();
+        let worker = worker.clone();
         let message_list = message_list.clone();
         let message_list_stack = message_list_stack.clone();
         let list_header = list_header.clone();
@@ -6424,7 +6467,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     drop(tree_item);
                     // Clicking a folder is a deliberate navigation away from
                     // search; leave it and let the selection take over.
-                    exit_search(&state, &message_list, &message_list_stack, &list_header, &search_entry);
+                    exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, &search_entry);
                     enter_unified_inbox(&state, &message_list, &message_list_stack);
                     refresh_list_header(&state, &list_header);
                 }
@@ -6432,8 +6475,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let mailbox_id = node.mailbox.id.clone();
                     let account_id = node.mailbox.account_id.clone();
                     drop(tree_item);
-                    exit_search(&state, &message_list, &message_list_stack, &list_header, &search_entry);
-                    select_mailbox(&state, &message_list, &message_list_stack, account_id, mailbox_id);
+                    exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, &search_entry);
+                    select_mailbox(&state, &worker, &message_list, &message_list_stack, account_id, mailbox_id);
                     refresh_list_header(&state, &list_header);
                 }
                 TreeItem::Account(_) | TreeItem::Favorites => {}
@@ -6840,6 +6883,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let window = window.clone();
         let state = state.clone();
+        let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let calendar_main = calendar_main.clone();
         let toast_overlay = toast_overlay.clone();
@@ -6857,7 +6901,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     anchor.and_hms_opt(9, 0, 0).unwrap()
                 }
             };
-            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, suggested_start, None);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, suggested_start, None);
         });
     }
     // Print: snapshots the currently-displayed month (checked calendars
@@ -6929,20 +6973,27 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         );
     }
     {
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
-        let dashboard_refresh = dashboard_refresh.clone();
+        let lookout_view = lookout_view.clone();
         lookout_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
-                dashboard_refresh();
+                // Bypasses `dashboard_refresh`'s visibility gate/debounce -
+                // the dashboard becoming visible is exactly the moment it
+                // must repaint immediately, not up to 500ms later.
+                refresh_lookout_view(&state, &calendar_state, &lookout_view);
                 widen_calendar_sync_horizon(&calendar_state);
             }
         });
     }
     {
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
-        let dashboard_refresh = dashboard_refresh.clone();
+        let lookout_view = lookout_view.clone();
         lookout_refresh_button.connect_clicked(move |_| {
-            dashboard_refresh();
+            // Bypasses the debounce for the same reason: an explicit click
+            // asking for a refresh should never wait out the trailing edge.
+            refresh_lookout_view(&state, &calendar_state, &lookout_view);
             widen_calendar_sync_horizon(&calendar_state);
         });
     }
@@ -6958,9 +7009,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let window = window.clone();
         let state = state.clone();
+        let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         calendar_view::connect_event_activated(&calendar_main, move |occ| {
-            open_event_editor_for(&window, &state, &calendar_state, &occ);
+            open_event_editor_for(&window, &state, &worker, &calendar_state, &occ);
         });
     }
     // --- Calendar drag-reschedule: dropping an event chip at a new position
@@ -7020,6 +7072,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let window = window.clone();
         let state = state.clone();
+        let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
         calendar_view::connect_slot_activated(&calendar_main, move |start_date, start_minutes, end_date, end_minutes| {
@@ -7037,7 +7090,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             } else {
                 end_date.and_hms_opt(((end_minutes + 30) / 60) as u32, ((end_minutes + 30) % 60) as u32, 0)
             };
-            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start, end);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, end);
         });
     }
     {
@@ -7057,13 +7110,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let window = window.clone();
         let state = state.clone();
+        let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
         calendar_view::connect_main_day_activated(&calendar_main, move |date| {
             let Some(start) = date.and_hms_opt(9, 0, 0) else {
                 return;
             };
-            show_new_event_editor(&window, &state, &calendar_state, &toast_overlay, start, None);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, None);
         });
     }
 
@@ -7519,7 +7573,7 @@ fn connect_account(
             // The session opens (and creates) the same file; whichever gets
             // there first wins, and a failure here only costs suggestions.
             address_cache: match lookout_mail::Cache::open(&account_id) {
-                Ok(cache) => Some(Rc::new(cache)),
+                Ok(cache) => Some(Arc::new(cache)),
                 Err(e) => {
                     tracing::warn!("no address-book cache for {account_id}, recipient autocomplete disabled: {e}");
                     None
@@ -8164,7 +8218,7 @@ fn connect_other_account(
             // The session opens (and creates) the same file; whichever gets
             // there first wins, and a failure here only costs suggestions.
             address_cache: match lookout_mail::Cache::open(&account_id) {
-                Ok(cache) => Some(Rc::new(cache)),
+                Ok(cache) => Some(Arc::new(cache)),
                 Err(e) => {
                     tracing::warn!("no address-book cache for {account_id}, recipient autocomplete disabled: {e}");
                     None
@@ -9583,7 +9637,7 @@ fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anch
 /// or the birthdays calendar) opens the editor in read-only mode - neither
 /// has a write-back path - so every input is disabled and the save/delete
 /// actions are hidden, with a dim note explaining the source.
-fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, occ: &EventOccurrence) {
+fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, calendar_state: &Rc<RefCell<CalendarUiState>>, occ: &EventOccurrence) {
     let (read_only, read_only_note) = {
         let st = calendar_state.borrow();
         let note = st.read_only_note(&occ.calendar_id);
@@ -9619,7 +9673,7 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
             read_only,
             read_only_note,
         },
-        calendar_attendee_suggestions(state),
+        calendar_attendee_suggestions(state, worker),
         {
             let calendar_state = calendar_state.clone();
             move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
@@ -9639,6 +9693,7 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
 fn show_new_event_editor(
     window: &adw::ApplicationWindow,
     state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
     calendar_state: &Rc<RefCell<CalendarUiState>>,
     toast_overlay: &adw::ToastOverlay,
     suggested_start: chrono::NaiveDateTime,
@@ -9666,7 +9721,7 @@ fn show_new_event_editor(
             read_only: false,
             read_only_note: "",
         },
-        calendar_attendee_suggestions(state),
+        calendar_attendee_suggestions(state, worker),
         {
             let calendar_state = calendar_state.clone();
             move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
@@ -11529,10 +11584,42 @@ fn sort_direction_icon(descending: bool) -> &'static str {
     }
 }
 
+/// Runs `query` against `cache` on the `Worker`'s blocking thread pool and
+/// returns a receiver for the result, instead of running it inline on the
+/// GTK thread. Mirrors the mail session's own `cache_op` helper for the
+/// blocking-pool dispatch, and `contacts_view`'s `dispatch_contact_command`
+/// for the bounded(1)-reply-channel shape that gets the value back without
+/// blocking the main loop: the caller sends nothing and blocks on nothing,
+/// it `.await`s `reply_rx.recv()` inside a `glib::spawn_future_local`.
+///
+/// A dropped reply (the query panicked, or the runtime is shutting down)
+/// simply closes the channel - callers already treat a closed/empty receiver
+/// as "no result," the same as a cache miss.
+pub(crate) fn spawn_cache_read<T: Send + 'static>(
+    worker: &Worker,
+    cache: Arc<lookout_mail::Cache>,
+    query: impl FnOnce(&lookout_mail::Cache) -> T + Send + 'static,
+) -> async_channel::Receiver<T> {
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+    worker.spawn(async move {
+        if let Ok(result) = tokio::task::spawn_blocking(move || query(&cache)).await {
+            let _ = reply_tx.send(result).await;
+        }
+    });
+    reply_rx
+}
+
 /// Switches the message list to a single mailbox and asks its owning account
 /// to sync it. Shared by the folder-selection handler and the account
 /// switcher's fallback path.
-fn select_mailbox(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, message_list_stack: &gtk::Stack, account_id: AccountId, mailbox_id: MailboxId) {
+fn select_mailbox(
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    message_list: &MessageListModel,
+    message_list_stack: &gtk::Stack,
+    account_id: AccountId,
+    mailbox_id: MailboxId,
+) {
     {
         let mut st = state.borrow_mut();
         st.mail_view = MailView::Single;
@@ -11547,28 +11634,38 @@ fn select_mailbox(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel,
             },
         );
     }
-    // Paint the new folder's own cached messages immediately - even an
-    // empty list if nothing's cached yet - rather than leaving the
-    // previously-selected folder's rows on screen until the async sync
-    // below answers. Mirrors `exit_search`'s single-view repaint, but
-    // unconditional: a missing cache must still clear the list rather than
-    // leaving stale content, since that's the actual bug being fixed here.
-    let cached = state
-        .borrow()
-        .accounts
-        .get(&account_id)
-        .and_then(|h| h.address_cache.clone())
-        .and_then(|cache| {
-            let mut messages = cache.load_messages(&mailbox_id).ok()?;
-            let snoozed = cache.active_snoozed_uids(&mailbox_id, chrono::Utc::now()).unwrap_or_default();
-            messages.retain(|m| !snoozed.contains(&m.uid));
-            Some(messages)
-        })
-        .unwrap_or_default();
+    // Clear immediately rather than leaving the previously-selected folder's
+    // rows on screen - the actual cached content for the new folder paints
+    // in a moment later, once the off-thread read (below) answers. Mirrors
+    // `exit_search`'s single-view repaint.
     let (key, descending) = current_sort(state);
-    message_list.repopulate(cached, key, descending);
+    message_list.repopulate(Vec::new(), key, descending);
     request_mailbox_sync(state, &account_id, &mailbox_id);
     refresh_message_loading_state(state, message_list, message_list_stack);
+
+    if let Some(cache) = state.borrow().accounts.get(&account_id).and_then(|h| h.address_cache.clone()) {
+        let reply_rx = spawn_cache_read(worker, cache, {
+            let mailbox_id = mailbox_id.clone();
+            move |cache| {
+                let mut messages = cache.load_messages(&mailbox_id).ok()?;
+                let snoozed = cache.active_snoozed_uids(&mailbox_id, chrono::Utc::now()).unwrap_or_default();
+                messages.retain(|m| !snoozed.contains(&m.uid));
+                Some(messages)
+            }
+        });
+        let state = state.clone();
+        let message_list = message_list.clone();
+        glib::spawn_future_local(async move {
+            let Ok(Some(cached)) = reply_rx.recv().await else { return };
+            // Discard a reply for a mailbox the user has since switched away
+            // from - applying it now would repaint the wrong folder.
+            if state.borrow().current_mailbox.as_ref() != Some(&mailbox_id) {
+                return;
+            }
+            let (key, descending) = current_sort(&state);
+            message_list.repopulate(cached, key, descending);
+        });
+    }
 }
 
 /// Requests a mailbox sync from its account, deduplicating against
@@ -11656,19 +11753,20 @@ fn resync_current_view(state: &Rc<RefCell<UiState>>) {
 /// the UI thread against the on-disk index (the same read-side handles the
 /// composer's autocomplete uses) - no IMAP round trip, so this is what makes
 /// results feel instant.
-fn search_cached_results(state: &Rc<RefCell<UiState>>, query: &str) -> Vec<EmailSummary> {
-    let mut seen: HashSet<(MailboxId, Uid)> = HashSet::new();
-    let mut results = Vec::new();
-    for cache in state.borrow().accounts.values().map(|h| h.address_cache.clone()) {
-        let Some(cache) = cache else { continue };
-        let Ok(hits) = cache.search(query, SEARCH_RESULT_LIMIT) else { continue };
-        for m in hits {
-            if seen.insert((m.mailbox.clone(), m.uid)) {
-                results.push(m);
-            }
-        }
-    }
-    results
+/// Fires one off-thread FTS query per connected account's cache and returns
+/// a receiver for each - the caller joins them (see `start_search`) rather
+/// than this function blocking the GTK thread until every account answers.
+fn search_cached_results(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, query: &str) -> Vec<async_channel::Receiver<Vec<EmailSummary>>> {
+    state
+        .borrow()
+        .accounts
+        .values()
+        .filter_map(|h| h.address_cache.clone())
+        .map(|cache| {
+            let query = query.to_string();
+            spawn_cache_read(worker, cache, move |cache| cache.search(&query, SEARCH_RESULT_LIMIT).unwrap_or_default())
+        })
+        .collect()
 }
 
 /// Repopulates the message list from the accumulated search results, under the
@@ -11717,10 +11815,12 @@ fn dispatch_search_fallbacks(state: &Rc<RefCell<UiState>>, query: &str) {
 }
 
 /// Enters (or re-enters) full-text search for `query`: flips the list into
-/// search mode, repopulates instantly from the local FTS index across every
-/// account, and dispatches the live IMAP pass on the open view. An empty query
-/// is `exit_search` by another name (clearing the entry's X ends the search).
-fn start_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, list_header: &ListHeader, query: &str) {
+/// search mode, dispatches the live IMAP pass on the open view, and repopulates
+/// from the local FTS index across every account as each one's off-thread
+/// query answers (an empty list paints immediately in the meantime). An empty
+/// query is `exit_search` by another name (clearing the entry's X ends the
+/// search).
+fn start_search(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, message_list: &MessageListModel, list_header: &ListHeader, query: &str) {
     let query = query.trim().to_string();
     debug_assert!(!query.is_empty(), "start_search is only called with a non-empty query; empty text takes the exit path");
     {
@@ -11733,15 +11833,35 @@ fn start_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, l
         // `query != search_query` check in the event loop) for the wrong
         // query, so it's discarded either way.
         st.search_pending.clear();
-    }
-    let cached = search_cached_results(state, &query);
-    {
-        let mut st = state.borrow_mut();
-        st.search_results = cached;
+        st.search_results.clear();
     }
     dispatch_search_fallbacks(state, &query);
     repopulate_search_results(state, message_list);
     refresh_list_header(state, list_header);
+
+    let receivers = search_cached_results(state, worker, &query);
+    let state = state.clone();
+    let message_list = message_list.clone();
+    glib::spawn_future_local(async move {
+        let mut seen: HashSet<(MailboxId, Uid)> = HashSet::new();
+        let mut results = Vec::new();
+        for rx in receivers {
+            if let Ok(hits) = rx.recv().await {
+                for m in hits {
+                    if seen.insert((m.mailbox.clone(), m.uid)) {
+                        results.push(m);
+                    }
+                }
+            }
+        }
+        // The query changed (or search was left entirely) while these were
+        // in flight - the reply is for a search that's no longer current.
+        if state.borrow().search_query != query {
+            return;
+        }
+        state.borrow_mut().search_results = results;
+        repopulate_search_results(&state, &message_list);
+    });
 }
 
 /// Leaves full-text search: clears the query entry and restores the
@@ -11749,7 +11869,14 @@ fn start_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, l
 /// its cache with a fresh sync requested) or the unified "All Inboxes" view
 /// (`MailView::UnifiedInbox`, repopulated from the per-mailbox snapshots). A
 /// no-op when no search is active, aside from clearing an idle (empty) entry.
-fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, message_list_stack: &gtk::Stack, list_header: &ListHeader, search_entry: &gtk::SearchEntry) {
+fn exit_search(
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    message_list: &MessageListModel,
+    message_list_stack: &gtk::Stack,
+    list_header: &ListHeader,
+    search_entry: &gtk::SearchEntry,
+) {
     if !state.borrow().search_active {
         search_entry.set_text("");
         return;
@@ -11786,10 +11913,22 @@ fn exit_search(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, me
         if let Some((account_id, mailbox_id)) = account_id.zip(mailbox_id) {
             request_mailbox_sync(state, &account_id, &mailbox_id);
             if let Some(cache) = state.borrow().accounts.get(&account_id).and_then(|h| h.address_cache.clone()) {
-                if let Ok(messages) = cache.load_messages(&mailbox_id) {
-                    let (key, descending) = current_sort(state);
+                let reply_rx = spawn_cache_read(worker, cache, {
+                    let mailbox_id = mailbox_id.clone();
+                    move |cache| cache.load_messages(&mailbox_id).ok()
+                });
+                let state = state.clone();
+                let message_list = message_list.clone();
+                glib::spawn_future_local(async move {
+                    let Ok(Some(messages)) = reply_rx.recv().await else { return };
+                    // Discard a reply for a mailbox the user has since
+                    // navigated away from.
+                    if state.borrow().current_mailbox.as_ref() != Some(&mailbox_id) {
+                        return;
+                    }
+                    let (key, descending) = current_sort(&state);
                     message_list.repopulate(messages, key, descending);
-                }
+                });
             }
         }
     }
@@ -13131,6 +13270,7 @@ async fn post_one_click_unsubscribe(url: &str) -> Result<(), String> {
 /// subject, so the user reviews what goes out before anything is sent.
 fn open_mailto_unsubscribe(
     state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
     reading_stack: &gtk::Stack,
     address: String,
     cmd_tx: async_channel::Sender<AccountCommand>,
@@ -13142,7 +13282,7 @@ fn open_mailto_unsubscribe(
         ..Default::default()
     };
     let rich_text_default = state.borrow().rich_text_default;
-    show_composer_in_reading_pane(state, reading_stack, "Unsubscribe", cmd_tx, prefill, rich_text_default, account_id);
+    show_composer_in_reading_pane(state, worker, reading_stack, "Unsubscribe", cmd_tx, prefill, rich_text_default, account_id);
 }
 
 /// A safe file extension for an attachment's temporary copy, so the system's
@@ -13802,6 +13942,7 @@ fn render_body(
 #[allow(clippy::too_many_arguments)]
 fn show_composer_in_reading_pane(
     state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
     reading_stack: &gtk::Stack,
     title: &str,
     cmd_tx: async_channel::Sender<AccountCommand>,
@@ -14001,18 +14142,31 @@ fn show_composer_in_reading_pane(
         }
     }));
     // Recipient autocomplete combines local mail-history addresses with
-    // CardDAV contacts discovered for this account. Both are queried from UI
-    // memory/state synchronously so a keystroke never waits on a worker round
-    // trip.
+    // CardDAV contacts discovered for this account. CardDAV is queried from
+    // UI memory synchronously (cheap, no SQLite); the mail-history half is
+    // an off-thread cache read (`spawn_cache_read`) - the completion callback
+    // fires once it answers, merged with the CardDAV half computed up front.
     let address_cache = account_id.clone().and_then(|id| state.borrow().accounts.get(&id).and_then(|h| h.address_cache.clone()));
     let carddav_provider = SnapshotContactsProvider {
         state: state.clone(),
         account: account_id.clone(),
     };
-    let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str| {
-        let mail_history = address_cache.as_ref().map(|cache| cache.search_contacts(prefix, 8)).unwrap_or_default();
+    let worker_for_suggestions = worker.clone();
+    let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str, complete: Box<dyn FnOnce(Vec<lookout_core::EmailAddress>)>| {
         let carddav = carddav_provider.search_contacts(prefix, 8);
-        merge_contact_suggestions(mail_history, &carddav, prefix.trim(), 8)
+        let Some(cache) = address_cache.clone() else {
+            complete(merge_contact_suggestions(Vec::new(), &carddav, prefix.trim(), 8));
+            return;
+        };
+        let reply_rx = spawn_cache_read(&worker_for_suggestions, cache, {
+            let prefix = prefix.to_string();
+            move |cache| cache.search_contacts(&prefix, 8)
+        });
+        let prefix = prefix.trim().to_string();
+        glib::spawn_future_local(async move {
+            let mail_history = reply_rx.recv().await.unwrap_or_default();
+            complete(merge_contact_suggestions(mail_history, &carddav, &prefix, 8));
+        });
     });
     // Shows the persistent "Sending: <subject>" toast the instant Send is
     // clicked, and registers it in `sending_toasts` so the account event

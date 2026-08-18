@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.69 (2026-08-18)
+
+### Changed
+
+- **App**: the Lookout dashboard no longer repaints on every folder/message/calendar/webcal/tasks/contacts event - it's now debounced (500ms trailing edge, the pane-resize save's existing idiom) and skipped entirely while the dashboard tab isn't visible, since a sync burst across several accounts used to re-run the per-account histogram/top-contacts scan once per event whether anyone was looking at it or not. The dashboard tab activating and the toolbar's manual Refresh button bypass both the gate and the delay, so becoming visible or an explicit ask still repaints immediately.
+- **App**: three UI-thread SQLite reads that used to block GTK's main loop for the query's duration now run on the background `Worker` instead: folder-switch mailbox loads, live full-text search (fanned out across every connected account and joined), and composer/calendar-attendee recipient autocomplete. A new `spawn_cache_read` helper dispatches each query onto the `Worker`'s blocking pool and returns a bounded-channel receiver, mirroring the mail session's own `cache_op` for the dispatch and `contacts_view`'s `dispatch_contact_command` for the reply-channel shape - deliberately not routed through the mail session's `AccountCommand` channel, since `address_cache` is a second connection specifically so a keystroke is never queued behind an in-flight IMAP round trip. `AccountHandle.address_cache` changed from `Rc<Cache>` to `Arc<Cache>` to make this possible (`Cache` was already `Send + Sync`, so this was a drop-in change at every existing call site). Because results now arrive after a round trip instead of on the same call stack, each read site guards against a stale reply superseded by a newer request: folder switch re-checks the still-current mailbox, search reuses the existing `search_query`/debounce token, and recipient autocomplete's `SuggestionSource` was restructured from a synchronous return value into a callback the query completes when it answers, with a new generation counter (`RecipientEntry::suggestion_generation`) discarding a reply that's since been superseded by a later keystroke. The calendar event editor's attendee autocomplete (`calendar_attendee_suggestions`), which shared the exact same synchronous multi-account-scan shape, got the identical treatment.
+
 ## 0.9.68 (2026-08-18)
 
 ### Changed

@@ -10,7 +10,7 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::glib;
@@ -91,10 +91,13 @@ pub fn is_plausible_address(token: &str) -> bool {
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.') && !domain.contains(' ')
 }
 
-/// Produces completions for a partially typed recipient. Supplied by the
-/// window, which owns the per-account cache handle the addresses come from -
-/// this module never touches storage itself.
-pub type SuggestionSource = Rc<dyn Fn(&str) -> Vec<EmailAddress>>;
+/// Produces completions for a partially typed recipient, delivered to the
+/// given callback rather than returned directly: the window's mail-history
+/// half of the lookup is an off-thread cache read (see `spawn_cache_read`),
+/// so results don't arrive on the same call stack. Supplied by the window,
+/// which owns the per-account cache handle the addresses come from - this
+/// module never touches storage itself.
+pub type SuggestionSource = Rc<dyn Fn(&str, Box<dyn FnOnce(Vec<EmailAddress>)>)>;
 
 /// A recipient field. Cheap to clone; clones share the same chips and entry.
 #[derive(Clone)]
@@ -115,6 +118,11 @@ pub struct RecipientEntry {
     suggestion_list: gtk::ListBox,
     suggestions: Rc<RefCell<Vec<EmailAddress>>>,
     source: Rc<RefCell<Option<SuggestionSource>>>,
+    /// Bumped on every `refresh_suggestions` call; a `source` reply is
+    /// applied only if it's still the most recent request when it lands, so
+    /// a keystroke that arrives while an earlier lookup is still in flight
+    /// can't have its results overwritten by that stale reply afterward.
+    suggestion_generation: Rc<Cell<u64>>,
 }
 
 impl RecipientEntry {
@@ -172,6 +180,7 @@ impl RecipientEntry {
             suggestion_list,
             suggestions: Rc::new(RefCell::new(Vec::new())),
             source: Rc::new(RefCell::new(None)),
+            suggestion_generation: Rc::new(Cell::new(0)),
         };
         this.connect_handlers();
         this
@@ -380,15 +389,42 @@ impl RecipientEntry {
         chip
     }
 
+    /// Dispatches a suggestion lookup for `prefix` and, once it answers,
+    /// applies the result - unless a later keystroke has since dispatched a
+    /// newer one, per `suggestion_generation`.
     fn refresh_suggestions(&self, prefix: &str) {
-        let prefix = prefix.trim();
+        let prefix = prefix.trim().to_string();
+        let generation = self.suggestion_generation.get() + 1;
+        self.suggestion_generation.set(generation);
+
         let source = self.source.borrow().clone();
         let Some(source) = source else {
+            self.apply_suggestions(generation, Vec::new());
             return;
         };
         // An empty field offering the whole address book would pop a list
         // over the composer the instant it opened.
-        let matches = if prefix.is_empty() { Vec::new() } else { source(prefix) };
+        if prefix.is_empty() {
+            self.apply_suggestions(generation, Vec::new());
+            return;
+        }
+        let this = self.clone();
+        source(
+            &prefix,
+            Box::new(move |matches| this.apply_suggestions(generation, matches)),
+        );
+    }
+
+    /// The "apply results to the popover" half of a suggestion lookup,
+    /// separated from `refresh_suggestions` so it can run either immediately
+    /// (empty prefix, no source) or later, once an async `source` reply
+    /// lands.
+    fn apply_suggestions(&self, generation: u64, matches: Vec<EmailAddress>) {
+        // A keystroke since this lookup started has already dispatched (and
+        // possibly already applied) a newer one - this reply is stale.
+        if self.suggestion_generation.get() != generation {
+            return;
+        }
 
         // Anything already chipped is not a useful suggestion.
         let existing: Vec<String> = self.tokens.borrow().iter().map(|t| address_of(t).to_lowercase()).collect();
