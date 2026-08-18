@@ -4,7 +4,7 @@
 
 Performance audit of the IMAP pipeline, SQLite cache layer, and GTK message list. The dominant systemic cost: **every IDLE wake triggers a full-mailbox flag fetch, a whole-table DB rewrite, and a full-list UI repopulate** — all O(mailbox size) when only a few messages changed. The codebase already defers the fix ("Full CONDSTORE/QRESYNC incremental sync is Phase 2", `mail/src/session.rs:26`).
 
-As of 0.9.68 (18 Aug 2026) all three legs of that root cause are addressed: the flag fetch and DB rewrite by Phase 2's CONDSTORE/QRESYNC/diff-based-cache-writes, the UI repopulate by Phase 5's incremental splices. Phases 1, 2, and 4 are complete; Phase 5 has one item left (67) plus two narrower items (70, 71); Phase 3's worker-routed UI reads (43-48, 50) and Phase 4's `FetchBody` coalescing (60) remain open.
+As of 0.9.69 (18 Aug 2026) all three legs of that root cause are addressed: the flag fetch and DB rewrite by Phase 2's CONDSTORE/QRESYNC/diff-based-cache-writes, the UI repopulate by Phase 5's incremental splices. Phases 1, 2, and 4 are complete; Phase 3 is down to two low-value stragglers (the dashboard's own reads, `Cache::open`'s connect-time DDL); Phase 5 has one item left (69) plus two narrower items (72, 73).
 
 ## Phase 1 — Quick wins
 
@@ -42,14 +42,14 @@ Completed 17 Aug 2026: `9268e0e` covered the redundant SELECT on IDLE wake, redu
 
 ## Phase 3 — Off-main-thread DB
 
-- [ ] Route every UI-side cache read through the worker with bounded reply channels (pattern already exists in `contacts_view.rs:296`):
-  - Full-mailbox load + JSON deserialize on folder switch (`window.rs:11389`, `11616`)
-  - FTS search + per-hit loads per keystroke (`window.rs:11486-11499`)
-  - Composer autocomplete LIKE query per keystroke (`window.rs:13814`)
-  - `hour_histogram(None)` full-table scan with `json_extract` per row (`window.rs:9714-9727`, `cache.rs:837-858`) — also debounce + only when the dashboard is visible
-  - `Cache::open` schema DDL at account connect (`window.rs:7490`)
+- [x] Route every UI-side cache read through the worker with bounded reply channels (pattern already exists in `contacts_view.rs:296`) — **mostly done** (0.9.69): a new `spawn_cache_read` helper dispatches a query onto the `Worker`'s blocking pool and returns a bounded-channel receiver (mirrors the mail session's own `cache_op` for the dispatch, `dispatch_contact_command` for the reply-channel shape). Required `AccountHandle.address_cache` to change from `Rc<Cache>` to `Arc<Cache>` (a drop-in change — `Cache` was already `Send + Sync`) and each read site to guard against a reply superseded by a newer request (folder switch re-checks the still-current mailbox; search reuses the existing `search_query` token; recipient/attendee autocomplete's `SuggestionSource` was restructured from a synchronous return into a completion callback, guarded by a new `RecipientEntry::suggestion_generation` counter). Deliberately *not* routed through the mail session's `AccountCommand` channel — `address_cache` is a second connection specifically so a keystroke is never queued behind an in-flight IMAP round trip, and reusing `AccountCommand` would have defeated that:
+  - [x] Full-mailbox load + JSON deserialize on folder switch (`window.rs:11389`, `11616`) — **done**: `select_mailbox`/`exit_search`
+  - [x] FTS search + per-hit loads per keystroke (`window.rs:11486-11499`) — **done**: `search_cached_results`/`start_search`, fanned out across every connected account and joined
+  - [x] Composer autocomplete LIKE query per keystroke (`window.rs:13814`) — **done**, plus the calendar event editor's attendee autocomplete (`contacts_view.rs::calendar_attendee_suggestions`), which shared the identical synchronous multi-account-scan shape and would otherwise have been left broken by the `SuggestionSource` contract change
+  - [ ] `hour_histogram(None)` full-table scan with `json_extract` per row (`window.rs:9714-9727`, `cache.rs:837-858`) — still on the UI thread, but the debounce/visibility gate below already removes most of its cost (at most once per 500ms, only while the dashboard is visible); revisit with the same `spawn_cache_read` mechanism only if profiling still shows it matters
+  - [ ] `Cache::open` schema DDL at account connect (`window.rs:7490`) — still synchronous; confirmed one-time/connect-only cost, lower value than the three above, natural follow-on once needed
 - [x] Make UI-side SQLite access read-only — `active_snoozed_uids` runs a `DELETE` on the UI thread (`window.rs:11390`, `cache.rs:1011`) that can block up to the 5s `busy_timeout` behind the session's write transaction; move the cleanup to the session thread — **done** (0.9.67): `active_snoozed_uids` is now a pure `SELECT ... AND snoozed_until > ?` (the time filter moved into the query itself, no longer dependent on a prior DELETE having run); the DELETE moved to a new `purge_expired_snoozed`, called from the session's three existing `cache_op`/blocking-pool call sites. `window.rs`'s UI-thread call site needed no code change — same name/signature, now safe to call synchronously
-- [ ] Debounce dashboard refreshes (500ms trailing edge, pattern exists at `window.rs:4242`) — currently `refresh_lookout_view` re-scans every account's whole message table on **every** `FoldersUpdated`/`MessagesUpdated` (`window.rs:7577`, `7598`)
+- [x] Debounce dashboard refreshes (500ms trailing edge, pattern exists at `window.rs:4242`) — currently `refresh_lookout_view` re-scans every account's whole message table on **every** `FoldersUpdated`/`MessagesUpdated` (`window.rs:7577`, `7598`) — **done** (0.9.69): the `dashboard_refresh` hook is now debounced (500ms trailing edge, the pane-resize save's existing `Rc<Cell<Option<glib::SourceId>>>` idiom) and skipped entirely while the dashboard tab isn't the visible view. The tab-activation and toolbar Refresh-button handlers bypass both the gate and the delay and call `refresh_lookout_view` directly, so becoming visible or an explicit ask still repaints immediately
 
 ## Phase 4 — Round-trip reduction
 
