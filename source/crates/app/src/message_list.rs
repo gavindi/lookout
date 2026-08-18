@@ -12,6 +12,7 @@
 /// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
@@ -548,6 +549,92 @@ fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
     messages.iter().map(message_row_key).collect()
 }
 
+/// A `SectionRow` fingerprint: bucket identity plus its label, so a relabel
+/// (e.g. `LastMonth`'s label crossing a month boundary between rebuilds)
+/// still counts as a change even though the bucket itself didn't move.
+type SectionRowKey = (DateBucket, String);
+
+fn section_row_key(bucket: DateBucket, label: &str) -> SectionRowKey {
+    (bucket, label.to_string())
+}
+
+/// A `ThreadRow` header fingerprint - every field the header renders, plus
+/// its identity. Does not cover the thread's own messages; those are a
+/// separate diff against the thread's child store. Named rather than written
+/// inline for the same clippy type-complexity reason as `MessageRowKey`, and
+/// must be kept in sync by hand with `ThreadRow`'s fields the same way.
+type ThreadRowKey = (ThreadId, String, Vec<String>, Option<String>, usize, DateTime<Utc>, bool, bool, bool, bool);
+
+fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
+    (
+        row.id.clone(),
+        row.sender.clone(),
+        row.participants.clone(),
+        row.subject.clone(),
+        row.count,
+        row.latest,
+        row.has_unread,
+        row.has_starred,
+        row.has_attachment,
+        row.has_calendar,
+    )
+}
+
+/// The uniform per-row fingerprint every store's incremental diff runs on -
+/// whichever of the three row kinds `MessageItem` can hold in that store.
+#[derive(Clone, PartialEq, Eq)]
+enum RowKey {
+    Section(SectionRowKey),
+    Thread(ThreadRowKey),
+    Message(MessageRowKey),
+}
+
+/// How much of `old`'s start/end is shared with `new`'s start/end at the same
+/// positions - `[prefix, len-suffix)` is the range that actually needs
+/// replacing. Sound here because both sequences are always freshly
+/// recomputed in sort order on every call, never a patched-in-place
+/// reordering of a stable set - so a common prefix/suffix is the whole diff
+/// worth computing; no interior row moves independently of the rows around
+/// it changing too. Degrades to a full replace (`prefix = suffix = 0`) when
+/// nothing is shared, e.g. a filter toggle or a threading-mode flip - still
+/// exactly one splice either way.
+struct RowDiff {
+    prefix: usize,
+    suffix: usize,
+}
+
+impl RowDiff {
+    fn old_removed(&self, old_len: usize) -> Range<usize> {
+        self.prefix..old_len - self.suffix
+    }
+
+    fn new_inserted(&self, new_len: usize) -> Range<usize> {
+        self.prefix..new_len - self.suffix
+    }
+}
+
+fn diff_range<K: PartialEq>(old: &[K], new: &[K]) -> RowDiff {
+    let max_common = old.len().min(new.len());
+    let prefix = old.iter().zip(new.iter()).take_while(|(a, b)| a == b).count();
+    // The suffix search must not re-cover ground the prefix search already
+    // claimed, or a short list where everything is shared could double-count
+    // and yield a negative-length middle range.
+    let remaining = max_common - prefix;
+    let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev()).take(remaining).take_while(|(a, b)| a == b).count();
+    RowDiff { prefix, suffix }
+}
+
+/// Splices `store`'s stale middle range (per `diff_range(old_keys, new_keys)`)
+/// with the corresponding slice of `new_rows` - the incremental counterpart
+/// of `store.splice(0, store.n_items(), &rows)`. `new_rows` must already hold
+/// the *entire* new content in the same order as `new_keys`.
+fn splice_diff(store: &gio::ListStore, old_keys: &[RowKey], new_keys: &[RowKey], new_rows: &[glib::Object]) {
+    let diff = diff_range(old_keys, new_keys);
+    let removed = diff.old_removed(old_keys.len());
+    let inserted = diff.new_inserted(new_keys.len());
+    store.splice(removed.start as u32, removed.len() as u32, &new_rows[inserted]);
+}
+
 /// The list's contents as last rendered, plus the sort, filter, and threading
 /// mode that produced them - the comparison `repopulate` skips a rebuild on.
 /// Holds each row's `MessageRowKey` fingerprint rather than the summaries
@@ -577,6 +664,20 @@ pub enum SelectionKind {
     Multiple(Vec<EmailSummary>),
 }
 
+/// A child `gio::ListStore` (a section's or a thread's) paired with the
+/// `RowKey` fingerprints of what it currently displays - `repopulate`'s diff
+/// target for that store on the next rebuild.
+struct TrackedStore {
+    store: gio::ListStore,
+    keys: Vec<RowKey>,
+}
+
+impl TrackedStore {
+    fn new() -> Self {
+        TrackedStore { store: gio::ListStore::new::<glib::BoxedAnyObject>(), keys: Vec::new() }
+    }
+}
+
 /// The message list's model: a `Gtk.TreeListModel` whose root rows are
 /// collapsible date sections and whose children are either the messages in
 /// each (unthreaded) or collapsible conversation headers whose own children
@@ -599,18 +700,25 @@ pub struct MessageListModel {
     /// The tree's root level: `Section` rows when grouped, `Message` rows
     /// when flat.
     root: gio::ListStore,
+    /// `root`'s content as last spliced, as `RowKey` fingerprints - the diff
+    /// target `repopulate` compares against to find the middle range that
+    /// actually changed, so a rebuild only touches the rows that did.
+    root_keys: Rc<RefCell<Vec<RowKey>>>,
     tree: gtk::TreeListModel,
     pub selection: gtk::MultiSelection,
     /// One child store per bucket, handed out by the tree's create-child
-    /// closure. These must outlive any individual rebuild: a `TreeListRow`
-    /// that survives a `splice` still holds the child model it was given, so
-    /// swapping in a fresh store would leave that row pointing at a discarded
-    /// one. Rebuilds splice *into* these instead.
-    sections: Rc<RefCell<HashMap<DateBucket, gio::ListStore>>>,
+    /// closure, plus that store's content as last spliced (`root_keys`'s
+    /// per-section counterpart - kept alongside the store, not in a parallel
+    /// map, so a store and its diff target can never desync). These must
+    /// outlive any individual rebuild: a `TreeListRow` that survives a
+    /// `splice` still holds the child model it was given, so swapping in a
+    /// fresh store would leave that row pointing at a discarded one.
+    /// Rebuilds splice *into* these instead.
+    sections: Rc<RefCell<HashMap<DateBucket, TrackedStore>>>,
     /// One child store per conversation, for the thread rows' own children -
     /// the third tree level, only populated while threading is on. Same
-    /// outlive-the-rebuild discipline as `sections`.
-    threads: Rc<RefCell<HashMap<ThreadId, gio::ListStore>>>,
+    /// outlive-the-rebuild discipline and diff-target pairing as `sections`.
+    threads: Rc<RefCell<HashMap<ThreadId, TrackedStore>>>,
     /// Sections the user has collapsed. Collapse is the exception, so an
     /// absent bucket means expanded and a newly-appearing section defaults
     /// open. Lives outside the model so it survives the constant rebuilds
@@ -650,8 +758,8 @@ pub struct MessageListModel {
 impl MessageListModel {
     pub fn build() -> Self {
         let root = gio::ListStore::new::<glib::BoxedAnyObject>();
-        let sections: Rc<RefCell<HashMap<DateBucket, gio::ListStore>>> = Rc::new(RefCell::new(HashMap::new()));
-        let threads: Rc<RefCell<HashMap<ThreadId, gio::ListStore>>> = Rc::new(RefCell::new(HashMap::new()));
+        let sections: Rc<RefCell<HashMap<DateBucket, TrackedStore>>> = Rc::new(RefCell::new(HashMap::new()));
+        let threads: Rc<RefCell<HashMap<ThreadId, TrackedStore>>> = Rc::new(RefCell::new(HashMap::new()));
         let tree = gtk::TreeListModel::new(root.clone(), false, false, {
             let sections = sections.clone();
             let threads = threads.clone();
@@ -661,17 +769,9 @@ impl MessageListModel {
                 let store = match &*item {
                     // A section's children are its conversation headers and
                     // lone messages.
-                    MessageItem::Section(section) => sections
-                        .borrow_mut()
-                        .entry(section.bucket)
-                        .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
-                        .clone(),
+                    MessageItem::Section(section) => sections.borrow_mut().entry(section.bucket).or_insert_with(TrackedStore::new).store.clone(),
                     // A conversation's children are its messages.
-                    MessageItem::Thread(thread) => threads
-                        .borrow_mut()
-                        .entry(thread.id.clone())
-                        .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
-                        .clone(),
+                    MessageItem::Thread(thread) => threads.borrow_mut().entry(thread.id.clone()).or_insert_with(TrackedStore::new).store.clone(),
                     // A message is a leaf: no child model, no expander.
                     MessageItem::Message(_) => return None,
                 };
@@ -685,6 +785,7 @@ impl MessageListModel {
         let selection = gtk::MultiSelection::new(Some(tree.clone()));
         MessageListModel {
             root,
+            root_keys: Rc::new(RefCell::new(Vec::new())),
             tree,
             selection,
             sections,
@@ -851,11 +952,13 @@ impl MessageListModel {
                 // that has been gone since the last capture.
                 self.clear_sections(&HashSet::new());
                 self.clear_threads(&HashSet::new());
+                let new_keys: Vec<RowKey> = messages.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
                 let rows: Vec<glib::Object> = messages
                     .into_iter()
                     .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m))).upcast())
                     .collect();
-                self.root.splice(0, self.root.n_items(), &rows);
+                let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
+                splice_diff(&self.root, &old_keys, &new_keys, &rows);
             }
             ListLayout::Grouped(sections) => {
                 // Children before roots: a root row whose child store is
@@ -863,17 +966,23 @@ impl MessageListModel {
                 // count to the tree model.
                 let live: HashSet<DateBucket> = sections.iter().map(|(b, _, _)| *b).collect();
                 for (bucket, _, messages) in &sections {
-                    let store = self
-                        .sections
-                        .borrow_mut()
-                        .entry(*bucket)
-                        .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
-                        .clone();
+                    let new_keys: Vec<RowKey> = messages.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
                     let rows: Vec<glib::Object> = messages
                         .iter()
                         .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast())
                         .collect();
-                    store.splice(0, store.n_items(), &rows);
+                    // Store handle cloned and the borrow dropped *before*
+                    // splicing: `items-changed` re-enters synchronously, and
+                    // a held `RefCell` borrow across it would panic on the
+                    // re-borrow (same discipline `clear_sections` already
+                    // follows below).
+                    let (store, old_keys) = {
+                        let mut sections = self.sections.borrow_mut();
+                        let tracked = sections.entry(*bucket).or_insert_with(TrackedStore::new);
+                        let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
+                        (tracked.store.clone(), old_keys)
+                    };
+                    splice_diff(&store, &old_keys, &new_keys, &rows);
                 }
                 self.clear_sections(&live);
                 // A grouped layout holds no thread rows, so every thread store
@@ -881,11 +990,13 @@ impl MessageListModel {
                 // that re-threads and finds the same id again.
                 self.clear_threads(&HashSet::new());
 
+                let new_keys: Vec<RowKey> = sections.iter().map(|(bucket, label, _)| RowKey::Section(section_row_key(*bucket, label))).collect();
                 let rows: Vec<glib::Object> = sections
                     .into_iter()
                     .map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast())
                     .collect();
-                self.root.splice(0, self.root.n_items(), &rows);
+                let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
+                splice_diff(&self.root, &old_keys, &new_keys, &rows);
                 self.apply_expansion();
             }
             ListLayout::Threaded(sections) => {
@@ -895,12 +1006,13 @@ impl MessageListModel {
                 let live_buckets: HashSet<DateBucket> = sections.iter().map(|(b, _, _)| *b).collect();
                 let mut live_threads: HashSet<ThreadId> = HashSet::new();
                 for (bucket, _, entries) in &sections {
-                    let store = self
-                        .sections
-                        .borrow_mut()
-                        .entry(*bucket)
-                        .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
-                        .clone();
+                    let new_keys: Vec<RowKey> = entries
+                        .iter()
+                        .map(|entry| match entry {
+                            ThreadEntry::Thread(thread) => RowKey::Thread(thread_row_key(&thread.row)),
+                            ThreadEntry::Single(message) => RowKey::Message(message_row_key(message)),
+                        })
+                        .collect();
                     let rows: Vec<glib::Object> = entries
                         .iter()
                         .map(|entry| match entry {
@@ -908,36 +1020,47 @@ impl MessageListModel {
                             ThreadEntry::Single(message) => glib::BoxedAnyObject::new(MessageItem::Message(Box::new(message.clone()))).upcast(),
                         })
                         .collect();
-                    store.splice(0, store.n_items(), &rows);
+                    // See the `Grouped` arm's comment: store handle cloned
+                    // and the borrow dropped before splicing.
+                    let (store, old_keys) = {
+                        let mut sections = self.sections.borrow_mut();
+                        let tracked = sections.entry(*bucket).or_insert_with(TrackedStore::new);
+                        let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
+                        (tracked.store.clone(), old_keys)
+                    };
+                    splice_diff(&store, &old_keys, &new_keys, &rows);
 
                     for entry in entries {
                         let ThreadEntry::Thread(thread) = entry else { continue };
                         live_threads.insert(thread.row.id.clone());
-                        let thread_store = self
-                            .threads
-                            .borrow_mut()
-                            .entry(thread.row.id.clone())
-                            .or_insert_with(gio::ListStore::new::<glib::BoxedAnyObject>)
-                            .clone();
                         // Children oldest-first (the order `group_threads`
                         // left them in) - the natural reading order of a
                         // conversation regardless of the list's sort.
+                        let new_message_keys: Vec<RowKey> = thread.messages.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
                         let message_rows: Vec<glib::Object> = thread
                             .messages
                             .iter()
                             .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast())
                             .collect();
-                        thread_store.splice(0, thread_store.n_items(), &message_rows);
+                        let (thread_store, old_message_keys) = {
+                            let mut threads = self.threads.borrow_mut();
+                            let tracked = threads.entry(thread.row.id.clone()).or_insert_with(TrackedStore::new);
+                            let old_keys = std::mem::replace(&mut tracked.keys, new_message_keys.clone());
+                            (tracked.store.clone(), old_keys)
+                        };
+                        splice_diff(&thread_store, &old_message_keys, &new_message_keys, &message_rows);
                     }
                 }
                 self.clear_sections(&live_buckets);
                 self.clear_threads(&live_threads);
 
+                let new_keys: Vec<RowKey> = sections.iter().map(|(bucket, label, _)| RowKey::Section(section_row_key(*bucket, label))).collect();
                 let rows: Vec<glib::Object> = sections
                     .into_iter()
                     .map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast())
                     .collect();
-                self.root.splice(0, self.root.n_items(), &rows);
+                let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
+                splice_diff(&self.root, &old_keys, &new_keys, &rows);
                 self.apply_expansion();
             }
         }
@@ -1003,16 +1126,26 @@ impl MessageListModel {
     /// that has gone away stops contributing rows. The stores themselves are
     /// kept (see the `sections` field's note).
     fn clear_sections(&self, live: &HashSet<DateBucket>) {
-        let stale: Vec<gio::ListStore> = self
+        let stale: Vec<(DateBucket, gio::ListStore)> = self
             .sections
             .borrow()
             .iter()
             .filter(|(bucket, _)| !live.contains(*bucket))
-            .map(|(_, store)| store.clone())
+            .map(|(bucket, tracked)| (*bucket, tracked.store.clone()))
             .collect();
         // Borrow dropped before splicing: `items-changed` re-enters.
-        for store in stale {
+        for (_, store) in &stale {
             store.splice(0, store.n_items(), &[] as &[glib::Object]);
+        }
+        // Second pass, after every splice has settled: zero the stale
+        // entries' cached keys too, or a bucket that's kept around (see the
+        // `sections` field's note) but now empty would diff its next
+        // reappearance against a stale non-empty baseline.
+        let mut sections = self.sections.borrow_mut();
+        for (bucket, _) in &stale {
+            if let Some(tracked) = sections.get_mut(bucket) {
+                tracked.keys.clear();
+            }
         }
     }
 
@@ -1023,9 +1156,16 @@ impl MessageListModel {
     /// messages under a row the next threaded rebuild re-creates for the same
     /// id.
     fn clear_threads(&self, live: &HashSet<ThreadId>) {
-        let stale: Vec<gio::ListStore> = self.threads.borrow().iter().filter(|(id, _)| !live.contains(*id)).map(|(_, store)| store.clone()).collect();
-        for store in stale {
+        let stale: Vec<(ThreadId, gio::ListStore)> =
+            self.threads.borrow().iter().filter(|(id, _)| !live.contains(*id)).map(|(id, tracked)| (id.clone(), tracked.store.clone())).collect();
+        for (_, store) in &stale {
             store.splice(0, store.n_items(), &[] as &[glib::Object]);
+        }
+        let mut threads = self.threads.borrow_mut();
+        for (id, _) in &stale {
+            if let Some(tracked) = threads.get_mut(id) {
+                tracked.keys.clear();
+            }
         }
     }
 
@@ -1431,6 +1571,30 @@ mod tests {
         // --- A sender sort ignores threading and renders flat ---
         threaded.repopulate(vec![summary(1, today), summary(2, today)], SortKey::Sender, true);
         assert_eq!(threaded.selection.n_items(), 2, "a sender sort should render flat under threading");
+
+        // --- A rebuild whose diff only touches one section must not perturb
+        // an untouched section's collapsed state or the selection. This pins
+        // the incremental-splice change: `apply_expansion` still runs
+        // unconditionally after every root splice, re-asserting
+        // `set_expanded` on every root row even when most of them weren't
+        // touched by this rebuild's diff - this guards that reasserting an
+        // already-correct value doesn't fire a spurious collapse. ---
+        let partial = MessageListModel::build();
+        partial.repopulate(vec![summary(1, today), summary(2, yesterday), summary(3, older)], SortKey::Date, true);
+        // Collapse "Older" (root row 2) - the section a Today-only change
+        // below won't touch.
+        partial.tree.child_row(2).expect("Older row").set_expanded(false);
+        assert_eq!(partial.selection.n_items(), 5, "collapsing Older hid its one message");
+        // Select Today's message (flat position 1: Today header, Today
+        // message, Yesterday header, Yesterday message, Older header).
+        partial.selection.select_item(1, true);
+        assert_eq!(partial.selected_summary().map(|s| s.uid), Some(Uid(1)));
+
+        // A rebuild that only adds a message to Today - Yesterday's and
+        // Older's stores/keys are untouched by the diff.
+        partial.repopulate(vec![summary(1, today), summary(4, today), summary(2, yesterday), summary(3, older)], SortKey::Date, true);
+        assert!(!partial.tree.child_row(2).expect("Older row").is_expanded(), "an untouched section's collapse must survive a partial diff");
+        assert_eq!(partial.selected_summary().map(|s| s.uid), Some(Uid(1)), "selection must survive a partial diff");
     }
 
     #[test]
@@ -1767,6 +1931,148 @@ mod tests {
         // so a different display order must read as a change.
         let reordered = vec![a[1].clone(), a[0].clone()];
         assert_ne!(message_row_keys(&a), message_row_keys(&reordered));
+    }
+
+    #[test]
+    fn section_row_key_differs_on_label_or_bucket_change() {
+        assert_eq!(section_row_key(DateBucket::Today, "Today"), section_row_key(DateBucket::Today, "Today"));
+        assert_ne!(section_row_key(DateBucket::Today, "Today"), section_row_key(DateBucket::Today, "Relabeled"));
+        assert_ne!(section_row_key(DateBucket::Today, "x"), section_row_key(DateBucket::Yesterday, "x"));
+    }
+
+    fn base_thread_row() -> ThreadRow {
+        ThreadRow {
+            id: (MailboxId("a:INBOX".into()), ThreadKey("t".into())),
+            sender: "Alice".into(),
+            participants: vec!["Alice".into(), "Bob".into()],
+            subject: Some("Subject".into()),
+            count: 2,
+            latest: Utc.with_ymd_and_hms(2024, 1, 10, 10, 0, 0).unwrap(),
+            has_unread: false,
+            has_starred: false,
+            has_attachment: false,
+            has_calendar: false,
+        }
+    }
+
+    /// Every field `ThreadRow`'s header renders has to appear in
+    /// `thread_row_key`, or a change to it would be mistaken for no change -
+    /// same contract `message_row_key`'s doc comment demands for
+    /// `EmailSummary`.
+    #[test]
+    fn thread_row_key_covers_every_rendered_field() {
+        let base = base_thread_row();
+        let base_key = thread_row_key(&base);
+        assert_eq!(thread_row_key(&base), base_key);
+
+        let mut other_id = base.clone();
+        other_id.id = (MailboxId("a:INBOX".into()), ThreadKey("other".into()));
+        assert_ne!(thread_row_key(&other_id), base_key);
+
+        let mut other_sender = base.clone();
+        other_sender.sender = "Carol".into();
+        assert_ne!(thread_row_key(&other_sender), base_key);
+
+        let mut other_participants = base.clone();
+        other_participants.participants = vec!["Carol".into()];
+        assert_ne!(thread_row_key(&other_participants), base_key);
+
+        let mut other_subject = base.clone();
+        other_subject.subject = Some("Different".into());
+        assert_ne!(thread_row_key(&other_subject), base_key);
+
+        let mut other_count = base.clone();
+        other_count.count = 3;
+        assert_ne!(thread_row_key(&other_count), base_key);
+
+        let mut other_latest = base.clone();
+        other_latest.latest = Utc.with_ymd_and_hms(2024, 1, 11, 10, 0, 0).unwrap();
+        assert_ne!(thread_row_key(&other_latest), base_key);
+
+        let mut other_unread = base.clone();
+        other_unread.has_unread = true;
+        assert_ne!(thread_row_key(&other_unread), base_key);
+
+        let mut other_starred = base.clone();
+        other_starred.has_starred = true;
+        assert_ne!(thread_row_key(&other_starred), base_key);
+
+        let mut other_attachment = base.clone();
+        other_attachment.has_attachment = true;
+        assert_ne!(thread_row_key(&other_attachment), base_key);
+
+        let mut other_calendar = base.clone();
+        other_calendar.has_calendar = true;
+        assert_ne!(thread_row_key(&other_calendar), base_key);
+    }
+
+    #[test]
+    fn diff_range_finds_common_prefix_and_suffix() {
+        // Insertion in the middle: prefix and suffix both nonempty. `5` is
+        // found as a shared suffix even though `3, 4` were inserted ahead of
+        // it, so nothing needs removing from `old` at all - only `3, 4` get
+        // inserted before the untouched `5`.
+        let old = vec![1, 2, 5];
+        let new = vec![1, 2, 3, 4, 5];
+        let d = diff_range(&old, &new);
+        assert_eq!(d.old_removed(old.len()), 2..2);
+        assert_eq!(d.new_inserted(new.len()), 2..4);
+
+        // Deletion in the middle.
+        let old = vec![1, 2, 3, 4, 5];
+        let new = vec![1, 2, 5];
+        let d = diff_range(&old, &new);
+        assert_eq!(d.old_removed(old.len()), 2..4);
+        assert_eq!(d.new_inserted(new.len()), 2..2);
+
+        // No overlap at all: full replace.
+        let old = vec![1, 2, 3];
+        let new = vec![9, 8, 7];
+        let d = diff_range(&old, &new);
+        assert_eq!(d.old_removed(old.len()), 0..3);
+        assert_eq!(d.new_inserted(new.len()), 0..3);
+
+        // Identical: empty middle range.
+        let old = vec![1, 2, 3];
+        let new = vec![1, 2, 3];
+        let d = diff_range(&old, &new);
+        assert_eq!(d.old_removed(old.len()), 3..3);
+        assert_eq!(d.new_inserted(new.len()), 3..3);
+
+        // Old empty: first population of a brand-new section/thread store.
+        let old: Vec<i32> = vec![];
+        let new = vec![1, 2];
+        let d = diff_range(&old, &new);
+        assert_eq!(d.old_removed(0), 0..0);
+        assert_eq!(d.new_inserted(2), 0..2);
+
+        // New empty: every row removed.
+        let old = vec![1, 2];
+        let new: Vec<i32> = vec![];
+        let d = diff_range(&old, &new);
+        assert_eq!(d.old_removed(2), 0..2);
+        assert_eq!(d.new_inserted(0), 0..0);
+
+        // Shifted-by-one: no shared prefix or suffix even though most
+        // elements appear in both, since none sit at a shared position.
+        let old = vec![1, 2, 3];
+        let new = vec![2, 3, 4];
+        let d = diff_range(&old, &new);
+        assert_eq!(d.old_removed(3), 0..3);
+        assert_eq!(d.new_inserted(3), 0..3);
+    }
+
+    /// Regression guard for the `remaining` clamp in `diff_range`: with equal-
+    /// length lists whose only match is a single shared middle element, the
+    /// prefix and suffix searches must not double-count that element into
+    /// both a "shared prefix" and a "shared suffix".
+    #[test]
+    fn diff_range_does_not_overlap_prefix_and_suffix_on_short_common_runs() {
+        let old = vec![9, 5, 8];
+        let new = vec![1, 5, 2];
+        let d = diff_range(&old, &new);
+        assert_eq!(d.old_removed(3), 0..3);
+        assert_eq!(d.new_inserted(3), 0..3);
     }
 
     fn uids(messages: &[EmailSummary]) -> Vec<u32> {

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.68 (2026-08-18)
+
+### Changed
+
+- **App**: the message list no longer tears down and rebuilds every row on a real change. `MessageListModel::repopulate` already skipped rebuilding entirely when nothing changed; now, when something did, it diffs the old displayed content against the new per `gio::ListStore` (root, every date-section store, every thread store) and splices only the differing middle range, instead of always `splice(0, store.n_items(), &rows)`-ing the whole thing. The diff is a common-prefix/common-suffix comparison over new `RowKey`/`SectionRowKey`/`ThreadRowKey` fingerprints (`message_row_key`'s siblings) - sound because both sequences are always freshly recomputed in sort order each call, never a patched-in-place reordering of a stable set, so a shared prefix/suffix is the whole diff worth computing and it degrades safely to a full replace when nothing is shared (a filter or threading-mode toggle). `sections`/`threads` now carry each store's last-shown keys alongside it (`TrackedStore`) so a store and its diff target can't desync, and `clear_sections`/`clear_threads` zero a stale entry's keys in the same two-pass, borrow-dropped-before-splicing shape the reentrancy-sensitive splice calls already required (`items-changed` fires synchronously and re-enters the selection handler). `capture_collapsed`/`apply_expansion`/`restore_selection` are unchanged - both already read live row state rather than row identity, so a partial splice's untouched rows keep their expansion state for free.
+
+### Testing
+
+- `lookout-app`: 12 new `message_list` tests - eight `diff_range` cases (middle insertion/deletion, no overlap, identical, empty-old, empty-new, shifted-by-one, and a same-length/single-shared-middle-element regression guard for the prefix/suffix overlap clamp), `section_row_key`/`thread_row_key` "every rendered field must appear" contracts (mirroring `message_row_key`'s), and two new assertions in the live `TreeListModel` test pinning the change's two highest-risk assumptions: an untouched section's collapse survives a partial diff, and the selection survives one too.
+
 ## 0.9.67 (2026-08-18)
 
 ### Changed
