@@ -551,6 +551,20 @@ pub async fn run_account_session(
         }
     });
 
+    // Same fire-and-forget shape for cache housekeeping: sweeping attachment
+    // `.bin`/`.eml` flat files that have no matching `messages` row, and the
+    // incremental-vacuum migration/reclaim (see `Cache::run_maintenance`).
+    // Off the connect path for the same reason as the backfill above - a
+    // large existing cache must never delay login.
+    let maintenance_cache = cache.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(c) = maintenance_cache.as_ref() {
+            if let Err(e) = c.run_maintenance() {
+                tracing::warn!("failed to run cache maintenance: {e}");
+            }
+        }
+    });
+
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 

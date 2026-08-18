@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.70" date="2026-08-19">
+      <description>
+        <p>Moving a message no longer leaves its attachments and raw copy behind in the local cache forever - those are now cleaned up immediately, with a background sweep and periodic disk reclaim to catch anything left over from before this fix.</p>
+      </description>
+    </release>
     <release version="0.9.69" date="2026-08-18">
       <description>
         <p>The dashboard no longer repaints on every sync event - it's debounced and skipped entirely while its tab isn't visible, though opening it or hitting Refresh still repaints right away. Folder switching, live search, and recipient/attendee autocomplete no longer briefly freeze the interface while reading from the local cache - those reads now happen in the background instead of blocking the window.</p>

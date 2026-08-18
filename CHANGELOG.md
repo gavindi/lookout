@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.70 (2026-08-19)
+
+### Fixed
+
+- **Mail**: moving a message no longer orphans its cached attachment `.bin` sidecars and raw `.eml` export on disk forever. `delete_messages` (the batch path every MOVE handler in `session.rs` actually calls - `delete_message` is now a thin wrapper around it) dropped only the `messages`/`bodies`/`snoozed`/`search_fts` rows and never touched the flat files, and once the `messages` row was gone `replace_messages`'s own expunge diff could no longer see that uid to purge it either - so nothing ever cleaned these up. `delete_messages` now looks up each deleted uid's `uidvalidity` before dropping its row and purges its flat files through the existing `purge_message_files`, the same helper `replace_messages` already used for its own expunge/whole-clear diff.
+
+### Added
+
+- **Mail**: a new `Cache::run_maintenance`, fired once per session start from the same non-awaited `spawn_blocking` slot `backfill_search_index` already uses (never from `Cache::open`'s synchronous path, so a large existing cache never delays login), backstops the fix above two ways: a new `sweep_orphaned_files` sweeps every attachment/raw-message flat file whose `(mailbox, uid, uidvalidity)` has no matching `messages` row anywhere in the account's cache - one `read_dir` pass per flat-file directory against a set built from a single `SELECT DISTINCT mailbox_id, uidvalidity, uid FROM messages` - catching anything left over from before this fix, or from a crash between a flat-file write and its row landing; and the database is migrated to SQLite's `auto_vacuum=INCREMENTAL` mode (a one-time `VACUUM`, paid once per install) so the now-cheap `PRAGMA incremental_vacuum` can reclaim the pages freed by every purge path above instead of leaving the database file to only ever grow.
+- **Mail**: `store_attachment`/`store_raw_message` now write their flat files atomically (temp file + rename, pid-suffixed against concurrent writers) through a new `write_atomic` helper, so a crash or a concurrent read mid-write can never observe a truncated attachment - mirroring the tmp+rename idiom already used for the OAuth token stores and the autostart file.
+
 ## 0.9.69 (2026-08-18)
 
 ### Changed

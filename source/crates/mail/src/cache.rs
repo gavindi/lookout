@@ -70,6 +70,27 @@ fn mailbox_filename_hash(mailbox_id: &MailboxId) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Writes `bytes` to `path` atomically: write to a sibling temp file, then
+/// rename over the target. A crash or a concurrent read mid-write can never
+/// observe a truncated `.bin`/`.eml` file this way (`load_attachment`/
+/// `load_raw_message` would otherwise be able to read a partial write and
+/// cache a corrupt attachment). Mirrors the tmp+rename idiom already used
+/// for the OAuth token stores (`microsoft_oauth.rs`, `google_tasks.rs`) and
+/// the autostart file (`background.rs`); the pid suffix keeps concurrent
+/// writers (different blocking-pool threads) from colliding on the same
+/// temp name.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp_name);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn cache_dir() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
@@ -811,11 +832,7 @@ impl Cache {
     /// `BodyPart::transfer_encoding` concern that belongs to the fetch path.
     pub fn store_attachment(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, part_number: &str, bytes: &[u8]) -> Result<()> {
         let path = self.attachment_path(mailbox_id, uid, uidvalidity, part_number);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, bytes)?;
-        Ok(())
+        write_atomic(&path, bytes)
     }
 
     /// The per-account flat-file path a whole raw RFC 5322 message's bytes are
@@ -844,11 +861,7 @@ impl Cache {
     /// path) at near-zero cost, or fetch on demand for an export.
     pub fn store_raw_message(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, bytes: &[u8]) -> Result<()> {
         let path = self.raw_message_path(mailbox_id, uid, uidvalidity);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, bytes)?;
-        Ok(())
+        write_atomic(&path, bytes)
     }
 
     /// Removes the flat-file cache for every `(uid, uidvalidity)` pair in
@@ -892,6 +905,86 @@ impl Cache {
         for &(uid, validity) in purged {
             let _ = std::fs::remove_file(self.raw_message_path(mailbox_id, Uid(uid), UidValidity(validity)));
         }
+    }
+
+    /// Deletes every attachment `.bin`/`.eml` flat file whose `(mailbox, uid,
+    /// uidvalidity)` has no matching `messages` row anywhere in this
+    /// account's cache. The backstop for files `purge_message_files` never
+    /// got a chance to catch - one orphaned before that purge path covered
+    /// `delete_messages`, or one left behind by a crash between a flat-file
+    /// write and its `messages` row landing. One `read_dir` pass per
+    /// flat-file directory (attachments, then raw messages), each file's
+    /// name split and looked up in a set built from a single query - not an
+    /// O(files) `read_dir` per uid.
+    ///
+    /// Best-effort like `purge_message_files`: a name that doesn't parse (or
+    /// a `write_atomic` temp file mid-write, which never matches the `.bin`/
+    /// `.eml` suffix in the first place) is left alone, and unlink failures
+    /// are ignored - worst case a stale file survives to the next sweep, or
+    /// a live file is deleted and re-fetched from the server on next use.
+    /// Called once per session start (see `session.rs`), never inline with
+    /// a sync.
+    fn sweep_orphaned_files(&self) {
+        let known: HashSet<(String, u32, u32)> = {
+            let conn = self.conn.lock().unwrap();
+            let Ok(mut stmt) = conn.prepare("SELECT DISTINCT mailbox_id, uidvalidity, uid FROM messages") else {
+                return;
+            };
+            let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?))) else {
+                return;
+            };
+            rows.flatten().map(|(mailbox_id, validity, uid)| (mailbox_filename_hash(&MailboxId(mailbox_id)), validity, uid)).collect()
+        };
+        for (dir, ext) in [(&self.attachments_dir, ".bin"), (&self.messages_dir, ".eml")] {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+                if !name.ends_with(ext) {
+                    continue;
+                }
+                // Strip the extension before splitting: `.bin`'s stem ends
+                // in `-<part_number>` but `.eml`'s ends bare (`...-<uid>`),
+                // so splitting the raw filename would swallow the `.eml`
+                // suffix into the uid field and fail to parse.
+                let stem = &name[..name.len() - ext.len()];
+                let mut fields = stem.split('-');
+                let Some(hash) = fields.next() else { continue };
+                let validity = fields.next().and_then(|s| s.parse::<u32>().ok());
+                let uid = fields.next().and_then(|s| s.parse::<u32>().ok());
+                let is_orphan = matches!((validity, uid), (Some(v), Some(u)) if !known.contains(&(hash.to_string(), v, u)));
+                if is_orphan {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    /// One-time migration plus periodic reclaim, meant to be called once per
+    /// session start on the blocking pool (the same fire-and-forget slot
+    /// `session.rs` already uses for `backfill_search_index`) - never from
+    /// `Cache::open` itself, so an account with a large existing cache never
+    /// pays this cost before the first connect attempt.
+    ///
+    /// `auto_vacuum` only takes effect via a full `VACUUM` on a database
+    /// that already has tables (SQLite's own rule), so an install upgrading
+    /// from a pre-incremental-vacuum cache pays that `VACUUM` exactly once;
+    /// every `Cache` opened afterward reads `auto_vacuum` back as
+    /// `INCREMENTAL` and skips straight to the cheap `PRAGMA
+    /// incremental_vacuum`, which only moves already-freed pages (from
+    /// expunged messages, purged bodies, `delete_messages`' and
+    /// `sweep_orphaned_files`'s flat-file purges, ...) to the end of the
+    /// file so the OS can reclaim them - no full-file rewrite.
+    pub fn run_maintenance(&self) -> Result<()> {
+        self.sweep_orphaned_files();
+        let conn = self.conn.lock().unwrap();
+        const INCREMENTAL: i64 = 2;
+        let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+        if mode != INCREMENTAL {
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+            conn.execute("VACUUM", [])?;
+        }
+        conn.execute("PRAGMA incremental_vacuum", [])?;
+        Ok(())
     }
 
     /// The list-row snippets already cached for `mailbox_id`, keyed by uid.
@@ -1270,35 +1363,44 @@ impl Cache {
     /// window. The next `replace_messages` wipes the window anyway, so this is
     /// a display-latency optimization, never the source of truth.
     pub fn delete_message(&self, mailbox_id: &MailboxId, uid: Uid) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
-        tx.execute("DELETE FROM bodies WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
-        tx.execute("DELETE FROM snoozed WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
-        tx.execute("DELETE FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid.0])?;
-        tx.commit()?;
-        Ok(())
+        self.delete_messages(mailbox_id, &[uid])
     }
 
-    /// Removes several messages (plus their cached bodies, snooze entries and
-    /// search-index rows) in one transaction - the batch counterpart of
-    /// `delete_message`, used by the move paths so a multi-message move pays
-    /// one commit instead of one per message.
+    /// Removes several messages (plus their cached bodies, snooze entries,
+    /// search-index rows, and flat files) in one transaction - the batch
+    /// counterpart of `delete_message`, used by the move paths so a
+    /// multi-message move pays one commit instead of one per message.
+    ///
+    /// Unlike `replace_messages`'s expunge diff, this is the only path that
+    /// deletes a message outside of a resync (a MOVE deletes it from the
+    /// cache immediately, before the next sync would otherwise notice it's
+    /// gone) - so it must purge that message's flat files itself; once the
+    /// `messages` row is gone, `replace_messages`'s stored-vs-present diff
+    /// can no longer see the uid to purge it for us.
     pub fn delete_messages(&self, mailbox_id: &MailboxId, uids: &[Uid]) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let mut purged: HashSet<(u32, u32)> = HashSet::new();
         {
-            let mut messages = tx.prepare("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
-            let mut bodies = tx.prepare("DELETE FROM bodies WHERE mailbox_id = ?1 AND uid = ?2")?;
-            let mut snoozed = tx.prepare("DELETE FROM snoozed WHERE mailbox_id = ?1 AND uid = ?2")?;
-            let mut fts = tx.prepare("DELETE FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut validity_of = tx.prepare_cached("SELECT uidvalidity FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut messages = tx.prepare_cached("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut bodies = tx.prepare_cached("DELETE FROM bodies WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut snoozed = tx.prepare_cached("DELETE FROM snoozed WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut fts = tx.prepare_cached("DELETE FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2")?;
             for uid in uids {
+                if let Ok(validity) = validity_of.query_row(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, u32>(0)) {
+                    purged.insert((uid.0, validity));
+                }
                 messages.execute(rusqlite::params![mailbox_id.0, uid.0])?;
                 bodies.execute(rusqlite::params![mailbox_id.0, uid.0])?;
                 snoozed.execute(rusqlite::params![mailbox_id.0, uid.0])?;
                 fts.execute(rusqlite::params![mailbox_id.0, uid.0])?;
             }
         }
+        self.purge_message_files(mailbox_id, &purged);
         tx.commit()?;
         Ok(())
     }
@@ -1495,6 +1597,9 @@ mod tests {
         cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("raw one")).unwrap();
         cache.store_body(&mailbox_id, Uid(2), UidValidity(1), &sample_body("raw two")).unwrap();
         cache.snooze_message(&mailbox_id, Uid(2), Utc::now() + chrono::Duration::hours(1)).unwrap();
+        cache.store_attachment(&mailbox_id, Uid(1), UidValidity(1), "2", b"gone pdf").unwrap();
+        cache.store_raw_message(&mailbox_id, Uid(1), UidValidity(1), b"Subject: gone\r\n\r\nx").unwrap();
+        cache.store_attachment(&mailbox_id, Uid(2), UidValidity(1), "2", b"kept pdf").unwrap();
 
         cache.delete_message(&mailbox_id, Uid(1)).unwrap();
 
@@ -1504,6 +1609,19 @@ mod tests {
         assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap());
         assert!(cache.has_body(&mailbox_id, Uid(2), UidValidity(1)).unwrap());
         assert_eq!(cache.active_snoozed_uids(&mailbox_id, Utc::now()).unwrap(), HashSet::from([Uid(2)]));
+        assert!(
+            cache.load_attachment(&mailbox_id, Uid(1), UidValidity(1), "2").unwrap().is_none(),
+            "the deleted message's attachment .bin is purged, not left orphaned"
+        );
+        assert!(
+            cache.load_raw_message(&mailbox_id, Uid(1), UidValidity(1)).unwrap().is_none(),
+            "the deleted message's .eml is purged, not left orphaned"
+        );
+        assert_eq!(
+            cache.load_attachment(&mailbox_id, Uid(2), UidValidity(1), "2").unwrap(),
+            Some(b"kept pdf".to_vec()),
+            "the surviving message's attachment is untouched"
+        );
 
         // Deleting a uid the cache doesn't know is fine - used when the moved
         // message fell outside the cached window.
@@ -1537,6 +1655,8 @@ mod tests {
         cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("one")).unwrap();
         cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("three")).unwrap();
         cache.snooze_message(&mailbox_id, Uid(3), Utc::now() + chrono::Duration::hours(1)).unwrap();
+        cache.store_attachment(&mailbox_id, Uid(1), UidValidity(1), "2", b"gone pdf").unwrap();
+        cache.store_raw_message(&mailbox_id, Uid(3), UidValidity(1), b"Subject: gone\r\n\r\nx").unwrap();
 
         cache.delete_messages(&mailbox_id, &[Uid(1), Uid(3), Uid(99)]).unwrap();
 
@@ -1546,6 +1666,62 @@ mod tests {
         assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap());
         assert!(!cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap());
         assert!(cache.active_snoozed_uids(&mailbox_id, Utc::now()).unwrap().is_empty());
+        assert!(
+            cache.load_attachment(&mailbox_id, Uid(1), UidValidity(1), "2").unwrap().is_none(),
+            "a batch-deleted message's attachment .bin is purged, not left orphaned"
+        );
+        assert!(
+            cache.load_raw_message(&mailbox_id, Uid(3), UidValidity(1)).unwrap().is_none(),
+            "a batch-deleted message's .eml is purged, not left orphaned"
+        );
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `run_maintenance`'s sweep is the backstop for flat files that have no
+    /// `messages` row at all - an attachment/raw message stored for a uid
+    /// that was never (or is no longer) part of the cached mailbox, the case
+    /// `purge_message_files`'s resync diff and `delete_messages`' explicit
+    /// purge can't reach because neither one ever ran for that uid. A file
+    /// backed by a real row must survive the same sweep.
+    #[test]
+    fn run_maintenance_sweeps_flat_files_with_no_matching_row() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None)]).unwrap();
+        cache.store_attachment(&mailbox_id, Uid(1), UidValidity(1), "2", b"kept pdf").unwrap();
+        cache.store_raw_message(&mailbox_id, Uid(1), UidValidity(1), b"Subject: kept\r\n\r\nx").unwrap();
+
+        // Uid 99 has flat files but was never given a `messages` row -
+        // exactly what a crash between the flat-file write and the row
+        // landing (or a pre-fix `delete_messages`) would leave behind.
+        cache.store_attachment(&mailbox_id, Uid(99), UidValidity(1), "2", b"orphan pdf").unwrap();
+        cache.store_raw_message(&mailbox_id, Uid(99), UidValidity(1), b"Subject: orphan\r\n\r\nx").unwrap();
+
+        cache.run_maintenance().unwrap();
+
+        assert_eq!(
+            cache.load_attachment(&mailbox_id, Uid(1), UidValidity(1), "2").unwrap(),
+            Some(b"kept pdf".to_vec()),
+            "a flat file backed by a real row survives the sweep"
+        );
+        assert!(cache.load_raw_message(&mailbox_id, Uid(1), UidValidity(1)).unwrap().is_some());
+        assert!(
+            cache.load_attachment(&mailbox_id, Uid(99), UidValidity(1), "2").unwrap().is_none(),
+            "an attachment with no matching messages row is swept"
+        );
+        assert!(
+            cache.load_raw_message(&mailbox_id, Uid(99), UidValidity(1)).unwrap().is_none(),
+            "a raw message with no matching messages row is swept"
+        );
+
+        let conn = cache.conn.lock().unwrap();
+        let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, 2, "run_maintenance migrates the database to incremental auto_vacuum");
+        drop(conn);
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
