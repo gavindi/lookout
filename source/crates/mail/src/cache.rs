@@ -1331,20 +1331,30 @@ impl Cache {
         Ok(())
     }
 
-    /// Returns every uid in `mailbox_id` still snoozed as of `now`, having
-    /// first opportunistically deleted rows whose snooze time has already
-    /// passed (cheap cleanup piggybacked on the read every caller already
-    /// does before building `MessagesUpdated`).
+    /// Returns every uid in `mailbox_id` still snoozed as of `now`. Pure
+    /// read - safe to call synchronously off the GTK main thread (a plain
+    /// indexed SELECT, no write lock contention). Expiry is filtered here
+    /// directly rather than relying on a prior `purge_expired_snoozed` call,
+    /// so correctness doesn't depend on that cleanup having run recently.
     pub fn active_snoozed_uids(&self, mailbox_id: &MailboxId, now: DateTime<Utc>) -> Result<HashSet<Uid>> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM snoozed WHERE snoozed_until <= ?1", rusqlite::params![now.timestamp()])?;
-        let mut stmt = conn.prepare("SELECT uid FROM snoozed WHERE mailbox_id = ?1")?;
-        let rows = stmt.query_map([&mailbox_id.0], |row| row.get::<_, u32>(0))?;
+        let mut stmt = conn.prepare("SELECT uid FROM snoozed WHERE mailbox_id = ?1 AND snoozed_until > ?2")?;
+        let rows = stmt.query_map(rusqlite::params![mailbox_id.0, now.timestamp()], |row| row.get::<_, u32>(0))?;
         let mut uids = HashSet::new();
         for row in rows {
             uids.insert(Uid(row?));
         }
         Ok(uids)
+    }
+
+    /// Deletes every snoozed-message row (account-wide) whose wake time has
+    /// passed. Cheap housekeeping meant to run alongside cache work already
+    /// off the GTK thread; kept separate from `active_snoozed_uids` so that
+    /// read can be called synchronously from the UI thread.
+    pub fn purge_expired_snoozed(&self, now: DateTime<Utc>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM snoozed WHERE snoozed_until <= ?1", rusqlite::params![now.timestamp()])?;
+        Ok(())
     }
 }
 
@@ -1422,6 +1432,29 @@ mod tests {
         // rather than erroring or duplicating the row.
         cache.snooze_message(&mailbox_id, Uid(1), now - chrono::Duration::hours(1)).unwrap();
         assert!(cache.active_snoozed_uids(&mailbox_id, now).unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn purge_expired_snoozed_removes_only_expired_rows() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let now = Utc::now();
+
+        cache.snooze_message(&mailbox_id, Uid(1), now + chrono::Duration::hours(1)).unwrap();
+        cache.snooze_message(&mailbox_id, Uid(2), now - chrono::Duration::hours(1)).unwrap();
+
+        cache.purge_expired_snoozed(now).unwrap();
+
+        let conn = cache.conn.lock().unwrap();
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM snoozed", [], |row| row.get(0)).unwrap();
+        assert_eq!(remaining, 1);
+        let remaining_uid: u32 = conn.query_row("SELECT uid FROM snoozed", [], |row| row.get(0)).unwrap();
+        assert_eq!(remaining_uid, 1);
+        drop(conn);
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

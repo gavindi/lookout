@@ -623,7 +623,7 @@ async fn connect_and_run(
     mut carried_command: Option<AccountCommand>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
-    let (mut session, has_move, condstore, has_list_status, qresync) = login(config, credential).await?;
+    let (mut session, has_move, condstore, has_list_status, qresync, has_uidplus) = login(config, credential).await?;
 
     let account_id = config.account_id.clone();
     let (mut folders, list_counts_supplied) = list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?;
@@ -1176,19 +1176,22 @@ async fn connect_and_run(
                         // mutation pattern `MoveMessage` uses below.
                         if let Some(sent_id) = sent_mailbox {
                             if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
-                                let open_changed = relist_folders(
+                                let mut ids = vec![sent_id.clone()];
+                                if sent_id != current_mailbox_id {
+                                    ids.push(current_mailbox_id.clone());
+                                }
+                                let open_changed = refresh_folders_targeted(
                                     &mut session,
                                     &mut folders,
-                                    &mut counts_pending,
                                     &account_id,
+                                    &ids,
                                     &current_mailbox_id,
+                                    condstore,
                                     cache,
                                     events,
-                                    condstore,
-                                    has_list_status,
                                     &mut dirty_mailboxes,
                                 )
-                                .await?;
+                                .await;
                                 sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache, &mut folders, Some(&session_selected), condstore, qresync).await?;
                                 dirty_mailboxes.remove(&sent_id);
                                 session_selected = sent_id.clone();
@@ -1227,7 +1230,7 @@ async fn connect_and_run(
                 },
                 AccountCommand::SaveDraft { msg, replace } => {
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
-                    match save_draft(&mut session, &folders, &account_id, *msg, replace).await {
+                    match save_draft(&mut session, &folders, &account_id, *msg, replace, has_uidplus).await {
                         Ok(message_id) => {
                             let _ = events.send(AccountEvent::DraftSaved { message_id }).await;
                         }
@@ -1283,7 +1286,7 @@ async fn connect_and_run(
                     }
                 }
                 AccountCommand::DeleteDraft { message_id } => {
-                    if let Err(e) = delete_draft(&mut session, &folders, &account_id, &message_id).await {
+                    if let Err(e) = delete_draft(&mut session, &folders, &account_id, &message_id, has_uidplus).await {
                         tracing::warn!("draft delete failed: {e}");
                     }
                     session.select(&current_mailbox_name).await?;
@@ -1308,7 +1311,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    match move_message_to_role(&mut session, &folders, &account_id, &[uid], role, has_move).await {
+                    match move_message_to_role(&mut session, &folders, &account_id, &[uid], role, has_move, has_uidplus).await {
                         Ok(()) => {
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
                             // The MOVE already succeeded server-side, so drop the
@@ -1329,19 +1332,22 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop moved message from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &mailbox, events).await;
-                            relist_folders(
+                            let mut ids = vec![mailbox.clone()];
+                            if let Some(dest) = folders.iter().find(|m| m.role == role) {
+                                ids.push(dest.id.clone());
+                            }
+                            refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
-                                &mut counts_pending,
                                 &account_id,
+                                &ids,
                                 &current_mailbox_id,
+                                condstore,
                                 cache,
                                 events,
-                                condstore,
-                                has_list_status,
                                 &mut dirty_mailboxes,
                             )
-                            .await?;
+                            .await;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -1380,7 +1386,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    match move_message_to_role(&mut session, &folders, &account_id, &uids, role, has_move).await {
+                    match move_message_to_role(&mut session, &folders, &account_id, &uids, role, has_move, has_uidplus).await {
                         Ok(()) => {
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
                             if let Some(Err(e)) = cache_op(cache, {
@@ -1393,19 +1399,22 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop moved messages from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &mailbox, events).await;
-                            relist_folders(
+                            let mut ids = vec![mailbox.clone()];
+                            if let Some(dest) = folders.iter().find(|m| m.role == role) {
+                                ids.push(dest.id.clone());
+                            }
+                            refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
-                                &mut counts_pending,
                                 &account_id,
+                                &ids,
                                 &current_mailbox_id,
+                                condstore,
                                 cache,
                                 events,
-                                condstore,
-                                has_list_status,
                                 &mut dirty_mailboxes,
                             )
-                            .await?;
+                            .await;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -1450,7 +1459,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    match move_uids_to_path(&mut session, &uids, &target_path, has_move).await {
+                    match move_uids_to_path(&mut session, &uids, &target_path, has_move, has_uidplus).await {
                         Ok(()) => {
                             // `Custom` here is just a marker for the generic
                             // "Moved" toast - the target was an arbitrary
@@ -1466,19 +1475,18 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop moved messages from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &mailbox, events).await;
-                            relist_folders(
+                            refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
-                                &mut counts_pending,
                                 &account_id,
+                                &[mailbox.clone(), target.clone()],
                                 &current_mailbox_id,
+                                condstore,
                                 cache,
                                 events,
-                                condstore,
-                                has_list_status,
                                 &mut dirty_mailboxes,
                             )
-                            .await?;
+                            .await;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -1514,7 +1522,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    match empty_mailbox(&mut session).await {
+                    match empty_mailbox(&mut session, has_uidplus).await {
                         Ok(count) => {
                             let role = folders.iter().find(|m| m.id == mailbox).map(|m| m.role).unwrap_or(MailboxRole::Custom);
                             let _ = events.send(AccountEvent::MailboxExpunged { role }).await;
@@ -1531,19 +1539,18 @@ async fn connect_and_run(
                                     }
                                 }
                             }
-                            relist_folders(
+                            refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
-                                &mut counts_pending,
                                 &account_id,
+                                std::slice::from_ref(&mailbox),
                                 &current_mailbox_id,
+                                condstore,
                                 cache,
                                 events,
-                                condstore,
-                                has_list_status,
                                 &mut dirty_mailboxes,
                             )
-                            .await?;
+                            .await;
                             sync_mailbox(
                                 &mut session,
                                 &account_id,
@@ -2233,22 +2240,22 @@ fn valid_keyword_atom(keyword: &str) -> bool {
 /// Moves `uids` (one or many) from the currently selected mailbox into the
 /// account's mailbox with special-use role `role`, via IMAP MOVE (RFC 6851)
 /// if the server advertises it, else COPY + STORE `\Deleted` + EXPUNGE.
-async fn move_message_to_role(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, uids: &[Uid], role: MailboxRole, has_move: bool) -> Result<()> {
+async fn move_message_to_role(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, uids: &[Uid], role: MailboxRole, has_move: bool, has_uidplus: bool) -> Result<()> {
     let Some(target) = folders.iter().find(|m| m.role == role) else {
         return Err(Error::NoSuchFolder(role));
     };
     let Some(path) = target.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
         return Ok(());
     };
-    move_uids_to_path(session, uids, path, has_move).await
+    move_uids_to_path(session, uids, path, has_move, has_uidplus).await
 }
 
 /// The IMAP move itself, shared by the role-based (`MoveMessages`) and
 /// explicit-target (`MoveMessagesTo`) paths: one MOVE over the joined UID
 /// set (RFC 6851) when the server advertises it, else COPY + STORE
-/// `\Deleted` + EXPUNGE. `has_move` comes from the single post-login
-/// `CAPABILITY` fetch, never a per-batch round trip.
-async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], path: &str, has_move: bool) -> Result<()> {
+/// `\Deleted` + EXPUNGE. `has_move`/`has_uidplus` come from the single
+/// post-login `CAPABILITY` fetch, never a per-batch round trip.
+async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], path: &str, has_move: bool, has_uidplus: bool) -> Result<()> {
     let uid_chunks = uid_set_chunks(uids);
     if has_move {
         for uid_set in &uid_chunks {
@@ -2261,10 +2268,17 @@ async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], p
         for uid_set in &uid_chunks {
             let _: Vec<_> = session.uid_store(uid_set, "+FLAGS (\\Deleted)").await?.try_collect().await?;
         }
-        // NB: expunges every \Deleted-flagged message in the currently
-        // selected mailbox, not just this batch - a documented, accepted
-        // simplification since nothing else in this crate ever sets \Deleted.
-        let _: Vec<_> = session.expunge().await?.try_collect().await?;
+        if has_uidplus {
+            for uid_set in &uid_chunks {
+                let _: Vec<_> = session.uid_expunge(uid_set).await?.try_collect().await?;
+            }
+        } else {
+            // NB: expunges every \Deleted-flagged message in the currently
+            // selected mailbox, not just this batch - a documented, accepted
+            // simplification since nothing else in this crate ever sets
+            // \Deleted, used only when the server lacks UIDPLUS.
+            let _: Vec<_> = session.expunge().await?.try_collect().await?;
+        }
     }
     Ok(())
 }
@@ -2317,7 +2331,7 @@ fn drafts_path<'a>(folders: &'a [Mailbox], account_id: &AccountId) -> Option<&'a
 /// crate sets `\Deleted` inside the folder being emptied. Returns how many
 /// messages were removed (0 when the folder is already empty, with no round
 /// trips beyond the search).
-async fn empty_mailbox(session: &mut Session<SessionStream>) -> Result<u32> {
+async fn empty_mailbox(session: &mut Session<SessionStream>, has_uidplus: bool) -> Result<u32> {
     let uids = session.uid_search("ALL").await?;
     let count = uids.len() as u32;
     if uids.is_empty() {
@@ -2327,25 +2341,39 @@ async fn empty_mailbox(session: &mut Session<SessionStream>) -> Result<u32> {
     // (RFC 3501 §6.4.8: `*` is the largest UID in use), where spelling out
     // every uid could exceed the server's command-line limit on a big folder.
     let _: Vec<_> = session.uid_store("1:*", "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
-    let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    if has_uidplus {
+        let _: Vec<_> = session.uid_expunge("1:*").await?.try_collect().await?;
+    } else {
+        let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    }
     Ok(count)
 }
 
 /// Permanently removes every message in the *currently selected* mailbox
 /// whose `Message-ID` header equals `message_id` (bare id, no brackets).
-/// `UID SEARCH HEADER` + `\Deleted` + EXPUNGE rather than MOVE so it works
-/// on servers without RFC 6851; the EXPUNGE-everything-`\Deleted` caveat
-/// from `move_message_to_role` applies, and is harmless here because this
-/// crate only ever sets `\Deleted` on the very uids it just flagged.
-async fn purge_by_message_id(session: &mut Session<SessionStream>, message_id: &str) -> Result<()> {
+/// `UID SEARCH HEADER` + `\Deleted` + expunge rather than MOVE so it works
+/// on servers without RFC 6851. On a UIDPLUS server (RFC 4315) the expunge
+/// is a targeted `UID EXPUNGE` over just the uids just flagged; otherwise it
+/// falls back to a whole-mailbox `EXPUNGE` - the everything-`\Deleted`
+/// caveat from `move_uids_to_path` applies to that fallback only, and is
+/// harmless here because this crate only ever sets `\Deleted` on the uids it
+/// just flagged.
+async fn purge_by_message_id(session: &mut Session<SessionStream>, message_id: &str, has_uidplus: bool) -> Result<()> {
     let uids: Vec<Uid> = session.uid_search(format!("HEADER Message-Id <{message_id}>")).await?.into_iter().map(Uid).collect();
     if uids.is_empty() {
         return Ok(());
     }
-    for uid_set in &uid_set_chunks(&uids) {
+    let chunks = uid_set_chunks(&uids);
+    for uid_set in &chunks {
         let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
     }
-    let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    if has_uidplus {
+        for uid_set in &chunks {
+            let _: Vec<_> = session.uid_expunge(uid_set).await?.try_collect().await?;
+        }
+    } else {
+        let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    }
     Ok(())
 }
 
@@ -2358,7 +2386,7 @@ async fn purge_by_message_id(session: &mut Session<SessionStream>, message_id: &
 /// such an account would be a worse surprise than a new folder. Leaves the
 /// session SELECTed on the Drafts mailbox; the caller re-selects the
 /// user's folder. Returns the draft's `Message-ID`.
-async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, msg: ComposedMessage, replace: bool) -> Result<String> {
+async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, msg: ComposedMessage, replace: bool, has_uidplus: bool) -> Result<String> {
     let path = match drafts_path(folders, account_id) {
         Some(path) => path.to_string(),
         None => {
@@ -2375,7 +2403,7 @@ async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], a
     let (raw, message_id, _) = build_raw_message(&msg);
     session.select(&path).await?;
     if replace {
-        purge_by_message_id(session, &message_id).await?;
+        purge_by_message_id(session, &message_id, has_uidplus).await?;
     }
     session.append(&path, Some("(\\Draft \\Seen)"), None, raw.as_slice()).await?;
     Ok(message_id)
@@ -2385,15 +2413,15 @@ async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], a
 /// mailbox (a no-op when the account has no Drafts mailbox or the draft
 /// isn't there). Leaves the session SELECTed on the Drafts mailbox; the
 /// caller re-selects the user's folder.
-async fn delete_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, message_id: &str) -> Result<()> {
+async fn delete_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, message_id: &str, has_uidplus: bool) -> Result<()> {
     let Some(path) = drafts_path(folders, account_id) else {
         return Ok(());
     };
     session.select(path).await?;
-    purge_by_message_id(session, message_id).await
+    purge_by_message_id(session, message_id, has_uidplus).await
 }
 
-async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, bool, bool, bool, bool)> {
+async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, bool, bool, bool, bool, bool)> {
     let stream = connect_tls(&config.imap.host, config.imap.port).await?;
     tracing::debug!("login: creating client, reading greeting");
     let mut client = async_imap::Client::new(stream);
@@ -2417,7 +2445,13 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     let capabilities = session.capabilities().await?;
     let has_move = capabilities.has_str("MOVE");
     let has_list_status = capabilities.has_str("LIST-STATUS");
-    tracing::debug!(has_move, has_list_status, "cached server capabilities after login");
+    // UIDPLUS (RFC 4315): lets a targeted `UID EXPUNGE <uid-set>` remove just
+    // the uids just flagged `\Deleted`, instead of the whole-mailbox
+    // `EXPUNGE` every `\Deleted`-then-remove path here otherwise falls back
+    // to (documented as "harmless" only because nothing else in this crate
+    // sets `\Deleted` outside the uids it means to remove).
+    let has_uidplus = capabilities.has_str("UIDPLUS");
+    tracing::debug!(has_move, has_list_status, has_uidplus, "cached server capabilities after login");
 
     // CONDSTORE (RFC 7162): enables the per-mailbox `highest_modseq` bookkeeping
     // that incremental sync (`CHANGEDSINCE`) builds on. `ENABLE` applies to the
@@ -2483,7 +2517,7 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     } else {
         session.map_stream(|stream| Box::new(stream) as SessionStream)
     };
-    Ok((session, has_move, condstore, has_list_status, qresync))
+    Ok((session, has_move, condstore, has_list_status, qresync, has_uidplus))
 }
 
 /// Builds a `Mailbox` from one LIST response entry, minus the count fields
@@ -2806,6 +2840,51 @@ async fn relist_folders(
     *counts_pending = if list_counts_supplied { VecDeque::new() } else { queue_folder_counts(folders, current) };
     publish_folders(folders, account_id, cache, events).await;
     Ok(open_changed)
+}
+
+/// Targeted counterpart of `relist_folders` for the common case where a
+/// mutation (move/empty/send) only changed one or two known folders' counts:
+/// one `STATUS` round trip per id via `refresh_folder_counts`, instead of a
+/// full account `LIST`. Unlike `relist_folders`, this never discovers new or
+/// removed mailboxes and never touches `counts_pending` - it must only be
+/// used where every affected id is already known to be in `folders` (not,
+/// say, a Drafts mailbox this call just `CREATE`d). Marks any changed
+/// non-`current` id dirty exactly as `mark_count_changes` does for the
+/// full-relist path, so the cache-hit shortcut can't serve a stale envelope
+/// list for a folder whose count moved off-screen. Returns whether
+/// `current`'s own counts changed, mirroring `relist_folders`'s `open_changed`.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_folders_targeted(
+    session: &mut Session<SessionStream>,
+    folders: &mut [Mailbox],
+    account_id: &AccountId,
+    ids: &[MailboxId],
+    current: &MailboxId,
+    condstore: bool,
+    cache: &CacheHandle,
+    events: &async_channel::Sender<AccountEvent>,
+    dirty_mailboxes: &mut HashSet<MailboxId>,
+) -> bool {
+    let mut open_changed = false;
+    let mut any_changed = false;
+    for id in ids {
+        let Some(index) = folders.iter().position(|m| m.id == *id) else {
+            continue;
+        };
+        if !refresh_folder_counts(session, &mut folders[index], account_id, condstore).await {
+            continue;
+        }
+        any_changed = true;
+        if id == current {
+            open_changed = true;
+        } else {
+            dirty_mailboxes.insert(id.clone());
+        }
+    }
+    if any_changed {
+        publish_folders(folders, account_id, cache, events).await;
+    }
+    open_changed
 }
 
 /// Quotes an IMAP search criterion's argument per RFC 3501 §9 (quoted string):
@@ -3175,7 +3254,7 @@ async fn sync_mailbox(
         reused = messages.len().saturating_sub(new_uids.len()),
         "synced mailbox"
     );
-    emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
+    emit_messages(mailbox_id, uidvalidity, &messages, events, cache, true).await;
 
     // Capture the count fields before `fetch_previews` takes `messages`: the
     // unread count comes straight from the flags this sync fetched, and the
@@ -3273,7 +3352,13 @@ async fn emit_cached_messages(cache: &CacheHandle, mailbox_id: &MailboxId, event
     if !cached.is_empty() {
         let snoozed = cache_op(cache, {
             let mailbox_id = mailbox_id.clone();
-            move |c| c.active_snoozed_uids(&mailbox_id, chrono::Utc::now())
+            move |c| {
+                let now = chrono::Utc::now();
+                if let Err(e) = c.purge_expired_snoozed(now) {
+                    tracing::warn!("failed to purge expired snoozes: {e}");
+                }
+                c.active_snoozed_uids(&mailbox_id, now)
+            }
         })
         .await
         .and_then(|r| r.ok())
@@ -3305,7 +3390,13 @@ async fn emit_cached_messages_after_removal(cache: &CacheHandle, mailbox_id: &Ma
     {
         let snoozed = cache_op(cache, {
             let mailbox_id = mailbox_id.clone();
-            move |c| c.active_snoozed_uids(&mailbox_id, chrono::Utc::now())
+            move |c| {
+                let now = chrono::Utc::now();
+                if let Err(e) = c.purge_expired_snoozed(now) {
+                    tracing::warn!("failed to purge expired snoozes: {e}");
+                }
+                c.active_snoozed_uids(&mailbox_id, now)
+            }
         })
         .await
         .and_then(|r| r.ok())
@@ -3323,7 +3414,15 @@ async fn emit_cached_messages_after_removal(cache: &CacheHandle, mailbox_id: &Ma
 /// Caches `messages` and publishes them to the UI, minus anything currently
 /// snoozed. Snoozed messages are still fetched and cached normally - only
 /// what's emitted is filtered, so a snooze is purely a display concern.
-async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary], events: &async_channel::Sender<AccountEvent>, cache: &CacheHandle) {
+///
+/// `update_address_book` gates `record_addresses`: `fetch_previews`'s
+/// second, preview-only emit per sync carries the same `from`/`to`/`cc` data
+/// as the first emit (only `preview` differs), so running `record_addresses`
+/// again there would double-count every correspondent's `seen_count`/
+/// `last_seen` on every sync. `replace_messages` always runs on both calls -
+/// it's what makes a fetched preview persist across resyncs - so it is not
+/// skippable here.
+async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary], events: &async_channel::Sender<AccountEvent>, cache: &CacheHandle, update_address_book: bool) {
     let mut messages = messages.to_vec();
     // The write, the address-book feed, and the snooze read in one blocking
     // hop: `replace_messages` is the session's heaviest cache write (a
@@ -3332,10 +3431,14 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
         let mailbox_id = mailbox_id.clone();
         let messages = messages.clone();
         move |c| {
+            let now = chrono::Utc::now();
+            if let Err(e) = c.purge_expired_snoozed(now) {
+                tracing::warn!("failed to purge expired snoozes: {e}");
+            }
             (
                 c.replace_messages(&mailbox_id, uidvalidity, &messages),
-                c.record_addresses(&messages),
-                c.active_snoozed_uids(&mailbox_id, chrono::Utc::now()),
+                update_address_book.then(|| c.record_addresses(&messages)),
+                c.active_snoozed_uids(&mailbox_id, now),
             )
         }
     })
@@ -3348,7 +3451,7 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
         // in `replace_messages` because the address book is cumulative -
         // `replace_messages` syncs a mailbox's window to the server's set,
         // and addresses must accumulate across those syncs.
-        if let Err(e) = addresses {
+        if let Some(Err(e)) = addresses {
             tracing::warn!("failed to record addresses for {mailbox_id}: {e}");
         }
         if let Ok(snoozed) = snoozed {
@@ -3408,7 +3511,7 @@ async fn fetch_previews(
         }
     }
     tracing::debug!(mailbox = %mailbox_id, count = previews.len(), "fetched message previews");
-    emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
+    emit_messages(mailbox_id, uidvalidity, &messages, events, cache, false).await;
     Ok(())
 }
 

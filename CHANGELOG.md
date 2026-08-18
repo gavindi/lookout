@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.67 (2026-08-18)
+
+### Changed
+
+- **Mail**: draft autosave, folder-empty, and the non-MOVE move fallback now expunge only the messages they just flagged `\Deleted`, instead of every `\Deleted` message in the mailbox, on servers advertising UIDPLUS (RFC 4315). `login`'s post-auth capability fetch now also caches `has_uidplus` alongside `has_move`/`has_list_status`; `purge_by_message_id` (the draft-replace/delete path), `move_uids_to_path`'s non-MOVE fallback, and `empty_mailbox` all issue a chunked `UID EXPUNGE <set>` instead of a whole-mailbox `EXPUNGE` when it's available, falling back to the previous whole-mailbox `EXPUNGE` otherwise - a documented, harmless fallback since this crate never sets `\Deleted` outside the uids each path just flagged.
+- **Mail**: moving, emptying, or archiving-to-Sent no longer re-`LIST`s the whole account to refresh sidebar counts. `relist_folders`' full-account `LIST` (plus a STATUS re-queue for every folder) is now reserved for the cases that actually need it - the user-triggered Refresh, and a draft-replace's brand-new Drafts mailbox, which isn't in the folder list yet. The five move/empty/send paths call a new `refresh_folders_targeted` instead: one `STATUS` round trip (via the existing `refresh_folder_counts`) for just the source and destination folders, publishing once if either changed, marking an off-screen changed folder dirty exactly as the full relist's `mark_count_changes` did.
+
+### Fixed
+
+- **Mail**: every sync was double-counting each correspondent's address-book `seen_count`/`last_seen`. `fetch_previews`'s second, preview-only re-emit of a synced mailbox called `record_addresses` again with the same envelope data the first emit had already recorded; `emit_messages` now takes an `update_address_book` flag, set only on the first, full emit, so previews arriving a beat later no longer inflate the composer autocomplete/dashboard "most contacted" ranking. `replace_messages` still runs on both emits - it's what makes a fetched preview persist across resyncs.
+- **Mail**: `active_snoozed_uids` no longer runs a `DELETE` on the GTK main thread. Folder selection calls it synchronously to filter snoozed messages out of the instant-paint cached list, and it used to open with an unconditional `DELETE FROM snoozed WHERE snoozed_until <= ?` - a real write, contending for the same SQLite mutex the session's background cache writes hold - before its `SELECT`. The `SELECT` now filters expired rows itself (`snoozed_until > ?`, no longer dependent on that DELETE having just run), and the cleanup moved to a separate `purge_expired_snoozed`, called from the session's three existing off-thread call sites instead.
+
+### Testing
+
+- `lookout-mail`: a new cache test (`purge_expired_snoozed_removes_only_expired_rows`) pins `purge_expired_snoozed`'s contract - only rows past their wake time are deleted, unexpired rows survive.
+
 ## 0.9.66 (2026-08-18)
 
 ### Changed

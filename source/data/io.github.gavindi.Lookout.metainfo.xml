@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.67" date="2026-08-18">
+      <description>
+        <p>Draft autosave, folder-empty, and non-MOVE moves now expunge only the messages they just deleted, instead of the whole mailbox's deleted messages, on servers that support UIDPLUS. Moving, emptying, or archiving a sent message no longer re-lists the entire account to refresh folder counts - just the folders that actually changed. Fixed a bug where every sync double-counted each contact's address-book ranking. Fixed a UI-thread database write that could stall the app briefly when switching folders with snoozed messages present.</p>
+      </description>
+    </release>
     <release version="0.9.66" date="2026-08-18">
       <description>
         <p>The IMAP connection is now DEFLATE-compressed (RFC 4978) on servers that advertise COMPRESS=DEFLATE, cutting 4-10x off the wire bytes for the first sync of a large folder, the background body prefetch, and the per-IDLE-wake flag fetch. The command is sent through a borrowing path, so a server that rejects it keeps the connection uncompressed instead of dropping it; Gmail, which doesn't advertise the capability, is untouched. async-imap is now vendored alongside imap-proto with the in-place stream-swap method this needs.</p>
