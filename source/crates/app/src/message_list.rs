@@ -973,7 +973,38 @@ impl MessageListModel {
         // including one the filter hides - or a later filter toggle would
         // render stale data.
         *self.truth.borrow_mut() = messages;
+        self.recompute_and_apply(sort_key, sort_descending);
+    }
 
+    /// Splices one account's slice into `truth` in place - for the unified
+    /// ("All Inboxes") view, where `truth` is the merge of every connected
+    /// account's Inbox and a single account's sync should cost O(that
+    /// account's messages), not O(every account's combined total). `truth`
+    /// must already be in `unified_merge_order`; this method preserves that
+    /// invariant so repeated calls keep working. `new_slice` must contain
+    /// only messages belonging to `mailbox` - a `MessagesUpdated` payload
+    /// always satisfies this (it's scoped to one mailbox at the source), so a
+    /// violation is a logic bug worth catching in debug builds rather than a
+    /// runtime condition to handle.
+    pub fn repopulate_unified_slice(&self, mailbox: &MailboxId, mut new_slice: Vec<EmailSummary>, sort_key: SortKey, sort_descending: bool) {
+        debug_assert!(new_slice.iter().all(|m| &m.mailbox == mailbox), "repopulate_unified_slice: new_slice must belong to `mailbox`");
+        {
+            let mut truth = self.truth.borrow_mut();
+            let rest = std::mem::take(&mut *truth).into_iter().filter(|m| &m.mailbox != mailbox);
+            new_slice.sort_by(unified_merge_order);
+            new_slice.dedup_by(|a, b| a.mailbox == b.mailbox && a.uid == b.uid);
+            *truth = merge_by_order(rest, new_slice.into_iter());
+        }
+        self.recompute_and_apply(sort_key, sort_descending);
+    }
+
+    /// The compute-and-apply tail shared by `repopulate` and
+    /// `repopulate_unified_slice`: filter/sort/fingerprint/bucket `truth`
+    /// (`compute_layout`, offloaded to the worker above
+    /// `BACKGROUND_REPOPULATE_THRESHOLD`), then splice the result onto the
+    /// GTK model (`apply_layout`). See `repopulate`'s doc comment for the
+    /// generation-guard rationale.
+    fn recompute_and_apply(&self, sort_key: SortKey, sort_descending: bool) {
         let filter = *self.filter.borrow();
         let threaded = *self.threaded.borrow();
         let now = Local::now();
@@ -1490,6 +1521,42 @@ pub fn sort_messages(messages: &mut [EmailSummary], key: SortKey, descending: bo
     }
 }
 
+/// Total order the unified-inbox merge (`truth` when `mail_view ==
+/// UnifiedInbox`) is kept in at all times, independent of the active display
+/// sort - `compute_layout` always re-sorts under the real `SortKey` anyway, so
+/// this only needs to be *a* well-defined total order, not the displayed one.
+/// It exists so `repopulate_unified_slice`'s two-pointer merge has a
+/// consistent order to merge against, and so date ties (unlike `HashMap`
+/// iteration order) resolve deterministically instead of by accident.
+pub(crate) fn unified_merge_order(a: &EmailSummary, b: &EmailSummary) -> std::cmp::Ordering {
+    b.date.cmp(&a.date).then_with(|| a.mailbox.cmp(&b.mailbox)).then_with(|| a.uid.cmp(&b.uid))
+}
+
+/// Merges `rest` (already in `unified_merge_order`) with `new_slice` (sorted
+/// the same way by the caller), producing one `Vec` in that same order. A
+/// plain two-pointer mergesort merge step - every element is moved, never
+/// cloned.
+fn merge_by_order(rest: impl Iterator<Item = EmailSummary>, new_slice: impl Iterator<Item = EmailSummary>) -> Vec<EmailSummary> {
+    let mut rest = rest.peekable();
+    let mut new_slice = new_slice.peekable();
+    let mut merged = Vec::with_capacity(rest.size_hint().0 + new_slice.size_hint().0);
+    loop {
+        match (rest.peek(), new_slice.peek()) {
+            (Some(a), Some(b)) => {
+                if unified_merge_order(a, b) != std::cmp::Ordering::Greater {
+                    merged.push(rest.next().unwrap());
+                } else {
+                    merged.push(new_slice.next().unwrap());
+                }
+            }
+            (Some(_), None) => merged.push(rest.next().unwrap()),
+            (None, Some(_)) => merged.push(new_slice.next().unwrap()),
+            (None, None) => break,
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1744,6 +1811,63 @@ mod tests {
 
         // One "Today" section header plus every message.
         assert_eq!(big.selection.n_items() as usize, n + 1, "the background-computed layout must splice exactly as the inline path would");
+
+        // --- `repopulate_unified_slice` matches a from-scratch merge ---
+        // Appended here for the same `gtk::init()`-once-per-process reason as
+        // the background-dispatch case above.
+        let d1 = today - chrono::Duration::days(3);
+        let d2 = today - chrono::Duration::days(2);
+        let d3 = today - chrono::Duration::days(1);
+        let d_newest = today;
+        let mut initial = vec![
+            summary_in(1, "a:INBOX", d1),
+            summary_in(1, "b:INBOX", d2),
+            summary_in(1, "c:INBOX", d3),
+            summary_in(2, "b:INBOX", d1),
+        ];
+        initial.sort_by(unified_merge_order);
+        let unified = MessageListModel::build();
+        unified.repopulate(initial, SortKey::Date, true);
+
+        // Account "b" resyncs: uid 1 unchanged, uid 2 dropped (expunged), a
+        // new uid 3 arrives. "a" and "c" are untouched by this call.
+        let b_new = vec![summary_in(1, "b:INBOX", d2), summary_in(3, "b:INBOX", d_newest)];
+        unified.repopulate_unified_slice(&MailboxId("b:INBOX".into()), b_new, SortKey::Date, true);
+
+        let mut expected = vec![
+            summary_in(1, "a:INBOX", d1),
+            summary_in(1, "b:INBOX", d2),
+            summary_in(3, "b:INBOX", d_newest),
+            summary_in(1, "c:INBOX", d3),
+        ];
+        expected.sort_by(unified_merge_order);
+        assert_eq!(merge_keys(&unified.all_messages()), merge_keys(&expected), "merge-slice diverged from a from-scratch merge");
+
+        // --- A cross-account date tie breaks deterministically, and stays
+        // that way across repeated calls (nothing here relies on any
+        // hash-map iteration order) ---
+        let tie = today - chrono::Duration::days(3);
+        let tied = MessageListModel::build();
+        let mut tied_initial = vec![summary_in(1, "a:INBOX", tie)];
+        tied_initial.sort_by(unified_merge_order);
+        tied.repopulate(tied_initial, SortKey::Date, true);
+        let tie_b = vec![summary_in(1, "b:INBOX", tie)];
+        tied.repopulate_unified_slice(&MailboxId("b:INBOX".into()), tie_b, SortKey::Date, true);
+        let mut tie_expected = vec![summary_in(1, "a:INBOX", tie), summary_in(1, "b:INBOX", tie)];
+        tie_expected.sort_by(unified_merge_order);
+        let tie_expected_keys = merge_keys(&tie_expected);
+        assert_eq!(merge_keys(&tied.all_messages()), tie_expected_keys, "date tie did not break deterministically");
+        let tie_b_again = vec![summary_in(1, "b:INBOX", tie)];
+        tied.repopulate_unified_slice(&MailboxId("b:INBOX".into()), tie_b_again, SortKey::Date, true);
+        assert_eq!(merge_keys(&tied.all_messages()), tie_expected_keys, "repeat call produced a different tie order");
+
+        // --- The mailbox-mismatch guard fires in debug builds ---
+        let guarded = MessageListModel::build();
+        let wrong_mailbox = vec![summary_in(1, "other:INBOX", today)];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            guarded.repopulate_unified_slice(&MailboxId("b:INBOX".into()), wrong_mailbox, SortKey::Date, true)
+        }));
+        assert!(result.is_err(), "repopulate_unified_slice accepted a message from the wrong mailbox");
     }
 
     #[test]
@@ -2385,5 +2509,37 @@ mod tests {
         assert_eq!(ListFilter::All.label(), "All");
         assert_eq!(ListFilter::from_action_state(ListFilter::Flagged.action_state()), Some(ListFilter::Flagged));
         assert_eq!(ListFilter::from_action_state("bogus"), None);
+    }
+
+    fn summary_in(uid: u32, mailbox: &str, date: DateTime<Utc>) -> EmailSummary {
+        let mut m = summary(uid, date);
+        m.mailbox = MailboxId(mailbox.into());
+        m
+    }
+
+    /// `EmailSummary` has no `PartialEq` (it's not meaningful in production
+    /// code); tests compare on the fields that matter here instead.
+    fn merge_key(m: &EmailSummary) -> (String, u32, DateTime<Utc>) {
+        (m.mailbox.0.clone(), m.uid.0, m.date)
+    }
+    fn merge_keys(messages: &[EmailSummary]) -> Vec<(String, u32, DateTime<Utc>)> {
+        messages.iter().map(merge_key).collect()
+    }
+
+    #[test]
+    fn unified_merge_order_ties_break_on_mailbox_then_uid() {
+        let now = local(2026, 8, 4, 8);
+        let date = utc_on(now, 2026, 8, 1);
+        let a = summary_in(2, "a:INBOX", date);
+        let b = summary_in(1, "b:INBOX", date);
+        // Same date: mailbox breaks the tie ("a" < "b"), so `a` sorts first
+        // despite its higher uid.
+        assert_eq!(unified_merge_order(&a, &b), std::cmp::Ordering::Less);
+        let c = summary_in(1, "a:INBOX", date);
+        // Same date and mailbox: uid breaks the tie.
+        assert_eq!(unified_merge_order(&c, &a), std::cmp::Ordering::Less);
+        let newer = summary_in(1, "a:INBOX", utc_on(now, 2026, 8, 2));
+        // Newest-first regardless of the tie-break fields.
+        assert_eq!(unified_merge_order(&newer, &a), std::cmp::Ordering::Less);
     }
 }

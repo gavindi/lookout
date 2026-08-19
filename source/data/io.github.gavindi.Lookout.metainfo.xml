@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.74" date="2026-08-19">
+      <description>
+        <p>"All Inboxes" updates faster when one account syncs - it no longer re-merges and re-sorts every connected account's mail on each update, only the account that actually changed.</p>
+      </description>
+    </release>
     <release version="0.9.73" date="2026-08-19">
       <description>
         <p>Fixed a bug where opening some messages showed nothing at all in the reading pane, with no error - a gap in how the app fell back to fetching a message's full content when its structure didn't declare a readable part up front.</p>

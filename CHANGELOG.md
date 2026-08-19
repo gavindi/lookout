@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.74 (2026-08-19)
+
+### Changed
+
+- **App**: "All Inboxes" no longer re-merges and re-sorts every connected account's Inbox on every single sync event - only the account that actually changed. `merge_unified_snapshots` used to clone and `Vec::sort_by_key` the combined snapshot of *every* account on each `MessagesUpdated`, even when just one account's Inbox had changed - O(every account's combined total) on every event. `MessageListModel` now keeps its merged `truth` in a persistent total order (`unified_merge_order`: newest-first by date, tie-broken by mailbox then uid), and a new `repopulate_unified_slice` splices just the changed account's entries into it with a two-pointer merge (`merge_by_order`) instead of rebuilding the whole list - O(the changed account's messages), with no `EmailSummary` clones beyond the ones the caller already had to build for that account. The 3 rarer full-rebuild call sites (account disconnect, exiting search, entering "All Inboxes") are unchanged, since `truth` isn't holding a valid prior unified merge to slice against at those points - a from-scratch rebuild there is correct, not merely simpler. Fixes a latent nondeterminism along the way: two messages sharing an identical date used to resolve their relative order by `HashMap` iteration order (unspecified), and now resolve by the same explicit `(date, mailbox, uid)` order everywhere, including the 3 unchanged rebuild sites.
+
+### Testing
+
+- `lookout-app`: a `unified_merge_order` tiebreak unit test, a merge-slice-vs-from-scratch-rebuild equivalence test, a cross-account date-tie determinism test (run twice, to rule out any dependence on hash-map iteration order), and a debug-only guard test for `repopulate_unified_slice`'s mailbox-mismatch `debug_assert!` - the three GTK-dependent ones appended to the existing `tree_model_expansion_and_layout` test, matching this suite's established one-`gtk::init()`-per-process pattern. A new `unified_merge_breaks_a_date_tie_by_mailbox_then_uid` test covers the same tiebreak on `merge_unified_snapshots` itself, at the free-function level.
+
 ## 0.9.73 (2026-08-19)
 
 ### Fixed

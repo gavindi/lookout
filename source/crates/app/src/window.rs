@@ -33,7 +33,7 @@ use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::google_tasks::{self, GoogleTasksCommand, GoogleTasksEvent, TaskList};
 use crate::last_view::{self, LastSelection};
-use crate::message_list::{format_row_date, ListFilter, MessageItem, MessageListModel, SelectionKind, SortKey};
+use crate::message_list::{format_row_date, unified_merge_order, ListFilter, MessageItem, MessageListModel, SelectionKind, SortKey};
 use crate::microsoft_oauth::MicrosoftCredentialProvider;
 use crate::ui_state_db::UiStateDb;
 use crate::worker::Worker;
@@ -7842,7 +7842,7 @@ fn spawn_account_event_loop(
                         // selected yet) the first inbox sync is still adopted as
                         // the default single-mailbox view, matching the old
                         // race-first behavior.
-                        let (display, single_messages, adopted) = {
+                        let (display, single_messages, adopted, unified_slice) = {
                             let mut st = state.borrow_mut();
                             if matches!(st.mail_view, MailView::UnifiedInbox) {
                                 // Only accept mailboxes that are actually part
@@ -7854,10 +7854,21 @@ fn spawn_account_event_loop(
                                     .accounts
                                     .values()
                                     .any(|h| h.folders.iter().any(|m| m.id == mailbox && matches!(m.role, MailboxRole::Inbox)));
-                                if in_unified_set {
-                                    st.unified_snapshots.insert(mailbox, messages);
-                                }
-                                (in_unified_set, None, false)
+                                // `unified_snapshots` and `message_list`'s own
+                                // merged `truth` are independently maintained
+                                // (the former is what the 3 full-rebuild call
+                                // sites - disconnect, exit_search,
+                                // enter_unified_inbox - read from), so both need
+                                // this account's new snapshot; the clones here
+                                // are O(this account's messages), not O(every
+                                // account's).
+                                let unified_slice = if in_unified_set {
+                                    st.unified_snapshots.insert(mailbox.clone(), messages.clone());
+                                    Some(messages)
+                                } else {
+                                    None
+                                };
+                                (in_unified_set, None, false, unified_slice)
                             } else {
                                 // Nothing selected yet: adopt whichever account's
                                 // initial inbox sync lands first as the default
@@ -7875,7 +7886,7 @@ fn spawn_account_event_loop(
                                     st.current_mailbox = Some(mailbox.clone());
                                 }
                                 let is_current = st.current_mailbox.as_ref() == Some(&mailbox);
-                                (is_current, is_current.then_some(messages), adopted)
+                                (is_current, is_current.then_some(messages), adopted, None)
                             }
                         };
                         // The adopt-first path picked a default view; name it in
@@ -7884,12 +7895,19 @@ fn spawn_account_event_loop(
                             refresh_list_header(&state, &list_header);
                         }
                         if display {
-                            let all = match single_messages {
-                                Some(messages) => messages,
-                                None => merge_unified_snapshots(&state.borrow().unified_snapshots),
-                            };
                             let (key, descending) = current_sort(&state);
-                            message_list.repopulate(all, key, descending);
+                            match single_messages {
+                                Some(messages) => message_list.repopulate(messages, key, descending),
+                                None => {
+                                    // `display` in the unified branch is exactly
+                                    // `in_unified_set`, which is also what gates
+                                    // `unified_slice` being `Some` above - so
+                                    // this arm (single-view's `single_messages`
+                                    // is always `Some`) only runs when it's set.
+                                    let slice = unified_slice.expect("display && single_messages.is_none() implies unified branch set unified_slice");
+                                    message_list.repopulate_unified_slice(&mailbox, slice, key, descending);
+                                }
+                            }
                         }
                     }
                     AccountEvent::NewMessages { mailbox, messages } => {
@@ -12047,7 +12065,7 @@ fn merge_unified_snapshots(snapshots: &HashMap<MailboxId, Vec<EmailSummary>>) ->
             }
         }
     }
-    merged.sort_by_key(|m| std::cmp::Reverse(m.date));
+    merged.sort_by(unified_merge_order);
     merged
 }
 
@@ -14615,6 +14633,21 @@ mod tests {
         let keys: Vec<(String, u32)> = merged.iter().map(|m| (m.mailbox.0.clone(), m.uid.0)).collect();
         // Newest first; a:INBOX/1 appears once despite being in both snapshots.
         assert_eq!(keys, vec![("b:INBOX".into(), 2), ("a:INBOX".into(), 1), ("a:INBOX".into(), 2)]);
+    }
+
+    #[test]
+    fn unified_merge_breaks_a_date_tie_by_mailbox_then_uid() {
+        // Two messages sharing an identical date, in different mailboxes.
+        // `HashMap::values()` iteration order is unspecified, so without an
+        // explicit tie-break this assertion would be flaky by construction -
+        // it must hold regardless of which snapshot the map happens to
+        // iterate first.
+        let snapshots = HashMap::from([
+            (MailboxId("z:INBOX".into()), vec![summary(Uid(1), "z:INBOX", 2024, 1, 10, 9)]),
+            (MailboxId("a:INBOX".into()), vec![summary(Uid(5), "a:INBOX", 2024, 1, 10, 9)]),
+        ]);
+        let keys: Vec<(String, u32)> = merge_unified_snapshots(&snapshots).iter().map(|m| (m.mailbox.0.clone(), m.uid.0)).collect();
+        assert_eq!(keys, vec![("a:INBOX".into(), 5), ("z:INBOX".into(), 1)], "equal dates must break on mailbox, not map iteration order");
     }
 
     /// A minimal `UiState` with one `AccountHandle` per given account (fresh
