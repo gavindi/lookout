@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.75" date="2026-08-19">
+      <description>
+        <p>Faster mail syncing for large folders - fixed an inefficiency in how the app reads IMAP server responses that made downloading a big batch of messages slower than it needed to be, especially on the first sync of a large folder.</p>
+      </description>
+    </release>
     <release version="0.9.74" date="2026-08-19">
       <description>
         <p>"All Inboxes" updates faster when one account syncs - it no longer re-merges and re-sorts every connected account's mail on each update, only the account that actually changed.</p>

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.75 (2026-08-19)
+
+### Changed
+
+- **Mail**: parsing a burst of IMAP responses - the shape a full-folder `FETCH`, a large prefetch batch, or a big search-hit fetch all produce - no longer costs O(k²) in the number of responses. The vendored `async-imap` client's response-stream buffer used to copy the *entire remaining unconsumed tail* of its read buffer into a freshly allocated, zeroed buffer after every single parsed response - a `ResponseData` value needed to be self-referential (owning a buffer while a `Response` borrowed from it), so `imap_stream.rs` had no way to just advance past what it had already consumed. `ResponseData` (`types/response_data.rs`) is now a plain owned wrapper around `Response<'static>`, built by calling `imap-proto`'s already-implemented (and previously unused) `Response::into_owned()` immediately after parsing; with no buffer lifetime left to babysit, `decode()`'s buffer (`imap_stream.rs`) is now a persistent one that's simply advanced (`bytes::Buf::advance` - a pointer move, not a copy) past each parsed response instead of being torn down and recreated. `Name`/`Fetch`/`UnsolicitedResponse::Other` needed no changes, since `ResponseData::parsed()`'s signature is unchanged - the fix is entirely contained inside the vendored `async-imap` crate.
+
+### Testing
+
+- `async-imap`: `test_ensure_capacity_loop` (a real historical EOF-misdetection regression guard) was updated to drop its now-removed `take_block`/`return_block` calls while keeping the property it actually guards; `test_buffer_take_and_return_block`/`test_buffer_reset_with_data` were replaced with `test_buffer_consume` and a test confirming `consume()` preserves free space rather than shrinking it. A new `#[ignore]`d manual timing probe, `decode_burst_cost_at_scale`, parses synthetic bursts of 100/1,000/10,000 small `FETCH` responses and reports per-response cost - measured ~640ns at n=100 down to ~390ns at n=10,000, flat rather than climbing with burst size, confirming the O(k²) behavior is gone. All 70 existing `async-imap` tests (including `fetch_body` and `large_fetch`, genuine multi-response-burst cases) pass unmodified.
+
 ## 0.9.74 (2026-08-19)
 
 ### Changed

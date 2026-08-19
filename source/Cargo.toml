@@ -14,16 +14,20 @@ members = [
 # sending raw UTF-8 in ENVELOPE fields parse instead of failing the whole
 # response stream.
 #
-# Local copy of `async-imap` 0.11.3 with one local addition (see
+# Local copy of `async-imap` 0.11.3 with two local changes (see
 # `crates/async-imap/Cargo.toml`): `Session::map_stream`, the in-place stream
 # swap that lets the mail session enable `COMPRESS DEFLATE` without losing
-# the connection if the server rejects it.
+# the connection if the server rejects it; and `imap_stream.rs`'s response
+# buffering, which used to copy the entire unconsumed tail into a fresh
+# allocation on every parsed response (O(k^2) over a multi-response burst) -
+# it now parses into an owned `Response` (`imap-proto`'s existing
+# `into_owned()`) and advances the buffer in place instead.
 [patch.crates-io]
 imap-proto = { path = "crates/imap-proto" }
 async-imap = { path = "crates/async-imap" }
 
 [workspace.package]
-version = "0.9.74"
+version = "0.9.75"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gavindi/lookout"

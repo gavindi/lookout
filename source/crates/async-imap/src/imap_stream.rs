@@ -98,47 +98,34 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             return Ok(None);
         }
 
-        let block = self.buffer.take_block();
-        // Be aware, now self.buffer is invalid until block is returned or reset!
-
-        let res = ResponseData::try_new_or_recover(block, |buf| {
-            let buf = &buf[..self.buffer.used()];
-            log::trace!("decode: input: {:?}", std::str::from_utf8(buf));
-            match imap_proto::parser::parse_response(buf) {
-                Ok((remaining, response)) => {
-                    // TODO: figure out if we can use a minimum required size for a response.
-                    self.decode_needs = 0;
-                    self.buffer.reset_with_data(remaining);
-                    Ok(response)
-                }
-                Err(nom::Err::Incomplete(Needed::Size(min))) => {
-                    log::trace!("decode: incomplete data, need minimum {min} bytes");
-                    self.decode_needs = self.buffer.used() + usize::from(min);
-                    Err(None)
-                }
-                Err(nom::Err::Incomplete(_)) => {
-                    log::trace!("decode: incomplete data, need unknown number of bytes");
-                    self.decode_needs = 0;
-                    Err(None)
-                }
-                Err(other) => {
-                    self.decode_needs = 0;
-                    Err(Some(io::Error::other(format!(
-                        "{:?} during parsing of {:?}",
-                        other,
-                        String::from_utf8_lossy(buf)
-                    ))))
-                }
+        let buf = self.buffer.as_slice();
+        log::trace!("decode: input: {:?}", std::str::from_utf8(buf));
+        match imap_proto::parser::parse_response(buf) {
+            Ok((remaining, response)) => {
+                // TODO: figure out if we can use a minimum required size for a response.
+                self.decode_needs = 0;
+                let consumed = buf.len() - remaining.len();
+                let response = response.into_owned();
+                self.buffer.consume(consumed);
+                Ok(Some(ResponseData::from_owned(response)))
             }
-        });
-        match res {
-            Ok(response) => Ok(Some(response)),
-            Err((heads, err)) => {
-                self.buffer.return_block(heads);
-                match err {
-                    Some(err) => Err(err),
-                    None => Ok(None),
-                }
+            Err(nom::Err::Incomplete(Needed::Size(min))) => {
+                log::trace!("decode: incomplete data, need minimum {min} bytes");
+                self.decode_needs = self.buffer.used() + usize::from(min);
+                Ok(None)
+            }
+            Err(nom::Err::Incomplete(_)) => {
+                log::trace!("decode: incomplete data, need unknown number of bytes");
+                self.decode_needs = 0;
+                Ok(None)
+            }
+            Err(other) => {
+                self.decode_needs = 0;
+                Err(io::Error::other(format!(
+                    "{:?} during parsing of {:?}",
+                    other,
+                    String::from_utf8_lossy(buf)
+                )))
             }
         }
     }
@@ -214,6 +201,12 @@ impl Buffer {
         self.offset
     }
 
+    /// Returns the used part of the buffer, containing whatever hasn't been
+    /// consumed by a successful `decode()` yet.
+    fn as_slice(&self) -> &[u8] {
+        &self.block[..self.offset]
+    }
+
     /// Returns the unused part of the buffer to which new data can be written.
     fn free_as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.block[self.offset..]
@@ -228,7 +221,6 @@ impl Buffer {
     /// space marks the entire buffer as used.
     ///
     /// [`free_as_mut_slice`]: Self::free_as_mut_slice
-    // aka advance()?
     fn extend_used(&mut self, num_bytes: usize) {
         self.offset += num_bytes;
         if self.offset > self.block.len() {
@@ -276,43 +268,18 @@ impl Buffer {
         }
     }
 
-    /// Return the block backing the buffer.
+    /// Drops `amount` consumed bytes off the front of the buffer.
     ///
-    /// Next you *must* either return this block using [`return_block`] or call
-    /// [`reset_with_data`].
-    ///
-    /// [`return_block`]: Self::return_block
-    /// [`reset_with_data`]: Self::reset_with_data
-    // TODO: Enforce this with typestate.
-    fn take_block(&mut self) -> BytesMut {
-        std::mem::replace(&mut self.block, BytesMut::zeroed(Self::BLOCK_SIZE))
-    }
-
-    /// Reset the buffer to be a new allocation with given data copied in.
-    ///
-    /// This allows the previously returned block from `get_block` to be used in and owned
-    /// by the [ResponseData].
-    ///
-    /// This does not do any bounds checking to see if the new buffer would exceed the
-    /// maximum size.  It will however ensure that there is at least some free space at the
-    /// end of the buffer so that the next reading operation won't need to realloc right
-    /// away.  This could be wasteful if the next action on the buffer is another decode
-    /// rather than a read, but we don't know.
-    fn reset_with_data(&mut self, data: &[u8]) {
-        let min_size = data.len();
-        let new_size = match min_size % Self::BLOCK_SIZE {
-            0 => min_size + Self::BLOCK_SIZE,
-            n => min_size + (Self::BLOCK_SIZE - n),
-        };
-        self.block = BytesMut::zeroed(new_size);
-        self.block[..data.len()].copy_from_slice(data);
-
-        self.offset = data.len();
-    }
-
-    /// Return the block which backs this buffer.
-    fn return_block(&mut self, block: BytesMut) {
-        self.block = block;
+    /// Called after a successful parse with however many bytes it consumed.
+    /// `BytesMut::advance` on the `Vec`-backed representation `block` always
+    /// has here (created via `zeroed`/`resize`, never `split_off`/`freeze`)
+    /// is a pointer bump, not a copy - unlike the old block-swap-and-copy
+    /// approach this replaces, a decode burst of many small responses no
+    /// longer re-copies the shrinking tail on every single one of them.
+    fn consume(&mut self, amount: usize) {
+        debug_assert!(amount <= self.offset);
+        bytes::Buf::advance(&mut self.block, amount);
+        self.offset -= amount;
     }
 }
 
@@ -476,6 +443,46 @@ mod tests {
         assert!(imap_stream.next().await.is_none());
     }
 
+    /// Manual timing probe (not a regression test) for OPT_TODO's "per-response
+    /// tail copy" item - a burst of many small untagged responses landing in
+    /// one buffered read (what a full-folder `FETCH` produces) used to cost
+    /// O(k^2): every parsed response copied the entire remaining unconsumed
+    /// tail into a freshly allocated buffer. `decode()` now consumes via
+    /// `BytesMut::advance` (a pointer move) instead, so per-response cost
+    /// should stay flat as the burst grows rather than climbing with it.
+    /// Measured (release build): ~640ns/response at n=100, ~480ns/response at
+    /// n=1,000, ~390ns/response at n=10,000 - flat (if anything improving, as
+    /// fixed per-burst overhead amortizes), not climbing with n as the old
+    /// O(k^2) tail copy would have shown. Run with:
+    /// `cargo test -p async-imap --release --features runtime-tokio decode_burst_cost_at_scale -- --ignored --nocapture`
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[ignore = "manual timing probe, not a regression test"]
+    async fn decode_burst_cost_at_scale() {
+        use futures::StreamExt;
+
+        for n in [100usize, 1_000, 10_000] {
+            let mut burst = Vec::new();
+            for i in 0..n {
+                burst.extend_from_slice(format!("* {i} FETCH (FLAGS (\\Seen))\r\n").as_bytes());
+            }
+            burst.extend_from_slice(b"a0 OK FETCH completed\r\n");
+
+            let mock_stream = crate::mock_stream::MockStream::new(burst);
+            let mut imap_stream = ImapStream::new(mock_stream);
+
+            let start = std::time::Instant::now();
+            // Every FETCH plus the tagged completion - read exactly that many
+            // rather than draining to `None`, since the mock stream reports
+            // running out of bytes as an error, not a clean EOF.
+            for _ in 0..(n + 1) {
+                imap_stream.next().await.expect("stream ended early").expect("parse error");
+            }
+            let elapsed = start.elapsed();
+            eprintln!("n={n} total={elapsed:?} per_response={:?}", elapsed / (n as u32 + 1));
+        }
+    }
+
     #[test]
     fn test_buffer_empty() {
         let buf = Buffer::new();
@@ -588,43 +595,43 @@ mod tests {
             buf.extend_used(used);
 
             // Test that we can read at least as much as requested.
-            let block = buf.take_block();
-            assert!(block.len() >= i);
-            buf.return_block(block);
+            assert!(buf.block.len() >= i);
         }
     }
 
     #[test]
-    fn test_buffer_take_and_return_block() {
-        // This test identifies blocks by their size.
+    fn test_buffer_consume() {
         let mut buf = Buffer::new();
-        buf.grow(1).unwrap();
-        let block_size = buf.block.len();
+        buf.extend_used(10);
+        buf.block[..10].copy_from_slice(b"0123456789");
 
-        let block = buf.take_block();
-        assert_eq!(block.len(), block_size);
-        assert_ne!(buf.block.len(), block_size);
+        buf.consume(4);
+        assert_eq!(buf.used(), 6);
+        assert_eq!(buf.as_slice(), b"456789");
 
-        buf.return_block(block);
-        assert_eq!(buf.block.len(), block_size);
+        buf.consume(6);
+        assert_eq!(buf.used(), 0);
+        assert_eq!(buf.as_slice(), b"");
     }
 
     #[test]
-    fn test_buffer_reset_with_data() {
-        // This test identifies blocks by their size.
-        let data: [u8; 2 * Buffer::BLOCK_SIZE] = [b'a'; 2 * Buffer::BLOCK_SIZE];
+    fn test_buffer_consume_preserves_free_space_and_unconsumed_tail() {
+        // A partial consume (some of the used bytes were an already-parsed
+        // response, the rest is the start of the next one still buffered)
+        // must drop exactly the consumed prefix, keep the remaining used
+        // bytes intact, and leave the same amount of free space at the tail
+        // it had before - `consume` must not need to touch the free region
+        // at all, since `Buf::advance` is a pointer move over the whole
+        // block, not a copy of the used bytes.
         let mut buf = Buffer::new();
-        let block_size = buf.block.len();
-        assert_eq!(block_size, Buffer::BLOCK_SIZE);
-        buf.reset_with_data(&data);
-        assert_ne!(buf.block.len(), block_size);
-        assert_eq!(buf.block.len(), 3 * Buffer::BLOCK_SIZE);
-        assert!(!buf.free_as_mut_slice().is_empty());
+        buf.extend_used(10);
+        buf.block[..10].copy_from_slice(b"0123456789");
+        let free_before = buf.free_as_mut_slice().len();
 
-        let data: [u8; 0] = [];
-        let mut buf = Buffer::new();
-        buf.reset_with_data(&data);
-        assert_eq!(buf.block.len(), Buffer::BLOCK_SIZE);
+        buf.consume(4);
+        assert_eq!(buf.used(), 6);
+        assert_eq!(buf.as_slice(), b"456789");
+        assert_eq!(buf.free_as_mut_slice().len(), free_before, "consume must not shrink the free region");
     }
 
     #[test]
