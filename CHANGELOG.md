@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.80 (2026-08-20)
+
+### Fixed
+
+- **App**: deleting a message from the list could flicker - the row vanished immediately, then reappeared for a moment, then vanished again for good. The per-account session actor races an IDLE wait against its next queued command (`tokio::select!` in `session.rs`); if an unrelated server notification (new mail, another client's flag change) resolved that race before an already-queued `MoveMessages` was drained, `sync_mailbox` ran against pre-delete server state and emitted a `MessagesUpdated` that still contained the row - and the UI's handler for that event unconditionally cleared `pending_optimistic_removals` and repainted from it, trusting every sync as authoritative over its own in-flight optimistic state. `optimistic_toggle_read` (mark read/unread) had the identical bug in the same handler, just less visible as a flag flipping back briefly rather than a row vanishing. Two new reconciliation helpers, `reconcile_optimistic_removals` and `reconcile_optimistic_flag_changes` (`window.rs`), now filter/patch an incoming snapshot against whatever's still pending instead of trusting it outright: a still-pending uid is stripped back out of the snapshot (or has its flag patched to the optimistic value) and stays stashed, and a stash entry only clears once a snapshot actually confirms the change - by omission for a delete, by a matching flag for a toggle. No changes to `session.rs` - the race there is benign background churn; the fix is entirely about the UI no longer trusting a resync over its own in-flight optimistic state.
+
+### Testing
+
+- `lookout-app`: `reconcile_optimistic_removals_survives_a_stale_racing_sync` and `reconcile_optimistic_flag_changes_survives_a_stale_racing_sync` simulate the race directly - feeding a snapshot that still shows the pre-change state must leave the stash intact and strip/patch the snapshot, and feeding a snapshot that confirms the change must clear the stash.
+
 ## 0.9.79 (2026-08-20)
 
 ### Changed

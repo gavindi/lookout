@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.80" date="2026-08-20">
+      <description>
+        <p>Deleting a message no longer flickers - the row could briefly reappear before being removed for good if it happened to coincide with a background sync.</p>
+      </description>
+    </release>
     <release version="0.9.79" date="2026-08-20">
       <description>
         <p>The dashboard's "most contacted" and "emails by time of day" panels are now read in the background instead of on the main thread - opening it no longer pauses the interface, even for accounts with hundreds of thousands of cached messages.</p>

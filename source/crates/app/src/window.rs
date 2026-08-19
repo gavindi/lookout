@@ -7821,14 +7821,15 @@ fn spawn_account_event_loop(
                         // never land.
                         refresh_message_loading_state(&state, &message_list, &message_list_stack);
                     }
-                    AccountEvent::MessagesUpdated { mailbox, messages } => {
-                        // An authoritative sync for this mailbox supersedes
-                        // whatever's still sitting in the optimistic-removal
-                        // stash - the success path that led here already
-                        // dropped those rows from the server too, so there's
-                        // nothing left to reconcile.
-                        state.borrow_mut().pending_optimistic_removals.remove(&mailbox);
-                        state.borrow_mut().pending_optimistic_flag_changes.remove(&mailbox);
+                    AccountEvent::MessagesUpdated { mailbox, mut messages } => {
+                        // A sync can land for reasons unrelated to a pending
+                        // optimistic removal/flag-toggle (see the IDLE-vs-
+                        // command race in session.rs) and carry stale state
+                        // for a uid this client already acted on locally -
+                        // reconcile against the stash instead of trusting
+                        // every sync as automatically authoritative.
+                        reconcile_optimistic_removals(&state, &mailbox, &mut messages);
+                        reconcile_optimistic_flag_changes(&state, &message_list, &mailbox, &mut messages);
                         // The sync this mailbox was asked for (if any) has landed.
                         state.borrow_mut().syncing.remove(&mailbox);
                         refresh_message_loading_state(&state, &message_list, &message_list_stack);
@@ -12268,6 +12269,29 @@ fn restore_optimistic_removals(state: &Rc<RefCell<UiState>>, message_list: &Mess
     message_list.repopulate(all, key, descending);
 }
 
+/// Reconciles an incoming authoritative `MessagesUpdated` snapshot against
+/// optimistic removals still pending for `mailbox`. The account session's
+/// IDLE-vs-command race means a resync can land for reasons unrelated to a
+/// pending delete, before the delete itself has reached the server - so a
+/// uid this client just hid can still show up in `messages`. A pending entry
+/// only survives if `messages` still shows that uid (the delete hasn't
+/// landed yet); anything `messages` omits is confirmed gone and drops out of
+/// the stash. Uids still pending after that are stripped back out of
+/// `messages` so the race can't repaint a row the user already deleted.
+fn reconcile_optimistic_removals(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, messages: &mut Vec<EmailSummary>) {
+    let mut st = state.borrow_mut();
+    let Some(pending) = st.pending_optimistic_removals.get_mut(mailbox) else { return };
+    let live_uids: HashSet<Uid> = messages.iter().map(|m| m.uid).collect();
+    pending.retain(|m| live_uids.contains(&m.uid));
+    if pending.is_empty() {
+        st.pending_optimistic_removals.remove(mailbox);
+        return;
+    }
+    let still_pending: HashSet<Uid> = st.pending_optimistic_removals[mailbox].iter().map(|m| m.uid).collect();
+    drop(st);
+    messages.retain(|m| !still_pending.contains(&m.uid));
+}
+
 /// Optimistically flips `SystemFlagBit::Seen` for `uids` in `mailbox` -
 /// added when marking read, removed when marking unread - and repaints
 /// immediately. The pre-toggle summaries are stashed in
@@ -12346,6 +12370,47 @@ fn restore_optimistic_flag_changes(state: &Rc<RefCell<UiState>>, message_list: &
     let all: Vec<EmailSummary> = message_list.all_messages().into_iter().map(|m| restored.get(&m.uid).cloned().unwrap_or(m)).collect();
     let (key, descending) = current_sort(state);
     message_list.repopulate(all, key, descending);
+}
+
+/// The read/unread sibling of `reconcile_optimistic_removals`: an incoming
+/// `MessagesUpdated` snapshot can race ahead of the `STORE` a pending
+/// `optimistic_toggle_read` is still waiting on, and land with the
+/// pre-toggle `Seen` flag. For each uid still in `pending_optimistic_flag_changes`,
+/// compares the snapshot's flag against what `message_list` is currently
+/// showing (the optimistic value): a match means the server confirmed it -
+/// drop the uid from the stash - a mismatch means the snapshot is stale, so
+/// `messages` is patched to keep showing the optimistic value instead of
+/// flickering back, and the uid stays stashed.
+fn reconcile_optimistic_flag_changes(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, messages: &mut [EmailSummary]) {
+    let pending_uids: HashSet<Uid> = match state.borrow().pending_optimistic_flag_changes.get(mailbox) {
+        Some(pending) if !pending.is_empty() => pending.iter().map(|m| m.uid).collect(),
+        _ => return,
+    };
+    let optimistic_seen: HashMap<Uid, bool> = message_list
+        .all_messages()
+        .into_iter()
+        .filter(|m| m.mailbox == *mailbox && pending_uids.contains(&m.uid))
+        .map(|m| (m.uid, m.flags.contains(&SystemFlagBit::Seen)))
+        .collect();
+
+    let mut confirmed = HashSet::new();
+    for m in messages.iter_mut() {
+        let Some(&want_seen) = optimistic_seen.get(&m.uid) else { continue };
+        if m.flags.contains(&SystemFlagBit::Seen) == want_seen {
+            confirmed.insert(m.uid);
+        } else if want_seen {
+            m.flags.insert(SystemFlagBit::Seen);
+        } else {
+            m.flags.remove(&SystemFlagBit::Seen);
+        }
+    }
+
+    let mut st = state.borrow_mut();
+    let Some(pending) = st.pending_optimistic_flag_changes.get_mut(mailbox) else { return };
+    pending.retain(|m| !confirmed.contains(&m.uid));
+    if pending.is_empty() {
+        st.pending_optimistic_flag_changes.remove(mailbox);
+    }
 }
 
 /// Patches a preview snippet onto matching displayed rows in place - the
@@ -15014,6 +15079,111 @@ mod tests {
         assert!(
             !state.borrow().pending_optimistic_flag_changes.contains_key(&mailbox),
             "the stash must be empty once its only entry is restored"
+        );
+    }
+
+    /// Regression test for the disappear-reappear-disappear flicker: the
+    /// account session's IDLE-vs-command race can land a `MessagesUpdated`
+    /// snapshot that still shows a just-deleted uid, because the resync ran
+    /// for an unrelated reason before the queued delete reached the server.
+    /// `reconcile_optimistic_removals` must keep the row hidden and the
+    /// stash entry alive in that case, and only clear the stash once a
+    /// snapshot actually omits the uid.
+    #[test]
+    fn reconcile_optimistic_removals_survives_a_stale_racing_sync() {
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let account_id = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(account_id, Vec::new())]);
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+        let three = summary(Uid(3), "acc:INBOX", 2026, 8, 1, 11);
+
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![one.clone(), two.clone(), three.clone()], SortKey::Date, true);
+        optimistic_remove_messages(&state, &message_list, &mailbox, &[Uid(2)]);
+
+        // A sync that raced ahead of the actual delete still has all three
+        // rows - reconciliation must strip the pending uid back out and
+        // keep it stashed rather than trust the stale snapshot.
+        let mut racing_snapshot = vec![one.clone(), two.clone(), three.clone()];
+        reconcile_optimistic_removals(&state, &mailbox, &mut racing_snapshot);
+        assert_eq!(
+            racing_snapshot.iter().map(|m| m.uid.0).collect::<HashSet<_>>(),
+            HashSet::from([1, 3]),
+            "a stale racing sync must not be allowed to repaint the deleted row"
+        );
+        assert_eq!(
+            state.borrow().pending_optimistic_removals[&mailbox].iter().map(|m| m.uid.0).collect::<Vec<_>>(),
+            vec![2],
+            "the stash must survive a sync that hasn't confirmed the delete yet"
+        );
+
+        // The genuine post-delete sync omits uid 2 - that's confirmation,
+        // so the stash clears and the snapshot passes through untouched.
+        let mut confirmed_snapshot = vec![one, three];
+        reconcile_optimistic_removals(&state, &mailbox, &mut confirmed_snapshot);
+        assert_eq!(confirmed_snapshot.iter().map(|m| m.uid.0).collect::<HashSet<_>>(), HashSet::from([1, 3]));
+        assert!(
+            !state.borrow().pending_optimistic_removals.contains_key(&mailbox),
+            "a sync confirming the uid is gone must clear the stash"
+        );
+    }
+
+    /// The read/unread sibling of the delete-flicker regression test: a
+    /// racing sync can land with the pre-toggle `Seen` flag before the
+    /// actual `STORE` reaches the server. `reconcile_optimistic_flag_changes`
+    /// must patch the stale snapshot back to the optimistic value (not let
+    /// the row flip back to unread) and only clear the stash once a
+    /// snapshot's flag actually matches.
+    #[test]
+    fn reconcile_optimistic_flag_changes_survives_a_stale_racing_sync() {
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let account_id = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(account_id, Vec::new())]);
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
+        optimistic_toggle_read(&state, &message_list, &mailbox, &[Uid(2)], true);
+
+        // A sync that raced ahead of the actual STORE still shows the
+        // pre-toggle unread flag - reconciliation must patch it back to the
+        // optimistic (read) value and keep the uid stashed.
+        let mut racing_snapshot = vec![one.clone(), two.clone()];
+        reconcile_optimistic_flag_changes(&state, &message_list, &mailbox, &mut racing_snapshot);
+        assert!(
+            !racing_snapshot.iter().find(|m| m.uid == Uid(2)).unwrap().is_unread(),
+            "a stale racing sync must not be allowed to flip the row back to unread"
+        );
+        assert_eq!(
+            state.borrow().pending_optimistic_flag_changes[&mailbox].iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![Uid(2)],
+            "the stash must survive a sync that hasn't confirmed the flag change yet"
+        );
+
+        // The genuine post-STORE sync agrees the row is read - that's
+        // confirmation, so the stash clears.
+        let two_read = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        let mut confirmed_snapshot = vec![one, two_read];
+        reconcile_optimistic_flag_changes(&state, &message_list, &mailbox, &mut confirmed_snapshot);
+        assert!(
+            !state.borrow().pending_optimistic_flag_changes.contains_key(&mailbox),
+            "a sync confirming the flag change must clear the stash"
         );
     }
 
