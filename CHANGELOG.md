@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.76 (2026-08-19)
+
+### Changed
+
+- **Mail**: fetching message previews no longer re-diffs and re-emits an entire mailbox to deliver a handful of snippets. `fetch_previews` used to patch up to 50 newly-fetched previews into its full envelope list and hand that whole list back to `emit_messages`, which re-ran a full `replace_messages` whole-mailbox diff/upsert and sent a second complete `MessagesUpdated` - work that scaled with mailbox size to deliver at most 50 changed rows. It now sends a new, narrow `AccountEvent::PreviewsFetched { mailbox, previews }` carrying just the changed `(uid, preview)` pairs, persisted through a new `Cache::update_previews` that patches only those rows (skipping `replace_messages`'s membership diff and expunge-purge entirely), and applied on the UI side by a new `patch_previews` - modeled on the existing `optimistic_toggle_read` pattern - that mutates just the matching rows in place instead of replacing `MessageListModel`'s whole `truth` and re-diffing every row's `message_row_key` fingerprint. `emit_messages` now has exactly one caller, so its `update_address_book` gating parameter (added when the double-emit's address-book double-counting was fixed) was removed as dead weight. Previews fetched this way are deliberately not re-indexed for full-text search immediately - they become searchable on the mailbox's next full sync, the same bounded staleness `update_flags_many`/`update_keywords` already accept for flag/tag changes - rather than reintroducing the FTS bookkeeping this change removes.
+
+### Testing
+
+- `lookout-mail`: `update_previews_patches_only_the_given_uids_and_survives_reload` and `update_previews_reports_a_uid_missing_from_the_cached_window` cover the new cache method's persistence and its `update_flags_many`-style all-or-partial contract. `lookout-app`: `patch_previews_updates_the_matching_row_and_leaves_others_untouched` reads back through the actual rendered GTK model (not just `MessageListModel::all_messages()`) to confirm a preview-only change still repaints - the exact regression `message_row_key`'s doc comment warns a delta fix could silently reintroduce - and `patch_previews_ignores_uids_not_in_the_displayed_list` confirms an unmatched uid or mailbox is a safe no-op. Two example binaries (`send_test`, `smoke_test`) needed a new match arm for the added `AccountEvent` variant.
+
 ## 0.9.75 (2026-08-19)
 
 ### Changed

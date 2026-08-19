@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                     AccountEvent::MessagesUpdated { .. } => {}
+                    AccountEvent::PreviewsFetched { .. } => {}
                     AccountEvent::NewMessages { .. } => {}
                     AccountEvent::BodyFetched { .. } => {}
                     AccountEvent::DraftSaved { .. } => {}

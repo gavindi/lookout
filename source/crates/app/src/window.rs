@@ -7910,6 +7910,36 @@ fn spawn_account_event_loop(
                             }
                         }
                     }
+                    AccountEvent::PreviewsFetched { mailbox, previews } => {
+                        // Keep the unified-view snapshot current regardless of
+                        // what's on screen - it's what the 3 full-rebuild call
+                        // sites (disconnect, exit_search, enter_unified_inbox)
+                        // read from.
+                        if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(&mailbox) {
+                            for m in snapshot.iter_mut() {
+                                if let Some(p) = previews.get(&m.uid) {
+                                    m.preview = Some(p.clone());
+                                }
+                            }
+                        }
+                        // Mirrors MessagesUpdated's search-active early-out:
+                        // the results list owns the pane during a search.
+                        if state.borrow().search_active {
+                            continue;
+                        }
+                        let display = {
+                            let st = state.borrow();
+                            match st.mail_view {
+                                MailView::UnifiedInbox => {
+                                    st.accounts.values().any(|h| h.folders.iter().any(|m| m.id == mailbox && matches!(m.role, MailboxRole::Inbox)))
+                                }
+                                _ => st.current_mailbox.as_ref() == Some(&mailbox),
+                            }
+                        };
+                        if display {
+                            patch_previews(&state, &message_list, &mailbox, &previews);
+                        }
+                    }
                     AccountEvent::NewMessages { mailbox, messages } => {
                         // Desktop notification for genuinely-new unread mail
                         // (`session.rs` already excludes a mailbox's first-ever
@@ -12226,6 +12256,33 @@ fn restore_optimistic_flag_changes(state: &Rc<RefCell<UiState>>, message_list: &
     message_list.repopulate(all, key, descending);
 }
 
+/// Patches a preview snippet onto matching displayed rows in place - the
+/// UI-side half of `AccountEvent::PreviewsFetched`. Not optimistic (unlike
+/// `optimistic_toggle_read` above): the cache write already succeeded before
+/// this event was sent, so there's nothing to stash for rollback.
+///
+/// `unified_snapshots` is kept in sync by the event-loop caller separately,
+/// unconditionally on every `PreviewsFetched` regardless of whether this
+/// function even runs - a preview must persist there even for a mailbox
+/// that isn't currently on screen, whereas this function only has anything
+/// to patch when the affected mailbox is actually displayed.
+fn patch_previews(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, previews: &HashMap<Uid, String>) {
+    let all: Vec<EmailSummary> = message_list
+        .all_messages()
+        .into_iter()
+        .map(|mut m| {
+            if m.mailbox == *mailbox {
+                if let Some(p) = previews.get(&m.uid) {
+                    m.preview = Some(p.clone());
+                }
+            }
+            m
+        })
+        .collect();
+    let (key, descending) = current_sort(state);
+    message_list.repopulate(all, key, descending);
+}
+
 /// Groups every currently-selected message in `message_list` by the
 /// `(account, mailbox)` it lives in, for the batch Delete/Archive/Report/
 /// Snooze/Flag/Mark-read button handlers - mirrors the lookup already done
@@ -14866,6 +14923,94 @@ mod tests {
             !state.borrow().pending_optimistic_flag_changes.contains_key(&mailbox),
             "the stash must be empty once its only entry is restored"
         );
+    }
+
+    /// The rendered `preview` of the row for `uid` in `model`'s flat
+    /// selection, or `None` if it isn't currently rendered as a message row
+    /// at all - reads through the actual GTK model rather than `truth`/
+    /// `all_messages()`, so a regression where `message_row_key` silently
+    /// dropped `preview` from its fingerprint (making a preview-only change
+    /// look like a no-op) would still be caught here.
+    fn rendered_preview(model: &MessageListModel, uid: Uid) -> Option<Option<String>> {
+        for i in 0..model.selection.n_items() {
+            let row = model.selection.item(i).and_downcast::<gtk::TreeListRow>()?;
+            let boxed = row.item().and_downcast::<glib::BoxedAnyObject>()?;
+            let item = boxed.borrow::<MessageItem>();
+            if let MessageItem::Message(summary) = &*item {
+                if summary.uid == uid {
+                    return Some(summary.preview.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// `patch_previews` patches only the matching `(mailbox, uid)` rows'
+    /// `preview` in place, leaves everything else untouched, and the change
+    /// actually reaches the rendered GTK model - not just `truth` - proving
+    /// `message_row_key`'s fingerprint diff (which `preview` is one field of)
+    /// correctly treats a preview-only change as a real change to repaint,
+    /// not a false no-op.
+    #[test]
+    fn patch_previews_updates_the_matching_row_and_leaves_others_untouched() {
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let account_id = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(account_id, Vec::new())]);
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
+        state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one, two]);
+
+        let previews = HashMap::from([(Uid(2), "new snippet".to_string())]);
+        patch_previews(&state, &message_list, &mailbox, &previews);
+
+        assert_eq!(rendered_preview(&message_list, Uid(2)), Some(Some("new snippet".to_string())), "the patched row must repaint with the new preview");
+        assert_eq!(rendered_preview(&message_list, Uid(1)), Some(None), "an untouched uid must render exactly as before");
+
+        let patched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        assert_eq!(patched.preview.as_deref(), Some("new snippet"));
+    }
+
+    /// A uid the patch doesn't mention, or one for a mailbox not currently
+    /// displayed at all, is a safe no-op - no panic, no spurious row, no
+    /// unrelated change.
+    #[test]
+    fn patch_previews_ignores_uids_not_in_the_displayed_list() {
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let account_id = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let other_mailbox = MailboxId("acc:Archive".into());
+        let state = test_state(vec![(account_id, Vec::new())]);
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![one], SortKey::Date, true);
+
+        // A uid that doesn't exist in this mailbox, and a whole mailbox
+        // that isn't displayed.
+        let previews = HashMap::from([(Uid(99), "nobody".to_string())]);
+        patch_previews(&state, &message_list, &mailbox, &previews);
+        assert_eq!(message_list.all_messages().len(), 1, "no row should be added");
+        assert_eq!(rendered_preview(&message_list, Uid(1)), Some(None), "the one real row must be untouched");
+
+        let previews_for_other = HashMap::from([(Uid(1), "wrong mailbox".to_string())]);
+        patch_previews(&state, &message_list, &other_mailbox, &previews_for_other);
+        assert_eq!(rendered_preview(&message_list, Uid(1)), Some(None), "a preview for a different mailbox must not leak onto this uid");
     }
 
     /// The depth-0 row for one account group in a freshly built tree.

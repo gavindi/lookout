@@ -1339,6 +1339,49 @@ impl Cache {
         Ok(all_found)
     }
 
+    /// Patches in a fetched preview snippet for each uid in `previews`,
+    /// without the whole-mailbox diff/upsert/expunge-purge `replace_messages`
+    /// does - `fetch_previews` calls this for the up-to-`PREVIEW_FETCH_LIMIT`
+    /// messages it just fetched a snippet for, not the whole mailbox.
+    ///
+    /// Deliberately does not touch `search_fts`: unlike `replace_messages`,
+    /// which re-indexes a changed row to preserve or seed the search index,
+    /// these messages are only ever missing a preview because they've never
+    /// been indexed with a body either - they stay unsearchable-by-content
+    /// until the next full sync's `replace_messages` catches them up. A
+    /// bounded staleness window (one sync cycle), not a permanent gap, and
+    /// the same asymmetry `update_flags_many`/`update_keywords` already have.
+    ///
+    /// Same all-or-resync contract as `update_flags_many`: returns `false` if
+    /// any uid is missing from the cached window (e.g. expunged between the
+    /// fetch and this write) - the caller only logs it, since a missing
+    /// preview for a message that no longer exists needs no reconciliation.
+    pub fn update_previews(&self, mailbox_id: &MailboxId, previews: &HashMap<Uid, String>) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut all_found = true;
+        {
+            let mut select = tx.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut update = tx.prepare("UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3")?;
+            for (uid, preview) in previews {
+                let mut rows = select.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
+                let Some(data) = rows.next().transpose()? else {
+                    all_found = false;
+                    continue;
+                };
+                let Ok(mut summary) = serde_json::from_str::<EmailSummary>(&data) else {
+                    all_found = false;
+                    continue;
+                };
+                summary.preview = Some(preview.clone());
+                let data = serde_json::to_string(&summary)?;
+                update.execute(rusqlite::params![data, mailbox_id.0, uid.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(all_found)
+    }
+
     /// Applies a keyword change to one cached summary, mirroring the `STORE`
     /// the session just issued - the same contract as `update_flags`, for the
     /// custom-flag atoms (e.g. `$Lookout-tag-<key>`) that carry color tags.
@@ -1978,6 +2021,54 @@ mod tests {
         assert_eq!(previews.len(), 1);
         assert_eq!(previews.get(&Uid(1)).map(String::as_str), Some("Truffle Security Co. says it scanned..."));
         assert!(!previews.contains_key(&Uid(2)));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_previews_patches_only_the_given_uids_and_survives_reload() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let messages = vec![sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None), sample_summary(&mailbox_id, 3, Some("already had one"))];
+        cache.replace_messages(&mailbox_id, UidValidity(1), &messages).unwrap();
+
+        let previews = HashMap::from([(Uid(1), "new snippet for 1".to_string())]);
+        assert!(cache.update_previews(&mailbox_id, &previews).unwrap());
+
+        let reloaded = cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap();
+        assert_eq!(reloaded[&Uid(1)].preview.as_deref(), Some("new snippet for 1"));
+        // Untouched uids keep exactly what they had, including their other
+        // fields (subject is uid-derived by `sample_summary`, so this also
+        // confirms the patch didn't clobber the row with a different uid's
+        // data).
+        assert_eq!(reloaded[&Uid(2)].preview, None);
+        assert_eq!(reloaded[&Uid(2)].subject.as_deref(), Some("subject 2"));
+        assert_eq!(reloaded[&Uid(3)].preview.as_deref(), Some("already had one"));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_previews_reports_a_uid_missing_from_the_cached_window() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let messages = vec![sample_summary(&mailbox_id, 1, None)];
+        cache.replace_messages(&mailbox_id, UidValidity(1), &messages).unwrap();
+
+        // Uid 99 was never synced into this mailbox (e.g. expunged between
+        // the preview fetch and this write).
+        let previews = HashMap::from([(Uid(1), "ok".to_string()), (Uid(99), "gone".to_string())]);
+        assert!(!cache.update_previews(&mailbox_id, &previews).unwrap());
+
+        let reloaded = cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap();
+        assert_eq!(reloaded[&Uid(1)].preview.as_deref(), Some("ok"));
+        assert_eq!(reloaded.len(), 1, "no row should have been created for the missing uid");
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

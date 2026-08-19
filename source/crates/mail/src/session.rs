@@ -360,6 +360,15 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         messages: Vec<EmailSummary>,
     },
+    /// A subset of a `MessagesUpdated` sync: just the up-to-`PREVIEW_FETCH_LIMIT`
+    /// list-row snippets `fetch_previews` fetched this round, keyed by uid.
+    /// Replaces a second whole-mailbox `MessagesUpdated` that changed nothing
+    /// but `preview` on these messages - the UI patches just these rows in
+    /// place instead of re-diffing/repainting the entire mailbox.
+    PreviewsFetched {
+        mailbox: MailboxId,
+        previews: HashMap<Uid, String>,
+    },
     BodyFetched {
         mailbox: MailboxId,
         uid: Uid,
@@ -3336,19 +3345,19 @@ async fn sync_mailbox(
         reused = messages.len().saturating_sub(new_uids.len()),
         "synced mailbox"
     );
-    emit_messages(mailbox_id, uidvalidity, &messages, events, cache, true).await;
+    emit_messages(mailbox_id, uidvalidity, &messages, events, cache).await;
 
-    // Capture the count fields before `fetch_previews` takes `messages`: the
-    // unread count comes straight from the flags this sync fetched, and the
-    // total from the fetch size (see the folder update after the previews).
+    // The unread count comes straight from the flags this sync fetched, and
+    // the total from the fetch size (see the folder update after the
+    // previews).
     let total = messages.len() as u32;
     let unread = messages.iter().filter(|m| m.is_unread()).count() as u32;
 
-    // Phase two: fill in the snippets this sync is still missing, then emit a
-    // second update. Deliberately *after* the first emit - the list paints at
-    // the envelope fetch's latency, and previews arrive a beat later rather
-    // than holding up first paint.
-    if let Err(e) = fetch_previews(session, mailbox_id, uidvalidity, messages, events, cache).await {
+    // Phase two: fill in the snippets this sync is still missing, then patch
+    // them in as a narrow `PreviewsFetched` event. Deliberately *after* the
+    // first emit - the list paints at the envelope fetch's latency, and
+    // previews arrive a beat later rather than holding up first paint.
+    if let Err(e) = fetch_previews(session, mailbox_id, &messages, events, cache).await {
         // Never propagated: this function's caller tears the connection down
         // on `Err`, and a malformed message or a server that dislikes partial
         // fetches must not cost the user their IMAP session over a cosmetic
@@ -3496,15 +3505,7 @@ async fn emit_cached_messages_after_removal(cache: &CacheHandle, mailbox_id: &Ma
 /// Caches `messages` and publishes them to the UI, minus anything currently
 /// snoozed. Snoozed messages are still fetched and cached normally - only
 /// what's emitted is filtered, so a snooze is purely a display concern.
-///
-/// `update_address_book` gates `record_addresses`: `fetch_previews`'s
-/// second, preview-only emit per sync carries the same `from`/`to`/`cc` data
-/// as the first emit (only `preview` differs), so running `record_addresses`
-/// again there would double-count every correspondent's `seen_count`/
-/// `last_seen` on every sync. `replace_messages` always runs on both calls -
-/// it's what makes a fetched preview persist across resyncs - so it is not
-/// skippable here.
-async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary], events: &async_channel::Sender<AccountEvent>, cache: &CacheHandle, update_address_book: bool) {
+async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary], events: &async_channel::Sender<AccountEvent>, cache: &CacheHandle) {
     let mut messages = messages.to_vec();
     // The write, the address-book feed, and the snooze read in one blocking
     // hop: `replace_messages` is the session's heaviest cache write (a
@@ -3519,7 +3520,7 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
             }
             (
                 c.replace_messages(&mailbox_id, uidvalidity, &messages),
-                update_address_book.then(|| c.record_addresses(&messages)),
+                c.record_addresses(&messages),
                 c.active_snoozed_uids(&mailbox_id, now),
             )
         }
@@ -3533,7 +3534,7 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
         // in `replace_messages` because the address book is cumulative -
         // `replace_messages` syncs a mailbox's window to the server's set,
         // and addresses must accumulate across those syncs.
-        if let Some(Err(e)) = addresses {
+        if let Err(e) = addresses {
             tracing::warn!("failed to record addresses for {mailbox_id}: {e}");
         }
         if let Ok(snoozed) = snoozed {
@@ -3549,15 +3550,17 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
 }
 
 /// Fetches list-row snippets for the newest `PREVIEW_FETCH_LIMIT` messages in
-/// `messages` that don't have one yet, and re-publishes the enriched set.
+/// `messages` that don't have one yet, and publishes them as a narrow
+/// `PreviewsFetched` patch rather than re-running the whole-mailbox
+/// `emit_messages` a second time - `messages` is only read here to find what
+/// still needs a preview, never re-emitted.
 ///
-/// A no-op (no round trip, no second event) when every message already has a
+/// A no-op (no round trip, no event) when every message already has a
 /// preview, which is the steady state once a mailbox has been synced once.
 async fn fetch_previews(
     session: &mut Session<SessionStream>,
     mailbox_id: &MailboxId,
-    uidvalidity: UidValidity,
-    mut messages: Vec<EmailSummary>,
+    messages: &[EmailSummary],
     events: &async_channel::Sender<AccountEvent>,
     cache: &CacheHandle,
 ) -> Result<()> {
@@ -3576,7 +3579,7 @@ async fn fetch_previews(
         fetches.extend(chunk);
     }
 
-    let mut previews = std::collections::HashMap::new();
+    let mut previews = HashMap::new();
     for fetch in &fetches {
         let (Some(uid), Some(raw)) = (fetch.uid, fetch.body()) else { continue };
         if let Some(preview) = preview_from_raw(raw) {
@@ -3587,13 +3590,18 @@ async fn fetch_previews(
         return Ok(());
     }
 
-    for msg in &mut messages {
-        if msg.preview.is_none() {
-            msg.preview = previews.get(&msg.uid).cloned();
-        }
-    }
     tracing::debug!(mailbox = %mailbox_id, count = previews.len(), "fetched message previews");
-    emit_messages(mailbox_id, uidvalidity, &messages, events, cache, false).await;
+    let mailbox_id = mailbox_id.clone();
+    let cached = cache_op(cache, {
+        let mailbox_id = mailbox_id.clone();
+        let previews = previews.clone();
+        move |c| c.update_previews(&mailbox_id, &previews)
+    })
+    .await;
+    if let Some(Err(e)) = cached {
+        tracing::warn!("failed to cache previews for {mailbox_id}: {e}");
+    }
+    let _ = events.send(AccountEvent::PreviewsFetched { mailbox: mailbox_id, previews }).await;
     Ok(())
 }
 
