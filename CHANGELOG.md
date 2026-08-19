@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.78 (2026-08-19)
+
+### Changed
+
+- **App**: adding or reconnecting a mail account no longer blocks the GTK main thread while its address-book cache's SQLite schema is opened/created. `connect_account`/`connect_other_account` used to call `Cache::open` (file open, WAL/pragma setup, `CREATE TABLE/INDEX IF NOT EXISTS`, a `PRAGMA user_version` check) inline and synchronously - cheap in steady state but still a blocking file+SQLite call sequence on the UI thread, and larger on the rare one-time case of a schema-version-bump migration. A new `spawn_cache_open` (mirroring the existing `spawn_cache_read` helper's shape, but producing a `Cache` instead of querying an existing one) dispatches the open to the `Worker`'s blocking thread pool instead; `AccountHandle.address_cache` is inserted as `None` immediately so account-connect can proceed, then patched in via `glib::spawn_future_local` once the open resolves. Every downstream reader (composer/search/attendee-autocomplete) already tolerated a missing cache as "no suggestions yet," so this is a pure dispatch-plumbing change - no changes to `Cache::open` itself or any reader. A remove-then-reconnect race during the brief open window just finds no account entry left to patch and is silently skipped, the same stale-reply idiom `select_mailbox`'s cache-read guard already uses. This was the last straggler item in `OPT_TODO.md`'s Phase 3 (off-main-thread DB) besides the dashboard's own low-priority `hour_histogram` reads.
+
 ## 0.9.77 (2026-08-19)
 
 ### Changed

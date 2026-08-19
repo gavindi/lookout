@@ -7621,18 +7621,24 @@ fn connect_account(
             smtp_host: config.smtp.host.clone(),
             smtp_port: config.smtp.port,
             folders: Vec::new(),
-            // Opened eagerly so the first composer already has completions.
-            // The session opens (and creates) the same file; whichever gets
-            // there first wins, and a failure here only costs suggestions.
-            address_cache: match lookout_mail::Cache::open(&account_id) {
-                Ok(cache) => Some(Arc::new(cache)),
-                Err(e) => {
-                    tracing::warn!("no address-book cache for {account_id}, recipient autocomplete disabled: {e}");
-                    None
-                }
-            },
+            // Opened off the GTK thread below and patched in once ready - see
+            // `spawn_cache_open`. The session opens (and creates) the same
+            // file; whichever gets there first wins, and until either lands
+            // the field just means no composer suggestions yet.
+            address_cache: None,
         },
     );
+    {
+        let reply_rx = spawn_cache_open(&worker, account_id.clone());
+        let state = state.clone();
+        let account_id = account_id.clone();
+        glib::spawn_future_local(async move {
+            let Ok(cache) = reply_rx.recv().await else { return };
+            if let Some(handle) = state.borrow_mut().accounts.get_mut(&account_id) {
+                handle.address_cache = cache;
+            }
+        });
+    }
 
     worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
 
@@ -8321,18 +8327,24 @@ fn connect_other_account(
             smtp_host: config.smtp.host.clone(),
             smtp_port: config.smtp.port,
             folders: Vec::new(),
-            // Opened eagerly so the first composer already has completions.
-            // The session opens (and creates) the same file; whichever gets
-            // there first wins, and a failure here only costs suggestions.
-            address_cache: match lookout_mail::Cache::open(&account_id) {
-                Ok(cache) => Some(Arc::new(cache)),
-                Err(e) => {
-                    tracing::warn!("no address-book cache for {account_id}, recipient autocomplete disabled: {e}");
-                    None
-                }
-            },
+            // Opened off the GTK thread below and patched in once ready - see
+            // `spawn_cache_open`. The session opens (and creates) the same
+            // file; whichever gets there first wins, and until either lands
+            // the field just means no composer suggestions yet.
+            address_cache: None,
         },
     );
+    {
+        let reply_rx = spawn_cache_open(&worker, account_id.clone());
+        let state = state.clone();
+        let account_id = account_id.clone();
+        glib::spawn_future_local(async move {
+            let Ok(cache) = reply_rx.recv().await else { return };
+            if let Some(handle) = state.borrow_mut().accounts.get_mut(&account_id) {
+                handle.address_cache = cache;
+            }
+        });
+    }
 
     worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
 
@@ -11712,6 +11724,32 @@ pub(crate) fn spawn_cache_read<T: Send + 'static>(
         if let Ok(result) = tokio::task::spawn_blocking(move || query(&cache)).await {
             let _ = reply_tx.send(result).await;
         }
+    });
+    reply_rx
+}
+
+/// Opens a mail account's address-book cache on the `Worker`'s blocking
+/// thread pool instead of synchronously on the GTK thread - the schema DDL
+/// (`CREATE TABLE IF NOT EXISTS` etc.) is cheap in steady state but is still
+/// a blocking file-open + SQLite call sequence, and `connect_account`/
+/// `connect_other_account` don't need the result before they can proceed
+/// (see `AccountHandle::address_cache`'s doc comment: "a failure here only
+/// costs suggestions"). Mirrors `spawn_cache_read`'s shape, except there's no
+/// existing `Cache` to query - this is what produces one in the first place.
+fn spawn_cache_open(worker: &Worker, account_id: AccountId) -> async_channel::Receiver<Option<Arc<lookout_mail::Cache>>> {
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+    worker.spawn(async move {
+        let warn_id = account_id.clone();
+        let opened = tokio::task::spawn_blocking(move || lookout_mail::Cache::open(&account_id)).await;
+        let cache = match opened {
+            Ok(Ok(cache)) => Some(Arc::new(cache)),
+            Ok(Err(e)) => {
+                tracing::warn!("no address-book cache for {warn_id}, recipient autocomplete disabled: {e}");
+                None
+            }
+            Err(_) => None,
+        };
+        let _ = reply_tx.send(cache).await;
     });
     reply_rx
 }
