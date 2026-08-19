@@ -510,10 +510,10 @@ type MessageRowKey = (MailboxId, Uid, bool, bool, DateTime<Utc>, Option<String>,
 /// and skip a rebuild.
 ///
 /// Every field the row renders has to appear here, or a change to it will be
-/// mistaken for no change at all: `preview` in particular arrives in a
-/// *second* `MessagesUpdated` that is otherwise byte-identical to the first
-/// (see `lookout_mail::session::sync_mailbox`'s two-phase sync), so omitting
-/// it would silently discard every snippet.
+/// mistaken for no change at all: `preview` in particular arrives after the
+/// envelope emit, patched in separately by `AccountEvent::PreviewsFetched`
+/// (see `window::patch_previews`), so omitting it would silently discard
+/// every snippet.
 fn message_row_key(m: &EmailSummary) -> MessageRowKey {
     let from = m.from.first().map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
     // Read *and* flagged state are both part of the key: each drives how the

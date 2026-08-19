@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.79 (2026-08-20)
+
+### Changed
+
+- **App**: the Lookout dashboard no longer scans its whole mail cache on the GTK main thread. `refresh_lookout_view` used to loop the connected accounts synchronously and, per account, run `top_addresses` and `hour_histogram(None)` straight off the UI thread - and the histogram is the dashboard's "all time" chart, an unfiltered `SELECT json_extract(data, '$.date') FROM messages` that no index can serve, so a Gmail-style account with 100k+ cached messages cost a multi-hundred-millisecond main-loop block per refresh (and the dashboard repaints on every debounced folder/message event while it's the visible tab). The per-account cache reads now run on the `Worker`'s blocking pool through the same `spawn_cache_read` dispatch the search/autocomplete paths already use - one blocking hop per account does both the top-contacts read and the histogram scan - and the replies are joined in a `glib::spawn_future_local`; the calendar-state half (tasks/events/colors) is pure in-memory reads and happens at reply time. A new `CalendarUiState::dashboard_generation` counter (the `suggestion_generation` idiom) discards a reply a newer refresh superseded while its reads were in flight, so a slower earlier snapshot can never land over a fresher one. The debounce and visibility gate from 0.9.69 stay as-is; this closes the last `OPT_TODO.md` Phase 3 straggler, making every UI-side cache read off-main-thread.
+
 ## 0.9.78 (2026-08-19)
 
 ### Changed

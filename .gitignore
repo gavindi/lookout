@@ -18,4 +18,4 @@ target/
 *.code-workspace
 .cline/
 
-
+.agents/

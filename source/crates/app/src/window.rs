@@ -989,6 +989,11 @@ struct CalendarUiState {
     /// loops call it so the dashboard stays live; `None` until then (a
     /// no-op, never an error).
     dashboard_refresh: Option<Rc<dyn Fn()>>,
+    /// Monotonic counter for the Lookout dashboard's async repaint. Each
+    /// `refresh_lookout_view` bump starts a fresh generation; a reply whose
+    /// generation no longer matches belongs to a refresh a newer one already
+    /// superseded and is discarded (the `suggestion_generation` idiom).
+    dashboard_generation: u64,
     /// The mail toolbar's "Add as Task" flag button's own repaint hook,
     /// registered by the window once `calendar_state` exists - same pattern
     /// as `dashboard_refresh`. `refresh_tasks_view` calls it so the button's
@@ -4741,6 +4746,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         local_tasks,
         local_tasks_db,
         dashboard_refresh: None,
+        dashboard_generation: 0,
         task_button_refresh: None,
         pending_calendar_moves: HashMap::new(),
         mail_overview_activate: None,
@@ -4763,6 +4769,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // table) histogram/top-contacts scan once per event, on screen or not.
     let dashboard_refresh: Rc<dyn Fn()> = {
         let state = state.clone();
+        let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let lookout_view = lookout_view.clone();
         let lookout_view_button = lookout_view_button.clone();
@@ -4775,12 +4782,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 id.remove();
             }
             let state = state.clone();
+            let worker = worker.clone();
             let calendar_state = calendar_state.clone();
             let lookout_view = lookout_view.clone();
             let debounce_for_timeout = debounce.clone();
             debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
                 debounce_for_timeout.set(None);
-                refresh_lookout_view(&state, &calendar_state, &lookout_view);
+                refresh_lookout_view(&state, &worker, &calendar_state, &lookout_view);
             })));
         })
     };
@@ -7026,6 +7034,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     {
         let state = state.clone();
+        let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let lookout_view = lookout_view.clone();
         lookout_view_button.connect_toggled(move |btn| {
@@ -7033,19 +7042,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // Bypasses `dashboard_refresh`'s visibility gate/debounce -
                 // the dashboard becoming visible is exactly the moment it
                 // must repaint immediately, not up to 500ms later.
-                refresh_lookout_view(&state, &calendar_state, &lookout_view);
+                refresh_lookout_view(&state, &worker, &calendar_state, &lookout_view);
                 widen_calendar_sync_horizon(&calendar_state);
             }
         });
     }
     {
         let state = state.clone();
+        let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let lookout_view = lookout_view.clone();
         lookout_refresh_button.connect_clicked(move |_| {
             // Bypasses the debounce for the same reason: an explicit click
             // asking for a refresh should never wait out the trailing edge.
-            refresh_lookout_view(&state, &calendar_state, &lookout_view);
+            refresh_lookout_view(&state, &worker, &calendar_state, &lookout_view);
             widen_calendar_sync_horizon(&calendar_state);
         });
     }
@@ -10048,28 +10058,72 @@ fn refresh_mail_overview_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
     }
 }
 
+/// One off-thread dashboard cache read's reply: the account's top contacts
+/// and its all-time hour-of-day histogram, fetched in a single blocking hop.
+type DashboardCacheReply = (Vec<(EmailAddress, i64)>, [i64; 24]);
+
 /// Repaints the Lookout dashboard from the current mail caches and
 /// calendar state: most-contacted people and the hour-of-day histogram are
 /// read straight off each connected account's cache SQLite (the same WAL
 /// reader the composer autocomplete uses, so no session round trip), and
 /// tasks/events come from the in-memory calendar state.
-fn refresh_lookout_view(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, lookout_view: &Rc<crate::lookout_view::LookoutView>) {
-    // Top contacts: union each account's top list, re-rank, keep the best.
-    let mut contacts: Vec<(lookout_core::EmailAddress, i64)> = Vec::new();
-    let mut histogram = [0i64; 24];
-    for cache in state.borrow().accounts.values().filter_map(|h| h.address_cache.as_ref()) {
-        if let Ok(top) = cache.top_addresses(crate::lookout_view::TOP_CONTACTS_LIMIT) {
-            contacts.extend(top);
-        }
-        if let Ok(h) = cache.hour_histogram(None) {
-            for (i, count) in h.iter().enumerate() {
-                histogram[i] += count;
+///
+/// The per-account cache reads run on the `Worker`'s blocking pool rather
+/// than the GTK thread - the histogram in particular scans the whole
+/// `messages` table ("all time", so no index can help it) and would block
+/// the main loop for the scan's duration at large cache sizes. One blocking
+/// hop per account does both the top-contacts read and the histogram scan,
+/// and the replies are joined in a `glib::spawn_future_local`; the
+/// calendar-state half is pure in-memory reads and happens at reply time.
+/// A reply whose `dashboard_generation` a newer refresh has already bumped
+/// past is a snapshot superseded before it landed and is discarded.
+fn refresh_lookout_view(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, calendar_state: &Rc<RefCell<CalendarUiState>>, lookout_view: &Rc<crate::lookout_view::LookoutView>) {
+    let receivers: Vec<async_channel::Receiver<DashboardCacheReply>> = state
+        .borrow()
+        .accounts
+        .values()
+        .filter_map(|h| h.address_cache.clone())
+        .map(|cache| {
+            spawn_cache_read(worker, cache, |cache| {
+                let contacts = cache.top_addresses(crate::lookout_view::TOP_CONTACTS_LIMIT).unwrap_or_default();
+                let histogram = cache.hour_histogram(None).unwrap_or_default();
+                (contacts, histogram)
+            })
+        })
+        .collect();
+    let generation = {
+        let mut cs = calendar_state.borrow_mut();
+        cs.dashboard_generation += 1;
+        cs.dashboard_generation
+    };
+    let calendar_state = calendar_state.clone();
+    let lookout_view = lookout_view.clone();
+    glib::spawn_future_local(async move {
+        let mut contacts: Vec<(EmailAddress, i64)> = Vec::new();
+        let mut histogram = [0i64; 24];
+        for rx in receivers {
+            if let Ok((account_contacts, account_histogram)) = rx.recv().await {
+                contacts.extend(account_contacts);
+                for (i, count) in account_histogram.iter().enumerate() {
+                    histogram[i] += count;
+                }
             }
         }
-    }
-    contacts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-    contacts.truncate(crate::lookout_view::TOP_CONTACTS_LIMIT);
+        // A newer refresh started while these reads were in flight - this
+        // snapshot is superseded, don't let it land over the newer one.
+        if calendar_state.borrow().dashboard_generation != generation {
+            return;
+        }
+        contacts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        contacts.truncate(crate::lookout_view::TOP_CONTACTS_LIMIT);
+        set_lookout_data(&calendar_state, &lookout_view, contacts, histogram);
+    });
+}
 
+/// Builds the dashboard's `LookoutData` from the worker-fetched mail stats
+/// plus the in-memory calendar state and repaints the view - the reply-time
+/// half of `refresh_lookout_view`.
+fn set_lookout_data(calendar_state: &Rc<RefCell<CalendarUiState>>, lookout_view: &Rc<crate::lookout_view::LookoutView>, contacts: Vec<(EmailAddress, i64)>, histogram: [i64; 24]) {
     let (tasks, events, checked_calendar_ids, colors) = {
         let st = calendar_state.borrow();
         (
