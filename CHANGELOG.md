@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.77 (2026-08-19)
+
+### Changed
+
+- **App**: the Settings screen's "Accounts" and "Mail accounts" sidebar pages are now one "Accounts" page - both were "where your accounts live" from a user's perspective, just showing different slices (add-account entry points + GNOME Online Accounts switches vs. the actual mail-account inventory with host/port, Edit/Remove, and sending identities). `config_view.rs`'s `add_section` is the single choke point that turns a set of `adw::PreferencesGroup`s into a sidebar page, so the merge is one call site: `mail_group` moved into the existing "Accounts" `add_section` call (ordered after the add-account rows and before the GNOME Online Accounts switches) and its own now-empty `"mail-accounts"` registration was deleted. `ConfigView`'s fields and `refresh()` populate `mail_group`/`goa_group`'s rows exactly as before regardless of which page hosts them, so no other wiring in `window.rs` changed. "Calendar accounts" and "Webcal subscriptions" remain their own pages, unaffected.
+
 ## 0.9.76 (2026-08-19)
 
 ### Changed

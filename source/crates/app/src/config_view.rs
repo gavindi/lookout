@@ -277,12 +277,11 @@ pub fn build() -> ConfigView {
         .build();
     accounts_group.add(&add_imap_row);
 
-    // The enable/disable list for GNOME Online Accounts accounts, alongside
-    // the add rows above. Repopulated by `refresh` with one switch row per
-    // discovered account.
-    let goa_group = adw::PreferencesGroup::builder().title("GNOME Online Accounts").build();
-
     let mail_group = adw::PreferencesGroup::builder().title("Mail accounts").build();
+
+    // The enable/disable list for GNOME Online Accounts accounts. Repopulated
+    // by `refresh` with one switch row per discovered account.
+    let goa_group = adw::PreferencesGroup::builder().title("GNOME Online Accounts").build();
 
     let calendar_group = adw::PreferencesGroup::builder().title("Calendar accounts").build();
 
@@ -487,8 +486,7 @@ pub fn build() -> ConfigView {
     section_stack.set_hexpand(true);
 
     let mut sections: Vec<(&'static str, &'static str)> = Vec::new();
-    add_section(&section_stack, &mut sections, "Accounts", "accounts", &[&accounts_group, &goa_group]);
-    add_section(&section_stack, &mut sections, "Mail accounts", "mail-accounts", &[&mail_group]);
+    add_section(&section_stack, &mut sections, "Accounts", "accounts", &[&accounts_group, &mail_group, &goa_group]);
     add_section(&section_stack, &mut sections, "Calendar accounts", "calendar-accounts", &[&calendar_group]);
     add_section(&section_stack, &mut sections, "Webcal subscriptions", "webcal", &[&webcal_group]);
     add_section(&section_stack, &mut sections, "Appearance", "appearance", &[&appearance_group]);

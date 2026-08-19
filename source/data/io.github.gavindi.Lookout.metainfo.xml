@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.77" date="2026-08-19">
+      <description>
+        <p>Settings is simpler - the separate "Accounts" and "Mail accounts" panels are now one "Accounts" panel, so there's a single place to add, edit, and manage your accounts.</p>
+      </description>
+    </release>
     <release version="0.9.76" date="2026-08-19">
       <description>
         <p>Snippets under new mail arrive faster and cheaper - fetching a message preview no longer re-reads and re-sends the entire folder's list, just the handful of messages that actually got a snippet.</p>
