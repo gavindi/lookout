@@ -3,8 +3,9 @@
 //! preference, the window-background image picker and its dimming slider), live Mail and Calendar
 //! preference groups (the remote-images/rich-text toggles and the event-alerts
 //! toggle), a live Keyboard-shortcuts section (per-action
-//! capture rows over the `shortcuts` GSettings key), a live Layout section
-//! (the folder/message-list vertical-spacing choice), disabled placeholder
+//! capture rows over the `shortcuts` GSettings key), the Appearance page
+//! (theme, accent, window background, and the folder/message-list vertical-
+//! spacing choice), disabled placeholder
 //! sections mirroring the rest of the Phase 5 settings taxonomy (Privacy) and a live
 //! Advanced section with a cache-clear action. Data-in/widget-out like
 //! `calendar_view.rs` and `folder_tree.rs`: the caller (window.rs) owns the
@@ -140,7 +141,7 @@ pub struct ConfigView {
     /// newly-opened HTML messages start with the header's "Switch message
     /// theme" override applied.
     pub message_theme_dark_row: adw::SwitchRow,
-    /// "Vertical spacing" dropdown (Config → Layout), exposed so the caller
+    /// "Vertical spacing" dropdown (Config → Appearance), exposed so the caller
     /// can seed it from the `layout-vertical-spacing` GSettings key and map
     /// its selection to the `spacing-*` CSS class on the folder and message
     /// list panes.
@@ -463,14 +464,16 @@ pub fn build() -> ConfigView {
         .build();
     general_group.add(&close_to_background_row);
 
-    let layout_group = adw::PreferencesGroup::builder().title("Layout").build();
+    // The "Vertical spacing" choice lives on the Appearance page rather than
+    // a separate Layout section - it's about how the panes look. Spacing
+    // between items in the folder and message list panes.
     let spacing_model = gtk::StringList::new(&["Tight", "Medium", "Loose"]);
     let spacing_row = adw::ComboRow::builder()
         .title("Vertical spacing")
         .subtitle("Spacing between items in the folder and message list panes")
         .model(&spacing_model)
         .build();
-    layout_group.add(&spacing_row);
+    appearance_group.add(&spacing_row);
     let privacy_group = placeholder_group("Privacy");
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
@@ -504,7 +507,6 @@ pub fn build() -> ConfigView {
     add_section(&section_stack, &mut sections, "Webcal subscriptions", "webcal", &[&webcal_group]);
     add_section(&section_stack, &mut sections, "Appearance", "appearance", &[&appearance_group]);
     add_section(&section_stack, &mut sections, "General", "general", &[&general_group, &keyboard_group]);
-    add_section(&section_stack, &mut sections, "Layout", "layout", &[&layout_group]);
     add_section(&section_stack, &mut sections, "Mail", "mail", &[&mail_settings_group]);
     add_section(&section_stack, &mut sections, "Calendar", "calendar", &[&calendar_settings_group]);
     add_section(&section_stack, &mut sections, "Privacy", "privacy", &[&privacy_group]);

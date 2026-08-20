@@ -1160,7 +1160,7 @@ fn install_paned_css() {
         .message-list > row {
             padding: 0;
         }
-        /* The panes' vertical spacing around items (Config → Layout →
+        /* The panes' vertical spacing around items (Config → Appearance →
            'Vertical spacing'): the whole point of the setting is that every
            row kind in a pane moves together, so all the folder rows and all
            the message-list row kinds share one value per level. The `tight`
@@ -5178,7 +5178,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // Config → Layout → "Vertical spacing": swaps the `spacing-*` CSS class
+    // Config → Appearance → "Vertical spacing": swaps the `spacing-*` CSS class
     // on the folder and message list panes, so every row in both reflows
     // live as the choice changes (see the `.spacing-*` rules in
     // `install_paned_css`). Written through to GSettings like the other
@@ -5384,7 +5384,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             config_view.accent_color_button.set_rgba(&rgba);
         }
         config_view.accent_switch_row.set_active(!accent.is_empty());
-        // Layout → "Vertical spacing": seeding fires the notify handler
+        // Appearance → "Vertical spacing": seeding fires the notify handler
         // above, which re-swaps the panes' `spacing-*` class (a no-op for
         // the value already applied at pane-build time). Seed separately so
         // the ComboRow can never drift from the stored value.

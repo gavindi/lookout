@@ -256,8 +256,8 @@ impl SettingsStore {
     }
 }
 
-/// The `layout-vertical-spacing` setting's values, in UI (Config → Layout →
-/// "Vertical spacing" ComboRow) order. "medium" is the default (and what an
+/// The `layout-vertical-spacing` setting's values, in UI (Config → Appearance
+/// → "Vertical spacing" ComboRow) order. "medium" is the default (and what an
 /// unset GSettings value resolves to); "tight" is the app's original, tightest
 /// look, and "loose" is the roomiest.
 pub const SPACINGS: [&str; 3] = ["tight", "medium", "loose"];
