@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.81" date="2026-08-21">
+      <description>
+        <p>You can now choose the spacing between items in the folder and message lists - tight, medium (the default), or loose - from Settings under Layout.</p>
+      </description>
+    </release>
     <release version="0.9.80" date="2026-08-20">
       <description>
         <p>Deleting a message no longer flickers - the row could briefly reappear before being removed for good if it happened to coincide with a background sync.</p>

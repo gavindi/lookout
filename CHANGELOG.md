@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.81 (2026-08-21)
+
+### Changed
+
+- **App**: the folder and message list panes' vertical spacing is now a setting (Config → Layout → "Vertical spacing"): tight (the app's original, tightest look), medium (the default), or loose. The rows' vertical padding used to be fixed per-widget margins (`margin-top`/`margin-bottom` 6px on folder rows, message rows, and conversation headers, 4px on date-section headers) baked into the list factories' `connect_setup` closures, so there was no way to adjust it and no way to make an adjustment live. Those margins moved out of the widget builders into scoped CSS rules (`install_paned_css`) keyed off a `spacing-*` class on the two panes themselves - `.folder-pane` and `.message-list` - with medium/loose adding 5% / 10% more padding (rounded to whole pixels: 7px/5px and 8px/6px). A new `layout-vertical-spacing` GSettings key (`settings.rs`'s `SPACINGS`/`spacing_index`/`spacing_at`/`spacing_class` helpers, mirrored in the schema with `'medium'` default) persists the choice through GSettings, and flipping the ComboRow swaps the panes' class so every row in both panes reflows live; startup seeds the row from the stored value (an unset GSettings value resolves to the `'medium'` default) after applying the same class at pane-build time, so the default never depends on a selection-notify firing.
+
 ## 0.9.80 (2026-08-20)
 
 ### Fixed

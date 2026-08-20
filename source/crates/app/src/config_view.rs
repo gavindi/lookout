@@ -3,8 +3,9 @@
 //! preference, the window-background image picker and its dimming slider), live Mail and Calendar
 //! preference groups (the remote-images/rich-text toggles and the event-alerts
 //! toggle), a live Keyboard-shortcuts section (per-action
-//! capture rows over the `shortcuts` GSettings key), disabled placeholder
-//! sections mirroring the rest of the Phase 5 settings taxonomy (Layout/Mail/Privacy/Apps) and a live
+//! capture rows over the `shortcuts` GSettings key), a live Layout section
+//! (the folder/message-list vertical-spacing choice), disabled placeholder
+//! sections mirroring the rest of the Phase 5 settings taxonomy (Privacy) and a live
 //! Advanced section with a cache-clear action. Data-in/widget-out like
 //! `calendar_view.rs` and `folder_tree.rs`: the caller (window.rs) owns the
 //! session state and feeds plain display structs into `refresh`.
@@ -139,6 +140,11 @@ pub struct ConfigView {
     /// newly-opened HTML messages start with the header's "Switch message
     /// theme" override applied.
     pub message_theme_dark_row: adw::SwitchRow,
+    /// "Vertical spacing" dropdown (Config → Layout), exposed so the caller
+    /// can seed it from the `layout-vertical-spacing` GSettings key and map
+    /// its selection to the `spacing-*` CSS class on the folder and message
+    /// list panes.
+    pub spacing_row: adw::ComboRow,
     /// "Custom accent color" switch (Config → Appearance), exposed so the
     /// caller can arm the accent picker row and map its state to the
     /// `accent-color` GSettings key (off = follow the system accent).
@@ -457,7 +463,14 @@ pub fn build() -> ConfigView {
         .build();
     general_group.add(&close_to_background_row);
 
-    let layout_group = placeholder_group("Layout");
+    let layout_group = adw::PreferencesGroup::builder().title("Layout").build();
+    let spacing_model = gtk::StringList::new(&["Tight", "Medium", "Loose"]);
+    let spacing_row = adw::ComboRow::builder()
+        .title("Vertical spacing")
+        .subtitle("Spacing between items in the folder and message list panes")
+        .model(&spacing_model)
+        .build();
+    layout_group.add(&spacing_row);
     let privacy_group = placeholder_group("Privacy");
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
@@ -556,6 +569,7 @@ pub fn build() -> ConfigView {
         animations_row,
         theme_row,
         message_theme_dark_row,
+        spacing_row,
         accent_switch_row,
         accent_color_row,
         accent_color_button,

@@ -61,6 +61,11 @@
       <default>true</default>
       <summary>Show the calendar overview</summary>
     </key>
+    <key name="layout-vertical-spacing" type="s">
+      <default>'medium'</default>
+      <summary>Vertical spacing in the folder and message list panes</summary>
+      <description>Vertical spacing between items in the folder and message list panes: tight (the least padding), medium (5% more padding) or loose (10% more padding). Medium is the default.</description>
+    </key>
     <key name="pane-folder-width-percent" type="d">
       <default>-1</default>
       <summary>Folder pane width as a percentage of the window width</summary>

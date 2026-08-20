@@ -41,6 +41,10 @@ pub const ACCENT_COLOR: &str = "accent-color";
 pub const LAYOUT_FOLDER_PANE: &str = "layout-folder-pane";
 pub const LAYOUT_READING_PANE: &str = "layout-reading-pane";
 pub const LAYOUT_CALENDAR_OVERVIEW: &str = "layout-calendar-overview";
+/// Vertical spacing between items in the folder and message list panes: one
+/// of [`SPACINGS`] ("medium" default, "tight", "loose"). Drives the
+/// `spacing-*` CSS class on both panes via [`spacing_class`].
+pub const LAYOUT_SPACING: &str = "layout-vertical-spacing";
 pub const PANE_FOLDER_WIDTH_PCT: &str = "pane-folder-width-percent";
 pub const PANE_MESSAGE_LIST_WIDTH_PCT: &str = "pane-message-list-width-percent";
 pub const PANE_CALENDAR_SIDEBAR_WIDTH_PCT: &str = "pane-calendar-sidebar-width-percent";
@@ -136,6 +140,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(LAYOUT_FOLDER_PANE, Value::Bool(true));
     map.insert(LAYOUT_READING_PANE, Value::Bool(true));
     map.insert(LAYOUT_CALENDAR_OVERVIEW, Value::Bool(true));
+    map.insert(LAYOUT_SPACING, Value::String("medium".into()));
     map.insert(PANE_FOLDER_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_MESSAGE_LIST_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_CALENDAR_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
@@ -251,6 +256,35 @@ impl SettingsStore {
     }
 }
 
+/// The `layout-vertical-spacing` setting's values, in UI (Config → Layout →
+/// "Vertical spacing" ComboRow) order. "medium" is the default (and what an
+/// unset GSettings value resolves to); "tight" is the app's original, tightest
+/// look, and "loose" is the roomiest.
+pub const SPACINGS: [&str; 3] = ["tight", "medium", "loose"];
+
+/// The CSS class each spacing value drives on the folder/message-list panes.
+/// Unknown values fall back to the default's class ("spacing-medium").
+pub fn spacing_class(name: &str) -> &'static str {
+    match name {
+        "tight" => "spacing-tight",
+        "loose" => "spacing-loose",
+        _ => "spacing-medium",
+    }
+}
+
+/// Index of a stored spacing value (for the config `ComboRow`); unknown
+/// values fall back to the default ("medium")'s index.
+pub fn spacing_index(name: &str) -> u32 {
+    let default = SPACINGS.iter().position(|s| *s == "medium").unwrap_or(1);
+    SPACINGS.iter().position(|s| *s == name).unwrap_or(default) as u32
+}
+
+/// The spacing value at a [`SPACINGS`] index (from the config `ComboRow`);
+/// out-of-range indexes fall back to the default.
+pub fn spacing_at(index: u32) -> &'static str {
+    SPACINGS.get(index as usize).copied().unwrap_or("medium")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +329,22 @@ mod tests {
     }
 
     #[test]
+    fn spacing_helpers_map_values_to_css_classes_and_indexes() {
+        assert_eq!(spacing_index("tight"), 0);
+        assert_eq!(spacing_index("medium"), 1);
+        assert_eq!(spacing_index("loose"), 2);
+        assert_eq!(spacing_index("no-such-spacing"), 1, "unknown values land on the default");
+        assert_eq!(spacing_at(0), "tight");
+        assert_eq!(spacing_at(1), "medium");
+        assert_eq!(spacing_at(2), "loose");
+        assert_eq!(spacing_at(99), "medium", "out-of-range indexes land on the default");
+        assert_eq!(spacing_class("tight"), "spacing-tight");
+        assert_eq!(spacing_class("medium"), "spacing-medium");
+        assert_eq!(spacing_class("loose"), "spacing-loose");
+        assert_eq!(spacing_class("no-such-spacing"), "spacing-medium");
+    }
+
+    #[test]
     fn untouched_keys_report_the_schema_defaults() {
         let store = resolve();
         assert!(!store.get_bool(MAIL_LOAD_REMOTE_IMAGES));
@@ -305,6 +355,7 @@ mod tests {
         assert_eq!(store.get_double(BACKGROUND_BRIGHTNESS), 0.75);
         assert_eq!(store.get_string(THEME_ID), "flat-dark");
         assert_eq!(store.get_string(ACCENT_COLOR), "");
+        assert_eq!(store.get_string(LAYOUT_SPACING), "medium");
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());
         assert!(store.get_strv(ACCOUNTS_DISABLED).is_empty());
         assert!(store.get_strv(SHORTCUTS).is_empty());

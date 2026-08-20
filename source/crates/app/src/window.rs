@@ -1160,6 +1160,45 @@ fn install_paned_css() {
         .message-list > row {
             padding: 0;
         }
+        /* The panes' vertical spacing around items (Config → Layout →
+           'Vertical spacing'): the whole point of the setting is that every
+           row kind in a pane moves together, so all the folder rows and all
+           the message-list row kinds share one value per level. The `tight`
+           rules are the app's original look; `spacing-medium` / `spacing-
+           loose` add 5% / 10% more padding (rounded to whole pixels). */
+        .message-list .message-text,
+        .message-list .message-thread-row,
+        .folder-pane .folder-row-label,
+        .folder-pane .folder-unread-count {
+            margin-top: 6px;
+            margin-bottom: 6px;
+        }
+        .message-list .message-section-header {
+            margin-top: 4px;
+            margin-bottom: 4px;
+        }
+        .message-list.spacing-medium .message-text,
+        .message-list.spacing-medium .message-thread-row,
+        .folder-pane.spacing-medium .folder-row-label,
+        .folder-pane.spacing-medium .folder-unread-count {
+            margin-top: 7px;
+            margin-bottom: 7px;
+        }
+        .message-list.spacing-medium .message-section-header {
+            margin-top: 5px;
+            margin-bottom: 5px;
+        }
+        .message-list.spacing-loose .message-text,
+        .message-list.spacing-loose .message-thread-row,
+        .folder-pane.spacing-loose .folder-row-label,
+        .folder-pane.spacing-loose .folder-unread-count {
+            margin-top: 8px;
+            margin-bottom: 8px;
+        }
+        .message-list.spacing-loose .message-section-header {
+            margin-top: 6px;
+            margin-bottom: 6px;
+        }
         .message-row {
             border-bottom: 1px solid @lookout-row-separator;
         }
@@ -1384,13 +1423,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .xalign(0.0)
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
-                .margin_top(6)
-                .margin_bottom(6)
+                .css_classes(["folder-row-label"])
                 .build();
             let count = gtk::Label::builder()
                 .xalign(1.0)
-                .margin_top(6)
-                .margin_bottom(6)
                 .css_classes(["folder-unread-count"])
                 .build();
             let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
@@ -1628,6 +1664,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let folder_card = card_section(&folder_scroller);
     folder_card.add_css_class("folder-pane");
     folder_card.add_css_class("card-flush-end");
+    folder_card.add_css_class(crate::settings::spacing_class(&settings.get_string(crate::settings::LAYOUT_SPACING)));
     folder_card.set_margin_end(0);
     // Floor on the folder pane's width, so the separator can't be dragged
     // left until the folder names are a sliver. Set on the card rather than
@@ -1792,8 +1829,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         expander.set_child(Some(&header_label));
         let header_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .margin_top(4)
-            .margin_bottom(4)
             .margin_start(10)
             .margin_end(10)
             .build();
@@ -1884,9 +1919,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
             .hexpand(true)
-            .margin_top(6)
-            .margin_bottom(6)
             .margin_end(10)
+            .css_classes(["message-text"])
             .build();
         text_column.append(&top_row);
         text_column.append(&preview_label);
@@ -1968,8 +2002,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         thread_expander.set_child(Some(&thread_top));
         let thread_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .margin_top(6)
-            .margin_bottom(6)
             .margin_start(14)
             .margin_end(10)
             .build();
@@ -2466,6 +2498,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     });
     let message_list_view = gtk::ListView::new(Some(message_list.selection.clone()), Some(message_factory));
     message_list_view.add_css_class("message-list");
+    message_list_view.add_css_class(crate::settings::spacing_class(&settings.get_string(crate::settings::LAYOUT_SPACING)));
     // Never scrolls sideways: every row's text ellipsizes to the pane's
     // width instead. Without pinning this, the preview line's natural width
     // request - it holds far more text than fits, by design, so the snippet
@@ -5144,6 +5177,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             theme_manager.apply(theme_id, Some(&accent));
         });
     }
+
+    // Config → Layout → "Vertical spacing": swaps the `spacing-*` CSS class
+    // on the folder and message list panes, so every row in both reflows
+    // live as the choice changes (see the `.spacing-*` rules in
+    // `install_paned_css`). Written through to GSettings like the other
+    // Config rows so the choice survives restarts.
+    {
+        let state = state.clone();
+        let folder_card = folder_card.clone().upcast::<gtk::Widget>();
+        let message_list_view = message_list_view.clone().upcast::<gtk::Widget>();
+        let panes = vec![folder_card, message_list_view];
+        config_view.spacing_row.connect_selected_notify(move |row| {
+            let spacing = crate::settings::spacing_at(row.selected());
+            state.borrow().settings.set_string(crate::settings::LAYOUT_SPACING, spacing);
+            for pane in &panes {
+                for class in ["spacing-tight", "spacing-medium", "spacing-loose"] {
+                    pane.remove_css_class(class);
+                }
+                pane.add_css_class(crate::settings::spacing_class(spacing));
+            }
+        });
+    }
     {
         let theme_manager = theme_manager.clone();
         let state = state.clone();
@@ -5329,6 +5384,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             config_view.accent_color_button.set_rgba(&rgba);
         }
         config_view.accent_switch_row.set_active(!accent.is_empty());
+        // Layout → "Vertical spacing": seeding fires the notify handler
+        // above, which re-swaps the panes' `spacing-*` class (a no-op for
+        // the value already applied at pane-build time). Seed separately so
+        // the ComboRow can never drift from the stored value.
+        config_view
+            .spacing_row
+            .set_selected(crate::settings::spacing_index(&persisted.get_string(crate::settings::LAYOUT_SPACING)));
     }
 
     {
