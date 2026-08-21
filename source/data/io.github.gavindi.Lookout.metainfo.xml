@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.86" date="2026-08-22">
+      <description>
+        <p>The "Trusted senders" dialog under Settings → Mail no longer opens empty - it now lists each connected account with its saved trusted senders and add rows, and adding or removing an entry updates the list in place.</p>
+      </description>
+    </release>
     <release version="0.9.85" date="2026-08-22">
       <description>
         <p>"Star/Unstar" is now "Pin/Unpin" throughout, matching Outlook - including a new pin icon in place of the star, while the separate mailbox/contact Favorites star is unchanged.</p>

@@ -79,17 +79,24 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
     // call it again after an add/remove, and reach it through the
     // `Rc<RefCell<Box<dyn Fn()>>>` (which forms a reference cycle that
     // lives until the dialog's widgets drop - a bounded, one-off cost for a
-    // modal dialog, as in the identities dialog).
+    // modal dialog, as in the identities dialog). The groups each rebuild
+    // adds are tracked in `groups` so the next rebuild can remove them
+    // through the page's own API - an `AdwPreferencesPage` isn't a plain
+    // container, and poking at its widget children would tear out the
+    // internal box that actually hosts the groups.
     let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
     let rebuild_handle = rebuild.clone();
+    let groups: Rc<RefCell<Vec<adw::PreferencesGroup>>> = Rc::new(RefCell::new(Vec::new()));
     {
         let state = state.clone();
         let page = page.clone();
         let rebuild_handle = rebuild_handle.clone();
+        let groups = groups.clone();
         *rebuild.borrow_mut() = Box::new(move || {
-            while let Some(child) = page.first_child() {
-                child.unparent();
+            for group in groups.borrow().iter() {
+                page.remove(group);
             }
+            groups.borrow_mut().clear();
             let (entries, accounts) = {
                 let st = state.borrow();
                 let entries: Vec<(AccountId, String, TrustLevel)> = st
@@ -117,10 +124,12 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                     .build();
                 group.add(&empty);
                 page.add(&group);
+                groups.borrow_mut().push(group);
                 return;
             }
             for (account, label) in accounts {
                 let group = adw::PreferencesGroup::builder().title(glib::markup_escape_text(&label)).build();
+                groups.borrow_mut().push(group.clone());
                 let mut account_entries: Vec<(String, TrustLevel)> = entries.iter().filter(|(a, _, _)| *a == account).map(|(_, entry, level)| (entry.clone(), *level)).collect();
                 account_entries.sort_by(|a, b| a.0.cmp(&b.0));
                 for (entry, level) in &account_entries {

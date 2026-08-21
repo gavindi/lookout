@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.86 (2026-08-22)
+
+### Fixed
+
+- **App**: the Config → Mail → "Trusted senders…" dialog always opened empty - no account sections, no saved entries, no add rows - even when trusted senders had been added. The dialog's rebuild cleared its `adw::PreferencesPage` by walking the widget tree (`first_child()` + `unparent()`), a pattern that's correct for plain containers but wrong for a `PreferencesPage`: its widget children are its internal template widgets (the box that actually hosts the groups), so the very first rebuild tore that internal box out of the page, and every subsequent `page.add()` appended into the now-orphaned box, which was never displayed. The rebuild now removes its previously-added groups through the page's own `remove()` API, tracking the groups it creates in a `Rc<RefCell<Vec<PreferencesGroup>>>` (the "no mail accounts connected yet" empty-state group included), so the dialog lists each connected account with its entries and per-account add row, and add/remove rebuilds in place.
+
 ## 0.9.85 (2026-08-22)
 
 ### Changed
