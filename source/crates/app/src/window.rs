@@ -158,6 +158,12 @@ struct MessageRowWidgets {
     date_label: gtk::Label,
     preview_label: gtk::Label,
     action_box: gtk::Box,
+    /// Hover-quickmenu toggle buttons - their icon/tooltip is set in `bind`
+    /// from this row's message state (unlike `delete_btn`/`reply_btn`, which
+    /// aren't state-dependent and so aren't stored here).
+    mark_read_btn: gtk::Button,
+    follow_up_btn: gtk::Button,
+    star_btn: gtk::Button,
     /// The right-click context menu's popover, parented to this row in setup
     /// and repopulated at press time.
     tag_popover: gtk::Popover,
@@ -707,6 +713,18 @@ pub(crate) struct UiState {
     /// change, so an identity added/edited while a composer is open shows up
     /// in its From list immediately. `None` while no composer is open.
     composer_identities_refresh: Option<Rc<dyn Fn()>>,
+    /// Whether a given message-id already has a follow-up task, per
+    /// `email_has_task`. Late-bound: the message row factory closures that
+    /// need this are built before `calendar_state` exists, so this hook is
+    /// filled in once it does (same ordering problem `task_button_refresh`
+    /// solves for the toolbar's own Follow-up button). `None` until then.
+    follow_up_status: Option<Rc<dyn Fn(&str) -> bool>>,
+    /// The message row hover-quickmenu's Follow-up toggle: creates or
+    /// removes the follow-up task for a message (with an optional preferred
+    /// account/email to default the task's calendar into, same as
+    /// `show_create_task_for_email`), returning the new has-task state.
+    /// Late-bound for the same reason as `follow_up_status`.
+    follow_up_toggle: Option<Rc<dyn Fn(&EmailSummary, Option<AccountId>, Option<String>) -> bool>>,
     /// Which compose session's relays (`draft_saved_tx` and
     /// `composer_identities_refresh`) are currently installed. Every composer
     /// bumps this when it opens and remembers its own value; a finishing
@@ -1761,6 +1779,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rendered_remote_scan: None,
         draft_saved_tx: None,
         composer_identities_refresh: None,
+        follow_up_status: None,
+        follow_up_toggle: None,
         composer_relay_generation: 0,
         compose_popout_window: None,
         folder_tree: None,
@@ -2024,16 +2044,27 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .margin_bottom(4)
             .build();
         action_box.add_css_class("hover-quick-actions");
-        let archive_btn = gtk::Button::from_icon_name("mail-archive-symbolic");
-        archive_btn.add_css_class("hover-quick-action");
-        archive_btn.set_tooltip_text(Some("Archive"));
+        // Icons/tooltips below are placeholders overwritten by `connect_bind`
+        // (`mark_read_btn`/`star_btn`/`follow_up_btn`) before the row is ever
+        // shown - each reflects this row's *current* message, not a fixed
+        // action, so there's nothing meaningful to set until bind time.
+        let mark_read_btn = gtk::Button::from_icon_name("mail-mark-read-symbolic");
+        mark_read_btn.add_css_class("hover-quick-action");
+        let follow_up_btn = gtk::Button::from_icon_name("flag-outline-thin-symbolic");
+        follow_up_btn.add_css_class("hover-quick-action");
+        follow_up_btn.set_tooltip_text(Some("Follow-up"));
+        let star_btn = gtk::Button::from_icon_name("non-starred-symbolic");
+        star_btn.add_css_class("hover-quick-action");
+        star_btn.set_tooltip_text(Some("Star/Unstar"));
         let delete_btn = gtk::Button::from_icon_name("user-trash-symbolic");
         delete_btn.add_css_class("hover-quick-action");
         delete_btn.set_tooltip_text(Some("Delete"));
         let reply_btn = gtk::Button::from_icon_name("mail-reply-sender-symbolic");
         reply_btn.add_css_class("hover-quick-action");
         reply_btn.set_tooltip_text(Some("Reply"));
-        action_box.append(&archive_btn);
+        action_box.append(&mark_read_btn);
+        action_box.append(&follow_up_btn);
+        action_box.append(&star_btn);
         action_box.append(&delete_btn);
         action_box.append(&reply_btn);
         // Initially hide actions
@@ -2196,20 +2227,76 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let state = state_clone.clone();
             let bound = bound.clone();
             let message_list = message_list_for_rows.clone();
-            archive_btn.connect_clicked(move |_| {
-                let Some((mailbox, uid)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid)) else {
+            mark_read_btn.connect_clicked(move |btn| {
+                let Some((mailbox, uid, mark_read)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid, s.is_unread())) else {
                     return;
                 };
                 let Some(account_id) = mailbox_account_id(&mailbox) else { return };
                 let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
-                if let Some(cmd_tx) = cmd_tx {
-                    optimistic_remove_messages(&state, &message_list, &mailbox, &[uid]);
-                    let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage {
-                        mailbox,
-                        uid,
-                        role: MailboxRole::Archive,
-                    });
-                }
+                let Some(cmd_tx) = cmd_tx else { return };
+                optimistic_toggle_read(&state, &message_list, &mailbox, &[uid], mark_read);
+                let (add, remove) = if mark_read {
+                    (vec![SystemFlagBit::Seen], Vec::new())
+                } else {
+                    (Vec::new(), vec![SystemFlagBit::Seen])
+                };
+                let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
+                    mailbox,
+                    uids: vec![uid],
+                    add,
+                    remove,
+                });
+                // `optimistic_toggle_read`'s repopulate will also rebind this
+                // row (refreshing the button via `connect_bind` like the
+                // sender/subject bold state already does), but flip the icon
+                // now too so there's no visible lag.
+                let (icon, tooltip) = mark_read_button_icon(!mark_read);
+                btn.set_icon_name(icon);
+                btn.set_tooltip_text(Some(tooltip));
+            });
+        }
+        {
+            let state = state_clone.clone();
+            let bound = bound.clone();
+            follow_up_btn.connect_clicked(move |btn| {
+                let Some(summary) = bound.borrow().clone() else { return };
+                let account_id = mailbox_account_id(&summary.mailbox);
+                let account_email = account_id.as_ref().and_then(|id| state.borrow().accounts.get(id).map(|handle| handle.email.clone()));
+                let toggle = state.borrow().follow_up_toggle.clone();
+                let Some(toggle) = toggle else { return };
+                let has_task = toggle(&summary, account_id, account_email);
+                btn.set_icon_name(follow_up_icon_name(has_task));
+            });
+        }
+        {
+            let state = state_clone.clone();
+            let bound = bound.clone();
+            let flag_icon = flag_icon.clone();
+            star_btn.connect_clicked(move |btn| {
+                let Some((mailbox, uid, starring)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid, !s.is_starred())) else {
+                    return;
+                };
+                let Some(account_id) = mailbox_account_id(&mailbox) else { return };
+                let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
+                let Some(cmd_tx) = cmd_tx else { return };
+                let (add, remove) = if starring {
+                    (vec![SystemFlagBit::Flagged], Vec::new())
+                } else {
+                    (Vec::new(), vec![SystemFlagBit::Flagged])
+                };
+                let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
+                    mailbox,
+                    uids: vec![uid],
+                    add,
+                    remove,
+                });
+                // Flag changes aren't optimistically patched into the message
+                // list model (see the toolbar star button's own handler), so
+                // both the button and the row's persistent star indicator
+                // flip themselves right away rather than waiting on a
+                // server-confirmed resync.
+                btn.set_icon_name(star_icon_name(starring));
+                flag_icon.set_visible(starring);
             });
         }
         {
@@ -2296,6 +2383,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     date_label,
                     preview_label,
                     action_box,
+                    mark_read_btn,
+                    follow_up_btn,
+                    star_btn,
                     tag_popover,
                     bound,
                 },
@@ -2415,6 +2505,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     widgets.accent.remove_css_class("unread");
                 }
                 widgets.flag_icon.set_visible(summary.is_starred());
+                widgets.star_btn.set_icon_name(star_icon_name(summary.is_starred()));
+                let (mr_icon, mr_tooltip) = mark_read_button_icon(unread);
+                widgets.mark_read_btn.set_icon_name(mr_icon);
+                widgets.mark_read_btn.set_tooltip_text(Some(mr_tooltip));
+                let has_task = summary
+                    .message_id
+                    .as_deref()
+                    .is_some_and(|mid| state_clone2.borrow().follow_up_status.as_ref().is_some_and(|f| f(mid)));
+                widgets.follow_up_btn.set_icon_name(follow_up_icon_name(has_task));
 
                 // Rebuild the color-tag dots for this message. Colored by the
                 // `.message-tag-dot.tag-<key>` rules `apply_tag_colors` keeps
@@ -4840,6 +4939,39 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     };
     calendar_state.borrow_mut().task_button_refresh = Some(task_button_refresh.clone());
     task_button_refresh();
+
+    // --- Message row hover-quickmenu's Follow-up toggle: `state.follow_up_status`
+    // and `state.follow_up_toggle` are the late-bound hooks the row factory
+    // closures (built earlier, before `calendar_state`/`tasks_view` existed)
+    // call through at bind/click time. `follow_up_toggle` also fires the
+    // toolbar's own `task_button_refresh` after mutating, so the two Follow-up
+    // controls (toolbar and per-row) never disagree.
+    {
+        let calendar_state = calendar_state.clone();
+        state.borrow_mut().follow_up_status = Some(Rc::new(move |message_id: &str| email_has_task(&calendar_state, message_id)));
+    }
+    {
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        state.borrow_mut().follow_up_toggle = Some(Rc::new(move |summary: &EmailSummary, preferred_account: Option<AccountId>, preferred_email: Option<String>| {
+            let Some(message_id) = summary.message_id.clone() else { return false };
+            let new_has_task = match task_for_email(&calendar_state, &message_id) {
+                Some(task) => {
+                    route_task_delete(&calendar_state, &tasks_view, task.calendar_id, task.uid, task.href, task.etag);
+                    false
+                }
+                None => {
+                    let (calendar_id, task) = build_task_seed_for_email(&calendar_state, summary, preferred_account, preferred_email);
+                    route_task_save(&calendar_state, &tasks_view, calendar_id, task);
+                    true
+                }
+            };
+            if let Some(refresh) = calendar_state.borrow().task_button_refresh.clone() {
+                refresh();
+            }
+            new_has_task
+        }));
+    }
 
     // --- Calendar event reminders. The engine accumulates every occurrence
     // the sessions report (via `connect_calendar_account`'s ingest) and the
@@ -10301,14 +10433,34 @@ fn task_email_marker(message_id: &str) -> String {
     format!("Lookout-Message-Id: {message_id}")
 }
 
-/// Whether any known task (local, CalDAV, or Google Tasks) was created from
-/// the email carrying `message_id` - drives the "Add as Task" flag button's
-/// filled/outline icon.
-fn email_has_task(calendar_state: &Rc<RefCell<CalendarUiState>>, message_id: &str) -> bool {
+/// The known task (local, CalDAV, or Google Tasks) created from the email
+/// carrying `message_id`, if any - matched via the hidden marker
+/// `show_create_task_for_email`/`build_task_seed_for_email` stamp into a
+/// task's description. Used both to answer "does this email have a
+/// follow-up task" (`email_has_task`) and, by the hover-quickmenu Follow-up
+/// toggle, to find the task to delete when removing one.
+fn task_for_email(calendar_state: &Rc<RefCell<CalendarUiState>>, message_id: &str) -> Option<CalendarTask> {
     let marker = task_email_marker(message_id);
-    merged_tasks(calendar_state)
-        .iter()
-        .any(|task| task.description.as_deref().is_some_and(|d| d.contains(&marker)))
+    merged_tasks(calendar_state).into_iter().find(|task| task.description.as_deref().is_some_and(|d| d.contains(&marker)))
+}
+
+/// Whether any known task (local, CalDAV, or Google Tasks) was created from
+/// the email carrying `message_id` - drives the "Add as Task"/Follow-up flag
+/// button's filled/outline icon.
+fn email_has_task(calendar_state: &Rc<RefCell<CalendarUiState>>, message_id: &str) -> bool {
+    task_for_email(calendar_state, message_id).is_some()
+}
+
+/// The "Add as Task"/Follow-up flag icon for a given has-task state - filled
+/// when `has_task`, outline otherwise. Shared by `refresh_task_button`
+/// (toolbar, selection-driven) and the message row's own hover-quickmenu
+/// button (single-message, bind- and click-driven).
+fn follow_up_icon_name(has_task: bool) -> &'static str {
+    if has_task {
+        themed_icon_name(&["mail-flag-symbolic", "flag-filled-symbolic", "mail-mark-important-symbolic"])
+    } else {
+        themed_icon_name(&["flag-outline-thin-symbolic", "flag-outline-symbolic", "mail-mark-important-symbolic"])
+    }
 }
 
 /// Sets the mail toolbar's "Add as Task" flag button's icon to reflect
@@ -10322,34 +10474,28 @@ fn refresh_task_button(button: &gtk::Button, message_list: &MessageListModel, ca
         .selected_summary()
         .and_then(|summary| summary.message_id)
         .is_some_and(|message_id| email_has_task(calendar_state, &message_id));
-    let icon = if has_task {
-        themed_icon_name(&["mail-flag-symbolic", "flag-filled-symbolic", "mail-mark-important-symbolic"])
-    } else {
-        themed_icon_name(&["flag-outline-thin-symbolic", "flag-outline-symbolic", "mail-mark-important-symbolic"])
-    };
-    button.set_icon_name(icon);
+    button.set_icon_name(follow_up_icon_name(has_task));
 }
 
-/// Opens the task editor's create form seeded from a mail message - the mail
-/// toolbar's "Add as Task" button. The title is the email's subject
-/// (falling back to "(no subject)"); since `CalendarTask` has no url/link
-/// field, the Notes field carries a "From: <sender> — <date>" line as the
-/// only way back to the source email. The calendar/list picker defaults to
+/// Builds a follow-up `CalendarTask` seed for a mail message plus the
+/// calendar it defaults into - the title is the email's subject (falling
+/// back to "(no subject)"); since `CalendarTask` has no url/link field, the
+/// Notes field carries a "From: <sender> — <date>" line and a hidden marker
+/// (`task_email_marker`) as the only way back to the source email, letting
+/// `email_has_task`/`task_for_email` later recognize this task as belonging
+/// to it - skipped when the message carries no Message-ID (rare, but then
+/// there's nothing stable to match against). The calendar defaults to
 /// `preferred_account`'s own task-capable calendar or Google Tasks list when
-/// it has one, else the same fallback order `show_new_task_editor` uses,
-/// else "Local (this device)".
-fn show_create_task_for_email(
-    window: &adw::ApplicationWindow,
+/// it has one, else the same fallback order `show_new_task_editor` uses.
+/// Shared by `show_create_task_for_email` (toolbar, opens an editor around
+/// this seed) and the message row's hover-quickmenu Follow-up toggle (saves
+/// this seed directly, no editor).
+fn build_task_seed_for_email(
     calendar_state: &Rc<RefCell<CalendarUiState>>,
-    tasks_view: &Rc<crate::tasks_view::TasksView>,
     summary: &EmailSummary,
     preferred_account: Option<AccountId>,
     preferred_email: Option<String>,
-) {
-    let mut calendars = pickable_task_calendars(calendar_state);
-    if calendars.is_empty() {
-        calendars.push(("Local (this device)".to_string(), local_tasks_calendar_id()));
-    }
+) -> (CalendarId, CalendarTask) {
     let default_calendar = default_task_calendar_preferring(calendar_state, preferred_account.as_ref(), preferred_email.as_deref());
 
     let title = summary.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("(no subject)").to_string();
@@ -10362,10 +10508,6 @@ fn show_create_task_for_email(
         "From: {sender_label} — {}",
         summary.date.with_timezone(&chrono::Local).format("%a, %b %-d, %Y at %-I:%M %p")
     );
-    // A hidden marker line so `email_has_task` can later recognize this task
-    // as belonging to this email, driving the flag button's filled icon -
-    // skipped when the message carries no Message-ID (rare, but then there's
-    // nothing stable to match against).
     if let Some(message_id) = &summary.message_id {
         description.push_str("\n\n");
         description.push_str(&task_email_marker(message_id));
@@ -10386,6 +10528,24 @@ fn show_create_task_for_email(
         href: None,
         etag: None,
     };
+    (default_calendar, seed)
+}
+
+/// Opens the task editor's create form seeded from a mail message - the mail
+/// toolbar's "Add as Task" button.
+fn show_create_task_for_email(
+    window: &adw::ApplicationWindow,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+    summary: &EmailSummary,
+    preferred_account: Option<AccountId>,
+    preferred_email: Option<String>,
+) {
+    let mut calendars = pickable_task_calendars(calendar_state);
+    if calendars.is_empty() {
+        calendars.push(("Local (this device)".to_string(), local_tasks_calendar_id()));
+    }
+    let (default_calendar, seed) = build_task_seed_for_email(calendar_state, summary, preferred_account, preferred_email);
 
     let calendar_state = calendar_state.clone();
     let tasks_view = tasks_view.clone();
@@ -11286,26 +11446,35 @@ fn refresh_star_button(button: &gtk::Button, message_list: &MessageListModel) {
     button.set_icon_name(star_icon_name(starred));
 }
 
-/// Sets `mark_read_button`'s icon/tooltip to reflect what clicking it would
-/// currently do, from the message list's live selection - full-opacity
-/// icons only (the stock `mail-read-symbolic` has `fill-opacity: 0.5` baked
-/// into its own SVG, which reads as disabled next to this toolbar's other
-/// solid icons): a checkmark when any selected message is unread (clicking
-/// marks everything read), an envelope when the selection is already all
-/// read (clicking marks everything unread) - matching the same aggregate
-/// direction the click handler itself computes. Mirrors
-/// `apply_favorite_visual`'s icon-swap convention.
-fn refresh_mark_read_button(button: &gtk::Button, message_list: &MessageListModel) {
-    let summaries = message_list.selected_summaries();
-    let mark_read = summaries.is_empty() || summaries.iter().any(|s| s.is_unread());
-    let (icon, tooltip) = if mark_read {
+/// The Mark Read/Unread icon+tooltip for what clicking would currently do -
+/// full-opacity icons only (the stock `mail-read-symbolic` has
+/// `fill-opacity: 0.5` baked into its own SVG, which reads as disabled next
+/// to this toolbar's other solid icons): a checkmark when `mark_read_action`
+/// (clicking marks read), an envelope otherwise (clicking marks unread).
+/// Shared by `refresh_mark_read_button` (toolbar, selection-driven) and the
+/// message row's own hover-quickmenu button (single-message, bind-driven).
+fn mark_read_button_icon(mark_read_action: bool) -> (&'static str, &'static str) {
+    if mark_read_action {
         (themed_icon_name(&["mail-mark-read-symbolic", "object-select-symbolic", "emblem-ok-symbolic"]), "Mark Read")
     } else {
         (
             themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]),
             "Mark Unread",
         )
-    };
+    }
+}
+
+/// Sets `mark_read_button`'s icon/tooltip to reflect what clicking it would
+/// currently do, from the message list's live selection: a checkmark when
+/// any selected message is unread (clicking marks everything read), an
+/// envelope when the selection is already all read (clicking marks
+/// everything unread) - matching the same aggregate direction the click
+/// handler itself computes. Mirrors `apply_favorite_visual`'s icon-swap
+/// convention.
+fn refresh_mark_read_button(button: &gtk::Button, message_list: &MessageListModel) {
+    let summaries = message_list.selected_summaries();
+    let mark_read = summaries.is_empty() || summaries.iter().any(|s| s.is_unread());
+    let (icon, tooltip) = mark_read_button_icon(mark_read);
     button.set_icon_name(icon);
     button.set_tooltip_text(Some(tooltip));
 }
@@ -15003,6 +15172,8 @@ mod tests {
             rendered_remote_scan: None,
             draft_saved_tx: None,
             composer_identities_refresh: None,
+            follow_up_status: None,
+            follow_up_toggle: None,
             composer_relay_generation: 0,
             compose_popout_window: None,
             folder_tree: None,

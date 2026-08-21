@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.83 (2026-08-22)
+
+### Changed
+
+- **App**: the message list's hover quickmenu trades its Archive button for three state-reflecting toggles - Mark Read/Unread, Follow-up, and Star/Unstar - keeping Delete and Reply as they were. Mark Read/Unread and Star/Unstar reuse the mail toolbar's own plumbing (`optimistic_toggle_read`/`AccountCommand::StoreFlagsMany` against just the hovered row's uid) and icon-swap conventions - now shared via extracted `mark_read_button_icon`/`star_icon_name` helpers - so each button always shows what clicking it would currently do, refreshed on every `connect_bind` and flipped immediately on click (starring isn't optimistically patched into the list model, so the row's own flag indicator flips itself too, same as the toolbar star button already does). Follow-up is new: unlike the toolbar's existing "Add as Task" flag button (tooltipped "Follow-up", but always opens a modal editor and only ever creates), the quickmenu's version is an instant, dialog-free toggle - clicking builds a task from the same prefill the toolbar button uses (extracted into `build_task_seed_for_email`) and saves it via `route_task_save` when the message has none, or finds and removes the existing one via `route_task_delete` (matched by the same hidden description marker, now exposed as `task_for_email`) when it does. Since the message row factory's `connect_setup` closures are built before `calendar_state`/`tasks_view` exist in `build_window`, the Follow-up toggle is wired through two new late-bound hooks on `UiState` (`follow_up_status`, `follow_up_toggle`) populated once those do - the same ordering fix the toolbar's own `task_button_refresh` hook already uses - and toggling also fires `task_button_refresh` itself, so the toolbar's Follow-up icon stays in sync with whatever the quickmenu just did.
+
 ## 0.9.82 (2026-08-21)
 
 ### Changed

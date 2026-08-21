@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.83" date="2026-08-22">
+      <description>
+        <p>The message list's hover menu trades its Archive button for three toggles - Mark Read/Unread, Follow-up, and Star/Unstar - so you can update a message's state without opening it.</p>
+      </description>
+    </release>
     <release version="0.9.82" date="2026-08-21">
       <description>
         <p>Settings is tidier - the "Layout" page is merged into "Appearance", so the vertical-spacing choice sits with the rest of the look-and-feel settings.</p>
