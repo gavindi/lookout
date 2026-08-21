@@ -56,7 +56,13 @@ pub const ACTION_DELETE: &str = "delete";
 pub const ACTION_ARCHIVE: &str = "archive";
 pub const ACTION_REPORT_JUNK: &str = "report-junk";
 pub const ACTION_SNOOZE: &str = "snooze";
-pub const ACTION_FLAG: &str = "flag";
+/// Pin/Unpin's action id. Named `ACTION_PIN` in code (the app calls this
+/// feature "Pin" throughout), but the string value is frozen at `"flag"` -
+/// `ShortcutState::persist`/`load` write/match this literal verbatim into
+/// GSettings when a user customizes the shortcut (`"flag=<accel>"` entries),
+/// so changing the value would silently drop any existing user's
+/// customization on upgrade. Only the human-visible `title` below changed.
+pub const ACTION_PIN: &str = "flag";
 pub const ACTION_MARK_READ: &str = "mark-read";
 pub const ACTION_PRINT: &str = "print";
 pub const ACTION_SEARCH: &str = "search";
@@ -131,8 +137,8 @@ pub const DEFAULT_SHORTCUTS: &[DefaultShortcut] = &[
         modifiers: mods(&[CONTROL, SHIFT]),
     },
     DefaultShortcut {
-        action: ACTION_FLAG,
-        title: "Star / unstar",
+        action: ACTION_PIN,
+        title: "Pin / unpin",
         keyval: gdk::Key::g,
         modifiers: mods(&[CONTROL, SHIFT]),
     },

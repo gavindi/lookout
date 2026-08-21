@@ -9,7 +9,6 @@
 @define-color lookout-header-search-bg @theme_base_color;
 @define-color lookout-section-header-bg alpha(@theme_bg_color, 0.9);
 @define-color lookout-column-header-bg alpha(@theme_bg_color, 0.85);
-@define-color lookout-flag #c99200;
 @define-color lookout-subject #b06a3f;
 @define-color lookout-muted alpha(@theme_fg_color, 0.55);
 @define-color lookout-column-header-fg alpha(@theme_fg_color, 0.55);

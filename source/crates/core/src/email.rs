@@ -160,7 +160,7 @@ impl EmailSummary {
         !self.flags.contains(&SystemFlagBit::Seen)
     }
 
-    pub fn is_starred(&self) -> bool {
+    pub fn is_pinned(&self) -> bool {
         self.flags.contains(&SystemFlagBit::Flagged)
     }
 }

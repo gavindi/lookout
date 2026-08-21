@@ -35,9 +35,6 @@
 /* Unread accent, folder unread counts and the dashboard count. Follows the
    accent so every blue accent in the app stays one axis. */
 @define-color lookout-unread @accent_color;
-/* The amber flag: deliberately not accent-derived so it reads as a separate
-   axis from unread. Fixed: amber works on both schemes. */
-@define-color lookout-flag #e5a50a;
 /* Warm subject colour for read messages. Fixed: works on both schemes. */
 @define-color lookout-subject #c1815c;
 /* Muted metadata (read dates, previews). Scheme-aware. */

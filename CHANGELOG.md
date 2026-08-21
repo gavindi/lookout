@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.85 (2026-08-22)
+
+### Changed
+
+- **App**: "Star/Unstar" is now "Pin/Unpin" throughout, matching Outlook's terminology - the toolbar and message-list hover-quickmenu buttons, the pinned-at-top section header (now labelled "Pinned"), the Config → Keyboard shortcut title ("Pin / unpin", still `Ctrl+Shift+G` by default), and the underlying code (`EmailSummary::is_starred()` → `is_pinned()`, `DateBucket::Starred` → `Pinned`, `optimistic_toggle_starred`/`refresh_star_button` and their whole optimistic-update trio → the `pinned` equivalents, and so on) all say "pin" now, not "star". The icon changed too: Adwaita has no outline/filled pin pair the way it does for a star, so the toggle buttons switch from swapping between two star glyphs to one constant `view-pin-symbolic` glyph (the same icon GNOME's own Evolution mail client uses for its pin feature) with a new dimmed/amber CSS state (`.pin-toggle`/`.pin-active`) standing in for the old outline/filled distinction. Two things were deliberately left alone: the IMAP protocol flag itself (`SystemFlagBit::Flagged`/`\Flagged` - that's the real wire name, not app wording) and the existing "Flagged" filter (View → Filter → Flagged), which already said "Flagged" rather than "Star" before this rename and stays that way. A user's previously-customized Pin/Unpin shortcut also survives the upgrade unchanged - the action's persisted GSettings key is still the literal string `"flag"` under the hood, only its Rust name (`ACTION_PIN`) and its visible title changed. Also, unrelated: the separate "Favorites" star (for mailboxes in the folder tree and contacts in the People screen) keeps its existing name and icon - that's a different feature and wasn't part of this rename.
+
 ## 0.9.84 (2026-08-22)
 
 ### Added

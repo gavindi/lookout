@@ -19,7 +19,7 @@ pub struct ThreadGroup {
     pub latest: usize,
     pub participants: Vec<String>,
     pub has_unread: bool,
-    pub has_starred: bool,
+    pub has_pinned: bool,
     pub has_attachment: bool,
     pub has_answered: bool,
 }
@@ -183,7 +183,7 @@ pub fn group_into_threads(mut messages: Vec<EmailSummary>) -> Vec<ThreadGroup> {
         .into_iter()
         .map(|(key, emails)| {
             let has_unread = emails.iter().any(|e| e.is_unread());
-            let has_starred = emails.iter().any(|e| e.is_starred());
+            let has_pinned = emails.iter().any(|e| e.is_pinned());
             let has_attachment = emails.iter().any(|e| e.has_attachment);
             let has_answered = emails.iter().any(|e| e.flags.contains(&crate::email::SystemFlagBit::Answered));
             let mut participants: Vec<String> = emails.iter().flat_map(|e| e.from.iter().map(|a| a.display_label().to_string())).collect();
@@ -195,7 +195,7 @@ pub fn group_into_threads(mut messages: Vec<EmailSummary>) -> Vec<ThreadGroup> {
                 latest,
                 participants,
                 has_unread,
-                has_starred,
+                has_pinned,
                 has_attachment,
                 has_answered,
             }

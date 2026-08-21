@@ -111,7 +111,7 @@ impl ListFilter {
         match self {
             ListFilter::All => true,
             ListFilter::Unread => message.is_unread(),
-            ListFilter::Flagged => message.is_starred(),
+            ListFilter::Flagged => message.is_pinned(),
         }
     }
 }
@@ -146,13 +146,13 @@ pub enum DateBucket {
     /// year ("2024"). `LastMonth` and `Older` shade into this as time passes,
     /// but a message already in one `Year` never moves to another.
     Year(i32),
-    /// The pinned "Starred" section, always the first root row when any
-    /// starred message is visible. Unlike every other variant, never
+    /// The pinned "Pinned" section header, always the first root row when
+    /// any pinned message is visible. Unlike every other variant, never
     /// produced by `bucket_for` - `compute_layout` assigns it directly,
-    /// pulling starred messages out of the date-bucketed/flat body entirely
-    /// (see `splice_starred_section`), so it coexists with every sort key
+    /// pulling pinned messages out of the date-bucketed/flat body entirely
+    /// (see `splice_pinned_section`), so it coexists with every sort key
     /// instead of only `SortKey::Date`.
-    Starred,
+    Pinned,
 }
 
 /// The Monday on or before `date`.
@@ -234,7 +234,7 @@ pub fn bucket_label(bucket: DateBucket, now: DateTime<Local>) -> String {
         }
         DateBucket::Older => "Older".to_string(),
         DateBucket::Year(year) => format!("{year}"),
-        DateBucket::Starred => "Starred".to_string(),
+        DateBucket::Pinned => "Pinned".to_string(),
     }
 }
 
@@ -305,8 +305,8 @@ pub struct ThreadRow {
     /// Any message in the thread is unread - the header bolds like an unread
     /// message row does.
     pub has_unread: bool,
-    /// Any message in the thread is flagged - the header shows the flag icon.
-    pub has_starred: bool,
+    /// Any message in the thread is pinned - the header shows the pin icon.
+    pub has_pinned: bool,
     /// Any message in the thread has an attachment - the header shows the
     /// attachment icon, mirroring how a lone message row renders its own.
     pub has_attachment: bool,
@@ -347,11 +347,11 @@ enum ListLayout {
 }
 
 /// `compute_layout`'s full result, bundled into one value rather than three
-/// separate `apply_layout` parameters: the pinned Starred section's
-/// messages, everything else's layout, and the fingerprint `apply_layout`'s
-/// no-op check compares against what's already displayed.
+/// separate `apply_layout` parameters: the Pinned section's messages,
+/// everything else's layout, and the fingerprint `apply_layout`'s no-op
+/// check compares against what's already displayed.
 struct ComputedLayout {
-    starred: Vec<EmailSummary>,
+    pinned: Vec<EmailSummary>,
     layout: ListLayout,
     keys: Vec<MessageRowKey>,
 }
@@ -508,7 +508,7 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
             count: emails.len(),
             latest: latest.date,
             has_unread: latest.is_unread() || emails.iter().any(|m| m.is_unread()),
-            has_starred: latest.is_starred() || emails.iter().any(|m| m.is_starred()),
+            has_pinned: latest.is_pinned() || emails.iter().any(|m| m.is_pinned()),
             has_attachment: latest.has_attachment || emails.iter().any(|m| m.has_attachment),
             has_calendar: latest.has_calendar || emails.iter().any(|m| m.has_calendar),
         };
@@ -537,7 +537,7 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
     // Read *and* flagged state are both part of the key: each drives how the
     // row is drawn, so a `STORE` that only changes a flag must still count as
     // a change - otherwise `repopulate`'s no-op check would swallow the
-    // rebuild and the row would keep its old accent bar / flag icon.
+    // rebuild and the row would keep its old accent bar / pin icon.
     // The `$Lookout-tag-*` keyword subset is here for the same reason: a tag
     // toggle changes only the message's keywords, and the row's tag dots are
     // drawn from them, so without it the rebuild that drops/adds a dot would
@@ -551,7 +551,7 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
         m.mailbox.clone(),
         m.uid,
         m.is_unread(),
-        m.is_starred(),
+        m.is_pinned(),
         m.date,
         m.subject.clone(),
         from,
@@ -583,28 +583,28 @@ fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
 /// dispatch buckets relative to the moment `repopulate` was called, not
 /// whenever the blocking pool happened to get around to it.
 ///
-/// Starred messages are pulled out of `messages` before `build_layout` ever
+/// Pinned messages are pulled out of `messages` before `build_layout` ever
 /// sees them (unless `filter` is already `Flagged`, in which case every
-/// visible message is starred and a pinned copy would just duplicate the
-/// list) - `apply_layout`'s `splice_starred_section` renders them as their
+/// visible message is pinned and a pinned copy would just duplicate the
+/// list) - `apply_layout`'s `splice_pinned_section` renders them as their
 /// own leading section, independent of `sort_key`/`threaded`, which is what
 /// lets the pinned section appear under every sort mode while
 /// `build_layout` itself stays exactly as date-grouping-only as before.
 fn compute_layout(truth: Vec<EmailSummary>, filter: ListFilter, sort_key: SortKey, sort_descending: bool, threaded: bool, now: DateTime<Local>) -> ComputedLayout {
     let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m)).collect();
     sort_messages(&mut messages, sort_key, sort_descending);
-    let starred = if filter == ListFilter::Flagged {
+    let pinned = if filter == ListFilter::Flagged {
         Vec::new()
     } else {
         // `partition` preserves each output's relative order, so both halves
         // stay sorted without a second `sort_messages` pass.
-        let (starred, rest): (Vec<EmailSummary>, Vec<EmailSummary>) = messages.into_iter().partition(|m| m.is_starred());
+        let (pinned, rest): (Vec<EmailSummary>, Vec<EmailSummary>) = messages.into_iter().partition(|m| m.is_pinned());
         messages = rest;
-        starred
+        pinned
     };
-    let keys = message_row_keys(&starred).into_iter().chain(message_row_keys(&messages)).collect();
+    let keys = message_row_keys(&pinned).into_iter().chain(message_row_keys(&messages)).collect();
     let layout = build_layout(messages, sort_key, now, threaded, sort_descending);
-    ComputedLayout { starred, layout, keys }
+    ComputedLayout { pinned, layout, keys }
 }
 
 /// A `SectionRow` fingerprint: bucket identity plus its label, so a relabel
@@ -632,7 +632,7 @@ fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
         row.count,
         row.latest,
         row.has_unread,
-        row.has_starred,
+        row.has_pinned,
         row.has_attachment,
         row.has_calendar,
     )
@@ -789,10 +789,10 @@ pub struct MessageListModel {
     /// only rewrites it when thread rows were actually on screen), so
     /// off-and-on doesn't forget the user's collapses.
     collapsed_threads: Rc<RefCell<HashSet<ThreadId>>>,
-    /// Whether the pinned Starred section is collapsed. Kept separate from
+    /// Whether the Pinned section is collapsed. Kept separate from
     /// `collapsed` rather than folded in as one more `DateBucket` member -
     /// see `capture_collapsed`/`apply_expansion`'s matching special cases.
-    collapsed_starred: Rc<Cell<bool>>,
+    collapsed_pinned: Rc<Cell<bool>>,
     /// Whether conversations render collapsed under their headers (on) or as
     /// bare messages (off). Owned by the model rather than `UiState`, like
     /// `filter`, so the rebuild-skipping check in `repopulate` can compare it
@@ -898,7 +898,7 @@ impl MessageListModel {
             threads,
             collapsed: Rc::new(RefCell::new(HashSet::new())),
             collapsed_threads: Rc::new(RefCell::new(HashSet::new())),
-            collapsed_starred: Rc::new(Cell::new(false)),
+            collapsed_pinned: Rc::new(Cell::new(false)),
             threaded: Rc::new(RefCell::new(true)),
             displayed: Rc::new(RefCell::new(None)),
             truth: Rc::new(RefCell::new(Vec::new())),
@@ -1088,7 +1088,7 @@ impl MessageListModel {
     /// and selection state, and splices the result into the tree. See
     /// `repopulate`'s doc comment for the two ways this gets called.
     fn apply_layout(&self, sort_key: SortKey, sort_descending: bool, filter: ListFilter, threaded: bool, now: DateTime<Local>, computed: ComputedLayout) {
-        let ComputedLayout { starred, layout, keys } = computed;
+        let ComputedLayout { pinned, layout, keys } = computed;
         // The sort is part of the comparison, not just the contents: a list
         // can be element-identical under ascending and descending order yet
         // still need re-grouping, because the sections come out mirrored. So
@@ -1128,36 +1128,36 @@ impl MessageListModel {
 
         *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, threaded, keys));
 
-        // The pinned Starred section, spliced first and unconditionally -
+        // The Pinned section, spliced first and unconditionally -
         // it exists independent of `layout`'s own grouping/threading mode,
         // so every arm below prepends its root row (if any) and folds its
         // bucket into whatever set it hands `clear_sections`.
-        let (starred_live, starred_root_keys, starred_root_rows) = self.splice_starred_section(&starred, now);
+        let (pinned_live, pinned_root_keys, pinned_root_rows) = self.splice_pinned_section(&pinned, now);
 
         match layout {
             ListLayout::Flat(messages) => {
                 // No date sections, no threads: every *other* child store
                 // drains, so a later threaded rebuild can't resurrect rows
                 // from a layout that has been gone since the last capture -
-                // the Starred store is deliberately spared via `starred_live`.
-                self.clear_sections(&starred_live);
+                // the Pinned store is deliberately spared via `pinned_live`.
+                self.clear_sections(&pinned_live);
                 self.clear_threads(&HashSet::new());
-                let mut new_keys: Vec<RowKey> = starred_root_keys;
+                let mut new_keys: Vec<RowKey> = pinned_root_keys;
                 new_keys.extend(messages.iter().map(|m| RowKey::Message(message_row_key(m))));
-                let mut rows: Vec<glib::Object> = starred_root_rows;
+                let mut rows: Vec<glib::Object> = pinned_root_rows;
                 rows.extend(messages.into_iter().map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m))).upcast()));
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
                 // A flat sort has no date sections of its own, but the
-                // pinned Starred row above might be one - apply its
-                // collapse state (a no-op walk when `starred` was empty).
+                // Pinned row above might be one - apply its collapse state
+                // (a no-op walk when `pinned` was empty).
                 self.apply_expansion();
             }
             ListLayout::Grouped(sections) => {
                 // Children before roots: a root row whose child store is
                 // already correct spends no time reporting a stale child
                 // count to the tree model.
-                let mut live: HashSet<DateBucket> = starred_live;
+                let mut live: HashSet<DateBucket> = pinned_live;
                 live.extend(sections.iter().map(|(b, _, _)| *b));
                 for (bucket, _, messages) in &sections {
                     let new_keys: Vec<RowKey> = messages.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
@@ -1184,9 +1184,9 @@ impl MessageListModel {
                 // that re-threads and finds the same id again.
                 self.clear_threads(&HashSet::new());
 
-                let mut new_keys: Vec<RowKey> = starred_root_keys;
+                let mut new_keys: Vec<RowKey> = pinned_root_keys;
                 new_keys.extend(sections.iter().map(|(bucket, label, _)| RowKey::Section(section_row_key(*bucket, label))));
-                let mut rows: Vec<glib::Object> = starred_root_rows;
+                let mut rows: Vec<glib::Object> = pinned_root_rows;
                 rows.extend(sections.into_iter().map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast()));
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
@@ -1196,7 +1196,7 @@ impl MessageListModel {
                 // Two child levels to splice before the roots: each section's
                 // store holds its conversation headers and lone messages, and
                 // each conversation's store holds its messages.
-                let mut live_buckets: HashSet<DateBucket> = starred_live;
+                let mut live_buckets: HashSet<DateBucket> = pinned_live;
                 live_buckets.extend(sections.iter().map(|(b, _, _)| *b));
                 let mut live_threads: HashSet<ThreadId> = HashSet::new();
                 for (bucket, _, entries) in &sections {
@@ -1248,9 +1248,9 @@ impl MessageListModel {
                 self.clear_sections(&live_buckets);
                 self.clear_threads(&live_threads);
 
-                let mut new_keys: Vec<RowKey> = starred_root_keys;
+                let mut new_keys: Vec<RowKey> = pinned_root_keys;
                 new_keys.extend(sections.iter().map(|(bucket, label, _)| RowKey::Section(section_row_key(*bucket, label))));
-                let mut rows: Vec<glib::Object> = starred_root_rows;
+                let mut rows: Vec<glib::Object> = pinned_root_rows;
                 rows.extend(sections.into_iter().map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast()));
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
@@ -1362,32 +1362,32 @@ impl MessageListModel {
         }
     }
 
-    /// Splices the pinned Starred section's message rows into its own
+    /// Splices the Pinned section's message rows into its own
     /// tracked store (reusing `self.sections`'s per-bucket-store machinery,
-    /// keyed by the new `DateBucket::Starred`) and returns what
+    /// keyed by the new `DateBucket::Pinned`) and returns what
     /// `apply_layout` needs to give it priority: the bucket to keep out of
     /// `clear_sections`, and the 0-or-1 `SectionRow` to place ahead of
     /// whatever the active sort/grouping renders below it. Called first,
     /// unconditionally, in every `apply_layout` arm - the pinned section
     /// exists independent of date grouping (`compute_layout` already pulled
-    /// starred messages out of `build_layout`'s input).
-    fn splice_starred_section(&self, starred: &[EmailSummary], now: DateTime<Local>) -> (HashSet<DateBucket>, Vec<RowKey>, Vec<glib::Object>) {
-        if starred.is_empty() {
+    /// pinned messages out of `build_layout`'s input).
+    fn splice_pinned_section(&self, pinned: &[EmailSummary], now: DateTime<Local>) -> (HashSet<DateBucket>, Vec<RowKey>, Vec<glib::Object>) {
+        if pinned.is_empty() {
             return (HashSet::new(), Vec::new(), Vec::new());
         }
-        let new_keys: Vec<RowKey> = starred.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
-        let rows: Vec<glib::Object> = starred.iter().map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast()).collect();
+        let new_keys: Vec<RowKey> = pinned.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
+        let rows: Vec<glib::Object> = pinned.iter().map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast()).collect();
         let (store, old_keys) = {
             let mut sections = self.sections.borrow_mut();
-            let tracked = sections.entry(DateBucket::Starred).or_insert_with(TrackedStore::new);
+            let tracked = sections.entry(DateBucket::Pinned).or_insert_with(TrackedStore::new);
             let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
             (tracked.store.clone(), old_keys)
         };
         splice_diff(&store, &old_keys, &new_keys, &rows);
-        let label = bucket_label(DateBucket::Starred, now);
-        let root_keys = vec![RowKey::Section(section_row_key(DateBucket::Starred, &label))];
-        let root_rows: Vec<glib::Object> = vec![glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket: DateBucket::Starred, label })).upcast()];
-        (HashSet::from([DateBucket::Starred]), root_keys, root_rows)
+        let label = bucket_label(DateBucket::Pinned, now);
+        let root_keys = vec![RowKey::Section(section_row_key(DateBucket::Pinned, &label))];
+        let root_rows: Vec<glib::Object> = vec![glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket: DateBucket::Pinned, label })).upcast()];
+        (HashSet::from([DateBucket::Pinned]), root_keys, root_rows)
     }
 
     /// Re-projects the user's collapsed-section set onto the freshly-created
@@ -1407,15 +1407,15 @@ impl MessageListModel {
             // splices children in. Iterating `tree.n_items()` would not be.
             let Some(row) = self.tree.child_row(i) else { continue };
             let Some(bucket) = section_bucket(&row) else { continue };
-            if bucket == DateBucket::Starred {
-                // Kept out of `collapsed`: the Starred section can appear
+            if bucket == DateBucket::Pinned {
+                // Kept out of `collapsed`: the Pinned section can appear
                 // under a flat (Sender/Subject) sort where no date section
                 // does, and folding its state into the same set `capture_
                 // collapsed` wholesale-overwrites would start forgetting
                 // remembered date-bucket collapses on every trip through a
                 // flat sort. It also never threads (see `compute_layout`),
                 // so there's no child walk to do here either.
-                row.set_expanded(!self.collapsed_starred.get());
+                row.set_expanded(!self.collapsed_pinned.get());
                 continue;
             }
             row.set_expanded(!collapsed.contains(&bucket));
@@ -1463,11 +1463,11 @@ impl MessageListModel {
         for i in 0..self.root.n_items() {
             let Some(row) = self.tree.child_row(i) else { continue };
             let Some(bucket) = section_bucket(&row) else { continue };
-            if bucket == DateBucket::Starred {
+            if bucket == DateBucket::Pinned {
                 // See `apply_expansion`'s matching special case: tracked
                 // separately so its presence under a flat sort can't wipe
                 // remembered date-bucket collapses.
-                self.collapsed_starred.set(!row.is_expanded());
+                self.collapsed_pinned.set(!row.is_expanded());
                 continue;
             }
             saw_section = true;
@@ -1776,10 +1776,10 @@ mod tests {
         };
         let full = vec![seen.clone(), unread.clone(), flagged_unread.clone(), flagged_read.clone()];
         filtered.repopulate(full.clone(), SortKey::Date, true);
-        // The two flagged messages pin into their own Starred section
+        // The two flagged messages pin into their own Pinned section
         // (1 section + 2 messages); `seen`/`unread` split across Today and
         // Older (2 sections + 2 messages).
-        assert_eq!(filtered.selection.n_items(), 7, "unfiltered: Starred section + two date sections + four messages");
+        assert_eq!(filtered.selection.n_items(), 7, "unfiltered: Pinned section + two date sections + four messages");
         assert_eq!(filtered.all_messages().len(), 4, "the unfiltered truth is kept");
 
         filtered.set_filter(ListFilter::Unread);
@@ -1801,40 +1801,40 @@ mod tests {
         filtered.set_filter(ListFilter::All);
         assert_eq!(filtered.selection.n_items(), 7, "switching back to All restored the hidden rows");
 
-        // --- The pinned Starred section stays root row 0 under a flat sort
-        // too, and collapsing it is tracked independently of any date
-        // bucket's own collapse - so a round trip through Sender sort
-        // (which has no date sections at all) can't forget a collapsed date
-        // bucket, and vice versa. ---
+        // --- The pinned section stays root row 0 under a flat sort too, and
+        // collapsing it is tracked independently of any date bucket's own
+        // collapse - so a round trip through Sender sort (which has no date
+        // sections at all) can't forget a collapsed date bucket, and vice
+        // versa. ---
         let pinned = MessageListModel::build();
-        let star = {
+        let pinned_msg = {
             let mut s = summary(5, today);
             s.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Flagged]);
             s
         };
-        pinned.repopulate(vec![star.clone(), summary(1, today), summary(2, older)], SortKey::Date, true);
-        // Starred + Today + Older headers, three messages.
+        pinned.repopulate(vec![pinned_msg.clone(), summary(1, today), summary(2, older)], SortKey::Date, true);
+        // Pinned + Today + Older headers, three messages.
         assert_eq!(pinned.selection.n_items(), 6);
         assert_eq!(pinned.message_at(0), None, "row 0 must be a header");
-        assert_eq!(pinned.selection.item(0).and_downcast::<gtk::TreeListRow>().and_then(|r| section_bucket(&r)), Some(DateBucket::Starred));
+        assert_eq!(pinned.selection.item(0).and_downcast::<gtk::TreeListRow>().and_then(|r| section_bucket(&r)), Some(DateBucket::Pinned));
 
-        // Collapse Starred and Older - `tree.child_row` indexes *root* rows
-        // (one per section header), so with Starred/Today/Older as the three
+        // Collapse Pinned and Older - `tree.child_row` indexes *root* rows
+        // (one per section header), so with Pinned/Today/Older as the three
         // root sections that's index 0 and index 2.
-        pinned.tree.child_row(0).expect("Starred row").set_expanded(false);
+        pinned.tree.child_row(0).expect("Pinned row").set_expanded(false);
         pinned.tree.child_row(2).expect("Older row").set_expanded(false);
         assert_eq!(pinned.selection.n_items(), 4, "both collapses hid their one message each");
 
         // A Sender-sort round trip has no date sections at all - it must not
-        // forget Older's remembered collapse - and Starred still appears
+        // forget Older's remembered collapse - and Pinned still appears
         // (still collapsed) even though nothing else groups under this sort.
-        pinned.repopulate(vec![star.clone(), summary(1, today), summary(2, older)], SortKey::Sender, true);
-        assert_eq!(pinned.selection.n_items(), 3, "Starred (collapsed) + two flat messages");
-        assert!(pinned.collapsed_starred.get(), "the Starred collapse must survive a flat-sort round trip");
+        pinned.repopulate(vec![pinned_msg.clone(), summary(1, today), summary(2, older)], SortKey::Sender, true);
+        assert_eq!(pinned.selection.n_items(), 3, "Pinned (collapsed) + two flat messages");
+        assert!(pinned.collapsed_pinned.get(), "the Pinned collapse must survive a flat-sort round trip");
 
-        pinned.repopulate(vec![star, summary(1, today), summary(2, older)], SortKey::Date, true);
+        pinned.repopulate(vec![pinned_msg, summary(1, today), summary(2, older)], SortKey::Date, true);
         assert!(!pinned.tree.child_row(2).expect("Older row").is_expanded(), "Older's collapse must not have been wiped by the flat-sort round trip");
-        assert!(!pinned.tree.child_row(0).expect("Starred row").is_expanded(), "Starred's own collapse must also survive the round trip");
+        assert!(!pinned.tree.child_row(0).expect("Pinned row").is_expanded(), "Pinned's own collapse must also survive the round trip");
 
         // --- Conversations: a thread of two collapses under one header, and
         // the collapse survives both rebuilds and a threading-mode round-trip
@@ -2116,35 +2116,35 @@ mod tests {
         ));
     }
 
-    fn starred(uid: u32, date: DateTime<Utc>) -> EmailSummary {
+    fn pinned(uid: u32, date: DateTime<Utc>) -> EmailSummary {
         let mut m = summary(uid, date);
         m.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Flagged]);
         m
     }
 
-    /// `compute_layout` pulls starred messages out ahead of `build_layout`
+    /// `compute_layout` pulls pinned messages out ahead of `build_layout`
     /// entirely, so the pinned section applies under every sort key - unlike
     /// date grouping, which `non_date_sorts_render_flat` above confirms stays
     /// off under Sender/Subject.
     #[test]
-    fn starred_messages_pin_ahead_of_a_flat_sort_and_are_excluded_from_it() {
+    fn pinned_messages_render_ahead_of_a_flat_sort_and_are_excluded_from_it() {
         let now = local(2026, 8, 4, 8);
-        let messages = vec![starred(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 2, 1)), starred(3, utc_on(now, 2026, 1, 1))];
+        let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 2, 1)), pinned(3, utc_on(now, 2026, 1, 1))];
         let computed = compute_layout(messages, ListFilter::All, SortKey::Sender, true, false, now);
-        assert_eq!(computed.starred.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1, 3], "both starred messages pinned, in sort order");
+        assert_eq!(computed.pinned.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1, 3], "both pinned messages appear, in sort order");
         let ListLayout::Flat(rest) = computed.layout else { panic!("Sender sort must still render its own body flat") };
-        assert_eq!(rest.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![2], "the starred messages must not also appear in the flat body");
+        assert_eq!(rest.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![2], "the pinned messages must not also appear in the flat body");
     }
 
     /// The pinned section would just duplicate the entire visible list under
-    /// `ListFilter::Flagged` (everything shown is already starred), so
+    /// `ListFilter::Flagged` (everything shown is already pinned), so
     /// `compute_layout` skips pulling anything out in that case.
     #[test]
-    fn starred_section_is_empty_under_the_flagged_filter() {
+    fn pinned_section_is_empty_under_the_flagged_filter() {
         let now = local(2026, 8, 4, 8);
-        let messages = vec![starred(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 8, 4))];
+        let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 8, 4))];
         let computed = compute_layout(messages, ListFilter::Flagged, SortKey::Date, true, false, now);
-        assert!(computed.starred.is_empty(), "Flagged already shows nothing but starred messages - no separate pin needed");
+        assert!(computed.pinned.is_empty(), "Flagged already shows nothing but pinned messages - no separate pin needed");
         let ListLayout::Grouped(sections) = computed.layout else { panic!("expected a grouped layout under Date sort") };
         assert_eq!(sections.len(), 1, "the lone flagged message still renders in its normal date section");
         assert_eq!(sections[0].2.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1]);
@@ -2208,7 +2208,7 @@ mod tests {
         let messages: Vec<EmailSummary> = (0..n as u32).map(|uid| summary(uid, dates[uid as usize % 3])).collect();
 
         let computed = compute_layout(messages, ListFilter::All, SortKey::Date, true, false, now);
-        assert!(computed.starred.is_empty(), "none of the fixture messages are starred");
+        assert!(computed.pinned.is_empty(), "none of the fixture messages are pinned");
         assert_eq!(computed.keys.len(), n, "every message produced one row-key fingerprint");
 
         let ListLayout::Grouped(sections) = computed.layout else {
@@ -2460,7 +2460,7 @@ mod tests {
             count: 2,
             latest: Utc.with_ymd_and_hms(2024, 1, 10, 10, 0, 0).unwrap(),
             has_unread: false,
-            has_starred: false,
+            has_pinned: false,
             has_attachment: false,
             has_calendar: false,
         }
@@ -2504,9 +2504,9 @@ mod tests {
         other_unread.has_unread = true;
         assert_ne!(thread_row_key(&other_unread), base_key);
 
-        let mut other_starred = base.clone();
-        other_starred.has_starred = true;
-        assert_ne!(thread_row_key(&other_starred), base_key);
+        let mut other_pinned = base.clone();
+        other_pinned.has_pinned = true;
+        assert_ne!(thread_row_key(&other_pinned), base_key);
 
         let mut other_attachment = base.clone();
         other_attachment.has_attachment = true;

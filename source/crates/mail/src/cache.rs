@@ -2119,12 +2119,12 @@ mod tests {
         assert!(cache.update_flags(&mailbox_id, Uid(1), &[SystemFlagBit::Seen, SystemFlagBit::Flagged], &[]).unwrap());
         let loaded = &cache.load_messages(&mailbox_id).unwrap()[0];
         assert!(!loaded.is_unread());
-        assert!(loaded.is_starred());
+        assert!(loaded.is_pinned());
 
         assert!(cache.update_flags(&mailbox_id, Uid(1), &[], &[SystemFlagBit::Flagged]).unwrap());
         let loaded = &cache.load_messages(&mailbox_id).unwrap()[0];
         assert!(!loaded.is_unread());
-        assert!(!loaded.is_starred());
+        assert!(!loaded.is_pinned());
 
         // A uid that isn't in the cached window is a no-op, not an error.
         assert!(!cache.update_flags(&mailbox_id, Uid(99), &[SystemFlagBit::Seen], &[]).unwrap());
@@ -2162,8 +2162,8 @@ mod tests {
         assert!(!loaded.iter().find(|m| m.uid == Uid(1)).unwrap().is_unread());
         assert!(!loaded.iter().find(|m| m.uid == Uid(2)).unwrap().is_unread());
         assert!(loaded.iter().find(|m| m.uid == Uid(3)).unwrap().is_unread());
-        assert!(loaded.iter().find(|m| m.uid == Uid(1)).unwrap().is_starred());
-        assert!(!loaded.iter().find(|m| m.uid == Uid(3)).unwrap().is_starred());
+        assert!(loaded.iter().find(|m| m.uid == Uid(1)).unwrap().is_pinned());
+        assert!(!loaded.iter().find(|m| m.uid == Uid(3)).unwrap().is_pinned());
 
         // One uid outside the cached window fails the whole batch.
         assert!(!cache.update_flags_many(&mailbox_id, &[Uid(2), Uid(99)], &[SystemFlagBit::Flagged], &[]).unwrap());

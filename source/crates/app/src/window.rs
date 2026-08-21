@@ -128,7 +128,7 @@ struct MessageRowWidgets {
     thread_calendar_icon: gtk::Image,
     thread_subject: gtk::Label,
     thread_count: gtk::Label,
-    thread_flag: gtk::Image,
+    thread_pin_icon: gtk::Image,
     thread_date: gtk::Label,
     /// Batch-select checkbox, kept in sync with the row's real selection
     /// state (see `checkbox_suppress`'s note) rather than driving it
@@ -146,12 +146,12 @@ struct MessageRowWidgets {
     sender_label: gtk::Label,
     /// Attachment/calendar indicator icons, right after the sender column.
     /// Hidden on rows that have neither, so they take no width at all there -
-    /// the same discipline as `flag_icon`, and the fixed sender column keeps
+    /// the same discipline as `pin_icon`, and the fixed sender column keeps
     /// their position aligned across rows.
     attachment_icon: gtk::Image,
     calendar_icon: gtk::Image,
     subject_label: gtk::Label,
-    flag_icon: gtk::Image,
+    pin_icon: gtk::Image,
     /// The color-tag dots: one small circle per configured tag the message
     /// carries, rebuilt on every bind.
     tag_dots: gtk::Box,
@@ -163,7 +163,7 @@ struct MessageRowWidgets {
     /// aren't state-dependent and so aren't stored here).
     mark_read_btn: gtk::Button,
     follow_up_btn: gtk::Button,
-    star_btn: gtk::Button,
+    pin_btn: gtk::Button,
     /// The right-click context menu's popover, parented to this row in setup
     /// and repopulated at press time.
     tag_popover: gtk::Popover,
@@ -491,12 +491,12 @@ pub(crate) struct UiState {
     /// `AccountEvent::MessagesUpdated` lands for it, same convention as
     /// `pending_optimistic_removals`.
     pending_optimistic_flag_changes: HashMap<MailboxId, Vec<EmailSummary>>,
-    /// The star/unstar sibling of `pending_optimistic_flag_changes` - kept
+    /// The pin/unpin sibling of `pending_optimistic_flag_changes` - kept
     /// as its own stash rather than sharing that one, since a message can
-    /// have a read-toggle and a star-toggle in flight at once and the two
+    /// have a read-toggle and a pin-toggle in flight at once and the two
     /// need independent "before" snapshots and reconciliation (see
-    /// `optimistic_toggle_starred`).
-    pending_optimistic_starred_changes: HashMap<MailboxId, Vec<EmailSummary>>,
+    /// `optimistic_toggle_pinned`).
+    pending_optimistic_pinned_changes: HashMap<MailboxId, Vec<EmailSummary>>,
     /// The most recently requested body fetch, used to ignore stale
     /// `BodyFetched` updates that arrive after the user has moved on to a
     /// different message.
@@ -1240,13 +1240,8 @@ fn install_paned_css() {
         .message-accent-bar.unread {
             background-color: @lookout-unread;
         }
-        /* Amber rather than the list's blue: the flag has to read as a
-           separate axis from unread, which owns every blue accent here. */
-        .message-flag-icon {
-            color: @lookout-flag;
-        }
         /* The attachment and meeting-invite indicators, dimmed so they stay
-           secondary to the sender/subject text and the amber flag. */
+           secondary to the sender/subject text and the pin marker. */
         .message-row-icon {
             color: alpha(currentColor, 0.5);
         }
@@ -1748,7 +1743,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         unified_snapshots: HashMap::new(),
         pending_optimistic_removals: HashMap::new(),
         pending_optimistic_flag_changes: HashMap::new(),
-        pending_optimistic_starred_changes: HashMap::new(),
+        pending_optimistic_pinned_changes: HashMap::new(),
         pending_body_request: None,
         pending_attachment: None,
         pending_raw_message: None,
@@ -1903,13 +1898,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .build();
         let subject_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let date_label = gtk::Label::builder().xalign(1.0).build();
-        // Sits between the expanding subject and the date, so a flagged row
+        // Sits between the expanding subject and the date, so a pinned row
         // shows its marker without shifting the date column - hidden (not
-        // just blank) on unflagged rows so it takes no width at all there.
-        let flag_icon = gtk::Image::builder()
-            .icon_name(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"]))
+        // just blank) on unpinned rows so it takes no width at all there.
+        let pin_icon = gtk::Image::builder()
+            .icon_name(pin_icon_name(true))
             .pixel_size(12)
-            .css_classes(["message-flag-icon"])
+            .css_classes(["message-pin-icon"])
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
@@ -1922,7 +1917,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         top_row.append(&attachment_icon);
         top_row.append(&calendar_icon);
         top_row.append(&subject_label);
-        top_row.append(&flag_icon);
+        top_row.append(&pin_icon);
         top_row.append(&tag_dots);
         top_row.append(&date_label);
 
@@ -2009,10 +2004,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .build();
         let thread_subject = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let thread_count = gtk::Label::builder().xalign(0.0).css_classes(["message-thread-count"]).build();
-        let thread_flag = gtk::Image::builder()
-            .icon_name(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"]))
+        let thread_pin_icon = gtk::Image::builder()
+            .icon_name(pin_icon_name(true))
             .pixel_size(12)
-            .css_classes(["message-flag-icon"])
+            .css_classes(["message-pin-icon"])
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
@@ -2023,7 +2018,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         thread_top.append(&thread_calendar_icon);
         thread_top.append(&thread_subject);
         thread_top.append(&thread_count);
-        thread_top.append(&thread_flag);
+        thread_top.append(&thread_pin_icon);
         thread_top.append(&thread_date);
         let thread_expander = gtk::TreeExpander::new();
         thread_expander.set_child(Some(&thread_top));
@@ -2052,7 +2047,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .build();
         action_box.add_css_class("hover-quick-actions");
         // Icons/tooltips below are placeholders overwritten by `connect_bind`
-        // (`mark_read_btn`/`star_btn`/`follow_up_btn`) before the row is ever
+        // (`mark_read_btn`/`pin_btn`/`follow_up_btn`) before the row is ever
         // shown - each reflects this row's *current* message, not a fixed
         // action, so there's nothing meaningful to set until bind time.
         let mark_read_btn = gtk::Button::from_icon_name("mail-mark-read-symbolic");
@@ -2060,9 +2055,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let follow_up_btn = gtk::Button::from_icon_name("flag-outline-thin-symbolic");
         follow_up_btn.add_css_class("hover-quick-action");
         follow_up_btn.set_tooltip_text(Some("Follow-up"));
-        let star_btn = gtk::Button::from_icon_name("non-starred-symbolic");
-        star_btn.add_css_class("hover-quick-action");
-        star_btn.set_tooltip_text(Some("Star/Unstar"));
+        let pin_btn = gtk::Button::from_icon_name(pin_icon_name(false));
+        pin_btn.add_css_class("hover-quick-action");
+        pin_btn.set_tooltip_text(Some("Pin/Unpin"));
         let delete_btn = gtk::Button::from_icon_name("user-trash-symbolic");
         delete_btn.add_css_class("hover-quick-action");
         delete_btn.set_tooltip_text(Some("Delete"));
@@ -2071,7 +2066,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         reply_btn.set_tooltip_text(Some("Reply"));
         action_box.append(&mark_read_btn);
         action_box.append(&follow_up_btn);
-        action_box.append(&star_btn);
+        action_box.append(&pin_btn);
         action_box.append(&delete_btn);
         action_box.append(&reply_btn);
         // Initially hide actions
@@ -2279,14 +2274,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let state = state_clone.clone();
             let bound = bound.clone();
             let message_list = message_list_for_rows.clone();
-            star_btn.connect_clicked(move |_btn| {
-                let Some((mailbox, uid, starring)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid, !s.is_starred())) else {
+            pin_btn.connect_clicked(move |_btn| {
+                let Some((mailbox, uid, pinning)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid, !s.is_pinned())) else {
                     return;
                 };
                 let Some(account_id) = mailbox_account_id(&mailbox) else { return };
                 let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
                 let Some(cmd_tx) = cmd_tx else { return };
-                // Patches the model (and, via the pinned Starred group, this
+                // Patches the model (and, via the Pinned group, this
                 // message's whole position in the list) immediately rather
                 // than waiting on a server-confirmed resync - unlike a plain
                 // icon flip, this can move the row to a different section
@@ -2294,8 +2289,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // shortcut left to take here: whatever row GTK recycles this
                 // very button onto during that repopulate gets its icon from
                 // `connect_bind`, not from this handler.
-                optimistic_toggle_starred(&state, &message_list, &mailbox, &[uid], starring);
-                let (add, remove) = if starring {
+                optimistic_toggle_pinned(&state, &message_list, &mailbox, &[uid], pinning);
+                let (add, remove) = if pinning {
                     (vec![SystemFlagBit::Flagged], Vec::new())
                 } else {
                     (Vec::new(), vec![SystemFlagBit::Flagged])
@@ -2377,7 +2372,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     thread_calendar_icon,
                     thread_subject,
                     thread_count,
-                    thread_flag,
+                    thread_pin_icon,
                     thread_date,
                     checkbox,
                     checkbox_suppress,
@@ -2387,14 +2382,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     attachment_icon,
                     calendar_icon,
                     subject_label,
-                    flag_icon,
+                    pin_icon,
                     tag_dots,
                     date_label,
                     preview_label,
                     action_box,
                     mark_read_btn,
                     follow_up_btn,
-                    star_btn,
+                    pin_btn,
                     tag_popover,
                     bound,
                 },
@@ -2513,8 +2508,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 } else {
                     widgets.accent.remove_css_class("unread");
                 }
-                widgets.flag_icon.set_visible(summary.is_starred());
-                widgets.star_btn.set_icon_name(star_icon_name(summary.is_starred()));
+                widgets.pin_icon.set_visible(summary.is_pinned());
+                set_pin_button_state(&widgets.pin_btn, summary.is_pinned());
                 let (mr_icon, mr_tooltip) = mark_read_button_icon(unread);
                 widgets.mark_read_btn.set_icon_name(mr_icon);
                 widgets.mark_read_btn.set_tooltip_text(Some(mr_tooltip));
@@ -2571,7 +2566,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     .thread_box
                     .set_tooltip_text(Some(&format!("{} messages: {}", thread.count, thread.participants.join(", "))));
                 widgets.thread_date.set_label(&format_row_date(thread.latest, chrono::Utc::now()));
-                widgets.thread_flag.set_visible(thread.has_starred);
+                widgets.thread_pin_icon.set_visible(thread.has_pinned);
                 // Unread bolds the whole header like it bolds a message row:
                 // an unread member makes the conversation's sender, subject,
                 // and date read as unread.
@@ -3746,7 +3741,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Command toolbar row. `compose_button`, `reply_button`,
     // `reply_all_button`, `forward_button`, `delete_button`,
-    // `archive_button`, `report_button`, `star_button`, `snooze_button`, and
+    // `archive_button`, `report_button`, `pin_button`, `snooze_button`, and
     // `more_button` (a menu of reading-pane extras like "Save as .eml…") are
     // backed by real functionality.
     let reply_button = gtk::Button::from_icon_name("mail-reply-sender-symbolic");
@@ -3761,12 +3756,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     archive_button.set_tooltip_text(Some("Archive"));
     let report_button = gtk::Button::from_icon_name("mail-mark-junk-symbolic");
     report_button.set_tooltip_text(Some("Report"));
-    let star_button = gtk::Button::from_icon_name("mail-mark-important-symbolic");
-    star_button.set_tooltip_text(Some("Star/Unstar"));
-    refresh_star_button(&star_button, &message_list);
+    let pin_button = gtk::Button::from_icon_name(pin_icon_name(false));
+    pin_button.set_tooltip_text(Some("Pin/Unpin"));
+    refresh_pin_button(&pin_button, &message_list);
     // Add as Task: opens the task editor prefilled from the selected
     // message (subject as title, sender/date in Notes - `CalendarTask` has
-    // no url field). Distinct from Star/Unstar above, which only toggles the
+    // no url field). Distinct from Pin/Unpin above, which only toggles the
     // IMAP `\Flagged` bit. Its icon starts outline and is kept in sync with
     // whether the selected message already has an associated task by
     // `refresh_task_button`, registered once `calendar_state` exists below.
@@ -3774,7 +3769,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     task_button.set_tooltip_text(Some("Follow-up"));
     // Mark read/unread: no explicit toolbar action for this existed before -
     // only the implicit mark-as-read that opening a message already does.
-    // Same aggregate-direction policy as Star/Unstar: any unread message in
+    // Same aggregate-direction policy as Pin/Unpin: any unread message in
     // the selection means the action marks everything read; only when every
     // selected message is already read does it become "mark all unread."
     let mark_read_button = gtk::Button::from_icon_name(themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]));
@@ -3829,7 +3824,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&delete_button);
     command_toolbar.append(&archive_button);
     command_toolbar.append(&report_button);
-    command_toolbar.append(&star_button);
+    command_toolbar.append(&pin_button);
     command_toolbar.append(&task_button);
     command_toolbar.append(&mark_read_button);
     command_toolbar.append(&categorize_button);
@@ -5696,7 +5691,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         (crate::shortcuts::ACTION_ARCHIVE, &archive_button),
         (crate::shortcuts::ACTION_REPORT_JUNK, &report_button),
         (crate::shortcuts::ACTION_SNOOZE, &snooze_button),
-        (crate::shortcuts::ACTION_FLAG, &star_button),
+        (crate::shortcuts::ACTION_PIN, &pin_button),
         (crate::shortcuts::ACTION_MARK_READ, &mark_read_button),
     ] {
         let button = button.clone();
@@ -5940,7 +5935,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let list_header = list_header.clone();
         let dashboard_refresh = dashboard_refresh.clone();
         let mark_read_button = mark_read_button.clone();
-        let star_button = star_button.clone();
+        let pin_button = pin_button.clone();
         // Everything the GOA enable/disable toggle needs beyond the mail
         // set above: the calendar/tasks/contacts wiring, and the page-state
         // cells the re-enable path flips back from their empty states.
@@ -6081,7 +6076,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let list_header = list_header.clone();
                 let dashboard_refresh = dashboard_refresh.clone();
                 let mark_read_button = mark_read_button.clone();
-                let star_button = star_button.clone();
+                let pin_button = pin_button.clone();
                 let refresh_hook = refresh_hook.clone();
                 Rc::new(move |anchor, account_id: &str| {
                     let Some(existing) = state.borrow().app_config.borrow().other_account(account_id) else {
@@ -6104,7 +6099,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         let list_header = list_header.clone();
                         let dashboard_refresh = dashboard_refresh.clone();
                         let mark_read_button = mark_read_button.clone();
-                        let star_button = star_button.clone();
+                        let pin_button = pin_button.clone();
                         let refresh_hook = refresh_hook.borrow().clone();
                         Rc::new(move |account_id: &str| {
                             // Editing always fully reconnects: the running
@@ -6136,7 +6131,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 keyring.clone(),
                                 dashboard_refresh.clone(),
                                 mark_read_button.clone(),
-                                star_button.clone(),
+                                pin_button.clone(),
                             );
                             refresh_hook();
                         })
@@ -6190,7 +6185,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let list_header = list_header.clone();
                 let dashboard_refresh = dashboard_refresh.clone();
                 let mark_read_button = mark_read_button.clone();
-                let star_button = star_button.clone();
+                let pin_button = pin_button.clone();
                 let root_stack = root_stack.clone();
                 let current_mail_page = current_mail_page.clone();
                 let mail_view_button = mail_view_button.clone();
@@ -6242,7 +6237,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 list_header.clone(),
                                 dashboard_refresh.clone(),
                                 mark_read_button.clone(),
-                                star_button.clone(),
+                                pin_button.clone(),
                                 calendar_main.clone(),
                                 calendar_list_box.clone(),
                                 mini_calendar.clone(),
@@ -6326,7 +6321,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let list_header = list_header.clone();
         let dashboard_refresh = dashboard_refresh.clone();
         let mark_read_button = mark_read_button.clone();
-        let star_button = star_button.clone();
+        let pin_button = pin_button.clone();
         let refresh_hook = refresh_hook.clone();
         add_imap_row.connect_activated(move |row| {
             let app_config = state.borrow().app_config.clone();
@@ -6346,7 +6341,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let list_header = list_header.clone();
                 let dashboard_refresh = dashboard_refresh.clone();
                 let mark_read_button = mark_read_button.clone();
-                let star_button = star_button.clone();
+                let pin_button = pin_button.clone();
                 let refresh_hook = refresh_hook.borrow().clone();
                 Rc::new(move |account_id: &str| {
                     let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else {
@@ -6369,7 +6364,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         keyring.clone(),
                         dashboard_refresh.clone(),
                         mark_read_button.clone(),
-                        star_button.clone(),
+                        pin_button.clone(),
                     );
                     refresh_hook();
                 })
@@ -6716,7 +6711,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_header = message_header.clone();
         let message_list_for_selection = message_list.clone();
         let mark_read_button = mark_read_button.clone();
-        let star_button = star_button.clone();
+        let pin_button = pin_button.clone();
         let task_button = task_button.clone();
         let calendar_state = calendar_state.clone();
         let web_view = web_view.clone();
@@ -6731,7 +6726,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             };
             tracing::debug!(pos, n_items, kind, "selection-changed fired");
             refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
-            refresh_star_button(&star_button, &message_list_for_selection);
+            refresh_pin_button(&pin_button, &message_list_for_selection);
             refresh_task_button(&task_button, &message_list_for_selection, &calendar_state);
             let summary = match message_list_for_selection.selection_kind() {
                 SelectionKind::Message(summary) => *summary,
@@ -6960,30 +6955,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
-    // --- Star/Unstar -> AccountCommand::StoreFlagsMany toggling `\Flagged`
+    // --- Pin/Unpin -> AccountCommand::StoreFlagsMany toggling `\Flagged`
     // on every selected message. The direction is computed once over the
-    // whole selection - Gmail/Outlook's convention: any unflagged message
-    // selected means the action flags everything; only when every selected
-    // message is already flagged does it become "unflag all" - rather than
+    // whole selection - Gmail/Outlook's convention: any unpinned message
+    // selected means the action pins everything; only when every selected
+    // message is already pinned does it become "unpin all" - rather than
     // per-message, so a single selected message (the common case) sees
-    // exactly today's is_starred()-based toggle.
+    // exactly today's is_pinned()-based toggle.
     {
         let message_list = message_list.clone();
         let state = state.clone();
-        let star_button_for_click = star_button.clone();
-        star_button.connect_clicked(move |_| {
+        let pin_button_for_click = pin_button.clone();
+        pin_button.connect_clicked(move |_| {
             let summaries = message_list.selected_summaries();
             if summaries.is_empty() {
                 return;
             }
-            let starring = summaries.iter().any(|s| !s.is_starred());
-            let (add, remove) = if starring {
+            let pinning = summaries.iter().any(|s| !s.is_pinned());
+            let (add, remove) = if pinning {
                 (vec![SystemFlagBit::Flagged], Vec::new())
             } else {
                 (Vec::new(), vec![SystemFlagBit::Flagged])
             };
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
-                optimistic_toggle_starred(&state, &message_list, &mailbox, &uids, starring);
+                optimistic_toggle_pinned(&state, &message_list, &mailbox, &uids, pinning);
                 let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
                     mailbox,
                     uids,
@@ -6992,11 +6987,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 });
             }
             // The optimistic patch above already moved every affected
-            // message into/out of the pinned Starred group and restored the
-            // selection, so the aggregate state `refresh_star_button` reads
+            // message into/out of the Pinned group and restored the
+            // selection, so the aggregate state `refresh_pin_button` reads
             // off `selected_summaries()` is genuinely current - no need for
             // a separate manual icon flip first.
-            refresh_star_button(&star_button_for_click, &message_list);
+            refresh_pin_button(&pin_button_for_click, &message_list);
         });
     }
     // --- Add as Task: opens the task editor prefilled from the selected
@@ -7459,7 +7454,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     keyring.clone(),
                     dashboard_refresh.clone(),
                     mark_read_button.clone(),
-                    star_button.clone(),
+                    pin_button.clone(),
                 );
             }
             refresh_config();
@@ -7487,7 +7482,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         lookout_view_button.clone(),
         dashboard_refresh.clone(),
         mark_read_button.clone(),
-        star_button.clone(),
+        pin_button.clone(),
     );
     spawn_contacts_discovery(
         worker.clone(),
@@ -7628,7 +7623,7 @@ fn spawn_account_discovery(
     lookout_view_button: gtk::ToggleButton,
     dashboard_refresh: Rc<dyn Fn()>,
     mark_read_button: gtk::Button,
-    star_button: gtk::Button,
+    pin_button: gtk::Button,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -7717,7 +7712,7 @@ fn spawn_account_discovery(
                             account,
                             dashboard_refresh.clone(),
                             mark_read_button.clone(),
-                            star_button.clone(),
+                            pin_button.clone(),
                         );
                     }
                     refresh_config();
@@ -7768,7 +7763,7 @@ fn connect_account(
     account: lookout_goa::GoaMailAccount,
     dashboard_refresh: Rc<dyn Fn()>,
     mark_read_button: gtk::Button,
-    star_button: gtk::Button,
+    pin_button: gtk::Button,
 ) {
     let account_id = AccountId(account.account_id.0.clone());
     let display_name = account.display_name.clone();
@@ -7874,7 +7869,7 @@ fn connect_account(
         list_header,
         dashboard_refresh,
         mark_read_button,
-        star_button,
+        pin_button,
     );
 }
 
@@ -7977,7 +7972,7 @@ fn spawn_account_event_loop(
     list_header: ListHeader,
     dashboard_refresh: Rc<dyn Fn()>,
     mark_read_button: gtk::Button,
-    star_button: gtk::Button,
+    pin_button: gtk::Button,
 ) {
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
@@ -8036,7 +8031,7 @@ fn spawn_account_event_loop(
                         // every sync as automatically authoritative.
                         reconcile_optimistic_removals(&state, &mailbox, &mut messages);
                         reconcile_optimistic_flag_changes(&state, &message_list, &mailbox, &mut messages);
-                        reconcile_optimistic_starred_changes(&state, &message_list, &mailbox, &mut messages);
+                        reconcile_optimistic_pinned_changes(&state, &message_list, &mailbox, &mut messages);
                         // The sync this mailbox was asked for (if any) has landed.
                         state.borrow_mut().syncing.remove(&mailbox);
                         refresh_message_loading_state(&state, &message_list, &message_list_stack);
@@ -8413,16 +8408,16 @@ fn spawn_account_event_loop(
                     AccountEvent::StoreFlagsFailed { mailbox, uids, message } => {
                         // The flag change actually failed server-side, so put
                         // back exactly the summaries `optimistic_toggle_read`/
-                        // `optimistic_toggle_starred` patched for this attempt -
+                        // `optimistic_toggle_pinned` patched for this attempt -
                         // each restore is a no-op if this failure wasn't from
                         // that particular toggle to begin with.
                         restore_optimistic_flag_changes(&state, &message_list, &mailbox, &uids);
-                        restore_optimistic_starred_changes(&state, &message_list, &mailbox, &uids);
+                        restore_optimistic_pinned_changes(&state, &message_list, &mailbox, &uids);
                         refresh_mark_read_button(&mark_read_button, &message_list);
                         // Reverts the click handler's optimistic icon flip back
                         // to whatever the (now-restored, so correct again)
                         // selected summaries actually say.
-                        refresh_star_button(&star_button, &message_list);
+                        refresh_pin_button(&pin_button, &message_list);
                         let title = glib::markup_escape_text(&format!("Couldn't update message flags: {message}"));
                         toast_overlay.add_toast(adw::Toast::new(&title));
                     }
@@ -8502,7 +8497,7 @@ fn connect_other_account(
     keyring: std::sync::Arc<dyn crate::other_accounts::KeyringStore>,
     dashboard_refresh: Rc<dyn Fn()>,
     mark_read_button: gtk::Button,
-    star_button: gtk::Button,
+    pin_button: gtk::Button,
 ) {
     let account_id = AccountId(account.id.clone());
     let display_name = account.display_name.clone();
@@ -8583,7 +8578,7 @@ fn connect_other_account(
         list_header,
         dashboard_refresh,
         mark_read_button,
-        star_button,
+        pin_button,
     );
 }
 
@@ -8623,7 +8618,7 @@ fn teardown_goa_account(
         st.syncing.retain(|mailbox| !belongs(mailbox));
         st.pending_optimistic_removals.retain(|mailbox, _| !belongs(mailbox));
         st.pending_optimistic_flag_changes.retain(|mailbox, _| !belongs(mailbox));
-        st.pending_optimistic_starred_changes.retain(|mailbox, _| !belongs(mailbox));
+        st.pending_optimistic_pinned_changes.retain(|mailbox, _| !belongs(mailbox));
         st.search_results.retain(|summary| !belongs(&summary.mailbox));
         st.search_pending.retain(|(_, mailbox)| !belongs(mailbox));
         st.current_mailbox.as_ref().is_some_and(belongs)
@@ -8704,7 +8699,7 @@ fn connect_goa_account(
     list_header: ListHeader,
     dashboard_refresh: Rc<dyn Fn()>,
     mark_read_button: gtk::Button,
-    star_button: gtk::Button,
+    pin_button: gtk::Button,
     calendar_main: Rc<CalendarMain>,
     calendar_list_box: gtk::Box,
     mini_calendar: calendar_view::MiniCalendar,
@@ -8737,7 +8732,7 @@ fn connect_goa_account(
             mail.clone(),
             dashboard_refresh.clone(),
             mark_read_button.clone(),
-            star_button.clone(),
+            pin_button.clone(),
         );
         current_mail_page.set("mail");
         if mail_view_button.is_active() {
@@ -11436,29 +11431,35 @@ fn apply_favorite_visual(button: &gtk::ToggleButton, starred: bool) {
     button.set_tooltip_text(Some(if starred { "Remove from Favorites" } else { "Add to Favorites" }));
 }
 
-/// The Star/Unstar button's icon for a given "is this starred" state -
-/// filled when `starred`, outline otherwise. Shared by `refresh_star_button`
-/// (recomputed from the message list's live data - selection change, and
-/// after a server-confirmed `MessagesUpdated`) and the click handler's own
-/// immediate flip (unlike Mark Read, starring isn't optimistically patched
-/// into the message list model, so the button updates itself right away
-/// rather than waiting on that confirmation).
-fn star_icon_name(starred: bool) -> &'static str {
-    if starred {
-        themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])
+/// The Pin/Unpin glyph for a given "is this pinned" state - the bundled
+/// `pinned-1`/`unpinned-1` icons (filled/outline pin shapes, `data/resources/
+/// icons/`), falling back to the generic themed pin icon (and then a
+/// universally-available one) if the resource bundle isn't compiled in (see
+/// `resources.rs`'s "best-effort" bundle doc comment).
+fn pin_icon_name(pinned: bool) -> &'static str {
+    if pinned {
+        themed_icon_name(&["pinned-1", "view-pin-symbolic", "mail-mark-important-symbolic"])
     } else {
-        themed_icon_name(&["non-starred-symbolic", "starred-symbolic", "mail-mark-important-symbolic"])
+        themed_icon_name(&["unpinned-1", "view-pin-symbolic", "mail-mark-important-symbolic"])
     }
 }
 
-/// Sets `star_button`'s icon to reflect whether the selected message(s) are
-/// starred (`\Flagged`) - filled only when every selected message is
-/// starred, outline otherwise (including nothing selected). Mirrors
-/// `apply_favorite_visual`'s icon-swap convention.
-fn refresh_star_button(button: &gtk::Button, message_list: &MessageListModel) {
+/// Sets `button`'s icon to reflect `pinned`, swapping between the filled and
+/// outline pin glyphs - the Pin/Unpin counterpart of `apply_favorite_visual`'s
+/// icon-swap, used at every Pin/Unpin toggle site (bind-time, both click
+/// handlers, and `refresh_pin_button` below).
+fn set_pin_button_state(button: &gtk::Button, pinned: bool) {
+    button.set_icon_name(pin_icon_name(pinned));
+}
+
+/// Sets `pin_button`'s active state to reflect whether the selected
+/// message(s) are pinned (`\Flagged`) - active only when every selected
+/// message is pinned (including nothing selected, which reads as inactive).
+/// Mirrors `apply_favorite_visual`'s icon-swap convention.
+fn refresh_pin_button(button: &gtk::Button, message_list: &MessageListModel) {
     let summaries = message_list.selected_summaries();
-    let starred = !summaries.is_empty() && summaries.iter().all(|s| s.is_starred());
-    button.set_icon_name(star_icon_name(starred));
+    let pinned = !summaries.is_empty() && summaries.iter().all(|s| s.is_pinned());
+    set_pin_button_state(button, pinned);
 }
 
 /// The Mark Read/Unread icon+tooltip for what clicking would currently do -
@@ -11496,7 +11497,7 @@ fn refresh_mark_read_button(button: &gtk::Button, message_list: &MessageListMode
 
 /// The first of `candidates` the current icon theme actually has. Icon names
 /// in this app resolve against the machine's theme rather than a bundled set
-/// (see `folder_icon_name`), and the header's sort/filter/star icons are names
+/// (see `folder_icon_name`), and the header's sort/filter/pin icons are names
 /// this codebase hasn't used before - so fall back to one that's already
 /// proven in-tree instead of rendering a "missing image" box. The last
 /// candidate is used unconditionally if none match.
@@ -12660,14 +12661,14 @@ fn reconcile_optimistic_flag_changes(state: &Rc<RefCell<UiState>>, message_list:
 }
 
 /// Optimistically flips `SystemFlagBit::Flagged` for `uids` in `mailbox` -
-/// added when starring, removed when unstarring - and repaints immediately,
-/// including moving the message into or out of the pinned Starred group
-/// (`message_list.rs`'s `compute_layout`/`splice_starred_section`) rather
-/// than waiting for the next `MessagesUpdated` to confirm it. The star/unstar
+/// added when pinning, removed when unpinning - and repaints immediately,
+/// including moving the message into or out of the Pinned group
+/// (`message_list.rs`'s `compute_layout`/`splice_pinned_section`) rather
+/// than waiting for the next `MessagesUpdated` to confirm it. The pin/unpin
 /// sibling of `optimistic_toggle_read`, with its own stash
-/// (`pending_optimistic_starred_changes`) rather than sharing
+/// (`pending_optimistic_pinned_changes`) rather than sharing
 /// `pending_optimistic_flag_changes` - see that field's doc comment.
-fn optimistic_toggle_starred(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid], starred: bool) {
+fn optimistic_toggle_pinned(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid], pinned: bool) {
     let mut before = Vec::new();
     let all: Vec<EmailSummary> = message_list
         .all_messages()
@@ -12675,7 +12676,7 @@ fn optimistic_toggle_starred(state: &Rc<RefCell<UiState>>, message_list: &Messag
         .map(|mut m| {
             if m.mailbox == *mailbox && uids.contains(&m.uid) {
                 before.push(m.clone());
-                if starred {
+                if pinned {
                     m.flags.insert(SystemFlagBit::Flagged);
                 } else {
                     m.flags.remove(&SystemFlagBit::Flagged);
@@ -12692,23 +12693,23 @@ fn optimistic_toggle_starred(state: &Rc<RefCell<UiState>>, message_list: &Messag
     let mut st = state.borrow_mut();
     if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
         for m in snapshot.iter_mut().filter(|m| uids.contains(&m.uid)) {
-            if starred {
+            if pinned {
                 m.flags.insert(SystemFlagBit::Flagged);
             } else {
                 m.flags.remove(&SystemFlagBit::Flagged);
             }
         }
     }
-    st.pending_optimistic_starred_changes.entry(mailbox.clone()).or_default().extend(before);
+    st.pending_optimistic_pinned_changes.entry(mailbox.clone()).or_default().extend(before);
 }
 
-/// Undoes `optimistic_toggle_starred` for `mailbox`/`uids` after a
+/// Undoes `optimistic_toggle_pinned` for `mailbox`/`uids` after a
 /// `StoreFlagsFailed` - puts the stashed pre-toggle summaries back in place
 /// (by uid) in both the visible list and the unified-view snapshot.
-fn restore_optimistic_starred_changes(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid]) {
+fn restore_optimistic_pinned_changes(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid]) {
     let restored: HashMap<Uid, EmailSummary> = {
         let mut st = state.borrow_mut();
-        let Some(pending) = st.pending_optimistic_starred_changes.get_mut(mailbox) else { return };
+        let Some(pending) = st.pending_optimistic_pinned_changes.get_mut(mailbox) else { return };
         let mut restored = HashMap::new();
         pending.retain(|m| {
             if uids.contains(&m.uid) {
@@ -12719,7 +12720,7 @@ fn restore_optimistic_starred_changes(state: &Rc<RefCell<UiState>>, message_list
             }
         });
         if pending.is_empty() {
-            st.pending_optimistic_starred_changes.remove(mailbox);
+            st.pending_optimistic_pinned_changes.remove(mailbox);
         }
         restored
     };
@@ -12740,22 +12741,22 @@ fn restore_optimistic_starred_changes(state: &Rc<RefCell<UiState>>, message_list
     message_list.repopulate(all, key, descending);
 }
 
-/// The star/unstar sibling of `reconcile_optimistic_flag_changes`: an
+/// The pin/unpin sibling of `reconcile_optimistic_flag_changes`: an
 /// incoming `MessagesUpdated` snapshot can race ahead of the `STORE` a
-/// pending `optimistic_toggle_starred` is still waiting on, and land with
+/// pending `optimistic_toggle_pinned` is still waiting on, and land with
 /// the pre-toggle `Flagged` state. For each uid still in
-/// `pending_optimistic_starred_changes`, compares the snapshot's flag
+/// `pending_optimistic_pinned_changes`, compares the snapshot's flag
 /// against what `message_list` is currently showing (the optimistic value):
 /// a match means the server confirmed it - drop the uid from the stash - a
 /// mismatch means the snapshot is stale, so `messages` is patched to keep
 /// showing the optimistic value instead of flickering back, and the uid
 /// stays stashed.
-fn reconcile_optimistic_starred_changes(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, messages: &mut [EmailSummary]) {
-    let pending_uids: HashSet<Uid> = match state.borrow().pending_optimistic_starred_changes.get(mailbox) {
+fn reconcile_optimistic_pinned_changes(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, messages: &mut [EmailSummary]) {
+    let pending_uids: HashSet<Uid> = match state.borrow().pending_optimistic_pinned_changes.get(mailbox) {
         Some(pending) if !pending.is_empty() => pending.iter().map(|m| m.uid).collect(),
         _ => return,
     };
-    let optimistic_starred: HashMap<Uid, bool> = message_list
+    let optimistic_pinned: HashMap<Uid, bool> = message_list
         .all_messages()
         .into_iter()
         .filter(|m| m.mailbox == *mailbox && pending_uids.contains(&m.uid))
@@ -12764,10 +12765,10 @@ fn reconcile_optimistic_starred_changes(state: &Rc<RefCell<UiState>>, message_li
 
     let mut confirmed = HashSet::new();
     for m in messages.iter_mut() {
-        let Some(&want_starred) = optimistic_starred.get(&m.uid) else { continue };
-        if m.flags.contains(&SystemFlagBit::Flagged) == want_starred {
+        let Some(&want_pinned) = optimistic_pinned.get(&m.uid) else { continue };
+        if m.flags.contains(&SystemFlagBit::Flagged) == want_pinned {
             confirmed.insert(m.uid);
-        } else if want_starred {
+        } else if want_pinned {
             m.flags.insert(SystemFlagBit::Flagged);
         } else {
             m.flags.remove(&SystemFlagBit::Flagged);
@@ -12775,10 +12776,10 @@ fn reconcile_optimistic_starred_changes(state: &Rc<RefCell<UiState>>, message_li
     }
 
     let mut st = state.borrow_mut();
-    let Some(pending) = st.pending_optimistic_starred_changes.get_mut(mailbox) else { return };
+    let Some(pending) = st.pending_optimistic_pinned_changes.get_mut(mailbox) else { return };
     pending.retain(|m| !confirmed.contains(&m.uid));
     if pending.is_empty() {
-        st.pending_optimistic_starred_changes.remove(mailbox);
+        st.pending_optimistic_pinned_changes.remove(mailbox);
     }
 }
 
@@ -15273,7 +15274,7 @@ mod tests {
             unified_snapshots: HashMap::new(),
             pending_optimistic_removals: HashMap::new(),
             pending_optimistic_flag_changes: HashMap::new(),
-            pending_optimistic_starred_changes: HashMap::new(),
+            pending_optimistic_pinned_changes: HashMap::new(),
             pending_body_request: None,
             pending_attachment: None,
             pending_raw_message: None,
@@ -15454,15 +15455,15 @@ mod tests {
         );
     }
 
-    /// The star/unstar sibling of the read-toggle test above:
-    /// `optimistic_toggle_starred` flips `SystemFlagBit::Flagged` (and the
+    /// The pin/unpin sibling of the read-toggle test above:
+    /// `optimistic_toggle_pinned` flips `SystemFlagBit::Flagged` (and the
     /// unified-view snapshot's copy) the instant it's called, stashing the
-    /// pre-toggle summary in its own `pending_optimistic_starred_changes`
+    /// pre-toggle summary in its own `pending_optimistic_pinned_changes`
     /// stash rather than the read-toggle's, and a matching
-    /// `restore_optimistic_starred_changes` puts the original flag straight
+    /// `restore_optimistic_pinned_changes` puts the original flag straight
     /// back and clears that stash without touching the other one.
     #[test]
-    fn optimistic_toggle_starred_and_restore_round_trips_flags_and_unified_snapshot() {
+    fn optimistic_toggle_pinned_and_restore_round_trips_flags_and_unified_snapshot() {
         if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
             return;
         }
@@ -15473,7 +15474,7 @@ mod tests {
         let account_id = AccountId("acc".into());
         let mailbox = MailboxId("acc:INBOX".into());
         let state = test_state(vec![(account_id, Vec::new())]);
-        // `summary()` defaults to no flags set, i.e. unstarred.
+        // `summary()` defaults to no flags set, i.e. unpinned.
         let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
         let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
 
@@ -15481,34 +15482,34 @@ mod tests {
         message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
         state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one.clone(), two.clone()]);
 
-        optimistic_toggle_starred(&state, &message_list, &mailbox, &[Uid(2)], true);
+        optimistic_toggle_pinned(&state, &message_list, &mailbox, &[Uid(2)], true);
         let patched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
-        assert!(patched.is_starred(), "the row must flip to starred immediately, before any server round trip");
+        assert!(patched.is_pinned(), "the row must flip to pinned immediately, before any server round trip");
         let untouched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(1)).unwrap();
-        assert!(!untouched.is_starred(), "an uid not in the toggle set must be untouched");
+        assert!(!untouched.is_pinned(), "an uid not in the toggle set must be untouched");
         assert!(
-            state.borrow().unified_snapshots[&mailbox].iter().find(|m| m.uid == Uid(2)).unwrap().is_starred(),
+            state.borrow().unified_snapshots[&mailbox].iter().find(|m| m.uid == Uid(2)).unwrap().is_pinned(),
             "the unified-view snapshot must reflect the toggle too"
         );
         assert_eq!(
-            state.borrow().pending_optimistic_starred_changes[&mailbox].iter().map(|m| m.uid).collect::<Vec<_>>(),
+            state.borrow().pending_optimistic_pinned_changes[&mailbox].iter().map(|m| m.uid).collect::<Vec<_>>(),
             vec![Uid(2)],
             "the pre-toggle summary must be stashed for a possible rollback, in its own stash"
         );
         assert!(
             !state.borrow().pending_optimistic_flag_changes.contains_key(&mailbox),
-            "a star toggle must never touch the read-toggle's stash"
+            "a pin toggle must never touch the read-toggle's stash"
         );
 
-        restore_optimistic_starred_changes(&state, &message_list, &mailbox, &[Uid(2)]);
+        restore_optimistic_pinned_changes(&state, &message_list, &mailbox, &[Uid(2)]);
         let restored = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
-        assert!(!restored.is_starred(), "a failed flag update must restore the original unstarred state");
+        assert!(!restored.is_pinned(), "a failed flag update must restore the original unpinned state");
         assert!(
-            !state.borrow().unified_snapshots[&mailbox].iter().find(|m| m.uid == Uid(2)).unwrap().is_starred(),
+            !state.borrow().unified_snapshots[&mailbox].iter().find(|m| m.uid == Uid(2)).unwrap().is_pinned(),
             "the unified-view snapshot must be restored too"
         );
         assert!(
-            !state.borrow().pending_optimistic_starred_changes.contains_key(&mailbox),
+            !state.borrow().pending_optimistic_pinned_changes.contains_key(&mailbox),
             "the stash must be empty once its only entry is restored"
         );
     }
@@ -15618,15 +15619,15 @@ mod tests {
         );
     }
 
-    /// The star/unstar sibling of the test above: a racing sync can land
+    /// The pin/unpin sibling of the test above: a racing sync can land
     /// with the pre-toggle `Flagged` state before the actual `STORE` reaches
-    /// the server. `reconcile_optimistic_starred_changes` must patch the
+    /// the server. `reconcile_optimistic_pinned_changes` must patch the
     /// stale snapshot back to the optimistic value (not let the message drop
-    /// out of the pinned Starred group) and only clear its own stash once a
+    /// out of the Pinned group) and only clear its own stash once a
     /// snapshot's flag actually matches - independent of the read-toggle
     /// stash `reconcile_optimistic_flag_changes` owns.
     #[test]
-    fn reconcile_optimistic_starred_changes_survives_a_stale_racing_sync() {
+    fn reconcile_optimistic_pinned_changes_survives_a_stale_racing_sync() {
         if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
             return;
         }
@@ -15642,30 +15643,30 @@ mod tests {
 
         let message_list = MessageListModel::build();
         message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
-        optimistic_toggle_starred(&state, &message_list, &mailbox, &[Uid(2)], true);
+        optimistic_toggle_pinned(&state, &message_list, &mailbox, &[Uid(2)], true);
 
         // A sync that raced ahead of the actual STORE still shows the
-        // pre-toggle unstarred flag - reconciliation must patch it back to
-        // the optimistic (starred) value and keep the uid stashed.
+        // pre-toggle unpinned flag - reconciliation must patch it back to
+        // the optimistic (pinned) value and keep the uid stashed.
         let mut racing_snapshot = vec![one.clone(), two.clone()];
-        reconcile_optimistic_starred_changes(&state, &message_list, &mailbox, &mut racing_snapshot);
+        reconcile_optimistic_pinned_changes(&state, &message_list, &mailbox, &mut racing_snapshot);
         assert!(
-            racing_snapshot.iter().find(|m| m.uid == Uid(2)).unwrap().is_starred(),
-            "a stale racing sync must not be allowed to drop the row's optimistic star"
+            racing_snapshot.iter().find(|m| m.uid == Uid(2)).unwrap().is_pinned(),
+            "a stale racing sync must not be allowed to drop the row's optimistic pin"
         );
         assert_eq!(
-            state.borrow().pending_optimistic_starred_changes[&mailbox].iter().map(|m| m.uid).collect::<Vec<_>>(),
+            state.borrow().pending_optimistic_pinned_changes[&mailbox].iter().map(|m| m.uid).collect::<Vec<_>>(),
             vec![Uid(2)],
             "the stash must survive a sync that hasn't confirmed the flag change yet"
         );
 
-        // The genuine post-STORE sync agrees the row is starred - that's
+        // The genuine post-STORE sync agrees the row is pinned - that's
         // confirmation, so the stash clears.
-        let two_starred = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
-        let mut confirmed_snapshot = vec![one, two_starred];
-        reconcile_optimistic_starred_changes(&state, &message_list, &mailbox, &mut confirmed_snapshot);
+        let two_pinned = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        let mut confirmed_snapshot = vec![one, two_pinned];
+        reconcile_optimistic_pinned_changes(&state, &message_list, &mailbox, &mut confirmed_snapshot);
         assert!(
-            !state.borrow().pending_optimistic_starred_changes.contains_key(&mailbox),
+            !state.borrow().pending_optimistic_pinned_changes.contains_key(&mailbox),
             "a sync confirming the flag change must clear the stash"
         );
     }
