@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.89" date="2026-08-22">
+      <description>
+        <p>The "Vertical spacing" setting now spaces every entry in the folder list, not just the account headers - tight, medium, and loose all apply evenly to every row, and loose gives folders 20% more room than the message list.</p>
+      </description>
+    </release>
     <release version="0.9.88" date="2026-08-22">
       <description>
         <p>The sender avatar in the message list now shows just the first letter for single-word names, and the initials of the first and last words for multi-word names.</p>

@@ -1189,7 +1189,12 @@ fn install_paned_css() {
            row kind in a pane moves together, so all the folder rows and all
            the message-list row kinds share one value per level. The `tight`
            rules are the app's original look; `spacing-medium` / `spacing-
-           loose` add 5% / 10% more padding (rounded to whole pixels). */
+           loose` add 5% / 20% more padding (rounded to whole pixels); in
+           `spacing-loose` the folder rows get 20% more again than the
+           message rows. The folder row's margin rides on the name label
+           (`folder-row-label`) and unread count, so `bind` must keep those
+           classes on every row (headings included) - replacing them is what
+           used to leave the folder items unspaced. */
         .message-list .message-text,
         .message-list .message-thread-row,
         .folder-pane .folder-row-label,
@@ -1213,15 +1218,18 @@ fn install_paned_css() {
             margin-bottom: 5px;
         }
         .message-list.spacing-loose .message-text,
-        .message-list.spacing-loose .message-thread-row,
-        .folder-pane.spacing-loose .folder-row-label,
-        .folder-pane.spacing-loose .folder-unread-count {
-            margin-top: 8px;
-            margin-bottom: 8px;
+        .message-list.spacing-loose .message-thread-row {
+            margin-top: 10px;
+            margin-bottom: 10px;
         }
         .message-list.spacing-loose .message-section-header {
-            margin-top: 6px;
-            margin-bottom: 6px;
+            margin-top: 7px;
+            margin-bottom: 7px;
+        }
+        .folder-pane.spacing-loose .folder-row-label,
+        .folder-pane.spacing-loose .folder-unread-count {
+            margin-top: 12px;
+            margin-bottom: 12px;
         }
         .message-row {
             border-bottom: 1px solid @lookout-row-separator;
@@ -1612,21 +1620,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 icon.set_visible(true);
                 icon.set_icon_name(Some("mail-inbox-symbolic"));
                 label.set_label("All Inboxes");
-                label.set_css_classes(&["heading"]);
+                label.set_css_classes(&["heading", "folder-row-label"]);
                 set_count(*unread);
             }
             TreeItem::Favorites => {
                 icon.set_visible(true);
                 icon.set_icon_name(Some(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])));
                 label.set_label("Favorites");
-                label.set_css_classes(&["heading"]);
+                label.set_css_classes(&["heading", "folder-row-label"]);
                 // A pure grouping row: every folder under it shows its own.
                 set_count(0);
             }
             TreeItem::Account(account) => {
                 icon.set_visible(false);
                 label.set_label(&account.label);
-                label.set_css_classes(&["heading"]);
+                label.set_css_classes(&["heading", "folder-row-label"]);
                 set_count(account.unread);
             }
             // A favorite renders exactly like the folder it duplicates.
@@ -1634,7 +1642,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 icon.set_visible(true);
                 icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
                 label.set_label(&display_name(&node.mailbox.name));
-                label.set_css_classes(&[]);
+                label.set_css_classes(&["folder-row-label"]);
                 set_count(node.mailbox.unread);
             }
         }

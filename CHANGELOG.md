@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.89 (2026-08-22)
+
+### Fixed
+
+- **App**: Config → Appearance's "Vertical spacing" now actually spaces every folder-list entry - before, only the account headers (and any row with a visible unread count) moved, so folder items sat at the same tight height under all three settings and the choice looked like it only adjusted gaps around the headers. The folder rows' spacing rides on margins on the row's name label and unread-count label, keyed off the `folder-row-label` / `folder-unread-count` CSS classes the row factory's `connect_setup` adds; but `connect_bind` then *replaced* the label's class list on every repaint (`set_css_classes(&["heading"])` for account headers, `set_css_classes(&[])` for folder rows - correct for clearing a recycled row's stale `heading` class, fatal for the permanently-applied `folder-row-label`, which `set_css_classes` wipes rather than appends to), so the only margins that ever applied were the unread count's - invisible on every row whose count is hidden, which is most of them. `bind` now re-asserts `folder-row-label` on every row kind (headings keep their `heading` class alongside it, folder/favorite rows get it alone), so tight/medium/loose space every row in the folder pane uniformly and live, exactly like the message list already did. Along the way the loose level (already 20% larger than medium's message rows) gives folder rows 20% more again than the message rows - 12px top/bottom vs the message rows' 10px - since the folder pane was the point of the whole setting.
+
 ## 0.9.88 (2026-08-22)
 
 ### Changed
