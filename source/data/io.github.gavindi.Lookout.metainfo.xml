@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.88" date="2026-08-22">
+      <description>
+        <p>The sender avatar in the message list now shows just the first letter for single-word names, and the initials of the first and last words for multi-word names.</p>
+      </description>
+    </release>
     <release version="0.9.87" date="2026-08-22">
       <description>
         <p>The reading pane no longer displays remote images from senders you haven't trusted, or when "Load images from the web" is off - the block is now enforced with a Content-Security-Policy in the message itself, which WebKit honors on every load.</p>

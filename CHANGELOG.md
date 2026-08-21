@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.88 (2026-08-22)
+
+### Changed
+
+- **App**: the sender avatar's initials in the message list follow the sender's name shape more closely now. A single-word name (or an address fallback) shows only its first letter - "Ada" is now "A", not "AD" - and a multi-word name takes its second initial from the *last* word rather than the second word, so "John Jacob Astor" is "JA" instead of "JJ" and "Microsoft Security" is unchanged at "MS". `initials` in `message_header.rs` now collects all of the name's words and reads `first`/`last` off the collected set, instead of the old `split_whitespace` two-word peek that stopped at the second word and grabbed two characters of a lone word.
+
+### Testing
+
+- `lookout-app`: `initials_uses_first_and_last_word_of_a_multi_word_name` gains a middle-name case ("John Jacob Astor" → "JA"), and the single-word fallback test now pins the one-letter result ("Ada" → "A", address fallback → "A") instead of the old two-character "AD".
+
 ## 0.9.87 (2026-08-22)
 
 ### Fixed

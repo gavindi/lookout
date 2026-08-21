@@ -227,18 +227,19 @@ impl MessageHeader {
     }
 }
 
-/// First+last initials for a multi-word name ("Microsoft Security" -> "MS"),
-/// else the first two characters of whatever single word/address is given.
+/// First+last initials for a multi-word name ("Microsoft Security" -> "MS",
+/// "John Jacob Astor" -> "JA"), else the first character of whatever single
+/// word/address is given.
 pub fn initials(name: Option<&str>, address: &str) -> String {
     let source = name.filter(|n| !n.trim().is_empty()).unwrap_or(address);
-    let mut words = source.split_whitespace();
-    match (words.next(), words.next()) {
-        (Some(first), Some(last)) => {
+    let words: Vec<&str> = source.split_whitespace().collect();
+    match (words.first(), words.last()) {
+        (Some(first), Some(last)) if words.len() > 1 => {
             let a = first.chars().next().unwrap_or('?');
             let b = last.chars().next().unwrap_or('?');
             format!("{a}{b}").to_uppercase()
         }
-        (Some(only), None) => only.chars().take(2).collect::<String>().to_uppercase(),
+        (Some(only), _) => only.chars().take(1).collect::<String>().to_uppercase(),
         _ => "?".to_string(),
     }
 }
@@ -260,13 +261,14 @@ mod tests {
     fn initials_uses_first_and_last_word_of_a_multi_word_name() {
         assert_eq!(initials(Some("Microsoft Security"), "msft@example.com"), "MS");
         assert_eq!(initials(Some("Ada Lovelace"), "ada@example.com"), "AL");
+        assert_eq!(initials(Some("John Jacob Astor"), "jja@example.com"), "JA");
     }
 
     #[test]
-    fn initials_falls_back_to_first_two_chars_without_a_multi_word_name() {
-        assert_eq!(initials(None, "ada@example.com"), "AD");
-        assert_eq!(initials(Some(""), "ada@example.com"), "AD");
-        assert_eq!(initials(Some("Ada"), "ada@example.com"), "AD");
+    fn initials_uses_first_word_last_letter_of_a_single_word_name() {
+        assert_eq!(initials(None, "ada@example.com"), "A");
+        assert_eq!(initials(Some(""), "ada@example.com"), "A");
+        assert_eq!(initials(Some("Ada"), "ada@example.com"), "A");
     }
 
     #[test]
