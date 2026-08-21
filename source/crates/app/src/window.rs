@@ -491,6 +491,12 @@ pub(crate) struct UiState {
     /// `AccountEvent::MessagesUpdated` lands for it, same convention as
     /// `pending_optimistic_removals`.
     pending_optimistic_flag_changes: HashMap<MailboxId, Vec<EmailSummary>>,
+    /// The star/unstar sibling of `pending_optimistic_flag_changes` - kept
+    /// as its own stash rather than sharing that one, since a message can
+    /// have a read-toggle and a star-toggle in flight at once and the two
+    /// need independent "before" snapshots and reconciliation (see
+    /// `optimistic_toggle_starred`).
+    pending_optimistic_starred_changes: HashMap<MailboxId, Vec<EmailSummary>>,
     /// The most recently requested body fetch, used to ignore stale
     /// `BodyFetched` updates that arrive after the user has moved on to a
     /// different message.
@@ -1742,6 +1748,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         unified_snapshots: HashMap::new(),
         pending_optimistic_removals: HashMap::new(),
         pending_optimistic_flag_changes: HashMap::new(),
+        pending_optimistic_starred_changes: HashMap::new(),
         pending_body_request: None,
         pending_attachment: None,
         pending_raw_message: None,
@@ -2271,14 +2278,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         {
             let state = state_clone.clone();
             let bound = bound.clone();
-            let flag_icon = flag_icon.clone();
-            star_btn.connect_clicked(move |btn| {
+            let message_list = message_list_for_rows.clone();
+            star_btn.connect_clicked(move |_btn| {
                 let Some((mailbox, uid, starring)) = bound.borrow().as_ref().map(|s| (s.mailbox.clone(), s.uid, !s.is_starred())) else {
                     return;
                 };
                 let Some(account_id) = mailbox_account_id(&mailbox) else { return };
                 let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
                 let Some(cmd_tx) = cmd_tx else { return };
+                // Patches the model (and, via the pinned Starred group, this
+                // message's whole position in the list) immediately rather
+                // than waiting on a server-confirmed resync - unlike a plain
+                // icon flip, this can move the row to a different section
+                // entirely, so there's no safe "flip this widget's icon too"
+                // shortcut left to take here: whatever row GTK recycles this
+                // very button onto during that repopulate gets its icon from
+                // `connect_bind`, not from this handler.
+                optimistic_toggle_starred(&state, &message_list, &mailbox, &[uid], starring);
                 let (add, remove) = if starring {
                     (vec![SystemFlagBit::Flagged], Vec::new())
                 } else {
@@ -2290,13 +2306,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     add,
                     remove,
                 });
-                // Flag changes aren't optimistically patched into the message
-                // list model (see the toolbar star button's own handler), so
-                // both the button and the row's persistent star indicator
-                // flip themselves right away rather than waiting on a
-                // server-confirmed resync.
-                btn.set_icon_name(star_icon_name(starring));
-                flag_icon.set_visible(starring);
             });
         }
         {
@@ -6967,17 +6976,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if summaries.is_empty() {
                 return;
             }
-            let (add, remove) = if summaries.iter().any(|s| !s.is_starred()) {
+            let starring = summaries.iter().any(|s| !s.is_starred());
+            let (add, remove) = if starring {
                 (vec![SystemFlagBit::Flagged], Vec::new())
             } else {
                 (Vec::new(), vec![SystemFlagBit::Flagged])
             };
-            // Flag changes aren't patched into the message list model like
-            // Mark Read's are (see `restore_optimistic_flag_changes`'s
-            // comment), so the button flips its own icon immediately rather
-            // than waiting for the server's `MessagesUpdated` confirmation.
-            star_button_for_click.set_icon_name(star_icon_name(!add.is_empty()));
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
+                optimistic_toggle_starred(&state, &message_list, &mailbox, &uids, starring);
                 let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
                     mailbox,
                     uids,
@@ -6985,6 +6991,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     remove: remove.clone(),
                 });
             }
+            // The optimistic patch above already moved every affected
+            // message into/out of the pinned Starred group and restored the
+            // selection, so the aggregate state `refresh_star_button` reads
+            // off `selected_summaries()` is genuinely current - no need for
+            // a separate manual icon flip first.
+            refresh_star_button(&star_button_for_click, &message_list);
         });
     }
     // --- Add as Task: opens the task editor prefilled from the selected
@@ -8024,6 +8036,7 @@ fn spawn_account_event_loop(
                         // every sync as automatically authoritative.
                         reconcile_optimistic_removals(&state, &mailbox, &mut messages);
                         reconcile_optimistic_flag_changes(&state, &message_list, &mailbox, &mut messages);
+                        reconcile_optimistic_starred_changes(&state, &message_list, &mailbox, &mut messages);
                         // The sync this mailbox was asked for (if any) has landed.
                         state.borrow_mut().syncing.remove(&mailbox);
                         refresh_message_loading_state(&state, &message_list, &message_list_stack);
@@ -8399,15 +8412,16 @@ fn spawn_account_event_loop(
                     }
                     AccountEvent::StoreFlagsFailed { mailbox, uids, message } => {
                         // The flag change actually failed server-side, so put
-                        // back exactly the summaries `optimistic_toggle_read`
-                        // patched for this attempt - a no-op if this failure
-                        // wasn't from a mark-read/unread toggle to begin with
-                        // (e.g. a Star/Unstar failure, which isn't optimistic).
+                        // back exactly the summaries `optimistic_toggle_read`/
+                        // `optimistic_toggle_starred` patched for this attempt -
+                        // each restore is a no-op if this failure wasn't from
+                        // that particular toggle to begin with.
                         restore_optimistic_flag_changes(&state, &message_list, &mailbox, &uids);
+                        restore_optimistic_starred_changes(&state, &message_list, &mailbox, &uids);
                         refresh_mark_read_button(&mark_read_button, &message_list);
                         // Reverts the click handler's optimistic icon flip back
-                        // to whatever the (unpatched, so still correct) selected
-                        // summaries actually say.
+                        // to whatever the (now-restored, so correct again)
+                        // selected summaries actually say.
                         refresh_star_button(&star_button, &message_list);
                         let title = glib::markup_escape_text(&format!("Couldn't update message flags: {message}"));
                         toast_overlay.add_toast(adw::Toast::new(&title));
@@ -8609,6 +8623,7 @@ fn teardown_goa_account(
         st.syncing.retain(|mailbox| !belongs(mailbox));
         st.pending_optimistic_removals.retain(|mailbox, _| !belongs(mailbox));
         st.pending_optimistic_flag_changes.retain(|mailbox, _| !belongs(mailbox));
+        st.pending_optimistic_starred_changes.retain(|mailbox, _| !belongs(mailbox));
         st.search_results.retain(|summary| !belongs(&summary.mailbox));
         st.search_pending.retain(|(_, mailbox)| !belongs(mailbox));
         st.current_mailbox.as_ref().is_some_and(belongs)
@@ -12644,6 +12659,129 @@ fn reconcile_optimistic_flag_changes(state: &Rc<RefCell<UiState>>, message_list:
     }
 }
 
+/// Optimistically flips `SystemFlagBit::Flagged` for `uids` in `mailbox` -
+/// added when starring, removed when unstarring - and repaints immediately,
+/// including moving the message into or out of the pinned Starred group
+/// (`message_list.rs`'s `compute_layout`/`splice_starred_section`) rather
+/// than waiting for the next `MessagesUpdated` to confirm it. The star/unstar
+/// sibling of `optimistic_toggle_read`, with its own stash
+/// (`pending_optimistic_starred_changes`) rather than sharing
+/// `pending_optimistic_flag_changes` - see that field's doc comment.
+fn optimistic_toggle_starred(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid], starred: bool) {
+    let mut before = Vec::new();
+    let all: Vec<EmailSummary> = message_list
+        .all_messages()
+        .into_iter()
+        .map(|mut m| {
+            if m.mailbox == *mailbox && uids.contains(&m.uid) {
+                before.push(m.clone());
+                if starred {
+                    m.flags.insert(SystemFlagBit::Flagged);
+                } else {
+                    m.flags.remove(&SystemFlagBit::Flagged);
+                }
+            }
+            m
+        })
+        .collect();
+    if before.is_empty() {
+        return;
+    }
+    let (key, descending) = current_sort(state);
+    message_list.repopulate(all, key, descending);
+    let mut st = state.borrow_mut();
+    if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
+        for m in snapshot.iter_mut().filter(|m| uids.contains(&m.uid)) {
+            if starred {
+                m.flags.insert(SystemFlagBit::Flagged);
+            } else {
+                m.flags.remove(&SystemFlagBit::Flagged);
+            }
+        }
+    }
+    st.pending_optimistic_starred_changes.entry(mailbox.clone()).or_default().extend(before);
+}
+
+/// Undoes `optimistic_toggle_starred` for `mailbox`/`uids` after a
+/// `StoreFlagsFailed` - puts the stashed pre-toggle summaries back in place
+/// (by uid) in both the visible list and the unified-view snapshot.
+fn restore_optimistic_starred_changes(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid]) {
+    let restored: HashMap<Uid, EmailSummary> = {
+        let mut st = state.borrow_mut();
+        let Some(pending) = st.pending_optimistic_starred_changes.get_mut(mailbox) else { return };
+        let mut restored = HashMap::new();
+        pending.retain(|m| {
+            if uids.contains(&m.uid) {
+                restored.insert(m.uid, m.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if pending.is_empty() {
+            st.pending_optimistic_starred_changes.remove(mailbox);
+        }
+        restored
+    };
+    if restored.is_empty() {
+        return;
+    }
+    let mut st = state.borrow_mut();
+    if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
+        for m in snapshot.iter_mut() {
+            if let Some(orig) = restored.get(&m.uid) {
+                m.flags = orig.flags.clone();
+            }
+        }
+    }
+    drop(st);
+    let all: Vec<EmailSummary> = message_list.all_messages().into_iter().map(|m| restored.get(&m.uid).cloned().unwrap_or(m)).collect();
+    let (key, descending) = current_sort(state);
+    message_list.repopulate(all, key, descending);
+}
+
+/// The star/unstar sibling of `reconcile_optimistic_flag_changes`: an
+/// incoming `MessagesUpdated` snapshot can race ahead of the `STORE` a
+/// pending `optimistic_toggle_starred` is still waiting on, and land with
+/// the pre-toggle `Flagged` state. For each uid still in
+/// `pending_optimistic_starred_changes`, compares the snapshot's flag
+/// against what `message_list` is currently showing (the optimistic value):
+/// a match means the server confirmed it - drop the uid from the stash - a
+/// mismatch means the snapshot is stale, so `messages` is patched to keep
+/// showing the optimistic value instead of flickering back, and the uid
+/// stays stashed.
+fn reconcile_optimistic_starred_changes(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, messages: &mut [EmailSummary]) {
+    let pending_uids: HashSet<Uid> = match state.borrow().pending_optimistic_starred_changes.get(mailbox) {
+        Some(pending) if !pending.is_empty() => pending.iter().map(|m| m.uid).collect(),
+        _ => return,
+    };
+    let optimistic_starred: HashMap<Uid, bool> = message_list
+        .all_messages()
+        .into_iter()
+        .filter(|m| m.mailbox == *mailbox && pending_uids.contains(&m.uid))
+        .map(|m| (m.uid, m.flags.contains(&SystemFlagBit::Flagged)))
+        .collect();
+
+    let mut confirmed = HashSet::new();
+    for m in messages.iter_mut() {
+        let Some(&want_starred) = optimistic_starred.get(&m.uid) else { continue };
+        if m.flags.contains(&SystemFlagBit::Flagged) == want_starred {
+            confirmed.insert(m.uid);
+        } else if want_starred {
+            m.flags.insert(SystemFlagBit::Flagged);
+        } else {
+            m.flags.remove(&SystemFlagBit::Flagged);
+        }
+    }
+
+    let mut st = state.borrow_mut();
+    let Some(pending) = st.pending_optimistic_starred_changes.get_mut(mailbox) else { return };
+    pending.retain(|m| !confirmed.contains(&m.uid));
+    if pending.is_empty() {
+        st.pending_optimistic_starred_changes.remove(mailbox);
+    }
+}
+
 /// Patches a preview snippet onto matching displayed rows in place - the
 /// UI-side half of `AccountEvent::PreviewsFetched`. Not optimistic (unlike
 /// `optimistic_toggle_read` above): the cache write already succeeded before
@@ -15135,6 +15273,7 @@ mod tests {
             unified_snapshots: HashMap::new(),
             pending_optimistic_removals: HashMap::new(),
             pending_optimistic_flag_changes: HashMap::new(),
+            pending_optimistic_starred_changes: HashMap::new(),
             pending_body_request: None,
             pending_attachment: None,
             pending_raw_message: None,
@@ -15315,6 +15454,65 @@ mod tests {
         );
     }
 
+    /// The star/unstar sibling of the read-toggle test above:
+    /// `optimistic_toggle_starred` flips `SystemFlagBit::Flagged` (and the
+    /// unified-view snapshot's copy) the instant it's called, stashing the
+    /// pre-toggle summary in its own `pending_optimistic_starred_changes`
+    /// stash rather than the read-toggle's, and a matching
+    /// `restore_optimistic_starred_changes` puts the original flag straight
+    /// back and clears that stash without touching the other one.
+    #[test]
+    fn optimistic_toggle_starred_and_restore_round_trips_flags_and_unified_snapshot() {
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let account_id = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(account_id, Vec::new())]);
+        // `summary()` defaults to no flags set, i.e. unstarred.
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
+        state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one.clone(), two.clone()]);
+
+        optimistic_toggle_starred(&state, &message_list, &mailbox, &[Uid(2)], true);
+        let patched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        assert!(patched.is_starred(), "the row must flip to starred immediately, before any server round trip");
+        let untouched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(1)).unwrap();
+        assert!(!untouched.is_starred(), "an uid not in the toggle set must be untouched");
+        assert!(
+            state.borrow().unified_snapshots[&mailbox].iter().find(|m| m.uid == Uid(2)).unwrap().is_starred(),
+            "the unified-view snapshot must reflect the toggle too"
+        );
+        assert_eq!(
+            state.borrow().pending_optimistic_starred_changes[&mailbox].iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![Uid(2)],
+            "the pre-toggle summary must be stashed for a possible rollback, in its own stash"
+        );
+        assert!(
+            !state.borrow().pending_optimistic_flag_changes.contains_key(&mailbox),
+            "a star toggle must never touch the read-toggle's stash"
+        );
+
+        restore_optimistic_starred_changes(&state, &message_list, &mailbox, &[Uid(2)]);
+        let restored = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        assert!(!restored.is_starred(), "a failed flag update must restore the original unstarred state");
+        assert!(
+            !state.borrow().unified_snapshots[&mailbox].iter().find(|m| m.uid == Uid(2)).unwrap().is_starred(),
+            "the unified-view snapshot must be restored too"
+        );
+        assert!(
+            !state.borrow().pending_optimistic_starred_changes.contains_key(&mailbox),
+            "the stash must be empty once its only entry is restored"
+        );
+    }
+
     /// Regression test for the disappear-reappear-disappear flicker: the
     /// account session's IDLE-vs-command race can land a `MessagesUpdated`
     /// snapshot that still shows a just-deleted uid, because the resync ran
@@ -15416,6 +15614,58 @@ mod tests {
         reconcile_optimistic_flag_changes(&state, &message_list, &mailbox, &mut confirmed_snapshot);
         assert!(
             !state.borrow().pending_optimistic_flag_changes.contains_key(&mailbox),
+            "a sync confirming the flag change must clear the stash"
+        );
+    }
+
+    /// The star/unstar sibling of the test above: a racing sync can land
+    /// with the pre-toggle `Flagged` state before the actual `STORE` reaches
+    /// the server. `reconcile_optimistic_starred_changes` must patch the
+    /// stale snapshot back to the optimistic value (not let the message drop
+    /// out of the pinned Starred group) and only clear its own stash once a
+    /// snapshot's flag actually matches - independent of the read-toggle
+    /// stash `reconcile_optimistic_flag_changes` owns.
+    #[test]
+    fn reconcile_optimistic_starred_changes_survives_a_stale_racing_sync() {
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            return;
+        }
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let account_id = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(account_id, Vec::new())]);
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
+        optimistic_toggle_starred(&state, &message_list, &mailbox, &[Uid(2)], true);
+
+        // A sync that raced ahead of the actual STORE still shows the
+        // pre-toggle unstarred flag - reconciliation must patch it back to
+        // the optimistic (starred) value and keep the uid stashed.
+        let mut racing_snapshot = vec![one.clone(), two.clone()];
+        reconcile_optimistic_starred_changes(&state, &message_list, &mailbox, &mut racing_snapshot);
+        assert!(
+            racing_snapshot.iter().find(|m| m.uid == Uid(2)).unwrap().is_starred(),
+            "a stale racing sync must not be allowed to drop the row's optimistic star"
+        );
+        assert_eq!(
+            state.borrow().pending_optimistic_starred_changes[&mailbox].iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![Uid(2)],
+            "the stash must survive a sync that hasn't confirmed the flag change yet"
+        );
+
+        // The genuine post-STORE sync agrees the row is starred - that's
+        // confirmation, so the stash clears.
+        let two_starred = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        let mut confirmed_snapshot = vec![one, two_starred];
+        reconcile_optimistic_starred_changes(&state, &message_list, &mailbox, &mut confirmed_snapshot);
+        assert!(
+            !state.borrow().pending_optimistic_starred_changes.contains_key(&mailbox),
             "a sync confirming the flag change must clear the stash"
         );
     }

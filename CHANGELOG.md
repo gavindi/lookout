@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.84 (2026-08-22)
+
+### Added
+
+- **App**: starred messages now pin to their own "Starred" section at the very top of the message list, ahead of every date section (even `Later`), regardless of sort key - it appears under Sender/Subject sort too, where nothing else groups. A starred message is pulled out of wherever it would otherwise sit (its date bucket, or its position in a flat sender/subject sort) rather than duplicated, so it renders exactly once; conversation threading stays off inside the pinned section even when it's on elsewhere, listing the individual starred message(s) flat, so a thread that loses its only starred message to the pin correctly shrinks or demotes to a plain row the same way `group_threads` already handles any thread down to one message. The section is skipped entirely under the existing Flagged filter (View → Filter → Flagged already shows nothing but starred messages, so a pinned copy would just duplicate the whole list), and it collapses/expands independently of any date bucket - collapsing it, then round-tripping through a flat sort and back, can't disturb (or be disturbed by) a separately-collapsed date section. Implementation-wise this is a `message_list.rs`-only concern: `compute_layout` partitions starred messages out before `build_layout` ever sees the rest, and a new `splice_starred_section` renders them through the same per-bucket `TrackedStore` machinery every other section already uses (a new payload-free `DateBucket::Starred` variant, never produced by `bucket_for` itself) - `window.rs`'s row factory needed no changes at all, since it already renders section/message rows generically regardless of which bucket they're under.
+
+### Changed
+
+- **App**: starring or unstarring a message (from the mail toolbar or the message list's hover quickmenu) now moves it into or out of the new pinned Starred group the instant you click, instead of only flipping the button's own icon and waiting for the next server sync to actually relocate the row. This mirrors the mark-read/unread toggle's existing optimistic-update pattern via a new `optimistic_toggle_starred` (`window.rs`), with its own pending-change stash (`pending_optimistic_starred_changes`) kept separate from the read-toggle's - a message can have both a read-toggle and a star-toggle in flight at once, and sharing one stash between them risked losing one side's rollback snapshot or leaving a stuck, never-reconciled entry. A failed `StoreFlagsMany` now rolls the star back too (previously a no-op for star specifically, since it wasn't optimistic yet), and a racing sync that lands before the real `STORE` confirms is reconciled the same way delete/read races already are, rather than letting the row flicker back.
+
 ## 0.9.83 (2026-08-22)
 
 ### Changed

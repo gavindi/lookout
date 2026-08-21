@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.84" date="2026-08-22">
+      <description>
+        <p>Starred messages now pin to their own "Starred" section at the top of the message list, no matter how you're sorting - and starring or unstarring moves a message into or out of it instantly.</p>
+      </description>
+    </release>
     <release version="0.9.83" date="2026-08-22">
       <description>
         <p>The message list's hover menu trades its Archive button for three toggles - Mark Read/Unread, Follow-up, and Star/Unstar - so you can update a message's state without opening it.</p>
