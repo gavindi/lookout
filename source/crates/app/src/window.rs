@@ -3027,7 +3027,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // receiving account, persisted in the UI-state database) raises the
     // bar to the entry's `TrustLevel`. State is re-read on every decision
     // too, so trusting a sender while a message is open applies on the
-    // next render.
+    // next render. `render_body` resolves the same predicate once per
+    // render and enforces it with a Content-Security-Policy meta tag
+    // injected into the loaded HTML (see `message_content_security_policy`)
+    // - WebKitGTK only delivers `decide-policy` *response* decisions for
+    // the main frame, not for subresources, so the response veto below
+    // can't be the gate that holds the block.
     // Opens an `http(s)` URI in the system's default browser. Other schemes
     // are deliberately ignored - `data:`/`cid:`/`about:`/`file:` are local to
     // the pane, and `mailto:` is itself a mail client's business (a
@@ -3096,6 +3101,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // or - at the `AllContent` level - every remote subresource
                 // response. Everything else stays blocked, and the veto
                 // still applies to the navigation branch above.
+                //
+                // Note: WebKitGTK only emits *this* decision for the main
+                // frame (verified empirically against 2.52) - subresource
+                // responses never reach it. The real gate for remote
+                // subresources is the Content-Security-Policy `render_body`
+                // injects into every message body (see
+                // `message_content_security_policy`); this branch is kept
+                // as defense-in-depth for versions that do deliver it.
                 if let Some(response) = decision.downcast_ref::<webkit::ResponsePolicyDecision>() {
                     if !response.is_main_frame_main_resource() {
                         if let Some(uri) = response.request().and_then(|r| r.uri()) {
@@ -14316,6 +14329,61 @@ fn send_read_receipt(state: &Rc<RefCell<UiState>>, automatic: bool) -> bool {
     true
 }
 
+/// The Content-Security-Policy prepended to every message body before it's
+/// loaded into the reading pane, enforcing the external-content load policy
+/// in the web process. WebKitGTK only delivers `decide-policy` response
+/// decisions for the main frame - not for subresources (verified empirically
+/// against 2.52) - so the response veto in the reading pane's policy handler
+/// can't gate remote images; CSP is checked on every resource load, cache
+/// hits included, and the meta tag below - prepended before any other
+/// element (or slipped after the doctype, so a doctyped message stays in
+/// standards mode), so the HTML5 parser hoists it into the head even for
+/// fragment bodies - is the block that actually holds.
+///
+/// `images_allowed` mirrors the "Load images from the web" toggle, the
+/// per-message "load once" override, and a sender trusted at the `Images`
+/// level: remote `image/*` loads pass, everything else remote stays blocked.
+/// `all_allowed` is a sender trusted at the `AllContent` level: every remote
+/// subresource passes. Either way the message's own inline `data:`/`cid:`
+/// content always loads, JavaScript stays off (`script-src 'none'`, also
+/// enforced by the WebKit setting), and `<frame>`/`<object>`/`<base>`/form
+/// targets are vetoed so a trusted sender still never gains navigation or
+/// scripting.
+fn message_content_security_policy(images_allowed: bool, all_allowed: bool) -> &'static str {
+    if all_allowed {
+        "default-src * data: cid: blob:; style-src 'unsafe-inline' * data: cid:; script-src 'none'; frame-src 'none'; object-src 'none'; connect-src * data:; base-uri 'none'; form-action 'none'"
+    } else if images_allowed {
+        "default-src 'none'; img-src * data: cid:; style-src 'unsafe-inline'; font-src data: cid:; media-src data: cid:; frame-src 'none'; object-src 'none'; connect-src 'none'; script-src 'none'; base-uri 'none'; form-action 'none'"
+    } else {
+        "default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; font-src data: cid:; media-src data: cid:; frame-src 'none'; object-src 'none'; connect-src 'none'; script-src 'none'; base-uri 'none'; form-action 'none'"
+    }
+}
+
+/// Prepend the reading pane's Content-Security-Policy meta tag to a message
+/// body, keeping it ahead of every content element the CSP spec counts: in
+/// front of the whole body for the usual fragment HTML, or slipped in right
+/// after the opening doctype when one leads the body, so a doctyped message
+/// keeps its standards-mode rendering (a meta before the doctype would trip
+/// the HTML5 parser into quirks mode and the doctype would then be ignored).
+fn wrap_message_with_csp(html: &str, images_allowed: bool, all_allowed: bool) -> String {
+    let csp_tag = format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">", message_content_security_policy(images_allowed, all_allowed));
+    let lead = html.len() - html.trim_start().len();
+    let trimmed = &html[lead..];
+    let mut out = String::with_capacity(html.len() + csp_tag.len() + 1);
+    if trimmed.as_bytes().get(..9).is_some_and(|b| b.eq_ignore_ascii_case(b"<!doctype")) {
+        if let Some(end) = trimmed.find('>') {
+            out.push_str(&html[..lead + end + 1]);
+            out.push_str(&csp_tag);
+            out.push_str(&html[lead + end + 1..]);
+            return out;
+        }
+    }
+    out.push_str(&csp_tag);
+    out.push_str(&html[..lead]);
+    out.push_str(trimmed);
+    out
+}
+
 fn render_body(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
@@ -14446,13 +14514,31 @@ fn render_body(
             render_invite_card(reading_stack, st.imip.as_ref().filter(|_| !dismissed));
         }
     }
-    // External-content trust banner: reveal it when the message on screen
-    // references remote content the load policy is *currently blocking* -
-    // its sender isn't trusted (at a high enough level) and the global
-    // "Load images from the web" toggle isn't covering the gap. The HTML
-    // scan is advisory; the decide-policy handler stays authoritative. The
-    // sender comes from `rendered_trust_sender`, stashed above; hidden
-    // when there's no sender to key trust on (the debug `.eml` viewer).
+    // External-content load policy for this render: whether the message's
+    // remote content may load is decided once here, from the same inputs the
+    // reading pane's decide-policy handler uses - the rendered sender's
+    // trust entry (per receiving account) and the global "Load images from
+    // the web" toggle / per-message "load once" override. The result feeds
+    // the trust banner's reveal below and the Content-Security-Policy
+    // injected into the loaded HTML; because WebKitGTK only delivers
+    // `decide-policy` response decisions for the main frame (not for
+    // subresources - verified empirically against 2.52), the CSP is what
+    // actually enforces the block on every remote image, style, font and
+    // media load.
+    let (images_allowed, all_allowed) = {
+        let st = state.borrow();
+        let level = st.rendered_trust_sender.as_ref().and_then(|(account, sender)| st.trusted_senders.get(&(account.clone(), sender.clone())).copied());
+        let images_allowed = st.load_remote_images || st.load_once_images || level.is_some_and(|l| l >= lookout_core::TrustLevel::Images);
+        let all_allowed = level.is_some_and(|l| l >= lookout_core::TrustLevel::AllContent);
+        (images_allowed, all_allowed)
+    };
+    // Trust banner: reveal it when the message on screen references remote
+    // content the policy above is *currently blocking* - its sender isn't
+    // trusted (at a high enough level) and the global "Load images from the
+    // web" toggle isn't covering the gap. The HTML scan is advisory; the CSP
+    // injected below is authoritative. The sender comes from
+    // `rendered_trust_sender`, stashed above; hidden when there's no sender
+    // to key trust on (the debug `.eml` viewer).
     {
         let st = state.borrow();
         let dismissed = st.trust_banner_dismissed.as_ref() == Some(&(mailbox.clone(), uid));
@@ -14461,8 +14547,7 @@ fn render_body(
                 // No sender to key trust on (the debug `.eml` viewer): the
                 // banner has nothing to act on, so leave it hidden.
                 None => banner.set_revealed(false),
-                Some((account, sender)) => {
-                    let level = st.trusted_senders.get(&(account, sender.clone())).copied();
+                Some((_, sender)) => {
                     // `html_remote_content_scan` re-parses the whole rendered
                     // HTML; `render_body` computed it once per render and
                     // cached it keyed by this message (see below), so a
@@ -14474,8 +14559,8 @@ fn render_body(
                         .filter(|(m, u, _)| m == &mailbox && u == &uid)
                         .map(|(_, _, s)| *s)
                         .unwrap_or_default();
-                    let images_blocked = scan.has_images && !(st.load_remote_images || st.load_once_images || level.is_some_and(|l| l >= lookout_core::TrustLevel::Images));
-                    let other_blocked = scan.has_other && !level.is_some_and(|l| l >= lookout_core::TrustLevel::AllContent);
+                    let images_blocked = scan.has_images && !images_allowed;
+                    let other_blocked = scan.has_other && !all_allowed;
                     banner.set_title(&format!("Remote content from {sender} is blocked"));
                     banner.set_revealed(!dismissed && (images_blocked || other_blocked));
                 }
@@ -14529,9 +14614,15 @@ fn render_body(
         return;
     };
     if let Some(html) = &body.html_body {
+        // The external-content load policy rides in on a Content-Security-
+        // Policy meta tag (see `message_content_security_policy`), slipped in
+        // before any content element - or right after a leading doctype so a
+        // doctyped message keeps its standards-mode rendering (see
+        // `wrap_message_with_csp`).
+        let loaded_html = wrap_message_with_csp(html, images_allowed, all_allowed);
         if let Some(web_view) = content_stack.child_by_name("html").and_downcast::<webkit::WebView>() {
             if !animated {
-                web_view.load_html(html, None);
+                web_view.load_html(&loaded_html, None);
                 content_stack.set_visible_child_name("html");
                 reading_stack.set_visible_child_name("message");
                 return;
@@ -14550,7 +14641,7 @@ fn render_body(
             // disarms it on every selection change, so a load started for a
             // message the user has already moved on from can never reveal.
             state.borrow_mut().pending_html_reveal = true;
-            web_view.load_html(html, None);
+            web_view.load_html(&loaded_html, None);
             tracing::debug!(?mailbox, uid = uid.0, "render_body: load_html issued");
             // The reveal above is gated on WebKit's `Finished` event, but a
             // slow/hung load must not be able to hold the pane on "empty"
@@ -15117,6 +15208,54 @@ mod tests {
         );
         // No account prefix (an id not shaped "account:path").
         assert_eq!(mailbox_account_id(&MailboxId("INBOX".into())), None);
+    }
+
+    #[test]
+    fn csp_blocks_remote_content_unless_the_level_allows_it() {
+        // Nothing allowed: no `*` source anywhere, so remote images, styles,
+        // fonts and media are all vetoed; the message's own data:/cid: images
+        // and inline styles still pass.
+        let blocked = message_content_security_policy(false, false);
+        assert!(blocked.contains("img-src data: cid:") && !blocked.contains("img-src *"));
+        assert!(blocked.contains("script-src 'none'") && blocked.contains("frame-src 'none'") && blocked.contains("object-src 'none'"));
+        assert!(blocked.contains("base-uri 'none'") && blocked.contains("form-action 'none'"));
+        assert!(blocked.contains("style-src 'unsafe-inline'"));
+        // Images only: remote image loads pass, everything else remote stays blocked.
+        let images = message_content_security_policy(true, false);
+        assert!(images.contains("img-src * data: cid:"));
+        assert!(!images.contains("font-src *") && !images.contains("media-src *"));
+        // All content: remote styles/fonts/media pass too.
+        let all = message_content_security_policy(true, true);
+        assert!(all.contains("default-src *"));
+        // JavaScript and frames are vetoed at every level - a trusted sender
+        // still never gains navigation or scripting.
+        for csp in [blocked, images, all] {
+            assert!(csp.contains("script-src 'none'"));
+            assert!(csp.contains("frame-src 'none'"));
+        }
+    }
+
+    #[test]
+    fn wrap_message_with_csp_prepends_to_fragments_and_slips_past_the_doctype() {
+        // Fragment HTML (no head): the meta goes first, ahead of every
+        // content element the CSP spec counts.
+        let wrapped = wrap_message_with_csp("<p>hello</p>", false, false);
+        assert!(wrapped.starts_with("<meta http-equiv=\"Content-Security-Policy\""));
+        assert!(wrapped.ends_with("<p>hello</p>"));
+        // Leading whitespace is insignificant in HTML; the meta stays the
+        // first element and the body's bytes are preserved in order.
+        let wrapped = wrap_message_with_csp("\n\n<p>hello</p>", false, false);
+        assert!(wrapped.starts_with("<meta"));
+        assert!(wrapped.ends_with("\n\n<p>hello</p>"));
+        // A doctyped document keeps the doctype first (so it stays in
+        // standards mode) and the meta lands immediately after it.
+        let wrapped = wrap_message_with_csp("<!DOCTYPE html><html><body><p>x</p></body></html>", false, false);
+        assert!(wrapped.starts_with("<!DOCTYPE html><meta"));
+        assert!(wrapped.ends_with("</html>"));
+        assert_eq!(wrapped.matches("http-equiv=\"Content-Security-Policy\"").count(), 1);
+        // Case-insensitive doctype.
+        let wrapped = wrap_message_with_csp("<!doctype html><html></html>", true, true);
+        assert!(wrapped.starts_with("<!doctype html><meta"));
     }
 
     /// A minimal vCard with one email field, for contact-lookup tests.

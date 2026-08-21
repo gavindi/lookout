@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.87 (2026-08-22)
+
+### Fixed
+
+- **App**: the reading pane displayed remote images even when the sender wasn't trusted and Config → Mail's "Load images from the web" was off - the external-content block simply didn't hold. The block lived in the reading pane's `decide-policy` handler's response branch, but WebKitGTK only delivers `decide-policy` *response* decisions for the main frame (verified empirically against 2.52): subresource responses - a message's remote `<img>`s, stylesheets, fonts, media - never reach the handler, so every remote image loaded unconditionally. `render_body` now resolves the load policy once per render (the rendered sender's trust entry per receiving account, the global toggle, and the per-message "load once" override - the same inputs the old veto used) and enforces it with a `Content-Security-Policy` meta tag injected into the loaded HTML (`message_content_security_policy`/`wrap_message_with_csp` in `window.rs`), which WebKit checks in-process on every resource load, cache hits included. The policy has three levels: nothing allowed (only the message's own `data:`/`cid:` inline content and inline styles pass), images allowed (`img-src *` - remote images pass, remote styles/fonts/media stay blocked), and `AllContent` (every remote subresource passes); all three keep `script-src 'none'`, `frame-src 'none'`, `object-src 'none'`, `base-uri 'none'` and `form-action 'none'`, so a trusted sender still never gains navigation or scripting. The meta is prepended ahead of every content element (or slipped right after a leading doctype, so a doctyped message keeps its standards-mode rendering), the trust banner now shares the same per-render decision, and the response veto is kept as defense-in-depth. Because the policy rides in with the loaded HTML, every policy change - trusting a sender, the "Load images" toggle, "Load images once" - applies to the open message on its re-render exactly as before.
+
+### Testing
+
+- `lookout-app`: `csp_blocks_remote_content_unless_the_level_allows_it` pins the three policy levels (remote `data:`/`cid:` inline content and inline styles always pass; JavaScript, frames, objects, `<base>` and form targets are vetoed at every level), and `wrap_message_with_csp_prepends_to_fragments_and_slips_past_the_doctype` pins the meta's placement - first element for fragment bodies, immediately after a case-insensitive leading doctype, with leading whitespace preserved. The WebKit behavior itself (no `Response` policy decisions for subresources; the CSP meta blocking a remote image, including one warm in WebKit's HTTP cache from an earlier allowed render; `cid:` scheme requests still reaching the handler under the block) was verified against WebKitGTK 2.52 in a standalone harness rather than the unit suite, which has no WebKit mocking.
+
 ## 0.9.86 (2026-08-22)
 
 ### Fixed
