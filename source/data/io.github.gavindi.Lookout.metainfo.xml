@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.98" date="2026-08-23">
+      <description>
+        <p>While composing in the reading pane, the rich text controls (attach, plain/rich toggle, and the formatting buttons) now live in the action bar below the menu bar, replacing the message-list buttons for the session; popping the composer out into its own window moves them back into the editor and restores the action bar. The formatting icons are built and styled exactly like the ribbon bar's default icons.</p>
+      </description>
+    </release>
     <release version="0.9.97" date="2026-08-23">
       <description>
         <p>The Settings gear moved from the bottom of the left rail into the header bar, next to the window controls, and the Settings screen now opens as a modal dialog over the main window - same design as before, just no longer a side view.</p>

@@ -43,8 +43,23 @@ const DRAFT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
 /// is where they normally live, so they can be returned on pop-back-in); the
 /// widgets keep their click/state handlers across the move, since they're
 /// the same widgets.
+///
+/// While the composer is embedded in the reading pane the editor toolbar
+/// lives in the main window's action bar (see `ComposeActionBar` in
+/// `window.rs`); `editor_toolbar` is the toolbar itself and `toolbar_anchor`
+/// the widget it normally follows in the composer column (the attachment
+/// flow), so the window layer can return the toolbar to the composer on
+/// pop-out and lift it back out on pop-back-in.
 pub struct PopOutHandle {
     pub widget: gtk::Box,
+    /// The compose editor's toolbar row (attach, plain/rich toggle, and the
+    /// rich-text formatting buttons). Relocated into the composer by the
+    /// pop-out handler and back into the action bar by the pop-back-in
+    /// handler (see `ComposeActionBar` in `window.rs`).
+    pub editor_toolbar: gtk::Box,
+    /// The composer-column widget the editor toolbar sits directly after -
+    /// the anchor for re-inserting the toolbar into the composer on pop-out.
+    pub toolbar_anchor: gtk::Widget,
     pub cancel_button: gtk::Button,
     pub send_button: gtk::Button,
     pub from_dropdown: gtk::DropDown,
@@ -395,9 +410,13 @@ async fn read_content(web_view: &webkit::WebView) -> Option<EditorContent> {
 }
 
 /// Adds a toolbar button that fires a plain WebKit editing command (bold,
-/// italic, list, ...) on click.
+/// italic, list, ...) on click. Built exactly like the main window's ribbon
+/// command-toolbar buttons (`gtk::Button::from_icon_name` + tooltip), so the
+/// rich-text icons carry the same background and dimensions as the ribbon
+/// bar's default icons wherever the toolbar lives.
 fn toolbar_command_button(toolbar: &gtk::Box, icon_name: &str, tooltip: &str, command: &'static str, web_view: &Rc<webkit::WebView>) {
-    let button = gtk::Button::builder().icon_name(icon_name).tooltip_text(tooltip).build();
+    let button = gtk::Button::from_icon_name(icon_name);
+    button.set_tooltip_text(Some(tooltip));
     let web_view = web_view.clone();
     button.connect_clicked(move |_| web_view.execute_editing_command(command));
     toolbar.append(&button);
@@ -783,7 +802,8 @@ fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
             }
         });
     }
-    let link_button = gtk::Button::builder().icon_name("insert-link-symbolic").tooltip_text("Insert link").build();
+    let link_button = gtk::Button::from_icon_name("insert-link-symbolic");
+    link_button.set_tooltip_text(Some("Insert link"));
     link_button.connect_clicked(move |button| link_dialog.present(Some(button)));
     toolbar.append(&link_button);
 
@@ -840,11 +860,13 @@ fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
             }
         });
     }
-    let table_button = gtk::Button::builder().icon_name("view-grid-symbolic").tooltip_text("Insert table").build();
+    let table_button = gtk::Button::from_icon_name("view-grid-symbolic");
+    table_button.set_tooltip_text(Some("Insert table"));
     table_button.connect_clicked(move |button| table_dialog.present(Some(button)));
     toolbar.append(&table_button);
 
-    let insert_image_button = gtk::Button::builder().icon_name("insert-image-symbolic").tooltip_text("Insert image").build();
+    let insert_image_button = gtk::Button::from_icon_name("insert-image-symbolic");
+    insert_image_button.set_tooltip_text(Some("Insert image"));
     {
         let web_view = web_view.clone();
         insert_image_button.connect_clicked(move |button| {
@@ -992,6 +1014,15 @@ fn build_attachment_chip(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, flow
 /// the same flags when moving it back and re-shows it via `root-notify`.
 /// Cohesive arguments (they all describe one composer to open), so they stay
 /// positional rather than being bundled into a single-use struct.
+///
+/// Returns the composer root (`content`), the editor toolbar row
+/// (`editor_toolbar`), the draft-confirmation relay, and the identities-
+/// refresh hook. The editor toolbar is built inside `content` but the
+/// caller (`show_composer_in_reading_pane` in `window.rs`) relocates it to
+/// the main window's action bar while the composer is embedded, and the
+/// pop-out/pop-back-in handlers move it between the composer and that bar
+/// (see `ComposeActionBar`); `editor_toolbar` is returned separately so the
+/// caller can reparent it without reaching into the composer's internals.
 #[allow(clippy::too_many_arguments)]
 pub fn build_compose_view(
     title: &str,
@@ -1003,7 +1034,7 @@ pub fn build_compose_view(
     suggestions: SuggestionSource,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
     on_send_started: Rc<dyn Fn(String)>,
-) -> (gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
+) -> (gtk::Box, gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
     let to_row = RecipientEntry::new("To");
     if let Some(to) = &prefill.to {
         to_row.set_from_text(to);
@@ -1139,10 +1170,11 @@ pub fn build_compose_view(
         .label("Rich text")
         .tooltip_text("Toggle between plain text and formatted editing")
         .build();
-    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
+    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     // Always sensitive - unlike the formatting buttons, plain-text mode can
     // carry real file attachments too.
-    let attach_button = gtk::Button::builder().icon_name("mail-attachment-symbolic").tooltip_text("Attach files").build();
+    let attach_button = gtk::Button::from_icon_name("mail-attachment-symbolic");
+    attach_button.set_tooltip_text(Some("Attach files"));
     {
         let attachments = attachments.clone();
         let attachment_flow = attachment_flow.clone();
@@ -1469,6 +1501,8 @@ pub fn build_compose_view(
         let send_button = send_button.clone();
         let from_dropdown = from_dropdown.clone();
         let read_receipt_toggle = read_receipt_toggle.clone();
+        let editor_toolbar = editor_toolbar.clone();
+        let attachment_flow = attachment_flow.clone();
         pop_out_button.connect_clicked(move |_| {
             if popped_out.get() {
                 return;
@@ -1477,6 +1511,8 @@ pub fn build_compose_view(
             popped_out.set(true);
             on_pop_out(PopOutHandle {
                 widget: content.clone(),
+                editor_toolbar: editor_toolbar.clone(),
+                toolbar_anchor: attachment_flow.clone().into(),
                 cancel_button: cancel_button.clone(),
                 send_button: send_button.clone(),
                 from_dropdown: from_dropdown.clone(),
@@ -1526,7 +1562,7 @@ pub fn build_compose_view(
         });
     }
 
-    (content, draft_saved_tx, refresh_from_dropdown)
+    (content, editor_toolbar, draft_saved_tx, refresh_from_dropdown)
 }
 
 #[cfg(test)]

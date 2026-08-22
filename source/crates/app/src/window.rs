@@ -760,6 +760,15 @@ pub(crate) struct UiState {
     /// into the reading pane, and a finishing composer destroys the window
     /// outright; both clear this.
     compose_popout_window: Option<(u64, adw::Window)>,
+    /// The main window's action bar (`view_toolbar_stack`'s "mail-home"
+    /// slot) plus the message-list command toolbar that normally fills it,
+    /// available to any code path that opens a composer. While a composer is
+    /// embedded in the reading pane, the action bar hosts the composer's
+    /// editor toolbar instead (see `ComposeActionBar`); `None` only until
+    /// `build_window` populates it (the toolbar row is built late, after the
+    /// message-row factories that open composers), so composers fall back to
+    /// their in-window toolbar layout if it's somehow missing.
+    compose_action_bar: Option<Rc<ComposeActionBar>>,
     /// What the folder sidebar currently has rendered (see
     /// `folder_tree_signature`). `FoldersUpdated` now arrives repeatedly per
     /// account as the unread counts fill in, and almost all of those carry
@@ -1811,6 +1820,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         follow_up_toggle: None,
         composer_relay_generation: 0,
         compose_popout_window: None,
+        compose_action_bar: None,
         folder_tree: None,
         suppress_folder_selection: false,
         search_active: false,
@@ -4029,6 +4039,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     lookout_refresh_button.set_tooltip_text(Some("Refresh dashboard"));
     lookout_command_toolbar.append(&lookout_refresh_button);
     view_toolbar_stack.add_named(&lookout_command_toolbar, Some("lookout"));
+
+    // The action-bar slot switcher, stored in `UiState` (not captured by the
+    // composer-opening closures) because the message-row factories are built
+    // earlier in this function than the toolbar row itself - and the
+    // factories' reply button opens composers. `show_composer_in_reading_pane`
+    // reads it from state and swaps the "mail-home" slot to the composer's
+    // editor toolbar while it's embedded, back to the command toolbar when
+    // the composer pops out or closes.
+    state.borrow_mut().compose_action_bar = Some(Rc::new(ComposeActionBar {
+        stack: view_toolbar_stack.clone(),
+        command_toolbar: command_toolbar.clone(),
+    }));
 
     // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
     // no background) strip along the window's left edge so the background
@@ -15200,6 +15222,62 @@ fn render_body(
 /// `on_pop_out` closure below), and closing that window pops the composer
 /// back into this stack - the same move-in / move-out round trip as the
 /// People screen's detach.
+/// The action bar row below the menu bar (`view_toolbar_stack`), which hosts
+/// a different command toolbar per module/ribbon tab. Its "mail-home" slot
+/// normally holds the message-list command toolbar (Reply/Delete/Archive/…);
+/// while a composer is embedded in the reading pane, that slot instead holds
+/// the composer's editor toolbar (attach, plain/rich toggle, rich-text
+/// formatting) - and the moment the composer pops out into its own window,
+/// the message-list toolbar takes the slot back. This struct is the shared
+/// switcher for that slot, called by `show_composer_in_reading_pane` at the
+/// composer's open/close/pop-out/pop-back-in points.
+struct ComposeActionBar {
+    /// `view_toolbar_stack` - the row whose "mail-home" page swaps content.
+    stack: gtk::Stack,
+    /// The message-list command toolbar, the "mail-home" slot's normal
+    /// resident; swapped back in whenever no composer is embedded.
+    command_toolbar: gtk::Box,
+}
+
+impl ComposeActionBar {
+    /// Puts `toolbar` into the stack's "mail-home" slot, evicting whatever
+    /// currently occupies it (the message-list toolbar, or - after a newer
+    /// composer displaced an older one - a dead composer's toolbar). The
+    /// toolbar is reparented from wherever it lives (the composer's column,
+    /// which GTK requires to be parent-less before `add_named`), and the
+    /// slot is re-shown only if it was the visible child: if the user is on
+    /// another ribbon tab or module, the swap stays silent until they
+    /// return.
+    fn install(&self, toolbar: &gtk::Box) {
+        let was_visible = self.stack.visible_child_name().as_deref() == Some("mail-home");
+        if let Some(current) = self.stack.child_by_name("mail-home") {
+            self.stack.remove(&current);
+        }
+        toolbar.unparent();
+        self.stack.add_named(toolbar, Some("mail-home"));
+        if was_visible {
+            self.stack.set_visible_child_name("mail-home");
+        }
+    }
+
+    /// Puts the message-list command toolbar back into the "mail-home" slot,
+    /// but only if `toolbar` (a composer's editor toolbar) currently owns it.
+    /// The identity check keeps a composer that finishes while popped out
+    /// (its toolbar lives in the pop-out window, not here) - or whose slot
+    /// was already taken over by a newer composer - from yanking someone
+    /// else's toolbar out of the bar.
+    fn restore(&self, toolbar: &gtk::Box) {
+        let owns_slot = self
+            .stack
+            .child_by_name("mail-home")
+            .map(|current| current.downcast_ref::<gtk::Box>().is_some_and(|b| b == toolbar))
+            .unwrap_or(false);
+        if owns_slot {
+            self.install(&self.command_toolbar);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_composer_in_reading_pane(
     state: &Rc<RefCell<UiState>>,
@@ -15217,6 +15295,19 @@ fn show_composer_in_reading_pane(
     let previous_page = reading_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_else(|| "empty".to_string());
     let reading_stack_for_close = reading_stack.clone();
     let state_for_close = state.clone();
+    // The main window's action bar, which hosts this composer's editor
+    // toolbar while it's embedded. `build_window` populates it after the
+    // toolbar row exists; a composer opening before then keeps its toolbar
+    // inside the composer column, as before (can't happen in practice -
+    // opening requires an account, which only exists once the window is
+    // fully built).
+    let compose_action_bar = state.borrow().compose_action_bar.clone();
+    // `on_done` runs before the editor toolbar exists (it's built later,
+    // alongside the composer), so it reaches the toolbar through this slot
+    // instead of capturing it directly.
+    let compose_toolbar: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
+    let compose_action_bar_for_done = compose_action_bar.clone();
+    let compose_toolbar_for_done = compose_toolbar.clone();
     // The pop-out closure below shares these with `on_done` - clone them
     // before `on_done` moves the originals in.
     let reading_stack_for_popout = reading_stack.clone();
@@ -15241,6 +15332,13 @@ fn show_composer_in_reading_pane(
     let popped = Rc::new(Cell::new(false));
     let popped_for_popout = popped.clone();
     let on_done: Rc<dyn Fn()> = Rc::new(move || {
+        // Hand the action bar back to the message-list command toolbar -
+        // unless this composer's toolbar no longer owns the slot (it
+        // finished while popped out, or a newer composer took the bar
+        // over), which `restore` checks for.
+        if let (Some(bar), Some(toolbar)) = (compose_action_bar_for_done.as_ref(), compose_toolbar_for_done.borrow().as_ref()) {
+            bar.restore(toolbar);
+        }
         if !popped.get() {
             // Switch away from the composer's page before removing it, not
             // after: the stack's crossfade transition snapshots the
@@ -15294,6 +15392,7 @@ fn show_composer_in_reading_pane(
         let previous_page = previous_page_for_popout;
         let title = title.to_string();
         let popped = popped_for_popout;
+        let compose_action_bar = compose_action_bar.clone();
         move |handle| {
             popped.set(true);
             // Switch away from "compose" before removing it - see the
@@ -15304,6 +15403,21 @@ fn show_composer_in_reading_pane(
             }
             if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
                 reading_stack_for_close.remove(&existing);
+            }
+            // The composer's editor toolbar lives in the main window's
+            // action bar while it's embedded (see `ComposeActionBar`);
+            // return it to the composer column - where it rides into the
+            // pop-out window below - and restore the message-list command
+            // toolbar to the action bar. Once out of the ribbon strip it
+            // loses that background, so the toolbar gets the ribbon's own
+            // strip treatment (the same `window-icon-toolbar-background`
+            // class as the action bar row) - its icons keep the same
+            // background and dimensions as the ribbon's in the editor
+            // window too.
+            if let Some(bar) = &compose_action_bar {
+                bar.restore(&handle.editor_toolbar);
+                handle.editor_toolbar.add_css_class("window-icon-toolbar-background");
+                handle.widget.insert_child_after(&handle.editor_toolbar, Some(&handle.toolbar_anchor));
             }
             // A header bar of its own is what gives the window a drag
             // region - a bare `adw::Window` has none (the People pop-out
@@ -15359,6 +15473,7 @@ fn show_composer_in_reading_pane(
                 let state_for_close = state_for_close.clone();
                 let reading_stack_for_close = reading_stack_for_close.clone();
                 let popped = popped.clone();
+                let compose_action_bar = compose_action_bar.clone();
                 let handle = handle;
                 win.connect_close_request(move |_| {
                     if !handle.done.get() {
@@ -15391,6 +15506,18 @@ fn show_composer_in_reading_pane(
                             reading_stack_for_close.remove(&existing);
                         }
                         reading_stack_for_close.add_named(&handle.widget, Some("compose"));
+                        // The editor toolbar rode into the pop-out window
+                        // inside the composer; lift it back into the main
+                        // window's action bar (see `ComposeActionBar`) now
+                        // that the composer is embedded again. `install`
+                        // evicts whatever currently owns the slot - a newer
+                        // composer's toolbar, if one opened meanwhile. The
+                        // pop-out's own strip styling comes off with it: the
+                        // action bar's strip provides that background again.
+                        if let Some(bar) = &compose_action_bar {
+                            handle.editor_toolbar.remove_css_class("window-icon-toolbar-background");
+                            bar.install(&handle.editor_toolbar);
+                        }
                         handle.moving.set(false);
                         popped.set(false);
                         reading_stack_for_close.set_visible_child_name("compose");
@@ -15448,7 +15575,7 @@ fn show_composer_in_reading_pane(
             }
         })
     };
-    let (composer, draft_tx, identities_refresh) = crate::compose::build_compose_view(
+    let (composer, editor_toolbar, draft_tx, identities_refresh) = crate::compose::build_compose_view(
         title,
         // The composer's From dropdown re-reads from here whenever the
         // Config → Mail accounts manage-identities dialog fires `on_changed`
@@ -15483,6 +15610,15 @@ fn show_composer_in_reading_pane(
     // composer's From dropdown.
     state.borrow_mut().draft_saved_tx = Some(draft_tx);
     state.borrow_mut().composer_identities_refresh = Some(identities_refresh);
+    // The composer is embedded, so its editor toolbar moves out of the
+    // composer column and into the main window's action bar, replacing the
+    // message-list command toolbar (see `ComposeActionBar`). Filled into the
+    // shared slot afterwards so `on_done` can hand the bar back on
+    // Cancel/Send.
+    if let Some(bar) = &compose_action_bar {
+        bar.install(&editor_toolbar);
+    }
+    *compose_toolbar.borrow_mut() = Some(editor_toolbar);
     reading_stack.add_named(&composer, Some("compose"));
     reading_stack.set_visible_child_name("compose");
 }
@@ -15942,6 +16078,7 @@ mod tests {
             follow_up_toggle: None,
             composer_relay_generation: 0,
             compose_popout_window: None,
+            compose_action_bar: None,
             folder_tree: None,
             suppress_folder_selection: false,
             search_active: false,

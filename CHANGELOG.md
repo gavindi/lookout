@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.98 (2026-08-23)
+
+### Changed
+
+- **App**: the rich text editing controls now live in the action bar below the menu bar while composing in the reading pane - the attach button, plain/rich toggle, and the formatting buttons (bold, italic, lists, font size, colour, link, alignment, indents, horizontal rule, remove formatting, font family, table, image) leave the composer and take over the slot that normally holds the message-list command toolbar (Compose/Reply/Delete/Archive/…), which stays hidden for the duration of the compose session. Pop the composer out into its own window and the controls ride back into the editor window above the body, exactly where they always lived, while the action bar reverts to the message-list controls; popping back in moves them out again. A new `ComposeActionBar` in `window.rs` swaps the `view_toolbar_stack`'s "mail-home" slot between the two toolbars at the composer's open/close/pop-out/pop-back-in points - the toolbar travels inside the composer's `PopOutHandle`, and the restore is identity-guarded so a composer that finishes while popped out (or whose slot a newer composer already took) never yanks someone else's toolbar out of the bar. The ribbon's tab behaviour is preserved: the compose toolbar replaces the Home tab's command toolbar, while View still shows its layout toggles. Draft autosave, shortcuts, and the attach file dialog are untouched - the toolbar is one widget that moves.
+- **App**: the rich text toolbar's icon buttons are now built exactly like the ribbon bar's default icons - the same `Gtk.Button` icon-button construction, in a row carrying the same `toolbar` class and spacing as the message-list command toolbar - and while the composer is popped out the toolbar sits on the same dark rounded strip (the `window-icon-toolbar-background` class) as the action bar row, so the formatting icons keep the same background and dimensions as the ribbon's icons in the editor window too; popping back in returns them to the ribbon's own strip.
+
 ## 0.9.97 (2026-08-23)
 
 ### Changed
