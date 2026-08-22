@@ -118,7 +118,8 @@ pub struct ShortcutRow {
     pub action: &'static str,
 }
 
-/// The config screen's widget tree. `root` goes into the main `root_stack`;
+/// The config screen's widget tree. `root` goes into the Settings dialog
+/// (a modal window opened from the header bar's Settings button);
 /// the account groups are kept here so `refresh` can repopulate them in
 /// place without rebuilding the whole page.
 pub struct ConfigView {

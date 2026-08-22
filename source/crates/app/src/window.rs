@@ -3757,14 +3757,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     search_entry.set_margin_start(12);
     window_header.pack_start(&search_entry);
     // A second home for the View tab's Calendar overview toggle, docked at
-    // the header's right end just left of the (debug-only) .eml opener.
-    // Wired to `overview_pane_toggle` below, so either button flips both -
-    // they can never disagree about the pane's visibility, and the toggle
-    // state survives a round-trip through the Calendar/Config views. Like
-    // Home/View, it goes honest-disabled while another module is active
-    // (see the nav-rail handlers).
+    // the header's right end. Wired to `overview_pane_toggle` below, so
+    // either button flips both - they can never disagree about the pane's
+    // visibility, and the toggle state survives a round-trip through the
+    // Calendar view. Like Home/View, it goes honest-disabled while another
+    // module is active (see the nav-rail handlers). The Settings button
+    // sits to its right, directly left of the window controls, and opens
+    // the Settings window as a modal dialog (see its click handler below).
+    // `pack_end` stacks right-to-left, so the calls are ordered rightmost
+    // first: on screen this reads open-.eml, Calendar overview, Settings.
     let header_calendar_overview_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").css_classes(["flat"]).build();
     header_calendar_overview_toggle.set_tooltip_text(Some("Calendar overview"));
+    let settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
+    settings_button.set_css_classes(&["flat"]);
+    settings_button.set_tooltip_text(Some("Settings"));
+    window_header.pack_end(&settings_button);
     window_header.pack_end(&header_calendar_overview_toggle);
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
@@ -3774,7 +3781,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // strip - mutually-exclusive toggle buttons that switch the ribbon
     // content row below (see `view_toolbar_stack`). Home holds the command
     // toolbar; View holds the pane-visibility layout toggles. Mail-only:
-    // they're disabled while a Calendar/Config module is active (see the
+    // they're disabled while another module is active (see the
     // nav-rail handlers), matching the codebase's honest-disabled convention.
     let file_menu = gio::Menu::new();
     file_menu.append(Some("Quit"), Some("app.quit"));
@@ -3788,7 +3795,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let help_button = gtk::MenuButton::builder().label("Help").css_classes(["flat"]).menu_model(&help_menu).build();
 
     // Which ribbon tab is active ("home" | "view") and which nav-rail module
-    // is selected ("mail" | "calendar" | "config") - together they decide the
+    // is selected ("mail" | "calendar" | "tasks" | "contacts" | "lookout") -
+    // together they decide the
     // `view_toolbar_stack`'s visible child (see `ribbon_stack_name`). The tab
     // state persists across module switches; the nav-rail handlers re-enable
     // Home/View on Mail and disable them elsewhere.
@@ -4064,10 +4072,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `vexpand(true)` so the rail stretches the window's full height (it
     // sits beside `outer_toolbar_view` - header bar, menu bar, and command
     // toolbar included - rather than below those top bars). The content is a
-    // fixed-height Box, wrapped in a scrolled window: a window shrunk shorter
-    // than the buttons' total height would otherwise clip the bottom-anchored
-    // Config button off-screen (a Box clips its trailing children first), and
-    // scrolling keeps every rail button reachable at any height.
+    // fixed-height Box, wrapped in a scrolled window so every rail button
+    // stays reachable at any window height. (Settings used to anchor at the
+    // rail's bottom; it now lives in the header bar as a modal dialog.)
     let nav_rail_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .width_request(56)
@@ -4265,7 +4272,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 root_stack.set_visible_child_name(current_mail_page.get());
                 view_toolbar_stack.set_visible_child_name(ribbon_stack_name("mail", active_ribbon_tab.get()));
                 // Respect the View tab's toggle rather than forcing the
-                // overview pane back on after a Calendar/Config round-trip -
+                // overview pane back on after a Calendar round-trip -
                 // and the width-based auto-hide while the window is narrow.
                 mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active() && !overview_forced_hidden.get());
                 home_button.set_sensitive(true);
@@ -5342,17 +5349,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // --- Config view: the third nav-rail view, a read-only overview of the
-    // connected Mail/Calendar accounts (endpoints included, so it shows how
-    // each account is configured) plus the Phase 5 placeholder sections, and
-    // an "Add account" entry that opens GOA settings - same invocation as the
-    // empty-state page's button. The account groups are repopulated by
-    // `refresh_config` on every activation and again whenever either
-    // discovery lands (`spawn_*_discovery` below). `config_view` itself is
-    // built earlier, alongside `contacts_paned` - see the comment there.
-    let config_card = card_section(&config_view.root);
-    config_card.add_css_class("folder-pane");
-    root_stack.add_named(&config_card, Some("config"));
+    // --- Config view: opened from the header bar's Settings button as a
+    // modal dialog (see the handler near the end of this function), a
+    // read-only overview of the connected Mail/Calendar accounts (endpoints
+    // included, so it shows how each account is configured) plus the Phase 5
+    // placeholder sections, and an "Add account" entry that opens GOA
+    // settings - same invocation as the empty-state page's button. The
+    // account groups are repopulated by `refresh_config` on every open and
+    // again whenever either discovery lands (`spawn_*_discovery` below).
+    // `config_view` itself is built earlier, alongside `contacts_paned` -
+    // see the comment there.
 
     // Config → Appearance → "Animate transitions": flips the reading pane's
     // crossfade on/off live. Session-only state until Phase 5's GSettings
@@ -5861,35 +5867,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // --- Config's own command-toolbar row, swapped in via `view_toolbar_stack`
-    // like Mail's and Calendar's when the Config nav-rail button is active.
-    let config_add_account_button = gtk::Button::from_icon_name("contact-new-symbolic");
-    config_add_account_button.set_tooltip_text(Some("Add account"));
-    {
-        let worker = worker.clone();
-        config_add_account_button.connect_clicked(move |_| {
-            worker.spawn(crate::online_accounts::open_online_accounts());
-        });
-    }
-    let config_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    config_command_toolbar.append(&config_add_account_button);
-    view_toolbar_stack.add_named(&config_command_toolbar, Some("config"));
-
-    let config_view_button = gtk::ToggleButton::builder()
-        .icon_name("preferences-system-symbolic")
-        .css_classes(["flat"])
-        .tooltip_text("Config")
-        .build();
-    config_view_button.set_group(Some(&contacts_view_button));
-    // Anchored to the bottom of the rail: Mail/Calendar stay at the top, a
-    // `vexpand(true)` spacer fills the middle, Config sits below it (inside
-    // the scrolled window, so a very short window scrolls rather than
-    // clipping it).
-    let nav_rail_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    nav_rail_spacer.set_vexpand(true);
-    nav_rail_content.append(&nav_rail_spacer);
-    nav_rail_content.append(&config_view_button);
-
     // --- Global keyboard shortcuts. One window-level `EventControllerKey`
     // matches every key press against `shortcuts.rs`'s physical-keycode
     // table - the logical GSettings accelerators are resolved against the
@@ -6002,13 +5979,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     );
     // Module switching via the rail toggles: `set_active` fires the same
     // `toggled` handler a click would, and is a no-op when already there.
+    // (Settings is not a module anymore - its shortcut opens the modal
+    // dialog via a `dispatch` entry inserted below, alongside `refresh_config`.)
     for (action, button) in [
         (crate::shortcuts::ACTION_MAIL, &mail_view_button),
         (crate::shortcuts::ACTION_CALENDAR, &calendar_view_button),
         (crate::shortcuts::ACTION_CONTACTS, &contacts_view_button),
         (crate::shortcuts::ACTION_TASKS, &tasks_view_button),
         (crate::shortcuts::ACTION_LOOKOUT, &lookout_view_button),
-        (crate::shortcuts::ACTION_CONFIG, &config_view_button),
     ] {
         let button = button.clone();
         dispatch.insert(action, Rc::new(move || button.set_active(true)));
@@ -6075,13 +6053,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // flow while a Config row is recording. Stop on anything handled, so a
     // matched chord never also reaches the focused widget (an entry
     // retyping "n" because Ctrl+N got through would be wrong).
+    let dispatch = Rc::new(RefCell::new(dispatch));
     {
         let shortcuts = shortcuts.clone();
         let shortcut_settings = shortcut_settings.clone();
         let capture_action = capture_action.clone();
         let refresh_shortcut_rows = refresh_shortcut_rows.clone();
         let state = state.clone();
-        let dispatch = Rc::new(dispatch);
+        let dispatch = dispatch.clone();
         let controller = gtk::EventControllerKey::new();
         controller.connect_key_pressed(move |_controller, _keyval, keycode, state_modifiers| {
             if shortcuts.borrow().capturing {
@@ -6121,7 +6100,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let Some(action) = shortcuts.borrow().action_for(keycode, state_modifiers) else {
                 return glib::Propagation::Proceed;
             };
-            if let Some(run) = dispatch.get(action) {
+            if let Some(run) = dispatch.borrow().get(action) {
                 run();
                 glib::Propagation::Stop
             } else {
@@ -6636,25 +6615,77 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // --- Settings window: the header bar's Settings button opens the Config
+    // screen (the same sidebar/stack layout that used to live in the nav
+    // rail) as a modal dialog over the main window. Single instance: while
+    // one is open, re-clicking the button (or the Ctrl+6 shortcut below)
+    // just re-presents it. The window is destroyed on close and rebuilt on
+    // the next open - `config_view.root` is a single shared widget that gets
+    // auto-unparented when its window is destroyed, so re-attaching it to a
+    // fresh window is safe. `refresh_config` runs on every open so the
+    // account lists are current, and the discovery passes keep refreshing
+    // it while the dialog is up. ---
     {
-        let root_stack = root_stack.clone();
-        let view_toolbar_stack = view_toolbar_stack.clone();
-        let mail_calendar_overview_card = mail_calendar_overview_card.clone();
+        let window = window.clone();
+        let config_view = config_view.clone();
         let refresh_config = refresh_config.clone();
-        let current_module = current_module.clone();
-        let home_button = home_button.clone();
-        let view_button = view_button.clone();
-        config_view_button.connect_toggled(move |btn| {
-            if btn.is_active() {
-                current_module.set("config");
-                root_stack.set_visible_child_name("config");
-                view_toolbar_stack.set_visible_child_name("config");
-                mail_calendar_overview_card.set_visible(false);
-                home_button.set_sensitive(false);
-                view_button.set_sensitive(false);
+        let config_window: Rc<RefCell<Option<adw::Window>>> = Rc::new(RefCell::new(None));
+        let open_settings = {
+            let window = window.clone();
+            let config_view = config_view.clone();
+            let refresh_config = refresh_config.clone();
+            let config_window = config_window.clone();
+            move || {
+                if let Some(existing) = config_window.borrow().as_ref() {
+                    existing.present();
+                    return;
+                }
+                let dialog = adw::Window::builder()
+                    .transient_for(&window)
+                    .modal(true)
+                    .title("Settings")
+                    .default_width(1000)
+                    .default_height(720)
+                    .build();
+                let header = adw::HeaderBar::new();
+                header.set_title_widget(Some(&adw::WindowTitle::new("Settings", "")));
+                let close_button = gtk::Button::from_icon_name("window-close-symbolic");
+                close_button.set_css_classes(&["flat"]);
+                close_button.set_tooltip_text(Some("Close"));
+                header.pack_end(&close_button);
+                let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+                content.append(&header);
+                // Same card treatment the Config screen had in the main
+                // window, so the dialog shows the identical design.
+                let config_card = card_section(&config_view.root);
+                config_card.add_css_class("folder-pane");
+                config_card.set_vexpand(true);
+                content.append(&config_card);
+                dialog.set_content(Some(&content));
+                {
+                    let dialog = dialog.clone();
+                    close_button.connect_clicked(move |_| dialog.close());
+                }
+                {
+                    let config_window = config_window.clone();
+                    dialog.connect_close_request(move |_| {
+                        *config_window.borrow_mut() = None;
+                        glib::Propagation::Proceed
+                    });
+                }
                 refresh_config();
+                *config_window.borrow_mut() = Some(dialog.clone());
+                dialog.present();
             }
+        };
+        settings_button.connect_clicked({
+            let open_settings = open_settings.clone();
+            move |_| open_settings()
         });
+        // Ctrl+6 (shortcuts.rs ACTION_CONFIG) opens the same dialog. The
+        // rail-toggle loop above can't carry it - `refresh_config` only
+        // exists from here on - so it's dispatched here instead.
+        dispatch.borrow_mut().insert(crate::shortcuts::ACTION_CONFIG, Rc::new(open_settings));
     }
 
     // --- "Clear all caches" (Config → Advanced): deletes the on-disk mail,
@@ -7829,8 +7860,8 @@ fn last_of_month(date: chrono::NaiveDate) -> chrono::NaiveDate {
 
 /// Maps a (nav-rail module, ribbon tab) pair to the `view_toolbar_stack`
 /// child to show. Mail is tabbed - Home shows the command toolbar, View the
-/// layout toggles; Calendar/Contacts/Config each have a single non-tabbed
-/// toolbar of their own, so they ignore the tab. Unknown combos fall back to
+/// layout toggles; Calendar/Contacts each have a single non-tabbed toolbar
+/// of their own, so they ignore the tab. Unknown combos fall back to
 /// Mail-Home.
 fn ribbon_stack_name(module: &str, tab: &str) -> &'static str {
     match (module, tab) {
@@ -7840,7 +7871,6 @@ fn ribbon_stack_name(module: &str, tab: &str) -> &'static str {
         ("tasks", _) => "tasks",
         ("contacts", _) => "contacts",
         ("lookout", _) => "lookout",
-        ("config", _) => "config",
         _ => "mail-home",
     }
 }

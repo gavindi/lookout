@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.97" date="2026-08-23">
+      <description>
+        <p>The Settings gear moved from the bottom of the left rail into the header bar, next to the window controls, and the Settings screen now opens as a modal dialog over the main window - same design as before, just no longer a side view.</p>
+      </description>
+    </release>
     <release version="0.9.96" date="2026-08-23">
       <description>
         <p>In the Mail screen's "Upcoming events" section, all-day events now show the day they fall on ("Today", "Tomorrow", "Sat 5 Sep") instead of a bare "All Day".</p>

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.97 (2026-08-23)
+
+### Changed
+
+- **App**: the Settings screen is no longer a nav-rail view - its gear icon left the bottom of the left rail and now lives in the app header bar, to the right of the Calendar overview toggle and directly left of the window controls (with the debug-only ".eml" opener left of the toggle, so the header reads open-.eml, Calendar overview, Settings). Clicking it (or the `Ctrl+6` shortcut, which now dispatches to the same handler instead of flipping a rail toggle) opens the Config screen as a modal dialog over the main window, titled "Settings", with the exact same design the tab had: the sidebar section list (Accounts, Calendar accounts, Webcal subscriptions, Appearance, General, Mail, Calendar, Privacy, Apps, Advanced) and the per-section pages, in the same card treatment. Single instance - re-clicking while one is open just re-presents it; closing (the header's close button or Escape) destroys it and the next open rebuilds it around the same shared `config_view` widget, so no per-session state is lost. The account lists refresh on every open and stay live while the dialog is up (the discovery passes still call `refresh_config`), and the sidebar-width persistence rides along unchanged. Everything the config screen used to own as a module is gone from the main window: the rail's bottom-anchored Config toggle and its spacer, the ribbon's "Add account" toolbar row (the same GOA-settings action remains as the Accounts section's "Add account…" row), the `"config"` child of the root stack, and the `ribbon_stack_name` arm - so Home/View and the Calendar overview toggle now stay enabled for every remaining module, and the mail-view handler's "round-trip" comment no longer has a config leg. `Gtk.HeaderBar.pack_end` stacks its widgets right-to-left (each call lands further left), which the initial implementation had backwards - the icon order was corrected to its final header layout by empirically verifying the child order rather than trusting the API's doc wording.
+
 ## 0.9.96 (2026-08-23)
 
 ### Changed
