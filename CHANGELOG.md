@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.92 (2026-08-22)
+
+### Added
+
+- **App**: an optional tray icon (a StatusNotifierItem, the AppIndicator protocol) with the total unread email count, behind a new Config → General → "Tray icon" toggle (`tray-icon-enabled` GSettings key, default off - it's an optional feature, opt-in like the 0.9.91 dock badge). Enabled, the app registers an item with the session's StatusNotifierWatcher (Ubuntu's AppIndicator extension, KDE Plasma's system tray, and other SNI hosts; no watcher just means the icon never appears - ksni stays offline and retries), whose left-click shows or hides the main window and whose right-click menu offers Open Lookout / Compose… / Quit. The unread count rides in the icon itself: the tray's `icon_pixmap` is the app icon rendered at the sizes hosts commonly ask for (16/22/24 px) with a red disc badge carrying the count baked into its bottom-right corner - Evolution-style, deliberately not the SNI `OverlayIcon*` properties, which some hosts ignore - and the tooltip names it too ("14 unread messages"). The count is the same summed-Inbox-unread number as the dock badge: `refresh_unread_indicators` (window.rs, renamed from `publish_dock_badge`) feeds both indicators from one computation on the same `FoldersUpdated` cadence, and the tray's updates dedupe so a steady state costs no re-render or D-Bus round trip. A new `tray.rs` module owns the SNI side on the `ksni` crate (0.3.6, the same zbus 5 stack the rest of the app's D-Bus code uses): the icon is rendered on the UI thread - GTK's pixbuf loader and cairo aren't thread-safe, and the icon file is found through the standard data paths (user share, every `XDG_DATA_DIRS` icons dir, then a repo-relative copy for a bare `target/release/lookout` run) with a cairo-drawn envelope fallback when none resolve (a headless run, or a snap without librsvg) - converted to the spec's straight ARGB32 network byte order (unpremultiplied, so the semi-transparent edges stay clean on hosts that blend naively), and shipped to the tray service thread via `ksni::Handle::update` on the worker's tokio runtime - the same reactor constraint `launcher_entry` hit, solved the same way. The tray's menu/click actions cross back from the service thread over an async channel and are dispatched on the GLib main context (the widgets all belong to the window); the composer path is shared with the toolbar's compose button through an extracted `compose_new_message` helper. Disabling the toggle unregisters the item so the host drops the icon. Packaging: the snap adds `librsvg2-common` (its `unity7` plug already covers SNI name ownership and the session-bus send rules), and the flatpak manifest gains the SNI item/dbusmenu `--own-name` and `--talk-name` rules.
+
+### Testing
+
+- `lookout-app`: `tray` tests pin the rendered pixmap structure (one icon per standard size, ARGB data length), that the badge actually changes the pixels - red badge pixels present at a non-zero count and absent at zero - and the menu's Open Lookout / Compose… / Quit labels and the tooltip's singular/plural unread wording. The full suite (249 tests) passes.
+
 ## 0.9.91 (2026-08-22)
 
 ### Added

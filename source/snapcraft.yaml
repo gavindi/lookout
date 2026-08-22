@@ -1,6 +1,6 @@
 name: lookout
 base: core24
-version: 0.9.91
+version: 0.9.92
 summary: Native GNOME mail client built on GNOME Online Accounts
 description: |
   Lookout is a native GNOME/libadwaita mail client. It connects to your mail
@@ -66,6 +66,7 @@ parts:
       - gsettings-desktop-schemas
       - adwaita-icon-theme
       - shared-mime-info
+      - librsvg2-common
     override-build: |
       if [ ! -x /root/.cargo/bin/rustup ]; then
         curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable

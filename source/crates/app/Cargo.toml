@@ -39,6 +39,10 @@ futures-util = "0.3"
 # GNOME keyring. Pure-Rust Secret Service client over the same zbus stack the
 # GOA integration uses; crypto-rust keeps OpenSSL out of the build.
 secret-service = { version = "5.1", default-features = false, features = ["rt-tokio-crypto-rust"] }
+# StatusNotifierItem tray icon (the AppIndicator protocol): implements the
+# SNI + dbusmenu D-Bus interfaces, watcher registration, and name ownership
+# on the same zbus 5 stack the rest of the app's D-Bus code uses.
+ksni = "0.3"
 
 [package.metadata.deb]
 name = "lookout"

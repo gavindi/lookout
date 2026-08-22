@@ -2040,6 +2040,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksni"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "814b44c24cd2cb236c3b8a41c7f08237b452a8e76ecaa81f1cec40b5b678215b"
+dependencies = [
+ "futures-util",
+ "pastey",
+ "serde",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "kv-log-macro"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2151,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-app"
-version = "0.9.91"
+version = "0.9.92"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
@@ -2160,6 +2173,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "gtk4",
+ "ksni",
  "libadwaita",
  "lookout-core",
  "lookout-dav",
@@ -2181,7 +2195,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-core"
-version = "0.9.91"
+version = "0.9.92"
 dependencies = [
  "chrono",
  "serde",
@@ -2190,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-dav"
-version = "0.9.91"
+version = "0.9.92"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -2214,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-goa"
-version = "0.9.91"
+version = "0.9.92"
 dependencies = [
  "anyhow",
  "lookout-core",
@@ -2226,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-mail"
-version = "0.9.91"
+version = "0.9.92"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -2541,6 +2555,12 @@ dependencies = [
  "structmeta",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "percent-encoding"

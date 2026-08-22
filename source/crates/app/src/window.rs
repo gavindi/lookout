@@ -5475,12 +5475,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Config → Mail → "Dock badge": gates the Unity LauncherEntry unread
     // badge. Republishing on the flip (rather than waiting for the next
     // `FoldersUpdated`) shows the badge the moment it's enabled, and
-    // `publish_dock_badge` sends zero - hiding the badge - the moment it's
-    // disabled. The next `rebuild_folder_tree` keeps it in sync after that.
+    // `refresh_unread_indicators` sends zero - hiding the badge - the
+    // moment it's disabled. The next `rebuild_folder_tree` keeps it in
+    // sync after that.
     {
         let state = state.clone();
         config_view.dock_badge_row.connect_active_notify(move |_row| {
-            publish_dock_badge(&state);
+            refresh_unread_indicators(&state);
         });
     }
 
@@ -5528,6 +5529,56 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             state.borrow().settings.set_bool(crate::settings::CLOSE_TO_BACKGROUND, row.is_active());
         });
     }
+
+    // Config → General → "Tray icon": starts/stops the StatusNotifierItem
+    // (AppIndicator) service. Enabling registers the icon with the session's
+    // watcher (absent watcher = the icon simply never appears; ksni retries);
+    // disabling unregisters it, so the host drops the icon. The next
+    // `refresh_unread_indicators` paints the current count into the icon.
+    // Tray commands cross back from the service thread on `tray_commands`.
+    let (tray_commands, tray_commands_rx) = async_channel::unbounded();
+    {
+        let state = state.clone();
+        config_view.tray_icon_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::TRAY_ICON_ENABLED, enabled);
+            if enabled {
+                if !crate::tray::start(tray_commands.clone()) {
+                    tracing::debug!("tray service did not start (no StatusNotifierWatcher on the session bus?)");
+                }
+            } else {
+                crate::tray::stop();
+            }
+            refresh_unread_indicators(&state);
+        });
+    }
+    // The tray's menu/click actions all target widgets this window owns, so
+    // they're dispatched here on the GLib main context (the tray service
+    // itself runs on the worker's tokio runtime; see `tray.rs`).
+    {
+        let app = app.clone();
+        let state = state.clone();
+        let window = window.clone();
+        let worker = worker.clone();
+        let reading_stack = reading_stack.clone();
+        let message_list = message_list.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(command) = tray_commands_rx.recv().await {
+                match command {
+                    crate::tray::TrayCommand::ToggleWindow => {
+                        if window.is_visible() {
+                            window.set_visible(false);
+                        } else {
+                            window.present();
+                        }
+                    }
+                    crate::tray::TrayCommand::OpenWindow => window.present(),
+                    crate::tray::TrayCommand::Compose => compose_new_message(&state, &worker, &reading_stack, &message_list),
+                    crate::tray::TrayCommand::Quit => app.quit(),
+                }
+            }
+        });
+    }
     // Phase 5: apply the persisted Config → Appearance/Mail switch states now
     // that their handlers are wired. Each `set_active` fires the notify
     // handler above, which re-derives UiState and any widget effect from the
@@ -5543,6 +5594,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .mail_notifications_row
             .set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
         config_view.dock_badge_row.set_active(persisted.get_bool(crate::settings::DOCK_BADGE_ENABLED));
+        config_view.tray_icon_row.set_active(persisted.get_bool(crate::settings::TRAY_ICON_ENABLED));
         config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
         // "Start Lookout at login": the setting is the source of truth for
         // the portal path; the managed XDG file is the fallback, so an
@@ -6532,35 +6584,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Compose button -> new-message composer in the reading pane,
     // "From" = the account owning the selected message (falling back to the
-    // currently-open mailbox's account, then any connected account) ---
+    // currently-open mailbox's account, then any connected account). The
+    // account choice is shared with the tray icon's "Compose…" menu item
+    // through `compose_new_message`.
     {
         let state = state.clone();
         let worker = worker.clone();
         let reading_stack = reading_stack.clone();
         let message_list = message_list.clone();
         compose_button.connect_clicked(move |_| {
-            let st = state.borrow();
-            // A section header is selected exactly like "nothing selected"
-            // here: fall through to the open mailbox's account.
-            let account_id = message_list
-                .selected_summary()
-                .and_then(|summary| mailbox_account_id(&summary.mailbox))
-                .or_else(|| st.current_account.clone())
-                .or_else(|| st.accounts.keys().next().cloned());
-            let Some(handle) = account_id.clone().and_then(|id| st.accounts.get(&id)) else { return };
-            let cmd_tx = handle.cmd_tx.clone();
-            let rich_text_default = state.borrow().rich_text_default;
-            drop(st);
-            show_composer_in_reading_pane(
-                &state,
-                &worker,
-                &reading_stack,
-                "New Message",
-                cmd_tx,
-                crate::compose::ComposePrefill::default(),
-                rich_text_default,
-                account_id,
-            );
+            compose_new_message(&state, &worker, &reading_stack, &message_list);
         });
     }
 
@@ -13003,6 +13036,40 @@ fn selected_message_reply_context(
     Some((summary, body, handle.email.clone(), handle.cmd_tx.clone()))
 }
 
+/// Opens a new-message composer in the reading pane for the best-guess
+/// account: the selected message's account, else the open mailbox's, else
+/// any connected account - exactly the toolbar compose button's logic,
+/// shared with the tray icon's "Compose…" menu item.
+fn compose_new_message(
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    reading_stack: &gtk::Stack,
+    message_list: &MessageListModel,
+) {
+    let st = state.borrow();
+    // A section header is selected exactly like "nothing selected" here:
+    // fall through to the open mailbox's account.
+    let account_id = message_list
+        .selected_summary()
+        .and_then(|summary| mailbox_account_id(&summary.mailbox))
+        .or_else(|| st.current_account.clone())
+        .or_else(|| st.accounts.keys().next().cloned());
+    let Some(handle) = account_id.clone().and_then(|id| st.accounts.get(&id)) else { return };
+    let cmd_tx = handle.cmd_tx.clone();
+    let rich_text_default = state.borrow().rich_text_default;
+    drop(st);
+    show_composer_in_reading_pane(
+        state,
+        worker,
+        reading_stack,
+        "New Message",
+        cmd_tx,
+        crate::compose::ComposePrefill::default(),
+        rich_text_default,
+        account_id,
+    );
+}
+
 fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String {
     state
         .borrow()
@@ -13042,25 +13109,33 @@ fn folder_tree_signature(accounts: &[(AccountId, String, Vec<Mailbox>)], favorit
     signature
 }
 
-/// The Unity LauncherEntry dock badge's current number: the summed Inbox
-/// unread count across every connected account - exactly the number the
-/// folder pane's "All Inboxes" row shows - or zero/hidden when the Config
-/// toggle is off. Called on folder rebuilds (the only thing that changes
-/// the underlying counts) and on the toggle flipping; `launcher_entry`
-/// dedupes unchanged values and fails silently without a bus or a dock
-/// that speaks the protocol.
-fn publish_dock_badge(state: &Rc<RefCell<UiState>>) {
-    if !state.borrow().settings.get_bool(crate::settings::DOCK_BADGE_ENABLED) {
-        crate::launcher_entry::set_unread_count(0);
-        return;
+/// Repaints the two unread-count indicators - the Ubuntu-dock badge (the
+/// Unity LauncherEntry count) and the tray icon (the StatusNotifierItem
+/// count) - with the summed Inbox unread count across every connected
+/// account, exactly the number the folder pane's "All Inboxes" row shows.
+/// Each is gated on its own Config toggle: the dock badge hides itself
+/// when its toggle is off (it sends zero, since the dock keeps the last
+/// value it was told), while a disabled tray icon was already unregistered
+/// by `tray::stop`, so there's nothing to clear. Called on folder rebuilds
+/// (the only thing that changes the underlying counts) and on either
+/// toggle flipping; the indicator modules dedupe unchanged values and fail
+/// silently without a bus or a listener that speaks the protocol.
+fn refresh_unread_indicators(state: &Rc<RefCell<UiState>>) {
+    let (dock_enabled, tray_enabled, total) = {
+        let st = state.borrow();
+        (
+            st.settings.get_bool(crate::settings::DOCK_BADGE_ENABLED),
+            st.settings.get_bool(crate::settings::TRAY_ICON_ENABLED),
+            st.accounts
+                .values()
+                .filter_map(|handle| handle.folders.iter().find(|m| matches!(m.role, MailboxRole::Inbox)).map(|m| m.unread))
+                .sum::<u32>(),
+        )
+    };
+    crate::launcher_entry::set_unread_count(if dock_enabled { total } else { 0 });
+    if tray_enabled {
+        crate::tray::set_unread_count(total);
     }
-    let total: u32 = state
-        .borrow()
-        .accounts
-        .values()
-        .filter_map(|handle| handle.folders.iter().find(|m| matches!(m.role, MailboxRole::Inbox)).map(|m| m.unread))
-        .sum();
-    crate::launcher_entry::set_unread_count(total);
 }
 
 /// Rebuilds the folder sidebar's `Gtk.TreeListModel` from every connected
@@ -13148,7 +13223,7 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
     }
     // The signature guards unread counts too, so a rebuild that got this
     // far means the badge's number changed - republish it.
-    publish_dock_badge(state);
+    refresh_unread_indicators(state);
 
     // The selection, the expanded subfolders, the account groups' collapse
     // state, and the scroll position don't survive `set_model`, so note them

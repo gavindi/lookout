@@ -37,6 +37,7 @@ mod tags;
 mod task_editor;
 mod tasks_view;
 mod theme;
+mod tray;
 mod trusted_senders;
 mod ui_state_db;
 mod window;
@@ -69,6 +70,7 @@ fn main() -> glib::ExitCode {
     // thread's GLib context has none - see `launcher_entry`); hand the
     // handle over before any window code can publish a count.
     crate::launcher_entry::init(&worker);
+    crate::tray::init(&worker);
 
     // The autostart entry launches `lookout --hidden`: build the window but
     // don't present it, so mail/calendar sync and the reminder loop run from

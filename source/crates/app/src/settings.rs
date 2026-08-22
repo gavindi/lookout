@@ -71,6 +71,9 @@ pub const MAIL_NOTIFICATIONS_ENABLED: &str = "mail-notifications-enabled";
 /// Config → Mail → "Dock badge": whether the app icon's Ubuntu-dock badge
 /// (the Unity LauncherEntry count) shows the summed Inbox unread count.
 pub const DOCK_BADGE_ENABLED: &str = "dock-badge-enabled";
+/// Config → General → "Tray icon": whether the app shows a StatusNotifierItem
+/// (AppIndicator) icon in the notification area with the unread count.
+pub const TRAY_ICON_ENABLED: &str = "tray-icon-enabled";
 pub const SHORTCUTS: &str = "shortcuts";
 pub const LAST_VIEW_UNIFIED: &str = "last-view-unified";
 pub const LAST_VIEW_MAILBOX: &str = "last-view-mailbox";
@@ -160,6 +163,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(MAIL_NOTIFICATIONS_ENABLED, Value::Bool(true));
     map.insert(DOCK_BADGE_ENABLED, Value::Bool(true));
+    map.insert(TRAY_ICON_ENABLED, Value::Bool(false));
     map.insert(SHORTCUTS, Value::Strv(Vec::new()));
     map.insert(LAST_VIEW_UNIFIED, Value::Bool(false));
     map.insert(LAST_VIEW_MAILBOX, Value::String(String::new()));

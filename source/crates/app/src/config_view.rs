@@ -229,6 +229,9 @@ pub struct ConfigView {
     /// exposed so the caller can wire it into the main window's
     /// close-request handling.
     pub close_to_background_row: adw::SwitchRow,
+    /// "Tray icon" switch (Config → General), exposed so the caller can
+    /// start/stop the StatusNotifierItem (AppIndicator) tray service.
+    pub tray_icon_row: adw::SwitchRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     webcal_group: adw::PreferencesGroup,
@@ -488,6 +491,11 @@ pub fn build() -> ConfigView {
         .active(true)
         .build();
     general_group.add(&close_to_background_row);
+    let tray_icon_row = adw::SwitchRow::builder()
+        .title("Tray icon")
+        .subtitle("Show an icon in the notification area with the unread mail count; clicking it shows or hides the window")
+        .build();
+    general_group.add(&tray_icon_row);
 
     // The "Vertical spacing" choice lives on the Appearance page rather than
     // a separate Layout section - it's about how the panes look. Spacing
@@ -615,6 +623,7 @@ pub fn build() -> ConfigView {
         reset_shortcuts_row,
         start_at_login_row,
         close_to_background_row,
+        tray_icon_row,
         mail_group,
         calendar_group,
         webcal_group,

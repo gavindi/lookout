@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.92" date="2026-08-22">
+      <description>
+        <p>An optional tray icon shows the total unread email count in the notification area - click it to show or hide the window, right-click for Open / Compose / Quit - controlled by the new "Tray icon" switch in Settings.</p>
+      </description>
+    </release>
     <release version="0.9.91" date="2026-08-22">
       <description>
         <p>The app icon in the dock now shows a badge with the total unread email count - the same number as the "All Inboxes" folder - with a Config → Mail toggle to hide it. Works on Ubuntu's dock and other launchers that speak the Unity LauncherEntry protocol.</p>

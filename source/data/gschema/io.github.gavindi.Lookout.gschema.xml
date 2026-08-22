@@ -147,6 +147,11 @@
       <summary>Dock badge</summary>
       <description>Show the total unread count on the app icon in the dock (Ubuntu's Unity LauncherEntry badge).</description>
     </key>
+    <key name="tray-icon-enabled" type="b">
+      <default>false</default>
+      <summary>Tray icon</summary>
+      <description>Show an icon in the notification area (the StatusNotifierItem/AppIndicator protocol) with the unread mail count. Clicking it shows or hides the window.</description>
+    </key>
 
     <!-- Calendar -->
     <key name="calendar-alerts-enabled" type="b">
