@@ -836,11 +836,12 @@ struct CalendarAccountHandle {
     last_occurrences: Vec<EventOccurrence>,
     last_synced_month: Option<chrono::NaiveDate>,
     /// Occurrences keyed by the month they were synced in, pruned to the
-    /// current and next month. The Lookout dashboard's "upcoming events"
-    /// section reads this union: a single month's window would drain as
-    /// events pass and the session's poll never advances past its one
-    /// polled month. The calendar view and reminders keep using
-    /// `last_occurrences`, so this map stays dashboard-only.
+    /// upcoming window (current month through three months ahead). The
+    /// upcoming-events surfaces - the Lookout dashboard card and the mail
+    /// overview panel's 90-day section - read this union: a single month's
+    /// window would drain as events pass and the session's poll never
+    /// advances past its one polled month. The calendar view and reminders
+    /// keep using `last_occurrences`, so this map stays upcoming-only.
     occurrences_by_month: HashMap<chrono::NaiveDate, Vec<EventOccurrence>>,
     /// Latest full task list from the account's last `TasksUpdated` - tasks
     /// have no month window, so a whole-set snapshot is the natural unit.
@@ -931,10 +932,10 @@ impl BirthdaysHandle {
         self.last_synced_month = Some(month);
     }
 
-    /// (Re)computes the dashboard-horizon months (current + next) - the
-    /// same window the account sessions' `FetchMonth` commands cover, so
-    /// the dashboard's upcoming-events section and the reminder engine see
-    /// next month's birthdays too.
+    /// (Re)computes the upcoming-window months (current through three
+    /// months ahead) - the same window the account sessions' `FetchMonth`
+    /// commands cover, so the upcoming-events surfaces and the reminder
+    /// engine see far-ahead birthdays too.
     fn sync_dashboard_window(&mut self) {
         for month in dashboard_month_window() {
             let occurrences = birthday_occurrences_batch(&self.contacts, &self.calendar_id, month);
@@ -5201,6 +5202,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // (that's the main Calendar view's own concern).
     let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(chrono::Utc::now().date_naive()));
     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+
+    // The overview panel's "Upcoming events" section needs the 90-day
+    // window fetched; switching to the Mail screen widens it, the same way
+    // the Lookout tab open widens it for its own upcoming card.
+    {
+        let calendar_state = calendar_state.clone();
+        mail_view_button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                widen_calendar_sync_horizon(&calendar_state);
+            }
+        });
+    }
 
     // --- Mail-screen overview pane's task rows + repaint hook, registered
     // here (same pattern as `dashboard_refresh`/`task_button_refresh` just
@@ -9706,12 +9719,18 @@ fn print_calendar_month<T: IsA<gtk::Window>>(calendar_state: &Rc<RefCell<Calenda
 /// `refresh_displayed_calendar_view`, the event filter is by exact day
 /// rather than by the main Calendar view's own displayed month - the
 /// overview pane can be showing a day from a different month entirely.
+/// How many rows the mail overview panel's "Upcoming events" section shows.
+const MAIL_UPCOMING_EVENTS_LIMIT: usize = 10;
+/// How far ahead that section looks (bounded by what the sessions have
+/// synced; `widen_calendar_sync_horizon` fetches the months covering it).
+const MAIL_UPCOMING_HORIZON_DAYS: i64 = 90;
+
 fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>, day: chrono::NaiveDate, day_list_box: &gtk::Box) {
     while let Some(child) = day_list_box.first_child() {
         day_list_box.remove(&child);
     }
 
-    let (occurrences, tasks, colors, activate) = {
+    let (occurrences, tasks, colors, checked, activate, upcoming_sources) = {
         let st = calendar_state.borrow();
         let occurrences: Vec<EventOccurrence> = st
             .checked_occurrences_all_months()
@@ -9731,9 +9750,36 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
             .chain(st.local_tasks.iter().cloned())
             .collect();
         let colors = st.calendar_colors.clone();
+        let checked = st.checked_calendar_ids.clone();
         let activate = st.mail_overview_activate.clone().unwrap_or_else(|| Rc::new(|_t| {}));
-        (occurrences, tasks, colors, activate)
+        // The "Upcoming events" section reads the per-month caches
+        // (`occurrences_by_month`) rather than `last_occurrences`, which
+        // only holds the last-synced month - the caches span the 90-day
+        // window `widen_calendar_sync_horizon` keeps fetched.
+        let upcoming_sources: Vec<EventOccurrence> = st
+            .accounts
+            .values()
+            .flat_map(|h| h.occurrences_by_month.values().flatten().cloned())
+            .chain(st.webcal_handles.values().flat_map(|h| h.occurrences_by_month.values().flatten().cloned()))
+            .chain(st.birthdays.as_ref().into_iter().flat_map(|h| h.occurrences_by_month.values().flatten().cloned()))
+            .collect();
+        (occurrences, tasks, colors, checked, activate, upcoming_sources)
     };
+
+    let now = chrono::Local::now();
+    let mut upcoming: Vec<EventOccurrence> = crate::lookout_view::upcoming_occurrences(
+        upcoming_sources.iter(),
+        now,
+        chrono::Duration::days(MAIL_UPCOMING_HORIZON_DAYS),
+        &checked,
+        MAIL_UPCOMING_EVENTS_LIMIT,
+    )
+    .into_iter()
+    .cloned()
+    .collect();
+    // The selected day's events are already listed in the section above;
+    // keep only the ones that come after it.
+    upcoming.retain(|occ| calendar_view::covered_local_dates(occ, day, day).is_empty());
 
     let header = gtk::Label::builder()
         .label(calendar_view::agenda_day_header(day, chrono::Utc::now().date_naive()))
@@ -9751,33 +9797,45 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
         // title starts at the same x regardless of which prefix it has.
         let grid = gtk::Grid::builder().row_spacing(10).column_spacing(6).build();
         for (row, occ) in occurrences.into_iter().enumerate() {
-            let row = row as i32;
-            let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR).to_string();
-            let dot = gtk::DrawingArea::builder().width_request(8).height_request(8).valign(gtk::Align::Center).build();
-            dot.set_draw_func(move |_, cr, width, height| {
-                let (r, g, b) = crate::tasks_view::parse_css_color(&color);
-                let radius = width.min(height) as f64 / 2.0 - 1.0;
-                cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius, 0.0, 2.0 * std::f64::consts::PI);
-                cr.set_source_rgba(r, g, b, 1.0);
-                let _ = cr.fill();
-            });
-            dot.set_tooltip_text(Some(&occ.calendar_id.0));
             let prefix_text = if occ.all_day {
                 "All Day".to_string()
             } else {
                 occ.start.with_timezone(&chrono::Local).format("%H:%M").to_string()
             };
-            let prefix = gtk::Label::builder().label(&prefix_text).xalign(0.0).css_classes(["dim-label", "caption"]).build();
-            let title = gtk::Label::builder()
-                .label(occ.summary.as_deref().unwrap_or("(untitled)"))
-                .xalign(0.0)
-                .hexpand(true)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["caption"])
-                .build();
-            grid.attach(&dot, 0, row, 1, 1);
-            grid.attach(&prefix, 1, row, 1, 1);
-            grid.attach(&title, 2, row, 1, 1);
+            append_overview_event_row(&grid, row as i32, &prefix_text, &occ, &colors);
+        }
+        day_list_box.append(&grid);
+    }
+
+    let upcoming_header = gtk::Label::builder()
+        .label("Upcoming events")
+        .css_classes(["caption-heading"])
+        .xalign(0.0)
+        .margin_top(8)
+        .build();
+    day_list_box.append(&upcoming_header);
+
+    if upcoming.is_empty() {
+        let placeholder = gtk::Label::builder().label("No upcoming events").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+        day_list_box.append(&placeholder);
+    } else {
+        let grid = gtk::Grid::builder().row_spacing(10).column_spacing(6).build();
+        for (row, occ) in upcoming.into_iter().enumerate() {
+            let prefix_text = if occ.all_day {
+                "All Day".to_string()
+            } else {
+                let start = occ.start.with_timezone(&chrono::Local);
+                let today = now.date_naive();
+                let date = start.date_naive();
+                if date == today {
+                    "Today".to_string()
+                } else if date == today + chrono::Days::new(1) {
+                    "Tomorrow".to_string()
+                } else {
+                    start.format("%a %d %b").to_string()
+                }
+            };
+            append_overview_event_row(&grid, row as i32, &prefix_text, &occ, &colors);
         }
         day_list_box.append(&grid);
     }
@@ -9803,6 +9861,34 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
             day_list_box.append(&crate::tasks_view::task_row(&task, &colors, Rc::new(|_t, _c| {}), activate.clone(), &["caption"], false));
         }
     }
+}
+
+/// One event row in the mail overview panel's lists (the selected day's
+/// events and the upcoming section): a colour dot, a prefix label (time,
+/// date, or "All Day"), and the event title, laid out in a shared grid so
+/// all titles align across rows.
+fn append_overview_event_row(grid: &gtk::Grid, row: i32, prefix_text: &str, occ: &EventOccurrence, colors: &calendar_colors::CalendarColorMap) {
+    let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR).to_string();
+    let dot = gtk::DrawingArea::builder().width_request(8).height_request(8).valign(gtk::Align::Center).build();
+    dot.set_draw_func(move |_, cr, width, height| {
+        let (r, g, b) = crate::tasks_view::parse_css_color(&color);
+        let radius = width.min(height) as f64 / 2.0 - 1.0;
+        cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius, 0.0, 2.0 * std::f64::consts::PI);
+        cr.set_source_rgba(r, g, b, 1.0);
+        let _ = cr.fill();
+    });
+    dot.set_tooltip_text(Some(&occ.calendar_id.0));
+    let prefix = gtk::Label::builder().label(prefix_text).xalign(0.0).css_classes(["dim-label", "caption"]).build();
+    let title = gtk::Label::builder()
+        .label(occ.summary.as_deref().unwrap_or("(untitled)"))
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["caption"])
+        .build();
+    grid.attach(&dot, 0, row, 1, 1);
+    grid.attach(&prefix, 1, row, 1, 1);
+    grid.attach(&title, 2, row, 1, 1);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10585,10 +10671,11 @@ fn set_lookout_data(calendar_state: &Rc<RefCell<CalendarUiState>>, lookout_view:
         let st = calendar_state.borrow();
         (
             merged_tasks(calendar_state),
-            // The dashboard unions *every* cached month (pruned to current +
-            // next by `insert_dashboard_occurrences`), so its 14-day horizon
-            // stays populated as events pass instead of draining to whatever
-            // single month the sessions' polls last synced.
+            // The dashboard unions *every* cached month (pruned to the
+            // upcoming-events window by `insert_dashboard_occurrences`), so
+            // its 14-day horizon stays populated as events pass instead of
+            // draining to whatever single month the sessions' polls last
+            // synced.
             st.accounts
                 .values()
                 .flat_map(|h| h.occurrences_by_month.values().flatten().cloned())
@@ -10613,45 +10700,48 @@ fn set_lookout_data(calendar_state: &Rc<RefCell<CalendarUiState>>, lookout_view:
     );
 }
 
-/// Asks every calendar source to fetch the current and next month, so the
-/// dashboard's "upcoming events" can reach past the month each session last
-/// fetched on its 5-minute cadence. Uses the fetch-only `FetchMonth`
+/// Asks every calendar source to fetch the current and next three months,
+/// so the upcoming-events surfaces (the dashboard card and the mail
+/// overview panel's 90-day section) can reach past the month each session
+/// last fetched on its 5-minute cadence. Uses the fetch-only `FetchMonth`
 /// commands - deliberately *not* `SyncMonth` - so the sessions' polled
 /// month (whatever the calendar view is showing) is left alone; hijacking
 /// it would starve the mail-overview day list and the calendar tab.
 fn widen_calendar_sync_horizon(calendar_state: &Rc<RefCell<CalendarUiState>>) {
-    let today = chrono::Local::now().date_naive();
-    let months = [today, today + chrono::Months::new(1)];
     let mut st = calendar_state.borrow_mut();
     if let Some(birthdays) = &mut st.birthdays {
         birthdays.sync_dashboard_window();
     }
     for handle in st.accounts.values() {
-        for month in months {
+        for month in dashboard_month_window() {
             let _ = handle.cmd_tx.send_blocking(CalendarCommand::FetchMonth(month));
         }
     }
     if let Some(cmd_tx) = &st.webcal_cmd_tx {
-        for month in months {
+        for month in dashboard_month_window() {
             let _ = cmd_tx.send_blocking(SubscriptionCommand::FetchMonth(month));
         }
     }
 }
 
-/// The months the Lookout dashboard's events section cares about - the
-/// current month and the next, which together cover its 14-day horizon.
-fn dashboard_month_window() -> [chrono::NaiveDate; 2] {
-    let current = chrono::Local::now().date_naive();
-    [first_of_month(current), first_of_month(current) + chrono::Months::new(1)]
+/// The months the upcoming-events surfaces care about - the current month
+/// and the next three, which together cover the 90-day horizon of the
+/// mail overview panel's "Upcoming events" section (and, in practice, the
+/// dashboard's shorter one). Month-normalized firsts so map keys and
+/// session sync commands line up.
+fn dashboard_month_window() -> [chrono::NaiveDate; 4] {
+    let current = first_of_month(chrono::Local::now().date_naive());
+    [current, current + chrono::Months::new(1), current + chrono::Months::new(2), current + chrono::Months::new(3)]
 }
 
-/// Stashes one synced month's occurrences in a dashboard map, pruning any
-/// month outside the current/next window so a long-lived session never
-/// accumulates stale month buckets.
+/// Stashes one synced month's occurrences in an upcoming-events map,
+/// pruning any month outside the upcoming window (current through three
+/// months ahead) so a long-lived session never accumulates stale month
+/// buckets.
 fn insert_dashboard_occurrences(map: &mut HashMap<chrono::NaiveDate, Vec<EventOccurrence>>, month: chrono::NaiveDate, occurrences: Vec<EventOccurrence>) {
     map.insert(month, occurrences);
     let window = dashboard_month_window();
-    map.retain(|m, _| *m >= window[0] && *m <= window[1]);
+    map.retain(|m, _| *m >= window[0] && *m <= window[window.len() - 1]);
 }
 
 /// Routes a completion-toggle (list checkbox) to the task's store: the
@@ -16498,34 +16588,39 @@ mod tests {
         }
     }
 
-    /// The dashboard's per-month occurrence map must never grow beyond the
-    /// current and next month - the two months its 14-day horizon needs -
-    /// or a long-lived session would accumulate stale month buckets (and a
-    /// single-month window is exactly the bug that made the upcoming-events
-    /// section drain over time).
+    /// The per-month occurrence map must never grow beyond the upcoming
+    /// window (current month through three months ahead - the months the
+    /// 90-day upcoming-events horizon needs), or a long-lived session would
+    /// accumulate stale month buckets (and a too-narrow window is exactly
+    /// the bug that made the upcoming-events section drain over time).
     #[test]
-    fn dashboard_occurrence_map_prunes_to_the_current_and_next_month() {
+    fn dashboard_occurrence_map_prunes_to_the_upcoming_months() {
         let window = dashboard_month_window();
         assert_eq!(window[0], first_of_month(window[0]), "the window is month-normalized");
-        assert_eq!(window[1], window[0] + chrono::Months::new(1), "the window spans current + next month");
+        for (i, month) in window.iter().enumerate() {
+            assert_eq!(*month, window[0] + chrono::Months::new(i as u32), "the window spans the current month through three months ahead");
+        }
         let stale_before = window[0] - chrono::Months::new(1);
-        let stale_after = window[1] + chrono::Months::new(1);
+        let stale_after = window[3] + chrono::Months::new(1);
 
         let mut map = HashMap::new();
         insert_dashboard_occurrences(&mut map, stale_before, vec![occ("stale", "cal")]);
         assert!(map.is_empty(), "a stale month is pruned immediately");
-        insert_dashboard_occurrences(&mut map, window[0], vec![occ("now", "cal")]);
-        insert_dashboard_occurrences(&mut map, window[1], vec![occ("next", "cal")]);
-        assert_eq!(map.len(), 2, "only the current and next month survive");
-        assert_eq!(map[&window[0]].len(), 1);
-        assert_eq!(map[&window[1]].len(), 1);
+        for month in window {
+            insert_dashboard_occurrences(&mut map, month, vec![occ("now", "cal")]);
+        }
+        assert_eq!(map.len(), 4, "only the upcoming window's months survive");
+        for month in window {
+            assert_eq!(map[&month].len(), 1);
+        }
 
         // A re-insert of an out-of-window month evicts itself but keeps the
         // in-window months (and their events) intact.
         insert_dashboard_occurrences(&mut map, stale_after, vec![occ("further", "cal")]);
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key(&window[0]));
-        assert!(map.contains_key(&window[1]));
+        assert_eq!(map.len(), 4);
+        for month in window {
+            assert!(map.contains_key(&month));
+        }
     }
 
     /// A pending drag-move is reapplied onto the incoming occurrence's

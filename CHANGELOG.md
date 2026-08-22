@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.95 (2026-08-23)
+
+### Added
+
+- **App**: the Mail screen's mini-calendar overview panel gains an "Upcoming events" section, slotted between the selected day's events and the outstanding-tasks list: up to 10 events starting now through the next 90 days, from the checked calendars (CalDAV accounts, webcal feeds, and the synthesized birthdays calendar), sorted by start time, rendered in the same colour-dot / prefix / title rows as the day list with date prefixes - "Today", "Tomorrow", "Sat 5 Sep", "All Day" for all-day events - and skipping any event already shown above for the selected day so nothing appears twice. The section reads a new per-month cache window rather than the last-synced month: `dashboard_month_window` grew from the current and next month to the current month through three months ahead (the four months that actually cover 90 days), `widen_calendar_sync_horizon` now asks every account and webcal feed for all four via the fetch-only `FetchMonth` commands and the birthdays calendar recomputes the same window, and switching to the Mail screen triggers that widening the same way the Lookout tab already does - so the sessions' own polled months and the calendar views stay untouched. The section repaints live as each month's fetch lands, through the same `OccurrencesUpdated`/`SubscriptionsUpdated` funnel that already refreshed the day list.
+
+### Testing
+
+- `lookout-app`: `dashboard_occurrence_map_prunes_to_the_current_and_next_month` became `dashboard_occurrence_map_prunes_to_the_upcoming_months`, pinning the four-month window - month-normalized consecutive months, out-of-window months pruned immediately, and a stale re-insert evicting itself while the in-window months survive. The full suite (252 tests) passes.
+
 ## 0.9.94 (2026-08-23)
 
 ### Added
