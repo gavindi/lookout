@@ -1195,6 +1195,12 @@ fn install_paned_css() {
         .message-list > row {
             padding: 0;
         }
+        /* The empty-folder placeholder's icon: the artwork is drawn black,
+           so it reads best at reduced opacity against the pane in both
+           schemes. */
+        .empty-state-icon {
+            opacity: 0.5;
+        }
         /* The panes' vertical spacing around items (Config → Appearance →
            'Vertical spacing'): the whole point of the setting is that every
            row kind in a pane moves together, so all the folder rows and all
@@ -2647,9 +2653,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     message_loading_box.append(&message_loading_spinner);
     message_loading_box.append(&message_loading_label);
+    // Shown instead of the list when the folder on screen is genuinely empty
+    // (or nothing is selected at all) - see `refresh_message_loading_state`,
+    // which picks between "loading" and "empty" by whether a sync is still
+    // outstanding.
+    let message_empty_icon = svg_image(
+        "/io/github/gavindi/Lookout/icons/empty-bird-1.svg",
+        include_bytes!("../../../data/resources/icons/empty-bird-1.svg"),
+        96,
+    );
+    message_empty_icon.add_css_class("empty-state-icon");
+    let message_empty_title = gtk::Label::builder().label("Folder is empty").css_classes(["heading"]).build();
+    let message_empty_subtitle = gtk::Label::builder().label("The stars were bright, Fernando.").css_classes(["dim-label"]).build();
+    let message_empty_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .build();
+    message_empty_box.append(&message_empty_icon);
+    message_empty_box.append(&message_empty_title);
+    message_empty_box.append(&message_empty_subtitle);
     let message_list_stack = gtk::Stack::new();
     message_list_stack.add_named(&message_scroller, Some("list"));
     message_list_stack.add_named(&message_loading_box, Some("loading"));
+    message_list_stack.add_named(&message_empty_box, Some("empty"));
     message_list_stack.set_visible_child_name("list");
     // Header row atop the message list: what's being shown on the left (the
     // folder's name over its account, plus the favorite star), and the list's
@@ -11631,16 +11660,28 @@ fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHeader) {
     header.favorite_suppress.set(false);
 }
 
+/// The bundled bytes of an SVG resource, preferring the GResource bundle
+/// (see `resources.rs`) and falling back to `include_bytes!` constants for
+/// builds whose bundle couldn't be compiled.
+fn svg_bytes(resource_path: &str, fallback: &'static [u8]) -> glib::Bytes {
+    crate::resources::bytes(resource_path).unwrap_or_else(|| glib::Bytes::from_static(fallback))
+}
+
+/// Decodes a bundled SVG into a fixed-size `gtk::Image`. The bundled copy is
+/// preferred (see `resources.rs`); `fallback` covers builds whose GResource
+/// bundle couldn't be compiled.
+fn svg_image(resource_path: &str, fallback: &'static [u8], pixel_size: i32) -> gtk::Image {
+    let bytes = svg_bytes(resource_path, fallback);
+    let texture = gtk::gdk::Texture::from_bytes(&bytes).expect("bundled SVG should decode");
+    let image = gtk::Image::from_paintable(Some(&texture));
+    image.set_pixel_size(pixel_size);
+    image
+}
+
 /// Decodes a nav-rail SVG into a fixed-size `gtk::Image` for the view
 /// buttons, which use full-colour artwork rather than theme icon names.
-/// The bundled copy is preferred (see `resources.rs`); `fallback` covers
-/// builds whose GResource bundle couldn't be compiled.
 fn nav_rail_image(resource_path: &str, fallback: &'static [u8]) -> gtk::Image {
-    let bytes = crate::resources::bytes(resource_path).unwrap_or_else(|| glib::Bytes::from_static(fallback));
-    let texture = gtk::gdk::Texture::from_bytes(&bytes).expect("bundled nav-rail SVG should decode");
-    let image = gtk::Image::from_paintable(Some(&texture));
-    image.set_pixel_size(28);
-    image
+    svg_image(resource_path, fallback, 28)
 }
 
 /// Keeps the favorite star's icon and tooltip in step with its pressed state.
@@ -12390,7 +12431,13 @@ fn refresh_message_loading_state(state: &Rc<RefCell<UiState>>, message_list: &Me
     } else {
         false
     };
-    message_list_stack.set_visible_child_name(if waiting { "loading" } else { "list" });
+    message_list_stack.set_visible_child_name(if !empty {
+        "list"
+    } else if waiting {
+        "loading"
+    } else {
+        "empty"
+    });
 }
 
 /// Every connected account's Inbox - the mailbox set the unified view is

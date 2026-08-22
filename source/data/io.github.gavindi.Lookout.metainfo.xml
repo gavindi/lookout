@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.94" date="2026-08-23">
+      <description>
+        <p>An empty message list (a folder with no messages) now shows a friendly placeholder - a white bird with "Folder is empty" and a quiet "The stars were bright, Fernando." - instead of a blank pane, and the loading spinner no longer lingers over an already-painted cached list.</p>
+      </description>
+    </release>
     <release version="0.9.93" date="2026-08-23">
       <description>
         <p>Settings → Advanced gains an "Aggressive prefetch" mode for the background body downloader: batches run on a timer you set, more of each folder is warmed, and folders re-scan periodically - all optional, with the cooperative default unchanged while the switch is off.</p>

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.94 (2026-08-23)
+
+### Added
+
+- **App**: the message list pane now shows a proper empty state instead of a blank scrim when the selected folder has no messages (or nothing is selected at all): a white bird artwork (bundled as `empty-bird-1.svg`, drawn white so it reads on the dark pane) centred in the pane, with "Folder is empty" over "The stars were bright, Fernando." - the loading spinner's sibling page in the pane's `Gtk.Stack`. The stack previously had just two pages - `"list"` and `"loading"` - and `refresh_message_loading_state` chose between them by whether an empty list's sync was still outstanding; it now picks a third `"empty"` page for an empty list with no sync in flight, so a folder that's genuinely empty (or no folder selected) gets the placeholder while a folder whose sync is still running keeps the spinner. The icon is loaded through a new `svg_image` helper extracted from `nav_rail_image` (the nav-rail variant passes the same 28px size it always used; the empty state asks for 96px), so any future bundled-SVG-in-an-`Image` site reuses one decode path instead of a copy of `nav_rail_image`'s body, and `empty-bird-1.svg` rides in the same GResource bundle as the other bundled icons with the usual `include_bytes!` fallback for builds without `glib-compile-resources`. The subtitle label is a `dim-label` and the title a `heading`, matching the loading page's own muted styling; the icon sits at 50% opacity via a new `.empty-state-icon` CSS rule so the artwork's hard white doesn't glare against the pane.
+
 ## 0.9.93 (2026-08-23)
 
 ### Added
