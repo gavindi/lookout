@@ -16,6 +16,7 @@ mod folder_tree;
 mod goa_calendar_credentials;
 mod goa_credentials;
 mod google_tasks;
+mod graph_pin;
 mod identities;
 mod last_view;
 mod lookout_view;

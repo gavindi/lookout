@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.90 (2026-08-22)
+
+### Added
+
+- **App**: pinning a message on a Microsoft 365 account now mirrors to Outlook's own pin, not just Lookout's `\Flagged` flag - Outlook doesn't use an IMAP flag for its "Pin" feature at all, it stamps the `PR_RENEW_TIME` MAPI property (tag `0x0F01`) to a far-future date so date-sorted views float the message to the top, a property IMAP has no way to reach. Since EWS (the other route to MAPI properties) is being retired for Exchange Online, this goes through the Microsoft Graph API instead, via a new `graph_pin.rs` module: it resolves the local `Message-ID` to a Graph message id and `PATCH`es `singleValueExtendedProperties` on pin, or resets the property to the message's real date on unpin. This is a write-only mirror - Lookout's own pinned/unpinned state still comes from `\Flagged` exactly as before, on every account including Microsoft 365 ones; reading pins made in real Outlook back into Lookout isn't implemented (it would need a second sync subsystem polling Graph's extended properties across the whole mailbox). `PR_RENEW_TIME_2` (`0x0F02`), Outlook's secondary pin-transaction property, is left alone too, since Graph's extended-properties API has no clean way to delete a single property to reproduce Outlook's "remove `0x0F02` entirely on unpin" behavior.
+- **App**: Microsoft 365 accounts get a "Sync pins with Outlook" button in Config, and the whole feature is opt-in - declining leaves pinning working exactly as it always has. Clicking it requests the additional Graph `Mail.ReadWrite` permission through one combined-scope consent alongside the account's existing IMAP/SMTP scopes; `microsoft_oauth.rs` now tracks Exchange and Graph as separate token audiences (a v2.0 access token is single-resource even though the refresh token and underlying consent aren't), caches and refreshes each independently, and never pops the consent browser window from a background pin action - only from this explicit button.
+
+### Testing
+
+- `lookout-app`: new `microsoft_oauth` tests cover the Exchange/Graph audience split and that a token file saved before Graph support existed still loads correctly (defaulting to not-consented); `graph_pin`'s OData filter-string percent-encoding is pinned directly.
+
 ## 0.9.89 (2026-08-22)
 
 ### Fixed

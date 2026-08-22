@@ -48,6 +48,20 @@ pub struct GoaAccountInfo {
     pub enabled: bool,
 }
 
+/// Whether a mail account can mirror Lookout pins to Outlook's own
+/// MAPI-property pin via Microsoft Graph, and if so, whether it's turned on.
+/// `\Flagged`-driven pinning itself is unaffected by any of these states -
+/// this only governs the "Sync pins with Outlook" row/button.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GraphPinStatus {
+    /// Not a Microsoft 365 account - no row shown.
+    NotApplicable,
+    /// Already consented; pins mirror to Outlook automatically.
+    Enabled,
+    /// A Microsoft 365 account that hasn't opted in yet.
+    NeedsConsent,
+}
+
 /// Plain display data for one mail account, decoupled from window.rs's
 /// private `AccountHandle` so this module has no dependency on the session
 /// types.
@@ -69,6 +83,7 @@ pub struct MailAccountInfo {
     pub imap: String,
     /// Preformatted `host:port`.
     pub smtp: String,
+    pub graph_pin_status: GraphPinStatus,
 }
 
 /// Plain display data for one calendar account.
@@ -611,7 +626,9 @@ pub fn build() -> ConfigView {
 /// gets an "Identities" row whose activation invokes `manage_identities`
 /// with the row's widget (as anchor) and the account's id - the caller owns
 /// the actual dialog. Manual ("other") accounts additionally get Edit and
-/// Remove suffix buttons wired to `edit_other`/`remove_other`.
+/// Remove suffix buttons wired to `edit_other`/`remove_other`; a Microsoft
+/// 365 account with `graph_pin_status == NeedsConsent` gets a "Sync pins
+/// with Outlook" suffix button wired to `enable_graph_pin`.
 #[allow(clippy::too_many_arguments)]
 pub fn refresh(
     view: &ConfigView,
@@ -628,6 +645,7 @@ pub fn refresh(
     manage_identities: &ManageIdentities,
     edit_other: &OtherAccountAction,
     remove_other: &OtherAccountAction,
+    enable_graph_pin: &OtherAccountAction,
     toggle_goa: &AccountToggle,
 ) {
     for row in view.goa_rows.borrow_mut().drain(..) {
@@ -696,6 +714,15 @@ pub fn refresh(
                 }
                 row.add_suffix(&edit_button);
                 row.add_suffix(&remove_button);
+            }
+            if info.graph_pin_status == GraphPinStatus::NeedsConsent {
+                let sync_button = gtk::Button::with_label("Sync pins with Outlook");
+                sync_button.add_css_class("flat");
+                let enable_graph_pin = enable_graph_pin.clone();
+                let row_widget = row.clone();
+                let account_id = info.account_id.clone();
+                sync_button.connect_clicked(move |_| enable_graph_pin(row_widget.upcast_ref::<gtk::Widget>(), &account_id));
+                row.add_suffix(&sync_button);
             }
             push_row(&view.mail_group, &view.mail_rows, row);
             let identities_subtitle = if info.identity_labels.is_empty() {

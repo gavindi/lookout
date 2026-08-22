@@ -15,6 +15,16 @@
 //! only the first connect needs the interactive browser step; every later
 //! connect refreshes the access token silently. Access tokens are cached in
 //! memory and re-fetched only when near expiry.
+//!
+//! The app registration also carries a `Microsoft Graph` → `Mail.ReadWrite`
+//! delegated permission (alongside the Exchange Online IMAP/SMTP ones),
+//! requested only when a user explicitly opts a Microsoft 365 account into
+//! mirroring Lookout pins to Outlook's own MAPI-property pin (see
+//! `graph_pin.rs`) via `ensure_graph_consent`. AAD v2 access tokens are
+//! single-resource, so a Graph-audience token is always minted separately
+//! from the Exchange-audience one - but the refresh token and the underlying
+//! consent grant aren't resource-scoped, so one combined-scope interactive
+//! consent is enough to redeem access tokens for either audience afterwards.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -38,12 +48,54 @@ const CLIENT_ID: &str = "07725d7c-f588-41ae-bdd0-7ee625fed328";
 
 /// Scopes Exchange Online's IMAP/SMTP endpoints require. A token carrying
 /// both works for either protocol (same `outlook.office.com` resource), and
-/// `offline_access` makes the token endpoint return a refresh token.
-const SCOPES: &str = concat!(
+/// `offline_access` makes the token endpoint return a refresh token. This is
+/// the only scope list the *implicit* re-auth path (`access_token`, used by
+/// the IMAP/SMTP session) ever requests - it must never silently grow to
+/// include Graph, since that path can fire in the background (token expiry
+/// recovery) without the user having asked for anything new.
+const EXCHANGE_SCOPES: &str = concat!(
     "offline_access ",
     "https://outlook.office.com/IMAP.AccessAsUser.All ",
     "https://outlook.office.com/SMTP.Send"
 );
+
+/// The Graph scope needed to write MAPI extended properties
+/// (`PR_RENEW_TIME`) on a message, so pinning in Lookout can mirror to
+/// Outlook's own pin - see `graph_pin.rs`. Only ever requested as part of
+/// `COMBINED_SCOPES` below, via the explicit, Config-triggered
+/// `ensure_graph_consent`.
+const GRAPH_SCOPES: &str = concat!("offline_access ", "https://graph.microsoft.com/Mail.ReadWrite");
+
+/// Requested only by `ensure_graph_consent`: a single interactive consent
+/// covering both resources at once, so the resulting refresh token can mint
+/// access tokens for either audience afterwards (a v2.0 refresh token isn't
+/// scope-bound, even though each individual access token it mints is
+/// single-resource).
+const COMBINED_SCOPES: &str = concat!(
+    "offline_access ",
+    "https://outlook.office.com/IMAP.AccessAsUser.All ",
+    "https://outlook.office.com/SMTP.Send ",
+    "https://graph.microsoft.com/Mail.ReadWrite"
+);
+
+/// Which resource a token is being requested for - AAD v2 access tokens are
+/// single-resource, so Exchange (IMAP/SMTP) and Graph tokens are always
+/// minted, cached, and refreshed independently even though they can share
+/// one refresh token once both have been consented.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenAudience {
+    Exchange,
+    Graph,
+}
+
+impl TokenAudience {
+    fn refresh_scopes(self) -> &'static str {
+        match self {
+            TokenAudience::Exchange => EXCHANGE_SCOPES,
+            TokenAudience::Graph => GRAPH_SCOPES,
+        }
+    }
+}
 
 const AUTHORIZE_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
 const TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
@@ -64,6 +116,14 @@ struct TokenResponse {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredToken {
     refresh_token: String,
+    /// Whether this refresh token has actually been proven to redeem a
+    /// Graph-audience access token (set by `ensure_graph_consent` after its
+    /// confirmation refresh succeeds, cleared if a later Graph refresh gets
+    /// rejected - e.g. an admin pulled the permission). `#[serde(default)]`
+    /// so a token file saved before Graph support existed just loads as
+    /// `false`, not a parse error.
+    #[serde(default)]
+    graph_consented: bool,
 }
 
 /// Persists one account's refresh token. Access tokens never touch disk.
@@ -116,24 +176,60 @@ enum RefreshOutcome {
     ReauthNeeded,
 }
 
-/// Manages one Microsoft 365 account's access token, running the interactive
-/// browser flow on first use and refresh-token exchanges afterwards.
+/// Why a Graph-audience token request failed. `ConsentRequired` covers both
+/// "no token at all" and "a token exists but was never (or no longer)
+/// granted `Mail.ReadWrite`" - either way, the caller needs to send the user
+/// through `ensure_graph_consent` before this account can mirror pins to
+/// Outlook.
+pub enum GraphAuthError {
+    ConsentRequired,
+    Transient(String),
+}
+
+impl std::fmt::Display for GraphAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphAuthError::ConsentRequired => write!(f, "Outlook pin sync isn't enabled for this account"),
+            GraphAuthError::Transient(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+/// Manages one Microsoft 365 account's access tokens, running the
+/// interactive browser flow on first use (or on explicit Graph consent) and
+/// refresh-token exchanges afterwards. Exchange and Graph audiences are
+/// cached and refreshed independently (see `TokenAudience`) but share one
+/// on-disk refresh token once both have been consented.
 pub struct MicrosoftOAuth {
     account_id: AccountId,
-    cached: Mutex<Option<(String, Instant)>>,
+    cached_exchange: Mutex<Option<(String, Instant)>>,
+    cached_graph: Mutex<Option<(String, Instant)>>,
 }
 
 impl MicrosoftOAuth {
     pub fn new(account_id: AccountId) -> Self {
         MicrosoftOAuth {
             account_id,
-            cached: Mutex::new(None),
+            cached_exchange: Mutex::new(None),
+            cached_graph: Mutex::new(None),
         }
     }
 
-    /// Returns a fresh access token, cached until ~a minute before expiry.
+    fn cache_slot(&self, audience: TokenAudience) -> &Mutex<Option<(String, Instant)>> {
+        match audience {
+            TokenAudience::Exchange => &self.cached_exchange,
+            TokenAudience::Graph => &self.cached_graph,
+        }
+    }
+
+    /// Returns a fresh Exchange-audience access token (for IMAP/SMTP),
+    /// cached until ~a minute before expiry. Behavior is unchanged from
+    /// before Graph support existed: a rejected stored refresh token is
+    /// permanent, so it's dropped and the account re-authorized against
+    /// `EXCHANGE_SCOPES` alone - this path never asks for the Graph
+    /// permission on its own.
     pub async fn access_token(&self) -> Result<String, String> {
-        if let Some((token, expires_at)) = self.cached.lock().unwrap().clone() {
+        if let Some((token, expires_at)) = self.cache_slot(TokenAudience::Exchange).lock().unwrap().clone() {
             if Instant::now() < expires_at {
                 return Ok(token);
             }
@@ -141,7 +237,7 @@ impl MicrosoftOAuth {
 
         let store = TokenStore::for_account(&self.account_id);
         if let Ok(stored) = store.load() {
-            match self.refresh(&store, &stored.refresh_token).await? {
+            match self.refresh(&store, &stored, TokenAudience::Exchange).await? {
                 RefreshOutcome::AccessToken(token) => return Ok(token),
                 // The token endpoint rejected the stored refresh token
                 // (revoked, expired, or issued for a different client id).
@@ -154,32 +250,131 @@ impl MicrosoftOAuth {
         self.authorize(&store).await
     }
 
-    async fn refresh(&self, store: &TokenStore, refresh_token: &str) -> Result<RefreshOutcome, String> {
+    /// Returns a fresh Graph-audience access token for `graph_pin.rs`, or
+    /// `ConsentRequired` if this account hasn't been through
+    /// `ensure_graph_consent` (or the grant no longer works). Never touches
+    /// the network to pop an interactive consent screen - this is called
+    /// from a background pin action, which must not surprise-launch a
+    /// browser.
+    pub async fn graph_access_token(&self) -> Result<String, GraphAuthError> {
+        if let Some((token, expires_at)) = self.cache_slot(TokenAudience::Graph).lock().unwrap().clone() {
+            if Instant::now() < expires_at {
+                return Ok(token);
+            }
+        }
+
+        let store = TokenStore::for_account(&self.account_id);
+        let stored = store.load().map_err(|_| GraphAuthError::ConsentRequired)?;
+        if !stored.graph_consented {
+            return Err(GraphAuthError::ConsentRequired);
+        }
+        match self.refresh(&store, &stored, TokenAudience::Graph).await {
+            Ok(RefreshOutcome::AccessToken(token)) => Ok(token),
+            Ok(RefreshOutcome::ReauthNeeded) => {
+                // Consent was revoked out of band (e.g. an admin pulled the
+                // permission) - clear the flag so Config offers the
+                // "Sync pins with Outlook" action again, but leave the
+                // refresh token itself alone; the Exchange audience may
+                // still work fine off it.
+                let _ = store.save(&StoredToken {
+                    refresh_token: stored.refresh_token,
+                    graph_consented: false,
+                });
+                Err(GraphAuthError::ConsentRequired)
+            }
+            Err(e) => Err(GraphAuthError::Transient(e)),
+        }
+    }
+
+    /// Synchronous, disk-only check for Config UI - never touches the
+    /// network, so it's safe to call while just building rows.
+    pub fn graph_consented(&self) -> bool {
+        TokenStore::for_account(&self.account_id).load().map(|s| s.graph_consented).unwrap_or(false)
+    }
+
+    /// Runs the interactive PKCE/loopback consent flow requesting both the
+    /// Exchange and Graph scopes at once (`COMBINED_SCOPES`), explicitly
+    /// triggered by Config's "Sync pins with Outlook" action - never called
+    /// automatically. The resulting refresh token replaces whatever was
+    /// stored for this account. Immediately follows up with a Graph-scoped
+    /// refresh (rather than trusting whatever audience the code-exchange's
+    /// own access token happens to be) to confirm the combined consent
+    /// actually redeems a working Graph token on this tenant before
+    /// reporting success.
+    pub async fn ensure_graph_consent(&self) -> Result<(), String> {
+        let store = TokenStore::for_account(&self.account_id);
+        let resp = self.authorize_interactive(COMBINED_SCOPES).await?;
+        let refresh_token = resp.refresh_token.ok_or("Microsoft token response didn't include a refresh token")?;
+        let stored = StoredToken {
+            refresh_token,
+            graph_consented: true,
+        };
+        store.save(&stored)?;
+        match self.refresh(&store, &stored, TokenAudience::Graph).await {
+            Ok(RefreshOutcome::AccessToken(_)) => Ok(()),
+            Ok(RefreshOutcome::ReauthNeeded) => {
+                // The combined grant didn't actually deliver Graph
+                // capability on this tenant - don't leave a false promise
+                // behind (the refresh token itself is still kept: it's
+                // valid for Exchange either way).
+                let _ = store.save(&StoredToken {
+                    refresh_token: stored.refresh_token,
+                    graph_consented: false,
+                });
+                Err("Microsoft granted sign-in but didn't allow the Outlook pin-sync permission - check your organization's app consent policy and try again".to_string())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn refresh(&self, store: &TokenStore, current: &StoredToken, audience: TokenAudience) -> Result<RefreshOutcome, String> {
         let params = [
             ("client_id", CLIENT_ID),
             ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("scope", SCOPES),
+            ("refresh_token", current.refresh_token.as_str()),
+            ("scope", audience.refresh_scopes()),
         ];
         let resp = match post_token_request(&params).await {
-            // A rejected grant is permanent (the token is unusable), so
-            // re-authorize instead of failing; anything else (network, 5xx,
-            // unparseable body) is transient and worth retrying later.
+            // A rejected grant is permanent (the token, or at least this
+            // scope of it, is unusable) - the caller decides what that means
+            // for its audience; anything else (network, 5xx, unparseable
+            // body) is transient and worth retrying later.
             Err(TokenRequestError::Rejected { .. }) => return Ok(RefreshOutcome::ReauthNeeded),
             Err(TokenRequestError::Transient(e)) => return Err(e),
             Ok(resp) => resp,
         };
         if let Some(new_refresh) = resp.refresh_token.filter(|t| !t.is_empty()) {
-            // Microsoft rotates refresh tokens; persist the new one so a
-            // stale stored token can't trigger a silent re-auth later.
-            let _ = store.save(&StoredToken { refresh_token: new_refresh });
+            // Microsoft rotates refresh tokens; persist the new one (keeping
+            // the existing consent flag) so a stale stored token can't
+            // trigger a silent re-auth later.
+            let _ = store.save(&StoredToken {
+                refresh_token: new_refresh,
+                graph_consented: current.graph_consented,
+            });
         }
         let (access_token, expires_in) = (resp.access_token, resp.expires_in);
-        self.cache(access_token.clone(), expires_in);
+        self.cache(audience, access_token.clone(), expires_in);
         Ok(RefreshOutcome::AccessToken(access_token))
     }
 
     async fn authorize(&self, store: &TokenStore) -> Result<String, String> {
+        let resp = self.authorize_interactive(EXCHANGE_SCOPES).await?;
+        let refresh_token = resp.refresh_token.ok_or("Microsoft token response didn't include a refresh token")?;
+        store.save(&StoredToken {
+            refresh_token,
+            graph_consented: false,
+        })?;
+        let (access_token, expires_in) = (resp.access_token, resp.expires_in);
+        self.cache(TokenAudience::Exchange, access_token.clone(), expires_in);
+        Ok(access_token)
+    }
+
+    /// Runs Lookout's interactive PKCE + loopback-redirect authorization
+    /// flow against `scope`, exchanging the resulting code for a token.
+    /// Doesn't touch the token store or the in-memory cache - callers decide
+    /// what to persist, since `ensure_graph_consent`'s combined-scope run
+    /// needs different handling than `authorize`'s single-resource one.
+    async fn authorize_interactive(&self, scope: &str) -> Result<TokenResponse, String> {
         let verifier = pkce_verifier()?;
         let challenge = pkce_challenge(&verifier);
         let state = uuid::Uuid::new_v4().simple().to_string();
@@ -193,7 +388,7 @@ impl MicrosoftOAuth {
             "{AUTHORIZE_URL}?client_id={}&response_type=code&redirect_uri={}&response_mode=query&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
             percent_encode(CLIENT_ID),
             percent_encode(&redirect_uri),
-            percent_encode(SCOPES),
+            percent_encode(scope),
             percent_encode(&state),
             percent_encode(&challenge),
         );
@@ -211,17 +406,12 @@ impl MicrosoftOAuth {
             ("redirect_uri", redirect_uri.as_str()),
             ("code_verifier", verifier.as_str()),
         ];
-        let resp = post_token_request(&params).await.map_err(|e| e.to_string())?;
-        let refresh_token = resp.refresh_token.ok_or("Microsoft token response didn't include a refresh token")?;
-        store.save(&StoredToken { refresh_token })?;
-        let (access_token, expires_in) = (resp.access_token, resp.expires_in);
-        self.cache(access_token.clone(), expires_in);
-        Ok(access_token)
+        post_token_request(&params).await.map_err(|e| e.to_string())
     }
 
-    fn cache(&self, token: String, expires_in: u64) {
+    fn cache(&self, audience: TokenAudience, token: String, expires_in: u64) {
         let expires_at = Instant::now() + Duration::from_secs(expires_in.saturating_sub(60));
-        *self.cached.lock().unwrap() = Some((token, expires_at));
+        *self.cache_slot(audience).lock().unwrap() = Some((token, expires_at));
     }
 }
 
@@ -504,10 +694,12 @@ mod tests {
         store
             .save(&StoredToken {
                 refresh_token: "rt-123".to_string(),
+                graph_consented: true,
             })
             .unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.refresh_token, "rt-123");
+        assert!(loaded.graph_consented);
 
         #[cfg(unix)]
         {
@@ -516,6 +708,29 @@ mod tests {
             assert_eq!(mode, 0o600, "refresh tokens must be stored 0600");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stored_token_without_graph_consented_field_defaults_to_false() {
+        // A token file saved before Graph support existed has no
+        // `graph_consented` key at all - it must still load rather than
+        // fail to parse, and default to "not consented".
+        let dir = std::env::temp_dir().join(format!("lookout-oauth-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("acct.json");
+        std::fs::write(&path, r#"{"refresh_token":"rt-legacy"}"#).unwrap();
+        let store = TokenStore::at(path);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.refresh_token, "rt-legacy");
+        assert!(!loaded.graph_consented);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn token_audience_selects_distinct_scopes() {
+        assert_eq!(TokenAudience::Exchange.refresh_scopes(), EXCHANGE_SCOPES);
+        assert_eq!(TokenAudience::Graph.refresh_scopes(), GRAPH_SCOPES);
+        assert_ne!(TokenAudience::Exchange.refresh_scopes(), TokenAudience::Graph.refresh_scopes());
     }
 
     #[test]

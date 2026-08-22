@@ -69,6 +69,17 @@ pub(crate) struct AccountHandle {
     /// `spawn_cache_read`, and `Cache` is already `Send + Sync` (its
     /// connection is `Mutex`-guarded), so `Arc` is what makes that possible.
     pub(crate) address_cache: Option<Arc<lookout_mail::Cache>>,
+    /// Present only for Microsoft 365 accounts - lets pin/unpin mirror to
+    /// Outlook's own MAPI-property pin via Graph, alongside (never instead
+    /// of) the IMAP `\Flagged` toggle that remains this app's own source of
+    /// truth. `None` for every other account, which is the entire guarantee
+    /// that non-M365 accounts see zero behavior change from this feature -
+    /// see `mirror_pin_to_graph`. An independent `MicrosoftOAuth` instance
+    /// from the one wrapped in `SendWrapper` for the session actor in
+    /// `connect_account` (that one is handed to the worker thread and never
+    /// touched from the GTK thread again); both safely share the same
+    /// on-disk token file via its atomic tmp+rename save.
+    pub(crate) graph_pin: Option<Rc<crate::graph_pin::GraphPinClient>>,
 }
 
 /// One GNOME Online Accounts account as discovered at startup, keeping the
@@ -6010,6 +6021,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         .collect(),
                     imap: format!("{}:{}", h.imap_host, h.imap_port),
                     smtp: format!("{}:{}", h.smtp_host, h.smtp_port),
+                    graph_pin_status: match &h.graph_pin {
+                        None => crate::config_view::GraphPinStatus::NotApplicable,
+                        Some(client) if client.consented() => crate::config_view::GraphPinStatus::Enabled,
+                        Some(_) => crate::config_view::GraphPinStatus::NeedsConsent,
+                    },
                 })
                 .collect();
             let webcal_list = st.app_config.borrow().webcal_subscriptions.clone();
@@ -6187,6 +6203,35 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     refresh();
                 })
             };
+            // Config's "Sync pins with Outlook" action for a Microsoft 365
+            // account that hasn't opted in yet - runs the interactive Graph
+            // consent flow and, on success, re-runs this closure so the row
+            // redraws without the button. Declining is simply not clicking
+            // it: `\Flagged`-driven pinning is unaffected either way.
+            let enable_graph_pin: crate::config_view::OtherAccountAction = {
+                let state = state.clone();
+                let toast_overlay = toast_overlay.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |_anchor, account_id: &str| {
+                    let Some(client) = state.borrow().accounts.get(&AccountId(account_id.to_string())).and_then(|h| h.graph_pin.clone()) else {
+                        return;
+                    };
+                    let toast_overlay = toast_overlay.clone();
+                    let refresh_hook = refresh_hook.clone();
+                    glib::spawn_future_local(async move {
+                        match client.ensure_consent().await {
+                            Ok(()) => {
+                                toast_overlay.add_toast(adw::Toast::new("Outlook pin sync enabled"));
+                                let refresh = refresh_hook.borrow().clone();
+                                refresh();
+                            }
+                            Err(e) => {
+                                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't enable Outlook pin sync: {e}")));
+                            }
+                        }
+                    });
+                })
+            };
             // The GOA enable/disable switches: persist the preference, then
             // connect the account's services back up (enable) or tear them
             // down and hide everything (disable).
@@ -6310,6 +6355,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &manage_identities,
                 &edit_other,
                 &remove_other,
+                &enable_graph_pin,
                 &toggle_goa,
             );
         }
@@ -7805,7 +7851,8 @@ fn connect_account(
             username: account.smtp.username.clone(),
         },
     };
-    let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = if account.is_microsoft_365() {
+    let is_microsoft_365 = account.is_microsoft_365();
+    let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = if is_microsoft_365 {
         // GOA's Microsoft 365 token carries only Microsoft Graph scopes and
         // can't authenticate to Exchange Online IMAP/SMTP (verified live), so
         // Microsoft accounts use Lookout's own OAuth2 flow instead - see
@@ -7858,6 +7905,9 @@ fn connect_account(
             // file; whichever gets there first wins, and until either lands
             // the field just means no composer suggestions yet.
             address_cache: None,
+            // Independent of the `credentials` provider constructed above -
+            // see the field's own doc comment on `AccountHandle`.
+            graph_pin: is_microsoft_365.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
         },
     );
     {
@@ -8567,6 +8617,10 @@ fn connect_other_account(
             // file; whichever gets there first wins, and until either lands
             // the field just means no composer suggestions yet.
             address_cache: None,
+            // Manual ("other") accounts are never Microsoft 365 - Graph pin
+            // mirroring only ever applies to GOA-discovered M365 accounts,
+            // wired in `connect_account`.
+            graph_pin: None,
         },
     );
     {
@@ -12709,6 +12763,7 @@ fn optimistic_toggle_pinned(state: &Rc<RefCell<UiState>>, message_list: &Message
     if before.is_empty() {
         return;
     }
+    mirror_pin_to_graph(state, mailbox, &before, pinned);
     let (key, descending) = current_sort(state);
     message_list.repopulate(all, key, descending);
     let mut st = state.borrow_mut();
@@ -12722,6 +12777,52 @@ fn optimistic_toggle_pinned(state: &Rc<RefCell<UiState>>, message_list: &Message
         }
     }
     st.pending_optimistic_pinned_changes.entry(mailbox.clone()).or_default().extend(before);
+}
+
+/// Best-effort side channel alongside the IMAP `\Flagged` toggle in
+/// `optimistic_toggle_pinned`: on Microsoft 365 accounts that have opted
+/// into Graph pin-mirroring (see `AccountHandle::graph_pin`, set up from
+/// Config's "Sync pins with Outlook" action), also write `PR_RENEW_TIME` via
+/// Graph so Outlook's own pin reflects the change. The single early return
+/// below for accounts without a `graph_pin` client is the entire guarantee
+/// that every non-opted-in account - which is every account except
+/// Microsoft 365 ones with sync explicitly enabled - sees zero behavior
+/// change from this feature.
+///
+/// Fired at optimistic-toggle time rather than gated on `StoreFlagsMany`
+/// actually succeeding: this matches the optimistic-UI pattern the rest of
+/// this file uses, and avoids threading a new Microsoft-only confirmation
+/// event through the protocol-agnostic `crates/mail` session actor. A rare
+/// IMAP-side rollback can leave the Graph mirror briefly stale until the
+/// next pin action.
+fn mirror_pin_to_graph(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, before: &[EmailSummary], pinned: bool) {
+    let Some(account_id) = mailbox_account_id(mailbox) else { return };
+    let Some(client) = state.borrow().accounts.get(&account_id).and_then(|h| h.graph_pin.clone()) else {
+        return;
+    };
+    for m in before {
+        let Some(message_id) = m.message_id.clone() else { continue };
+        let client = client.clone();
+        let original_date = m.date;
+        glib::spawn_future_local(async move {
+            if let Err(e) = client.set_pinned(&message_id, original_date, pinned).await {
+                match e {
+                    // Expected for most Microsoft 365 accounts (sync isn't
+                    // enabled) or a message Graph hasn't indexed yet - quiet
+                    // on purpose, never surfaced as a pin failure.
+                    crate::graph_pin::GraphPinError::ConsentRequired => {
+                        tracing::debug!("skipping Outlook pin mirror for {message_id}: Graph pin sync isn't enabled for this account");
+                    }
+                    crate::graph_pin::GraphPinError::MessageNotFound => {
+                        tracing::debug!("skipping Outlook pin mirror for {message_id}: no matching Graph message found");
+                    }
+                    crate::graph_pin::GraphPinError::Http(msg) => {
+                        tracing::warn!("Outlook pin mirror failed for {message_id}: {msg}");
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Undoes `optimistic_toggle_pinned` for `mailbox`/`uids` after a
@@ -15400,6 +15501,7 @@ mod tests {
                         smtp_port: 465,
                         folders,
                         address_cache: None,
+                        graph_pin: None,
                     },
                 )
             })
