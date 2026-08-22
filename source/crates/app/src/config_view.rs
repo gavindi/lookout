@@ -202,6 +202,10 @@ pub struct ConfigView {
     /// wire its `active` state into the `Gio::Notification` new-mail/send-
     /// failure notifications.
     pub mail_notifications_row: adw::SwitchRow,
+    /// "Dock badge" switch (Config → Mail), exposed so the caller can wire
+    /// its `active` state into the Unity LauncherEntry dock badge (the
+    /// Ubuntu dock's unread-count overlay).
+    pub dock_badge_row: adw::SwitchRow,
     /// "Event alerts" switch (Config → Calendar), exposed so the caller can
     /// wire its `active` state into the `Gio::Notification` reminder
     /// scheduling.
@@ -407,6 +411,12 @@ pub fn build() -> ConfigView {
         .active(true)
         .build();
     mail_settings_group.add(&mail_notifications_row);
+    let dock_badge_row = adw::SwitchRow::builder()
+        .title("Dock badge")
+        .subtitle("Show the total unread count on the app icon in the dock")
+        .active(true)
+        .build();
+    mail_settings_group.add(&dock_badge_row);
 
     // The real "Calendar" group, replacing that section's placeholder: the
     // event-alerts toggle, wired by the caller into the `Gio::Notification`
@@ -598,6 +608,7 @@ pub fn build() -> ConfigView {
         rich_text_row,
         read_receipts_row,
         mail_notifications_row,
+        dock_badge_row,
         calendar_alerts_row,
         google_tasks_client_row,
         keyboard_rows: RefCell::new(keyboard_rows),

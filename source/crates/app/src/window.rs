@@ -5472,6 +5472,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Dock badge": gates the Unity LauncherEntry unread
+    // badge. Republishing on the flip (rather than waiting for the next
+    // `FoldersUpdated`) shows the badge the moment it's enabled, and
+    // `publish_dock_badge` sends zero - hiding the badge - the moment it's
+    // disabled. The next `rebuild_folder_tree` keeps it in sync after that.
+    {
+        let state = state.clone();
+        config_view.dock_badge_row.connect_active_notify(move |_row| {
+            publish_dock_badge(&state);
+        });
+    }
+
     // Config → Calendar → "Event alerts": gates the reminder loop. The loop
     // (see `reminders::spawn_reminder_loop`) reads the key on every tick, so
     // nothing needs re-arming here - disabling mid-session simply stops new
@@ -5530,6 +5542,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .mail_notifications_row
             .set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
+        config_view.dock_badge_row.set_active(persisted.get_bool(crate::settings::DOCK_BADGE_ENABLED));
         config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
         // "Start Lookout at login": the setting is the source of truth for
         // the portal path; the managed XDG file is the fallback, so an
@@ -13029,6 +13042,27 @@ fn folder_tree_signature(accounts: &[(AccountId, String, Vec<Mailbox>)], favorit
     signature
 }
 
+/// The Unity LauncherEntry dock badge's current number: the summed Inbox
+/// unread count across every connected account - exactly the number the
+/// folder pane's "All Inboxes" row shows - or zero/hidden when the Config
+/// toggle is off. Called on folder rebuilds (the only thing that changes
+/// the underlying counts) and on the toggle flipping; `launcher_entry`
+/// dedupes unchanged values and fails silently without a bus or a dock
+/// that speaks the protocol.
+fn publish_dock_badge(state: &Rc<RefCell<UiState>>) {
+    if !state.borrow().settings.get_bool(crate::settings::DOCK_BADGE_ENABLED) {
+        crate::launcher_entry::set_unread_count(0);
+        return;
+    }
+    let total: u32 = state
+        .borrow()
+        .accounts
+        .values()
+        .filter_map(|handle| handle.folders.iter().find(|m| matches!(m.role, MailboxRole::Inbox)).map(|m| m.unread))
+        .sum();
+    crate::launcher_entry::set_unread_count(total);
+}
+
 /// Rebuilds the folder sidebar's `Gtk.TreeListModel` from every connected
 /// account's latest folder snapshot. Accounts are sorted by email for a
 /// stable order across rebuilds (`HashMap` iteration order isn't stable,
@@ -13112,6 +13146,9 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
             return;
         }
     }
+    // The signature guards unread counts too, so a rebuild that got this
+    // far means the badge's number changed - republish it.
+    publish_dock_badge(state);
 
     // The selection, the expanded subfolders, the account groups' collapse
     // state, and the scroll position don't survive `set_model`, so note them

@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.91" date="2026-08-22">
+      <description>
+        <p>The app icon in the dock now shows a badge with the total unread email count - the same number as the "All Inboxes" folder - with a Config → Mail toggle to hide it. Works on Ubuntu's dock and other launchers that speak the Unity LauncherEntry protocol.</p>
+      </description>
+    </release>
     <release version="0.9.90" date="2026-08-22">
       <description>
         <p>Pinning a message on a Microsoft 365 account now also pins it in Outlook itself, via an opt-in "Sync pins with Outlook" button in Settings - Lookout's own pinning still works exactly as before either way.</p>

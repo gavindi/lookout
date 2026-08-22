@@ -19,6 +19,7 @@ mod google_tasks;
 mod graph_pin;
 mod identities;
 mod last_view;
+mod launcher_entry;
 mod lookout_view;
 mod mail_notifications;
 mod message_header;
@@ -64,6 +65,10 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     let worker = Rc::new(worker::Worker::new());
+    // The dock badge's D-Bus work needs the worker's tokio reactor (the UI
+    // thread's GLib context has none - see `launcher_entry`); hand the
+    // handle over before any window code can publish a count.
+    crate::launcher_entry::init(&worker);
 
     // The autostart entry launches `lookout --hidden`: build the window but
     // don't present it, so mail/calendar sync and the reminder loop run from

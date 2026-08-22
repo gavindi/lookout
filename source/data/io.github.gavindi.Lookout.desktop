@@ -9,3 +9,4 @@ Terminal=false
 Categories=GNOME;GTK;Network;Email;
 Keywords=Mail;Email;IMAP;SMTP;
 StartupNotify=true
+StartupWMClass=lookout

@@ -142,6 +142,11 @@
       <summary>Mail notifications</summary>
       <description>Show a desktop notification when new mail arrives or a send fails.</description>
     </key>
+    <key name="dock-badge-enabled" type="b">
+      <default>true</default>
+      <summary>Dock badge</summary>
+      <description>Show the total unread count on the app icon in the dock (Ubuntu's Unity LauncherEntry badge).</description>
+    </key>
 
     <!-- Calendar -->
     <key name="calendar-alerts-enabled" type="b">

@@ -28,6 +28,10 @@ impl Worker {
         Worker { handle, _thread: thread }
     }
 
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.handle.clone()
+    }
+
     pub fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
