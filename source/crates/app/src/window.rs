@@ -5552,9 +5552,80 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             refresh_unread_indicators(&state);
         });
     }
+
+    // Config → Advanced → "Aggressive prefetch": writes every control through
+    // to GSettings, re-sends the assembled `PrefetchPolicy` to all account
+    // sessions (applied live on each session's next main-loop iteration), and
+    // greys the frequency/limit rows while the switch is off - "off" always
+    // means the cooperative default, whatever the rows hold. Seeding below
+    // fires these handlers too, which is what pushes the stored policy to the
+    // sessions at startup.
+    {
+        let send_policy = {
+            let state = state.clone();
+            move || {
+                let policy = state.borrow().settings.prefetch_policy();
+                for handle in state.borrow().accounts.values() {
+                    let _ = handle.cmd_tx.send_blocking(lookout_mail::session::AccountCommand::SetPrefetchPolicy(policy));
+                }
+            }
+        };
+        let interval_row = config_view.prefetch_interval_row.clone();
+        let limit_row = config_view.prefetch_limit_row.clone();
+        let batch_row = config_view.prefetch_batch_row.clone();
+        let refresh_row = config_view.prefetch_refresh_row.clone();
+        {
+            let state = state.clone();
+            let send_policy = send_policy.clone();
+            let interval_row = interval_row.clone();
+            let limit_row = limit_row.clone();
+            let batch_row = batch_row.clone();
+            let refresh_row = refresh_row.clone();
+            config_view.aggressive_prefetch_row.connect_active_notify(move |row| {
+                state.borrow().settings.set_bool(crate::settings::PREFETCH_AGGRESSIVE, row.is_active());
+                let enabled = row.is_active();
+                interval_row.set_sensitive(enabled);
+                limit_row.set_sensitive(enabled);
+                batch_row.set_sensitive(enabled);
+                refresh_row.set_sensitive(enabled);
+                send_policy();
+            });
+        }
+        {
+            let state = state.clone();
+            let send_policy = send_policy.clone();
+            interval_row.connect_value_notify(move |row| {
+                state.borrow().settings.set_int(crate::settings::PREFETCH_BATCH_INTERVAL_SECONDS, row.value() as i32);
+                send_policy();
+            });
+        }
+        {
+            let state = state.clone();
+            let send_policy = send_policy.clone();
+            limit_row.connect_value_notify(move |row| {
+                state.borrow().settings.set_int(crate::settings::PREFETCH_FOLDER_LIMIT, row.value() as i32);
+                send_policy();
+            });
+        }
+        {
+            let state = state.clone();
+            let send_policy = send_policy.clone();
+            batch_row.connect_value_notify(move |row| {
+                state.borrow().settings.set_int(crate::settings::PREFETCH_BATCH_SIZE, row.value() as i32);
+                send_policy();
+            });
+        }
+        {
+            let state = state.clone();
+            let send_policy = send_policy;
+            refresh_row.connect_value_notify(move |row| {
+                state.borrow().settings.set_int(crate::settings::PREFETCH_REFRESH_INTERVAL_MINUTES, row.value() as i32);
+                send_policy();
+            });
+        }
+    }
+
     // The tray's menu/click actions all target widgets this window owns, so
-    // they're dispatched here on the GLib main context (the tray service
-    // itself runs on the worker's tokio runtime; see `tray.rs`).
     {
         let app = app.clone();
         let state = state.clone();
@@ -5624,6 +5695,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .spacing_row
             .set_selected(crate::settings::spacing_index(&persisted.get_string(crate::settings::LAYOUT_SPACING)));
+        // Advanced → "Aggressive prefetch": seeding fires the notify handlers
+        // above - the switch's handler re-applies the rows' sensitivity and
+        // every handler re-sends the assembled `PrefetchPolicy` to the
+        // account sessions, so startup always pushes the stored policy (and a
+        // freshly-discovered account gets it on its first `FoldersUpdated`).
+        config_view.aggressive_prefetch_row.set_active(persisted.get_bool(crate::settings::PREFETCH_AGGRESSIVE));
+        config_view
+            .prefetch_interval_row
+            .set_value(persisted.get_int(crate::settings::PREFETCH_BATCH_INTERVAL_SECONDS) as f64);
+        config_view
+            .prefetch_limit_row
+            .set_value(persisted.get_int(crate::settings::PREFETCH_FOLDER_LIMIT) as f64);
+        config_view
+            .prefetch_batch_row
+            .set_value(persisted.get_int(crate::settings::PREFETCH_BATCH_SIZE) as f64);
+        config_view
+            .prefetch_refresh_row
+            .set_value(persisted.get_int(crate::settings::PREFETCH_REFRESH_INTERVAL_MINUTES) as f64);
     }
 
     {
@@ -8125,6 +8214,19 @@ fn spawn_account_event_loop(
                             // them so a later request for the same mailbox isn't
                             // wrongly suppressed by an entry that'll never resolve.
                             st.syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
+                        }
+                        // Fresh folder list also means a brand-new session: re-send
+                        // the stored prefetch policy (Config → Advanced →
+                        // "Aggressive prefetch") so a reconnect never leaves the
+                        // session on the cooperative default when the user enabled
+                        // aggressive prefetch.
+                        {
+                            let policy = state.borrow().settings.prefetch_policy();
+                            if let Some(handle) = state.borrow().accounts.get(&account_id) {
+                                let _ = handle
+                                    .cmd_tx
+                                    .send_blocking(lookout_mail::session::AccountCommand::SetPrefetchPolicy(policy));
+                            }
                         }
                         rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
                         // Folder names and account labels only exist once this

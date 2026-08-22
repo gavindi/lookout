@@ -28,7 +28,10 @@ use crate::send::{build_raw_message, send_smtp, ComposedMessage};
 /// CONDSTORE connections the steady-state sync is itself a `CHANGEDSINCE`
 /// delta (see `sync_mailbox`); with QRESYNC enabled the wake's `SELECT
 /// (QRESYNC ...)` additionally reports expunged UIDs via `VANISHED`,
-/// replacing the delta path's `UID SEARCH ALL` membership pass.
+/// replacing the delta path's `UID SEARCH ALL` membership pass. This is the
+/// aggressive-off default; Config → Advanced's "Messages per folder"
+/// ([`PrefetchPolicy::folder_limit`]) replaces it when aggressive prefetch
+/// is on.
 const INITIAL_FETCH_LIMIT: u32 = 200;
 
 /// How long a single IDLE wait runs before we re-enter it purely as a
@@ -75,7 +78,9 @@ const PREVIEW_FETCH_BYTES: u32 = 16384;
 /// queue behind. Was 10 ("a few seconds" per batch by the old target), which
 /// reads as a UI stall; this is small enough to keep each batch close to a
 /// second, still large enough to make real progress across hundreds of
-/// messages.
+/// messages. This is the aggressive-off default; Config → Advanced's "Bodies
+/// per batch" ([`PrefetchPolicy::batch_size`]) replaces it when aggressive
+/// prefetch is on.
 const PREFETCH_BATCH_SIZE: usize = 3;
 
 /// How many bytes of sequence-set syntax one `UID`-prefixed command line may
@@ -105,6 +110,9 @@ struct PrefetchState {
     /// pass so the body fetches can be text-parts-only (see
     /// `fetch_body_partial`) instead of whole-message downloads.
     structures: HashMap<Uid, Vec<BodyPart>>,
+    /// When this pass started, so aggressive prefetch can restart the whole
+    /// pass once `refresh_interval` elapses.
+    started: std::time::Instant,
 }
 
 impl PrefetchState {
@@ -117,6 +125,7 @@ impl PrefetchState {
             envelopes_fetched: false,
             current_folder_name: String::new(),
             structures: HashMap::new(),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -131,6 +140,44 @@ impl PrefetchState {
         self.envelopes_fetched = false;
         self.current_folder_name.clear();
         self.structures.clear();
+    }
+}
+
+/// The background body prefetch's behavior, settable live from the app (Config
+/// → Advanced → "Aggressive prefetch") via [`AccountCommand::SetPrefetchPolicy`].
+/// `Default` is the app's original cooperative pass: one batch per main-loop
+/// iteration paced by IDLE wakes, the newest [`INITIAL_FETCH_LIMIT`] messages
+/// per folder, [`PREFETCH_BATCH_SIZE`] bodies per round trip, no re-scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefetchPolicy {
+    /// Whether the aggressive mode is on. Off means `Default` behavior even
+    /// if the other fields carry non-default values.
+    pub aggressive: bool,
+    /// How long the session waits between prefetch batches while aggressive
+    /// (the IDLE slice during the pass) - a quiet session wakes this often to
+    /// run the next batch instead of waiting for user activity.
+    pub batch_interval: std::time::Duration,
+    /// How many of a folder's newest messages the prefetch warms up. Replaces
+    /// [`INITIAL_FETCH_LIMIT`] when aggressive.
+    pub folder_limit: u32,
+    /// Message bodies per prefetch round trip. Replaces
+    /// [`PREFETCH_BATCH_SIZE`] when aggressive.
+    pub batch_size: usize,
+    /// How often the whole prefetch pass re-runs while aggressive, so mail
+    /// that arrived in unopened folders gets its bodies cached too. The
+    /// pass restarts when this elapses after the previous pass started.
+    pub refresh_interval: std::time::Duration,
+}
+
+impl Default for PrefetchPolicy {
+    fn default() -> Self {
+        Self {
+            aggressive: false,
+            batch_interval: Duration::from_secs(30),
+            folder_limit: INITIAL_FETCH_LIMIT,
+            batch_size: PREFETCH_BATCH_SIZE,
+            refresh_interval: Duration::from_secs(60 * 60),
+        }
     }
 }
 
@@ -200,6 +247,14 @@ pub enum AccountCommand {
     /// `Gio.NetworkMonitor` reporting connectivity just came back. A no-op
     /// if the session is already connected (nothing to reconnect).
     Reconnect,
+    /// Update the background body prefetch's behavior live (Config → Advanced
+    /// → "Aggressive prefetch"). Applied on the next main-loop iteration:
+    /// the batch interval reshapes the IDLE slice, the per-folder limit the
+    /// next envelope pass, the batch size the next batch, and the refresh
+    /// interval the next pass restart. Sent again by the app on every change
+    /// and on every (re)connect, so a reconnect never leaves a stale policy
+    /// in place.
+    SetPrefetchPolicy(PrefetchPolicy),
     /// Moves a message from its current mailbox into the account's mailbox
     /// with the given special-use role (Trash for Delete, Archive for
     /// Archive, Junk for Report-as-junk) - via IMAP MOVE (RFC 6851) if the
@@ -739,6 +794,12 @@ async fn connect_and_run(
         Some(PrefetchState::new(prefetch_mailboxes))
     };
 
+    // The background prefetch's behavior, live-updatable from the app via
+    // `SetPrefetchPolicy` (Config → Advanced → "Aggressive prefetch"). Starts
+    // at the cooperative default; the app re-sends the stored policy on
+    // startup, on every settings change, and on every (re)connect.
+    let mut prefetch_policy = PrefetchPolicy::default();
+
     // What ended a main-loop iteration's wait. Declared outside the loop
     // because the wait itself is now conditional - a command already sitting
     // in the queue produces a `Wake` without any IDLE at all.
@@ -799,7 +860,18 @@ async fn connect_and_run(
 
                     let mut handle = session.idle();
                     handle.init().await?;
-                    let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
+                    // Aggressive prefetch paces the session with a short IDLE
+                    // slice so batches keep flowing on a quiet session (a
+                    // timeout wake runs the next prefetch batch), and the
+                    // short slice also keeps the periodic re-scan tick alive
+                    // once a pass is done. Otherwise the wait is the usual
+                    // keepalive slice.
+                    let slice = if prefetch_policy.aggressive {
+                        prefetch_policy.batch_interval
+                    } else {
+                        IDLE_SLICE
+                    };
+                    let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
 
                     // Race the IDLE wait against the next command so an on-demand
                     // request (open a message, switch folders, ...) doesn't wait for
@@ -1349,6 +1421,9 @@ async fn connect_and_run(
                 // only does something useful while backed off between
                 // connection attempts, see `run_account_session`.
                 AccountCommand::Reconnect => {}
+                AccountCommand::SetPrefetchPolicy(policy) => {
+                    prefetch_policy = policy;
+                }
                 AccountCommand::MoveMessage { mailbox, uid, role } => {
                     let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
                         continue;
@@ -2057,6 +2132,25 @@ async fn connect_and_run(
         // back to IDLE, so user actions (message clicks, folder switches)
         // are never starved.
         let mut did_prefetch_work = false;
+
+        // Aggressive prefetch re-scans on a timer: once a pass is done and
+        // `refresh_interval` has elapsed since it started, restart it over
+        // the whole folder list so mail that arrived in unopened folders
+        // gets its bodies cached too. The short aggressive IDLE slice keeps
+        // this tick firing on a quiet session. Already-cached bodies are
+        // filtered out by the envelope pass's `has_bodies` query, so a re-run
+        // over warm folders is one SELECT + envelope fetch per folder, not a
+        // re-download.
+        if let Some(pf) = prefetch.as_ref() {
+            if pf.is_done() && prefetch_policy.aggressive && pf.started.elapsed() >= prefetch_policy.refresh_interval {
+                let mailboxes: Vec<MailboxId> = folders.iter().filter(|m| m.id != inbox_id).map(|m| m.id.clone()).collect();
+                if !mailboxes.is_empty() {
+                    tracing::info!(count = mailboxes.len(), "restarting background body prefetch");
+                    prefetch = Some(PrefetchState::new(mailboxes));
+                }
+            }
+        }
+
         if let Some(pf) = prefetch.as_mut() {
             if !pf.is_done() {
                 // Check before starting any batch work (SELECT, envelope
@@ -2102,7 +2196,7 @@ async fn connect_and_run(
                             f.highest_modseq = Some(modseq);
                         }
                     }
-                    let fetch_from = mailbox_meta.exists.saturating_sub(INITIAL_FETCH_LIMIT - 1).max(1);
+                    let fetch_from = mailbox_meta.exists.saturating_sub(prefetch_policy.folder_limit.saturating_sub(1)).max(1);
                     let seq_range = format!("{fetch_from}:*");
                     let started = std::time::Instant::now();
                     let fetches: Vec<_> = session.fetch(&seq_range, "(UID BODYSTRUCTURE)").await?.try_collect().await?;
@@ -2126,9 +2220,9 @@ async fn connect_and_run(
                     .unwrap_or_default();
                     uids.retain(|uid| !have.contains(uid));
 
-                    // Remember each still-wanted uid's part structure (only
-                    // the newest `INITIAL_FETCH_LIMIT`'s worth) so its body
-                    // fetch skips attachments entirely.
+                    // Remember each still-wanted uid's part structure (only the
+                    // per-folder limit's worth) so its body fetch skips
+                    // attachments entirely.
                     pf.structures.clear();
                     for fetch in &fetches {
                         let (Some(uid), Some(structure)) = (fetch.uid.map(Uid), fetch.bodystructure()) else {
@@ -2150,16 +2244,18 @@ async fn connect_and_run(
                     did_prefetch_work = true;
                 }
 
-                // Fetch up to PREFETCH_BATCH_SIZE bodies in **one** `UID
+                // Fetch up to the policy's batch size bodies in **one** `UID
                 // FETCH` round trip (see `fetch_bodies_batch`), yielding to
                 // user commands between batches so they are never blocked for
-                // more than one batch's transfer.
+                // more than one batch's transfer. The default batch size is
+                // `PREFETCH_BATCH_SIZE`; aggressive prefetch lets the user
+                // raise it.
                 if !pf.pending_uids.is_empty() {
                     // Check before starting the batch fetch.
                     if !commands.is_empty() {
                         continue;
                     }
-                    let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(PREFETCH_BATCH_SIZE)).collect();
+                    let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(prefetch_policy.batch_size)).collect();
                     let batch_len = batch.len();
                     let started = std::time::Instant::now();
                     let fetched = match fetch_bodies_batch(
@@ -3799,9 +3895,10 @@ async fn fetch_bodies_batch(
         }
         query.push(')');
 
-        // The prefetch caller's batch is at most `PREFETCH_BATCH_SIZE` uids,
-        // so this is always a single (range-compressed) chunk there; the
-        // on-demand caller's batch has no such fixed cap, so every chunk
+        // The prefetch caller's batch is at most its policy's batch size
+        // (aggressive prefetch lets the user raise it), which still lands
+        // in a single (range-compressed) chunk for any sane value; the
+        // on-demand caller's batch has no cap, so every chunk
         // `uid_set_chunks` produces gets its own round trip rather than
         // assuming there's only one.
         let mut fetches = Vec::new();

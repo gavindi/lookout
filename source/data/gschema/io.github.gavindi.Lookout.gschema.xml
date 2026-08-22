@@ -167,6 +167,37 @@
       <description>One 'action=accelerator' entry per action overriding the built-in default, e.g. 'compose=&lt;Primary&gt;n'. An empty array means all built-in defaults.</description>
     </key>
 
+    <!-- Advanced -->
+    <key name="prefetch-aggressive" type="b">
+      <default>false</default>
+      <summary>Aggressive background prefetch</summary>
+      <description>When on, the background body prefetch runs more eagerly: batches fire on a short timer instead of waiting for activity, more of each folder is warmed, and the whole pass re-scans periodically. Uses more bandwidth and server connections.</description>
+    </key>
+    <key name="prefetch-batch-interval-seconds" type="i">
+      <range min="5" max="300"/>
+      <default>30</default>
+      <summary>Seconds between prefetch batches</summary>
+      <description>How often the background body prefetch runs a batch while aggressive prefetch is enabled. Lower values download bodies faster but use more bandwidth.</description>
+    </key>
+    <key name="prefetch-folder-limit" type="i">
+      <range min="10" max="5000"/>
+      <default>200</default>
+      <summary>Messages prefetched per folder</summary>
+      <description>How many of the newest messages in each folder get their bodies downloaded during aggressive prefetch; older messages still fetch on demand.</description>
+    </key>
+    <key name="prefetch-batch-size" type="i">
+      <range min="1" max="100"/>
+      <default>3</default>
+      <summary>Message bodies per prefetch batch</summary>
+      <description>How many message bodies each prefetch round trip downloads. Larger batches download faster but each one is a round trip a user command can queue behind.</description>
+    </key>
+    <key name="prefetch-refresh-interval-minutes" type="i">
+      <range min="5" max="240"/>
+      <default>60</default>
+      <summary>Minutes between prefetch re-scans</summary>
+      <description>How often the aggressive prefetch re-scans every folder, so mail that arrived in unopened folders gets its bodies cached too.</description>
+    </key>
+
     <!-- Session memory -->
     <key name="last-view-unified" type="b">
       <default>false</default>

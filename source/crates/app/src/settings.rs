@@ -77,14 +77,32 @@ pub const TRAY_ICON_ENABLED: &str = "tray-icon-enabled";
 pub const SHORTCUTS: &str = "shortcuts";
 pub const LAST_VIEW_UNIFIED: &str = "last-view-unified";
 pub const LAST_VIEW_MAILBOX: &str = "last-view-mailbox";
+/// Config → Advanced → "Aggressive prefetch": whether the background body
+/// prefetch runs eagerly (short batch timer, larger per-folder warm-up,
+/// periodic full-pass re-scans) instead of one cooperative pass per session.
+pub const PREFETCH_AGGRESSIVE: &str = "prefetch-aggressive";
+/// Config → Advanced → "Aggressive prefetch" → "Batch interval": seconds
+/// between prefetch batches while aggressive prefetch is enabled.
+pub const PREFETCH_BATCH_INTERVAL_SECONDS: &str = "prefetch-batch-interval-seconds";
+/// Config → Advanced → "Aggressive prefetch" → "Messages per folder": how
+/// many of a folder's newest messages the prefetch warms up.
+pub const PREFETCH_FOLDER_LIMIT: &str = "prefetch-folder-limit";
+/// Config → Advanced → "Aggressive prefetch" → "Bodies per batch": message
+/// bodies each prefetch round trip downloads.
+pub const PREFETCH_BATCH_SIZE: &str = "prefetch-batch-size";
+/// Config → Advanced → "Aggressive prefetch" → "Re-scan every": minutes
+/// between full prefetch re-scans of every folder.
+pub const PREFETCH_REFRESH_INTERVAL_MINUTES: &str = "prefetch-refresh-interval-minutes";
 
 /// One stored value, mirroring the GSettings key types the app uses: booleans,
-/// strings, doubles (pane-width percentages), and string arrays (favorites).
+/// strings, doubles (pane-width percentages), integers (prefetch counts),
+/// and string arrays (favorites).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Value {
     Bool(bool),
     String(String),
     Double(f64),
+    Int(i32),
     Strv(Vec<String>),
 }
 
@@ -167,6 +185,11 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(SHORTCUTS, Value::Strv(Vec::new()));
     map.insert(LAST_VIEW_UNIFIED, Value::Bool(false));
     map.insert(LAST_VIEW_MAILBOX, Value::String(String::new()));
+    map.insert(PREFETCH_AGGRESSIVE, Value::Bool(false));
+    map.insert(PREFETCH_BATCH_INTERVAL_SECONDS, Value::Int(30));
+    map.insert(PREFETCH_FOLDER_LIMIT, Value::Int(200));
+    map.insert(PREFETCH_BATCH_SIZE, Value::Int(3));
+    map.insert(PREFETCH_REFRESH_INTERVAL_MINUTES, Value::Int(60));
     map
 }
 
@@ -240,6 +263,29 @@ impl SettingsStore {
         }
     }
 
+    pub fn get_int(&self, key: &'static str) -> i32 {
+        match self {
+            SettingsStore::Gio(settings) => settings.int(key),
+            SettingsStore::Memory(map) => match map.borrow().get(key) {
+                Some(Value::Int(value)) => *value,
+                _ => 0,
+            },
+        }
+    }
+
+    pub fn set_int(&self, key: &'static str, value: i32) {
+        match self {
+            SettingsStore::Gio(settings) => {
+                if let Err(e) = settings.set_int(key, value) {
+                    tracing::warn!(key, "could not write setting: {e}");
+                }
+            }
+            SettingsStore::Memory(map) => {
+                map.borrow_mut().insert(key, Value::Int(value));
+            }
+        }
+    }
+
     pub fn get_strv(&self, key: &'static str) -> Vec<String> {
         match self {
             SettingsStore::Gio(settings) => settings.strv(key).iter().map(|s| s.to_string()).collect(),
@@ -260,6 +306,24 @@ impl SettingsStore {
             SettingsStore::Memory(map) => {
                 map.borrow_mut().insert(key, Value::Strv(values));
             }
+        }
+    }
+
+    /// Assembles the session's background-prefetch policy from the Advanced
+    /// settings. When aggressive prefetch is off, the policy is `Default` -
+    /// the app's original cooperative one-pass behavior - so the
+    /// frequency/limit values (greyed out in the UI while off) only ever
+    /// shape an enabled aggressive pass.
+    pub fn prefetch_policy(&self) -> lookout_mail::session::PrefetchPolicy {
+        if !self.get_bool(PREFETCH_AGGRESSIVE) {
+            return lookout_mail::session::PrefetchPolicy::default();
+        }
+        lookout_mail::session::PrefetchPolicy {
+            aggressive: true,
+            batch_interval: std::time::Duration::from_secs(self.get_int(PREFETCH_BATCH_INTERVAL_SECONDS).max(1) as u64),
+            folder_limit: self.get_int(PREFETCH_FOLDER_LIMIT).max(1) as u32,
+            batch_size: self.get_int(PREFETCH_BATCH_SIZE).max(1) as usize,
+            refresh_interval: std::time::Duration::from_secs((self.get_int(PREFETCH_REFRESH_INTERVAL_MINUTES).max(1) as u64) * 60),
         }
     }
 }
@@ -337,6 +401,47 @@ mod tests {
     }
 
     #[test]
+    fn int_round_trip() {
+        let store = resolve();
+        assert_eq!(store.get_int(PREFETCH_BATCH_INTERVAL_SECONDS), 30);
+        store.set_int(PREFETCH_BATCH_INTERVAL_SECONDS, 15);
+        assert_eq!(store.get_int(PREFETCH_BATCH_INTERVAL_SECONDS), 15);
+        store.set_int(PREFETCH_FOLDER_LIMIT, 1000);
+        assert_eq!(store.get_int(PREFETCH_FOLDER_LIMIT), 1000);
+        store.set_int(PREFETCH_BATCH_SIZE, 10);
+        assert_eq!(store.get_int(PREFETCH_BATCH_SIZE), 10);
+        store.set_int(PREFETCH_REFRESH_INTERVAL_MINUTES, 120);
+        assert_eq!(store.get_int(PREFETCH_REFRESH_INTERVAL_MINUTES), 120);
+    }
+
+    #[test]
+    fn prefetch_policy_assembly() {
+        let store = resolve();
+        let off = store.prefetch_policy();
+        assert!(!off.aggressive);
+        assert_eq!(off.folder_limit, 200);
+        assert_eq!(off.batch_size, 3);
+        store.set_bool(PREFETCH_AGGRESSIVE, true);
+        let on = store.prefetch_policy();
+        assert!(on.aggressive);
+        assert_eq!(on.batch_interval, std::time::Duration::from_secs(30));
+        assert_eq!(on.folder_limit, 200);
+        assert_eq!(on.batch_size, 3);
+        assert_eq!(on.refresh_interval, std::time::Duration::from_secs(60 * 60));
+        store.set_int(PREFETCH_BATCH_INTERVAL_SECONDS, 10);
+        store.set_int(PREFETCH_FOLDER_LIMIT, 500);
+        store.set_int(PREFETCH_BATCH_SIZE, 20);
+        store.set_int(PREFETCH_REFRESH_INTERVAL_MINUTES, 45);
+        let tuned = store.prefetch_policy();
+        assert_eq!(tuned.batch_interval, std::time::Duration::from_secs(10));
+        assert_eq!(tuned.folder_limit, 500);
+        assert_eq!(tuned.batch_size, 20);
+        assert_eq!(tuned.refresh_interval, std::time::Duration::from_secs(45 * 60));
+        store.set_bool(PREFETCH_AGGRESSIVE, false);
+        assert!(!store.prefetch_policy().aggressive);
+    }
+
+    #[test]
     fn spacing_helpers_map_values_to_css_classes_and_indexes() {
         assert_eq!(spacing_index("tight"), 0);
         assert_eq!(spacing_index("medium"), 1);
@@ -364,6 +469,11 @@ mod tests {
         assert_eq!(store.get_string(THEME_ID), "flat-dark");
         assert_eq!(store.get_string(ACCENT_COLOR), "");
         assert_eq!(store.get_string(LAYOUT_SPACING), "medium");
+        assert_eq!(store.get_int(PREFETCH_BATCH_INTERVAL_SECONDS), 30);
+        assert_eq!(store.get_int(PREFETCH_FOLDER_LIMIT), 200);
+        assert_eq!(store.get_int(PREFETCH_BATCH_SIZE), 3);
+        assert_eq!(store.get_int(PREFETCH_REFRESH_INTERVAL_MINUTES), 60);
+        assert!(!store.get_bool(PREFETCH_AGGRESSIVE));
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());
         assert!(store.get_strv(ACCOUNTS_DISABLED).is_empty());
         assert!(store.get_strv(SHORTCUTS).is_empty());

@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.93" date="2026-08-23">
+      <description>
+        <p>Settings → Advanced gains an "Aggressive prefetch" mode for the background body downloader: batches run on a timer you set, more of each folder is warmed, and folders re-scan periodically - all optional, with the cooperative default unchanged while the switch is off.</p>
+      </description>
+    </release>
     <release version="0.9.92" date="2026-08-22">
       <description>
         <p>An optional tray icon shows the total unread email count in the notification area - click it to show or hide the window, right-click for Open / Compose / Quit - controlled by the new "Tray icon" switch in Settings.</p>

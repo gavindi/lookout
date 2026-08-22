@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.93 (2026-08-23)
+
+### Added
+
+- **App**: Config → Advanced gains an **Aggressive prefetch** switch (and four frequency/limit spin rows behind it, greyed out while the switch is off) that turns the background body prefetch from its default cooperative one-pass behavior into an eager, user-tuned downloader. Off (the default) is exactly what shipped before: one pass per session over every non-INBOX folder, one small batch per main-loop iteration paced by IDLE wakes (a quiet session advances roughly one 3-body batch per wake), the newest 200 messages per folder warmed, older ones fetched on demand. On, the session wakes on a short timer so batches keep flowing with no user activity - the IDLE slice during the pass is the "Batch interval" (default 30 s, 5-300) instead of the 25-minute keepalive slice - and each batch carries the user's "Bodies per batch" (default 3, 1-100, one `UID FETCH` round trip per batch exactly as before, so the worst case a queued user command waits behind is still one batch's transfer). "Messages per folder" (default 200, 10-5000) widens the envelope pass's window, and "Re-scan every" (default 60 min, 5-240) restarts the whole pass on a timer once it's done, so mail that lands in unopened folders gets its bodies cached without a folder visit; re-scans stay cheap because the pass's `has_bodies` query filters out everything already cached. All five persist through new GSettings keys (`prefetch-aggressive`, `prefetch-batch-interval-seconds`, `prefetch-folder-limit`, `prefetch-batch-size`, `prefetch-refresh-interval-minutes`) and apply live: a new `PrefetchPolicy` struct (mail crate, defaulted to the old constants) travels to each account session via a new `AccountCommand::SetPrefetchPolicy`, re-sent on every control change, at startup, and on every reconnect (the app re-sends it whenever an account's fresh folder list announces a new session), so a reconnect never silently drops the user back to the cooperative default. The session reads the policy per iteration - the interval shapes the next IDLE slice, the folder limit the next envelope pass, the batch size the next batch, the refresh interval the next pass restart - and the prefetch log lines are unchanged, so the existing `prefetch: batch complete` debug output already shows the aggressive cadence.
+
+### Testing
+
+- `lookout-app`: `settings` gains `int_round_trip` (the new GSettings int keys) and `prefetch_policy_assembly` (off = `Default`, on = the stored values, and back off again); the schema-defaults test pins the five new keys. The full suite (252 tests) passes.
+
 ## 0.9.92 (2026-08-22)
 
 ### Added

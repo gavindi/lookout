@@ -232,6 +232,24 @@ pub struct ConfigView {
     /// "Tray icon" switch (Config → General), exposed so the caller can
     /// start/stop the StatusNotifierItem (AppIndicator) tray service.
     pub tray_icon_row: adw::SwitchRow,
+    /// "Aggressive prefetch" switch (Config → Advanced), exposed so the caller
+    /// can wire it into the session's `PrefetchPolicy`: on runs batches on a
+    /// short timer, warms more of each folder, and re-scans periodically. The
+    /// rows below are disabled while it's off, so the cooperative default is
+    /// always what an off switch means.
+    pub aggressive_prefetch_row: adw::SwitchRow,
+    /// "Batch interval" spin row (Config → Advanced), exposed so the caller
+    /// can wire its value into the policy's `batch_interval`.
+    pub prefetch_interval_row: adw::SpinRow,
+    /// "Messages per folder" spin row (Config → Advanced), exposed so the
+    /// caller can wire its value into the policy's `folder_limit`.
+    pub prefetch_limit_row: adw::SpinRow,
+    /// "Bodies per batch" spin row (Config → Advanced), exposed so the caller
+    /// can wire its value into the policy's `batch_size`.
+    pub prefetch_batch_row: adw::SpinRow,
+    /// "Re-scan every" spin row (Config → Advanced), exposed so the caller
+    /// can wire its value into the policy's `refresh_interval`.
+    pub prefetch_refresh_row: adw::SpinRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     webcal_group: adw::PreferencesGroup,
@@ -511,6 +529,43 @@ pub fn build() -> ConfigView {
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
 
+    // Background body prefetch: the cooperative default (one pass, one small
+    // batch per activity, newest 200 per folder) vs. the user-tuned
+    // "aggressive" mode. The frequency/limit rows sit under a switch so an
+    // off switch always means exactly the default behavior.
+    let prefetch_group = adw::PreferencesGroup::builder().title("Mail prefetch").build();
+    let aggressive_prefetch_row = adw::SwitchRow::builder()
+        .title("Aggressive prefetch")
+        .subtitle("Download message bodies more eagerly: batches run on a timer, more of each folder is warmed, and folders re-scan periodically. Uses more bandwidth")
+        .build();
+    prefetch_group.add(&aggressive_prefetch_row);
+    let prefetch_interval_row = adw::SpinRow::with_range(5.0, 300.0, 5.0);
+    prefetch_interval_row.set_value(30.0);
+    prefetch_interval_row.set_title("Batch interval");
+    prefetch_interval_row.set_subtitle("Seconds between prefetch batches");
+    prefetch_group.add(&prefetch_interval_row);
+    let prefetch_limit_row = adw::SpinRow::with_range(10.0, 5000.0, 10.0);
+    prefetch_limit_row.set_value(200.0);
+    prefetch_limit_row.set_title("Messages per folder");
+    prefetch_limit_row.set_subtitle("How many of the newest messages each folder warms up");
+    prefetch_group.add(&prefetch_limit_row);
+    let prefetch_batch_row = adw::SpinRow::with_range(1.0, 100.0, 1.0);
+    prefetch_batch_row.set_value(3.0);
+    prefetch_batch_row.set_title("Bodies per batch");
+    prefetch_batch_row.set_subtitle("Message bodies each prefetch round trip downloads");
+    prefetch_group.add(&prefetch_batch_row);
+    let prefetch_refresh_row = adw::SpinRow::with_range(5.0, 240.0, 5.0);
+    prefetch_refresh_row.set_value(60.0);
+    prefetch_refresh_row.set_title("Re-scan every");
+    prefetch_refresh_row.set_subtitle("Minutes between full prefetch re-scans of every folder");
+    prefetch_group.add(&prefetch_refresh_row);
+    // The frequency/limit rows are meaningless while the switch is off -
+    // "off" always means the cooperative default - so they grey out with it.
+    for row in [&prefetch_interval_row, &prefetch_limit_row, &prefetch_batch_row, &prefetch_refresh_row] {
+        row.set_sensitive(false);
+    }
+    advanced_group.add(&prefetch_group);
+
     let mail_cache_group = adw::PreferencesGroup::builder().title("Mail cache").build();
     advanced_group.add(&mail_cache_group);
 
@@ -624,6 +679,11 @@ pub fn build() -> ConfigView {
         start_at_login_row,
         close_to_background_row,
         tray_icon_row,
+        aggressive_prefetch_row,
+        prefetch_interval_row,
+        prefetch_limit_row,
+        prefetch_batch_row,
+        prefetch_refresh_row,
         mail_group,
         calendar_group,
         webcal_group,
