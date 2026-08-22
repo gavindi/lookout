@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.96 (2026-08-23)
+
+### Changed
+
+- **App**: in the Mail screen's mini-calendar overview panel, the "Upcoming events" section no longer labels all-day events "All Day" - every row's prefix is now the event's day, exactly like the day list's agenda headers: "Today", "Tomorrow", or "Sat 5 Sep" for anything further out. The section spans up to 90 days, so "All Day" would have hidden which day an event actually falls on; the selected-day events section above keeps its "All Day" prefixes, since there the day is already given by the section heading.
+
 ## 0.9.95 (2026-08-23)
 
 ### Added

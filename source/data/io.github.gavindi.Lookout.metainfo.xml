@@ -21,6 +21,11 @@
   <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
   <releases>
+    <release version="0.9.96" date="2026-08-23">
+      <description>
+        <p>In the Mail screen's "Upcoming events" section, all-day events now show the day they fall on ("Today", "Tomorrow", "Sat 5 Sep") instead of a bare "All Day".</p>
+      </description>
+    </release>
     <release version="0.9.95" date="2026-08-23">
       <description>
         <p>The Mail screen's mini-calendar panel now shows an "Upcoming events" section between the selected day's events and the outstanding tasks - up to 10 events from your checked calendars over the next 90 days, fetched live as you open the Mail screen.</p>

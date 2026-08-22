@@ -9821,19 +9821,15 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
     } else {
         let grid = gtk::Grid::builder().row_spacing(10).column_spacing(6).build();
         for (row, occ) in upcoming.into_iter().enumerate() {
-            let prefix_text = if occ.all_day {
-                "All Day".to_string()
+            let start = occ.start.with_timezone(&chrono::Local);
+            let today = now.date_naive();
+            let date = start.date_naive();
+            let prefix_text = if date == today {
+                "Today".to_string()
+            } else if date == today + chrono::Days::new(1) {
+                "Tomorrow".to_string()
             } else {
-                let start = occ.start.with_timezone(&chrono::Local);
-                let today = now.date_naive();
-                let date = start.date_naive();
-                if date == today {
-                    "Today".to_string()
-                } else if date == today + chrono::Days::new(1) {
-                    "Tomorrow".to_string()
-                } else {
-                    start.format("%a %d %b").to_string()
-                }
+                start.format("%a %d %b").to_string()
             };
             append_overview_event_row(&grid, row as i32, &prefix_text, &occ, &colors);
         }
