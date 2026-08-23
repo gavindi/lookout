@@ -1,8 +1,11 @@
-name: Build packages
+name: Release
 
 on:
-  push:
-    branches: [build]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to build and release (e.g. 0.9.99)"
+        required: true
 
 defaults:
   run:
@@ -16,6 +19,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - name: Install GTK4/libadwaita/WebKitGTK dev packages
         run: |
           sudo apt-get update
@@ -54,6 +59,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - name: Generate cargo-sources.json
         run: |
           python3 -m venv /tmp/fbtools
@@ -74,6 +81,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: snapcore/action-build@v1
         with:
           path: source
@@ -82,3 +91,33 @@ jobs:
         with:
           name: snap
           path: source/*.snap
+
+  release:
+    needs: [deb-rpm, flatpak, snap]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Extract release notes from CHANGELOG.md
+        working-directory: .
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          awk -v ver="$TAG" '
+            $0 ~ "^## " ver " " { found=1; print; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: Lookout ${{ inputs.tag }}
+          body_path: release-notes.md
+          files: dist/**/*
