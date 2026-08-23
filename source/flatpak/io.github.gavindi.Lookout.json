@@ -58,10 +58,7 @@
                     "dest": ".",
                     "exclude": ["target", ".git"]
                 },
-                {
-                    "type": "file",
-                    "path": "cargo-sources.json"
-                }
+                "cargo-sources.json"
             ]
         }
     ]

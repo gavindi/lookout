@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.103 (2026-08-24)
+
+### Fixed
+
+- **App**: the release workflow's flatpak build failed with `error: no matching package named \`chrono\` found` (or any other dependency, depending on build order) despite the generated `cargo-sources.json` correctly listing every vendored crate - the manifest wired it in as `{"type": "file", "path": "cargo-sources.json"}`, which just copies the JSON file itself into the build tree as an inert file rather than vendoring anything, so `cargo --offline build --release` had no local registry to draw from and fell through to the (network-blocked) real crates.io index. flatpak-builder treats a bare string in a module's `sources` array as an external source-list file whose contents get spliced in at that point, which is the form the generator actually expects; `io.github.gavindi.Lookout.json` now lists it as plain `"cargo-sources.json"` instead of a `type: file` object.
+
 ## 0.9.102 (2026-08-24)
 
 ### Fixed
