@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.102 (2026-08-24)
+
+### Fixed
+
+- **App**: the GitHub Actions snap build failed with "Stage package not found in part 'lookout': libwebkitgtk-6.0-0" - the `stage-packages` list named a runtime package that doesn't exist on the `core24` (Ubuntu 24.04 noble) archive. The actual runtime package is `libwebkitgtk-6.0-4` (matching the soname the already-correct `libwebkitgtk-6.0-dev` build-package pulls in), so `snapcraft.yaml` now stages that instead.
+- **App**: the release workflow's flatpak job now builds inside `ghcr.io/flathub-infra/flatpak-github-actions:gnome-49` (`--privileged`) instead of the bare `ubuntu-24.04` runner - flatpak-builder needs the GNOME 49 runtime/SDK and a working bubblewrap sandbox already in place, which only that container provides.
+
+## 0.9.101 (2026-08-24)
+
+### Fixed
+
+- **App**: the release workflow's RPM build failed - `cargo generate-rpm` was pointed at `CARGO_TARGET_DIR: ../..` from `source/crates/app`, one directory short of the shared workspace `target/` where the release binary actually landed; it now points at `../../target`.
+- **App**: the release workflow's snap build failed on `core24` - `snapcraft.yaml`'s top-level `architectures: - build-on: amd64` key isn't valid for the `core24` base, which expects the newer `platforms` key; it's now `platforms: amd64:`.
+- **App**: the release workflow's flatpak build failed generating `cargo-sources.json` - the step tried to `pip install flatpak-builder-tools`, a package that doesn't exist on PyPI, then run a script that was never installed. It now clones the real `flatpak/flatpak-builder-tools` repo, installs the exact dependencies (`aiohttp`, `PyYAML`, `tomlkit`) pulled straight from the generator script's own PEP 723 inline metadata, and runs `cargo/flatpak-cargo-generator.py` directly from the clone.
+
 ## 0.9.100 (2026-08-24)
 
 ### Added
