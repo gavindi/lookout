@@ -45,7 +45,7 @@ jobs:
       - name: Build .rpm
         working-directory: source/crates/app
         env:
-          CARGO_TARGET_DIR: ../..
+          CARGO_TARGET_DIR: ../../target
         run: cargo generate-rpm
       - name: Upload .deb and .rpm
         uses: actions/upload-artifact@v4
@@ -63,9 +63,10 @@ jobs:
           ref: ${{ inputs.tag }}
       - name: Generate cargo-sources.json
         run: |
+          git clone --depth 1 https://github.com/flatpak/flatpak-builder-tools /tmp/flatpak-builder-tools
           python3 -m venv /tmp/fbtools
-          /tmp/fbtools/bin/pip install --quiet flatpak-builder-tools
-          /tmp/fbtools/bin/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
+          /tmp/fbtools/bin/pip install --quiet aiohttp toml
+          /tmp/fbtools/bin/python3 /tmp/flatpak-builder-tools/cargo/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
       - uses: flathub-infra/flatpak-github-actions/flatpak-builder@master
         with:
           bundle: lookout.flatpak

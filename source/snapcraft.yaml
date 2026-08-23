@@ -8,8 +8,8 @@ description: |
   add an account in Settings and Lookout picks it up automatically.
 grade: devel
 confinement: strict
-architectures:
-  - build-on: amd64
+platforms:
+  amd64:
 
 apps:
   lookout:
