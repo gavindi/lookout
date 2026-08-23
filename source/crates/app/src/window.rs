@@ -730,6 +730,11 @@ pub(crate) struct UiState {
     /// change, so an identity added/edited while a composer is open shows up
     /// in its From list immediately. `None` while no composer is open.
     composer_identities_refresh: Option<Rc<dyn Fn()>>,
+    /// Opens the Settings dialog to the Accounts → Signatures section - the
+    /// composer's signature menu "Manage Signatures…" item. Late-bound:
+    /// `build_window` fills it in once the settings window's open logic
+    /// exists (same pattern as `composer_identities_refresh`).
+    manage_signatures: Option<Rc<dyn Fn()>>,
     /// Whether a given message-id already has a follow-up task, per
     /// `email_has_task`. Late-bound: the message row factory closures that
     /// need this are built before `calendar_state` exists, so this hook is
@@ -1816,6 +1821,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rendered_remote_scan: None,
         draft_saved_tx: None,
         composer_identities_refresh: None,
+        manage_signatures: None,
         follow_up_status: None,
         follow_up_toggle: None,
         composer_relay_generation: 0,
@@ -2388,7 +2394,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // in the pane (so its autosave loop stops), restores the
                 // previous page on close, and owns the `draft_saved_tx` slot.
                 if let Some((_from_email, cmd_tx, prefill, rich_text_default)) = opened {
-                    show_composer_in_reading_pane(&state, &worker, &reading_stack, "Reply", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
+                    show_composer_in_reading_pane(&state, &worker, &reading_stack, "Reply", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox), crate::config_view::SignatureDefault::Reply);
                 }
             });
         }
@@ -6226,6 +6232,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 })
                 .collect();
             let webcal_list = st.app_config.borrow().webcal_subscriptions.clone();
+            let signatures_list = st.app_config.borrow().signatures.clone();
+            let signature_defaults = st.app_config.borrow().signature_defaults.clone();
             drop(st);
             mail.sort_by_key(|a| a.email.to_lowercase());
             let mut calendar: Vec<crate::config_view::CalendarAccountInfo> = calendar_state
@@ -6292,6 +6300,55 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         })
                     };
                     crate::identities::show_manage_dialog(anchor, app_config, account_id, on_changed);
+                })
+            };
+            // Config → Accounts → Signatures row actions: edit reopens the
+            // signature editor prefilled with the saved content; remove
+            // deletes the signature outright (no confirmation - signatures
+            // are cheap to recreate, matching the identities dialog).
+            let edit_signature: crate::config_view::SignaturesAction = {
+                let state = state.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |anchor, id| {
+                    let Some(signature) = state.borrow().app_config.borrow().signatures.iter().find(|s| &s.id == id).cloned() else {
+                        return;
+                    };
+                    let app_config = state.borrow().app_config.clone();
+                    let on_changed = {
+                        let refresh_hook = refresh_hook.borrow().clone();
+                        Rc::new(move || refresh_hook())
+                    };
+                    crate::signatures::show_editor_dialog(anchor, app_config, Some(signature), on_changed);
+                })
+            };
+            let remove_signature: crate::config_view::SignaturesAction = {
+                let state = state.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |_anchor, id| {
+                    state.borrow().app_config.borrow_mut().remove_signature(id);
+                    crate::app_config::save(&state.borrow().app_config.borrow());
+                    let refresh = refresh_hook.borrow().clone();
+                    refresh();
+                })
+            };
+            // Config → Mail accounts → default-signature dropdowns: write the
+            // chosen signature id (or `None` for no signature) through to
+            // `app_config` for the account the dropdown belongs to,
+            // immediately. The dropdown already shows the selection, so no
+            // refresh is needed - the value just has to survive restarts
+            // and be ready for the composer.
+            let set_default_signature: crate::config_view::SetAccountSignatureDefault = {
+                let state = state.clone();
+                Rc::new(move |account_id, kind, id| {
+                    let st = state.borrow();
+                    let mut config = st.app_config.borrow_mut();
+                    let defaults = config.signature_defaults.entry(AccountId(account_id.to_string())).or_default();
+                    match kind {
+                        crate::config_view::SignatureDefault::New => defaults.new = id,
+                        crate::config_view::SignatureDefault::Reply => defaults.reply = id,
+                    }
+                    drop(config);
+                    crate::app_config::save(&st.app_config.borrow());
                 })
             };
             let edit_other: crate::config_view::OtherAccountAction = {
@@ -6549,7 +6606,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &calendar_cache_files,
                 &contacts_cache_dir,
                 &contacts_cache_files,
+                &signatures_list,
+                &signature_defaults,
                 &manage_identities,
+                &set_default_signature,
+                &edit_signature,
+                &remove_signature,
                 &edit_other,
                 &remove_other,
                 &enable_graph_pin,
@@ -6637,16 +6699,39 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Accounts → Signatures → "New Signature…": the rich-text
+    // signature editor. Saving writes through to `app_config` and re-runs
+    // this closure (via `refresh_hook`) so the list below the button
+    // redraws with the new entry.
+    {
+        let new_signature_row = config_view.new_signature_row.clone();
+        let state = state.clone();
+        let refresh_hook = refresh_hook.clone();
+        new_signature_row.connect_activated(move |row| {
+            let app_config = state.borrow().app_config.clone();
+            let on_changed = {
+                let refresh_hook = refresh_hook.borrow().clone();
+                Rc::new(move || refresh_hook())
+            };
+            crate::signatures::show_editor_dialog(row.upcast_ref::<gtk::Widget>(), app_config, None, on_changed);
+        });
+    }
+
     // --- Settings window: the header bar's Settings button opens the Config
     // screen (the same sidebar/stack layout that used to live in the nav
     // rail) as a modal dialog over the main window. Single instance: while
     // one is open, re-clicking the button (or the Ctrl+6 shortcut below)
     // just re-presents it. The window is destroyed on close and rebuilt on
-    // the next open - `config_view.root` is a single shared widget that gets
-    // auto-unparented when its window is destroyed, so re-attaching it to a
-    // fresh window is safe. `refresh_config` runs on every open so the
-    // account lists are current, and the discovery passes keep refreshing
-    // it while the dialog is up. ---
+    // the next open around the same shared `config_view.root` widget, so no
+    // per-session state is lost. The root is detached *explicitly* rather
+    // than relying on the destroy cascade to unparent it: closure reference
+    // cycles into the window's content chain (the close button's handler
+    // holds the dialog, the dialog holds the chain) can keep the chain
+    // alive after the window is destroyed, leaving the root parented to a
+    // dead window - and the next open then fails to attach it, showing an
+    // empty modal. `refresh_config` runs on every open so the account lists
+    // are current, and the discovery passes keep refreshing it while the
+    // dialog is up. ---
     {
         let window = window.clone();
         let config_view = config_view.clone();
@@ -6662,6 +6747,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     existing.present();
                     return;
                 }
+                // Defensive: if the previous window's chain somehow still
+                // parents the root, drop that link first so the attach below
+                // can't fail. Safe no-op when the root is already detached.
+                config_view.root.unparent();
                 let dialog = adw::Window::builder()
                     .transient_for(&window)
                     .modal(true)
@@ -6690,7 +6779,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 {
                     let config_window = config_window.clone();
+                    let config_view = config_view.clone();
                     dialog.connect_close_request(move |_| {
+                        // Unparent the shared root now, while the window is
+                        // still alive: the destroy cascade may never reach it
+                        // if a reference cycle keeps this window's content
+                        // chain alive, and the next open then can't re-attach
+                        // it (the modal would open empty).
+                        config_view.root.unparent();
                         *config_window.borrow_mut() = None;
                         glib::Propagation::Proceed
                     });
@@ -6706,8 +6802,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
         // Ctrl+6 (shortcuts.rs ACTION_CONFIG) opens the same dialog. The
         // rail-toggle loop above can't carry it - `refresh_config` only
-        // exists from here on - so it's dispatched here instead.
-        dispatch.borrow_mut().insert(crate::shortcuts::ACTION_CONFIG, Rc::new(open_settings));
+        // exists from here on - so it's dispatched here instead. The same
+        // `open_settings` rides as the composer's "Manage Signatures…"
+        // hook, which additionally jumps the settings screen to the
+        // Accounts section (where the global signature list lives).
+        let open_settings = Rc::new(open_settings);
+        dispatch.borrow_mut().insert(crate::shortcuts::ACTION_CONFIG, open_settings.clone());
+        state.borrow_mut().manage_signatures = Some(Rc::new({
+            let open_settings = open_settings.clone();
+            let config_view = config_view.clone();
+            move || {
+                open_settings();
+                crate::config_view::show_section(&config_view, "accounts");
+            }
+        }));
     }
 
     // --- "Clear all caches" (Config → Advanced): deletes the on-disk mail,
@@ -6803,7 +6911,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&state, &worker, &reading_stack, title, cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
+                show_composer_in_reading_pane(&state, &worker, &reading_stack, title, cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox), crate::config_view::SignatureDefault::Reply);
             }
         });
     }
@@ -6816,7 +6924,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, _from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&state, &worker, &reading_stack, "Forward", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox));
+                show_composer_in_reading_pane(&state, &worker, &reading_stack, "Forward", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox), crate::config_view::SignatureDefault::Reply);
             }
         });
     }
@@ -11808,7 +11916,7 @@ fn svg_bytes(resource_path: &str, fallback: &'static [u8]) -> glib::Bytes {
 /// Decodes a bundled SVG into a fixed-size `gtk::Image`. The bundled copy is
 /// preferred (see `resources.rs`); `fallback` covers builds whose GResource
 /// bundle couldn't be compiled.
-fn svg_image(resource_path: &str, fallback: &'static [u8], pixel_size: i32) -> gtk::Image {
+pub(crate) fn svg_image(resource_path: &str, fallback: &'static [u8], pixel_size: i32) -> gtk::Image {
     let bytes = svg_bytes(resource_path, fallback);
     let texture = gtk::gdk::Texture::from_bytes(&bytes).expect("bundled SVG should decode");
     let image = gtk::Image::from_paintable(Some(&texture));
@@ -13354,6 +13462,7 @@ fn compose_new_message(
         crate::compose::ComposePrefill::default(),
         rich_text_default,
         account_id,
+        crate::config_view::SignatureDefault::New,
     );
 }
 
@@ -14478,7 +14587,7 @@ fn open_mailto_unsubscribe(
         ..Default::default()
     };
     let rich_text_default = state.borrow().rich_text_default;
-    show_composer_in_reading_pane(state, worker, reading_stack, "Unsubscribe", cmd_tx, prefill, rich_text_default, account_id);
+    show_composer_in_reading_pane(state, worker, reading_stack, "Unsubscribe", cmd_tx, prefill, rich_text_default, account_id, crate::config_view::SignatureDefault::Reply);
 }
 
 /// A safe file extension for an attachment's temporary copy, so the system's
@@ -15288,6 +15397,10 @@ fn show_composer_in_reading_pane(
     prefill: crate::compose::ComposePrefill,
     rich_text_default: bool,
     account_id: Option<AccountId>,
+    // Whether this is a new message (uses the account's "Default for new
+    // messages") or a reply/forward (uses "Default for replies &
+    // forwards"). The resolved signature is appended to the body on open.
+    signature_kind: crate::config_view::SignatureDefault,
 ) {
     if let Some(existing) = reading_stack.child_by_name("compose") {
         reading_stack.remove(&existing);
@@ -15596,6 +15709,31 @@ fn show_composer_in_reading_pane(
                     None => Vec::new(),
                 }
             })
+        },
+        // The composer's signature menu re-reads the global signature list
+        // each time it opens, so a signature added via Settings while a
+        // composer is open shows up in its list immediately.
+        {
+            let state = state.clone();
+            Rc::new(move || state.borrow().app_config.borrow().signatures.clone())
+        },
+        // "Manage Signatures…" opens Settings on the Accounts section; set
+        // by `build_window` once the settings window exists (see
+        // `UiState::manage_signatures`).
+        state.borrow().manage_signatures.clone(),
+        // The account's default signature for this compose kind, resolved
+        // from the per-account defaults (falling back to the first
+        // connected account when no explicit account was resolved, exactly
+        // like the From dropdown above). Appended to the body on open.
+        {
+            let st = state.borrow();
+            let resolved = account_id.clone().or_else(|| st.accounts.keys().next().cloned());
+            let config = st.app_config.borrow();
+            let selected = resolved.and_then(|id| config.signature_defaults.get(&id)).and_then(|defaults| match signature_kind {
+                crate::config_view::SignatureDefault::New => defaults.new,
+                crate::config_view::SignatureDefault::Reply => defaults.reply,
+            });
+            selected.and_then(|id| config.signatures.iter().find(|s| s.id == id).cloned())
         },
         cmd_tx,
         prefill,
@@ -16074,6 +16212,7 @@ mod tests {
             rendered_remote_scan: None,
             draft_saved_tx: None,
             composer_identities_refresh: None,
+        manage_signatures: None,
             follow_up_status: None,
             follow_up_toggle: None,
             composer_relay_generation: 0,

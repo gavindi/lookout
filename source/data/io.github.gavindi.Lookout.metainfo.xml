@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.100" date="2026-08-24">
+      <description>
+        <p>Signatures: a global signature library managed from Settings → Accounts (a rich-text editor creates them, Edit/Delete manage the list), per-account default signatures for new messages and replies &amp; forwards, and a composer signature button that inserts any signature at the cursor and auto-appends each account's default when composing. Embedded signature images are stored inline, and reopening the Settings modal no longer shows it empty.</p>
+      </description>
+    </release>
     <release version="0.9.99" date="2026-08-23">
       <description>
         <p>Packaging polish: the .deb now ships a DEP-5 copyright file with the full GPL-3 license text, and the appstream metainfo gains bug tracker and repository links, carousel tile branding colours, and a clean validation.</p>

@@ -11,6 +11,7 @@
         <file alias="icons/popout1.svg">resources/icons/popout1.svg</file>
         <file alias="icons/pinned-1.svg">resources/icons/pinned-1.svg</file>
         <file alias="icons/unpinned-1.svg">resources/icons/unpinned-1.svg</file>
+        <file alias="icons/signature-1.svg">resources/icons/signature-1.svg</file>
         <file alias="backgrounds/background2.jpg">resources/backgrounds/background2.jpg</file>
         <file alias="themes/base.css">themes/base.css</file>
         <file alias="themes/flat-dark.css">themes/flat-dark.css</file>

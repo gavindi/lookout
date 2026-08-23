@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.100 (2026-08-24)
+
+### Added
+
+- **App**: user-authored email signatures, managed from Settings → Accounts → Signatures: a "New Signature…" row opens a modal rich-text editor - the same contenteditable WebKit editor the composer uses, toolbar included (bold, italic, lists, font size, colour, link, alignment, tables) - where a signature gets a name and rich HTML content; saving (disabled until named) writes it into the global signature list rendered below the button, each row carrying Edit and Delete actions (delete also clears the signature from any account default that pointed at it). The list is global - one library shared by every account, stored in `settings.json` under a new `signatures` array (`id`, `name`, `html`, `text`) - and the editor's embedded images are persisted too: `read_content` pulls pasted images out as `cid:`-referenced `InlineImage`s for the send path, so signatures re-embed them as base64 `data:` URIs right in the stored HTML, keeping the signature self-contained (it renders again when edited or inserted, and extracts back into a real inline attachment at send time).
+- **App**: each mail account gets its own default signatures, chosen from the global list: every row in Settings → Accounts → Mail accounts now carries two dropdowns - "Default for new messages" and "Default for replies & forwards" - each offering "None" plus one entry per saved signature, seeded from the account's stored selections and persisted to `settings.json` under a new per-account `signature_defaults` map (additive keys, so existing config files load untouched). The dropdowns rebuild on every Config refresh and heal a stored default whose signature was deleted back to "None".
+- **App**: the composer gains a signature button at the end of the rich-text toolbar (the ribbon slot while composing): a bundled signature icon (white on the dark toolbar strip, `signature-1.svg` in the GResource bundle with the usual `include_bytes!` fallback) plus an always-visible drop-down arrow. It opens a menu listing the global signatures - each inserts at the editor's cursor (HTML via the proven `document.execCommand('insertHTML')` JS path in rich mode, plain text into the text buffer otherwise), sized to half the field rows' width and growing to fit the list, with a pinned, slim "Manage Signatures…" footer below the scrollable list that jumps to Settings → Accounts. The menu rebuilds on every open so signatures created mid-compose appear immediately, and the button is disabled entirely while no signatures exist.
+- **App**: composing applies the account's default signature automatically - new messages use the account's "Default for new messages", replies, reply-alls, forwards (and the unsubscribe prefill) use "Default for replies & forwards". The composer resolves the default on open (falling back to the first connected account exactly like the From dropdown) and appends it to the end of the body in both editors: plain text into the text editor with a blank-line separator, and the rich HTML into the contenteditable document once it finishes loading (never flattened through the plain-text conversion, so formatting survives).
+
+### Fixed
+
+- **App**: opening the Settings modal a second time showed it empty - the shared `config_view.root` widget relied on the window-destroy cascade to unparent it, but reference cycles into the dialog's content chain (the close button's handler holds the dialog, the dialog holds the chain) can keep that chain alive after destruction, leaving the root parented to a dead window so the reopen's attach silently failed. The settings window's close handler now explicitly unparents the root before destruction, and the open path defensively unparents first, so a reopen always re-attaches the full screen.
+
+### Testing
+
+- `lookout-app`: `remove_signature_clears_defaults_pointing_at_it` (delete clears every account default referencing the signature), `signature_defaults_round_trip_through_the_config_file` (persistence plus a pre-defaults file loading as an empty map), `embed_images_turns_cid_references_into_data_uris` / `embed_images_without_images_returns_the_html_unchanged` (the signature image round trip), and an opt-in `#[ignore]`d `settings_window_reopen_reparents_the_config_root` guarding the modal-reopen contract (it needs a display and a single test thread; run with `--ignored --test-threads=1`, same self-skipping convention as the window.rs GTK tests). The full suite (255 tests) passes.
+
 ## 0.9.99 (2026-08-23)
 
 ### Changed

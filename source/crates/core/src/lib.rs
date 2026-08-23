@@ -9,6 +9,7 @@ pub mod calendar;
 pub mod email;
 pub mod identity;
 pub mod ids;
+pub mod signature;
 pub mod mailbox;
 pub mod thread;
 pub mod trust;
@@ -25,6 +26,7 @@ pub use email::{
 };
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
+pub use signature::Signature;
 pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use thread::{ThreadGroup, ThreadKey};
 pub use trust::{html_remote_content_scan, normalize_trust_entry, sender_matches_trust_entry, RemoteContentScan, TrustLevel};

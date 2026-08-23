@@ -33,6 +33,7 @@ mod reminders;
 mod resources;
 mod settings;
 mod shortcuts;
+mod signatures;
 mod tags;
 mod task_editor;
 mod tasks_view;

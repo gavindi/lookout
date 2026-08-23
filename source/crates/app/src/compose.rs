@@ -7,7 +7,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use base64::Engine;
 use gtk::{gio, glib};
-use lookout_core::{header_value, AccountId, EmailBody, EmailSummary, Identity};
+use lookout_core::{header_value, AccountId, EmailBody, EmailSummary, Identity, Signature};
 use lookout_mail::session::AccountCommand;
 use lookout_mail::{new_message_id, Attachment, ComposedMessage, InlineImage};
 use webkit::prelude::*;
@@ -341,13 +341,13 @@ fn table_html(rows: u32, cols: u32) -> String {
 /// dispatch` is an `extern "C"` callback that cannot unwind, so the panic
 /// becomes an abort. Awaiting on the executor that's already running avoids
 /// the nested loop entirely.
-struct EditorContent {
-    html: String,
-    text: String,
-    images: Vec<InlineImage>,
+pub(crate) struct EditorContent {
+    pub(crate) html: String,
+    pub(crate) text: String,
+    pub(crate) images: Vec<InlineImage>,
 }
 
-async fn read_content(web_view: &webkit::WebView) -> Option<EditorContent> {
+pub(crate) async fn read_content(web_view: &webkit::WebView) -> Option<EditorContent> {
     const READ_SCRIPT: &str = r#"(
         function () {
             document.querySelectorAll('font').forEach(function (el) {
@@ -658,7 +658,7 @@ fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
 /// images" setting - composing must never fetch remote content. Returns the
 /// WebView (which the caller keeps alive for send-time content reads) plus
 /// the toolbar.
-fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
+pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
     let settings = webkit::Settings::builder().enable_javascript(true).build();
     let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).build());
 
@@ -1027,6 +1027,12 @@ fn build_attachment_chip(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, flow
 pub fn build_compose_view(
     title: &str,
     identities_source: Rc<dyn Fn() -> Vec<Identity>>,
+    signatures_source: Rc<dyn Fn() -> Vec<Signature>>,
+    manage_signatures: Option<Rc<dyn Fn()>>,
+    // The account's default signature for this compose kind (new message or
+    // reply/forward), resolved by the caller from `AppConfig::signature_defaults`.
+    // Appended to the end of the body when the composer opens.
+    default_signature: Option<Signature>,
     cmd_tx: async_channel::Sender<AccountCommand>,
     prefill: ComposePrefill,
     on_done: Rc<dyn Fn()>,
@@ -1162,6 +1168,53 @@ pub fn build_compose_view(
     body_stack.add_named(&rich_scroller, Some("rich"));
     body_stack.set_visible_child_name("text");
 
+    // --- The account's default signature for this compose kind is appended
+    // to the end of the body when the composer opens. Both editors are
+    // seeded (the user composes in whichever one they switch to): the text
+    // editor gets the plain-text form right away, and the rich editor gets
+    // its HTML once the contenteditable document has finished loading (the
+    // same `insertHTML`-at-end script path the paste handler and the
+    // signature menu use - the rich content must not round-trip through
+    // `text_to_html`, which would flatten its formatting).
+    if let Some(signature) = default_signature {
+        let signature_text = signature.text.trim();
+        if !signature_text.is_empty() {
+            let buffer = body_view.buffer();
+            let has_body = !buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).is_empty();
+            let mut end = buffer.end_iter();
+            let prefix = if has_body { "\n" } else { "" };
+            buffer.insert(&mut end, &format!("{prefix}{signature_text}\n"));
+        }
+        let signature_html = signature.html;
+        let html_json = serde_json::to_string(&signature_html).unwrap_or_else(|_| "\"\"".to_string());
+        let script = format!(
+            r#"(function () {{
+                var range = document.createRange();
+                range.selectNodeContents(document.body);
+                range.collapse(false);
+                var sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+                document.execCommand('insertHTML', false, {html_json});
+            }})()"#
+        );
+        let appended = Rc::new(Cell::new(false));
+        let appended_for_handler = appended.clone();
+        rich_web_view.connect_load_changed(move |view, event| {
+            // `load_html` is async; the append must wait for the document.
+            // The guard keeps a stray second load from appending twice.
+            if event != webkit::LoadEvent::Finished || appended_for_handler.get() {
+                return;
+            }
+            appended_for_handler.set(true);
+            let view = view.clone();
+            let script = script.clone();
+            glib::spawn_future_local(async move {
+                let _ = view.evaluate_javascript_future(&script, None, None).await;
+            });
+        });
+    }
+
     // The plain/rich switch lives in a shared toolbar row above the body,
     // ahead of the formatting buttons - it must be reachable in both modes,
     // while the formatting buttons only make sense in rich mode and so stay
@@ -1210,9 +1263,173 @@ pub fn build_compose_view(
         });
     }
     editor_toolbar.append(&attach_button);
+    // --- Signature menu: a "Signature" button that drops down the global
+    // signature list (Config → Accounts → Signatures), one row per
+    // signature inserting it at the cursor - the HTML form in rich mode,
+    // the plain text in text mode - with a "Manage Signatures…" row at the
+    // bottom jumping to the settings screen. Rebuilt every time the popover
+    // opens, so a signature added via Settings while a composer is open
+    // lands in the list immediately; the button is disabled entirely while
+    // no signatures exist. The button lives at the end of the toolbar (the
+    // formatting controls stay ahead of it) and carries the bundled
+    // signature icon instead of a text label, matching the toolbar's other
+    // icon buttons.
+    let signature_image = crate::window::svg_image(
+        "/io/github/gavindi/Lookout/icons/signature-1.svg",
+        include_bytes!("../../../data/resources/icons/signature-1.svg"),
+        18,
+    );
+    let signature_button = gtk::MenuButton::builder()
+        .child(&signature_image)
+        .css_classes(["flat"])
+        .tooltip_text("Insert a signature")
+        .build();
+    // A visible drop-down arrow next to the icon, like other menu buttons.
+    signature_button.set_always_show_arrow(true);
+    let signature_popover = gtk::Popover::new();
+    let signature_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
+    let signature_scroller = gtk::ScrolledWindow::builder()
+        .child(&signature_list)
+        // No fixed size: the dropdown grows to fit the whole signature
+        // list, and the map handler below re-syncs its width to the field
+        // rows each time it opens. The floor only guards the pre-first-map
+        // state.
+        .min_content_width(240)
+        .build();
+    // The menu's root: the scrollable signature list above, and "Manage
+    // Signatures…" pinned below the list - outside the scroller - so the
+    // settings shortcut is always on screen no matter how long the list
+    // grows (only the list portion ever scrolls, and only when the screen
+    // forces it).
+    let signature_menu_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    signature_menu_box.append(&signature_scroller);
+    signature_menu_box.append(&gtk::Separator::builder().orientation(gtk::Orientation::Horizontal).build());
+    let manage_label = gtk::Label::builder()
+        .label("Manage Signatures…")
+        .xalign(0.0)
+        .margin_start(10)
+        .margin_end(10)
+        .margin_top(3)
+        .margin_bottom(3)
+        .build();
+    let manage_button = gtk::Button::builder().css_classes(["flat"]).build();
+    manage_button.set_child(Some(&manage_label));
+    {
+        let manage_signatures = manage_signatures.clone();
+        let signature_popover = signature_popover.clone();
+        manage_button.connect_clicked(move |_| {
+            signature_popover.popdown();
+            if let Some(manage) = &manage_signatures {
+                manage();
+            }
+        });
+    }
+    signature_menu_box.append(&manage_button);
+    signature_popover.set_child(Some(&signature_menu_box));
+    signature_button.set_popover(Some(&signature_popover));
+
+    let rebuild_signature_menu: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
+    {
+        let signatures_source = signatures_source.clone();
+        let signature_list = signature_list.clone();
+        let signature_button = signature_button.clone();
+        *rebuild_signature_menu.borrow_mut() = Box::new(move || {
+            while let Some(child) = signature_list.first_child() {
+                signature_list.remove(&child);
+            }
+            let signatures = signatures_source();
+            signature_button.set_sensitive(!signatures.is_empty());
+            // Plain labels are appended (the ListBox wraps each in a row),
+            // matching the recipient-suggestions popover. "Manage
+            // Signatures…" is not part of the list - it's pinned below the
+            // scroller.
+            for signature in &signatures {
+                let label = gtk::Label::builder()
+                    .label(&signature.name)
+                    .xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .margin_start(10)
+                    .margin_end(10)
+                    .margin_top(6)
+                    .margin_bottom(6)
+                    .build();
+                signature_list.append(&label);
+            }
+        });
+    }
+    (rebuild_signature_menu.borrow())();
+    {
+        let rebuild_handle = rebuild_signature_menu.clone();
+        let signature_scroller = signature_scroller.clone();
+        let fields_group = fields_group.clone();
+        signature_popover.connect_map(move |_| {
+            // Match the dropdown's width to half the composer's field rows
+            // (the To/Cc/Bcc/Subject entries): the fields group spans
+            // exactly the entries' width. Runs while the popover is
+            // mapping, before its size is measured, so the new width lands
+            // on the menu that's about to open.
+            let width = (fields_group.width() as i32 / 2).max(240);
+            signature_scroller.set_min_content_width(width);
+            (rebuild_handle.borrow())();
+        });
+    }
+    // One activation handler for the whole list, like the recipient
+    // suggestions: the index is resolved against the *current* signature
+    // list at click time, so a rebuild can never leave a stale handler
+    // mapping a row onto the wrong signature.
+    {
+        let signatures_source = signatures_source.clone();
+        let signature_popover = signature_popover.clone();
+        let rich_web_view = rich_web_view.clone();
+        let body_view = body_view.clone();
+        let rich_toggle = rich_toggle.clone();
+        signature_list.connect_row_activated(move |_, row| {
+            let index = row.index() as usize;
+            signature_popover.popdown();
+            let signatures = signatures_source();
+            let Some(signature) = signatures.get(index) else { return };
+            if rich_toggle.is_active() {
+                // Rich mode: insert the signature's HTML at the editor's
+                // cursor. `webkit_web_view_execute_editing_command_with_argument`
+                // doesn't reliably resolve WebKit's "InsertHTML" editing
+                // command (the paste handler's `document.execCommand` JS
+                // path is the proven one - same round trip, minus the C
+                // command-name translation), so the insertion goes through
+                // `evaluate_javascript` like the paste path. The script
+                // restores the editor's focus (the popover click blurred
+                // it), keeps the user's caret/selection when one exists,
+                // and falls back to appending at the end of the body when
+                // the selection was cleared - an insertion must never
+                // silently vanish.
+                let html_json = serde_json::to_string(&signature.html).unwrap_or_else(|_| "\"\"".to_string());
+                let script = format!(
+                    r#"(function () {{
+                        document.body.focus();
+                        var sel = window.getSelection();
+                        if (!sel || sel.rangeCount === 0) {{
+                            var range = document.createRange();
+                            range.selectNodeContents(document.body);
+                            range.collapse(false);
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                        }}
+                        document.execCommand('insertHTML', false, {html_json});
+                    }})()"#
+                );
+                let web_view = rich_web_view.clone();
+                glib::spawn_future_local(async move {
+                    let _ = web_view.evaluate_javascript_future(&script, None, None).await;
+                });
+            } else {
+                body_view.buffer().insert_at_cursor(&signature.text);
+            }
+        });
+    }
     editor_toolbar.append(&rich_toggle);
     editor_toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
     editor_toolbar.append(&format_toolbar);
+    // The signature menu is the toolbar's last control.
+    editor_toolbar.append(&signature_button);
 
     {
         let web_view = rich_web_view.clone();

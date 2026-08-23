@@ -18,10 +18,32 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
+use lookout_core::AccountId;
 
 /// The caller's hook for opening the manage-identities dialog: takes the
 /// anchoring widget and the account id (opaque string).
 pub type ManageIdentities = Rc<dyn Fn(&gtk::Widget, &str)>;
+
+/// The caller's hook for one signature row's actions: takes the anchoring
+/// widget and the signature's id. Used for both editing (opens the signature
+/// editor prefilled) and removing - the caller distinguishes the two by
+/// which closure it registers.
+pub type SignaturesAction = Rc<dyn Fn(&gtk::Widget, &uuid::Uuid)>;
+
+/// Which default-signature slot a dropdown writes (see `refresh`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SignatureDefault {
+    /// "Default for new messages".
+    New,
+    /// "Default for replies & forwards".
+    Reply,
+}
+
+/// The caller's hook for a per-account default-signature dropdown's
+/// selection: the account id (opaque string), the dropdown's slot, and the
+/// chosen signature's id (`None` = no signature). The caller owns the
+/// persistence.
+pub type SetAccountSignatureDefault = Rc<dyn Fn(&str, SignatureDefault, Option<uuid::Uuid>)>;
 
 /// The caller's hook for one manual ("other") account's row actions: takes
 /// the anchoring widget and the account id. Used for both editing (opens the
@@ -118,6 +140,18 @@ pub struct ShortcutRow {
     pub action: &'static str,
 }
 
+/// Shows the given section page in the settings screen, syncing the
+/// sidebar's selection to it - e.g. the composer's "Manage Signatures…"
+/// jumps to the Accounts section where the signature list lives.
+pub fn show_section(view: &ConfigView, name: &str) {
+    view.section_stack.set_visible_child_name(name);
+    if let Some(index) = view.section_names.iter().position(|n| *n == name) {
+        if let Some(row) = view.section_list.row_at_index(index as i32) {
+            view.section_list.select_row(Some(&row));
+        }
+    }
+}
+
 /// The config screen's widget tree. `root` goes into the Settings dialog
 /// (a modal window opened from the header bar's Settings button);
 /// the account groups are kept here so `refresh` can repopulate them in
@@ -128,6 +162,12 @@ pub struct ConfigView {
     /// `position` to the same persist-width-as-a-percentage mechanism used
     /// by the Mail/Calendar/Contacts panes.
     pub paned: gtk::Paned,
+    /// The section stack and sidebar list (and the section names in order),
+    /// kept so `show_section` can jump to a named section - e.g. the
+    /// composer's "Manage Signatures…" lands on the Accounts section.
+    section_stack: gtk::Stack,
+    section_list: gtk::ListBox,
+    section_names: Rc<Vec<&'static str>>,
     /// "Add account…" entry row, exposed so the caller can wire its
     /// `activated` signal to the same GOA-settings invocation the empty-state
     /// page uses.
@@ -259,6 +299,18 @@ pub struct ConfigView {
     webcal_rows: RefCell<Vec<adw::ActionRow>>,
     /// The per-account "Identities" rows, rebuilt alongside `mail_rows`.
     identity_rows: RefCell<Vec<adw::ActionRow>>,
+    /// "New Signature…" entry row (Config → Accounts → Signatures) - the
+    /// entry point for the signature editor, wired by the caller.
+    pub new_signature_row: adw::ActionRow,
+    /// The list of saved signatures below the "New Signature…" button.
+    signatures_group: adw::PreferencesGroup,
+    /// The per-account "Default for new messages" / "Default for replies &
+    /// forwards" dropdown rows in the Mail accounts section, rebuilt
+    /// alongside `mail_rows`/`identity_rows` (one pair per account).
+    signature_default_rows: RefCell<Vec<adw::ComboRow>>,
+    /// The signature list rows rebuilt by `refresh_signatures`. The button
+    /// row itself stays put; only these are cleared and re-added.
+    signature_rows: RefCell<Vec<adw::ActionRow>>,
     mail_cache_group: adw::PreferencesGroup,
     calendar_cache_group: adw::PreferencesGroup,
     contacts_cache_group: adw::PreferencesGroup,
@@ -324,6 +376,19 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     accounts_group.add(&add_imap_row);
+
+    // The user-authored signature list: the "New Signature…" button opens
+    // the rich-text signature editor; saved signatures appear as rows below
+    // it, rebuilt by `refresh_signatures`. The per-account default-signature
+    // dropdowns live in the Mail accounts section (`refresh`), one pair per
+    // account, selecting from this global list.
+    let signatures_group = adw::PreferencesGroup::builder().title("Signatures").build();
+    let new_signature_row = adw::ActionRow::builder()
+        .title("New Signature…")
+        .subtitle("Create a rich-text signature for your messages")
+        .activatable(true)
+        .build();
+    signatures_group.add(&new_signature_row);
 
     let mail_group = adw::PreferencesGroup::builder().title("Mail accounts").build();
 
@@ -591,7 +656,7 @@ pub fn build() -> ConfigView {
     section_stack.set_hexpand(true);
 
     let mut sections: Vec<(&'static str, &'static str)> = Vec::new();
-    add_section(&section_stack, &mut sections, "Accounts", "accounts", &[&accounts_group, &mail_group, &goa_group]);
+    add_section(&section_stack, &mut sections, "Accounts", "accounts", &[&accounts_group, &signatures_group, &mail_group, &goa_group]);
     add_section(&section_stack, &mut sections, "Calendar accounts", "calendar-accounts", &[&calendar_group]);
     add_section(&section_stack, &mut sections, "Webcal subscriptions", "webcal", &[&webcal_group]);
     add_section(&section_stack, &mut sections, "Appearance", "appearance", &[&appearance_group]);
@@ -618,11 +683,12 @@ pub fn build() -> ConfigView {
     }
 
     let section_names: Rc<Vec<&'static str>> = Rc::new(sections.iter().map(|(_, name)| *name).collect());
+    let section_names_for_stack = section_names.clone();
     let stack_for_selection = section_stack.clone();
     section_list.connect_row_selected(move |_, row| {
         let Some(row) = row else { return };
         let Ok(index) = usize::try_from(row.index()) else { return };
-        if let Some(name) = section_names.get(index) {
+        if let Some(name) = section_names_for_stack.get(index) {
             stack_for_selection.set_visible_child_name(name);
         }
     });
@@ -652,10 +718,17 @@ pub fn build() -> ConfigView {
     ConfigView {
         root: paned.clone().upcast(),
         paned,
+        section_stack,
+        section_list,
+        section_names,
         add_account_row,
         add_imap_row,
         goa_group,
         goa_rows: RefCell::new(Vec::new()),
+        new_signature_row,
+        signatures_group,
+        signature_default_rows: RefCell::new(Vec::new()),
+        signature_rows: RefCell::new(Vec::new()),
         clear_cache_row,
         animations_row,
         theme_row,
@@ -723,7 +796,12 @@ pub fn refresh(
     calendar_cache_files: &[CacheFile],
     contacts_cache_dir: &std::path::Path,
     contacts_cache_files: &[CacheFile],
+    signatures: &[lookout_core::Signature],
+    signature_defaults: &std::collections::HashMap<AccountId, crate::app_config::AccountSignatureDefaults>,
     manage_identities: &ManageIdentities,
+    set_default_signature: &SetAccountSignatureDefault,
+    edit_signature: &SignaturesAction,
+    remove_signature: &SignaturesAction,
     edit_other: &OtherAccountAction,
     remove_other: &OtherAccountAction,
     enable_graph_pin: &OtherAccountAction,
@@ -758,6 +836,9 @@ pub fn refresh(
         view.mail_group.remove(&row);
     }
     for row in view.identity_rows.borrow_mut().drain(..) {
+        view.mail_group.remove(&row);
+    }
+    for row in view.signature_default_rows.borrow_mut().drain(..) {
         view.mail_group.remove(&row);
     }
     for row in view.calendar_rows.borrow_mut().drain(..) {
@@ -820,6 +901,34 @@ pub fn refresh(
             let manage = manage_identities.clone();
             identity_row.connect_activated(move |row| manage(row.upcast_ref::<gtk::Widget>(), &account_id));
             push_row(&view.mail_group, &view.identity_rows, identity_row);
+
+            // This account's default signatures, chosen from the global
+            // signature list (Config → Accounts → Signatures). Rebuilt per
+            // refresh like the rows above, so the options and stored
+            // selection always match the current signature list.
+            let account_defaults = signature_defaults.get(&AccountId(info.account_id.clone())).cloned().unwrap_or_default();
+            let new_default = signature_default_dropdown(
+                "Default for new messages",
+                "Use this signature when composing a new message from this account",
+                &info.account_id,
+                account_defaults.new,
+                signatures,
+                SignatureDefault::New,
+                set_default_signature,
+            );
+            view.mail_group.add(&new_default);
+            view.signature_default_rows.borrow_mut().push(new_default);
+            let reply_default = signature_default_dropdown(
+                "Default for replies & forwards",
+                "Use this signature when replying to or forwarding from this account",
+                &info.account_id,
+                account_defaults.reply,
+                signatures,
+                SignatureDefault::Reply,
+                set_default_signature,
+            );
+            view.mail_group.add(&reply_default);
+            view.signature_default_rows.borrow_mut().push(reply_default);
         }
     }
 
@@ -880,6 +989,9 @@ pub fn refresh(
             push_row(&view.contacts_cache_group, &view.contacts_cache_rows, cache_file_row(&file.name, &file.size));
         }
     }
+
+    // -- signatures --
+    refresh_signatures(view, signatures, edit_signature, remove_signature);
 }
 
 fn account_row(title: &str, subtitle: &str) -> adw::ActionRow {
@@ -909,6 +1021,98 @@ fn cache_file_row(name: &str, size: &str) -> adw::ActionRow {
     row
 }
 
+/// The row subtitle for a signature: its plain-text first line, truncated
+/// to a preview width.
+fn signature_preview(text: &str) -> String {
+    let first_line = text.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        "Empty signature".to_string()
+    } else if first_line.chars().count() > 80 {
+        let mut preview: String = first_line.chars().take(80).collect();
+        preview.push('…');
+        preview
+    } else {
+        first_line.to_string()
+    }
+}
+
+/// Rebuilds the signature rows below the "New Signature…" button (Config →
+/// Accounts → Signatures). The button row itself stays put; only these rows
+/// are cleared and re-added, so the button keeps its place above the list.
+/// Each row's Edit/Delete suffix buttons invoke the caller's `edit`/`remove`
+/// hooks (which own the actual editor dialog and persistence).
+pub fn refresh_signatures(view: &ConfigView, signatures: &[lookout_core::Signature], edit: &SignaturesAction, remove: &SignaturesAction) {
+    for row in view.signature_rows.borrow_mut().drain(..) {
+        view.signatures_group.remove(&row);
+    }
+    if signatures.is_empty() {
+        push_row(&view.signatures_group, &view.signature_rows, empty_row("No signatures yet"));
+        return;
+    }
+    for signature in signatures {
+        let row = account_row(&signature.name, &signature_preview(&signature.text));
+        let edit_button = gtk::Button::from_icon_name("document-edit-symbolic");
+        edit_button.set_tooltip_text(Some("Edit signature"));
+        edit_button.add_css_class("flat");
+        let remove_button = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove_button.set_tooltip_text(Some("Delete signature"));
+        remove_button.add_css_class("flat");
+        let id = signature.id;
+        {
+            let edit = edit.clone();
+            let row_widget = row.clone();
+            edit_button.connect_clicked(move |_| edit(row_widget.upcast_ref::<gtk::Widget>(), &id));
+        }
+        {
+            let remove = remove.clone();
+            let row_widget = row.clone();
+            remove_button.connect_clicked(move |_| remove(row_widget.upcast_ref::<gtk::Widget>(), &id));
+        }
+        row.add_suffix(&edit_button);
+        row.add_suffix(&remove_button);
+        push_row(&view.signatures_group, &view.signature_rows, row);
+    }
+}
+
+/// One per-account default-signature dropdown: title/subtitle for the slot,
+/// options from the global signature list ("None" + one per signature), the
+/// account's stored selection seeded, and the selection's write-through
+/// wired to the caller's `set_default` hook. A stored default whose
+/// signature no longer exists (a hand-edited file) is healed to "None"
+/// through the same hook.
+fn signature_default_dropdown(
+    title: &str,
+    subtitle: &str,
+    account_id: &str,
+    default: Option<uuid::Uuid>,
+    signatures: &[lookout_core::Signature],
+    kind: SignatureDefault,
+    set_default: &SetAccountSignatureDefault,
+) -> adw::ComboRow {
+    let mut names: Vec<String> = vec!["None".to_string()];
+    names.extend(signatures.iter().map(|s| s.name.clone()));
+    let mut ids: Vec<Option<uuid::Uuid>> = vec![None];
+    ids.extend(signatures.iter().map(|s| Some(s.id)));
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let selected_index = ids.iter().position(|id| *id == default).unwrap_or(0) as u32;
+
+    let row = adw::ComboRow::builder().title(title).subtitle(subtitle).build();
+    let model = gtk::StringList::new(&name_refs);
+    row.set_model(Some(&model));
+    row.set_selected(selected_index);
+    if default.is_some() && !ids.contains(&default) {
+        set_default(account_id, kind, None);
+    }
+    let ids_for_row = ids.clone();
+    let set_default = set_default.clone();
+    let account_id = account_id.to_string();
+    row.connect_selected_notify(move |row| {
+        let id = ids_for_row.get(row.selected() as usize).copied().flatten();
+        set_default(&account_id, kind, id);
+    });
+    row
+}
+
 pub fn format_size(bytes: u64) -> String {
     match bytes {
         0 => "0 B".into(),
@@ -930,4 +1134,69 @@ pub fn refresh_google_tasks_client_row(row: &adw::ActionRow) {
         format!("Configured: {id}")
     };
     row.set_subtitle(&subtitle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card_section(content: &gtk::Widget) -> gtk::Box {
+        let card = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["card"])
+            .overflow(gtk::Overflow::Hidden)
+            .build();
+        card.append(content);
+        card
+    }
+
+    /// The Settings window's close/reopen contract from window.rs, guarded
+    /// without mapping real windows (GTK may only be initialized on one
+    /// thread, and libtest gives each test its own - the repo's other
+    /// GTK-touching tests race to `gtk::init()` the same way). Closing the
+    /// settings dialog must leave the shared `config_view.root` detached so
+    /// the next open can re-attach it: the window's close handler unparents
+    /// it explicitly because reference cycles into the window's content
+    /// chain (the close button's handler holds the dialog, the dialog holds
+    /// the chain) can otherwise leave the root parented to a destroyed
+    /// window, and the reopen's attach then fails - the empty modal bug.
+    /// Ignored by default: it needs a real display, and GTK is not
+    /// thread-safe while libtest spreads tests across threads, so it only
+    /// runs on demand - `cargo test -p lookout-app -- --ignored
+    /// --test-threads=1 config_view::tests`. Same self-skipping convention
+    /// as the window.rs GTK tests when run among them.
+    #[ignore = "needs a display and a single test thread; run with --ignored --test-threads=1"]
+    #[test]
+    fn settings_window_reopen_reparents_the_config_root() {
+        // Same convention as the window.rs GTK tests: libtest gives each
+        // test its own thread, GTK may only be initialized on one - if
+        // another test thread got there first, skip rather than panic.
+        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
+            eprintln!("skipping: GTK initialized on another test thread");
+            return;
+        }
+        if gtk::init().is_err() {
+            // Headless environments (CI) can't initialize GTK; the
+            // lifecycle is exercised where a display exists.
+            eprintln!("skipping: no display available");
+            return;
+        }
+        let config_view = Rc::new(build());
+
+        // First open: the root attaches to the window's content chain.
+        let card = card_section(&config_view.root);
+        assert!(config_view.root.parent().is_some(), "root must attach to the window's chain");
+
+        // Close: the window.rs close handler unparents the root explicitly
+        // before the window is destroyed.
+        config_view.root.unparent();
+        assert!(config_view.root.parent().is_none(), "close-path unparent must detach the root");
+
+        // Second open: the defensive unparent is a no-op, and the root
+        // re-attaches to the fresh window's chain.
+        config_view.root.unparent();
+        let card2 = card_section(&config_view.root);
+        assert!(config_view.root.parent().is_some(), "root must re-attach to the second window");
+        let _ = (card, card2);
+    }
 }

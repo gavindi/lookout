@@ -16,7 +16,7 @@
 /// Software released under the GPL3 license
 use std::path::PathBuf;
 
-use lookout_core::{AccountId, Identity, MailboxRole, WebcalSubscription};
+use lookout_core::{AccountId, Identity, MailboxRole, Signature, WebcalSubscription};
 use serde::{Deserialize, Serialize};
 
 /// The id prefix distinguishing manually-added accounts (stored here) from
@@ -62,11 +62,29 @@ pub struct OtherAccount {
     pub use_same_password: bool,
 }
 
+/// One account's default-signature selections - which signature its new
+/// messages (and its replies & forwards) start with, by id. `None` (or an id
+/// that's no longer in `signatures`, which `remove_signature` clears and the
+/// settings dropdowns heal) means no signature.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AccountSignatureDefaults {
+    pub new: Option<uuid::Uuid>,
+    pub reply: Option<uuid::Uuid>,
+}
+
 /// The whole file's contents. All fields are additive: an older build's file
 /// (or a `{}` hand-edited file) deserializes into defaults for the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub identities: Vec<Identity>,
+    /// The user-authored signatures (see `signatures.rs` for the editor UI).
+    /// Global - not pinned to an account - so the list lives on the Accounts
+    /// settings screen and a future send-time step can pick one per message.
+    pub signatures: Vec<Signature>,
+    /// Which signature each mail account applies by default - keyed by the
+    /// account id, per-account rows in Config → Mail accounts select from
+    /// the global `signatures` list.
+    pub signature_defaults: std::collections::HashMap<AccountId, AccountSignatureDefaults>,
     pub folder_role_overrides: Vec<FolderRoleOverride>,
     pub webcal_subscriptions: Vec<WebcalSubscription>,
     pub other_accounts: Vec<OtherAccount>,
@@ -108,6 +126,31 @@ impl AppConfig {
             *existing = account;
         } else {
             self.other_accounts.push(account);
+        }
+    }
+
+    /// Inserts `signature`, replacing any existing entry with the same id
+    /// (the edit path) or appending it (the add path).
+    pub fn upsert_signature(&mut self, signature: Signature) {
+        if let Some(existing) = self.signatures.iter_mut().find(|s| s.id == signature.id) {
+            *existing = signature;
+        } else {
+            self.signatures.push(signature);
+        }
+    }
+
+    /// Removes the signature with `id`, if any - and clears every account
+    /// default-signature slot that pointed at it, so a deleted signature can
+    /// never leave a dangling default behind.
+    pub fn remove_signature(&mut self, id: &uuid::Uuid) {
+        self.signatures.retain(|s| &s.id != id);
+        for defaults in self.signature_defaults.values_mut() {
+            if defaults.new.as_ref() == Some(id) {
+                defaults.new = None;
+            }
+            if defaults.reply.as_ref() == Some(id) {
+                defaults.reply = None;
+            }
         }
     }
 }
@@ -188,6 +231,8 @@ mod tests {
         identity.bcc = vec![lookout_core::EmailAddress::new("archive@example.com")];
         let config = AppConfig {
             identities: vec![identity],
+            signatures: Vec::new(),
+            signature_defaults: std::collections::HashMap::new(),
             folder_role_overrides: vec![FolderRoleOverride {
                 account_id: "account_1".into(),
                 mailbox: "account_1:Archive 2024".into(),
@@ -234,6 +279,8 @@ mod tests {
                 // Duplicates the account's own address - must be dropped.
                 Identity::new(account.clone(), "The Account Itself", "ME@example.com"),
             ],
+            signatures: Vec::new(),
+            signature_defaults: std::collections::HashMap::new(),
             folder_role_overrides: Vec::new(),
             webcal_subscriptions: Vec::new(),
             other_accounts: Vec::new(),
@@ -288,6 +335,70 @@ mod tests {
         assert_eq!(config.other_accounts.len(), 1);
         assert_eq!(config.other_account(&account.id), Some(edited));
         assert_eq!(config.other_account("other:nope"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_signature_clears_defaults_pointing_at_it() {
+        let account_a = AccountId("account_a".into());
+        let account_b = AccountId("account_b".into());
+        let mut config = AppConfig::default();
+        let work = Signature::new("Work", "<p>Work</p>", "Work");
+        let personal = Signature::new("Personal", "<p>Personal</p>", "Personal");
+        config.upsert_signature(work.clone());
+        config.upsert_signature(personal.clone());
+        config.signature_defaults.insert(
+            account_a.clone(),
+            AccountSignatureDefaults {
+                new: Some(work.id),
+                reply: Some(personal.id),
+            },
+        );
+        config.signature_defaults.insert(account_b.clone(), AccountSignatureDefaults::default());
+
+        // Removing a signature that is nobody's default only drops the row.
+        config.remove_signature(&personal.id);
+        assert_eq!(config.signatures.len(), 1);
+        assert_eq!(config.signature_defaults[&account_a].new, Some(work.id));
+        assert_eq!(config.signature_defaults[&account_a].reply, None, "the reply default must clear with its signature");
+
+        config.remove_signature(&work.id);
+        assert_eq!(config.signature_defaults[&account_a].new, None, "the new-message default must clear with its signature");
+
+        // Removing an unknown id is a no-op.
+        config.remove_signature(&uuid::Uuid::new_v4());
+        assert!(config.signatures.is_empty());
+    }
+
+    #[test]
+    fn signature_defaults_round_trip_through_the_config_file() {
+        let dir = std::env::temp_dir().join(format!("lookout-defaults-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating the defaults (no such key) loads as an empty map.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        assert!(load_at(&path).signature_defaults.is_empty());
+
+        let mut config = AppConfig::default();
+        let signature = Signature::new("Work", "<p>Work</p>", "Work");
+        config.upsert_signature(signature.clone());
+        config.signature_defaults.insert(
+            AccountId("account_1".into()),
+            AccountSignatureDefaults {
+                new: Some(signature.id),
+                reply: Some(signature.id),
+            },
+        );
+        save_at(&path, &config);
+        let loaded = load_at(&path);
+        assert_eq!(loaded.signature_defaults.len(), 1);
+        assert_eq!(
+            loaded.signature_defaults[&AccountId("account_1".into())].new,
+            Some(signature.id)
+        );
+        assert_eq!(loaded.signature_defaults[&AccountId("account_1".into())].reply, Some(signature.id));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
