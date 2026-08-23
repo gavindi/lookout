@@ -65,7 +65,7 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/flatpak/flatpak-builder-tools /tmp/flatpak-builder-tools
           python3 -m venv /tmp/fbtools
-          /tmp/fbtools/bin/pip install --quiet aiohttp toml
+          /tmp/fbtools/bin/pip install --quiet aiohttp PyYAML tomlkit
           /tmp/fbtools/bin/python3 /tmp/flatpak-builder-tools/cargo/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
       - uses: flathub-infra/flatpak-github-actions/flatpak-builder@master
         with:
