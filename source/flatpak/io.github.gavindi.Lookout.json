@@ -21,10 +21,7 @@
 
         "--talk-name=org.freedesktop.portal.Background",
 
-        "--own-name=org.kde.StatusNotifierItem-*",
-        "--own-name=com.canonical.dbusmenu-*",
         "--talk-name=org.kde.StatusNotifierWatcher",
-        "--talk-name=com.canonical.dbusmenu-*",
 
         "--talk-name=org.gnome.Settings",
         "--talk-name=org.gnome.ControlCenter",

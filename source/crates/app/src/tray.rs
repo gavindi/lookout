@@ -175,7 +175,7 @@ pub fn start(commands: async_channel::Sender<TrayCommand>) -> bool {
     };
     let (tx, rx) = std::sync::mpsc::channel();
     tokio.spawn(async move {
-        let _ = tx.send(tray.spawn().await.ok());
+        let _ = tx.send(tray.disable_dbus_name(true).spawn().await.ok());
     });
     let Ok(Some(handle)) = rx.recv_timeout(START_TIMEOUT) else {
         return false;

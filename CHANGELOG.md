@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.104 (2026-08-24)
+
+### Fixed
+
+- **App**: the release workflow's flatpak build failed at the finishing step with `error: Invalid dbus name org.kde.StatusNotifierItem-*` - flatpak's `--own-name` wildcard only recognizes a literal trailing `.*` (a dot-separated prefix match), and `*` isn't a legal character in a D-Bus name otherwise, so the tray icon's `org.kde.StatusNotifierItem-*`/`com.canonical.dbusmenu-*` finish-args were rejected outright as malformed names, not just as a bad match for the hyphen-suffixed names `ksni` actually registers (`org.kde.StatusNotifierItem-<pid>-<n>`) that no `own-name` wildcard syntax could have matched anyway. The tray now calls `ksni`'s `disable_dbus_name(true)` before `spawn()`, so it registers with the StatusNotifierWatcher under its connection's unique name instead of claiming a well-known one - `ksni`'s own documented accommodation for sandboxes exactly like Flatpak's. With no name left to own, the manifest drops both invalid `--own-name` entries and the equally-invalid wildcarded `--talk-name=com.canonical.dbusmenu-*` (the dbusmenu object lives on the same connection as the tray item, so nothing needed to `--talk-name` it in the first place); `--talk-name=org.kde.StatusNotifierWatcher`, needed to call `RegisterStatusNotifierItem` on the watcher, stays.
+
 ## 0.9.103 (2026-08-24)
 
 ### Fixed
