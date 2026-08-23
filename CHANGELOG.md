@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.99 (2026-08-23)
+
+### Changed
+
+- **App**: the .deb package now carries the full GPL-3 license text in DEP-5 copyright format at `/usr/share/doc/lookout/copyright` - cargo-deb's `license-file` metadata pulls the repository-root `LICENSE` into the generated copyright header (`Format`/`Upstream-Name`/`Source`/`Copyright`/`License: GPL-3.0-or-later` followed by the complete, unmodified license), so package auditors and `dpkg -L`/`dpkg -c` consumers see the license without fetching it from the web.
+- **App**: the appstream metainfo is validation-clean: the 0.7.7 release note's plaintext `https://…ics` URL (which tripped `appstreamcli`'s `description-has-plaintext-url` warning) is now just "webcal feed". `appstreamcli validate` passes with zero warnings - only the unavoidable pedantic note about the uppercase component id (the `Lookout` in `io.github.gavindi.Lookout`, which the desktop file, icon, schema, and Flatpak id all share) remains. This matters for distribution: validation warnings can keep `appstream-generator`/`appstreamcli` from including a package's metainfo in the AppStream pool that GNOME Software reads, which is what makes the store page show "Unknown License", no release notes, and a 0-byte download size for locally-installed builds.
+- **App**: the metainfo gains `<url type="bugtracker">` and `<url type="vcs-browser">` links (both to the github.com/gavindi/lookout repository, beside the existing homepage), dropping the stale "placeholder until a real repository exists" comment, plus a `<branding>` block with the two blues from the app icon (`#299acc` light, `#006cb7` dark) so GNOME Software's featured-carousel tile paints a branded background instead of a colour it picks from the icon.
+
 ## 0.9.98 (2026-08-23)
 
 ### Changed

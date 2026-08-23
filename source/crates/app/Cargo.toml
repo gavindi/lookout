@@ -48,6 +48,7 @@ ksni = "0.3"
 name = "lookout"
 maintainer = "Gavin Graham <gavindi@users.noreply.github.com>"
 copyright = "2026 Gavin Graham"
+license-file = ["../../../LICENSE", "0"]
 depends = "libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), libwebkitgtk-6.0-0, libglib2.0-0"
 section = "mail"
 priority = "optional"

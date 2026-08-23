@@ -18,9 +18,19 @@
   <developer id="io.github.gavindi">
     <name>Gavin Graham</name>
   </developer>
-  <!-- Placeholder until a real repository exists at this address. -->
   <url type="homepage">https://github.com/gavindi/lookout</url>
+  <url type="bugtracker">https://github.com/gavindi/lookout/issues</url>
+  <url type="vcs-browser">https://github.com/gavindi/lookout</url>
+  <branding>
+    <color type="primary" scheme_preference="light">#299acc</color>
+    <color type="primary" scheme_preference="dark">#006cb7</color>
+  </branding>
   <releases>
+    <release version="0.9.99" date="2026-08-23">
+      <description>
+        <p>Packaging polish: the .deb now ships a DEP-5 copyright file with the full GPL-3 license text, and the appstream metainfo gains bug tracker and repository links, carousel tile branding colours, and a clean validation.</p>
+      </description>
+    </release>
     <release version="0.9.98" date="2026-08-23">
       <description>
         <p>While composing in the reading pane, the rich text controls (attach, plain/rich toggle, and the formatting buttons) now live in the action bar below the menu bar, replacing the message-list buttons for the session; popping the composer out into its own window moves them back into the editor and restores the action bar. The formatting icons are built and styled exactly like the ribbon bar's default icons.</p>
@@ -532,7 +542,7 @@
     </release>
     <release version="0.7.7" date="2026-08-08">
       <description>
-        <p>Calendar feeds and file import: the Add calendar button now opens a dialog to subscribe to a webcal (https://…ics) feed - events appear read-only, refreshing automatically - to import an .ics file into one of your calendars (re-importing updates, not duplicates), or to manage existing subscriptions.</p>
+        <p>Calendar feeds and file import: the Add calendar button now opens a dialog to subscribe to a webcal feed - events appear read-only, refreshing automatically - to import an .ics file into one of your calendars (re-importing updates, not duplicates), or to manage existing subscriptions.</p>
       </description>
     </release>
     <release version="0.7.6" date="2026-08-07">
