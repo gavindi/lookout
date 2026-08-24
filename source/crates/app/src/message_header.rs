@@ -144,7 +144,7 @@ pub fn build() -> MessageHeader {
     sender_row.append(&contact_button);
     sender_row.append(&header_more_button);
 
-    let to_label = gtk::Label::builder().xalign(0.0).hexpand(true).css_classes(["message-header-meta"]).build();
+    let to_label = gtk::Label::builder().xalign(0.0).hexpand(true).css_classes(["message-header-meta"]).ellipsize(gtk::pango::EllipsizeMode::End).build();
     let date_label = gtk::Label::builder().css_classes(["message-header-meta"]).valign(gtk::Align::Center).build();
     let meta_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
     meta_row.append(&to_label);

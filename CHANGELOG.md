@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.105 (2026-08-24)
+
+### Fixed
+
+- **App**: opening a message with a long recipient list could blow the window up to tens of thousands of pixels wide and kill the reading pane. The header's `To:` row is a plain `Gtk.Label` with no ellipsis, so a bulk-mailer blast sent to a hundred recipients (the header renders the full ~2,400-character address list) made the label's *minimum* width its full text width; the reading pane's `Gtk.Paned` chain propagates child minimums up to the window, which resized to fit - 18,438px wide on the reported email - taking the WebView along with it, and WebKit's attempt to allocate a compositing buffer for the now-18438px-wide pane failed ("Failed to create GBM buffer of size 18438x450"), after which the WebView couldn't paint that message or any later one. The `To:` label now ellipsizes (`pango::EllipsizeMode::End`, matching the sender row's labels), so its minimum width collapses to a small value and nothing can inflate the pane - the address list still truncates gracefully in the header with a "…" instead of ever widening the window. The reproduction (`test-fixtures/wide-email.eml`, a real bulk blast with 99 recipients, verbatim from the report) is wired into the mail crate's fixture tests so the parse path stays covered.
+
 ## 0.9.104 (2026-08-24)
 
 ### Fixed

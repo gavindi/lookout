@@ -1,0 +1,132 @@
+Delivered-To: gavindi@gmail.com
+Received: by 2002:adf:f943:0:b0:482:a408:e864 with SMTP id q3csp447405wrr;
+        Thu, 20 Aug 2026 02:56:47 -0700 (PDT)
+X-Forwarded-Encrypted: i=2; AHgh+RpwJknSENElX4EH00/N+KEFFW5iIjKBOKDkOR0JvPAh9nUzKBBDk/BKbepKI0QO9bBkLYJ4xn4o@gmail.com
+X-Received: by 2002:a05:6000:2213:b0:47f:e4e3:d85f with SMTP id ffacd0b85a97d-482b1fe2baamr21578601f8f.17.1787219807216;
+        Thu, 20 Aug 2026 02:56:47 -0700 (PDT)
+ARC-Seal: i=1; a=rsa-sha256; t=1787219807; cv=none;
+        d=google.com; s=arc-20260327;
+        b=KRU8zxPYuD7RryiNAQOidxxTeP5ERSgG/FNUuK++qnYsSKgmmuvqD3u5/91KyXSqps
+         M6IlNxU6pyndYyb2A+U9J//zm54Y6OVP/+aWsjJWzXRDzb5k8y+nA/5zXO07uwEkNC8Z
+         Adj7T9zBrHIj/cyJt7T/sfMt4WbzbuD7ldW8knaiT4hFSewG2811BXjF5SPWTXghYjVg
+         6ttFBfOn2S8N4NAJvWKtjSCjvm9cV0Lt0LN/Zw2UgHeRiWjvb+9ldh/VVYu18bDvMnYc
+         mxgH7fCDDMc22CtvLX0gH8b0hRT2SruNb9mbd3ljUXbBPtTQUjHVA11s1304kQvfcc02
+         TR5A==
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20260327;
+        h=content-transfer-encoding:mime-version:list-unsubscribe-post
+         :origin-messageid:date:feedback-id:list-unsubscribe:from:message-id
+         :subject:reply-to:to:dkim-signature;
+        bh=P/WBx8rPBQxid7YhWKmghXStGD/ydPv3ZJokNdFC8zQ=;
+        fh=6uDan/SOR7Fnp1bt5S+7VYdWxO/2vh4y+DbI6LDbnB8=;
+        b=Zj3dCUcwjIwJCEhujIorZw9jxX9G7D6jNL5DdZ08MXuyxINWRYqFHEZOcm4cPJSCVa
+         /4GthgE2x+l53ZEhoQSMKqfTgJSJJKFU8pa+PYdq3QMcosi3Lolp06nA6aOAy+JbBW/G
+         ykUP5U3E4lTddHgf4BkY1Ux4ZPGz/RVDnCAryxJ/iblBHZZFoLudAXlykWBksfkxU2Oj
+         IJXuQK4/03+0MwGLkxUDDa7PhfUVgJRFnVSL5+MpyZO25e4l2zFVZ06ljU/LEo1iY/rS
+         9T21jc+6ctcNKTrcBSGm7PBvQ/pOGqE7eAQ9Tv1gQKDw1VkHTHewa5sYsh5Psk33y8e7
+         w6hA==;
+        dara=google.com
+ARC-Authentication-Results: i=1; mx.google.com;
+       dkim=pass header.i=@localcigsupplies.com header.s=brevo2 header.b=IPD1wUTu;
+       spf=pass (google.com: domain of bounces-466881610-1408032162@gz.d.sender-sib.com designates 77.32.148.26 as permitted sender) smtp.mailfrom=bounces-466881610-1408032162@gz.d.sender-sib.com;
+       dmarc=pass (p=QUARANTINE sp=QUARANTINE dis=NONE) header.from=localcigsupplies.com
+Return-Path: <bounces-466881610-1408032162@gz.d.sender-sib.com>
+Received: from gz.d.sender-sib.com (gz.d.sender-sib.com. [77.32.148.26])
+        by mx.google.com with ESMTPS id ffacd0b85a97d-482b146fff3si8111221f8f.48.2026.08.20.02.56.46
+        for <gavindi@gmail.com>
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Thu, 20 Aug 2026 02:56:47 -0700 (PDT)
+Received-SPF: pass (google.com: domain of bounces-466881610-1408032162@gz.d.sender-sib.com designates 77.32.148.26 as permitted sender) client-ip=77.32.148.26;
+Authentication-Results: mx.google.com;
+       dkim=pass header.i=@localcigsupplies.com header.s=brevo2 header.b=IPD1wUTu;
+       spf=pass (google.com: domain of bounces-466881610-1408032162@gz.d.sender-sib.com designates 77.32.148.26 as permitted sender) smtp.mailfrom=bounces-466881610-1408032162@gz.d.sender-sib.com;
+       dmarc=pass (p=QUARANTINE sp=QUARANTINE dis=NONE) header.from=localcigsupplies.com
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=localcigsupplies.com;
+ q=dns/txt; s=brevo2; bh=P/WBx8rPBQxid7YhWKmghXStGD/ydPv3ZJokNdFC8zQ=;
+ h=from:reply-to:subject:date:to:mime-version:content-type:content-transfer-encoding:list-unsubscribe:x-csa-complaints:list-unsubscribe-post:message-id:x-sib-id:feedback-id;
+        b=IPD1wUTuNTIttbnx8XjJvl/Avc/SWM9oTRPLz4PgNVw0Wz7VMFNyXoY014F+GA/P6dsGYjnQaP8s
+        +UWP5ay+QO+Fu2zOAXkXkRQh6i+2lcWJt5U1ZszD3Fj9cazr8VAydMp6iFxnRautsulWKrH/Fui8
+        SYH50CUxexrRiKTZzO7ZHGJxUceLE86wJ5W8WBTbVVVYpSp0kuR34pAwWdB6eLbyr3FLLvVp9tRN
+        ia80R4L4dOgLioFbk8bWvpEY/fPus4Xm/kmhWPUyeZ9FpGZ4fXgMMEoH0vzi6g+6eNDX0t68s2IO
+        fMYQAla25i+ROAzsMcWSotr5cigo6IzAouww8w==
+X-CSA-Complaints: csa-complaints@eco.de
+To: <frederickwork@yahoo.com>,<fredrick.lundberg86@gmail.com>,<fredtakz@gmail.com>,<freefall33772@hotmail.com>,<freefirefjx@gmail.com>,<freekjennifer@gmail.com>,<french.divina@yahoo.com.au>,<freya.townson@icloud.com>,<freyadbroderick@gmail.com>,<friedrichkuepper@hotmail.com>,<frithriley@gmail.com>,<froggytien@gmail.com>,<frogmorley@gmail.com>,<fuller.electrical.94@gmail.com>,<fullyblasting24@gmail.com>,<full_invention@hotmail.com>,<funguy55555@gmail.com>,<funkyoneee21@gmail.com>,<furyps55@gmail.com>,<fuzzb9@gmail.com>,<fzs166899@gmail.com>,<g.bishyy101@outlook.com>,<g.gord95@hotmail.com>,<g.ladz@hotmail.com>,<g.moneghetti@outlook.com>,<g16andj16@hotmail.com>,<g13421@outlook.com>,<gabbyesmeraldo1396@gmail.com>,<gabbymoore3223@gmail.com>,<gabbysmulders@gmail.com>,<gabekember@yahoo.com.au>,<gabemcgovern011@gmail.com>,<gabriel.82@icloud.com>,<gabrielappontel@gmail.com>,<gabriellamrees@gmail.com>,<gabrielleburwell@yahoo.com>,<gabriellecuthbert90@gmail.com>,<gabriellefrancis13@gmail.com>,<gabriellepeckover@gmail.com>,<gai232@bigpond.net.au>,<gaia.leepop@gmail.com>,<gailaitken@gmail.com>,<gailfor333@gmail.com>,<gailparker6@bigpond.com>,<gailsaunders4@hotmail.com>,<galinakaukov@hotmail.com>,<galvey77@gmail.com>,<gam5333@bigpond.com>,<gamehovk@gmail.com>,<gameo4341@gmail.com>,<gamingtuning@gmail.com>,<gappy1983@yahoo.com>,<garedal17@gmail.com>,<garesa@bigpond.com>,<gareth181092@gmail.com>,<garethbell87@gmail.com>,<garethj4373@gmail.com>,<garethowen1114@gmail.com>,<gargoyle451@gmail.com>,<garlingev@gmail.com>,<garnerdawn0@gmail.com>,<garrard.white@bigpond.com>,<garrettorrell1928@gmail.com>,<garry.hodge@bigpond.com>,<garv2@bigpond.com>,<gary@ruvo.com.au>,<garyawebb42@gmail.com>,<garyjporter@yahoo.com.au>,<garyohara67@gmail.com>,<garyrogers47@bigpond.com>,<gattcon@gmail.com>,<gaurav.shrestha21@gmail.com>,<gav.lilly@gmail.com>,<gavanleota321@gmail.com>,<gavinbar65@outlook.com>,<gavindi@gmail.com>,<gaviny@hotmail.com.au>,<gavlil@hotmail.com>,<gayactor31@gmail.com>,<gayledelores@gmail.com>,<gaylhalley@gmail.com>,<gazawalton94@gmail.com>,<gazzachap69@gmail.com>,<gbonython@yahoo.com>,<gcoogan17@gmail.com>,<gc_4211@hotmail.com>,<gdeeble59@gmail.com>,<gdm1502@gmail.com>,<gdobson91@gmail.com>,<gearyman86@gmail.com>,<geddestahlia@gmail.com>,<gedeagungsaputra03@gmail.com>,<geemoss9@gmail.com>,<geinyl123@gmail.com>,<gelise2000@hotmail.com>,<gellemore@icloud.com>,<gema.mcvay@gmail.com>,<gemlay404@icloud.com>,<gemma.rud@icloud.com>
+X-Mailin-EID: NDY2ODgxNjEwfmdhdmluZGlAZ21haWwuY29tfjwyMDI2MDgyMDA5NTYuMTI3ODc3MjQ4NDhAc210cC1yZWxheS5tYWlsaW4uZnI%2Bfmd6LmQuc2VuZGVyLXNpYi5jb20%3D
+Reply-To: "LocalCigSupply" <support@localcigsupplies.com>
+Subject: An Update About Recent Order Delays
+Message-Id: <202608200956.12787724848@smtp-relay.mailin.fr>
+From: "LocalCigSupply" <support@localcigsupplies.com>
+List-Unsubscribe: <https://bbaedgbe.r.bh.d.sendibt3.com/tr/un/li/E5FWvPIgbf2cbaLum63L0CqgKOJBG0tAPbIrns4Iy0hs8Z7k1HDfd5UZWFdcvBavYcuXy85_1judKpQlXsOQhvUSyRlCZpL4FdAMvsicjypslaG2wIzYM-OC8XZs2xdCpa0HrzLxAppfQLNTqxGUyVKE5USlSInYofE9CNaGiN_M4HpXl2esA3J2L8Pq-Tb6L9Su_BNou6BZ6w9bIlNTshe25hb1yFNwTYJurODSHhbc6rRcSoEdA8k1>
+Feedback-ID: 77.32.148.26:11043614_-1:11043614:Sendinblue
+Date: Thu, 20 Aug 2026 09:56:46 +0000
+X-sib-id: Ta8OQGjPfafPKHsYewG6O2-fE9NkpvZJXc5lThfiE-wVowGoNGLpWEqfES7WstTa1K4NcIQcCRVAZ6xHBDp_zRDRBXp_rM4Ly03ojNPWtC2pUQDkThDtpXL3vUDvE4bViuxfpQwp_bRurIjqHzZR4uWbU2KF2G0SyUWCvBBW6EQ
+Origin-messageId: <202608200956.12787724848@smtp-relay.mailin.fr>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+Mime-Version: 1.0
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/html; charset=utf-8
+X-Api-Version: v3
+
+<!DOCTYPE html><html lang=3D"en"><head><meta charset=3D"utf-8"/><meta name=
+=3D"viewport" content=3D"width=3Ddevice-width,initial-scale=3D1"/></head><b=
+ody style=3D"margin:0;background:#f5f6f8;font-family:Arial,Helvetica,sans-s=
+erif;color:#1f2937"><table role=3D"presentation" width=3D"100%" cellspacing=
+=3D"0" cellpadding=3D"0"><tbody><tr><td align=3D"center" style=3D"padding:3=
+0px 14px"><!--[if mso]> <img width=3D"1" height=3D"1" src=3D"https://bbaedg=
+be.r.bh.d.sendibt3.com/tr/op/N-MozHUmrT6f2_wWYj6bfBHJn93Mvb2-DITVuCvZ8QzE7b=
+aAn2ZFRCJUYdAsQfEaEEOK8luB19psgs8VCxcO8rcuT4prdj6nQj7AZ7RShyqJyYkscwiy8XAvK=
+g8EDD_3aq_wwscZYC9y-v3Te4-3GgyxjkSROedHQTr_ATmBVW69orEQmTY076fG1z4Wi6Lc5sO7=
+y_AYsVLN1jlhbnp2mAg-AdsjQw" /> <![endif]--><!--[if !mso]><!--> <img style=
+=3D"display:none" src=3D"https://bbaedgbe.r.bh.d.sendibt3.com/tr/op/N-MozHU=
+mrT6f2_wWYj6bfBHJn93Mvb2-DITVuCvZ8QzE7baAn2ZFRCJUYdAsQfEaEEOK8luB19psgs8VCx=
+cO8rcuT4prdj6nQj7AZ7RShyqJyYkscwiy8XAvKg8EDD_3aq_wwscZYC9y-v3Te4-3GgyxjkSRO=
+edHQTr_ATmBVW69orEQmTY076fG1z4Wi6Lc5sO7y_AYsVLN1jlhbnp2mAg-AdsjQw" /> <!--<=
+![endif]--><table role=3D"presentation" width=3D"100%" cellspacing=3D"0" ce=
+llpadding=3D"0" style=3D"max-width:680px;background:#fff;border-radius:12px=
+;overflow:hidden;box-shadow:0 3px 14px rgba(0,0,0,.07)"><tbody><tr><td styl=
+e=3D"background:#151515;padding:24px 30px;color:#fff"><div style=3D"font-si=
+ze:22px;font-weight:700">LocalCigSupply</div><div style=3D"font-size:13px;c=
+olor:#d1d5db;margin-top:4px">Order update</div></td></tr><tr><td style=3D"p=
+adding:32px 30px;font-size:16px;line-height:1.65"><h1 style=3D"margin:0 0 2=
+2px;font-size:26px;line-height:1.25;color:#111827">An Update About Recent O=
+rder Delays</h1><p>Hi everyone,</p><p>If you=E2=80=99re receiving this emai=
+l, it means you=E2=80=99ve recently placed an order with us.</p><p>We wante=
+d to reach out personally and be transparent about a temporary issue we=E2=
+=80=99ve been experiencing. Due to a significant increase in order volume c=
+ombined with a temporary staff shortage, we are currently working through a=
+ backlog, and some orders may take around <strong>3=E2=80=935 days</strong>=
+ to be dispatched.</p><p>We sincerely apologise to anyone whose order has b=
+een affected by these delays.</p><p>Our entire team is currently working ex=
+tended hours to process orders as quickly as possible, and we expect the si=
+tuation to start improving within the next week. This is only temporary, an=
+d we expect our usual dispatch times to gradually return over the next 1=E2=
+=80=932 weeks.</p><p>We completely understand that when you order these pro=
+ducts, you=E2=80=99re usually hoping to receive them as quickly as possible=
+. We know delays can be frustrating, and we genuinely appreciate your patie=
+nce while we work through this busy period.</p><p>Most importantly, please =
+be assured that every order placed with us is our responsibility. Your mone=
+y will not simply disappear, and we will make sure your order is fulfilled =
+or appropriately resolved if any issue occurs. The current delay simply mea=
+ns that some orders may arrive a little later than what you=E2=80=99ve norm=
+ally experienced with us.</p><div style=3D"margin:18px 0;border:1px solid #=
+fecaca;background:#fff1f2;color:#991b1b;padding:16px 18px;border-radius:8px=
+"><strong style=3D"font-size:17px">=E2=AD=95=EF=B8=8F Please consider waiti=
+ng before placing a new order</strong><br/>If you feel that the current wai=
+ting time is too long, we completely understand and recommend holding off o=
+n placing a new order for the next week or two until things settle down.</d=
+iv><div style=3D"margin:18px 0;border:1px solid #fecaca;background:#fff1f2;=
+color:#991b1b;padding:16px 18px;border-radius:8px"><strong style=3D"font-si=
+ze:17px">=E2=AD=95=EF=B8=8F If you order during this period</strong><br/>If=
+ you do choose to place an order during this period, we truly appreciate yo=
+ur patience and understanding regarding the temporary delays.</div><p>Thank=
+ you again for your continued support, trust, and patience. It genuinely me=
+ans a lot to our entire team.</p><div style=3D"margin:18px 0 24px;border:2p=
+x solid #dc2626;background:#fff7ed;color:#7f1d1d;padding:20px;border-radius=
+:10px"><strong style=3D"font-size:18px">=E2=AD=95=EF=B8=8F A small thank-yo=
+u for your understanding</strong><br/><br/><strong>Coupon Code:</strong> <s=
+pan style=3D"font-family:monospace;font-size:18px;color:#b91c1c;font-weight=
+:bold">THKU4SUPPORT</span><br/><strong>Discount:</strong> 9% OFF<br/><stron=
+g>Valid Until:</strong> 14 September 2026</div><p>Thank you again for stick=
+ing with us. We=E2=80=99re working hard to get everything back to normal as=
+ soon as possible.</p><p>Warm regards,<br/><strong>LocalCigSupply Support</=
+strong></p></td></tr></tbody></table></td></tr></tbody></table>
+</body></html>

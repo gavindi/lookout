@@ -487,6 +487,24 @@ mod tests {
         assert!(body.html_body.expect("has html body").contains("example.com/tracker.png"));
     }
 
+    /// A real-world HTML-only message whose body is a full-width
+    /// presentation table with a 680px content card - the kind of layout the
+    /// reading pane's width clamp (`MESSAGE_WIDTH_CLAMP_CSS` in the app
+    /// crate's `window.rs`) exists for. The fixture proves the parse
+    /// survives the quoted-printable body and keeps the wide markup intact.
+    #[test]
+    fn wide_email_fixture_parses_html() {
+        let body = parse_body(Uid(0), &fixture("wide-email.eml")).expect("parses");
+        let html = body.html_body.expect("has html body");
+        // The heading survives quoted-printable decoding (utf-8, soft line
+        // breaks) ...
+        assert!(html.contains("An Update About Recent Order Delays"));
+        // ... and the wide layout is preserved: the full-width presentation
+        // table and the 680px content card are still in the markup.
+        assert!(html.contains(r#"<table role="presentation" width="100%""#));
+        assert!(html.contains("max-width:680px"));
+    }
+
     #[test]
     fn malformed_html_fixture_does_not_panic() {
         let body = parse_body(Uid(0), &fixture("html-malformed.eml")).expect("parses");

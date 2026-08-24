@@ -7009,10 +7009,40 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Debug: open a raw .eml fixture straight into the reading pane ---
     #[cfg(debug_assertions)]
     {
+        // Shared by the debug opener button and the `LOOKOUT_DEBUG_EML` env
+        // hook below: parse a fixture file and render it into the reading
+        // pane. There's no IMAP session behind it, so the reading pane's cid:
+        // scheme handler can't fetch inline images - rewrite them to `data:`
+        // URIs straight from the raw message so fixtures render in full.
+        fn render_fixture(
+            path: &std::path::Path,
+            state: &Rc<RefCell<UiState>>,
+            reading_stack: &gtk::Stack,
+            message_header: &crate::message_header::MessageHeader,
+        ) {
+            let Ok(raw) = std::fs::read(path) else { return };
+            if let Some(body) = lookout_mail::body::parse_body(lookout_core::Uid(0), &raw) {
+                let body = if let Some(html) = body.html_body.as_deref() {
+                    lookout_core::EmailBody {
+                        html_body: Some(lookout_mail::body::rewrite_cid_refs_to_data_uris(html, &raw)),
+                        ..body
+                    }
+                } else {
+                    body
+                };
+                render_body(state, reading_stack, message_header, MailboxId("debug:eml".into()), body.uid, body);
+            }
+        }
+
         let window = window.clone();
         let state = state.clone();
         let message_header = message_header.clone();
         let reading_stack = reading_stack.clone();
+        // The env hook's own captures - it fires after the button's closure
+        // has taken the originals above.
+        let env_state = state.clone();
+        let env_message_header = message_header.clone();
+        let env_reading_stack = reading_stack.clone();
         open_eml_button.connect_clicked(move |_| {
             let window = window.clone();
             let state = state.clone();
@@ -7029,24 +7059,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
                 let Ok(file) = dialog.open_future(Some(&window)).await else { return };
                 let Some(path) = file.path() else { return };
-                let Ok(raw) = std::fs::read(&path) else { return };
-                if let Some(body) = lookout_mail::body::parse_body(lookout_core::Uid(0), &raw) {
-                    // The debug viewer has no IMAP session behind it, so the
-                    // reading pane's cid: scheme handler can't fetch inline
-                    // images - rewrite them to `data:` URIs straight from the
-                    // raw message so fixtures render in full.
-                    let body = if let Some(html) = body.html_body.as_deref() {
-                        lookout_core::EmailBody {
-                            html_body: Some(lookout_mail::body::rewrite_cid_refs_to_data_uris(html, &raw)),
-                            ..body
-                        }
-                    } else {
-                        body
-                    };
-                    render_body(&state, &reading_stack, &message_header, MailboxId("debug:eml".into()), body.uid, body);
-                }
+                render_fixture(&path, &state, &reading_stack, &message_header);
             });
         });
+
+        // `LOOKOUT_DEBUG_EML`: render the named fixture at startup instead of
+        // clicking through the dialog - the headless path for reproducing a
+        // fixture's breakage.
+        if let Ok(path) = std::env::var("LOOKOUT_DEBUG_EML") {
+            glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
+                render_fixture(std::path::Path::new(&path), &env_state, &env_reading_stack, &env_message_header);
+            });
+        }
     }
 
     // --- Network connectivity -> nudge every backed-off account to retry now ---
