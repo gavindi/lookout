@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.106 (2026-08-24)
+
+### Fixed
+
+- **App**: installing the .deb on Ubuntu 24.04+/26.04 failed with `lookout depends on libwebkitgtk-6.0-0; however: Package libwebkitgtk-6.0-0 is not installed` - the `[package.metadata.deb]` `depends` string in `crates/app/Cargo.toml` hardcoded a runtime package name that doesn't exist on those archives, the same wrong name already fixed for the snap build in 0.9.102. The actual runtime package is `libwebkitgtk-6.0-4` (matching the soname `libwebkitgtk-6.0-dev` pulls in), so the deb now depends on that instead.
+
 ## 0.9.105 (2026-08-24)
 
 ### Fixed
