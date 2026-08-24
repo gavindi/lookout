@@ -160,6 +160,18 @@
       <description>Show a notification when an event reminder comes due.</description>
     </key>
 
+    <!-- Assistant -->
+    <key name="assistant-api-url" type="s">
+      <default>''</default>
+      <summary>Assistant API base URL</summary>
+      <description>Base URL of the OpenAI-compatible API the assistant talks to, e.g. https://api.openai.com/v1. The API token itself lives in the GNOME keyring, never in dconf.</description>
+    </key>
+    <key name="assistant-agent" type="s">
+      <default>''</default>
+      <summary>Assistant agent (model id)</summary>
+      <description>The model id chosen from the API's /models list; empty means none selected yet.</description>
+    </key>
+
     <!-- Keyboard shortcuts -->
     <key name="shortcuts" type="as">
       <default>[]</default>

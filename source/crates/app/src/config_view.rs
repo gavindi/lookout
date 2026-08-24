@@ -255,6 +255,33 @@ pub struct ConfigView {
     /// can wire its `activated` signal to the client-id dialog (and update
     /// the subtitle after a save).
     pub google_tasks_client_row: adw::ActionRow,
+    /// "API URL" entry (Config → Assistant): the row's child is a `gtk::Entry`
+    /// (placeholders aren't bound on `adw::EntryRow`), exposed so the
+    /// caller can seed it from GSettings and write edits back to the
+    /// `assistant-api-url` key.
+    pub assistant_url_entry: gtk::Entry,
+    /// "API token" entry (Config → Assistant), exposed so the caller can
+    /// seed it from the keyring and write edits back there (the token never
+    /// touches dconf or settings.json).
+    pub assistant_token_row: adw::PasswordEntryRow,
+    /// "Test connection" row (Config → Assistant): its subtitle is the
+    /// connection status line ("Not tested yet", "Testing…", then success
+    /// or a failure message), updated by the caller after each run.
+    pub assistant_test_row: adw::ActionRow,
+    /// The "Test" button on the row above, exposed so the caller can wire
+    /// its click and arm/disarm it with the URL's presence.
+    pub assistant_test_button: gtk::Button,
+    /// "Agent" dropdown (Config → Assistant), listing the API's available
+    /// models (`/models` `data[].id`); its subtitle is the list's status
+    /// line ("Refresh to list the API's agents", "Loading…", "N agents
+    /// available", or a failure), updated by the caller after each load.
+    pub assistant_agent_row: adw::ComboRow,
+    /// The dropdown's model, exposed so the caller can repopulate it with
+    /// the fetched agent list (and re-assert the stored selection).
+    pub assistant_agent_model: gtk::StringList,
+    /// The "Refresh" button on the Agent row, exposed so the caller can
+    /// wire its click and arm/disarm it with the URL's presence.
+    pub assistant_agent_refresh_button: gtk::Button,
     /// The per-action keyboard-shortcut rows (Config → Keyboard shortcuts),
     /// exposed so the caller can seed their labels from the live shortcut
     /// table and wire each row's activation to the chord-capture flow.
@@ -527,6 +554,47 @@ pub fn build() -> ConfigView {
         .build();
     google_tasks_group.add(&google_tasks_client_row);
 
+    // The real "Assistant" group: the OpenAI-compatible endpoint the
+    // assistant talks to. The URL is a plain GSettings string
+    // (`assistant-api-url`); the token lives in the GNOME keyring, never in
+    // dconf or settings.json (see `assistant.rs`). The "Test connection"
+    // row's button runs the `GET {url}/models` probe; its subtitle is the
+    // status line, updated by the caller after each run and armed/disarmed
+    // with the URL's presence.
+    let assistant_group = adw::PreferencesGroup::builder().title("Assistant").build();
+    let assistant_url_row = adw::ActionRow::builder().title("API URL").build();
+    let assistant_url_entry = gtk::Entry::builder().placeholder_text("https://api.openai.com/v1").build();
+    assistant_url_row.set_child(Some(&assistant_url_entry));
+    assistant_group.add(&assistant_url_row);
+    let assistant_token_row = adw::PasswordEntryRow::builder().title("API token").build();
+    assistant_group.add(&assistant_token_row);
+    let assistant_test_row = adw::ActionRow::builder()
+        .title("Test connection")
+        .subtitle("Checks the URL and token against the server's /models endpoint")
+        .build();
+    let assistant_test_button = gtk::Button::with_label("Test");
+    assistant_test_button.add_css_class("flat");
+    assistant_test_button.set_sensitive(false);
+    assistant_test_row.add_suffix(&assistant_test_button);
+    assistant_group.add(&assistant_test_row);
+    // The "Agent" dropdown lists the API's available models (the same
+    // `/models` endpoint the Test button probes); the refresh button
+    // repopulates it. Both start disabled - the caller arms them with the
+    // URL's presence - and the row's subtitle is the list's status line.
+    let assistant_agent_model = gtk::StringList::new(&[]);
+    let assistant_agent_row = adw::ComboRow::builder()
+        .title("Agent")
+        .subtitle("Refresh to list the API's available agents")
+        .model(&assistant_agent_model)
+        .sensitive(false)
+        .build();
+    let assistant_agent_refresh_button = gtk::Button::from_icon_name("view-refresh-symbolic");
+    assistant_agent_refresh_button.set_tooltip_text(Some("Reload the agent list"));
+    assistant_agent_refresh_button.add_css_class("flat");
+    assistant_agent_refresh_button.set_sensitive(false);
+    assistant_agent_row.add_suffix(&assistant_agent_refresh_button);
+    assistant_group.add(&assistant_agent_row);
+
     // The real "Keyboard shortcuts" group, replacing that section's
     // placeholder: an expander row (collapsed by default - there are
     // nineteen bindings) holding one row per built-in action, each showing
@@ -671,6 +739,7 @@ pub fn build() -> ConfigView {
     add_section(&section_stack, &mut sections, "Calendar", "calendar", &[&calendar_settings_group]);
     add_section(&section_stack, &mut sections, "Privacy", "privacy", &[&privacy_group]);
     add_section(&section_stack, &mut sections, "Apps", "apps", &[&google_tasks_group]);
+    add_section(&section_stack, &mut sections, "Assistant", "assistant", &[&assistant_group]);
     add_section(&section_stack, &mut sections, "Advanced", "advanced", &[&advanced_group]);
 
     let section_list = gtk::ListBox::builder()
@@ -754,6 +823,13 @@ pub fn build() -> ConfigView {
         dock_badge_row,
         calendar_alerts_row,
         google_tasks_client_row,
+        assistant_url_entry,
+        assistant_token_row,
+        assistant_test_row,
+        assistant_test_button,
+        assistant_agent_row,
+        assistant_agent_model,
+        assistant_agent_refresh_button,
         keyboard_rows: RefCell::new(keyboard_rows),
         reset_shortcuts_row,
         start_at_login_row,

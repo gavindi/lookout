@@ -93,8 +93,9 @@ fn account_attributes(account_id: &AccountId) -> HashMap<&str, &str> {
 /// Turns a `secret-service` error into a user-facing message. The exotic
 /// cases (no provider on the bus, no default collection, a dismissed
 /// unlock prompt) get explicit explanations because they're the ones the
-/// user can actually do something about.
-fn keyring_error(e: secret_service::Error) -> String {
+/// user can actually do something about. Shared with `assistant.rs`, which
+/// stores the Assistant API token in the same keyring.
+pub(crate) fn keyring_error(e: secret_service::Error) -> String {
     match e {
         secret_service::Error::Unavailable => {
             "No GNOME keyring is available - start the keyring service (e.g. install and run gnome-keyring) to store account passwords.".to_string()

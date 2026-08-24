@@ -4,11 +4,12 @@
 //! scalars (layout toggles, sort key/direction, favorites, the Mail-section
 //! switches, and the session-memory keys migrated from `last_view.rs` /
 //! `background_image.rs`) live in a `gio::Settings` object for the
-//! `io.github.gavindi.Lookout` schema. That schema is found either
-//! system-installed (a packaged install puts it in
-//! `/usr/share/glib-2.0/schemas`) or, for cargo-run dev builds, compiled by
-//! `build.rs` into `$OUT_DIR` and registered at runtime as an extra schema
-//! source.
+//! `io.github.gavindi.Lookout` schema. That schema is found either in the
+//! `$OUT_DIR` bundle `build.rs` compiles (dev builds - the bundle always
+//! matches the freshly-built binary, unlike a system install, which can
+//! shadow it with a stale copy) or, for a packaged install (which has no
+//! `$OUT_DIR` at runtime), system-installed in
+//! `/usr/share/glib-2.0/schemas`.
 //!
 //! When neither is available - or in tests - [`resolve`] falls back to a
 //! process-local in-memory map seeded with the schema's defaults, which is
@@ -68,6 +69,13 @@ pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
 pub const MAIL_MESSAGE_THEME_DARK: &str = "mail-message-theme-dark";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
 pub const MAIL_NOTIFICATIONS_ENABLED: &str = "mail-notifications-enabled";
+/// Config → Assistant → "API URL": the base URL of the OpenAI-compatible
+/// API the assistant talks to. The API token itself is kept in the GNOME
+/// keyring (`assistant.rs`), never in GSettings.
+pub const ASSISTANT_API_URL: &str = "assistant-api-url";
+/// Config → Assistant → "Agent": the model id chosen from the API's
+/// `/models` list, for the assistant to talk to.
+pub const ASSISTANT_AGENT: &str = "assistant-agent";
 /// Config → Mail → "Dock badge": whether the app icon's Ubuntu-dock badge
 /// (the Unity LauncherEntry count) shows the summed Inbox unread count.
 pub const DOCK_BADGE_ENABLED: &str = "dock-badge-enabled";
@@ -131,20 +139,26 @@ pub fn resolve() -> SettingsStore {
     }
 }
 
-/// Finds the schema in the system install first (which also honours
-/// `GSETTINGS_SCHEMA_DIR`), then in the `OUT_DIR` bundle `build.rs` compiled.
-/// `gio::Settings::new` aborts on a missing schema, so it's only ever called
-/// after a successful lookup here.
+/// Finds the schema for this build, preferring the `OUT_DIR` bundle
+/// `build.rs` compiled. The bundle exists on dev machines - where the
+/// freshly-built binary and its schema always match - while a
+/// system-installed schema is often stale (the leftover of an earlier
+/// packaged install), and a stale schema makes `gio::Settings` abort on
+/// any key the running binary reads but the old schema lacks. A packaged
+/// install has no `OUT_DIR` at runtime, so the lookup then falls through
+/// to the system-installed schema in `/usr/share/glib-2.0/schemas`.
+/// `gio::Settings::new` aborts on a missing schema, so it's only ever
+/// called after a successful lookup here.
 fn create_gio_settings() -> Option<gio::Settings> {
-    if let Some(source) = gio::SettingsSchemaSource::default() {
-        if source.lookup(SCHEMA_ID, true).is_some() {
-            return Some(gio::Settings::new(SCHEMA_ID));
-        }
-    }
     let out_dir = std::path::PathBuf::from(env!("OUT_DIR"));
     if let Ok(source) = gio::SettingsSchemaSource::from_directory(&out_dir, None, false) {
         if let Some(schema) = source.lookup(SCHEMA_ID, true) {
             return Some(gio::Settings::new_full(&schema, None::<&gio::SettingsBackend>, None));
+        }
+    }
+    if let Some(source) = gio::SettingsSchemaSource::default() {
+        if source.lookup(SCHEMA_ID, true).is_some() {
+            return Some(gio::Settings::new(SCHEMA_ID));
         }
     }
     None
@@ -180,6 +194,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_MESSAGE_THEME_DARK, Value::Bool(false));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(MAIL_NOTIFICATIONS_ENABLED, Value::Bool(true));
+    map.insert(ASSISTANT_API_URL, Value::String(String::new()));
+    map.insert(ASSISTANT_AGENT, Value::String(String::new()));
     map.insert(DOCK_BADGE_ENABLED, Value::Bool(true));
     map.insert(TRAY_ICON_ENABLED, Value::Bool(false));
     map.insert(SHORTCUTS, Value::Strv(Vec::new()));
@@ -465,6 +481,8 @@ mod tests {
         assert!(store.get_bool(CALENDAR_ALERTS_ENABLED));
         assert_eq!(store.get_string(LAST_VIEW_MAILBOX), "");
         assert_eq!(store.get_string(SORT_KEY), "date");
+        assert_eq!(store.get_string(ASSISTANT_API_URL), "");
+        assert_eq!(store.get_string(ASSISTANT_AGENT), "");
         assert_eq!(store.get_double(BACKGROUND_BRIGHTNESS), 0.75);
         assert_eq!(store.get_string(THEME_ID), "flat-dark");
         assert_eq!(store.get_string(ACCENT_COLOR), "");

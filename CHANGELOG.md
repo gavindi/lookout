@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.109 (2026-08-25)
+
+### Added
+
+- **App**: Settings gains an **Assistant** section (the sidebar's last entry, between Apps and Advanced) for configuring the OpenAI-compatible API an assistant will talk to. "API URL" is a text field seeded from - and written through live to - a new `assistant-api-url` GSettings key; "API token" is a password field (built-in eye toggle to show/reveal) whose contents never touch dconf or settings.json - the token lives in the GNOME keyring through the same Secret Service API the manually-added IMAP/SMTP accounts use, in a new `assistant.rs` module addressed by stable `application`/`account`/`protocol` attributes so it can be replaced or deleted without reading it back. The field is seeded from the keyring at startup, saves with a 600 ms debounce (each write is a fresh keyring connection, so per-keystroke writes would be too noisy), and clearing it deletes the stored token. A "Test connection" button (armed whenever the URL field is non-empty) runs a `GET {url}/models` probe with the token as a Bearer header on the worker thread - the standard OpenAI-compatible liveness check, answered by OpenAI, LM Studio, vLLM, Ollama's `/v1` endpoint, and the rest - with a 10-second timeout, and reports the outcome in the row's subtitle: "Testing…", "Connection OK", or a failure carrying the server's status and a short snippet of its error body. The probe is deliberately read-only, so testing never touches the chat endpoint or spends a token. Below it, an "Agent" dropdown lists the API's available models (the `/models` response's `data[].id`s, sorted) behind a refresh button; refreshing loads the list with the keyring token, reports "N agents available" in the row's subtitle (or the same failure wording as the test button), and a successful Test connection refreshes the list automatically - the connection is known good then. Changing the URL clears the list, since another server's agents are meaningless, and the chosen agent persists to a new `assistant-agent` GSettings key for the assistant itself to use.
+
+### Fixed
+
+- **App**: dev builds crashed at startup with `GLib-GIO-ERROR: Settings schema 'io.github.gavindi.Lookout' does not contain a key named 'assistant-api-url'` on machines where an older packaged install left a stale schema in `/usr/share/glib-2.0/schemas`. `settings.rs`'s `create_gio_settings` looked up the system-installed schema first, so a leftover copy - which can't know about keys added after it was installed - shadowed the freshly-compiled dev schema, and `gio::Settings` aborts the process when the code reads a key the loaded schema lacks. The lookup now prefers the `$OUT_DIR` schema bundle `build.rs` compiles, which in a dev build always matches the freshly-built binary, and only falls through to the system install when the bundle is absent - the packaged-install case, where the build machine's `$OUT_DIR` doesn't exist at runtime.
+
+### Testing
+
+- `lookout-app`: new `assistant` tests pin the probe's wire shape and the model-list parse against an ephemeral loopback listener - `GET {base}/models` with the Bearer token, a trailing slash tolerated, a 2xx counting as a successful connection, a 401 reported with its status and a short body snippet, empty or blank URLs rejected before any network I/O, the model list's `data[].id`s extracted and sorted (missing or empty `data` arrays tolerated, unparseable bodies an error), and `settings`' schema-defaults test covers the new `assistant-api-url` and `assistant-agent` keys. The whole workspace suite (653 tests) passes.
+
 ## 0.9.108 (2026-08-25)
 
 ### Changed

@@ -6885,6 +6885,225 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // --- Config → Assistant: the OpenAI-compatible endpoint the assistant
+    // talks to. The URL lives in GSettings (`assistant-api-url`); the token
+    // lives in the GNOME keyring (`assistant.rs`), never in dconf or
+    // settings.json. Edits persist live: the URL writes straight through on
+    // every change, while the token's keyring write is debounced - each
+    // write opens a fresh Secret Service connection, so per-keystroke
+    // writes would be too noisy. The "Test connection" button runs the
+    // `GET {url}/models` probe on the worker and reports the outcome in the
+    // row's subtitle.
+    {
+        let settings = state.borrow().settings.clone();
+        let assistant_url_entry = config_view.assistant_url_entry.clone();
+        let assistant_token_row = config_view.assistant_token_row.clone();
+        let assistant_test_row = config_view.assistant_test_row.clone();
+        let assistant_test_button = config_view.assistant_test_button.clone();
+        let assistant_agent_row = config_view.assistant_agent_row.clone();
+        let assistant_agent_model = config_view.assistant_agent_model.clone();
+        let assistant_agent_refresh_button = config_view.assistant_agent_refresh_button.clone();
+
+        // Seed the URL before wiring the `changed` handler so the seed's
+        // own signal can't fire a redundant write. The token seed is async
+        // (keyring), so its `set_text` runs behind a guard flag that
+        // suppresses the debounced write-back (and skips seeding over
+        // anything the user has already typed).
+        assistant_url_entry.set_text(&settings.get_string(crate::settings::ASSISTANT_API_URL));
+        assistant_test_button.set_sensitive(!assistant_url_entry.text().trim().is_empty());
+        let pending_token_write: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let seeding_token = Rc::new(Cell::new(true));
+        {
+            let worker = worker.clone();
+            let token_row = assistant_token_row.clone();
+            let seeding_token = seeding_token.clone();
+            let (result_tx, result_rx) = async_channel::bounded(1);
+            worker.spawn(async move {
+                let _ = result_tx.send(crate::assistant::load_token().await).await;
+            });
+            glib::spawn_future_local(async move {
+                let Ok(result) = result_rx.recv().await else { return };
+                match result {
+                    Ok(Some(token)) if token_row.text().is_empty() => {
+                        token_row.set_text(&token);
+                    }
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(e) => tracing::warn!("could not load the Assistant API token from the keyring: {e}"),
+                }
+                seeding_token.set(false);
+            });
+        }
+        // The URL's `changed` handler writes through and arms/disarms the
+        // Test and Refresh buttons with the URL's presence. Changing the
+        // URL also clears the agent list - another server's agents are
+        // meaningless.
+        {
+            let settings = settings.clone();
+            let assistant_test_button = assistant_test_button.clone();
+            let assistant_agent_row = assistant_agent_row.clone();
+            let assistant_agent_model = assistant_agent_model.clone();
+            let assistant_agent_refresh_button = assistant_agent_refresh_button.clone();
+            assistant_url_entry.connect_changed(move |entry| {
+                let url = entry.text().trim().to_string();
+                settings.set_string(crate::settings::ASSISTANT_API_URL, &url);
+                assistant_test_button.set_sensitive(!url.is_empty());
+                assistant_agent_refresh_button.set_sensitive(!url.is_empty());
+                assistant_agent_model.splice(0, assistant_agent_model.n_items(), &[]);
+                assistant_agent_row.set_subtitle("Refresh to list the API's available agents");
+                assistant_agent_row.set_sensitive(false);
+            });
+        }
+        // The "Agent" dropdown: the refresh closure loads the API's model
+        // list (the same `/models` probe the Test button runs, with the
+        // keyring token) into the dropdown, re-asserting the stored
+        // selection, and reports the outcome in the row's subtitle. Shared
+        // by the Refresh button and by a successful Test connection.
+        let refresh_agents: Rc<dyn Fn()> = {
+            let worker = worker.clone();
+            let settings = settings.clone();
+            let assistant_url_entry = assistant_url_entry.clone();
+            let assistant_agent_row = assistant_agent_row.clone();
+            let assistant_agent_model = assistant_agent_model.clone();
+            let assistant_agent_refresh_button = assistant_agent_refresh_button.clone();
+            Rc::new(move || {
+                let url = assistant_url_entry.text().trim().to_string();
+                if url.is_empty() {
+                    return;
+                }
+                assistant_agent_refresh_button.set_sensitive(false);
+                assistant_agent_row.set_subtitle("Loading agents…");
+                let (result_tx, result_rx) = async_channel::bounded(1);
+                worker.spawn(async move {
+                    let result = async {
+                        let token = crate::assistant::load_token().await?.unwrap_or_default();
+                        crate::assistant::list_models(&url, &token).await
+                    }
+                    .await;
+                    let _ = result_tx.send(result).await;
+                });
+                let assistant_agent_row = assistant_agent_row.clone();
+                let assistant_agent_model = assistant_agent_model.clone();
+                let assistant_agent_refresh_button = assistant_agent_refresh_button.clone();
+                let settings = settings.clone();
+                glib::spawn_future_local(async move {
+                    let Ok(result) = result_rx.recv().await else { return };
+                    match result {
+                        Ok(models) => {
+                            let additions: Vec<&str> = models.iter().map(String::as_str).collect();
+                            assistant_agent_model.splice(0, assistant_agent_model.n_items(), &additions);
+                            let subtitle = if models.is_empty() {
+                                "No agents available".to_string()
+                            } else if models.len() == 1 {
+                                "1 agent available".to_string()
+                            } else {
+                                format!("{} agents available", models.len())
+                            };
+                            assistant_agent_row.set_subtitle(&subtitle);
+                            assistant_agent_row.set_sensitive(!models.is_empty());
+                            let stored = settings.get_string(crate::settings::ASSISTANT_AGENT);
+                            if let Some(index) = models.iter().position(|m| *m == stored) {
+                                assistant_agent_row.set_selected(index as u32);
+                            }
+                        }
+                        Err(e) => assistant_agent_row.set_subtitle(&format!("Failed: {e}")),
+                    }
+                    assistant_agent_refresh_button.set_sensitive(true);
+                });
+            })
+        };
+        // The token's `changed` handler debounces the keyring write: a
+        // pending write is cancelled and rescheduled, so the keyring is
+        // only touched once typing settles (or the field is cleared, which
+        // deletes the stored token).
+        {
+            let worker = worker.clone();
+            let pending_token_write = pending_token_write.clone();
+            let seeding_token = seeding_token.clone();
+            assistant_token_row.connect_changed(move |row| {
+                if seeding_token.get() {
+                    return;
+                }
+                if let Some(source) = pending_token_write.borrow_mut().take() {
+                    source.remove();
+                }
+                let worker = worker.clone();
+                let token = row.text().to_string();
+                *pending_token_write.borrow_mut() = Some(glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+                    worker.spawn(async move {
+                        let result = if token.is_empty() {
+                            crate::assistant::delete_token().await
+                        } else {
+                            crate::assistant::store_token(&token).await
+                        };
+                        if let Err(e) = result {
+                            tracing::warn!("could not save the Assistant API token to the keyring: {e}");
+                        }
+                    });
+                }));
+            });
+        }
+        // The Test button: run the probe on the worker (keyring token load
+        // + the HTTP GET), then report the outcome in the row's subtitle.
+        // A successful connection also refreshes the agent list - the
+        // connection is known good then, so the dropdown fills itself.
+        {
+            let worker = worker.clone();
+            let assistant_url_entry = assistant_url_entry.clone();
+            let assistant_test_row = assistant_test_row.clone();
+            let assistant_test_button = assistant_test_button.clone();
+            let refresh_agents = refresh_agents.clone();
+            assistant_test_button.connect_clicked(move |button| {
+                let url = assistant_url_entry.text().trim().to_string();
+                if url.is_empty() {
+                    return;
+                }
+                button.set_sensitive(false);
+                assistant_test_row.set_subtitle("Testing…");
+                let (result_tx, result_rx) = async_channel::bounded(1);
+                worker.spawn(async move {
+                    let result = async {
+                        let token = crate::assistant::load_token().await?.unwrap_or_default();
+                        crate::assistant::test_connection(&url, &token).await
+                    }
+                    .await;
+                    let _ = result_tx.send(result).await;
+                });
+                let assistant_test_row = assistant_test_row.clone();
+                let button = button.clone();
+                let refresh_agents = refresh_agents.clone();
+                glib::spawn_future_local(async move {
+                    let Ok(result) = result_rx.recv().await else { return };
+                    match result {
+                        Ok(()) => {
+                            assistant_test_row.set_subtitle("Connection OK");
+                            refresh_agents();
+                        }
+                        Err(e) => assistant_test_row.set_subtitle(&format!("Failed: {e}")),
+                    }
+                    button.set_sensitive(true);
+                });
+            });
+        }
+        // The Refresh button triggers the agent-list load; the selection
+        // persists live to the `assistant-agent` GSettings key.
+        {
+            let refresh_agents = refresh_agents.clone();
+            assistant_agent_refresh_button.connect_clicked(move |_| refresh_agents());
+        }
+        {
+            let settings = settings.clone();
+            let assistant_agent_model = assistant_agent_model.clone();
+            assistant_agent_row.connect_selected_notify(move |row| {
+                let selected = row.selected();
+                if selected != gtk::INVALID_LIST_POSITION {
+                    if let Some(id) = assistant_agent_model.string(selected) {
+                        settings.set_string(crate::settings::ASSISTANT_AGENT, &id);
+                    }
+                }
+            });
+        }
+    }
+
     // --- Compose button -> new-message composer in the reading pane,
     // "From" = the account owning the selected message (falling back to the
     // currently-open mailbox's account, then any connected account). The

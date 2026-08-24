@@ -3,6 +3,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 mod app_config;
+mod assistant;
 mod background;
 mod background_image;
 mod calendar_colors;

@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.109" date="2026-08-25">
+      <description>
+        <p>Settings gains an Assistant section for configuring an OpenAI-compatible API: an API URL field (persisted in GSettings), an API token field stored in the GNOME keyring, a Test connection button that probes the server's /models endpoint and reports whether the URL and token work, and an Agent dropdown listing the API's available models with a refresh button. Dev builds also no longer crash when a stale packaged schema shadows the freshly-compiled one.</p>
+      </description>
+    </release>
     <release version="0.9.108" date="2026-08-25">
       <description>
         <p>Opening email is now instant: new messages are cached the moment they arrive - their bodies download as part of the sync itself, not whenever the background prefetch gets to them - and opening a message reads the local cache directly, so already-cached mail renders without waiting on the mail session. User actions also preempt background work: message, image, and attachment fetches get their own priority lane, server-side searches yield to clicks, and the background body prefetch fetches conservatively, so nothing you're doing waits behind bulk downloads.</p>
