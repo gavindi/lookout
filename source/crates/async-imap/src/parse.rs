@@ -17,34 +17,28 @@ pub(crate) fn parse_names<T: Stream<Item = io::Result<ResponseData>> + Unpin + S
 ) -> impl Stream<Item = Result<Name>> + '_ + Send + Unpin {
     use futures::{FutureExt, StreamExt};
 
-    StreamExt::filter_map(
-        StreamExt::take_while(stream, move |res| filter(res, &command_tag)),
-        move |resp| {
-            let unsolicited = unsolicited.clone();
-            async move {
-                match resp {
-                    Ok(resp) => match resp.parsed() {
-                        Response::MailboxData(MailboxDatum::List { .. }) => {
-                            let name = Name::from_mailbox_data(resp);
-                            Some(Ok(name))
-                        }
-                        _ => {
-                            handle_unilateral(resp, unsolicited);
-                            None
-                        }
-                    },
-                    Err(err) => Some(Err(err.into())),
-                }
+    StreamExt::filter_map(StreamExt::take_while(stream, move |res| filter(res, &command_tag)), move |resp| {
+        let unsolicited = unsolicited.clone();
+        async move {
+            match resp {
+                Ok(resp) => match resp.parsed() {
+                    Response::MailboxData(MailboxDatum::List { .. }) => {
+                        let name = Name::from_mailbox_data(resp);
+                        Some(Ok(name))
+                    }
+                    _ => {
+                        handle_unilateral(resp, unsolicited);
+                        None
+                    }
+                },
+                Err(err) => Some(Err(err.into())),
             }
-            .boxed()
-        },
-    )
+        }
+        .boxed()
+    })
 }
 
-pub(crate) fn filter(
-    res: &io::Result<ResponseData>,
-    command_tag: &RequestId,
-) -> impl Future<Output = bool> {
+pub(crate) fn filter(res: &io::Result<ResponseData>, command_tag: &RequestId) -> impl Future<Output = bool> {
     let val = filter_sync(res, command_tag);
     futures::future::ready(val)
 }
@@ -69,26 +63,23 @@ pub(crate) fn parse_fetches<T: Stream<Item = io::Result<ResponseData>> + Unpin +
 ) -> impl Stream<Item = Result<Fetch>> + '_ + Send + Unpin {
     use futures::{FutureExt, StreamExt};
 
-    StreamExt::filter_map(
-        StreamExt::take_while(stream, move |res| filter(res, &command_tag)),
-        move |resp| {
-            let unsolicited = unsolicited.clone();
+    StreamExt::filter_map(StreamExt::take_while(stream, move |res| filter(res, &command_tag)), move |resp| {
+        let unsolicited = unsolicited.clone();
 
-            async move {
-                match resp {
-                    Ok(resp) => match resp.parsed() {
-                        Response::Fetch(..) => Some(Ok(Fetch::new(resp))),
-                        _ => {
-                            handle_unilateral(resp, unsolicited);
-                            None
-                        }
-                    },
-                    Err(err) => Some(Err(err.into())),
-                }
+        async move {
+            match resp {
+                Ok(resp) => match resp.parsed() {
+                    Response::Fetch(..) => Some(Ok(Fetch::new(resp))),
+                    _ => {
+                        handle_unilateral(resp, unsolicited);
+                        None
+                    }
+                },
+                Err(err) => Some(Err(err.into())),
             }
-            .boxed()
-        },
-    )
+        }
+        .boxed()
+    })
 }
 
 pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Unpin + Send>(
@@ -102,44 +93,28 @@ pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Un
     while let Some(resp) = stream.try_next().await? {
         match resp.parsed() {
             Response::Done {
-                tag,
-                status,
-                code,
-                information,
-                ..
+                tag, status, code, information, ..
             } if tag == &command_tag => {
                 use imap_proto::Status;
                 match status {
                     Status::Ok => {
                         break;
                     }
-                    Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")))
-                    }
-                    Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")))
-                    }
+                    Status::Bad => return Err(Error::Bad(format!("code: {code:?}, info: {information:?}"))),
+                    Status::No => return Err(Error::No(format!("code: {code:?}, info: {information:?}"))),
                     _ => {
-                        return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, code: {code:?}, information: {information:?}"
-                        ))));
+                        return Err(Error::Io(io::Error::other(format!("status: {status:?}, code: {code:?}, information: {information:?}"))));
                     }
                 }
             }
-            Response::MailboxData(MailboxDatum::Status { mailbox, status })
-                if mailbox == expected_mailbox =>
-            {
+            Response::MailboxData(MailboxDatum::Status { mailbox, status }) if mailbox == expected_mailbox => {
                 for attribute in status {
                     match attribute {
-                        StatusAttribute::HighestModSeq(highest_modseq) => {
-                            mbox.highest_modseq = Some(*highest_modseq)
-                        }
+                        StatusAttribute::HighestModSeq(highest_modseq) => mbox.highest_modseq = Some(*highest_modseq),
                         StatusAttribute::Messages(exists) => mbox.exists = *exists,
                         StatusAttribute::Recent(recent) => mbox.recent = *recent,
                         StatusAttribute::UidNext(uid_next) => mbox.uid_next = Some(*uid_next),
-                        StatusAttribute::UidValidity(uid_validity) => {
-                            mbox.uid_validity = Some(*uid_validity)
-                        }
+                        StatusAttribute::UidValidity(uid_validity) => mbox.uid_validity = Some(*uid_validity),
                         StatusAttribute::Unseen(unseen) => mbox.unseen = Some(*unseen),
                         _ => {}
                     }
@@ -161,25 +136,22 @@ pub(crate) fn parse_expunge<T: Stream<Item = io::Result<ResponseData>> + Unpin +
 ) -> impl Stream<Item = Result<u32>> + '_ + Send {
     use futures::StreamExt;
 
-    StreamExt::filter_map(
-        StreamExt::take_while(stream, move |res| filter(res, &command_tag)),
-        move |resp| {
-            let unsolicited = unsolicited.clone();
+    StreamExt::filter_map(StreamExt::take_while(stream, move |res| filter(res, &command_tag)), move |resp| {
+        let unsolicited = unsolicited.clone();
 
-            async move {
-                match resp {
-                    Ok(resp) => match resp.parsed() {
-                        Response::Expunge(id) => Some(Ok(*id)),
-                        _ => {
-                            handle_unilateral(resp, unsolicited);
-                            None
-                        }
-                    },
-                    Err(err) => Some(Err(err.into())),
-                }
+        async move {
+            match resp {
+                Ok(resp) => match resp.parsed() {
+                    Response::Expunge(id) => Some(Ok(*id)),
+                    _ => {
+                        handle_unilateral(resp, unsolicited);
+                        None
+                    }
+                },
+                Err(err) => Some(Err(err.into())),
             }
-        },
-    )
+        }
+    })
 }
 
 pub(crate) async fn parse_capabilities<T: Stream<Item = io::Result<ResponseData>> + Unpin>(
@@ -189,11 +161,7 @@ pub(crate) async fn parse_capabilities<T: Stream<Item = io::Result<ResponseData>
 ) -> Result<Capabilities> {
     let mut caps: HashSet<Capability> = HashSet::new();
 
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = stream.take_while(|res| filter(res, &command_tag)).try_next().await? {
         match resp.parsed() {
             Response::Capabilities(cs) => {
                 for c in cs {
@@ -214,11 +182,7 @@ pub(crate) async fn parse_noop<T: Stream<Item = io::Result<ResponseData>> + Unpi
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> Result<()> {
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = stream.take_while(|res| filter(res, &command_tag)).try_next().await? {
         handle_unilateral(resp, unsolicited.clone());
     }
 
@@ -235,35 +199,21 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
     while let Some(resp) = stream.try_next().await? {
         match resp.parsed() {
             Response::Done {
-                tag,
-                status,
-                code,
-                information,
-                ..
+                tag, status, code, information, ..
             } if tag == &command_tag => {
                 use imap_proto::Status;
                 match status {
                     Status::Ok => {
                         break;
                     }
-                    Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")))
-                    }
-                    Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")))
-                    }
+                    Status::Bad => return Err(Error::Bad(format!("code: {code:?}, info: {information:?}"))),
+                    Status::No => return Err(Error::No(format!("code: {code:?}, info: {information:?}"))),
                     _ => {
-                        return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, code: {code:?}, information: {information:?}"
-                        ))));
+                        return Err(Error::Io(io::Error::other(format!("status: {status:?}, code: {code:?}, information: {information:?}"))));
                     }
                 }
             }
-            Response::Data {
-                status,
-                code,
-                information,
-            } => {
+            Response::Data { status, code, information } => {
                 use imap_proto::Status;
 
                 match status {
@@ -283,23 +233,15 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                                 mailbox.unseen = Some(*n);
                             }
                             Some(ResponseCode::PermanentFlags(flags)) => {
-                                mailbox
-                                    .permanent_flags
-                                    .extend(flags.iter().map(|s| (*s).to_string()).map(Flag::from));
+                                mailbox.permanent_flags.extend(flags.iter().map(|s| (*s).to_string()).map(Flag::from));
                             }
                             _ => {}
                         }
                     }
-                    Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")))
-                    }
-                    Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")))
-                    }
+                    Status::Bad => return Err(Error::Bad(format!("code: {code:?}, info: {information:?}"))),
+                    Status::No => return Err(Error::No(format!("code: {code:?}, info: {information:?}"))),
                     _ => {
-                        return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, code: {code:?}, information: {information:?}"
-                        ))));
+                        return Err(Error::Io(io::Error::other(format!("status: {status:?}, code: {code:?}, information: {information:?}"))));
                     }
                 }
             }
@@ -312,9 +254,7 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                     mailbox.recent = *r;
                 }
                 MailboxDatum::Flags(flags) => {
-                    mailbox
-                        .flags
-                        .extend(flags.iter().map(|s| (*s).to_string()).map(Flag::from));
+                    mailbox.flags.extend(flags.iter().map(|s| (*s).to_string()).map(Flag::from));
                 }
                 MailboxDatum::List { .. } => {}
                 MailboxDatum::MetadataSolicited { .. } => {}
@@ -339,11 +279,7 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
 ) -> Result<HashSet<u32>> {
     let mut ids: HashSet<u32> = HashSet::new();
 
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = stream.take_while(|res| filter(res, &command_tag)).try_next().await? {
         match resp.parsed() {
             Response::MailboxData(MailboxDatum::Search(cs)) => {
                 for c in cs {
@@ -367,17 +303,11 @@ pub(crate) async fn parse_metadata<T: Stream<Item = io::Result<ResponseData>> + 
     command_tag: RequestId,
 ) -> Result<Vec<Metadata>> {
     let mut res_values = Vec::new();
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = stream.take_while(|res| filter(res, &command_tag)).try_next().await? {
         match resp.parsed() {
             // METADATA Response with Values
             // <https://datatracker.ietf.org/doc/html/rfc5464.html#section-4.4.1>
-            Response::MailboxData(MailboxDatum::MetadataSolicited { mailbox, values })
-                if mailbox == mailbox_name =>
-            {
+            Response::MailboxData(MailboxDatum::MetadataSolicited { mailbox, values }) if mailbox == mailbox_name => {
                 res_values.extend_from_slice(values.as_slice());
             }
 
@@ -399,10 +329,7 @@ pub(crate) async fn parse_metadata<T: Stream<Item = io::Result<ResponseData>> + 
 /// If the channel is full or closed,
 /// i.e. the responses are not being consumed,
 /// ignores new responses.
-pub(crate) fn handle_unilateral(
-    res: ResponseData,
-    unsolicited: channel::Sender<UnsolicitedResponse>,
-) {
+pub(crate) fn handle_unilateral(res: ResponseData, unsolicited: channel::Sender<UnsolicitedResponse>) {
     match res.parsed() {
         Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
             unsolicited
@@ -450,8 +377,7 @@ mod tests {
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn parse_capability_test() {
         let expected_capabilities = &["IMAP4rev1", "STARTTLS", "AUTH=GSSAPI", "LOGINDISABLED"];
-        let responses =
-            input_stream(&["* CAPABILITY IMAP4rev1 STARTTLS AUTH=GSSAPI LOGINDISABLED\r\n"]);
+        let responses = input_stream(&["* CAPABILITY IMAP4rev1 STARTTLS AUTH=GSSAPI LOGINDISABLED\r\n"]);
 
         let mut stream = async_std::stream::from_iter(responses);
         let (send, recv) = bounded(10);
@@ -494,9 +420,7 @@ mod tests {
         let mut stream = async_std::stream::from_iter(responses);
 
         let id = RequestId("A0001".into());
-        parse_capabilities(&mut stream, send.clone(), id)
-            .await
-            .unwrap();
+        parse_capabilities(&mut stream, send.clone(), id).await.unwrap();
         assert!(recv.is_empty());
     }
 
@@ -508,16 +432,10 @@ mod tests {
         let mut stream = async_std::stream::from_iter(responses);
 
         let id = RequestId("A0001".into());
-        let names: Vec<_> = parse_names(&mut stream, send, id)
-            .try_collect::<Vec<Name>>()
-            .await
-            .unwrap();
+        let names: Vec<_> = parse_names(&mut stream, send, id).try_collect::<Vec<Name>>().await.unwrap();
         assert!(recv.is_empty());
         assert_eq!(names.len(), 1);
-        assert_eq!(
-            names[0].attributes(),
-            &[NameAttribute::Extension("\\HasNoChildren".into())]
-        );
+        assert_eq!(names[0].attributes(), &[NameAttribute::Extension("\\HasNoChildren".into())]);
         assert_eq!(names[0].delimiter(), Some("."));
         assert_eq!(names[0].name(), "INBOX");
     }
@@ -530,10 +448,7 @@ mod tests {
         let mut stream = async_std::stream::from_iter(responses);
         let id = RequestId("a".into());
 
-        let fetches = parse_fetches(&mut stream, send, id)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let fetches = parse_fetches(&mut stream, send, id).try_collect::<Vec<_>>().await.unwrap();
         assert!(recv.is_empty());
         assert!(fetches.is_empty());
     }
@@ -542,17 +457,11 @@ mod tests {
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn parse_fetches_test() {
         let (send, recv) = bounded(10);
-        let responses = input_stream(&[
-            "* 24 FETCH (FLAGS (\\Seen) UID 4827943)\r\n",
-            "* 25 FETCH (FLAGS (\\Seen))\r\n",
-        ]);
+        let responses = input_stream(&["* 24 FETCH (FLAGS (\\Seen) UID 4827943)\r\n", "* 25 FETCH (FLAGS (\\Seen))\r\n"]);
         let mut stream = async_std::stream::from_iter(responses);
         let id = RequestId("a".into());
 
-        let fetches = parse_fetches(&mut stream, send, id)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let fetches = parse_fetches(&mut stream, send, id).try_collect::<Vec<_>>().await.unwrap();
         assert!(recv.is_empty());
 
         assert_eq!(fetches.len(), 2);
@@ -577,10 +486,7 @@ mod tests {
         let mut stream = async_std::stream::from_iter(responses);
         let id = RequestId("a".into());
 
-        let fetches = parse_fetches(&mut stream, send, id)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let fetches = parse_fetches(&mut stream, send, id).try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(recv.recv().await.unwrap(), UnsolicitedResponse::Recent(1));
 
         assert_eq!(fetches.len(), 1);
@@ -592,25 +498,16 @@ mod tests {
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn parse_names_w_unilateral() {
         let (send, recv) = bounded(10);
-        let responses = input_stream(&[
-            "* LIST (\\HasNoChildren) \".\" \"INBOX\"\r\n",
-            "* 4 EXPUNGE\r\n",
-        ]);
+        let responses = input_stream(&["* LIST (\\HasNoChildren) \".\" \"INBOX\"\r\n", "* 4 EXPUNGE\r\n"]);
         let mut stream = async_std::stream::from_iter(responses);
 
         let id = RequestId("A0001".into());
-        let names = parse_names(&mut stream, send, id)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let names = parse_names(&mut stream, send, id).try_collect::<Vec<_>>().await.unwrap();
 
         assert_eq!(recv.recv().await.unwrap(), UnsolicitedResponse::Expunge(4));
 
         assert_eq!(names.len(), 1);
-        assert_eq!(
-            names[0].attributes(),
-            &[NameAttribute::Extension("\\HasNoChildren".into())]
-        );
+        assert_eq!(names[0].attributes(), &[NameAttribute::Extension("\\HasNoChildren".into())]);
         assert_eq!(names[0].delimiter(), Some("."));
         assert_eq!(names[0].name(), "INBOX");
     }
@@ -700,15 +597,11 @@ mod tests {
         assert_eq!(
             ids,
             [
-                1600, 1698, 1739, 1781, 1795, 1885, 1891, 1892, 1893, 1898, 1899, 1901, 1911, 1926,
-                1932, 1933, 1993, 1994, 2007, 2032, 2033, 2041, 2053, 2062, 2063, 2065, 2066, 2072,
-                2078, 2079, 2082, 2084, 2095, 2100, 2101, 2102, 2103, 2104, 2107, 2116, 2120, 2135,
-                2138, 2154, 2163, 2168, 2172, 2189, 2193, 2198, 2199, 2205, 2212, 2213, 2221, 2227,
-                2267, 2275, 2276, 2295, 2300, 2328, 2330, 2332, 2333, 2334, 2335, 2336, 2337, 2338,
-                2339, 2341, 2342, 2347, 2349, 2350, 2358, 2359, 2362, 2369, 2371, 2372, 2373, 2374,
-                2375, 2376, 2377, 2378, 2379, 2380, 2381, 2382, 2383, 2384, 2385, 2386, 2390, 2392,
-                2397, 2400, 2401, 2403, 2405, 2409, 2411, 2414, 2417, 2419, 2420, 2424, 2426, 2428,
-                2439, 2454, 2456, 2467, 2468, 2469, 2490, 2515, 2519, 2520, 2521
+                1600, 1698, 1739, 1781, 1795, 1885, 1891, 1892, 1893, 1898, 1899, 1901, 1911, 1926, 1932, 1933, 1993, 1994, 2007, 2032, 2033, 2041, 2053, 2062, 2063, 2065, 2066,
+                2072, 2078, 2079, 2082, 2084, 2095, 2100, 2101, 2102, 2103, 2104, 2107, 2116, 2120, 2135, 2138, 2154, 2163, 2168, 2172, 2189, 2193, 2198, 2199, 2205, 2212, 2213,
+                2221, 2227, 2267, 2275, 2276, 2295, 2300, 2328, 2330, 2332, 2333, 2334, 2335, 2336, 2337, 2338, 2339, 2341, 2342, 2347, 2349, 2350, 2358, 2359, 2362, 2369, 2371,
+                2372, 2373, 2374, 2375, 2376, 2377, 2378, 2379, 2380, 2381, 2382, 2383, 2384, 2385, 2386, 2390, 2392, 2397, 2400, 2401, 2403, 2405, 2409, 2411, 2414, 2417, 2419,
+                2420, 2424, 2426, 2428, 2439, 2454, 2456, 2467, 2468, 2469, 2490, 2515, 2519, 2520, 2521
             ]
             .iter()
             .cloned()
@@ -735,9 +628,7 @@ mod tests {
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn parse_mailbox_does_not_exist_error() {
         let (send, recv) = bounded(10);
-        let responses = input_stream(&[
-            "A0003 NO Mailbox doesn't exist: DeltaChat (0.001 + 0.140 + 0.139 secs).\r\n",
-        ]);
+        let responses = input_stream(&["A0003 NO Mailbox doesn't exist: DeltaChat (0.001 + 0.140 + 0.139 secs).\r\n"]);
         let mut stream = async_std::stream::from_iter(responses);
 
         let id = RequestId("A0003".into());

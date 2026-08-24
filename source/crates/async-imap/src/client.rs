@@ -74,10 +74,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// that accepted `COMPRESS DEFLATE` starts sending compressed responses
     /// immediately after its OK, so the stream handed back by `f` must
     /// already be the decoder/encoder wrapper.
-    pub fn map_stream<S: Read + Write + Unpin + fmt::Debug + Send>(
-        self,
-        f: impl FnOnce(T) -> S,
-    ) -> Session<S> {
+    pub fn map_stream<S: Read + Write + Unpin + fmt::Debug + Send>(self, f: impl FnOnce(T) -> S) -> Session<S> {
         let Self {
             conn,
             unsolicited_responses_tx,
@@ -217,11 +214,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
     /// # Ok(())
     /// # }) }
     /// ```
-    pub async fn login<U: AsRef<str>, P: AsRef<str>>(
-        self,
-        username: U,
-        password: P,
-    ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
+    pub async fn login<U: AsRef<str>, P: AsRef<str>>(self, username: U, password: P) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
         let (session, _capabilities) = self.login_with_capabilities(username, password).await?;
         Ok(session)
     }
@@ -245,30 +238,17 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                 return Err((Error::ConnectionLost, self));
             };
 
-            if let Response::Done {
-                status,
-                code,
-                information,
-                tag,
-            } = res.parsed()
-            {
-                ok_or_unauth_client_err!(
-                    self.check_status_ok(status, code.as_ref(), information.as_deref()),
-                    self
-                );
+            if let Response::Done { status, code, information, tag } = res.parsed() {
+                ok_or_unauth_client_err!(self.check_status_ok(status, code.as_ref(), information.as_deref()), self);
 
                 if *tag == id {
-                    let capabilities =
-                        if let Some(imap_proto::types::ResponseCode::Capabilities(capabilities)) =
-                            code
-                        {
-                            use crate::types::{Capabilities, Capability};
-                            let capability_set: HashSet<Capability> =
-                                capabilities.iter().map(Capability::from).collect();
-                            Some(Capabilities(capability_set))
-                        } else {
-                            None
-                        };
+                    let capabilities = if let Some(imap_proto::types::ResponseCode::Capabilities(capabilities)) = code {
+                        use crate::types::{Capabilities, Capability};
+                        let capability_set: HashSet<Capability> = capabilities.iter().map(Capability::from).collect();
+                        Some(Capabilities(capability_set))
+                    } else {
+                        None
+                    };
                     return Ok((Session::new(self.conn), capabilities));
                 }
             }
@@ -318,26 +298,14 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
     /// # Ok(())
     /// # }) }
     /// ```
-    pub async fn authenticate<A: Authenticator, S: AsRef<str>>(
-        mut self,
-        auth_type: S,
-        authenticator: A,
-    ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
-        let id = ok_or_unauth_client_err!(
-            self.run_command(&format!("AUTHENTICATE {}", auth_type.as_ref()))
-                .await,
-            self
-        );
+    pub async fn authenticate<A: Authenticator, S: AsRef<str>>(mut self, auth_type: S, authenticator: A) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
+        let id = ok_or_unauth_client_err!(self.run_command(&format!("AUTHENTICATE {}", auth_type.as_ref())).await, self);
         let session = self.do_auth_handshake(id, authenticator).await?;
         Ok(session)
     }
 
     /// This func does the handshake process once the authenticate command is made.
-    async fn do_auth_handshake<A: Authenticator>(
-        mut self,
-        id: RequestId,
-        mut authenticator: A,
-    ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
+    async fn do_auth_handshake<A: Authenticator>(mut self, id: RequestId, mut authenticator: A) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
         // explicit match blocks neccessary to convert error to tuple and not bind self too
         // early (see also comment on `login`)
         loop {
@@ -350,23 +318,16 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                         ok_or_unauth_client_err!(
                             base64::engine::general_purpose::STANDARD
                                 .decode(text.as_ref())
-                                .map_err(|e| Error::Parse(ParseError::Authentication(
-                                    (*text).to_string(),
-                                    Some(e)
-                                ))),
+                                .map_err(|e| Error::Parse(ParseError::Authentication((*text).to_string(), Some(e)))),
                             self
                         )
                     } else {
                         Vec::new()
                     };
                     let raw_response = &mut authenticator.process(&challenge);
-                    let auth_response =
-                        base64::engine::general_purpose::STANDARD.encode(raw_response);
+                    let auth_response = base64::engine::general_purpose::STANDARD.encode(raw_response);
 
-                    ok_or_unauth_client_err!(
-                        self.conn.run_command_untagged(&auth_response).await,
-                        self
-                    );
+                    ok_or_unauth_client_err!(self.conn.run_command_untagged(&auth_response).await, self);
                 }
                 _ => {
                     ok_or_unauth_client_err!(self.check_done_ok_from(&id, None, res).await, self);
@@ -413,15 +374,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// You can get them from the `unsolicited_responses` channel of the [`Session`](struct.Session.html).
     pub async fn select<S: AsRef<str>>(&mut self, mailbox_name: S) -> Result<Mailbox> {
         // TODO: also note READ/WRITE vs READ-only mode!
-        let id = self
-            .run_command(&format!("SELECT {}", validate_str(mailbox_name.as_ref())?))
-            .await?;
-        let mbox = parse_mailbox(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let id = self.run_command(&format!("SELECT {}", validate_str(mailbox_name.as_ref())?)).await?;
+        let mbox = parse_mailbox(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
 
         Ok(mbox)
     }
@@ -429,18 +383,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// Selects a mailbox with `(CONDSTORE)` parameter as defined in
     /// [RFC 7162](https://www.rfc-editor.org/rfc/rfc7162.html#section-3.1.8).
     pub async fn select_condstore<S: AsRef<str>>(&mut self, mailbox_name: S) -> Result<Mailbox> {
-        let id = self
-            .run_command(&format!(
-                "SELECT {} (CONDSTORE)",
-                validate_str(mailbox_name.as_ref())?
-            ))
-            .await?;
-        let mbox = parse_mailbox(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let id = self.run_command(&format!("SELECT {} (CONDSTORE)", validate_str(mailbox_name.as_ref())?)).await?;
+        let mbox = parse_mailbox(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
 
         Ok(mbox)
     }
@@ -450,15 +394,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// of the mailbox, including per-user state, will happen in a mailbox opened with `examine`;
     /// in particular, messagess cannot lose [`Flag::Recent`] in an examined mailbox.
     pub async fn examine<S: AsRef<str>>(&mut self, mailbox_name: S) -> Result<Mailbox> {
-        let id = self
-            .run_command(&format!("EXAMINE {}", validate_str(mailbox_name.as_ref())?))
-            .await?;
-        let mbox = parse_mailbox(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let id = self.run_command(&format!("EXAMINE {}", validate_str(mailbox_name.as_ref())?)).await?;
+        let mbox = parse_mailbox(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
 
         Ok(mbox)
     }
@@ -521,66 +458,33 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///  - `RFC822.HEADER`: Functionally equivalent to `BODY.PEEK[HEADER]`.
     ///  - `RFC822.SIZE`: The [RFC-2822](https://tools.ietf.org/html/rfc2822) size of the message.
     ///  - `UID`: The unique identifier for the message.
-    pub async fn fetch<S1, S2>(
-        &mut self,
-        sequence_set: S1,
-        query: S2,
-    ) -> Result<impl Stream<Item = Result<Fetch>> + '_ + Send>
+    pub async fn fetch<S1, S2>(&mut self, sequence_set: S1, query: S2) -> Result<impl Stream<Item = Result<Fetch>> + '_ + Send>
     where
         S1: AsRef<str>,
         S2: AsRef<str>,
     {
-        let id = self
-            .run_command(&format!(
-                "FETCH {} {}",
-                sequence_set.as_ref(),
-                query.as_ref()
-            ))
-            .await?;
-        let res = parse_fetches(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        );
+        let id = self.run_command(&format!("FETCH {} {}", sequence_set.as_ref(), query.as_ref())).await?;
+        let res = parse_fetches(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id);
 
         Ok(res)
     }
 
     /// Equivalent to [`Session::fetch`], except that all identifiers in `uid_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
-    pub async fn uid_fetch<S1, S2>(
-        &mut self,
-        uid_set: S1,
-        query: S2,
-    ) -> Result<impl Stream<Item = Result<Fetch>> + '_ + Send + Unpin>
+    pub async fn uid_fetch<S1, S2>(&mut self, uid_set: S1, query: S2) -> Result<impl Stream<Item = Result<Fetch>> + '_ + Send + Unpin>
     where
         S1: AsRef<str>,
         S2: AsRef<str>,
     {
-        let id = self
-            .run_command(&format!(
-                "UID FETCH {} {}",
-                uid_set.as_ref(),
-                query.as_ref()
-            ))
-            .await?;
-        let res = parse_fetches(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        );
+        let id = self.run_command(&format!("UID FETCH {} {}", uid_set.as_ref(), query.as_ref())).await?;
+        let res = parse_fetches(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id);
         Ok(res)
     }
 
     /// Noop always succeeds, and it does nothing.
     pub async fn noop(&mut self) -> Result<()> {
         let id = self.run_command("NOOP").await?;
-        parse_noop(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        parse_noop(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
         Ok(())
     }
 
@@ -613,8 +517,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// See the description of the [`UID`
     /// command](https://tools.ietf.org/html/rfc3501#section-6.4.8) for more detail.
     pub async fn create<S: AsRef<str>>(&mut self, mailbox_name: S) -> Result<()> {
-        self.run_command_and_check_ok(&format!("CREATE {}", validate_str(mailbox_name.as_ref())?))
-            .await?;
+        self.run_command_and_check_ok(&format!("CREATE {}", validate_str(mailbox_name.as_ref())?)).await?;
 
         Ok(())
     }
@@ -639,8 +542,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// See the description of the [`UID`
     /// command](https://tools.ietf.org/html/rfc3501#section-6.4.8) for more detail.
     pub async fn delete<S: AsRef<str>>(&mut self, mailbox_name: S) -> Result<()> {
-        self.run_command_and_check_ok(&format!("DELETE {}", validate_str(mailbox_name.as_ref())?))
-            .await?;
+        self.run_command_and_check_ok(&format!("DELETE {}", validate_str(mailbox_name.as_ref())?)).await?;
 
         Ok(())
     }
@@ -671,12 +573,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// supports inferior hierarchical names of `INBOX`, these are unaffected by a rename of
     /// `INBOX`.
     pub async fn rename<S1: AsRef<str>, S2: AsRef<str>>(&mut self, from: S1, to: S2) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "RENAME {} {}",
-            validate_str(from.as_ref())?,
-            validate_str(to.as_ref())?
-        ))
-        .await?;
+        self.run_command_and_check_ok(&format!("RENAME {} {}", validate_str(from.as_ref())?, validate_str(to.as_ref())?))
+            .await?;
 
         Ok(())
     }
@@ -690,8 +588,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// However, it will not unilaterally remove an existing mailbox name from the subscription
     /// list even if a mailbox by that name no longer exists.
     pub async fn subscribe<S: AsRef<str>>(&mut self, mailbox: S) -> Result<()> {
-        self.run_command_and_check_ok(&format!("SUBSCRIBE {}", validate_str(mailbox.as_ref())?))
-            .await?;
+        self.run_command_and_check_ok(&format!("SUBSCRIBE {}", validate_str(mailbox.as_ref())?)).await?;
         Ok(())
     }
 
@@ -700,8 +597,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// returned by [`Session::lsub`].  This command returns `Ok` only if the unsubscription is
     /// successful.
     pub async fn unsubscribe<S: AsRef<str>>(&mut self, mailbox: S) -> Result<()> {
-        self.run_command_and_check_ok(&format!("UNSUBSCRIBE {}", validate_str(mailbox.as_ref())?))
-            .await?;
+        self.run_command_and_check_ok(&format!("UNSUBSCRIBE {}", validate_str(mailbox.as_ref())?)).await?;
         Ok(())
     }
 
@@ -710,12 +606,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// one of the listed capabilities. See [`Capabilities`] for further details.
     pub async fn capabilities(&mut self) -> Result<Capabilities> {
         let id = self.run_command("CAPABILITY").await?;
-        let c = parse_capabilities(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let c = parse_capabilities(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
         Ok(c)
     }
 
@@ -724,11 +615,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// The message sequence number of each message that is removed is returned.
     pub async fn expunge(&mut self) -> Result<impl Stream<Item = Result<Seq>> + '_ + Send> {
         let id = self.run_command("EXPUNGE").await?;
-        let res = parse_expunge(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        );
+        let res = parse_expunge(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id);
         Ok(res)
     }
 
@@ -754,18 +641,9 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///
     /// Alternatively, the client may fall back to using just [`Session::expunge`], risking the
     /// unintended removal of some messages.
-    pub async fn uid_expunge<S: AsRef<str>>(
-        &mut self,
-        uid_set: S,
-    ) -> Result<impl Stream<Item = Result<Uid>> + '_ + Send> {
-        let id = self
-            .run_command(&format!("UID EXPUNGE {}", uid_set.as_ref()))
-            .await?;
-        let res = parse_expunge(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        );
+    pub async fn uid_expunge<S: AsRef<str>>(&mut self, uid_set: S) -> Result<impl Stream<Item = Result<Uid>> + '_ + Send> {
+        let id = self.run_command(&format!("UID EXPUNGE {}", uid_set.as_ref())).await?;
+        let res = parse_expunge(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id);
         Ok(res)
     }
 
@@ -853,53 +731,25 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn store<S1, S2>(
-        &mut self,
-        sequence_set: S1,
-        query: S2,
-    ) -> Result<impl Stream<Item = Result<Fetch>> + '_ + Send>
+    pub async fn store<S1, S2>(&mut self, sequence_set: S1, query: S2) -> Result<impl Stream<Item = Result<Fetch>> + '_ + Send>
     where
         S1: AsRef<str>,
         S2: AsRef<str>,
     {
-        let id = self
-            .run_command(&format!(
-                "STORE {} {}",
-                sequence_set.as_ref(),
-                query.as_ref()
-            ))
-            .await?;
-        let res = parse_fetches(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        );
+        let id = self.run_command(&format!("STORE {} {}", sequence_set.as_ref(), query.as_ref())).await?;
+        let res = parse_fetches(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id);
         Ok(res)
     }
 
     /// Equivalent to [`Session::store`], except that all identifiers in `sequence_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
-    pub async fn uid_store<S1, S2>(
-        &mut self,
-        uid_set: S1,
-        query: S2,
-    ) -> Result<impl Stream<Item = Result<Fetch>> + '_ + Send>
+    pub async fn uid_store<S1, S2>(&mut self, uid_set: S1, query: S2) -> Result<impl Stream<Item = Result<Fetch>> + '_ + Send>
     where
         S1: AsRef<str>,
         S2: AsRef<str>,
     {
-        let id = self
-            .run_command(&format!(
-                "UID STORE {} {}",
-                uid_set.as_ref(),
-                query.as_ref()
-            ))
-            .await?;
-        let res = parse_fetches(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        );
+        let id = self.run_command(&format!("UID STORE {} {}", uid_set.as_ref(), query.as_ref())).await?;
+        let res = parse_fetches(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id);
         Ok(res)
     }
 
@@ -910,34 +760,18 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///
     /// If the `COPY` command is unsuccessful for any reason, the server restores the destination
     /// mailbox to its state before the `COPY` attempt.
-    pub async fn copy<S1: AsRef<str>, S2: AsRef<str>>(
-        &mut self,
-        sequence_set: S1,
-        mailbox_name: S2,
-    ) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "COPY {} {}",
-            sequence_set.as_ref(),
-            validate_str(mailbox_name.as_ref())?
-        ))
-        .await?;
+    pub async fn copy<S1: AsRef<str>, S2: AsRef<str>>(&mut self, sequence_set: S1, mailbox_name: S2) -> Result<()> {
+        self.run_command_and_check_ok(&format!("COPY {} {}", sequence_set.as_ref(), validate_str(mailbox_name.as_ref())?))
+            .await?;
 
         Ok(())
     }
 
     /// Equivalent to [`Session::copy`], except that all identifiers in `sequence_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
-    pub async fn uid_copy<S1: AsRef<str>, S2: AsRef<str>>(
-        &mut self,
-        uid_set: S1,
-        mailbox_name: S2,
-    ) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "UID COPY {} {}",
-            uid_set.as_ref(),
-            validate_str(mailbox_name.as_ref())?
-        ))
-        .await?;
+    pub async fn uid_copy<S1: AsRef<str>, S2: AsRef<str>>(&mut self, uid_set: S1, mailbox_name: S2) -> Result<()> {
+        self.run_command_and_check_ok(&format!("UID COPY {} {}", uid_set.as_ref(), validate_str(mailbox_name.as_ref())?))
+            .await?;
 
         Ok(())
     }
@@ -972,17 +806,9 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// orphaned).  The server will generally not leave any message in both mailboxes (it would be
     /// bad for a partial failure to result in a bunch of duplicate messages).  This is true even
     /// if the server returns with [`Error::No`].
-    pub async fn mv<S1: AsRef<str>, S2: AsRef<str>>(
-        &mut self,
-        sequence_set: S1,
-        mailbox_name: S2,
-    ) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "MOVE {} {}",
-            sequence_set.as_ref(),
-            validate_str(mailbox_name.as_ref())?
-        ))
-        .await?;
+    pub async fn mv<S1: AsRef<str>, S2: AsRef<str>>(&mut self, sequence_set: S1, mailbox_name: S2) -> Result<()> {
+        self.run_command_and_check_ok(&format!("MOVE {} {}", sequence_set.as_ref(), validate_str(mailbox_name.as_ref())?))
+            .await?;
 
         Ok(())
     }
@@ -991,17 +817,9 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8)
     /// and the [semantics of `MOVE` and `UID
     /// MOVE`](https://tools.ietf.org/html/rfc6851#section-3.3).
-    pub async fn uid_mv<S1: AsRef<str>, S2: AsRef<str>>(
-        &mut self,
-        uid_set: S1,
-        mailbox_name: S2,
-    ) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "UID MOVE {} {}",
-            uid_set.as_ref(),
-            validate_str(mailbox_name.as_ref())?
-        ))
-        .await?;
+    pub async fn uid_mv<S1: AsRef<str>, S2: AsRef<str>>(&mut self, uid_set: S1, mailbox_name: S2) -> Result<()> {
+        self.run_command_and_check_ok(&format!("UID MOVE {} {}", uid_set.as_ref(), validate_str(mailbox_name.as_ref())?))
+            .await?;
 
         Ok(())
     }
@@ -1037,23 +855,11 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// arguments with wildcards.  The criteria for omitting `INBOX` is whether `SELECT INBOX` will
     /// return failure; it is not relevant whether the user's real `INBOX` resides on this or some
     /// other server.
-    pub async fn list(
-        &mut self,
-        reference_name: Option<&str>,
-        mailbox_pattern: Option<&str>,
-    ) -> Result<impl Stream<Item = Result<Name>> + '_ + Send> {
+    pub async fn list(&mut self, reference_name: Option<&str>, mailbox_pattern: Option<&str>) -> Result<impl Stream<Item = Result<Name>> + '_ + Send> {
         let id = self
-            .run_command(&format!(
-                "LIST {} {}",
-                validate_str(reference_name.unwrap_or(""))?,
-                mailbox_pattern.unwrap_or("\"\"")
-            ))
+            .run_command(&format!("LIST {} {}", validate_str(reference_name.unwrap_or(""))?, mailbox_pattern.unwrap_or("\"\"")))
             .await?;
-        let names = parse_names(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        );
+        let names = parse_names(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id);
 
         Ok(names)
     }
@@ -1073,11 +879,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///
     /// The server will not unilaterally remove an existing mailbox name from the subscription list
     /// even if a mailbox by that name no longer exists.
-    pub async fn lsub(
-        &mut self,
-        reference_name: Option<&str>,
-        mailbox_pattern: Option<&str>,
-    ) -> Result<impl Stream<Item = Result<Name>> + '_ + Send> {
+    pub async fn lsub(&mut self, reference_name: Option<&str>, mailbox_pattern: Option<&str>) -> Result<impl Stream<Item = Result<Name>> + '_ + Send> {
         let id = self
             .run_command(&format!(
                 "LSUB {} {}",
@@ -1085,11 +887,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
                 validate_str(mailbox_pattern.unwrap_or(""))?
             ))
             .await?;
-        let names = parse_names(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        );
+        let names = parse_names(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id);
 
         Ok(names)
     }
@@ -1128,25 +926,11 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///  - `UNSEEN`: The number of messages which do not have [`Flag::Seen`] set.
     ///
     /// `data_items` is a space-separated list enclosed in parentheses.
-    pub async fn status<S1: AsRef<str>, S2: AsRef<str>>(
-        &mut self,
-        mailbox_name: S1,
-        data_items: S2,
-    ) -> Result<Mailbox> {
+    pub async fn status<S1: AsRef<str>, S2: AsRef<str>>(&mut self, mailbox_name: S1, data_items: S2) -> Result<Mailbox> {
         let id = self
-            .run_command(&format!(
-                "STATUS {} {}",
-                validate_str(mailbox_name.as_ref())?,
-                data_items.as_ref()
-            ))
+            .run_command(&format!("STATUS {} {}", validate_str(mailbox_name.as_ref())?, data_items.as_ref()))
             .await?;
-        let mbox = parse_status(
-            &mut self.conn.stream,
-            mailbox_name.as_ref(),
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let mbox = parse_status(&mut self.conn.stream, mailbox_name.as_ref(), self.unsolicited_responses_tx.clone(), id).await?;
         Ok(mbox)
     }
 
@@ -1191,13 +975,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// Specifically, the server will generally notify the client immediately via an untagged
     /// `EXISTS` response.  If the server does not do so, the client MAY issue a `NOOP` command (or
     /// failing that, a `CHECK` command) after one or more `APPEND` commands.
-    pub async fn append(
-        &mut self,
-        mailbox: impl AsRef<str>,
-        flags: Option<&str>,
-        internaldate: Option<&str>,
-        content: impl AsRef<[u8]>,
-    ) -> Result<()> {
+    pub async fn append(&mut self, mailbox: impl AsRef<str>, flags: Option<&str>, internaldate: Option<&str>, content: impl AsRef<[u8]>) -> Result<()> {
         let content = content.as_ref();
         let id = self
             .run_command(&format!(
@@ -1221,9 +999,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         self.stream.as_mut().write_all(content).await?;
         self.stream.as_mut().write_all(b"\r\n").await?;
         self.stream.flush().await?;
-        self.conn
-            .check_done_ok(&id, Some(self.unsolicited_responses_tx.clone()))
-            .await?;
+        self.conn.check_done_ok(&id, Some(self.unsolicited_responses_tx.clone())).await?;
         Ok(())
     }
 
@@ -1272,15 +1048,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///  - `BEFORE <date>`: Messages whose internal date (disregarding time and timezone) is earlier than the specified date.
     ///  - `SINCE <date>`: Messages whose internal date (disregarding time and timezone) is within or later than the specified date.
     pub async fn search<S: AsRef<str>>(&mut self, query: S) -> Result<HashSet<Seq>> {
-        let id = self
-            .run_command(&format!("SEARCH {}", query.as_ref()))
-            .await?;
-        let seqs = parse_ids(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let id = self.run_command(&format!("SEARCH {}", query.as_ref())).await?;
+        let seqs = parse_ids(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
 
         Ok(seqs)
     }
@@ -1289,96 +1058,42 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// are [`Uid`] instead of [`Seq`]. See also the [`UID`
     /// command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
     pub async fn uid_search<S: AsRef<str>>(&mut self, query: S) -> Result<HashSet<Uid>> {
-        let id = self
-            .run_command(&format!("UID SEARCH {}", query.as_ref()))
-            .await?;
-        let uids = parse_ids(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let id = self.run_command(&format!("UID SEARCH {}", query.as_ref())).await?;
+        let uids = parse_ids(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
 
         Ok(uids)
     }
 
     /// The [`GETQUOTA` command](https://tools.ietf.org/html/rfc2087#section-4.2)
     pub async fn get_quota(&mut self, quota_root: &str) -> Result<Quota> {
-        let id = self
-            .run_command(format!("GETQUOTA {}", validate_str(quota_root)?))
-            .await?;
-        let c = parse_get_quota(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let id = self.run_command(format!("GETQUOTA {}", validate_str(quota_root)?)).await?;
+        let c = parse_get_quota(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
         Ok(c)
     }
 
     /// The [`GETQUOTAROOT` command](https://tools.ietf.org/html/rfc2087#section-4.3)
-    pub async fn get_quota_root(
-        &mut self,
-        mailbox_name: &str,
-    ) -> Result<(Vec<QuotaRoot>, Vec<Quota>)> {
-        let id = self
-            .run_command(format!("GETQUOTAROOT {}", validate_str(mailbox_name)?))
-            .await?;
-        let c = parse_get_quota_root(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+    pub async fn get_quota_root(&mut self, mailbox_name: &str) -> Result<(Vec<QuotaRoot>, Vec<Quota>)> {
+        let id = self.run_command(format!("GETQUOTAROOT {}", validate_str(mailbox_name)?)).await?;
+        let c = parse_get_quota_root(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
         Ok(c)
     }
 
     /// The [`GETMETADATA` command](https://datatracker.ietf.org/doc/html/rfc5464.html#section-4.2)
-    pub async fn get_metadata(
-        &mut self,
-        mailbox_name: &str,
-        options: &str,
-        entry_specifier: &str,
-    ) -> Result<Vec<Metadata>> {
-        let options = if options.is_empty() {
-            String::new()
-        } else {
-            format!(" {options}")
-        };
+    pub async fn get_metadata(&mut self, mailbox_name: &str, options: &str, entry_specifier: &str) -> Result<Vec<Metadata>> {
+        let options = if options.is_empty() { String::new() } else { format!(" {options}") };
         let id = self
-            .run_command(format!(
-                "GETMETADATA {} {}{}",
-                validate_str(mailbox_name)?,
-                options,
-                entry_specifier
-            ))
+            .run_command(format!("GETMETADATA {} {}{}", validate_str(mailbox_name)?, options, entry_specifier))
             .await?;
-        let metadata = parse_metadata(
-            &mut self.conn.stream,
-            mailbox_name,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let metadata = parse_metadata(&mut self.conn.stream, mailbox_name, self.unsolicited_responses_tx.clone(), id).await?;
         Ok(metadata)
     }
 
     /// The [`ID` command](https://datatracker.ietf.org/doc/html/rfc2971)
     ///
     /// `identification` is an iterable sequence of pairs such as `("name", Some("MyMailClient"))`.
-    pub async fn id(
-        &mut self,
-        identification: impl IntoIterator<Item = (&str, Option<&str>)>,
-    ) -> Result<Option<HashMap<String, String>>> {
-        let id = self
-            .run_command(format!("ID ({})", format_identification(identification)))
-            .await?;
-        let server_identification = parse_id(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+    pub async fn id(&mut self, identification: impl IntoIterator<Item = (&str, Option<&str>)>) -> Result<Option<HashMap<String, String>>> {
+        let id = self.run_command(format!("ID ({})", format_identification(identification))).await?;
+        let server_identification = parse_id(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
         Ok(server_identification)
     }
 
@@ -1387,24 +1102,14 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// Sends `ID NIL` command and returns server response.
     pub async fn id_nil(&mut self) -> Result<Option<HashMap<String, String>>> {
         let id = self.run_command("ID NIL").await?;
-        let server_identification = parse_id(
-            &mut self.conn.stream,
-            self.unsolicited_responses_tx.clone(),
-            id,
-        )
-        .await?;
+        let server_identification = parse_id(&mut self.conn.stream, self.unsolicited_responses_tx.clone(), id).await?;
         Ok(server_identification)
     }
 
     // these are only here because they are public interface, the rest is in `Connection`
     /// Runs a command and checks if it returns OK.
     pub async fn run_command_and_check_ok<S: AsRef<str>>(&mut self, command: S) -> Result<()> {
-        self.conn
-            .run_command_and_check_ok(
-                command.as_ref(),
-                Some(self.unsolicited_responses_tx.clone()),
-            )
-            .await?;
+        self.conn.run_command_and_check_ok(command.as_ref(), Some(self.unsolicited_responses_tx.clone())).await?;
 
         Ok(())
     }
@@ -1454,39 +1159,27 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
     }
 
     pub(crate) async fn run_command_untagged(&mut self, command: &str) -> Result<()> {
-        self.stream
-            .encode(Request(None, command.as_bytes().into()))
-            .await?;
+        self.stream.encode(Request(None, command.as_bytes().into())).await?;
         self.stream.flush().await?;
         Ok(())
     }
 
     pub(crate) async fn run_command(&mut self, command: &str) -> Result<RequestId> {
         let request_id = self.request_ids.next().unwrap(); // safe: never returns Err
-        self.stream
-            .encode(Request(Some(request_id.clone()), command.as_bytes().into()))
-            .await?;
+        self.stream.encode(Request(Some(request_id.clone()), command.as_bytes().into())).await?;
         self.stream.flush().await?;
         Ok(request_id)
     }
 
     /// Execute a command and check that the next response is a matching done.
-    pub async fn run_command_and_check_ok(
-        &mut self,
-        command: &str,
-        unsolicited: Option<channel::Sender<UnsolicitedResponse>>,
-    ) -> Result<()> {
+    pub async fn run_command_and_check_ok(&mut self, command: &str, unsolicited: Option<channel::Sender<UnsolicitedResponse>>) -> Result<()> {
         let id = self.run_command(command).await?;
         self.check_done_ok(&id, unsolicited).await?;
 
         Ok(())
     }
 
-    pub(crate) async fn check_done_ok(
-        &mut self,
-        id: &RequestId,
-        unsolicited: Option<channel::Sender<UnsolicitedResponse>>,
-    ) -> Result<()> {
+    pub(crate) async fn check_done_ok(&mut self, id: &RequestId, unsolicited: Option<channel::Sender<UnsolicitedResponse>>) -> Result<()> {
         if let Some(first_res) = self.stream.try_next().await? {
             self.check_done_ok_from(id, unsolicited, first_res).await
         } else {
@@ -1494,20 +1187,9 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
         }
     }
 
-    pub(crate) async fn check_done_ok_from(
-        &mut self,
-        id: &RequestId,
-        unsolicited: Option<channel::Sender<UnsolicitedResponse>>,
-        mut response: ResponseData,
-    ) -> Result<()> {
+    pub(crate) async fn check_done_ok_from(&mut self, id: &RequestId, unsolicited: Option<channel::Sender<UnsolicitedResponse>>, mut response: ResponseData) -> Result<()> {
         loop {
-            if let Response::Done {
-                status,
-                code,
-                information,
-                tag,
-            } = response.parsed()
-            {
+            if let Response::Done { status, code, information, tag } = response.parsed() {
                 self.check_status_ok(status, code.as_ref(), information.as_deref())?;
 
                 if tag == id {
@@ -1526,20 +1208,13 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
         }
     }
 
-    pub(crate) fn check_status_ok(
-        &self,
-        status: &imap_proto::Status,
-        code: Option<&imap_proto::ResponseCode<'_>>,
-        information: Option<&str>,
-    ) -> Result<()> {
+    pub(crate) fn check_status_ok(&self, status: &imap_proto::Status, code: Option<&imap_proto::ResponseCode<'_>>, information: Option<&str>) -> Result<()> {
         use imap_proto::Status;
         match status {
             Status::Ok => Ok(()),
             Status::Bad => Err(Error::Bad(format!("code: {code:?}, info: {information:?}"))),
             Status::No => Err(Error::No(format!("code: {code:?}, info: {information:?}"))),
-            _ => Err(Error::Io(io::Error::other(format!(
-                "status: {status:?}, code: {code:?}, information: {information:?}"
-            )))),
+            _ => Err(Error::Io(io::Error::other(format!("status: {status:?}, code: {code:?}, information: {information:?}")))),
         }
     }
 }
@@ -1583,11 +1258,7 @@ mod tests {
 
     macro_rules! assert_eq_bytes {
         ($a:expr, $b:expr, $c:expr) => {
-            assert_eq!(
-                std::str::from_utf8($a).unwrap(),
-                std::str::from_utf8($b).unwrap(),
-                $c
-            )
+            assert_eq!(std::str::from_utf8($a).unwrap(), std::str::from_utf8($b).unwrap(), $c)
         };
     }
 
@@ -1606,9 +1277,7 @@ mod tests {
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn readline_delay_read() {
         let greeting = "* OK Dovecot ready.\r\n";
-        let mock_stream = MockStream::default()
-            .with_buf(greeting.as_bytes().to_vec())
-            .with_delay();
+        let mock_stream = MockStream::default().with_buf(greeting.as_bytes().to_vec()).with_delay();
 
         let mut client = mock_client!(mock_stream);
         let actual_response = client.read_response().await.unwrap().unwrap();
@@ -1661,16 +1330,8 @@ mod tests {
                 b"foo".to_vec()
             }
         }
-        let session = client
-            .authenticate("PLAIN", &Authenticate::Auth)
-            .await
-            .ok()
-            .unwrap();
-        assert_eq_bytes!(
-            &session.stream.inner.written_buf,
-            command.as_bytes(),
-            "Invalid authenticate command"
-        );
+        let session = client.authenticate("PLAIN", &Authenticate::Auth).await.ok().unwrap();
+        assert_eq_bytes!(&session.stream.inner.written_buf, command.as_bytes(), "Invalid authenticate command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1683,11 +1344,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let client = mock_client!(mock_stream);
         if let Ok(session) = client.login(username, password).await {
-            assert_eq!(
-                session.stream.inner.written_buf,
-                command.as_bytes().to_vec(),
-                "Invalid login command"
-            );
+            assert_eq!(session.stream.inner.written_buf, command.as_bytes().to_vec(), "Invalid login command");
         } else {
             unreachable!("invalid login");
         }
@@ -1702,14 +1359,8 @@ mod tests {
         let command = format!("A0001 LOGIN {} {}\r\n", quote!(username), quote!(password));
         let mock_stream = MockStream::new(response);
         let client = mock_client!(mock_stream);
-        if let Ok((session, capabilities)) =
-            client.login_with_capabilities(username, password).await
-        {
-            assert_eq!(
-                session.stream.inner.written_buf,
-                command.as_bytes().to_vec(),
-                "Invalid login command"
-            );
+        if let Ok((session, capabilities)) = client.login_with_capabilities(username, password).await {
+            assert_eq!(session.stream.inner.written_buf, command.as_bytes().to_vec(), "Invalid login command");
             let capabilities = capabilities.expect("Capabilities should not be None");
             assert_eq!(capabilities.len(), 3);
             assert!(capabilities.has(&Capability::Imap4rev1));
@@ -1732,14 +1383,8 @@ mod tests {
         let command = format!("A0001 LOGIN {} {}\r\n", quote!(username), quote!(password));
         let mock_stream = MockStream::new(response);
         let client = mock_client!(mock_stream);
-        if let Ok((session, capabilities)) =
-            client.login_with_capabilities(username, password).await
-        {
-            assert_eq!(
-                session.stream.inner.written_buf,
-                command.as_bytes().to_vec(),
-                "Invalid login command"
-            );
+        if let Ok((session, capabilities)) = client.login_with_capabilities(username, password).await {
+            assert_eq!(session.stream.inner.written_buf, command.as_bytes().to_vec(), "Invalid login command");
             assert!(capabilities.is_none());
         } else {
             unreachable!("invalid login");
@@ -1754,10 +1399,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.logout().await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid logout command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid logout command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1766,21 +1408,11 @@ mod tests {
         let response = b"A0001 OK RENAME completed\r\n".to_vec();
         let current_mailbox_name = "INBOX";
         let new_mailbox_name = "NEWINBOX";
-        let command = format!(
-            "A0001 RENAME {} {}\r\n",
-            quote!(current_mailbox_name),
-            quote!(new_mailbox_name)
-        );
+        let command = format!("A0001 RENAME {} {}\r\n", quote!(current_mailbox_name), quote!(new_mailbox_name));
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
-        session
-            .rename(current_mailbox_name, new_mailbox_name)
-            .await
-            .unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid rename command"
-        );
+        session.rename(current_mailbox_name, new_mailbox_name).await.unwrap();
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid rename command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1792,10 +1424,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.subscribe(mailbox).await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid subscribe command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid subscribe command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1807,10 +1436,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.unsubscribe(mailbox).await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid unsubscribe command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid unsubscribe command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1820,10 +1446,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.expunge().await.unwrap().collect::<Vec<_>>().await;
-        assert!(
-            session.stream.inner.written_buf == b"A0001 EXPUNGE\r\n".to_vec(),
-            "Invalid expunge command"
-        );
+        assert!(session.stream.inner.written_buf == b"A0001 EXPUNGE\r\n".to_vec(), "Invalid expunge command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1836,16 +1459,8 @@ mod tests {
             .to_vec();
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
-        session
-            .uid_expunge("2:4")
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await;
-        assert!(
-            session.stream.inner.written_buf == b"A0001 UID EXPUNGE 2:4\r\n".to_vec(),
-            "Invalid expunge command"
-        );
+        session.uid_expunge("2:4").await.unwrap().collect::<Vec<_>>().await;
+        assert!(session.stream.inner.written_buf == b"A0001 UID EXPUNGE 2:4\r\n".to_vec(), "Invalid expunge command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1855,10 +1470,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.check().await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == b"A0001 CHECK\r\n".to_vec(),
-            "Invalid check command"
-        );
+        assert!(session.stream.inner.written_buf == b"A0001 CHECK\r\n".to_vec(), "Invalid check command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1874,13 +1486,7 @@ mod tests {
             A0001 OK [READ-ONLY] Select completed.\r\n"
             .to_vec();
         let expected_mailbox = Mailbox {
-            flags: vec![
-                Flag::Answered,
-                Flag::Flagged,
-                Flag::Deleted,
-                Flag::Seen,
-                Flag::Draft,
-            ],
+            flags: vec![Flag::Answered, Flag::Flagged, Flag::Deleted, Flag::Seen, Flag::Draft],
             exists: 1,
             recent: 1,
             unseen: Some(1),
@@ -1894,10 +1500,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         let mailbox = session.examine(mailbox_name).await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid examine command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid examine command");
         assert_eq!(mailbox, expected_mailbox);
     }
 
@@ -1916,24 +1519,11 @@ mod tests {
             A0001 OK [READ-ONLY] Select completed.\r\n"
             .to_vec();
         let expected_mailbox = Mailbox {
-            flags: vec![
-                Flag::Answered,
-                Flag::Flagged,
-                Flag::Deleted,
-                Flag::Seen,
-                Flag::Draft,
-            ],
+            flags: vec![Flag::Answered, Flag::Flagged, Flag::Deleted, Flag::Seen, Flag::Draft],
             exists: 1,
             recent: 1,
             unseen: Some(1),
-            permanent_flags: vec![
-                Flag::MayCreate,
-                Flag::Answered,
-                Flag::Flagged,
-                Flag::Deleted,
-                Flag::Draft,
-                Flag::Seen,
-            ],
+            permanent_flags: vec![Flag::MayCreate, Flag::Answered, Flag::Flagged, Flag::Deleted, Flag::Draft, Flag::Seen],
             uid_next: Some(2),
             uid_validity: Some(1257842737),
             highest_modseq: Some(90060115205545359),
@@ -1943,10 +1533,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         let mailbox = session.select(mailbox_name).await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid select command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid select command");
         assert_eq!(mailbox, expected_mailbox);
     }
 
@@ -1960,10 +1547,7 @@ mod tests {
         let mut session = mock_session!(mock_stream);
         let ids = session.search("Unseen").await.unwrap();
         let ids: HashSet<u32> = ids.iter().cloned().collect();
-        assert!(
-            session.stream.inner.written_buf == b"A0001 SEARCH Unseen\r\n".to_vec(),
-            "Invalid search command"
-        );
+        assert!(session.stream.inner.written_buf == b"A0001 SEARCH Unseen\r\n".to_vec(), "Invalid search command");
         assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect());
     }
 
@@ -1977,10 +1561,7 @@ mod tests {
         let mut session = mock_session!(mock_stream);
         let ids = session.uid_search("Unseen").await.unwrap();
         let ids: HashSet<Uid> = ids.iter().cloned().collect();
-        assert!(
-            session.stream.inner.written_buf == b"A0001 UID SEARCH Unseen\r\n".to_vec(),
-            "Invalid search command"
-        );
+        assert!(session.stream.inner.written_buf == b"A0001 UID SEARCH Unseen\r\n".to_vec(), "Invalid search command");
         assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect());
     }
 
@@ -1995,10 +1576,7 @@ mod tests {
         let mut session = mock_session!(mock_stream);
         let ids = session.uid_search("Unseen").await.unwrap();
         let ids: HashSet<Uid> = ids.iter().cloned().collect();
-        assert!(
-            session.stream.inner.written_buf == b"A0001 UID SEARCH Unseen\r\n".to_vec(),
-            "Invalid search command"
-        );
+        assert!(session.stream.inner.written_buf == b"A0001 UID SEARCH Unseen\r\n".to_vec(), "Invalid search command");
         assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect());
     }
 
@@ -2012,10 +1590,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         let capabilities = session.capabilities().await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == b"A0001 CAPABILITY\r\n".to_vec(),
-            "Invalid capability command"
-        );
+        assert!(session.stream.inner.written_buf == b"A0001 CAPABILITY\r\n".to_vec(), "Invalid capability command");
         assert_eq!(capabilities.len(), 4);
         for e in expected_capabilities {
             assert!(capabilities.has_str(e));
@@ -2031,10 +1606,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.create(mailbox_name).await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid create command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid create command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -2046,10 +1618,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.delete(mailbox_name).await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid delete command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid delete command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -2059,10 +1628,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.noop().await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == b"A0001 NOOP\r\n".to_vec(),
-            "Invalid noop command"
-        );
+        assert!(session.stream.inner.written_buf == b"A0001 NOOP\r\n".to_vec(), "Invalid noop command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -2072,22 +1638,14 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.close().await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == b"A0001 CLOSE\r\n".to_vec(),
-            "Invalid close command"
-        );
+        assert!(session.stream.inner.written_buf == b"A0001 CLOSE\r\n".to_vec(), "Invalid close command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn store() {
         generic_store(" ", |c, set, query| async move {
-            c.lock()
-                .await
-                .store(set, query)
-                .await?
-                .collect::<Vec<_>>()
-                .await;
+            c.lock().await.store(set, query).await?.collect::<Vec<_>>().await;
             Ok(())
         })
         .await;
@@ -2097,12 +1655,7 @@ mod tests {
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn uid_store() {
         generic_store(" UID ", |c, set, query| async move {
-            c.lock()
-                .await
-                .uid_store(set, query)
-                .await?
-                .collect::<Vec<_>>()
-                .await;
+            c.lock().await.uid_store(set, query).await?.collect::<Vec<_>>().await;
             Ok(())
         })
         .await;
@@ -2155,10 +1708,7 @@ mod tests {
         {
             let _ = op(session.clone(), seq, query).await.unwrap();
         }
-        assert!(
-            session.lock().await.stream.inner.written_buf == line.as_bytes().to_vec(),
-            "Invalid command"
-        );
+        assert!(session.lock().await.stream.inner.written_buf == line.as_bytes().to_vec(), "Invalid command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -2174,10 +1724,7 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.mv("1:2", mailbox_name).await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid move command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid move command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -2193,22 +1740,14 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         session.uid_mv("41:42", mailbox_name).await.unwrap();
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid uid move command"
-        );
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid uid move command");
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn fetch() {
         generic_fetch(" ", |c, seq, query| async move {
-            c.lock()
-                .await
-                .fetch(seq, query)
-                .await?
-                .collect::<Vec<_>>()
-                .await;
+            c.lock().await.fetch(seq, query).await?.collect::<Vec<_>>().await;
 
             Ok(())
         })
@@ -2219,12 +1758,7 @@ mod tests {
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn uid_fetch() {
         generic_fetch(" UID ", |c, seq, query| async move {
-            c.lock()
-                .await
-                .uid_fetch(seq, query)
-                .await?
-                .collect::<Vec<_>>()
-                .await;
+            c.lock().await.uid_fetch(seq, query).await?.collect::<Vec<_>>().await;
             Ok(())
         })
         .await;
@@ -2240,23 +1774,15 @@ mod tests {
         let mut session = mock_session!(mock_stream);
 
         {
-            let mut fetch_result = session
-                .uid_fetch("1:*", "(FLAGS BODY.PEEK[])")
-                .await
-                .unwrap();
+            let mut fetch_result = session.uid_fetch("1:*", "(FLAGS BODY.PEEK[])").await.unwrap();
 
             // Unexpected EOF.
             let err = fetch_result.try_next().await.unwrap_err();
-            let Error::Io(io_err) = err else {
-                panic!("Unexpected error type: {err}")
-            };
+            let Error::Io(io_err) = err else { panic!("Unexpected error type: {err}") };
             assert_eq!(io_err.kind(), io::ErrorKind::UnexpectedEof);
         }
 
-        assert_eq!(
-            session.stream.inner.written_buf,
-            b"A0001 UID FETCH 1:* (FLAGS BODY.PEEK[])\r\n".to_vec()
-        );
+        assert_eq!(session.stream.inner.written_buf, b"A0001 UID FETCH 1:* (FLAGS BODY.PEEK[])\r\n".to_vec());
     }
 
     async fn generic_fetch<'a, F, T, K>(prefix: &'a str, op: F)
@@ -2264,25 +1790,11 @@ mod tests {
         F: 'a + FnOnce(Arc<Mutex<Session<MockStream>>>, &'a str, &'a str) -> K,
         K: 'a + Future<Output = Result<T>>,
     {
-        generic_with_uid(
-            "A0001 OK FETCH completed\r\n",
-            "FETCH",
-            "1",
-            "BODY[]",
-            prefix,
-            op,
-        )
-        .await;
+        generic_with_uid("A0001 OK FETCH completed\r\n", "FETCH", "1", "BODY[]", prefix, op).await;
     }
 
-    async fn generic_with_uid<'a, F, T, K>(
-        res: &'a str,
-        cmd: &'a str,
-        seq: &'a str,
-        query: &'a str,
-        prefix: &'a str,
-        op: F,
-    ) where
+    async fn generic_with_uid<'a, F, T, K>(res: &'a str, cmd: &'a str, seq: &'a str, query: &'a str, prefix: &'a str, op: F)
+    where
         F: 'a + FnOnce(Arc<Mutex<Session<MockStream>>>, &'a str, &'a str) -> K,
         K: 'a + Future<Output = Result<T>>,
     {
@@ -2293,10 +1805,7 @@ mod tests {
         {
             let _ = op(session.clone(), seq, query).await.unwrap();
         }
-        assert!(
-            session.lock().await.stream.inner.written_buf == line.as_bytes().to_vec(),
-            "Invalid command"
-        );
+        assert!(session.lock().await.stream.inner.written_buf == line.as_bytes().to_vec(), "Invalid command");
     }
 
     #[test]
@@ -2311,10 +1820,7 @@ mod tests {
 
     #[test]
     fn validate_random() {
-        assert_eq!(
-            "\"~iCQ_k;>[&\\\"sVCvUW`e<<P!wJ\"",
-            &validate_str("~iCQ_k;>[&\"sVCvUW`e<<P!wJ").unwrap()
-        );
+        assert_eq!("\"~iCQ_k;>[&\\\"sVCvUW`e<<P!wJ\"", &validate_str("~iCQ_k;>[&\"sVCvUW`e<<P!wJ").unwrap());
     }
 
     #[test]
@@ -2359,11 +1865,7 @@ mod tests {
             let (request_id, request) = line.split_once(' ').unwrap();
             eprintln!("Received request {request_id}.");
 
-            let (id, _) = request
-                .strip_prefix("FETCH ")
-                .unwrap()
-                .split_once(' ')
-                .unwrap();
+            let (id, _) = request.strip_prefix("FETCH ").unwrap().split_once(' ').unwrap();
             let id = id.parse().unwrap();
 
             let mut body = concat!(
@@ -2376,16 +1878,13 @@ mod tests {
             )
             .to_string();
             for _ in 1..id {
-                body +=
-                    "012345678901234567890123456789012345678901234567890123456789012345678901\r\n";
+                body += "012345678901234567890123456789012345678901234567890123456789012345678901\r\n";
             }
             let body_len = body.len();
 
             let response = format!("* {id} FETCH (RFC822.SIZE {body_len} BODY[] {{{body_len}}}\r\n{body} FLAGS (\\Seen))\r\n");
             writer.write_all(response.as_bytes()).await?;
-            writer
-                .write_all(format!("{request_id} OK FETCH completed\r\n").as_bytes())
-                .await?;
+            writer.write_all(format!("{request_id} OK FETCH completed\r\n").as_bytes()).await?;
             writer.flush().await?;
         }
 
@@ -2399,10 +1898,7 @@ mod tests {
     /// read into a buffer of zero size and erroneously detected it
     /// as the end of stream.
     #[cfg(feature = "runtime-tokio")]
-    #[cfg_attr(
-        feature = "runtime-tokio",
-        tokio::test(flavor = "multi_thread", worker_threads = 2)
-    )]
+    #[cfg_attr(feature = "runtime-tokio", tokio::test(flavor = "multi_thread", worker_threads = 2))]
     async fn large_fetch() -> Result<()> {
         use futures::TryStreamExt;
 
@@ -2414,13 +1910,8 @@ mod tests {
 
         for i in 200..300 {
             eprintln!("Fetching {i}.");
-            let mut messages_stream = imap_session
-                .fetch(format!("{i}"), "(RFC822.SIZE BODY.PEEK[] FLAGS)")
-                .await?;
-            let fetch = messages_stream
-                .try_next()
-                .await?
-                .expect("no FETCH returned");
+            let mut messages_stream = imap_session.fetch(format!("{i}"), "(RFC822.SIZE BODY.PEEK[] FLAGS)").await?;
+            let fetch = messages_stream.try_next().await?.expect("no FETCH returned");
             let body = fetch.body().expect("message did not have a body!");
             assert_eq!(body.len(), 76 + 74 * i);
 
@@ -2443,10 +1934,7 @@ mod tests {
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
             let status = session.status("INBOX", "(UIDNEXT)").await.unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 STATUS \"INBOX\" (UIDNEXT)\r\n".to_vec()
-            );
+            assert_eq!(session.stream.inner.written_buf, b"A0001 STATUS \"INBOX\" (UIDNEXT)\r\n".to_vec());
             assert_eq!(status.uid_next, Some(25));
         }
 
@@ -2458,10 +1946,7 @@ mod tests {
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
             let status = session.status("INBOX", "(RECENT)").await.unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 STATUS \"INBOX\" (RECENT)\r\n".to_vec()
-            );
+            assert_eq!(session.stream.inner.written_buf, b"A0001 STATUS \"INBOX\" (RECENT)\r\n".to_vec());
             assert_eq!(status.recent, 15);
         }
 
@@ -2473,14 +1958,8 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            let status = session
-                .status("blurdybloop", "(UIDNEXT MESSAGES)")
-                .await
-                .unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 STATUS \"blurdybloop\" (UIDNEXT MESSAGES)\r\n".to_vec()
-            );
+            let status = session.status("blurdybloop", "(UIDNEXT MESSAGES)").await.unwrap();
+            assert_eq!(session.stream.inner.written_buf, b"A0001 STATUS \"blurdybloop\" (UIDNEXT MESSAGES)\r\n".to_vec());
             assert_eq!(status.uid_next, Some(44292));
             assert_eq!(status.exists, 231);
         }
@@ -2497,14 +1976,8 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            session
-                .append("INBOX", Some(r"(\Seen)"), None, "foobarbaz")
-                .await
-                .unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 APPEND \"INBOX\" (\\Seen) {9}\r\nfoobarbaz\r\n".to_vec()
-            );
+            session.append("INBOX", Some(r"(\Seen)"), None, "foobarbaz").await.unwrap();
+            assert_eq!(session.stream.inner.written_buf, b"A0001 APPEND \"INBOX\" (\\Seen) {9}\r\nfoobarbaz\r\n".to_vec());
         }
 
         {
@@ -2515,14 +1988,8 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            session
-                .append("INBOX", Some(r"(\Seen)"), None, "foobarbaz")
-                .await
-                .unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 APPEND \"INBOX\" (\\Seen) {9}\r\nfoobarbaz\r\n".to_vec()
-            );
+            session.append("INBOX", Some(r"(\Seen)"), None, "foobarbaz").await.unwrap();
+            assert_eq!(session.stream.inner.written_buf, b"A0001 APPEND \"INBOX\" (\\Seen) {9}\r\nfoobarbaz\r\n".to_vec());
             let exists_response = session.unsolicited_responses.recv().await.unwrap();
             assert_eq!(exists_response, UnsolicitedResponse::Exists(3));
             let recent_response = session.unsolicited_responses.recv().await.unwrap();
@@ -2531,19 +1998,11 @@ mod tests {
 
         {
             // APPEND to nonexisting folder fails.
-            let response =
-                b"A0001 NO [TRYCREATE] Mailbox doesn't exist: foobar (0.001 + 0.000 secs)."
-                    .to_vec();
+            let response = b"A0001 NO [TRYCREATE] Mailbox doesn't exist: foobar (0.001 + 0.000 secs).".to_vec();
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            session
-                .append("foobar", None, None, "foobarbaz")
-                .await
-                .unwrap_err();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 APPEND \"foobar\" {9}\r\n".to_vec()
-            );
+            session.append("foobar", None, None, "foobarbaz").await.unwrap_err();
+            assert_eq!(session.stream.inner.written_buf, b"A0001 APPEND \"foobar\" {9}\r\n".to_vec());
         }
     }
 
@@ -2557,14 +2016,8 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            let metadata = session
-                .get_metadata("INBOX", "", "/private/comment")
-                .await
-                .unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 GETMETADATA \"INBOX\" /private/comment\r\n".to_vec()
-            );
+            let metadata = session.get_metadata("INBOX", "", "/private/comment").await.unwrap();
+            assert_eq!(session.stream.inner.written_buf, b"A0001 GETMETADATA \"INBOX\" /private/comment\r\n".to_vec());
             assert_eq!(metadata.len(), 1);
             assert_eq!(metadata[0].entry, "/private/comment");
             assert_eq!(metadata[0].value.as_ref().unwrap(), "My own comment");
@@ -2577,10 +2030,7 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            let metadata = session
-                .get_metadata("INBOX", "", "(/shared/comment /private/comment)")
-                .await
-                .unwrap();
+            let metadata = session.get_metadata("INBOX", "", "(/shared/comment /private/comment)").await.unwrap();
             assert_eq!(
                 session.stream.inner.written_buf,
                 b"A0001 GETMETADATA \"INBOX\" (/shared/comment /private/comment)\r\n".to_vec()
@@ -2599,22 +2049,13 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            let metadata = session
-                .get_metadata("", "", "(/shared/comment /shared/admin)")
-                .await
-                .unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 GETMETADATA \"\" (/shared/comment /shared/admin)\r\n".to_vec()
-            );
+            let metadata = session.get_metadata("", "", "(/shared/comment /shared/admin)").await.unwrap();
+            assert_eq!(session.stream.inner.written_buf, b"A0001 GETMETADATA \"\" (/shared/comment /shared/admin)\r\n".to_vec());
             assert_eq!(metadata.len(), 2);
             assert_eq!(metadata[0].entry, "/shared/comment");
             assert_eq!(metadata[0].value.as_ref().unwrap(), "Chatmail server");
             assert_eq!(metadata[1].entry, "/shared/admin");
-            assert_eq!(
-                metadata[1].value.as_ref().unwrap(),
-                "mailto:root@nine.testrun.org"
-            );
+            assert_eq!(metadata[1].value.as_ref().unwrap(), "mailto:root@nine.testrun.org");
         }
 
         {
@@ -2625,22 +2066,13 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            let metadata = session
-                .get_metadata("", "", "(/shared/comment /shared/admin)")
-                .await
-                .unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 GETMETADATA \"\" (/shared/comment /shared/admin)\r\n".to_vec()
-            );
+            let metadata = session.get_metadata("", "", "(/shared/comment /shared/admin)").await.unwrap();
+            assert_eq!(session.stream.inner.written_buf, b"A0001 GETMETADATA \"\" (/shared/comment /shared/admin)\r\n".to_vec());
             assert_eq!(metadata.len(), 2);
             assert_eq!(metadata[0].entry, "/shared/comment");
             assert_eq!(metadata[0].value.as_ref().unwrap(), "Chatmail server");
             assert_eq!(metadata[1].entry, "/shared/admin");
-            assert_eq!(
-                metadata[1].value.as_ref().unwrap(),
-                "mailto:root@nine.testrun.org"
-            );
+            assert_eq!(metadata[1].value.as_ref().unwrap(), "mailto:root@nine.testrun.org");
         }
 
         {
@@ -2650,14 +2082,8 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            let metadata = session
-                .get_metadata("", "", "(/shared/comment /shared/admin)")
-                .await
-                .unwrap();
-            assert_eq!(
-                session.stream.inner.written_buf,
-                b"A0001 GETMETADATA \"\" (/shared/comment /shared/admin)\r\n".to_vec()
-            );
+            let metadata = session.get_metadata("", "", "(/shared/comment /shared/admin)").await.unwrap();
+            assert_eq!(session.stream.inner.written_buf, b"A0001 GETMETADATA \"\" (/shared/comment /shared/admin)\r\n".to_vec());
             assert_eq!(metadata.len(), 2);
             assert_eq!(metadata[0].entry, "/shared/comment");
             assert_eq!(metadata[0].value, None);
@@ -2678,10 +2104,7 @@ mod tests {
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
             let (quotaroots, quota) = dbg!(session.get_quota_root("Sent").await.unwrap());
-            assert_eq!(
-                str::from_utf8(&session.stream.inner.written_buf).unwrap(),
-                "A0001 GETQUOTAROOT \"Sent\"\r\n"
-            );
+            assert_eq!(str::from_utf8(&session.stream.inner.written_buf).unwrap(), "A0001 GETQUOTAROOT \"Sent\"\r\n");
             assert_eq!(
                 quotaroots,
                 vec![QuotaRoot {
@@ -2712,10 +2135,7 @@ mod tests {
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
             let (quotaroots, quota) = session.get_quota_root("INBOX").await.unwrap();
-            assert_eq!(
-                str::from_utf8(&session.stream.inner.written_buf).unwrap(),
-                "A0001 GETQUOTAROOT \"INBOX\"\r\n"
-            );
+            assert_eq!(str::from_utf8(&session.stream.inner.written_buf).unwrap(), "A0001 GETQUOTAROOT \"INBOX\"\r\n");
             assert_eq!(
                 quotaroots,
                 vec![QuotaRoot {
@@ -2746,15 +2166,7 @@ mod tests {
         let command = "A0001 NOOP\r\n";
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
-        assert!(session
-            .noop()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("220 mail.example.org ESMTP Postcow"));
-        assert!(
-            session.stream.inner.written_buf == command.as_bytes().to_vec(),
-            "Invalid NOOP command"
-        );
+        assert!(session.noop().await.unwrap_err().to_string().contains("220 mail.example.org ESMTP Postcow"));
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid NOOP command");
     }
 }

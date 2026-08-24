@@ -48,11 +48,7 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
     }
 
     pub async fn encode(&mut self, msg: Request) -> Result<(), io::Error> {
-        log::trace!(
-            "encode: input: {:?}, {:?}",
-            msg.0,
-            std::str::from_utf8(&msg.1)
-        );
+        log::trace!("encode: input: {:?}, {:?}", msg.0, std::str::from_utf8(&msg.1));
 
         if let Some(tag) = msg.0 {
             self.inner.write_all(tag.as_bytes()).await?;
@@ -121,19 +117,12 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             }
             Err(other) => {
                 self.decode_needs = 0;
-                Err(io::Error::other(format!(
-                    "{:?} during parsing of {:?}",
-                    other,
-                    String::from_utf8_lossy(buf)
-                )))
+                Err(io::Error::other(format!("{:?} during parsing of {:?}", other, String::from_utf8_lossy(buf))))
             }
         }
     }
 
-    fn do_poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<io::Result<ResponseData>>> {
+    fn do_poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<io::Result<ResponseData>>> {
         let this = &mut *self;
         if let Some(response) = this.decode()? {
             return Poll::Ready(Some(Ok(response)));
@@ -162,10 +151,7 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
 
             if num_bytes_read == 0 {
                 if this.buffer.used() > 0 {
-                    return Poll::Ready(Some(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "bytes remaining in stream",
-                    ))));
+                    return Poll::Ready(Some(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "bytes remaining in stream"))));
                 }
                 return Poll::Ready(None);
             }
@@ -285,10 +271,7 @@ impl Buffer {
 
 impl fmt::Debug for Buffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Buffer")
-            .field("used", &self.used())
-            .field("capacity", &self.block.capacity())
-            .finish()
+        f.debug_struct("Buffer").field("used", &self.used()).field("capacity", &self.block.capacity()).finish()
     }
 }
 
@@ -331,20 +314,13 @@ mod tests {
 
     impl FailingStream {
         fn new(buf: &'static [u8]) -> Self {
-            Self {
-                inner: buf,
-                has_failed: false,
-            }
+            Self { inner: buf, has_failed: false }
         }
     }
 
     #[cfg(feature = "runtime-tokio")]
     impl Read for FailingStream {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> Poll<tokio::io::Result<()>> {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
             let this = self.project();
             if !*this.has_failed {
                 *this.has_failed = true;
@@ -358,11 +334,7 @@ mod tests {
 
     #[cfg(feature = "runtime-async-std")]
     impl Read for FailingStream {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<async_std::io::Result<usize>> {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<async_std::io::Result<usize>> {
             let this = self.project();
             if !*this.has_failed {
                 *this.has_failed = true;
@@ -376,11 +348,7 @@ mod tests {
 
     #[cfg(feature = "runtime-tokio")]
     impl Write for FailingStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<tokio::io::Result<usize>> {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<tokio::io::Result<usize>> {
             Poll::Ready(Ok(buf.len()))
         }
 
@@ -388,35 +356,22 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<tokio::io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<tokio::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
 
     #[cfg(feature = "runtime-async-std")]
     impl Write for FailingStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<async_std::io::Result<usize>> {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<async_std::io::Result<usize>> {
             Poll::Ready(Ok(buf.len()))
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<async_std::io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<async_std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<async_std::io::Result<()>> {
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<async_std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -636,9 +591,6 @@ mod tests {
 
     #[test]
     fn test_buffer_debug() {
-        assert_eq!(
-            format!("{:?}", Buffer::new()),
-            format!(r#"Buffer {{ used: 0, capacity: {} }}"#, Buffer::BLOCK_SIZE)
-        );
+        assert_eq!(format!("{:?}", Buffer::new()), format!(r#"Buffer {{ used: 0, capacity: {} }}"#, Buffer::BLOCK_SIZE));
     }
 }

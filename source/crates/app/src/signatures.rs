@@ -133,11 +133,7 @@ fn embed_images(html: &str, images: &[lookout_mail::InlineImage]) -> String {
     }
     let mut out = html.to_string();
     for image in images {
-        let data_uri = format!(
-            "data:{};base64,{}",
-            image.content_type,
-            base64::engine::general_purpose::STANDARD.encode(&image.bytes)
-        );
+        let data_uri = format!("data:{};base64,{}", image.content_type, base64::engine::general_purpose::STANDARD.encode(&image.bytes));
         out = out.replace(&format!("cid:{}", image.cid), &data_uri);
     }
     out
@@ -155,7 +151,10 @@ mod tests {
         };
         let html = r#"<p>Hi</p><img src="cid:img-1@lookout.local"><p>Bye</p>"#;
         let embedded = embed_images(html, &[image]);
-        assert!(embedded.contains(r#"<img src="data:image/png;base64,iVBORw==">"#), "the cid reference must become an inline data URI");
+        assert!(
+            embedded.contains(r#"<img src="data:image/png;base64,iVBORw==">"#),
+            "the cid reference must become an inline data URI"
+        );
         assert!(!embedded.contains("cid:"), "no cid reference may survive");
         assert!(embedded.contains("<p>Hi</p>"), "the surrounding HTML must be untouched");
     }

@@ -72,8 +72,9 @@ async fn main() -> anyhow::Result<()> {
     let credentials: Arc<dyn CredentialProvider> = Arc::new(GoaCredentialProvider { client: goa, account });
 
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (_interactive_tx, interactive_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::unbounded();
-    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx));
 
     let marker = format!("Lookout send_test {}", uuid::Uuid::new_v4());
     println!("Sending self-addressed test email, subject: {marker:?}");

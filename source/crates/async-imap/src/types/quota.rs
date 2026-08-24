@@ -87,11 +87,7 @@ impl From<QuotaRootRef<'_>> for QuotaRoot {
     fn from(root: QuotaRootRef<'_>) -> Self {
         Self {
             mailbox_name: root.mailbox_name.to_string(),
-            quota_root_names: root
-                .quota_root_names
-                .iter()
-                .map(|n| n.to_string())
-                .collect(),
+            quota_root_names: root.quota_root_names.iter().map(|n| n.to_string()).collect(),
         }
     }
 }

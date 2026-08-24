@@ -409,10 +409,7 @@ impl RecipientEntry {
             return;
         }
         let this = self.clone();
-        source(
-            &prefix,
-            Box::new(move |matches| this.apply_suggestions(generation, matches)),
-        );
+        source(&prefix, Box::new(move |matches| this.apply_suggestions(generation, matches)));
     }
 
     /// The "apply results to the popover" half of a suggestion lookup,

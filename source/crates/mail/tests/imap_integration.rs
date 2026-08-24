@@ -95,9 +95,10 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     };
 
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (_interactive_tx, interactive_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::unbounded();
     let credentials: Arc<dyn CredentialProvider> = Arc::new(FixedCredentialProvider);
-    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx));
 
     // --- Wait for the account to come up: folder list + initial inbox sync.
     let folders = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::FoldersUpdated(_))).await;

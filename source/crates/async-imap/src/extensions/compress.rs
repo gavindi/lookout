@@ -69,63 +69,37 @@ impl<T: Read + Write + Unpin + fmt::Debug> DeflateStream<T> {
 
 #[cfg(feature = "runtime-tokio")]
 impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         self.project().inner.poll_read(cx, buf)
     }
 }
 
 #[cfg(feature = "runtime-async-std")]
 impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<async_std::io::Result<usize>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<async_std::io::Result<usize>> {
         self.project().inner.poll_read(cx, buf)
     }
 
-    fn poll_read_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &mut [IoSliceMut<'_>],
-    ) -> Poll<async_std::io::Result<usize>> {
+    fn poll_read_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &mut [IoSliceMut<'_>]) -> Poll<async_std::io::Result<usize>> {
         self.project().inner.poll_read_vectored(cx, bufs)
     }
 }
 
 #[cfg(feature = "runtime-tokio")]
 impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         self.project().inner.get_pin_mut().poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
         self.project().inner.poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
         self.project().inner.poll_shutdown(cx)
     }
 
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<std::io::Result<usize>> {
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
         self.project().inner.poll_write_vectored(cx, bufs)
     }
 
@@ -136,33 +110,19 @@ impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
 
 #[cfg(feature = "runtime-async-std")]
 impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<async_std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<async_std::io::Result<usize>> {
         self.project().inner.as_mut().poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<async_std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<async_std::io::Result<()>> {
         self.project().inner.poll_flush(cx)
     }
 
-    fn poll_close(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<async_std::io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<async_std::io::Result<()>> {
         self.project().inner.poll_close(cx)
     }
 
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<async_std::io::Result<usize>> {
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<async_std::io::Result<usize>> {
         self.project().inner.poll_write_vectored(cx, bufs)
     }
 }
@@ -179,8 +139,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
             unsolicited_responses_tx,
             unsolicited_responses,
         } = self;
-        conn.run_command_and_check_ok("COMPRESS DEFLATE", Some(unsolicited_responses_tx.clone()))
-            .await?;
+        conn.run_command_and_check_ok("COMPRESS DEFLATE", Some(unsolicited_responses_tx.clone())).await?;
 
         let stream = conn.into_inner();
         let deflate_stream = DeflateStream::new(stream);

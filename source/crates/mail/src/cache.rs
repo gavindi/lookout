@@ -859,7 +859,8 @@ impl Cache {
     /// §2.3.1.1) can never resolve to a stale attachment, matching
     /// `load_body`'s guard.
     fn attachment_path(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, part_number: &str) -> PathBuf {
-        self.attachments_dir.join(format!("{}-{}-{}-{part_number}.bin", mailbox_filename_hash(mailbox_id), uidvalidity.0, uid.0))
+        self.attachments_dir
+            .join(format!("{}-{}-{}-{part_number}.bin", mailbox_filename_hash(mailbox_id), uidvalidity.0, uid.0))
     }
 
     /// Returns the previously-fetched bytes of one attachment part, or `None`
@@ -942,9 +943,7 @@ impl Cache {
                 let file_hash = fields.next();
                 let validity = fields.next().and_then(|s| s.parse::<u32>().ok());
                 let uid = fields.next().and_then(|s| s.parse::<u32>().ok());
-                if file_hash == Some(hash.as_str())
-                    && matches!((validity, uid), (Some(v), Some(u)) if purged.contains(&(u, v)))
-                {
+                if file_hash == Some(hash.as_str()) && matches!((validity, uid), (Some(v), Some(u)) if purged.contains(&(u, v))) {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -981,7 +980,9 @@ impl Cache {
             let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?))) else {
                 return;
             };
-            rows.flatten().map(|(mailbox_id, validity, uid)| (mailbox_filename_hash(&MailboxId(mailbox_id)), validity, uid)).collect()
+            rows.flatten()
+                .map(|(mailbox_id, validity, uid)| (mailbox_filename_hash(&MailboxId(mailbox_id)), validity, uid))
+                .collect()
         };
         for (dir, ext) in [(&self.attachments_dir, ".bin"), (&self.messages_dir, ".eml")] {
             let Ok(entries) = std::fs::read_dir(dir) else { continue };
@@ -2032,7 +2033,11 @@ mod tests {
         let cache = Cache::open(&account_id).unwrap();
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
-        let messages = vec![sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None), sample_summary(&mailbox_id, 3, Some("already had one"))];
+        let messages = vec![
+            sample_summary(&mailbox_id, 1, None),
+            sample_summary(&mailbox_id, 2, None),
+            sample_summary(&mailbox_id, 3, Some("already had one")),
+        ];
         cache.replace_messages(&mailbox_id, UidValidity(1), &messages).unwrap();
 
         let previews = HashMap::from([(Uid(1), "new snippet for 1".to_string())]);
@@ -2558,10 +2563,7 @@ mod tests {
         assert_eq!(cache.search("preview", 10).unwrap().len(), 2);
         assert_eq!(cache.search("confidential", 10).unwrap().len(), 0);
 
-        let bodies = vec![
-            (Uid(1), sample_body("confidential earnings")),
-            (Uid(2), sample_body("confidential roadmap")),
-        ];
+        let bodies = vec![(Uid(1), sample_body("confidential earnings")), (Uid(2), sample_body("confidential roadmap"))];
         cache.store_bodies(&mailbox_id, UidValidity(1), &bodies).unwrap();
 
         assert_eq!(cache.search("confidential", 10).unwrap().len(), 2);
@@ -2721,11 +2723,7 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         cache
-            .replace_messages(
-                &mailbox_id,
-                UidValidity(1),
-                &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)],
-            )
+            .replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)])
             .unwrap();
         cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("gone body")).unwrap();
         cache.store_body(&mailbox_id, Uid(2), UidValidity(1), &sample_body("kept body")).unwrap();
@@ -2735,9 +2733,7 @@ mod tests {
         cache.snooze_message(&mailbox_id, Uid(1), Utc::now() + chrono::Duration::hours(1)).unwrap();
 
         // The resync drops uid 1 (expunged server-side) and keeps uid 2.
-        cache
-            .replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 2, None)])
-            .unwrap();
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 2, None)]).unwrap();
 
         let remaining = cache.load_messages(&mailbox_id).unwrap();
         assert_eq!(remaining.len(), 1);
@@ -2754,7 +2750,10 @@ mod tests {
             "every attachment part is purged"
         );
         assert!(cache.load_raw_message(&mailbox_id, Uid(1), UidValidity(1)).unwrap().is_none(), "the .eml is purged");
-        assert!(cache.load_attachment(&mailbox_id, Uid(2), UidValidity(1), "9").unwrap().is_none(), "an untargeted file still loads (miss)");
+        assert!(
+            cache.load_attachment(&mailbox_id, Uid(2), UidValidity(1), "9").unwrap().is_none(),
+            "an untargeted file still loads (miss)"
+        );
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
@@ -2772,11 +2771,7 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         cache
-            .replace_messages(
-                &mailbox_id,
-                UidValidity(1),
-                &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)],
-            )
+            .replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)])
             .unwrap();
         cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("one")).unwrap();
         cache.store_raw_message(&mailbox_id, Uid(2), UidValidity(1), b"Subject: two\r\n\r\nx").unwrap();

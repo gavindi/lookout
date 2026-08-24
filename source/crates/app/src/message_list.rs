@@ -678,7 +678,13 @@ fn diff_range<K: PartialEq>(old: &[K], new: &[K]) -> RowDiff {
     // claimed, or a short list where everything is shared could double-count
     // and yield a negative-length middle range.
     let remaining = max_common - prefix;
-    let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev()).take(remaining).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take(remaining)
+        .take_while(|(a, b)| a == b)
+        .count();
     RowDiff { prefix, suffix }
 }
 
@@ -732,7 +738,10 @@ struct TrackedStore {
 
 impl TrackedStore {
     fn new() -> Self {
-        TrackedStore { store: gio::ListStore::new::<glib::BoxedAnyObject>(), keys: Vec::new() }
+        TrackedStore {
+            store: gio::ListStore::new::<glib::BoxedAnyObject>(),
+            keys: Vec::new(),
+        }
     }
 }
 
@@ -1027,7 +1036,10 @@ impl MessageListModel {
     /// violation is a logic bug worth catching in debug builds rather than a
     /// runtime condition to handle.
     pub fn repopulate_unified_slice(&self, mailbox: &MailboxId, mut new_slice: Vec<EmailSummary>, sort_key: SortKey, sort_descending: bool) {
-        debug_assert!(new_slice.iter().all(|m| &m.mailbox == mailbox), "repopulate_unified_slice: new_slice must belong to `mailbox`");
+        debug_assert!(
+            new_slice.iter().all(|m| &m.mailbox == mailbox),
+            "repopulate_unified_slice: new_slice must belong to `mailbox`"
+        );
         {
             let mut truth = self.truth.borrow_mut();
             let rest = std::mem::take(&mut *truth).into_iter().filter(|m| &m.mailbox != mailbox);
@@ -1056,7 +1068,11 @@ impl MessageListModel {
         // an owned `Vec` to filter/sort/consume.
         let truth_snapshot = self.truth.borrow().clone();
 
-        let worker = if truth_snapshot.len() > BACKGROUND_REPOPULATE_THRESHOLD { self.worker.as_ref() } else { None };
+        let worker = if truth_snapshot.len() > BACKGROUND_REPOPULATE_THRESHOLD {
+            self.worker.as_ref()
+        } else {
+            None
+        };
         let Some(worker) = worker else {
             // Small enough to be imperceptible inline (or no worker - every
             // test-built model), or under the threshold: compute and apply
@@ -1187,7 +1203,11 @@ impl MessageListModel {
                 let mut new_keys: Vec<RowKey> = pinned_root_keys;
                 new_keys.extend(sections.iter().map(|(bucket, label, _)| RowKey::Section(section_row_key(*bucket, label))));
                 let mut rows: Vec<glib::Object> = pinned_root_rows;
-                rows.extend(sections.into_iter().map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast()));
+                rows.extend(
+                    sections
+                        .into_iter()
+                        .map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast()),
+                );
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
                 self.apply_expansion();
@@ -1251,7 +1271,11 @@ impl MessageListModel {
                 let mut new_keys: Vec<RowKey> = pinned_root_keys;
                 new_keys.extend(sections.iter().map(|(bucket, label, _)| RowKey::Section(section_row_key(*bucket, label))));
                 let mut rows: Vec<glib::Object> = pinned_root_rows;
-                rows.extend(sections.into_iter().map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast()));
+                rows.extend(
+                    sections
+                        .into_iter()
+                        .map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast()),
+                );
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
                 self.apply_expansion();
@@ -1349,8 +1373,13 @@ impl MessageListModel {
     /// messages under a row the next threaded rebuild re-creates for the same
     /// id.
     fn clear_threads(&self, live: &HashSet<ThreadId>) {
-        let stale: Vec<(ThreadId, gio::ListStore)> =
-            self.threads.borrow().iter().filter(|(id, _)| !live.contains(*id)).map(|(id, tracked)| (id.clone(), tracked.store.clone())).collect();
+        let stale: Vec<(ThreadId, gio::ListStore)> = self
+            .threads
+            .borrow()
+            .iter()
+            .filter(|(id, _)| !live.contains(*id))
+            .map(|(id, tracked)| (id.clone(), tracked.store.clone()))
+            .collect();
         for (_, store) in &stale {
             store.splice(0, store.n_items(), &[] as &[glib::Object]);
         }
@@ -1376,7 +1405,10 @@ impl MessageListModel {
             return (HashSet::new(), Vec::new(), Vec::new());
         }
         let new_keys: Vec<RowKey> = pinned.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
-        let rows: Vec<glib::Object> = pinned.iter().map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast()).collect();
+        let rows: Vec<glib::Object> = pinned
+            .iter()
+            .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast())
+            .collect();
         let (store, old_keys) = {
             let mut sections = self.sections.borrow_mut();
             let tracked = sections.entry(DateBucket::Pinned).or_insert_with(TrackedStore::new);
@@ -1386,7 +1418,11 @@ impl MessageListModel {
         splice_diff(&store, &old_keys, &new_keys, &rows);
         let label = bucket_label(DateBucket::Pinned, now);
         let root_keys = vec![RowKey::Section(section_row_key(DateBucket::Pinned, &label))];
-        let root_rows: Vec<glib::Object> = vec![glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket: DateBucket::Pinned, label })).upcast()];
+        let root_rows: Vec<glib::Object> = vec![glib::BoxedAnyObject::new(MessageItem::Section(SectionRow {
+            bucket: DateBucket::Pinned,
+            label,
+        }))
+        .upcast()];
         (HashSet::from([DateBucket::Pinned]), root_keys, root_rows)
     }
 
@@ -1816,7 +1852,10 @@ mod tests {
         // Pinned + Today + Older headers, three messages.
         assert_eq!(pinned.selection.n_items(), 6);
         assert_eq!(pinned.message_at(0), None, "row 0 must be a header");
-        assert_eq!(pinned.selection.item(0).and_downcast::<gtk::TreeListRow>().and_then(|r| section_bucket(&r)), Some(DateBucket::Pinned));
+        assert_eq!(
+            pinned.selection.item(0).and_downcast::<gtk::TreeListRow>().and_then(|r| section_bucket(&r)),
+            Some(DateBucket::Pinned)
+        );
 
         // Collapse Pinned and Older - `tree.child_row` indexes *root* rows
         // (one per section header), so with Pinned/Today/Older as the three
@@ -1833,8 +1872,14 @@ mod tests {
         assert!(pinned.collapsed_pinned.get(), "the Pinned collapse must survive a flat-sort round trip");
 
         pinned.repopulate(vec![pinned_msg, summary(1, today), summary(2, older)], SortKey::Date, true);
-        assert!(!pinned.tree.child_row(2).expect("Older row").is_expanded(), "Older's collapse must not have been wiped by the flat-sort round trip");
-        assert!(!pinned.tree.child_row(0).expect("Pinned row").is_expanded(), "Pinned's own collapse must also survive the round trip");
+        assert!(
+            !pinned.tree.child_row(2).expect("Older row").is_expanded(),
+            "Older's collapse must not have been wiped by the flat-sort round trip"
+        );
+        assert!(
+            !pinned.tree.child_row(0).expect("Pinned row").is_expanded(),
+            "Pinned's own collapse must also survive the round trip"
+        );
 
         // --- Conversations: a thread of two collapses under one header, and
         // the collapse survives both rebuilds and a threading-mode round-trip
@@ -1906,7 +1951,10 @@ mod tests {
         // A rebuild that only adds a message to Today - Yesterday's and
         // Older's stores/keys are untouched by the diff.
         partial.repopulate(vec![summary(1, today), summary(4, today), summary(2, yesterday), summary(3, older)], SortKey::Date, true);
-        assert!(!partial.tree.child_row(2).expect("Older row").is_expanded(), "an untouched section's collapse must survive a partial diff");
+        assert!(
+            !partial.tree.child_row(2).expect("Older row").is_expanded(),
+            "an untouched section's collapse must survive a partial diff"
+        );
         assert_eq!(partial.selected_summary().map(|s| s.uid), Some(Uid(1)), "selection must survive a partial diff");
 
         // --- Above BACKGROUND_REPOPULATE_THRESHOLD, repopulate dispatches to
@@ -1945,7 +1993,11 @@ mod tests {
         main_loop.run();
 
         // One "Today" section header plus every message.
-        assert_eq!(big.selection.n_items() as usize, n + 1, "the background-computed layout must splice exactly as the inline path would");
+        assert_eq!(
+            big.selection.n_items() as usize,
+            n + 1,
+            "the background-computed layout must splice exactly as the inline path would"
+        );
 
         // --- `repopulate_unified_slice` matches a from-scratch merge ---
         // Appended here for the same `gtk::init()`-once-per-process reason as
@@ -2131,9 +2183,19 @@ mod tests {
         let now = local(2026, 8, 4, 8);
         let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 2, 1)), pinned(3, utc_on(now, 2026, 1, 1))];
         let computed = compute_layout(messages, ListFilter::All, SortKey::Sender, true, false, now);
-        assert_eq!(computed.pinned.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1, 3], "both pinned messages appear, in sort order");
-        let ListLayout::Flat(rest) = computed.layout else { panic!("Sender sort must still render its own body flat") };
-        assert_eq!(rest.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![2], "the pinned messages must not also appear in the flat body");
+        assert_eq!(
+            computed.pinned.iter().map(|m| m.uid.0).collect::<Vec<_>>(),
+            vec![1, 3],
+            "both pinned messages appear, in sort order"
+        );
+        let ListLayout::Flat(rest) = computed.layout else {
+            panic!("Sender sort must still render its own body flat")
+        };
+        assert_eq!(
+            rest.iter().map(|m| m.uid.0).collect::<Vec<_>>(),
+            vec![2],
+            "the pinned messages must not also appear in the flat body"
+        );
     }
 
     /// The pinned section would just duplicate the entire visible list under
@@ -2145,7 +2207,9 @@ mod tests {
         let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 8, 4))];
         let computed = compute_layout(messages, ListFilter::Flagged, SortKey::Date, true, false, now);
         assert!(computed.pinned.is_empty(), "Flagged already shows nothing but pinned messages - no separate pin needed");
-        let ListLayout::Grouped(sections) = computed.layout else { panic!("expected a grouped layout under Date sort") };
+        let ListLayout::Grouped(sections) = computed.layout else {
+            panic!("expected a grouped layout under Date sort")
+        };
         assert_eq!(sections.len(), 1, "the lone flagged message still renders in its normal date section");
         assert_eq!(sections[0].2.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1]);
     }

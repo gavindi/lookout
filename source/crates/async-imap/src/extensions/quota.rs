@@ -21,11 +21,7 @@ pub(crate) async fn parse_get_quota<T: Stream<Item = io::Result<ResponseData>> +
     command_tag: RequestId,
 ) -> Result<Quota> {
     let mut quota = None;
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = stream.take_while(|res| filter(res, &command_tag)).try_next().await? {
         match resp.parsed() {
             Response::Quota(q) => quota = Some(q.clone().into()),
             _ => {
@@ -36,9 +32,7 @@ pub(crate) async fn parse_get_quota<T: Stream<Item = io::Result<ResponseData>> +
 
     match quota {
         Some(q) => Ok(q),
-        None => Err(Error::Parse(ParseError::ExpectedResponseNotFound(
-            "Quota, no quota response found".to_string(),
-        ))),
+        None => Err(Error::Parse(ParseError::ExpectedResponseNotFound("Quota, no quota response found".to_string()))),
     }
 }
 
@@ -50,11 +44,7 @@ pub(crate) async fn parse_get_quota_root<T: Stream<Item = io::Result<ResponseDat
     let mut roots: Vec<QuotaRoot> = Vec::new();
     let mut quotas: Vec<Quota> = Vec::new();
 
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = stream.take_while(|res| filter(res, &command_tag)).try_next().await? {
         match resp.parsed() {
             Response::QuotaRoot(qr) => {
                 roots.push(qr.clone().into());

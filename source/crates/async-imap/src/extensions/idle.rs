@@ -114,12 +114,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
 
     /// Start listening to the server side responses.
     /// Must be called after [`Handle::init`].
-    pub fn wait(
-        &mut self,
-    ) -> (
-        impl Future<Output = Result<IdleResponse>> + '_,
-        stop_token::StopSource,
-    ) {
+    pub fn wait(&mut self) -> (impl Future<Output = Result<IdleResponse>> + '_, stop_token::StopSource) {
         self.wait_with_timeout(Duration::from_secs(29 * 60))
     }
 
@@ -129,17 +124,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
     /// Timeout is reset by any response, including `* OK Still here` keepalives.
     ///
     /// Must be called after [Handle::init].
-    pub fn wait_with_timeout(
-        &mut self,
-        dur: Duration,
-    ) -> (
-        impl Future<Output = Result<IdleResponse>> + '_,
-        stop_token::StopSource,
-    ) {
-        assert!(
-            self.id.is_some(),
-            "Cannot listen to response without starting IDLE"
-        );
+    pub fn wait_with_timeout(&mut self, dur: Duration) -> (impl Future<Output = Result<IdleResponse>> + '_, stop_token::StopSource) {
+        assert!(self.id.is_some(), "Cannot listen to response without starting IDLE");
 
         let sender = self.session.unsolicited_responses_tx.clone();
 
@@ -159,9 +145,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
 
                 let resp = resp?;
                 match resp.parsed() {
-                    Response::Data {
-                        status: Status::Ok, ..
-                    } => {
+                    Response::Data { status: Status::Ok, .. } => {
                         // all good continue
                     }
                     Response::Continue { .. } => {
@@ -187,19 +171,10 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
                 Response::Continue { .. } => {
                     return Ok(());
                 }
-                Response::Done {
-                    tag,
-                    status,
-                    information,
-                    ..
-                } => {
+                Response::Done { tag, status, information, .. } => {
                     if tag == self.id.as_ref().unwrap() {
                         if let Status::Bad = status {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                information.as_ref().unwrap().to_string(),
-                            )
-                            .into());
+                            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, information.as_ref().unwrap().to_string()).into());
                         }
                     }
                     handle_unilateral(res, self.session.unsolicited_responses_tx.clone());
@@ -216,15 +191,10 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
     /// Signal that we want to exit the idle connection, by sending the `DONE`
     /// command to the server.
     pub async fn done(mut self) -> Result<Session<T>> {
-        assert!(
-            self.id.is_some(),
-            "Cannot call DONE on a non initialized idle connection"
-        );
+        assert!(self.id.is_some(), "Cannot call DONE on a non initialized idle connection");
         self.session.run_command_untagged("DONE").await?;
         let sender = self.session.unsolicited_responses_tx.clone();
-        self.session
-            .check_done_ok(&self.id.expect("invalid setup"), Some(sender))
-            .await?;
+        self.session.check_done_ok(&self.id.expect("invalid setup"), Some(sender)).await?;
 
         Ok(self.session)
     }

@@ -391,6 +391,21 @@ pub fn preview_from_raw(raw: &[u8]) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
+/// Extracts the one-line snippet from an already-decoded [`EmailBody`], for
+/// the new-email path in `sync_mailbox` where the body is fetched before the
+/// preview pass runs. Same normalization as `preview_from_raw`; the caller
+/// patches the summary's `preview` with the result so the separate preview
+/// fetch round trip for that message is skipped entirely.
+pub fn preview_from_body(body: &EmailBody) -> Option<String> {
+    let text = match (&body.text_body, &body.html_body) {
+        (Some(t), _) => t.as_str(),
+        (None, Some(h)) => &strip_html(h),
+        (None, None) => return None,
+    };
+    let preview = normalize_preview(text);
+    (!preview.is_empty()).then_some(preview)
+}
+
 /// Crude tag-stripper for the HTML fallback - enough to turn markup into
 /// readable words, not a sanitizer. The reading pane renders real HTML
 /// through WebKit; this is only ever a list row's worth of plain text.

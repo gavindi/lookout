@@ -46,13 +46,7 @@ impl fmt::Display for Mailbox {
             f,
             "flags: {:?}, exists: {}, recent: {}, unseen: {:?}, permanent_flags: {:?},\
              uid_next: {:?}, uid_validity: {:?}",
-            self.flags,
-            self.exists,
-            self.recent,
-            self.unseen,
-            self.permanent_flags,
-            self.uid_next,
-            self.uid_validity
+            self.flags, self.exists, self.recent, self.unseen, self.permanent_flags, self.uid_next, self.uid_validity
         )
     }
 }

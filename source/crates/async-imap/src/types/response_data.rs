@@ -16,10 +16,7 @@ impl ResponseData {
     ///
     /// `owner` only needs to live for the duration of `f` - once `f` returns,
     /// nothing further borrows from it.
-    pub fn try_new<Err>(
-        owner: BytesMut,
-        f: impl for<'a> FnOnce(&'a BytesMut) -> Result<Response<'a>, Err>,
-    ) -> Result<Self, Err> {
+    pub fn try_new<Err>(owner: BytesMut, f: impl for<'a> FnOnce(&'a BytesMut) -> Result<Response<'a>, Err>) -> Result<Self, Err> {
         let response = f(&owner)?;
         Ok(ResponseData(response.into_owned()))
     }

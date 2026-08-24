@@ -11,7 +11,7 @@ use chrono::{Datelike, Timelike};
 use gtk::{gio, glib};
 use lookout_core::{
     display_name, AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody,
-    EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, VCard, WebcalSubscription,
+    EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, UidValidity, VCard, WebcalSubscription,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
@@ -46,7 +46,18 @@ use crate::worker::Worker;
 /// `pub(crate)` because `contacts_view` reads `cmd_tx`/`email`/`display_name`
 /// (and `address_cache`) off the account handles.
 pub(crate) struct AccountHandle {
+    /// The session's *background* command channel - syncs, moves, searches,
+    /// flag changes, refreshes. FIFO with every other background command;
+    /// drained only after the interactive channel (see `interactive_cmd_tx`).
     pub(crate) cmd_tx: async_channel::Sender<AccountCommand>,
+    /// The session's *interactive* command channel: user-facing fetches
+    /// (`FetchBody`, `FetchAttachment`, `FetchRawMessage`) that must never
+    /// queue behind background work - the session drains this channel ahead
+    /// of `cmd_tx` and yields background work (STATUS drains, prefetch
+    /// batches, the inline new-email body fetch) when it's non-empty, so an
+    /// open-message click is answered as fast as the one in-flight IMAP
+    /// round trip allows.
+    pub(crate) interactive_cmd_tx: async_channel::Sender<AccountCommand>,
     pub(crate) email: String,
     pub(crate) display_name: String,
     /// Connection parameters, kept for the Config view's account overview
@@ -1484,10 +1495,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["folder-row-label"])
                 .build();
-            let count = gtk::Label::builder()
-                .xalign(1.0)
-                .css_classes(["folder-unread-count"])
-                .build();
+            let count = gtk::Label::builder().xalign(1.0).css_classes(["folder-unread-count"]).build();
             let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
             row_box.append(&icon);
             row_box.append(&label);
@@ -1891,11 +1899,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let header_label = gtk::Label::builder().xalign(0.0).css_classes(["heading"]).build();
         let expander = gtk::TreeExpander::new();
         expander.set_child(Some(&header_label));
-        let header_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .margin_start(10)
-            .margin_end(10)
-            .build();
+        let header_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).margin_start(10).margin_end(10).build();
         header_box.add_css_class("message-section-header");
         header_box.append(&expander);
 
@@ -2064,11 +2068,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         thread_top.append(&thread_date);
         let thread_expander = gtk::TreeExpander::new();
         thread_expander.set_child(Some(&thread_top));
-        let thread_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .margin_start(14)
-            .margin_end(10)
-            .build();
+        let thread_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).margin_start(14).margin_end(10).build();
         thread_box.add_css_class("message-thread-row");
         thread_box.append(&thread_expander);
 
@@ -2394,7 +2394,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // in the pane (so its autosave loop stops), restores the
                 // previous page on close, and owns the `draft_saved_tx` slot.
                 if let Some((_from_email, cmd_tx, prefill, rich_text_default)) = opened {
-                    show_composer_in_reading_pane(&state, &worker, &reading_stack, "Reply", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox), crate::config_view::SignatureDefault::Reply);
+                    show_composer_in_reading_pane(
+                        &state,
+                        &worker,
+                        &reading_stack,
+                        "Reply",
+                        cmd_tx,
+                        prefill,
+                        rich_text_default,
+                        mailbox_account_id(&summary.mailbox),
+                        crate::config_view::SignatureDefault::Reply,
+                    );
                 }
             });
         }
@@ -3538,7 +3548,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
         let (armed, stuck_on_empty) = {
             let st = state_for_reveal.borrow();
-            (st.pending_html_reveal, st.rendered_message.is_some() && reading_stack_for_reveal.visible_child_name().as_deref() == Some("empty"))
+            (
+                st.pending_html_reveal,
+                st.rendered_message.is_some() && reading_stack_for_reveal.visible_child_name().as_deref() == Some("empty"),
+            )
         };
         // `stuck_on_empty` is a backstop for a scenario the selection
         // handler's same-message guard is meant to prevent, not the normal
@@ -5054,24 +5067,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let calendar_state = calendar_state.clone();
         let tasks_view = tasks_view.clone();
-        state.borrow_mut().follow_up_toggle = Some(Rc::new(move |summary: &EmailSummary, preferred_account: Option<AccountId>, preferred_email: Option<String>| {
-            let Some(message_id) = summary.message_id.clone() else { return false };
-            let new_has_task = match task_for_email(&calendar_state, &message_id) {
-                Some(task) => {
-                    route_task_delete(&calendar_state, &tasks_view, task.calendar_id, task.uid, task.href, task.etag);
-                    false
+        state.borrow_mut().follow_up_toggle = Some(Rc::new(
+            move |summary: &EmailSummary, preferred_account: Option<AccountId>, preferred_email: Option<String>| {
+                let Some(message_id) = summary.message_id.clone() else { return false };
+                let new_has_task = match task_for_email(&calendar_state, &message_id) {
+                    Some(task) => {
+                        route_task_delete(&calendar_state, &tasks_view, task.calendar_id, task.uid, task.href, task.etag);
+                        false
+                    }
+                    None => {
+                        let (calendar_id, task) = build_task_seed_for_email(&calendar_state, summary, preferred_account, preferred_email);
+                        route_task_save(&calendar_state, &tasks_view, calendar_id, task);
+                        true
+                    }
+                };
+                if let Some(refresh) = calendar_state.borrow().task_button_refresh.clone() {
+                    refresh();
                 }
-                None => {
-                    let (calendar_id, task) = build_task_seed_for_email(&calendar_state, summary, preferred_account, preferred_email);
-                    route_task_save(&calendar_state, &tasks_view, calendar_id, task);
-                    true
-                }
-            };
-            if let Some(refresh) = calendar_state.borrow().task_button_refresh.clone() {
-                refresh();
-            }
-            new_has_task
-        }));
+                new_has_task
+            },
+        ));
     }
 
     // --- Calendar event reminders. The engine accumulates every occurrence
@@ -5780,12 +5795,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .prefetch_interval_row
             .set_value(persisted.get_int(crate::settings::PREFETCH_BATCH_INTERVAL_SECONDS) as f64);
-        config_view
-            .prefetch_limit_row
-            .set_value(persisted.get_int(crate::settings::PREFETCH_FOLDER_LIMIT) as f64);
-        config_view
-            .prefetch_batch_row
-            .set_value(persisted.get_int(crate::settings::PREFETCH_BATCH_SIZE) as f64);
+        config_view.prefetch_limit_row.set_value(persisted.get_int(crate::settings::PREFETCH_FOLDER_LIMIT) as f64);
+        config_view.prefetch_batch_row.set_value(persisted.get_int(crate::settings::PREFETCH_BATCH_SIZE) as f64);
         config_view
             .prefetch_refresh_row
             .set_value(persisted.get_int(crate::settings::PREFETCH_REFRESH_INTERVAL_MINUTES) as f64);
@@ -6911,7 +6922,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&state, &worker, &reading_stack, title, cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox), crate::config_view::SignatureDefault::Reply);
+                show_composer_in_reading_pane(
+                    &state,
+                    &worker,
+                    &reading_stack,
+                    title,
+                    cmd_tx,
+                    prefill,
+                    rich_text_default,
+                    mailbox_account_id(&summary.mailbox),
+                    crate::config_view::SignatureDefault::Reply,
+                );
             }
         });
     }
@@ -6924,7 +6945,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if let Some((summary, body, _from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
                 let prefill = crate::compose::build_forward_prefill(&summary, &body);
                 let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(&state, &worker, &reading_stack, "Forward", cmd_tx, prefill, rich_text_default, mailbox_account_id(&summary.mailbox), crate::config_view::SignatureDefault::Reply);
+                show_composer_in_reading_pane(
+                    &state,
+                    &worker,
+                    &reading_stack,
+                    "Forward",
+                    cmd_tx,
+                    prefill,
+                    rich_text_default,
+                    mailbox_account_id(&summary.mailbox),
+                    crate::config_view::SignatureDefault::Reply,
+                );
             }
         });
     }
@@ -7014,12 +7045,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // pane. There's no IMAP session behind it, so the reading pane's cid:
         // scheme handler can't fetch inline images - rewrite them to `data:`
         // URIs straight from the raw message so fixtures render in full.
-        fn render_fixture(
-            path: &std::path::Path,
-            state: &Rc<RefCell<UiState>>,
-            reading_stack: &gtk::Stack,
-            message_header: &crate::message_header::MessageHeader,
-        ) {
+        fn render_fixture(path: &std::path::Path, state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, message_header: &crate::message_header::MessageHeader) {
             let Ok(raw) = std::fs::read(path) else { return };
             if let Some(body) = lookout_mail::body::parse_body(lookout_core::Uid(0), &raw) {
                 let body = if let Some(html) = body.html_body.as_deref() {
@@ -7135,6 +7161,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Message selection -> AccountCommand::FetchBody on the current account ---
     {
         let state = state.clone();
+        let worker = worker.clone();
         let reading_stack = reading_stack.clone();
         let reading_multi_label = reading_multi_label.clone();
         let message_header = message_header.clone();
@@ -7331,13 +7358,65 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 if let Some(account_id) = mailbox_account_id(&mailbox) {
                     if let Some(handle) = st.accounts.get(&account_id) {
                         tracing::debug!(?mailbox, uid = uid.0, "FetchBody: dispatching to account actor");
-                        let _ = handle.cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox.clone(), uid });
+                        let _ = handle.interactive_cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox.clone(), uid });
+                        // Parallel disk fast-path: a body cached on disk but
+                        // not in the 25-entry in-memory LRU renders the
+                        // instant this read lands, without waiting for the
+                        // command to round-trip through the session (the
+                        // session's own FetchBody still serves the same row
+                        // from its own cache check and answers without a
+                        // network round trip; whichever lands first renders
+                        // and the other is deduped by `pending_body_request`).
+                        // The `address_cache` handle may still be opening
+                        // right after connect, and a mailbox not yet in
+                        // `folders` falls back to `UidValidity(0)` - a
+                        // deliberate cache-miss sentinel, so neither case can
+                        // serve a wrong body.
+                        let cache = handle.address_cache.clone();
+                        let uidvalidity = handle.folders.iter().find(|f| f.id == mailbox).map(|f| f.uidvalidity).unwrap_or(UidValidity(0));
+                        drop(st);
+                        if let Some(cache) = cache {
+                            let reply_rx = spawn_cache_read(&worker, cache, {
+                                let mailbox = mailbox.clone();
+                                move |c| c.load_bodies(&mailbox, &[uid], uidvalidity)
+                            });
+                            let state = state.clone();
+                            let reading_stack = reading_stack.clone();
+                            let message_header = message_header.clone();
+                            let request_key = request.clone();
+                            let mailbox_for_render = mailbox.clone();
+                            glib::spawn_future_local(async move {
+                                let Ok(result) = reply_rx.recv().await else { return };
+                                let Ok(bodies) = result else { return };
+                                let Some(body) = bodies.get(&uid).cloned() else { return };
+                                // The selection may have moved on while the
+                                // read ran, or the session's own BodyFetched
+                                // may already have rendered the message.
+                                let still_current = state.borrow().pending_body_request.as_ref() == Some(&request_key);
+                                if !still_current {
+                                    return;
+                                }
+                                // Serving from disk: clear the pending request
+                                // so the session's own BodyFetched for this
+                                // message is treated as a stale duplicate,
+                                // then render immediately.
+                                state.borrow_mut().pending_body_request = None;
+                                tracing::debug!(?mailbox_for_render, uid = uid.0, "FetchBody: serving from disk cache");
+                                render_body(&state, &reading_stack, &message_header, mailbox_for_render, uid, body);
+                            });
+                        }
+                    } else {
+                        drop(st);
                     }
+                } else {
+                    drop(st);
                 }
             }
             // Also silently abandons an in-progress composer in the reading
             // pane, if one's open - no "discard draft?" prompt, consistent
             // with this app's existing no-confirmation-dialog convention.
+            // The pane sits on "empty" while an uncached body is in flight -
+            // the crossfade through it is fast enough to cover the fetch.
             reading_stack.set_visible_child_name("empty");
             // Every navigation resets the per-message override to the
             // configured default (Config → Appearance → "Dark message
@@ -8248,12 +8327,17 @@ fn connect_account(
     // Commands stay unbounded (sent via `send_blocking` from the main thread);
     // events are bounded so the drain coalesces a batch and stalls the session
     // under a flood instead of queueing unboundedly - see `EVENT_CHANNEL_CAPACITY`.
+    // Two command channels: user-facing fetches (`FetchBody`/`FetchAttachment`/
+    // `FetchRawMessage`) ride the interactive one, which the session drains
+    // ahead of the background one - see `AccountHandle::interactive_cmd_tx`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (interactive_cmd_tx, interactive_cmd_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     state.borrow_mut().accounts.insert(
         account_id.clone(),
         AccountHandle {
             cmd_tx,
+            interactive_cmd_tx,
             email: config.email.clone(),
             display_name,
             imap_host: config.imap.host.clone(),
@@ -8283,7 +8367,7 @@ fn connect_account(
         });
     }
 
-    worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
+    worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_cmd_rx, evt_tx));
 
     spawn_account_event_loop(
         evt_rx,
@@ -8449,9 +8533,7 @@ fn spawn_account_event_loop(
                         {
                             let policy = state.borrow().settings.prefetch_policy();
                             if let Some(handle) = state.borrow().accounts.get(&account_id) {
-                                let _ = handle
-                                    .cmd_tx
-                                    .send_blocking(lookout_mail::session::AccountCommand::SetPrefetchPolicy(policy));
+                                let _ = handle.cmd_tx.send_blocking(lookout_mail::session::AccountCommand::SetPrefetchPolicy(policy));
                             }
                         }
                         rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
@@ -8594,9 +8676,10 @@ fn spawn_account_event_loop(
                         let display = {
                             let st = state.borrow();
                             match st.mail_view {
-                                MailView::UnifiedInbox => {
-                                    st.accounts.values().any(|h| h.folders.iter().any(|m| m.id == mailbox && matches!(m.role, MailboxRole::Inbox)))
-                                }
+                                MailView::UnifiedInbox => st
+                                    .accounts
+                                    .values()
+                                    .any(|h| h.folders.iter().any(|m| m.id == mailbox && matches!(m.role, MailboxRole::Inbox))),
                                 _ => st.current_mailbox.as_ref() == Some(&mailbox),
                             }
                         };
@@ -8973,12 +9056,17 @@ fn connect_other_account(
     // Commands stay unbounded (sent via `send_blocking` from the main thread);
     // events are bounded so the drain coalesces a batch and stalls the session
     // under a flood instead of queueing unboundedly - see `EVENT_CHANNEL_CAPACITY`.
+    // Two command channels: user-facing fetches (`FetchBody`/`FetchAttachment`/
+    // `FetchRawMessage`) ride the interactive one, which the session drains
+    // ahead of the background one - see `AccountHandle::interactive_cmd_tx`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (interactive_cmd_tx, interactive_cmd_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     state.borrow_mut().accounts.insert(
         account_id.clone(),
         AccountHandle {
             cmd_tx,
+            interactive_cmd_tx,
             email: config.email.clone(),
             display_name,
             imap_host: config.imap.host.clone(),
@@ -9009,7 +9097,7 @@ fn connect_other_account(
         });
     }
 
-    worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, evt_tx));
+    worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_cmd_rx, evt_tx));
 
     spawn_account_event_loop(
         evt_rx,
@@ -10911,7 +10999,12 @@ fn widen_calendar_sync_horizon(calendar_state: &Rc<RefCell<CalendarUiState>>) {
 /// session sync commands line up.
 fn dashboard_month_window() -> [chrono::NaiveDate; 4] {
     let current = first_of_month(chrono::Local::now().date_naive());
-    [current, current + chrono::Months::new(1), current + chrono::Months::new(2), current + chrono::Months::new(3)]
+    [
+        current,
+        current + chrono::Months::new(1),
+        current + chrono::Months::new(2),
+        current + chrono::Months::new(3),
+    ]
 }
 
 /// Stashes one synced month's occurrences in an upcoming-events map,
@@ -10973,7 +11066,9 @@ fn task_email_marker(message_id: &str) -> String {
 /// toggle, to find the task to delete when removing one.
 fn task_for_email(calendar_state: &Rc<RefCell<CalendarUiState>>, message_id: &str) -> Option<CalendarTask> {
     let marker = task_email_marker(message_id);
-    merged_tasks(calendar_state).into_iter().find(|task| task.description.as_deref().is_some_and(|d| d.contains(&marker)))
+    merged_tasks(calendar_state)
+        .into_iter()
+        .find(|task| task.description.as_deref().is_some_and(|d| d.contains(&marker)))
 }
 
 /// Whether any known task (local, CalDAV, or Google Tasks) was created from
@@ -13459,12 +13554,7 @@ fn selected_message_reply_context(
 /// account: the selected message's account, else the open mailbox's, else
 /// any connected account - exactly the toolbar compose button's logic,
 /// shared with the tray icon's "Compose…" menu item.
-fn compose_new_message(
-    state: &Rc<RefCell<UiState>>,
-    worker: &Rc<Worker>,
-    reading_stack: &gtk::Stack,
-    message_list: &MessageListModel,
-) {
+fn compose_new_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, message_list: &MessageListModel) {
     let st = state.borrow();
     // A section header is selected exactly like "nothing selected" here:
     // fall through to the open mailbox's account.
@@ -14057,7 +14147,7 @@ fn dispatch_cid_request(state: &Rc<RefCell<UiState>>, cid: &str, request: webkit
             .iter()
             .find(|p| p.cid.as_deref().is_some_and(|c| lookout_core::cid_matches(cid, c)))?
             .clone();
-        let cmd_tx = mailbox_account_id(&mailbox).and_then(|id| st.accounts.get(&id)).map(|h| h.cmd_tx.clone())?;
+        let cmd_tx = mailbox_account_id(&mailbox).and_then(|id| st.accounts.get(&id)).map(|h| h.interactive_cmd_tx.clone())?;
         Some((mailbox, uid, part, cmd_tx))
     })();
     let Some((mailbox, uid, part, cmd_tx)) = target else {
@@ -14415,7 +14505,7 @@ fn start_attachment_fetch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid
     let cmd_tx = match mailbox_account_id(mailbox) {
         Some(id) => {
             let st = state.borrow();
-            st.accounts.get(&id).map(|h| h.cmd_tx.clone())
+            st.accounts.get(&id).map(|h| h.interactive_cmd_tx.clone())
         }
         None => None,
     };
@@ -14471,7 +14561,7 @@ fn start_raw_message_export(message_list: &MessageListModel, state: &Rc<RefCell<
     let Some(account_id) = mailbox_account_id(&summary.mailbox) else { return };
     let cmd_tx = {
         let st = state.borrow();
-        st.accounts.get(&account_id).map(|h| h.cmd_tx.clone())
+        st.accounts.get(&account_id).map(|h| h.interactive_cmd_tx.clone())
     };
     let Some(cmd_tx) = cmd_tx else { return };
     // One export in flight at a time; ignore a click while one is outstanding.
@@ -14611,7 +14701,17 @@ fn open_mailto_unsubscribe(
         ..Default::default()
     };
     let rich_text_default = state.borrow().rich_text_default;
-    show_composer_in_reading_pane(state, worker, reading_stack, "Unsubscribe", cmd_tx, prefill, rich_text_default, account_id, crate::config_view::SignatureDefault::Reply);
+    show_composer_in_reading_pane(
+        state,
+        worker,
+        reading_stack,
+        "Unsubscribe",
+        cmd_tx,
+        prefill,
+        rich_text_default,
+        account_id,
+        crate::config_view::SignatureDefault::Reply,
+    );
 }
 
 /// A safe file extension for an attachment's temporary copy, so the system's
@@ -15007,7 +15107,10 @@ fn message_content_security_policy(images_allowed: bool, all_allowed: bool) -> &
 /// keeps its standards-mode rendering (a meta before the doctype would trip
 /// the HTML5 parser into quirks mode and the doctype would then be ignored).
 fn wrap_message_with_csp(html: &str, images_allowed: bool, all_allowed: bool) -> String {
-    let csp_tag = format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">", message_content_security_policy(images_allowed, all_allowed));
+    let csp_tag = format!(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">",
+        message_content_security_policy(images_allowed, all_allowed)
+    );
     let lead = html.len() - html.trim_start().len();
     let trimmed = &html[lead..];
     let mut out = String::with_capacity(html.len() + csp_tag.len() + 1);
@@ -15168,7 +15271,10 @@ fn render_body(
     // media load.
     let (images_allowed, all_allowed) = {
         let st = state.borrow();
-        let level = st.rendered_trust_sender.as_ref().and_then(|(account, sender)| st.trusted_senders.get(&(account.clone(), sender.clone())).copied());
+        let level = st
+            .rendered_trust_sender
+            .as_ref()
+            .and_then(|(account, sender)| st.trusted_senders.get(&(account.clone(), sender.clone())).copied());
         let images_allowed = st.load_remote_images || st.load_once_images || level.is_some_and(|l| l >= lookout_core::TrustLevel::Images);
         let all_allowed = level.is_some_and(|l| l >= lookout_core::TrustLevel::AllContent);
         (images_allowed, all_allowed)
@@ -15307,8 +15413,8 @@ fn render_body(
                 // from this message, stranding the pane on "empty" with
                 // nothing left to reveal it. If `rendered_message` still
                 // names this exact message, revealing now is still correct.
-                let stuck_on_empty = st.rendered_message.as_ref() == Some(&(mailbox_for_timeout.clone(), uid))
-                    && reading_stack_for_timeout.visible_child_name().as_deref() == Some("empty");
+                let stuck_on_empty =
+                    st.rendered_message.as_ref() == Some(&(mailbox_for_timeout.clone(), uid)) && reading_stack_for_timeout.visible_child_name().as_deref() == Some("empty");
                 if still_armed || stuck_on_empty {
                     st.pending_html_reveal = false;
                     drop(st);
@@ -16154,7 +16260,11 @@ mod tests {
             (MailboxId("a:INBOX".into()), vec![summary(Uid(5), "a:INBOX", 2024, 1, 10, 9)]),
         ]);
         let keys: Vec<(String, u32)> = merge_unified_snapshots(&snapshots).iter().map(|m| (m.mailbox.0.clone(), m.uid.0)).collect();
-        assert_eq!(keys, vec![("a:INBOX".into(), 5), ("z:INBOX".into(), 1)], "equal dates must break on mailbox, not map iteration order");
+        assert_eq!(
+            keys,
+            vec![("a:INBOX".into(), 5), ("z:INBOX".into(), 1)],
+            "equal dates must break on mailbox, not map iteration order"
+        );
     }
 
     /// A minimal `UiState` with one `AccountHandle` per given account (fresh
@@ -16164,10 +16274,12 @@ mod tests {
             .into_iter()
             .map(|(id, folders)| {
                 let (cmd_tx, _cmd_rx) = async_channel::unbounded();
+                let (interactive_cmd_tx, _interactive_cmd_rx) = async_channel::unbounded();
                 (
                     id.clone(),
                     AccountHandle {
                         cmd_tx,
+                        interactive_cmd_tx,
                         email: "a@b.c".into(),
                         display_name: String::new(),
                         imap_host: "imap".into(),
@@ -16236,7 +16348,7 @@ mod tests {
             rendered_remote_scan: None,
             draft_saved_tx: None,
             composer_identities_refresh: None,
-        manage_signatures: None,
+            manage_signatures: None,
             follow_up_status: None,
             follow_up_toggle: None,
             composer_relay_generation: 0,
@@ -16645,7 +16757,11 @@ mod tests {
         let previews = HashMap::from([(Uid(2), "new snippet".to_string())]);
         patch_previews(&state, &message_list, &mailbox, &previews);
 
-        assert_eq!(rendered_preview(&message_list, Uid(2)), Some(Some("new snippet".to_string())), "the patched row must repaint with the new preview");
+        assert_eq!(
+            rendered_preview(&message_list, Uid(2)),
+            Some(Some("new snippet".to_string())),
+            "the patched row must repaint with the new preview"
+        );
         assert_eq!(rendered_preview(&message_list, Uid(1)), Some(None), "an untouched uid must render exactly as before");
 
         let patched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
@@ -16682,7 +16798,11 @@ mod tests {
 
         let previews_for_other = HashMap::from([(Uid(1), "wrong mailbox".to_string())]);
         patch_previews(&state, &message_list, &other_mailbox, &previews_for_other);
-        assert_eq!(rendered_preview(&message_list, Uid(1)), Some(None), "a preview for a different mailbox must not leak onto this uid");
+        assert_eq!(
+            rendered_preview(&message_list, Uid(1)),
+            Some(None),
+            "a preview for a different mailbox must not leak onto this uid"
+        );
     }
 
     /// The depth-0 row for one account group in a freshly built tree.
@@ -16924,7 +17044,11 @@ mod tests {
         let window = dashboard_month_window();
         assert_eq!(window[0], first_of_month(window[0]), "the window is month-normalized");
         for (i, month) in window.iter().enumerate() {
-            assert_eq!(*month, window[0] + chrono::Months::new(i as u32), "the window spans the current month through three months ahead");
+            assert_eq!(
+                *month,
+                window[0] + chrono::Months::new(i as u32),
+                "the window spans the current month through three months ahead"
+            );
         }
         let stale_before = window[0] - chrono::Months::new(1);
         let stale_after = window[3] + chrono::Months::new(1);

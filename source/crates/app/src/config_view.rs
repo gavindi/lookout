@@ -656,7 +656,13 @@ pub fn build() -> ConfigView {
     section_stack.set_hexpand(true);
 
     let mut sections: Vec<(&'static str, &'static str)> = Vec::new();
-    add_section(&section_stack, &mut sections, "Accounts", "accounts", &[&accounts_group, &signatures_group, &mail_group, &goa_group]);
+    add_section(
+        &section_stack,
+        &mut sections,
+        "Accounts",
+        "accounts",
+        &[&accounts_group, &signatures_group, &mail_group, &goa_group],
+    );
     add_section(&section_stack, &mut sections, "Calendar accounts", "calendar-accounts", &[&calendar_group]);
     add_section(&section_stack, &mut sections, "Webcal subscriptions", "webcal", &[&webcal_group]);
     add_section(&section_stack, &mut sections, "Appearance", "appearance", &[&appearance_group]);

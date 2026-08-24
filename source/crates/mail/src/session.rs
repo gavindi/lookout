@@ -75,13 +75,36 @@ const PREVIEW_FETCH_BYTES: u32 = 16384;
 /// prefetch. A batch's `UID FETCH` round trip can't be interrupted once sent,
 /// since the connection is one-command-at-a-time, so this is also the
 /// worst-case delay a user command (a folder switch, an open message) can
-/// queue behind. Was 10 ("a few seconds" per batch by the old target), which
-/// reads as a UI stall; this is small enough to keep each batch close to a
-/// second, still large enough to make real progress across hundreds of
-/// messages. This is the aggressive-off default; Config → Advanced's "Bodies
-/// per batch" ([`PrefetchPolicy::batch_size`]) replaces it when aggressive
-/// prefetch is on.
-const PREFETCH_BATCH_SIZE: usize = 3;
+/// queue behind. One per round trip keeps that worst case to a single body
+/// download - the entire point of the prefetch being cooperative - while
+/// aggressive prefetch lets the user raise it (Config → Advanced's "Bodies
+/// per batch") for faster warm-ups on connections where a click's response
+/// time doesn't matter as much.
+const PREFETCH_BATCH_SIZE: usize = 1;
+
+/// Prefetched messages whose whole raw size exceeds this many bytes are
+/// skipped: a prefetch round trip must never be able to hold the connection
+/// hostage behind one pathological message (a multi-megabyte text part, a
+/// server that ignores section fetches and returns the whole message on the
+/// whole-message fallback path). Such messages stay uncached and fetch on
+/// demand, exactly as if the prefetch had never reached them. The
+/// `RFC822.SIZE` value comes free with the prefetch's envelope pass.
+const PREFETCH_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many of a sync's genuinely-new messages get their bodies fetched
+/// immediately, inline in the sync, so a brand-new email is cached (and the
+/// reading pane opens it instantly) without waiting for the background
+/// prefetch pass to reach it. The newest messages only: the list shows
+/// newest-first, so the top of the folder is what the user actually opens.
+/// The rest of the new set stays uncached and fetches on demand (or joins
+/// the prefetch queue), exactly as before.
+const INLINE_BODY_FETCH_LIMIT: usize = 25;
+
+/// Inline new-email body fetches skip messages whose whole raw size exceeds
+/// this many bytes: caching one giant message must not stretch the sync
+/// itself - the sync is what makes the new email *visible* - so oversized
+/// messages are left to the on-demand path and the (size-capped) prefetch.
+const INLINE_BODY_FETCH_SIZE_CAP: u32 = 2 * 1024 * 1024;
 
 /// How many bytes of sequence-set syntax one `UID`-prefixed command line may
 /// carry before it is split into further commands. Servers cap command-line
@@ -558,14 +581,31 @@ where
     tokio::task::spawn_blocking(move || (*cache).as_ref().map(op)).await.ok().flatten()
 }
 
+/// True when neither the background command queue nor the interactive one
+/// holds anything, so background work (a STATUS drain, a prefetch batch) may
+/// take another round trip. Background work checks this before every round
+/// trip: a user command arriving mid-flight still has to wait out the one
+/// round trip already in hand (the connection is one-command-at-a-time, so
+/// an in-flight command can't be interrupted), but never more than that.
+fn no_commands_pending(commands: &async_channel::Receiver<AccountCommand>, interactive_commands: &async_channel::Receiver<AccountCommand>) -> bool {
+    commands.is_empty() && interactive_commands.is_empty()
+}
+
 /// Runs one account's IMAP connection lifecycle on the calling task (spawn
 /// this onto the shared tokio worker thread - see the crate docs). Reconnects
 /// with backoff on any connection error; re-fetches credentials from
 /// `credentials` on every attempt rather than reusing a possibly-expired one.
+///
+/// `commands` is the *background* queue and `interactive_commands` the
+/// *interactive* one; see [`connect_and_run`] for how the session prioritizes
+/// the latter. The app crate routes user-facing fetches (`FetchBody`,
+/// `FetchAttachment`, `FetchRawMessage`) through the interactive sender so a
+/// message click is never queued behind a sync, search, or move.
 pub async fn run_account_session(
     config: AccountConfig,
     credentials: std::sync::Arc<dyn CredentialProvider>,
     commands: async_channel::Receiver<AccountCommand>,
+    interactive_commands: async_channel::Receiver<AccountCommand>,
     events: async_channel::Sender<AccountEvent>,
 ) {
     let cache: CacheHandle = std::sync::Arc::new(match crate::cache::Cache::open(&config.account_id) {
@@ -645,7 +685,7 @@ pub async fn run_account_session(
 
     loop {
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
-        match connect_and_run(&config, credentials.as_ref(), &commands, &events, &cache, carried_command.take()).await {
+        match connect_and_run(&config, credentials.as_ref(), &commands, &interactive_commands, &events, &cache, carried_command.take()).await {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
                 return;
@@ -675,7 +715,8 @@ pub async fn run_account_session(
         // ...) can't be answered without a session, but must not just vanish
         // either - it's carried into the next `connect_and_run` above rather
         // than dropped, so reconnecting doesn't silently eat the interaction
-        // that was waiting on it.
+        // that was waiting on it. Both channels are raced: an interactive
+        // fetch carries just as faithfully as a background command.
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
             cmd = commands.recv() => {
@@ -686,6 +727,11 @@ pub async fn run_account_session(
                     }
                     Ok(other) => carried_command = Some(other),
                     Err(_) => {}
+                }
+            }
+            cmd = interactive_commands.recv() => {
+                if let Ok(other) = cmd {
+                    carried_command = Some(other);
                 }
             }
         }
@@ -701,6 +747,7 @@ async fn connect_and_run(
     config: &AccountConfig,
     credentials: &dyn CredentialProvider,
     commands: &async_channel::Receiver<AccountCommand>,
+    interactive_commands: &async_channel::Receiver<AccountCommand>,
     events: &async_channel::Sender<AccountEvent>,
     cache: &CacheHandle,
     mut carried_command: Option<AccountCommand>,
@@ -737,7 +784,20 @@ async fn connect_and_run(
 
     let inbox_id = MailboxId::new(&account_id, "INBOX");
     // Fresh session: no mailbox is SELECTed yet, so the sync must select INBOX.
-    sync_mailbox(&mut session, &account_id, "INBOX", &inbox_id, events, cache, &mut folders, None, condstore, qresync).await?;
+    sync_mailbox(
+        &mut session,
+        &account_id,
+        "INBOX",
+        &inbox_id,
+        events,
+        cache,
+        &mut folders,
+        interactive_commands,
+        None,
+        condstore,
+        qresync,
+    )
+    .await?;
 
     // Folders still awaiting their STATUS count, drained cooperatively below.
     // Held as ids rather than indices so a re-list that reorders (or shortens)
@@ -820,97 +880,108 @@ async fn connect_and_run(
         // made a folder click land a beat late while counts were filling in.
         // A command carried over from a previous, failed connection attempt
         // (see `run_account_session`) takes priority over the queue - it's
-        // already the oldest thing waiting to be answered.
+        // already the oldest thing waiting to be answered. The interactive
+        // channel is checked first: user-facing fetches are never made to
+        // wait behind queued background work.
         let wake = match carried_command.take() {
             Some(cmd) => Wake::Command(cmd),
-            None => match commands.try_recv() {
+            None => match interactive_commands.try_recv() {
                 Ok(cmd) => Wake::Command(cmd),
-                Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
-                Err(async_channel::TryRecvError::Empty) => {
-                    let idle_entry_started = std::time::Instant::now();
-                    let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
+                // A closed interactive channel just means no interactive
+                // commands will ever arrive again; the background channel
+                // still drives the session exactly as before.
+                Err(async_channel::TryRecvError::Closed) | Err(async_channel::TryRecvError::Empty) => match commands.try_recv() {
+                    Ok(cmd) => Wake::Command(cmd),
+                    Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
+                    Err(async_channel::TryRecvError::Empty) => {
+                        let idle_entry_started = std::time::Instant::now();
+                        let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
-                    // A cache-served folder switch (or an interrupted prefetch) can
-                    // leave the session SELECTed on a different folder than the one
-                    // the user is viewing. IDLE only reports changes to the
-                    // currently-selected folder, so bring the session back in line
-                    // before the wait. This is a cheap round trip (no FETCH) and is
-                    // skipped whenever the session already matches. Only reached on
-                    // the way *into* IDLE, so a queued command never pays for it -
-                    // its own handler selects whatever folder it needs.
-                    if session_selected != current_mailbox_id {
-                        let meta = session.select(&current_mailbox_name).await?;
-                        session_selected = current_mailbox_id.clone();
-                        // Keep the folder list's `uidvalidity`/`uidnext` fresh so a
-                        // sync that skips its SELECT (the session is already on the
-                        // folder, see `sync_mailbox`) still keys the cache correctly
-                        // instead of falling back to a stale pre-connect value.
-                        if let Some(f) = folders.iter_mut().find(|f| f.id == current_mailbox_id) {
-                            if let Some(v) = meta.uid_validity {
-                                f.uidvalidity = UidValidity(v);
-                            }
-                            if let Some(next) = meta.uid_next {
-                                f.uidnext = next;
-                            }
-                            if let Some(modseq) = meta.highest_modseq {
-                                f.highest_modseq = Some(modseq);
+                        // A cache-served folder switch (or an interrupted prefetch) can
+                        // leave the session SELECTed on a different folder than the one
+                        // the user is viewing. IDLE only reports changes to the
+                        // currently-selected folder, so bring the session back in line
+                        // before the wait. This is a cheap round trip (no FETCH) and is
+                        // skipped whenever the session already matches. Only reached on
+                        // the way *into* IDLE, so a queued command never pays for it -
+                        // its own handler selects whatever folder it needs.
+                        if session_selected != current_mailbox_id {
+                            let meta = session.select(&current_mailbox_name).await?;
+                            session_selected = current_mailbox_id.clone();
+                            // Keep the folder list's `uidvalidity`/`uidnext` fresh so a
+                            // sync that skips its SELECT (the session is already on the
+                            // folder, see `sync_mailbox`) still keys the cache correctly
+                            // instead of falling back to a stale pre-connect value.
+                            if let Some(f) = folders.iter_mut().find(|f| f.id == current_mailbox_id) {
+                                if let Some(v) = meta.uid_validity {
+                                    f.uidvalidity = UidValidity(v);
+                                }
+                                if let Some(next) = meta.uid_next {
+                                    f.uidnext = next;
+                                }
+                                if let Some(modseq) = meta.highest_modseq {
+                                    f.highest_modseq = Some(modseq);
+                                }
                             }
                         }
+
+                        let mut handle = session.idle();
+                        handle.init().await?;
+                        // Aggressive prefetch paces the session with a short IDLE
+                        // slice so batches keep flowing on a quiet session (a
+                        // timeout wake runs the next prefetch batch), and the
+                        // short slice also keeps the periodic re-scan tick alive
+                        // once a pass is done. Otherwise the wait is the usual
+                        // keepalive slice.
+                        let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
+                        let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
+
+                        // Race the IDLE wait against the next command so an on-demand
+                        // request (open a message, switch folders, ...) doesn't wait for
+                        // IDLE_SLICE to elapse. Both channels race the wait: the
+                        // interactive one exists so a user-facing fetch isn't queued
+                        // behind background commands (and vice versa). If a command
+                        // branch wins, `wait_fut` is dropped along with `stop_source`;
+                        // dropping a `StopSource` cancels its associated wait
+                        // immediately (see `stop_token::StopSource`'s docs) - but since
+                        // we're also dropping `wait_fut` itself here, we don't even need
+                        // to observe that cancellation, we just move straight on to
+                        // `handle.done()` below to send IMAP's `DONE` and reclaim the
+                        // session.
+                        let wake = tokio::select! {
+                            r = wait_fut => Wake::Idle(r),
+                            c = interactive_commands.recv() => match c {
+                                Ok(cmd) => Wake::Command(cmd),
+                                Err(_) => Wake::ChannelClosed,
+                            },
+                            c = commands.recv() => match c {
+                                Ok(cmd) => Wake::Command(cmd),
+                                Err(_) => Wake::ChannelClosed,
+                            },
+                        };
+
+                        // How long a command that arrived while we were entering
+                        // IDLE (the SELECT-if-needed above, plus `handle.init()`'s
+                        // own round trip) had to wait before it was even noticed -
+                        // independent of any background prefetch batch, which has
+                        // its own elapsed logging. Not logged for an `Idle`/
+                        // `ChannelClosed` wake since nothing was waiting on those.
+                        if let Wake::Command(_) = &wake {
+                            tracing::debug!(elapsed_ms = idle_entry_started.elapsed().as_millis(), "idle-entry: command noticed after SELECT+IDLE-init");
+                        }
+
+                        // Emit cached messages for instant display the instant a folder
+                        // switch arrives, *before* the IDLE teardown (handle.done().await)
+                        // so the UI paints from disk while we wait for the network round-trip.
+                        if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
+                            emit_cached_messages(cache, mailbox_id, events).await;
+                        }
+
+                        drop(stop_source);
+                        session = handle.done().await?;
+                        wake
                     }
-
-                    let mut handle = session.idle();
-                    handle.init().await?;
-                    // Aggressive prefetch paces the session with a short IDLE
-                    // slice so batches keep flowing on a quiet session (a
-                    // timeout wake runs the next prefetch batch), and the
-                    // short slice also keeps the periodic re-scan tick alive
-                    // once a pass is done. Otherwise the wait is the usual
-                    // keepalive slice.
-                    let slice = if prefetch_policy.aggressive {
-                        prefetch_policy.batch_interval
-                    } else {
-                        IDLE_SLICE
-                    };
-                    let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
-
-                    // Race the IDLE wait against the next command so an on-demand
-                    // request (open a message, switch folders, ...) doesn't wait for
-                    // IDLE_SLICE to elapse. If the command branch wins, `wait_fut` is
-                    // dropped along with `stop_source`; dropping a `StopSource` cancels
-                    // its associated wait immediately (see `stop_token::StopSource`'s
-                    // docs) - but since we're also dropping `wait_fut` itself here, we
-                    // don't even need to observe that cancellation, we just move
-                    // straight on to `handle.done()` below to send IMAP's `DONE` and
-                    // reclaim the session.
-                    let wake = tokio::select! {
-                        r = wait_fut => Wake::Idle(r),
-                        c = commands.recv() => match c {
-                            Ok(cmd) => Wake::Command(cmd),
-                            Err(_) => Wake::ChannelClosed,
-                        },
-                    };
-
-                    // How long a command that arrived while we were entering
-                    // IDLE (the SELECT-if-needed above, plus `handle.init()`'s
-                    // own round trip) had to wait before it was even noticed -
-                    // independent of any background prefetch batch, which has
-                    // its own elapsed logging. Not logged for an `Idle`/
-                    // `ChannelClosed` wake since nothing was waiting on those.
-                    if let Wake::Command(_) = &wake {
-                        tracing::debug!(elapsed_ms = idle_entry_started.elapsed().as_millis(), "idle-entry: command noticed after SELECT+IDLE-init");
-                    }
-
-                    // Emit cached messages for instant display the instant a folder
-                    // switch arrives, *before* the IDLE teardown (handle.done().await)
-                    // so the UI paints from disk while we wait for the network round-trip.
-                    if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
-                        emit_cached_messages(cache, mailbox_id, events).await;
-                    }
-
-                    drop(stop_source);
-                    session = handle.done().await?;
-                    wake
-                }
+                },
             },
         };
 
@@ -936,6 +1007,7 @@ async fn connect_and_run(
                     events,
                     cache,
                     &mut folders,
+                    interactive_commands,
                     Some(&session_selected),
                     condstore,
                     qresync,
@@ -956,8 +1028,25 @@ async fn connect_and_run(
         // requests (`coalesce_fetch_body`) and push back whatever it decided
         // not to coalesce - it needs somewhere to put that back other than
         // the channel itself.
+        //
+        // Interactive commands are drained *ahead of* `pending` and the
+        // background channel: they're user-facing (open a message, fetch an
+        // attachment, export a `.eml`), so a click that landed behind a queue
+        // of syncs, moves, or searches is never made to wait for all of it.
+        // The only work a click still waits on is the one command in flight
+        // when it arrived (the connection is one-command-at-a-time, so an
+        // in-flight round trip can't be interrupted) - and the background
+        // work yields before every round trip (`no_commands_pending`), so
+        // that in-flight command is itself bounded.
         let mut pending: VecDeque<AccountCommand> = woke_on_command.into_iter().collect();
-        while let Some(command) = pending.pop_front().or_else(|| commands.try_recv().ok()) {
+        loop {
+            let command = match interactive_commands.try_recv() {
+                Ok(cmd) => cmd,
+                Err(_) => match pending.pop_front().or_else(|| commands.try_recv().ok()) {
+                    Some(cmd) => cmd,
+                    None => break,
+                },
+            };
             match command {
                 AccountCommand::Shutdown => {
                     let _ = session.logout().await;
@@ -985,6 +1074,7 @@ async fn connect_and_run(
                         events,
                         cache,
                         &mut folders,
+                        interactive_commands,
                         Some(&session_selected),
                         condstore,
                         qresync,
@@ -1050,6 +1140,7 @@ async fn connect_and_run(
                             events,
                             cache,
                             &mut folders,
+                            interactive_commands,
                             Some(&session_selected),
                             condstore,
                             qresync,
@@ -1076,8 +1167,11 @@ async fn connect_and_run(
                     // same mailbox with the same round trip - paging quickly
                     // through several uncached messages queues one per
                     // selection change well before the first one's fetch
-                    // even starts.
-                    let uids = coalesce_fetch_body(&mailbox, uid, &mut pending, commands);
+                    // even starts. Further requests wait on the interactive
+                    // channel, which the drain loop empties ahead of
+                    // background work - that's where every `FetchBody`
+                    // travels.
+                    let uids = coalesce_fetch_body(&mailbox, uid, &mut pending, interactive_commands);
                     if session_selected != mailbox {
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
@@ -1098,7 +1192,13 @@ async fn connect_and_run(
                         "FetchBody: batch ready"
                     );
                     for (uid, body) in bodies {
-                        let _ = events.send(AccountEvent::BodyFetched { mailbox: mailbox.clone(), uid, body }).await;
+                        let _ = events
+                            .send(AccountEvent::BodyFetched {
+                                mailbox: mailbox.clone(),
+                                uid,
+                                body,
+                            })
+                            .await;
                     }
                 }
                 AccountCommand::FetchAttachment { mailbox, uid, part } => {
@@ -1277,7 +1377,7 @@ async fn connect_and_run(
                         session.select(&path).await?;
                         session_selected = mailbox.clone();
                     }
-                    let messages = match search_mailbox(&mut session, &account_id, &mailbox, &query).await {
+                    let messages = match search_mailbox(&mut session, &account_id, &mailbox, &query, interactive_commands).await {
                         Ok(messages) => messages,
                         // A failed search must still complete the app's live
                         // pass (an empty answer), or its "searching" state
@@ -1317,7 +1417,20 @@ async fn connect_and_run(
                                     &mut dirty_mailboxes,
                                 )
                                 .await;
-                                sync_mailbox(&mut session, &account_id, &path, &sent_id, events, cache, &mut folders, Some(&session_selected), condstore, qresync).await?;
+                                sync_mailbox(
+                                    &mut session,
+                                    &account_id,
+                                    &path,
+                                    &sent_id,
+                                    events,
+                                    cache,
+                                    &mut folders,
+                                    interactive_commands,
+                                    Some(&session_selected),
+                                    condstore,
+                                    qresync,
+                                )
+                                .await?;
                                 dirty_mailboxes.remove(&sent_id);
                                 session_selected = sent_id.clone();
                                 if session_selected != current_mailbox_id {
@@ -1338,6 +1451,7 @@ async fn connect_and_run(
                                         events,
                                         cache,
                                         &mut folders,
+                                        interactive_commands,
                                         Some(&session_selected),
                                         condstore,
                                         qresync,
@@ -1400,6 +1514,7 @@ async fn connect_and_run(
                                 events,
                                 cache,
                                 &mut folders,
+                                interactive_commands,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -1484,6 +1599,7 @@ async fn connect_and_run(
                                 events,
                                 cache,
                                 &mut folders,
+                                interactive_commands,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -1551,6 +1667,7 @@ async fn connect_and_run(
                                 events,
                                 cache,
                                 &mut folders,
+                                interactive_commands,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -1623,6 +1740,7 @@ async fn connect_and_run(
                                 events,
                                 cache,
                                 &mut folders,
+                                interactive_commands,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -1687,6 +1805,7 @@ async fn connect_and_run(
                                 events,
                                 cache,
                                 &mut folders,
+                                interactive_commands,
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
@@ -1717,6 +1836,7 @@ async fn connect_and_run(
                         events,
                         cache,
                         &mut folders,
+                        interactive_commands,
                         Some(&session_selected),
                         condstore,
                         qresync,
@@ -1743,6 +1863,7 @@ async fn connect_and_run(
                         events,
                         cache,
                         &mut folders,
+                        interactive_commands,
                         Some(&session_selected),
                         condstore,
                         qresync,
@@ -1801,6 +1922,7 @@ async fn connect_and_run(
                                     events,
                                     cache,
                                     &mut folders,
+                                    interactive_commands,
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
@@ -1886,6 +2008,7 @@ async fn connect_and_run(
                                     events,
                                     cache,
                                     &mut folders,
+                                    interactive_commands,
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
@@ -1981,6 +2104,7 @@ async fn connect_and_run(
                                     events,
                                     cache,
                                     &mut folders,
+                                    interactive_commands,
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
@@ -2033,6 +2157,7 @@ async fn connect_and_run(
                                     events,
                                     cache,
                                     &mut folders,
+                                    interactive_commands,
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
@@ -2061,7 +2186,7 @@ async fn connect_and_run(
         // cheap, whereas re-entering and tearing down IDLE around every few of
         // them cost two extra round trips per batch and kept the session
         // audibly busy for the entire pass - which is what a folder click had
-        // to queue behind. `commands.is_empty()` is checked before every round
+        // to queue behind. `no_commands_pending` is checked before every round
         // trip, so the longest a user action ever waits here is one in-flight
         // STATUS; the queue is resumed on the next iteration exactly where it
         // stopped. Deliberately ahead of the prefetch batch below: counts are
@@ -2070,7 +2195,7 @@ async fn connect_and_run(
         if !counts_pending.is_empty() {
             let mut since_emit = 0usize;
             let mut dirty = false;
-            while commands.is_empty() {
+            while no_commands_pending(commands, interactive_commands) {
                 let Some(mailbox_id) = counts_pending.pop_front() else { break };
                 // The folder may have vanished from a re-list between being
                 // queued and being drained; skip it rather than miscounting.
@@ -2098,6 +2223,7 @@ async fn connect_and_run(
                             events,
                             cache,
                             &mut folders,
+                            interactive_commands,
                             Some(&session_selected),
                             condstore,
                             qresync,
@@ -2156,7 +2282,7 @@ async fn connect_and_run(
                 // Check before starting any batch work (SELECT, envelope
                 // fetch, body fetch) so a rapid stream of user clicks
                 // never waits for even one IMAP round trip.
-                if !commands.is_empty() {
+                if !no_commands_pending(commands, interactive_commands) {
                     continue;
                 }
 
@@ -2180,7 +2306,7 @@ async fn connect_and_run(
                 if !pf.envelopes_fetched {
                     // Check before SELECT to avoid blocking the session if a
                     // user command arrived during the previous body fetch.
-                    if !commands.is_empty() {
+                    if !no_commands_pending(commands, interactive_commands) {
                         continue;
                     }
                     let folder_name = pf.current_folder_name.clone();
@@ -2199,7 +2325,9 @@ async fn connect_and_run(
                     let fetch_from = mailbox_meta.exists.saturating_sub(prefetch_policy.folder_limit.saturating_sub(1)).max(1);
                     let seq_range = format!("{fetch_from}:*");
                     let started = std::time::Instant::now();
-                    let fetches: Vec<_> = session.fetch(&seq_range, "(UID BODYSTRUCTURE)").await?.try_collect().await?;
+                    // `RFC822.SIZE` rides along so the oversized-message
+                    // filter below has a size to compare against.
+                    let fetches: Vec<_> = session.fetch(&seq_range, "(UID RFC822.SIZE BODYSTRUCTURE)").await?.try_collect().await?;
                     let envelope_fetch_elapsed_ms = started.elapsed().as_millis();
 
                     // Collect UIDs, newest first.
@@ -2219,6 +2347,17 @@ async fn connect_and_run(
                     .and_then(|r| r.ok())
                     .unwrap_or_default();
                     uids.retain(|uid| !have.contains(uid));
+
+                    // Skip oversized messages (`RFC822.SIZE` rides free with
+                    // the envelope fetch): one giant message must never hold
+                    // the connection hostage behind a prefetch round trip
+                    // (see `PREFETCH_SIZE_CAP_BYTES`).
+                    let sizes: HashMap<Uid, u64> = fetches.iter().filter_map(|f| f.uid.map(Uid).zip(f.size.map(u64::from))).collect();
+                    let skipped = uids.len();
+                    uids.retain(|uid| sizes.get(uid).is_none_or(|s| *s <= PREFETCH_SIZE_CAP_BYTES));
+                    if skipped != uids.len() {
+                        tracing::debug!(mailbox = %pf.mailboxes[pf.current], oversized = skipped - uids.len(), "prefetch: skipped oversized bodies");
+                    }
 
                     // Remember each still-wanted uid's part structure (only the
                     // per-folder limit's worth) so its body fetch skips
@@ -2252,22 +2391,13 @@ async fn connect_and_run(
                 // raise it.
                 if !pf.pending_uids.is_empty() {
                     // Check before starting the batch fetch.
-                    if !commands.is_empty() {
+                    if !no_commands_pending(commands, interactive_commands) {
                         continue;
                     }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(prefetch_policy.batch_size)).collect();
                     let batch_len = batch.len();
                     let started = std::time::Instant::now();
-                    let fetched = match fetch_bodies_batch(
-                        cache,
-                        &mut session,
-                        &pf.mailboxes[pf.current],
-                        pf.uidvalidity,
-                        &batch,
-                        &pf.structures,
-                    )
-                    .await
-                    {
+                    let fetched = match fetch_bodies_batch(cache, &mut session, &pf.mailboxes[pf.current], pf.uidvalidity, &batch, &pf.structures).await {
                         Ok(bodies) => bodies.len(),
                         Err(e) => {
                             tracing::warn!(?e, "prefetch: batch fetch failed");
@@ -2309,7 +2439,7 @@ async fn connect_and_run(
         // fetch or body fetches). Skip if a user command is pending — the
         // command handler will SELECT the folder it needs, and the top-of-loop
         // check re-selects the user's folder anyway.
-        if did_prefetch_work && commands.is_empty() {
+        if did_prefetch_work && no_commands_pending(commands, interactive_commands) {
             session.select(&current_mailbox_name).await?;
             session_selected = current_mailbox_id.clone();
         }
@@ -2402,7 +2532,15 @@ fn valid_keyword_atom(keyword: &str) -> bool {
 /// Moves `uids` (one or many) from the currently selected mailbox into the
 /// account's mailbox with special-use role `role`, via IMAP MOVE (RFC 6851)
 /// if the server advertises it, else COPY + STORE `\Deleted` + EXPUNGE.
-async fn move_message_to_role(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, uids: &[Uid], role: MailboxRole, has_move: bool, has_uidplus: bool) -> Result<()> {
+async fn move_message_to_role(
+    session: &mut Session<SessionStream>,
+    folders: &[Mailbox],
+    account_id: &AccountId,
+    uids: &[Uid],
+    role: MailboxRole,
+    has_move: bool,
+    has_uidplus: bool,
+) -> Result<()> {
     let Some(target) = folders.iter().find(|m| m.role == role) else {
         return Err(Error::NoSuchFolder(role));
     };
@@ -2892,10 +3030,13 @@ fn queue_folder_counts(folders: &[Mailbox], current: &MailboxId) -> VecDeque<Mai
 /// Preserves arrival order for everything else: the first command that
 /// doesn't coalesce - a different mailbox, or a different command entirely -
 /// is put back on the *front* of `pending` so it's the very next thing the
-/// main loop processes, exactly as if it had never been peeked at.
-fn coalesce_fetch_body(mailbox: &MailboxId, first_uid: Uid, pending: &mut VecDeque<AccountCommand>, commands: &async_channel::Receiver<AccountCommand>) -> Vec<Uid> {
+/// main loop processes, exactly as if it had never been peeked at. `pending`
+/// is checked first, then `interactive_commands` - `FetchBody` only ever
+/// travels on the interactive channel, so that's where the remaining
+/// same-mailbox requests are queued.
+fn coalesce_fetch_body(mailbox: &MailboxId, first_uid: Uid, pending: &mut VecDeque<AccountCommand>, interactive_commands: &async_channel::Receiver<AccountCommand>) -> Vec<Uid> {
     let mut uids = vec![first_uid];
-    while let Some(next) = pending.pop_front().or_else(|| commands.try_recv().ok()) {
+    while let Some(next) = pending.pop_front().or_else(|| interactive_commands.try_recv().ok()) {
         match next {
             AccountCommand::FetchBody { mailbox: m, uid } if &m == mailbox => uids.push(uid),
             other => {
@@ -3091,7 +3232,21 @@ fn imap_quote(s: &str) -> String {
 /// answer; `sync_mailbox`'s whole-folder strategy is not used here because
 /// the server already did the filtering (and re-fetching a whole folder to
 /// filter locally would defeat the fallback's purpose).
-async fn search_mailbox(session: &mut Session<SessionStream>, account_id: &AccountId, mailbox: &MailboxId, query: &str) -> Result<Vec<EmailSummary>> {
+/// Runs the server-side `UID SEARCH TEXT` fallback for `mailbox` and fetches
+/// the matching envelopes. Yields to the interactive command queue between
+/// envelope-fetch chunks: a large match set is many round trips, and the
+/// user can click a message while the search runs (the local FTS results are
+/// already on screen), so the search stops fetching further chunks the moment
+/// an interactive command arrives and returns the partial match set - the UI
+/// merges the answer into its accumulated results, so a partial answer is a
+/// degraded search, never a broken one.
+async fn search_mailbox(
+    session: &mut Session<SessionStream>,
+    account_id: &AccountId,
+    mailbox: &MailboxId,
+    query: &str,
+    interactive_commands: &async_channel::Receiver<AccountCommand>,
+) -> Result<Vec<EmailSummary>> {
     let search_query = format!("TEXT {}", imap_quote(query));
     let uids = session.uid_search(&search_query).await?;
     if uids.is_empty() {
@@ -3104,6 +3259,14 @@ async fn search_mailbox(session: &mut Session<SessionStream>, account_id: &Accou
     uid_list.sort_by_key(|u| u.0);
     let mut fetches: Vec<_> = Vec::new();
     for uid_set in &uid_set_chunks(&uid_list) {
+        // A user-facing fetch arrived mid-search: stop fetching chunks and
+        // hand back what we have - the click wins over the rest of the
+        // match set (the connection is one-command-at-a-time, so the
+        // in-flight chunk still completes, but no further ones start).
+        if !interactive_commands.is_empty() {
+            tracing::debug!(account = %account_id, mailbox = %mailbox, "mailbox search interrupted by interactive command");
+            break;
+        }
         let chunk: Vec<_> = session
             .uid_fetch(uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
             .await?
@@ -3145,13 +3308,7 @@ async fn search_mailbox(session: &mut Session<SessionStream>, account_id: &Accou
 /// responses that accompany any SELECT; they're drained and discarded here -
 /// the folder's actual counts come from the fetch the caller already ran.
 /// Any `Err` means the caller should downgrade to the plain CONDSTORE delta.
-async fn select_with_qresync(
-    session: &mut Session<SessionStream>,
-    folder_path: &str,
-    uidvalidity: UidValidity,
-    modseq: u64,
-    known_set: &str,
-) -> Result<HashSet<Uid>> {
+async fn select_with_qresync(session: &mut Session<SessionStream>, folder_path: &str, uidvalidity: UidValidity, modseq: u64, known_set: &str) -> Result<HashSet<Uid>> {
     // `SELECT` goes through `run_command` rather than `Session::select` -
     // async-imap's select only supports the `(CONDSTORE)` parameter, and
     // QRESYNC's expunge reporting is exactly what this session needs. The
@@ -3195,6 +3352,7 @@ async fn sync_mailbox(
     events: &async_channel::Sender<AccountEvent>,
     cache: &CacheHandle,
     folders: &mut Vec<Mailbox>,
+    interactive_commands: &async_channel::Receiver<AccountCommand>,
     session_selected: Option<&MailboxId>,
     condstore: bool,
     qresync: bool,
@@ -3418,11 +3576,7 @@ async fn sync_mailbox(
     // the cache (an expunge paired with an arrival keeps the count, so the
     // Message-ID mapping below catches that case), and every message's
     // Message-ID still matching its cached value.
-    let keys_are_stable = new_uids.is_empty()
-        && messages.len() == cached.len()
-        && messages
-            .iter()
-            .all(|m| cached.get(&m.uid).is_some_and(|c| c.message_id == m.message_id));
+    let keys_are_stable = new_uids.is_empty() && messages.len() == cached.len() && messages.iter().all(|m| cached.get(&m.uid).is_some_and(|c| c.message_id == m.message_id));
     if !keys_are_stable {
         let keys = lookout_core::thread::compute_thread_keys(&messages);
         for msg in &mut messages {
@@ -3449,10 +3603,90 @@ async fn sync_mailbox(
     let total = messages.len() as u32;
     let unread = messages.iter().filter(|m| m.is_unread()).count() as u32;
 
-    // Phase two: fill in the snippets this sync is still missing, then patch
+    // Phase two: cache the sync's genuinely-new messages' bodies immediately.
+    // The envelope pass already learned each new uid's `BODYSTRUCTURE`, so
+    // this is one `UID FETCH` of text parts via `fetch_bodies_batch` - the
+    // same round trip the old path would have spent on a separate preview
+    // fetch, since the derived previews below let `fetch_previews` skip these
+    // messages. A brand-new email is therefore cached (and its opening is
+    // instant) one round trip after it appears, instead of whenever the
+    // background prefetch pass happens to reach this folder. Bounded: only
+    // the newest `INLINE_BODY_FETCH_LIMIT`, only under the size cap, and
+    // skipped entirely when any user command is queued (the click wins; the
+    // message then fetches on demand). Best-effort like previews: a failure
+    // leaves the message uncached, never breaks the sync.
+    if !new_uids.is_empty() && interactive_commands.is_empty() {
+        // Newest first - the top of the list is what the user opens.
+        let mut candidates: Vec<(Uid, u32)> = messages.iter().filter(|m| new_uids.contains(&m.uid)).map(|m| (m.uid, m.size)).collect();
+        candidates.sort_by_key(|(uid, _)| std::cmp::Reverse(uid.0));
+        let inline_uids: Vec<Uid> = candidates
+            .into_iter()
+            .filter(|(_, size)| *size <= INLINE_BODY_FETCH_SIZE_CAP)
+            .take(INLINE_BODY_FETCH_LIMIT)
+            .map(|(uid, _)| uid)
+            .collect();
+        if !inline_uids.is_empty() {
+            let mut structures: HashMap<Uid, Vec<BodyPart>> = HashMap::new();
+            for msg in messages.iter().filter(|m| inline_uids.contains(&m.uid)) {
+                if let Some(parts) = &msg.structure {
+                    structures.insert(msg.uid, parts.clone());
+                }
+            }
+            match fetch_bodies_batch(cache, session, mailbox_id, uidvalidity, &inline_uids, &structures).await {
+                Ok(bodies) => {
+                    let mut previews_from_bodies: HashMap<Uid, String> = HashMap::new();
+                    for (uid, body) in &bodies {
+                        // Warms the reading pane's in-memory body cache, so a
+                        // click on the just-arrived message renders without
+                        // any session round trip.
+                        let _ = events
+                            .send(AccountEvent::BodyFetched {
+                                mailbox: mailbox_id.clone(),
+                                uid: *uid,
+                                body: body.clone(),
+                            })
+                            .await;
+                        if let Some(preview) = crate::body::preview_from_body(body) {
+                            previews_from_bodies.insert(*uid, preview);
+                        }
+                    }
+                    if !previews_from_bodies.is_empty() {
+                        // Patch the in-memory summaries so the preview pass
+                        // below skips these uids, then persist and emit the
+                        // derived previews exactly as `fetch_previews` would.
+                        for msg in messages.iter_mut() {
+                            if let Some(p) = previews_from_bodies.get(&msg.uid) {
+                                msg.preview = Some(p.clone());
+                            }
+                        }
+                        if let Some(Err(e)) = cache_op(cache, {
+                            let mailbox_id = mailbox_id.clone();
+                            let previews = previews_from_bodies.clone();
+                            move |c| c.update_previews(&mailbox_id, &previews)
+                        })
+                        .await
+                        {
+                            tracing::warn!("failed to cache new-message previews for {mailbox_id}: {e}");
+                        }
+                        let _ = events
+                            .send(AccountEvent::PreviewsFetched {
+                                mailbox: mailbox_id.clone(),
+                                previews: previews_from_bodies,
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => tracing::warn!(?mailbox_id, count = inline_uids.len(), "inline body fetch for new messages failed: {e}"),
+            }
+        }
+    }
+
+    // Phase three: fill in the snippets this sync is still missing, then patch
     // them in as a narrow `PreviewsFetched` event. Deliberately *after* the
     // first emit - the list paints at the envelope fetch's latency, and
-    // previews arrive a beat later rather than holding up first paint.
+    // previews arrive a beat later rather than holding up first paint. New
+    // uids whose bodies were fetched above already carry a derived preview,
+    // so they're skipped here.
     if let Err(e) = fetch_previews(session, mailbox_id, &messages, events, cache).await {
         // Never propagated: this function's caller tears the connection down
         // on `Err`, and a malformed message or a server that dislikes partial
@@ -4035,7 +4269,8 @@ async fn fetch_bodies_on_demand(
 /// via `transfer_part_bytes`). An embedded `message/rfc822` attachment is
 /// returned whole, not re-parsed. Returns `None` if the server didn't return
 /// the section (rather than erroring), so the caller can no-op gracefully.
-async fn fetch_attachment_part(session: &mut Session<SessionStream>, uid: Uid, part: &BodyPart) -> Result<Option<Vec<u8>>> {    // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part` the
+async fn fetch_attachment_part(session: &mut Session<SessionStream>, uid: Uid, part: &BodyPart) -> Result<Option<Vec<u8>>> {
+    // `BODY.PEEK[1.2]` parses back into the same `SectionPath::Part` the
     // server's response carries, exactly as `fetch_body_partial` relies on.
     let path = part_section_path(&part.part_number);
     let query = format!("(BODY.PEEK[{}])", part.part_number);
@@ -4218,13 +4453,28 @@ mod tests {
         let (tx, rx) = async_channel::unbounded();
         // Already sitting in the channel: two more same-mailbox requests,
         // then a different mailbox's request that must stop the coalesce.
-        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(2) }).unwrap();
-        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(3) }).unwrap();
-        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_b.clone(), uid: Uid(9) }).unwrap();
+        tx.send_blocking(AccountCommand::FetchBody {
+            mailbox: mailbox_a.clone(),
+            uid: Uid(2),
+        })
+        .unwrap();
+        tx.send_blocking(AccountCommand::FetchBody {
+            mailbox: mailbox_a.clone(),
+            uid: Uid(3),
+        })
+        .unwrap();
+        tx.send_blocking(AccountCommand::FetchBody {
+            mailbox: mailbox_b.clone(),
+            uid: Uid(9),
+        })
+        .unwrap();
 
         // Already sitting in `pending`, as if peeked by an earlier call and
         // not consumed - must drain before the channel is even touched.
-        let mut pending: VecDeque<AccountCommand> = VecDeque::from([AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(1) }]);
+        let mut pending: VecDeque<AccountCommand> = VecDeque::from([AccountCommand::FetchBody {
+            mailbox: mailbox_a.clone(),
+            uid: Uid(1),
+        }]);
 
         let uids = coalesce_fetch_body(&mailbox_a, Uid(0), &mut pending, &rx);
         assert_eq!(uids, vec![Uid(0), Uid(1), Uid(2), Uid(3)], "pending drains before the channel, both in arrival order");
@@ -4245,9 +4495,17 @@ mod tests {
         let mailbox_a = MailboxId::new(&account, "INBOX");
 
         let (tx, rx) = async_channel::unbounded();
-        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(2) }).unwrap();
+        tx.send_blocking(AccountCommand::FetchBody {
+            mailbox: mailbox_a.clone(),
+            uid: Uid(2),
+        })
+        .unwrap();
         tx.send_blocking(AccountCommand::Refresh).unwrap();
-        tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox_a.clone(), uid: Uid(3) }).unwrap();
+        tx.send_blocking(AccountCommand::FetchBody {
+            mailbox: mailbox_a.clone(),
+            uid: Uid(3),
+        })
+        .unwrap();
 
         let mut pending: VecDeque<AccountCommand> = VecDeque::new();
         let uids = coalesce_fetch_body(&mailbox_a, Uid(1), &mut pending, &rx);
@@ -4255,7 +4513,10 @@ mod tests {
 
         assert!(matches!(pending.front(), Some(AccountCommand::Refresh)), "the stopping command is put back at the front");
         assert_eq!(pending.len(), 1);
-        assert!(matches!(rx.try_recv(), Ok(AccountCommand::FetchBody { uid, .. }) if uid == Uid(3)), "the channel's remaining item is untouched");
+        assert!(
+            matches!(rx.try_recv(), Ok(AccountCommand::FetchBody { uid, .. }) if uid == Uid(3)),
+            "the channel's remaining item is untouched"
+        );
     }
 
     fn summary(uid: u32, mailbox: &MailboxId, seen: bool) -> EmailSummary {

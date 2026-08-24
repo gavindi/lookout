@@ -188,7 +188,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(PREFETCH_AGGRESSIVE, Value::Bool(false));
     map.insert(PREFETCH_BATCH_INTERVAL_SECONDS, Value::Int(30));
     map.insert(PREFETCH_FOLDER_LIMIT, Value::Int(200));
-    map.insert(PREFETCH_BATCH_SIZE, Value::Int(3));
+    map.insert(PREFETCH_BATCH_SIZE, Value::Int(1));
     map.insert(PREFETCH_REFRESH_INTERVAL_MINUTES, Value::Int(60));
     map
 }
@@ -420,13 +420,13 @@ mod tests {
         let off = store.prefetch_policy();
         assert!(!off.aggressive);
         assert_eq!(off.folder_limit, 200);
-        assert_eq!(off.batch_size, 3);
+        assert_eq!(off.batch_size, 1);
         store.set_bool(PREFETCH_AGGRESSIVE, true);
         let on = store.prefetch_policy();
         assert!(on.aggressive);
         assert_eq!(on.batch_interval, std::time::Duration::from_secs(30));
         assert_eq!(on.folder_limit, 200);
-        assert_eq!(on.batch_size, 3);
+        assert_eq!(on.batch_size, 1);
         assert_eq!(on.refresh_interval, std::time::Duration::from_secs(60 * 60));
         store.set_int(PREFETCH_BATCH_INTERVAL_SECONDS, 10);
         store.set_int(PREFETCH_FOLDER_LIMIT, 500);
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(store.get_string(LAYOUT_SPACING), "medium");
         assert_eq!(store.get_int(PREFETCH_BATCH_INTERVAL_SECONDS), 30);
         assert_eq!(store.get_int(PREFETCH_FOLDER_LIMIT), 200);
-        assert_eq!(store.get_int(PREFETCH_BATCH_SIZE), 3);
+        assert_eq!(store.get_int(PREFETCH_BATCH_SIZE), 1);
         assert_eq!(store.get_int(PREFETCH_REFRESH_INTERVAL_MINUTES), 60);
         assert!(!store.get_bool(PREFETCH_AGGRESSIVE));
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());

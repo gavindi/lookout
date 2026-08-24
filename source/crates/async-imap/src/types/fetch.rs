@@ -1,9 +1,7 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, FixedOffset};
-use imap_proto::types::{
-    AttributeValue, BodyStructure, Envelope, MessageSection, Response, SectionPath,
-};
+use imap_proto::types::{AttributeValue, BodyStructure, Envelope, MessageSection, Response, SectionPath};
 
 use super::{Flag, Seq, Uid};
 use crate::types::ResponseData;
@@ -40,24 +38,23 @@ pub struct Fetch {
 
 impl Fetch {
     pub(crate) fn new(response: ResponseData) -> Self {
-        let (message, uid, size, modseq) =
-            if let Response::Fetch(message, attrs) = response.parsed() {
-                let mut uid = None;
-                let mut size = None;
-                let mut modseq = None;
+        let (message, uid, size, modseq) = if let Response::Fetch(message, attrs) = response.parsed() {
+            let mut uid = None;
+            let mut size = None;
+            let mut modseq = None;
 
-                for attr in attrs {
-                    match attr {
-                        AttributeValue::Uid(id) => uid = Some(*id),
-                        AttributeValue::Rfc822Size(sz) => size = Some(*sz),
-                        AttributeValue::ModSeq(ms) => modseq = Some(*ms),
-                        _ => {}
-                    }
+            for attr in attrs {
+                match attr {
+                    AttributeValue::Uid(id) => uid = Some(*id),
+                    AttributeValue::Rfc822Size(sz) => size = Some(*sz),
+                    AttributeValue::ModSeq(ms) => modseq = Some(*ms),
+                    _ => {}
                 }
-                (*message, uid, size, modseq)
-            } else {
-                unreachable!()
-            };
+            }
+            (*message, uid, size, modseq)
+        } else {
+            unreachable!()
+        };
 
         Fetch {
             response,
@@ -74,9 +71,7 @@ impl Fetch {
             attrs
                 .iter()
                 .filter_map(|attr| match attr {
-                    AttributeValue::Flags(raw_flags) => {
-                        Some(raw_flags.iter().map(|s| Flag::from(s.as_ref())))
-                    }
+                    AttributeValue::Flags(raw_flags) => Some(raw_flags.iter().map(|s| Flag::from(s.as_ref()))),
                     _ => None,
                 })
                 .flatten()
@@ -115,9 +110,7 @@ impl Fetch {
                 .iter()
                 .filter_map(|av| match av {
                     AttributeValue::BodySection {
-                        section: None,
-                        data: Some(body),
-                        ..
+                        section: None, data: Some(body), ..
                     }
                     | AttributeValue::Rfc822(Some(body)) => Some(body.as_ref()),
                     _ => None,

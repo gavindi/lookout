@@ -26,11 +26,7 @@ pub struct InnerName<'a> {
 impl Name {
     pub(crate) fn from_mailbox_data(resp: ResponseData) -> Self {
         Name::new(Box::new(resp), |response| match response.parsed() {
-            Response::MailboxData(MailboxDatum::List {
-                name_attributes,
-                delimiter,
-                name,
-            }) => InnerName {
+            Response::MailboxData(MailboxDatum::List { name_attributes, delimiter, name }) => InnerName {
                 attributes: name_attributes.to_owned(),
                 delimiter: delimiter.as_deref(),
                 name,

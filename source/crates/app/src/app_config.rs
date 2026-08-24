@@ -394,10 +394,7 @@ mod tests {
         save_at(&path, &config);
         let loaded = load_at(&path);
         assert_eq!(loaded.signature_defaults.len(), 1);
-        assert_eq!(
-            loaded.signature_defaults[&AccountId("account_1".into())].new,
-            Some(signature.id)
-        );
+        assert_eq!(loaded.signature_defaults[&AccountId("account_1".into())].new, Some(signature.id));
         assert_eq!(loaded.signature_defaults[&AccountId("account_1".into())].reply, Some(signature.id));
 
         let _ = std::fs::remove_dir_all(&dir);

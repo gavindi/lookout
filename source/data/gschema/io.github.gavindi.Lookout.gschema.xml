@@ -187,7 +187,7 @@
     </key>
     <key name="prefetch-batch-size" type="i">
       <range min="1" max="100"/>
-      <default>3</default>
+      <default>1</default>
       <summary>Message bodies per prefetch batch</summary>
       <description>How many message bodies each prefetch round trip downloads. Larger batches download faster but each one is a round trip a user command can queue behind.</description>
     </key>

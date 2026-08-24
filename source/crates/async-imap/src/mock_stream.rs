@@ -46,11 +46,7 @@ impl MockStream {
 
 #[cfg(feature = "runtime-tokio")]
 impl Read for MockStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<Result<()>> {
         if self.eof_on_read {
             return Poll::Ready(Ok(()));
         }
@@ -74,11 +70,7 @@ impl Read for MockStream {
 
 #[cfg(feature = "runtime-tokio")]
 impl Write for MockStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
         self.written_buf.extend_from_slice(buf);
         Poll::Ready(Ok(buf.len()))
     }
@@ -94,11 +86,7 @@ impl Write for MockStream {
 
 #[cfg(feature = "runtime-async-std")]
 impl Read for MockStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize>> {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize>> {
         if self.eof_on_read {
             return Poll::Ready(Ok(0));
         }
@@ -124,11 +112,7 @@ impl Read for MockStream {
 
 #[cfg(feature = "runtime-async-std")]
 impl Write for MockStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
         self.written_buf.extend_from_slice(buf);
         Poll::Ready(Ok(buf.len()))
     }
