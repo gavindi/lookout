@@ -19,7 +19,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use gtk::glib;
 use zbus::zvariant::{OwnedValue, Value};
@@ -78,76 +78,78 @@ fn update_vardict(count: u32) -> HashMap<String, OwnedValue> {
     properties
 }
 
-/// The persistent session-bus connection the badge is emitted on, plus the
-/// last count sent so repeated identical updates stay no-ops. The
-/// connection must outlive the badge itself: the dock resets an entry the
-/// moment its sender's unique bus name disappears, so a fresh connection
-/// per update would flicker the badge (or clear it outright) instead of
-/// painting it.
-struct BadgeEntry {
-    connection: zbus::Connection,
-    last: Mutex<Option<u32>>,
-}
+/// The outbound queue of badge counts. `set_unread_count` sends the latest
+/// count here from the UI thread (in call order); the single consumer task
+/// `init` spawned drains it in order and emits each on the session bus. The
+/// consumer dedupes, so only a count that actually differs is emitted, and
+/// because the drain is strictly FIFO the badge always lands on the *last*
+/// count the window published - a burst of rapid updates can't leave a stale
+/// one painted last.
+static TX: OnceLock<async_channel::Sender<u32>> = OnceLock::new();
 
-static BADGE: OnceLock<BadgeEntry> = OnceLock::new();
-
-/// The worker's tokio handle, handed in once at startup (see `init`). zbus
-/// needs a Tokio reactor to build and drive a session connection, and the
-/// app's one tokio runtime lives on the worker thread (`worker.rs`) - the
-/// GLib main context the UI runs on has none, so the emissions must be
-/// spawned here or zbus aborts the task ("there is no reactor running").
-static TOKIO: OnceLock<tokio::runtime::Handle> = OnceLock::new();
-
-/// Hands `worker`'s tokio handle to the badge machinery. Called once at
-/// startup, before any window code can publish a count; without it
-/// `set_unread_count` is a silent no-op (the `rebuild_folder_tree` tests
-/// exercise `publish_dock_badge` without ever touching a bus).
+/// Hands `worker`'s tokio handle to the badge machinery and starts the one
+/// consumer task that owns the session-bus connection and every emission.
+/// Called once at startup, before any window code can publish a count;
+/// without it `set_unread_count` is a silent no-op (the `rebuild_folder_tree`
+/// tests exercise `refresh_unread_indicators` without ever touching a bus).
 pub fn init(worker: &crate::worker::Worker) {
-    let _ = TOKIO.set(worker.handle());
+    let (tx, rx) = async_channel::unbounded();
+    let _ = TX.set(tx);
+    worker.spawn(async move {
+        badge_loop(rx).await;
+    });
 }
 
-/// Emits the dock badge for `count` (the summed Inbox unread count) - or
-/// hides it for zero. Fire-and-forget on the worker's tokio runtime: a
-/// session bus with no Unity-protocol listener (plain GNOME Shell, KDE, no
-/// bus at all) just logs at `debug!`. Safe to call from anywhere on the UI
-/// thread; the first call opens the one connection every later update
-/// reuses.
-pub fn set_unread_count(count: u32) {
-    let Some(handle) = TOKIO.get() else { return };
-    handle.spawn(async move {
-        if BADGE.get().is_none() {
-            let Ok(connection) = zbus::Connection::session().await else { return };
-            let _ = BADGE.set(BadgeEntry {
-                connection,
-                last: Mutex::new(None),
-            });
-        }
-        let Some(badge) = BADGE.get() else { return };
-
-        let vardict = update_vardict(count);
-        // Record the attempt before the awaits so a concurrent update with
-        // the same count stays a no-op.
-        {
-            let mut last = badge.last.lock().unwrap();
-            if *last == Some(count) {
-                return;
+/// Drains `rx` in order, emitting each count on the session bus exactly once
+/// per change. Runs on the worker's tokio runtime - zbus needs a reactor, and
+/// the GLib main context the UI runs on has none, so the emissions must live
+/// here. Only the latest count matters (the dock paints the badge from the
+/// last signal it saw), so the loop is the single point where ordering is
+/// guaranteed: each count is fully emitted before the next is read, and a
+/// failed emission leaves `last` unset so the next queued count retries it.
+async fn badge_loop(rx: async_channel::Receiver<u32>) {
+    let mut last: Option<u32> = None;
+    let mut connection: Option<zbus::Connection> = None;
+    while let Ok(count) = rx.recv().await {
+        if connection.is_none() {
+            match zbus::Connection::session().await {
+                Ok(c) => connection = Some(c),
+                Err(e) => {
+                    tracing::debug!("dock badge: no session bus, deferring count {count}: {e}");
+                    continue;
+                }
             }
-            *last = Some(count);
         }
+        let vardict = update_vardict(count);
+        if last == Some(count) {
+            continue;
+        }
+        let mut sent = true;
         for app_uri in candidate_app_uris() {
-            if let Err(e) = badge
-                .connection
+            let conn = connection.as_ref().expect("connection established above");
+            if let Err(e) = conn
                 .emit_signal(None::<&str>, ENTRY_PATH, "com.canonical.Unity.LauncherEntry", "Update", &(app_uri.clone(), vardict.clone()))
                 .await
             {
                 tracing::debug!("dock badge update for {app_uri} failed: {e}");
-                // Leave the slot unrecorded so the next update with this
-                // same count retries the emission.
-                *badge.last.lock().unwrap() = None;
-                return;
+                sent = false;
+                break;
             }
         }
-    });
+        if sent {
+            last = Some(count);
+        }
+    }
+}
+
+/// Emits the dock badge for `count` (the summed Inbox unread count) - or
+/// hides it for zero. Safe to call from the UI thread; the count is queued
+/// and the consumer task (see `init`) emits it in order on the worker's
+/// tokio runtime. A session bus with no Unity-protocol listener (plain GNOME
+/// Shell, KDE, no bus at all) just logs at `debug!`.
+pub fn set_unread_count(count: u32) {
+    let Some(tx) = TX.get() else { return };
+    let _ = tx.try_send(count);
 }
 
 #[cfg(test)]

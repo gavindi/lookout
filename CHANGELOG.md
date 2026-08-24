@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.107 (2026-08-24)
+
+### Fixed
+
+- **App**: the dock badge's unread count could get stuck at a stale value - on the report it sat at "1" (via `count-visible`) after the last message was read, while the tray icon's count had correctly dropped to nothing, even though both indicators are fed from the same `refresh_unread_indicators` computation. `launcher_entry::set_unread_count` spawned a fresh async task per update onto the `Worker`'s *multi-threaded* tokio runtime, and each task independently did its dedup check and its `emit_signal` calls with awaits in between - so two near-simultaneous updates (a burst of `FoldersUpdated` events while reading) could interleave, and the *older* count's signal could land on the bus *after* the newer one. The dock paints the badge from the last signal it saw, so it ended up showing the stale count; the tray wasn't affected because it dedupes synchronously on the UI thread before spawning. `launcher_entry` now routes every count through a single unbounded FIFO channel drained by one consumer task (`badge_loop`, spawned once by `init`), which owns the session-bus connection and every emission - counts are processed strictly in call order, so the badge always lands on the last count the window published, and a failed emission leaves the dedup slot unset so a later update retries instead of being swallowed. `set_unread_count` just queues the count (a silent no-op before `init`, exactly as before for the unit tests); the persistent-connection, `count-visible`-at-zero, and multi-desktop-file-id behavior are unchanged.
+
+### Testing
+
+- `lookout-app`: the `launcher_entry` tests (candidate desktop-file ids, the `count`/`count-visible` vardict at non-zero and zero) are unchanged and pass. The full suite (255 tests) passes.
+
 ## 0.9.106 (2026-08-24)
 
 ### Fixed
