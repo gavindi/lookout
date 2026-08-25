@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.111" date="2026-08-25">
+      <description>
+        <p>The AI Chat card's empty-state robot glyph now loads through the app's standard asset pipeline - a bundled SVG resource (ai-1.svg) with the usual embedded fallback - instead of being embedded in code, so the artwork is editable as a file.</p>
+      </description>
+    </release>
     <release version="0.9.110" date="2026-08-25">
       <description>
         <p>The Lookout dashboard's AI Chat card talks to the configured assistant with real data: it answers from the app's own emails, contacts, and tasks through five function-calling tools (recent mail, full-text search, most-contacted people, address-book contacts, and tasks from every source), and renders its replies as formatted HTML - markdown headings, bold, lists, code, links, tables, and embedded graphics like inline SVG - in a read-only, script-free WebView with a transparent background over the dashboard. The layout shifts too: outstanding tasks move to the right column, People most contacted shows five rows instead of eight, and the AI Chat card fills its column's full height.</p>

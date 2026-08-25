@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
     <gresource prefix="/io/github/gavindi/Lookout">
+        <file alias="icons/ai-1.svg">resources/icons/ai-1.svg</file>
         <file alias="icons/calendar-1.svg">resources/icons/calendar-1.svg</file>
         <file alias="icons/contact-1.svg">resources/icons/contact-1.svg</file>
         <file alias="icons/email-1.svg">resources/icons/email-1.svg</file>

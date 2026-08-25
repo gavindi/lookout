@@ -76,10 +76,11 @@ mod tests {
             .lookup_data("/io/github/gavindi/Lookout/icons/email-1.svg", gio::ResourceLookupFlags::NONE)
             .expect("nav-rail icon should be in the bundle");
         assert!(!bytes.is_empty());
-        // The pop-out/pop-in window buttons' icons, and the Pin/Unpin
-        // toggle's filled/outline pair, ride along in the same bundle, so
-        // `themed_icon_name` resolves them as plain icon names.
-        for name in ["popin1.svg", "popout1.svg", "pinned-1.svg", "unpinned-1.svg"] {
+        // The pop-out/pop-in window buttons' icons, the Pin/Unpin
+        // toggle's filled/outline pair, and the AI Chat card's empty-state
+        // robot ride along in the same bundle, so `themed_icon_name`
+        // resolves them as plain icon names.
+        for name in ["popin1.svg", "popout1.svg", "pinned-1.svg", "unpinned-1.svg", "ai-1.svg"] {
             let path = format!("/io/github/gavindi/Lookout/icons/{name}");
             let bytes = match resource.lookup_data(&path, gio::ResourceLookupFlags::NONE) {
                 Ok(bytes) => bytes,
