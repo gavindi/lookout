@@ -7176,8 +7176,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let prompt = chat_entry.text().trim().to_string();
             let prompt = if prompt.is_empty() { "Summarize my inbox".to_string() } else { prompt };
             chat_button.set_sensitive(false);
-            let placeholder = crate::lookout_view::chat_reply_html("Asking the assistant…");
-            chat_output.load_html(&crate::lookout_view::chat_document(&placeholder), None);
+            chat_output.load_html(&crate::lookout_view::chat_loading_document(), None);
             let context = {
                 // The upcoming-occurrences union the dashboard's own
                 // "Upcoming events" card reads from (`window.rs`'s
@@ -7216,12 +7215,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let chat_button = chat_button.clone();
             glib::spawn_future_local(async move {
                 let Ok(result) = result_rx.recv().await else { return };
-                let label = match result {
-                    Ok(reply) => reply,
-                    Err(e) => format!("Failed: {e}"),
+                let document = match result {
+                    Ok(reply) => crate::lookout_view::chat_document(&crate::lookout_view::chat_reply_html(&reply)),
+                    Err(e) => crate::lookout_view::chat_error_document(&e),
                 };
-                let html = crate::lookout_view::chat_reply_html(&label);
-                chat_output.load_html(&crate::lookout_view::chat_document(&html), None);
+                chat_output.load_html(&document, None);
                 chat_button.set_sensitive(true);
             });
         });

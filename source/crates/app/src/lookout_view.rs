@@ -604,17 +604,74 @@ pub fn chat_empty_document() -> String {
     chat_document(&fragment)
 }
 
-/// The robot glyph's SVG source, through the app's asset pipeline: the
-/// compiled GResource's `ai-1.svg` when the bundle is registered (the
+/// The document shown in the chat view while a question is in flight: the
+/// same robot glyph as the idle state (`chat_empty_document`), lightened
+/// the same `invert(1)` way, but pulsing - a soft opacity fade in and out -
+/// instead of sitting static at a fixed 60%, so there's a visible sign of
+/// life for however long the configured assistant takes to answer. No
+/// placeholder text, matching the idle state's icon-only look; the reply
+/// (or [`chat_error_document`] on failure) replaces this document.
+pub fn chat_loading_document() -> String {
+    let svg = chat_empty_svg();
+    let fragment = format!(
+        "<style>\
+         body {{ margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100%; }}\
+         .chat-loading-icon {{ width: 88px; height: 88px; }}\
+         .chat-loading-icon svg {{ width: 88px; height: 88px; filter: invert(1); animation: chat-icon-pulse 1.4s ease-in-out infinite; }}\
+         @keyframes chat-icon-pulse {{ 0%, 100% {{ opacity: 0.2; }} 50% {{ opacity: 0.6; }} }}\
+         </style>\
+         <div class=\"chat-loading-icon\">{svg}</div>"
+    );
+    chat_document(&fragment)
+}
+
+/// The document shown when a question fails: the robot glyph recolored to
+/// the app's standard error red (`#e01b24` - the same GNOME red used
+/// elsewhere for tags, calendar colors, and the tray badge), with the error
+/// text underneath so the failure stays diagnosable (a bad URL, an expired
+/// token, the model rejecting the request, ...) instead of just a mute red
+/// icon.
+///
+/// Recoloring goes through a CSS mask rather than the idle/loading states'
+/// `filter: invert(1)`: a `filter` can only rotate/invert the artwork's
+/// *existing* colors, which gets you *a* different color but not
+/// necessarily *this exact* one, whereas masking a solid `background-color`
+/// through the artwork's alpha channel (via [`chat_icon_data_uri`]) matches
+/// the target hex exactly regardless of the SVG's own stroke colors.
+pub fn chat_error_document(message: &str) -> String {
+    let icon_uri = chat_icon_data_uri();
+    let fragment = format!(
+        "<style>\
+         body {{ margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; \
+         min-height: 100%; gap: 12px; text-align: center; padding: 12px; box-sizing: border-box; }}\
+         .chat-error-icon {{ width: 88px; height: 88px; flex-shrink: 0; background-color: #e01b24; \
+         -webkit-mask-image: url(\"{icon_uri}\"); -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; -webkit-mask-size: contain; \
+         mask-image: url(\"{icon_uri}\"); mask-repeat: no-repeat; mask-position: center; mask-size: contain; }}\
+         .chat-error-message {{ margin: 0; font-size: 0.95em; }}\
+         </style>\
+         <div class=\"chat-error-icon\"></div>\
+         <p class=\"chat-error-message\">{}</p>",
+        escape_html(message)
+    );
+    chat_document(&fragment)
+}
+
+/// The robot glyph artwork's raw bytes, through the app's asset pipeline:
+/// the compiled GResource's `ai-1.svg` when the bundle is registered (the
 /// normal runtime path, see `resources::register`), otherwise the
 /// compile-time `include_bytes!` copy - the same convention as
 /// `window::svg_image`'s fallback for builds whose bundle couldn't be
-/// compiled. The leading XML declaration is stripped so the artwork embeds
-/// cleanly as an inline element of the HTML document.
-fn chat_empty_svg() -> String {
-    let bytes = crate::resources::bytes("/io/github/gavindi/Lookout/icons/ai-1.svg")
+/// compiled.
+fn chat_icon_bytes() -> Vec<u8> {
+    crate::resources::bytes("/io/github/gavindi/Lookout/icons/ai-1.svg")
         .map(|bytes| bytes.to_vec())
-        .unwrap_or_else(|| include_bytes!("../../../data/resources/icons/ai-1.svg").to_vec());
+        .unwrap_or_else(|| include_bytes!("../../../data/resources/icons/ai-1.svg").to_vec())
+}
+
+/// [`chat_icon_bytes`] with its leading XML declaration stripped, so it
+/// embeds cleanly as an inline element of the HTML document.
+fn chat_empty_svg() -> String {
+    let bytes = chat_icon_bytes();
     let source = String::from_utf8_lossy(&bytes);
     let trimmed = source.trim_start();
     let body = trimmed
@@ -622,6 +679,13 @@ fn chat_empty_svg() -> String {
         .and_then(|rest| rest.find("?>").map(|end| &rest[end + 2..]))
         .unwrap_or(trimmed);
     body.trim_start().to_string()
+}
+
+/// [`chat_icon_bytes`] as a `data:image/svg+xml;base64,...` URI, for the
+/// CSS mask [`chat_error_document`] recolors the artwork through.
+fn chat_icon_data_uri() -> String {
+    use base64::Engine;
+    format!("data:image/svg+xml;base64,{}", base64::engine::general_purpose::STANDARD.encode(chat_icon_bytes()))
 }
 
 /// Flushes a completed paragraph: `<p>` around its inline HTML, with each
@@ -964,5 +1028,30 @@ mod tests {
         assert!(doc.contains("viewBox=\"0 0 400 400\""), "the bundled ai-1.svg artwork is inlined");
         assert!(!doc.contains("<?xml"), "the XML declaration is stripped so the artwork embeds cleanly");
         assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""), "the empty state loads through the same CSP document");
+    }
+
+    #[test]
+    fn chat_loading_document_pulses_the_robot_glyph() {
+        let doc = chat_loading_document();
+        assert!(doc.contains("class=\"chat-loading-icon\""), "the robot glyph is present");
+        assert!(doc.contains("filter: invert(1)"), "the same lightening as the idle state");
+        assert!(doc.contains("animation: chat-icon-pulse"), "the icon animates instead of sitting static");
+        assert!(doc.contains("@keyframes chat-icon-pulse"), "the pulse keyframes are defined");
+        assert!(doc.contains("viewBox=\"0 0 400 400\""), "the bundled ai-1.svg artwork is inlined");
+        assert!(!doc.contains("<?xml"), "the XML declaration is stripped so the artwork embeds cleanly");
+        assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""), "the loading state loads through the same CSP document");
+    }
+
+    #[test]
+    fn chat_error_document_recolors_the_glyph_red_and_keeps_the_message() {
+        let doc = chat_error_document("Failed: connection refused & timed out <retry>");
+        assert!(doc.contains("class=\"chat-error-icon\""), "the robot glyph is present, recolored");
+        assert!(doc.contains("background-color: #e01b24"), "the app's standard error red");
+        assert!(doc.contains("mask-image: url(\"data:image/svg+xml;base64,"), "the artwork is masked, not filtered, for an exact color");
+        assert!(
+            doc.contains("<p class=\"chat-error-message\">Failed: connection refused &amp; timed out &lt;retry&gt;</p>"),
+            "the failure reason stays visible, HTML-escaped"
+        );
+        assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""), "the error state loads through the same CSP document");
     }
 }

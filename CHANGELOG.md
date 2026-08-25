@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.113 (2026-08-25)
+
+### Added
+
+- **App**: the AI Chat card's in-flight and failure states now match the idle state's icon-only look instead of reading as plain text. Pressing Go swaps the "Asking the assistant…" text for a new `chat_loading_document`: the same idle-state robot glyph, lightened the same `filter: invert(1)` way, now pulsing (a CSS `@keyframes` opacity fade between 20% and 60%, no JavaScript involved - the chat WebView keeps it disabled) so there's a visible sign of life for however long the configured assistant takes to answer. A failed request now renders `chat_error_document`: the same glyph recolored to the app's standard error red (`#e01b24`, already used for tags, calendar colors, and the tray badge) via a CSS mask - punching the artwork's alpha channel out of a solid `background-color` through a `data:image/svg+xml;base64,...` source (`chat_icon_data_uri`), which matches the target hex exactly where a `filter` could only approximate it - with the actual error text kept underneath so a bad URL, an expired token, or a rejected request stays diagnosable rather than disappearing behind a mute red icon.
+
+### Testing
+
+- `lookout-app`: new `chat_loading_document`/`chat_error_document` tests pin the pulsing idle-glyph animation and the red CSS-mask recolor, and that the failure text still rides along, HTML-escaped, underneath the error icon. The whole workspace suite (685 tests) passes.
+
 ## 0.9.112 (2026-08-25)
 
 ### Added
@@ -11,6 +21,8 @@
 - **App**: for a short window while the above was being built, the AI Chat card's reply pane stopped rendering anything at all - "Asking the assistant…" never appeared, nor did the final answer, even though the assistant was working correctly in the background. The newly-added `decide-policy` handler on the chat WebView vetoed every navigation unconditionally, including the pane's own `load_html()` calls (which fire a `NavigationAction` decision too, not just a real click) - so every reply was silently dropped before it ever painted. The handler now only intercepts a genuine link click (`NavigationType::LinkClicked` or a user gesture), mirroring the distinction the reading pane's own handler already relies on, and lets everything else load normally.
 
 - **App**: a chat reply's link could render as clickable-looking text but do nothing when clicked, if the model wrote its destination using CommonMark's angle-bracket form (`[text](<url>)`) - valid Markdown some models reach for on a long, punctuation-heavy URL like the ones above. `lookout_view`'s hand-rolled markdown parser (`bracket_paren`) didn't know that form and parsed the angle brackets as part of the URL itself, so the resulting `href` never matched a real scheme and the click silently no-opped. It now strips a matching `<...>` wrapper around a link (or image) destination before use.
+
+- **App**: clicking an email link in the AI Chat card selected the right mailbox and message but left the window wherever it already was (e.g. still on the Lookout tab, where the chat card itself lives) instead of bringing the Mail view into sight. The `open-message` navigation closure now calls `mail_view_button.set_active(true)` before selecting, the same way an `open-event` click already switches to the Calendar tab.
 
 ### Testing
 

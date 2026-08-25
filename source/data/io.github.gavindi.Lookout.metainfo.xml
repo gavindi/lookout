@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.113" date="2026-08-25">
+      <description>
+        <p>The Lookout tab's AI Chat card no longer shows "Asking the assistant…" text while waiting for an answer - it now shows a gently pulsing version of its idle-state robot icon instead, and a failed request shows the same icon recolored red with the error message underneath.</p>
+      </description>
+    </release>
     <release version="0.9.112" date="2026-08-25">
       <description>
         <p>The Lookout tab's AI Chat card can now link straight to the emails and calendar events it mentions: replies include clickable links that jump to the exact message (switching to Mail, opening its folder, and selecting the row - expanding a collapsed section or conversation if needed) or open the exact calendar event's editor, the same way clicking a desktop notification already does. A new "upcoming events" tool lets the assistant look up real calendar events, not just tasks. Also fixes two bugs introduced while building this: chat replies briefly stopped rendering at all, and a link some models wrap in angle brackets failed to open.</p>
