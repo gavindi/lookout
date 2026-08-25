@@ -7154,9 +7154,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Lookout tab → AI Chat: the card's Go button (and the prompt
     // field's Enter key) asks the configured assistant - the Settings →
     // Assistant URL, agent, and keyring token - and shows the reply in the
-    // card's HTML output view (markdown-formatted by `chat_reply_html`,
-    // loaded through the reading pane's CSP wrapper so the agent can use
-    // formatting and graphics but never scripts). The prompt defaults to
+    // card's HTML output view (split into section cards by
+    // `chat_reply_cards_html`, loaded through the reading pane's CSP
+    // wrapper so the agent can use formatting and graphics but never
+    // scripts). The prompt defaults to
     // "Summarize my inbox" when the field is left empty. The assistant
     // answers with function calling over the same local data the dashboard
     // shows: the mail caches, the contact snapshots, and the merged task
@@ -7216,7 +7217,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             glib::spawn_future_local(async move {
                 let Ok(result) = result_rx.recv().await else { return };
                 let document = match result {
-                    Ok(reply) => crate::lookout_view::chat_document(&crate::lookout_view::chat_reply_html(&reply)),
+                    Ok(reply) => crate::lookout_view::chat_document(&crate::lookout_view::chat_reply_cards_html(&reply)),
                     Err(e) => crate::lookout_view::chat_error_document(&e),
                 };
                 chat_output.load_html(&document, None);

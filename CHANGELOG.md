@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.114 (2026-08-25)
+
+### Added
+
+- **App**: the Lookout tab's assistant card now divides a multi-topic reply into separate visual cards instead of one long flowing document - each `#`/`##` heading in the model's markdown answer starts a new card, styled to echo the dashboard's native `.card` look (rounded corners, a subtle translucent panel against the dark scrim), while `###`/`####` headings stay as sub-headings inside whichever card they fall under rather than splitting one. A reply with no headings, or any text before the first `#`/`##` heading, still gets wrapped in its own card - the view is never bare, and the previous plain-flowing-text look is gone. The renderer's markdown parsing didn't change: `chat_reply_html`'s block-recognition loop was factored into a shared `parse_blocks` helper, and a new `chat_reply_cards_html` groups the same blocks into cards and is now the function `window.rs` loads into the chat WebView (`chat_reply_html` itself, now unused in the live path, was removed along with its tests, which were carried over onto `chat_reply_cards_html`). `chat_document`'s CSS gained the `.lookout-card`/`.lookout-card-title` rules the cards render into - inert, harmless dead CSS in the idle/loading/error documents, which never emit a `.lookout-card` element. The system prompt now tells the agent that `#`/`##` headings each become a card, so it reserves them for genuinely distinct topics in a multi-part answer instead of sprinkling them through a single-topic one.
+
+### Changed
+
+- **App**: the Lookout tab's "AI Chat" card is renamed "Ask", and its "Go" button now reads "Ask" as well.
+
+### Fixed
+
+- **App**: links in the assistant card's reply were the WebKit UA stylesheet's default blue, which read as low-contrast against the card's dark background. `chat_document` now sets an explicit `a`/`a:visited` colour (`#4d9dff`, the same accent the app already uses for unread badges in its dark theme) instead of relying on the browser default.
+
+### Testing
+
+- `lookout-app`: `chat_reply_cards_html` tests cover `#`/`##` headings splitting into separate titled cards while `###`/`####` stay inline, a headingless reply landing in a single untitled card, text before the first heading getting its own leading untitled card, a reply that opens directly on a heading producing no empty leading card, and the ```` ```html ```` graphics passthrough still rendering verbatim inside a card - plus the inline-formatting coverage (bold/italic/links/code/lists/images/angle-bracket link destinations) carried over from the removed `chat_reply_html` tests. New `chat_document` tests pin the `.lookout-card`/`.lookout-card-title` CSS and the explicit link colour. The whole workspace suite (691 tests) passes.
+
 ## 0.9.113 (2026-08-25)
 
 ### Added

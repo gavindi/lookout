@@ -134,11 +134,11 @@ pub fn build_lookout_view() -> LookoutView {
     // and navigation off whatever HTML arrives. The card (and the reply
     // view inside it) expands vertically so the AI Chat card fills the
     // whole height of its column.
-    let (chat_card, chat_box) = section_card("AI Chat");
+    let (chat_card, chat_box) = section_card("Ask");
     chat_card.set_vexpand(true);
     chat_box.set_vexpand(true);
     let chat_entry = gtk::Entry::builder().placeholder_text("Summarize my inbox").hexpand(true).build();
-    let chat_button = gtk::Button::with_label("Go");
+    let chat_button = gtk::Button::with_label("Ask");
     chat_button.add_css_class("suggested-action");
     chat_button.set_tooltip_text(Some("Ask the configured assistant"));
     let chat_input_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
@@ -487,12 +487,38 @@ fn install_lookout_css() {
     });
 }
 
-/// The assistant's reply as renderable HTML: a tiny markdown-to-HTML
-/// renderer over fully escaped text, so a reply can never smuggle in
-/// markup the caller didn't ask for. The caller wraps the result in the
-/// reading pane's CSP document before loading it into the chat WebView -
-/// this function is deliberately *not* the security boundary, only the
-/// formatting pass.
+/// One block-level unit [`parse_blocks`] recognizes: either a heading
+/// (level 1-4, already inline-formatted) that [`chat_reply_cards_html`] may
+/// split a card on, or a fully-rendered other block (paragraph, list,
+/// fenced code, ```html passthrough) that always stays wherever it's put.
+enum Block {
+    Heading { level: usize, title_html: String },
+    Html(String),
+}
+
+/// A [`chat_reply_cards_html`] card: an optional heading (its level and
+/// already-rendered title) plus the rendered HTML of everything under it.
+struct Section {
+    title: Option<(usize, String)>,
+    body: String,
+}
+
+/// Flushes `paragraph` (via [`flush_paragraph`]) and, if that produced any
+/// HTML, appends it to `blocks` as a [`Block::Html`].
+fn flush_paragraph_block(paragraph: &mut String, blocks: &mut Vec<Block>) {
+    let mut html = String::new();
+    flush_paragraph(paragraph, &mut html);
+    if !html.is_empty() {
+        blocks.push(Block::Html(html));
+    }
+}
+
+/// The markdown block parser behind [`chat_reply_cards_html`]: a tiny
+/// markdown-to-HTML renderer over fully escaped text, so a reply can never
+/// smuggle in markup the caller didn't ask for - the caller wraps the
+/// result in the reading pane's CSP document before loading it into the
+/// chat WebView, so this function is deliberately *not* the security
+/// boundary, only the formatting pass.
 ///
 /// Supported: `#`-`####` headings, `**bold**`, `*italic*`, `` `code` ``
 /// and fenced ``` fences, `[text](url)` links, `![alt](url)` images,
@@ -501,18 +527,18 @@ fn install_lookout_css() {
 /// one passthrough: its contents are inserted verbatim (still under the
 /// caller's CSP), which is how the agent embeds graphics - inline SVG,
 /// `<table>`s, `<img>` - that markdown can't express.
-pub fn chat_reply_html(reply: &str) -> String {
-    let mut out = String::new();
+fn parse_blocks(reply: &str) -> Vec<Block> {
+    let mut blocks = Vec::new();
     let mut paragraph = String::new();
     let mut lines = reply.lines().peekable();
     while let Some(line) = lines.next() {
         if line.trim().is_empty() {
-            flush_paragraph(&mut paragraph, &mut out);
+            flush_paragraph_block(&mut paragraph, &mut blocks);
             continue;
         }
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
-            flush_paragraph(&mut paragraph, &mut out);
+            flush_paragraph_block(&mut paragraph, &mut blocks);
             let fence_lang = trimmed.trim_start_matches('`').trim();
             let mut code: Vec<&str> = Vec::new();
             for code_line in lines.by_ref() {
@@ -525,22 +551,19 @@ pub fn chat_reply_html(reply: &str) -> String {
             if fence_lang.eq_ignore_ascii_case("html") {
                 // The graphics passthrough: verbatim HTML, CSP-guarded by
                 // the caller when it loads the document.
-                out.push_str(&code_text);
-                out.push('\n');
+                blocks.push(Block::Html(format!("{code_text}\n")));
             } else {
-                out.push_str("<pre><code>");
-                out.push_str(&escape_html(&code_text));
-                out.push_str("</code></pre>\n");
+                blocks.push(Block::Html(format!("<pre><code>{}</code></pre>\n", escape_html(&code_text))));
             }
             continue;
         }
         if let Some((level, content)) = heading(trimmed) {
-            flush_paragraph(&mut paragraph, &mut out);
-            out.push_str(&format!("<h{level}>{}</h{level}>\n", inline_html(content)));
+            flush_paragraph_block(&mut paragraph, &mut blocks);
+            blocks.push(Block::Heading { level, title_html: inline_html(content) });
             continue;
         }
         if let Some((ordered, content)) = list_item(trimmed) {
-            flush_paragraph(&mut paragraph, &mut out);
+            flush_paragraph_block(&mut paragraph, &mut blocks);
             let mut items: Vec<String> = vec![inline_html(content)];
             while let Some(next) = lines.peek().map(|l| l.trim_start()) {
                 let Some((same_kind, item_content)) = list_item(next) else { break };
@@ -551,11 +574,12 @@ pub fn chat_reply_html(reply: &str) -> String {
                 lines.next();
             }
             let tag = if ordered { "ol" } else { "ul" };
-            out.push_str(&format!("<{tag}>\n"));
+            let mut html = format!("<{tag}>\n");
             for item in &items {
-                out.push_str(&format!("<li>{item}</li>\n"));
+                html.push_str(&format!("<li>{item}</li>\n"));
             }
-            out.push_str(&format!("</{tag}>\n"));
+            html.push_str(&format!("</{tag}>\n"));
+            blocks.push(Block::Html(html));
             continue;
         }
         if !paragraph.is_empty() {
@@ -563,22 +587,90 @@ pub fn chat_reply_html(reply: &str) -> String {
         }
         paragraph.push_str(&inline_html(trimmed));
     }
-    flush_paragraph(&mut paragraph, &mut out);
+    flush_paragraph_block(&mut paragraph, &mut blocks);
+    blocks
+}
+
+/// The assistant's reply grouped into visual "cards" by top-level heading:
+/// each `#`/`##` heading starts a new card (its own tag is suppressed from
+/// the body and reused as the card's title, styled by the `.lookout-card-
+/// title` rule in [`chat_document`]); `###`/`####` headings stay inline
+/// inside whichever card they fall in - they mark sub-structure within a
+/// topic, not a new one. A reply is always at least one card: a reply with
+/// no `#`/`##` headings is a single untitled card holding the whole reply,
+/// and any content before the first `#`/`##` heading becomes its own
+/// leading untitled card rather than being left card-less or folded into
+/// the first titled section.
+pub fn chat_reply_cards_html(reply: &str) -> String {
+    let mut sections = vec![Section { title: None, body: String::new() }];
+    for block in parse_blocks(reply) {
+        match block {
+            Block::Heading { level, title_html } if level <= 2 => {
+                let claim_first = sections.len() == 1 && sections[0].title.is_none() && sections[0].body.is_empty();
+                if claim_first {
+                    sections[0].title = Some((level, title_html));
+                } else {
+                    sections.push(Section { title: Some((level, title_html)), body: String::new() });
+                }
+            }
+            Block::Heading { level, title_html } => {
+                sections.last_mut().expect("always at least one section").body.push_str(&format!("<h{level}>{title_html}</h{level}>\n"));
+            }
+            Block::Html(html) => {
+                sections.last_mut().expect("always at least one section").body.push_str(&html);
+            }
+        }
+    }
+    if sections.len() == 1 && sections[0].title.is_none() && sections[0].body.is_empty() {
+        return String::new();
+    }
+    sections.into_iter().map(render_card).collect()
+}
+
+/// Renders one [`chat_reply_cards_html`] section as a `.lookout-card` div:
+/// its title (if any) as an `.lookout-card-title` heading, then its body.
+fn render_card(section: Section) -> String {
+    let mut out = String::from("<div class=\"lookout-card\">");
+    if let Some((level, title_html)) = section.title {
+        out.push_str(&format!("<h{level} class=\"lookout-card-title\">{title_html}</h{level}>"));
+    }
+    out.push_str(&section.body);
+    out.push_str("</div>");
     out
 }
 
 /// The full document the caller loads into the chat WebView: a rendered
-/// reply (`chat_reply_html` output or a plain status string) inside the
-/// reading pane's CSP wrapper at the images-allowed level - remote images
-/// may load, everything else remote stays blocked - with an explicit
-/// `background: transparent` rule so the card shows the dashboard's dark
-/// scrim behind the reply instead of WebKit's default white, and a grey
-/// default text colour (`#e5e5e5`, the 90% grey of the CSS/SVG grey ramp)
-/// so uncoloured reply text is readable on that scrim without being stark
-/// white. Links keep the theme's accent via the `a { color: ... }` from
-/// the UA stylesheet; everything the agent styles itself still wins.
+/// reply (`chat_reply_cards_html` output or a plain status string) inside
+/// the reading pane's CSP wrapper at the images-allowed level - remote
+/// images may load, everything else remote stays blocked - with an
+/// explicit `background: transparent` rule so the card shows the
+/// dashboard's dark scrim behind the reply instead of WebKit's default
+/// white, and a grey default text colour (`#e5e5e5`, the 90% grey of the
+/// CSS/SVG grey ramp) so uncoloured reply text is readable on that scrim
+/// without being stark white. Links get an explicit `a`/`a:visited` colour
+/// (`#4d9dff`, the same accent the app already uses for unread badges in
+/// its dark theme, see `flat-dark.css`'s `@lookout-unread`) rather than the
+/// WebKit UA stylesheet's default link blue, which reads low-contrast on
+/// this dark scrim; everything the agent styles itself still wins.
+///
+/// Also carries the `.lookout-card`/`.lookout-card-title` rules
+/// `chat_reply_cards_html` wraps each section in: WebKit's CSS engine can't
+/// see libadwaita's `.card` style or its theme variables, so the look is
+/// approximated with literal translucent-white-on-dark values (in the same
+/// spirit as this function's own literal `#e5e5e5`) rather than reused from
+/// the native dashboard cards' `section_card` GTK styling. These rules are
+/// simply unused (harmless dead CSS) in the empty/loading/error documents,
+/// which never emit a `.lookout-card` element.
 pub fn chat_document(html: &str) -> String {
-    let styled = format!("<style>html, body {{ background: transparent; color: #e5e5e5; }}</style>{html}");
+    let styled = format!(
+        "<style>html, body {{ background: transparent; color: #e5e5e5; }}\
+         a, a:visited {{ color: #4d9dff; }}\
+         .lookout-card {{ background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.09); \
+         border-radius: 12px; margin: 6px; padding: 12px; box-sizing: border-box; }}\
+         .lookout-card-title {{ margin: 0 0 6px 0; font-size: 1.05em; font-weight: bold; color: #e5e5e5; }}\
+         .lookout-card > *:first-child {{ margin-top: 0; }}\
+         .lookout-card > *:last-child {{ margin-bottom: 0; }}</style>{html}"
+    );
     crate::window::wrap_message_with_csp(&styled, true, false)
 }
 
@@ -947,19 +1039,22 @@ mod tests {
     }
 
     #[test]
-    fn chat_reply_html_escapes_plain_text_and_builds_paragraphs() {
+    fn chat_reply_cards_html_escapes_plain_text_and_builds_paragraphs_in_an_untitled_card() {
         // Everything the reply says is escaped, so a reply can never smuggle
         // in its own tags.
-        let html = chat_reply_html("Hello <b>world</b> & friends\nsecond line\n\nNew paragraph.");
-        assert_eq!(html, "<p>Hello &lt;b&gt;world&lt;/b&gt; &amp; friends<br>second line</p>\n<p>New paragraph.</p>\n");
+        let cards = chat_reply_cards_html("Hello <b>world</b> & friends\nsecond line\n\nNew paragraph.");
+        assert_eq!(
+            cards,
+            "<div class=\"lookout-card\"><p>Hello &lt;b&gt;world&lt;/b&gt; &amp; friends<br>second line</p>\n<p>New paragraph.</p>\n</div>"
+        );
     }
 
     #[test]
-    fn chat_reply_html_renders_headings_bold_italic_links_and_code() {
-        let html = chat_reply_html("# Heading\n\n**bold** and *italic* and `code` and [a link](https://example.org).");
+    fn chat_reply_cards_html_renders_bold_italic_links_and_code_in_a_titled_card() {
+        let cards = chat_reply_cards_html("# Heading\n\n**bold** and *italic* and `code` and [a link](https://example.org).");
         assert_eq!(
-            html,
-            "<h1>Heading</h1>\n<p><strong>bold</strong> and <em>italic</em> and <code>code</code> and <a href=\"https://example.org\">a link</a>.</p>\n"
+            cards,
+            "<div class=\"lookout-card\"><h1 class=\"lookout-card-title\">Heading</h1><p><strong>bold</strong> and <em>italic</em> and <code>code</code> and <a href=\"https://example.org\">a link</a>.</p>\n</div>"
         );
     }
 
@@ -970,42 +1065,93 @@ mod tests {
     /// its delimiters, so the emitted `href` would never match a real
     /// scheme and the link would silently do nothing when clicked.
     #[test]
-    fn chat_reply_html_strips_angle_brackets_around_a_link_destination() {
-        let html = chat_reply_html("[Team sync](<lookout-action:open-event?data=a%3Ab>)");
-        assert_eq!(html, "<p><a href=\"lookout-action:open-event?data=a%3Ab\">Team sync</a></p>\n");
+    fn chat_reply_cards_html_strips_angle_brackets_around_a_link_destination() {
+        let cards = chat_reply_cards_html("[Team sync](<lookout-action:open-event?data=a%3Ab>)");
+        assert_eq!(cards, "<div class=\"lookout-card\"><p><a href=\"lookout-action:open-event?data=a%3Ab\">Team sync</a></p>\n</div>");
     }
 
     #[test]
-    fn chat_reply_html_escapes_fenced_code_but_passes_html_fences_verbatim() {
-        let code = chat_reply_html("```\nlet x = 1 < 2;\n```");
-        assert_eq!(code, "<pre><code>let x = 1 &lt; 2;</code></pre>\n");
+    fn chat_reply_cards_html_escapes_fenced_code_but_passes_html_fences_verbatim_in_an_untitled_card() {
+        let code = chat_reply_cards_html("```\nlet x = 1 < 2;\n```");
+        assert_eq!(code, "<div class=\"lookout-card\"><pre><code>let x = 1 &lt; 2;</code></pre>\n</div>");
 
         // The ```html fence is the graphics passthrough: verbatim, so the
         // agent can embed SVG/tables/imgs that markdown can't express (the
         // caller's CSP wrapper is the actual safety boundary).
-        let graphic = chat_reply_html("```html\n<svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n```");
-        assert_eq!(graphic, "<svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n");
+        let graphic = chat_reply_cards_html("```html\n<svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n```");
+        assert_eq!(graphic, "<div class=\"lookout-card\"><svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n</div>");
     }
 
     #[test]
-    fn chat_reply_html_renders_bullet_and_numbered_lists() {
-        let bullets = chat_reply_html("- one\n- two\n\n1. first\n2. second");
-        assert_eq!(bullets, "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n<ol>\n<li>first</li>\n<li>second</li>\n</ol>\n");
-    }
-
-    #[test]
-    fn chat_reply_html_renders_images_and_escapes_their_attributes() {
-        let html = chat_reply_html("![a \"quote\" & chart](https://example.org/chart?x=1&y=2)");
+    fn chat_reply_cards_html_renders_bullet_and_numbered_lists_in_an_untitled_card() {
+        let cards = chat_reply_cards_html("- one\n- two\n\n1. first\n2. second");
         assert_eq!(
-            html,
-            "<p><img src=\"https://example.org/chart?x=1&amp;y=2\" alt=\"a &quot;quote&quot; &amp; chart\"></p>\n"
+            cards,
+            "<div class=\"lookout-card\"><ul>\n<li>one</li>\n<li>two</li>\n</ul>\n<ol>\n<li>first</li>\n<li>second</li>\n</ol>\n</div>"
         );
     }
 
     #[test]
-    fn chat_reply_html_handles_empty_and_code_only_replies() {
-        assert_eq!(chat_reply_html(""), "");
-        assert_eq!(chat_reply_html("   \n\n"), "");
+    fn chat_reply_cards_html_renders_images_and_escapes_their_attributes() {
+        let cards = chat_reply_cards_html("![a \"quote\" & chart](https://example.org/chart?x=1&y=2)");
+        assert_eq!(
+            cards,
+            "<div class=\"lookout-card\"><p><img src=\"https://example.org/chart?x=1&amp;y=2\" alt=\"a &quot;quote&quot; &amp; chart\"></p>\n</div>"
+        );
+    }
+
+    #[test]
+    fn chat_reply_cards_html_splits_on_h1_and_h2_but_keeps_h3_h4_inline() {
+        let cards = chat_reply_cards_html("# Topic A\nfirst\n\n## Topic B\nsecond\n\n### Detail\nthird");
+        assert_eq!(
+            cards,
+            "<div class=\"lookout-card\"><h1 class=\"lookout-card-title\">Topic A</h1><p>first</p>\n</div>\
+             <div class=\"lookout-card\"><h2 class=\"lookout-card-title\">Topic B</h2><p>second</p>\n<h3>Detail</h3>\n<p>third</p>\n</div>"
+        );
+    }
+
+    #[test]
+    fn chat_reply_cards_html_gives_preamble_before_first_heading_its_own_untitled_card() {
+        let cards = chat_reply_cards_html("Some intro text.\n\n## First section\nbody");
+        assert_eq!(
+            cards,
+            "<div class=\"lookout-card\"><p>Some intro text.</p>\n</div>\
+             <div class=\"lookout-card\"><h2 class=\"lookout-card-title\">First section</h2><p>body</p>\n</div>"
+        );
+    }
+
+    #[test]
+    fn chat_reply_cards_html_starts_directly_with_a_heading_without_an_empty_leading_card() {
+        let cards = chat_reply_cards_html("# Only section\nbody");
+        assert_eq!(cards, "<div class=\"lookout-card\"><h1 class=\"lookout-card-title\">Only section</h1><p>body</p>\n</div>");
+    }
+
+    #[test]
+    fn chat_reply_cards_html_keeps_html_fence_graphics_passthrough_inside_a_card() {
+        let cards = chat_reply_cards_html("## Chart\n```html\n<svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n```");
+        assert_eq!(
+            cards,
+            "<div class=\"lookout-card\"><h2 class=\"lookout-card-title\">Chart</h2><svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n</div>"
+        );
+    }
+
+    #[test]
+    fn chat_reply_cards_html_handles_empty_reply() {
+        assert_eq!(chat_reply_cards_html(""), "");
+        assert_eq!(chat_reply_cards_html("   \n\n"), "");
+    }
+
+    #[test]
+    fn chat_document_carries_the_card_styling_rules() {
+        let doc = chat_document("");
+        assert!(doc.contains(".lookout-card"));
+        assert!(doc.contains(".lookout-card-title"));
+    }
+
+    #[test]
+    fn chat_document_gives_links_a_high_contrast_colour() {
+        let doc = chat_document("");
+        assert!(doc.contains("a, a:visited { color: #4d9dff; }"), "links get an explicit accent colour instead of the low-contrast UA default");
     }
 
     #[test]
@@ -1014,7 +1160,8 @@ mod tests {
         assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\" content=\""), "the CSP meta leads the document");
         assert!(doc.contains("img-src * data: cid:"), "remote images are allowed at the chat level");
         assert!(doc.contains("script-src 'none'"), "scripts stay off");
-        assert!(doc.ends_with("<style>html, body { background: transparent; color: #e5e5e5; }</style><p>hi</p>"), "the transparent-background and grey-text rules ride in ahead of the content");
+        assert!(doc.contains("html, body { background: transparent; color: #e5e5e5; }"), "the transparent-background and grey-text rules are present");
+        assert!(doc.ends_with("</style><p>hi</p>"), "the style block rides in ahead of the content");
     }
 
     #[test]
