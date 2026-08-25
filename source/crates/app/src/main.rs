@@ -9,6 +9,7 @@ mod background;
 mod background_image;
 mod calendar_colors;
 mod calendar_view;
+mod chat_links;
 mod compose;
 mod config_view;
 mod contacts_editor;

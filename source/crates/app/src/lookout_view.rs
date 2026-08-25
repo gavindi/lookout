@@ -738,9 +738,21 @@ fn inline_html(line: &str) -> String {
 /// Parses the `text](url)` half of a `[text](url)` / `![alt](url)`
 /// construct, given the text already past the opening `[`: the text up to
 /// the closing `]`, then the URL between the following `(` and `)`.
+///
+/// Also accepts CommonMark's angle-bracket destination form, `(<url>)` -
+/// the model's own tool-provided deep links (`chat_links`) are long,
+/// punctuation-heavy strings, and some models wrap exactly that kind of URL
+/// in `< >` rather than leaving it bare. Without this, the angle brackets
+/// would be parsed as part of the URL itself instead of its delimiters,
+/// silently breaking the link.
 fn bracket_paren(s: &str) -> Option<(&str, (&str, &str))> {
     let close = s.find(']')?;
     let after = s[close + 1..].strip_prefix('(')?;
+    if let Some(inside) = after.strip_prefix('<') {
+        let end = inside.find('>')?;
+        let rest = inside[end + 1..].strip_prefix(')')?;
+        return Some((&s[..close], (&inside[..end], rest)));
+    }
     let end = after.find(')')?;
     Some((&s[..close], (&after[..end], &after[end + 1..])))
 }
@@ -885,6 +897,18 @@ mod tests {
             html,
             "<h1>Heading</h1>\n<p><strong>bold</strong> and <em>italic</em> and <code>code</code> and <a href=\"https://example.org\">a link</a>.</p>\n"
         );
+    }
+
+    /// CommonMark's angle-bracket destination form, `[text](<url>)`. A model
+    /// asked to link to a `chat_links`-built deep link (long, punctuation-
+    /// heavy) sometimes wraps it this way; without special-casing it the
+    /// angle brackets would be parsed as part of the URL itself rather than
+    /// its delimiters, so the emitted `href` would never match a real
+    /// scheme and the link would silently do nothing when clicked.
+    #[test]
+    fn chat_reply_html_strips_angle_brackets_around_a_link_destination() {
+        let html = chat_reply_html("[Team sync](<lookout-action:open-event?data=a%3Ab>)");
+        assert_eq!(html, "<p><a href=\"lookout-action:open-event?data=a%3Ab\">Team sync</a></p>\n");
     }
 
     #[test]

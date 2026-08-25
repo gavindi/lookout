@@ -491,6 +491,13 @@ pub(crate) struct UiState {
     /// whatever the user is currently looking at).
     current_account: Option<AccountId>,
     current_mailbox: Option<MailboxId>,
+    /// A message the `app.open-message` action (an AI Chat link click) wants
+    /// selected once the mailbox it lives in has actually finished loading -
+    /// that load is async (see `select_mailbox`). Consumed - and cleared -
+    /// the next time any mailbox's cache-read reply lands there, whether or
+    /// not it matches, so a stale entry from an interrupted navigation can
+    /// never fire later on an unrelated load.
+    pending_message_selection: Option<(MailboxId, Uid)>,
     /// Which of the two message-list views is active. `Single` keys the list
     /// off `current_mailbox` exactly as before; `UnifiedInbox` instead merges
     /// every connected account's Inbox (see `unified_snapshots`).
@@ -1787,6 +1794,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         goa_client: None,
         current_account: None,
         current_mailbox: None,
+        pending_message_selection: None,
         mail_view: MailView::Single,
         unified_snapshots: HashMap::new(),
         pending_optimistic_removals: HashMap::new(),
@@ -5140,6 +5148,45 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             Rc::new(move || window.present())
         },
     );
+    // --- AI Chat link actions. `app.open-message` is the click target a
+    // `lookout-action:open-message?...` link in the chat pane resolves to
+    // (see the AI-Chat wiring block's `connect_decide_policy` handler
+    // below). Already on the target mailbox: select the row directly,
+    // since `select_mailbox` won't fire again for a same-mailbox reselect.
+    // Otherwise stash the target in `pending_message_selection` (consumed
+    // once `select_mailbox`'s async cache-read reply actually repaints the
+    // list - see there) and switch to that mailbox exactly like the
+    // `open-mailbox` closure above.
+    crate::chat_links::spawn_open_message_action(app, {
+        let window = window.clone();
+        let state = state.clone();
+        let folder_selection = folder_selection.clone();
+        let message_list = message_list.clone();
+        let mail_view_button = mail_view_button.clone();
+        Rc::new(move |mailbox: MailboxId, uid: Uid| {
+            window.present();
+            // Switch to the Mail tab - a chat link may be clicked from the
+            // Lookout tab (where the AI Chat card lives) or any other, same
+            // as `calendar_view_button.set_active(true)` does for an
+            // `open-event` click landing on the Calendar tab.
+            mail_view_button.set_active(true);
+            if state.borrow().current_mailbox.as_ref() == Some(&mailbox) {
+                message_list.select_uid(&mailbox, uid);
+                return;
+            }
+            state.borrow_mut().pending_message_selection = Some((mailbox.clone(), uid));
+            if let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() {
+                if let Some(index) = find_mailbox_index(&model, &mailbox) {
+                    folder_selection.set_selected(index);
+                } else {
+                    // Not in the tree (e.g. hidden/unsubscribed) - drop the
+                    // stash so it can't wrongly fire on some later,
+                    // unrelated navigation.
+                    state.borrow_mut().pending_message_selection = None;
+                }
+            }
+        })
+    });
     // --- iMIP banner actions. The banner's button acts on the invitation
     // stashed in `UiState::imip` by `render_body`; the calendar half of the
     // response (saving an accepted event, removing a cancelled one) needs
@@ -7131,10 +7178,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             chat_button.set_sensitive(false);
             let placeholder = crate::lookout_view::chat_reply_html("Asking the assistant…");
             chat_output.load_html(&crate::lookout_view::chat_document(&placeholder), None);
-            let context = crate::assistant_tools::ToolContext {
-                caches: state.borrow().accounts.values().filter_map(|h| h.address_cache.clone()).collect(),
-                contacts: state.borrow().contacts_by_account.iter().map(|(id, snapshot)| (id.clone(), snapshot.clone())).collect(),
-                tasks: merged_tasks(&calendar_state),
+            let context = {
+                // The upcoming-occurrences union the dashboard's own
+                // "Upcoming events" card reads from (`window.rs`'s
+                // Lookout-tab repaint) - gathered here in its own scope and
+                // dropped before `merged_tasks` re-borrows `calendar_state`.
+                let st = calendar_state.borrow();
+                let occurrences: Vec<EventOccurrence> = st
+                    .accounts
+                    .values()
+                    .flat_map(|h| h.occurrences_by_month.values().flatten().cloned())
+                    .chain(st.webcal_handles.values().flat_map(|h| h.occurrences_by_month.values().flatten().cloned()))
+                    .chain(st.birthdays.as_ref().into_iter().flat_map(|h| h.occurrences_by_month.values().flatten().cloned()))
+                    .collect();
+                let checked_calendars = st.checked_calendar_ids.clone();
+                drop(st);
+                crate::assistant_tools::ToolContext {
+                    caches: state.borrow().accounts.values().filter_map(|h| h.address_cache.clone()).collect(),
+                    contacts: state.borrow().contacts_by_account.iter().map(|(id, snapshot)| (id.clone(), snapshot.clone())).collect(),
+                    tasks: merged_tasks(&calendar_state),
+                    occurrences,
+                    checked_calendars,
+                }
             };
             let url = settings.get_string(crate::settings::ASSISTANT_API_URL);
             let agent = settings.get_string(crate::settings::ASSISTANT_AGENT);
@@ -7168,6 +7233,60 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let ask_assistant = ask_assistant.clone();
             chat_entry_for_activate.connect_activate(move |_| ask_assistant());
         }
+    }
+
+    // --- AI Chat link clicks. `chat_output` has no `decide-policy` handling
+    // of its own (unlike the reading pane's `web_view`, wired near the top
+    // of this function): a `lookout-action:<action>?data=...` link (see
+    // `chat_links`) dispatches straight to the matching `GAction` -
+    // `open-event` (unchanged, reused from `reminders.rs`) or `open-message`
+    // (registered above) - and anything else falls back to
+    // `open_uri_in_default_browser`, the same treatment the reading pane
+    // gives an ordinary link. The WebView itself never navigates either way.
+    //
+    // Critical: every `chat_output.load_html(...)` call (the "Asking the
+    // assistant…" placeholder, then the real reply) is *itself* a
+    // NavigationAction decision, not just a real click - exactly the
+    // distinction the reading pane's handler documents and relies on
+    // (`is_link_click`/`is_user_gesture`, above). Vetoing unconditionally
+    // here silently drops every `load_html`, so the pane never renders
+    // anything at all: only a genuine link click (`LinkClicked` or a user
+    // gesture) is intercepted; anything else falls through to `false` so
+    // WebKit's normal load proceeds.
+    {
+        let app_for_chat_links = app.clone();
+        lookout_view.chat_output.connect_decide_policy(move |_view, decision, decision_type| {
+            if decision_type != webkit::PolicyDecisionType::NavigationAction {
+                return false;
+            }
+            let Some(navigation) = decision.downcast_ref::<webkit::NavigationPolicyDecision>().and_then(|d| d.navigation_action()) else {
+                return false;
+            };
+            let is_link_click = navigation.navigation_type() == webkit::NavigationType::LinkClicked;
+            let is_user_gesture = navigation.is_user_gesture();
+            tracing::debug!(
+                "AI Chat chat_output navigation: type={:?} is_link_click={is_link_click} is_user_gesture={is_user_gesture} uri={:?}",
+                navigation.navigation_type(),
+                navigation.request().and_then(|r| r.uri())
+            );
+            if !(is_link_click || is_user_gesture) {
+                // The programmatic `load_html()` call itself - let it load.
+                return false;
+            }
+            let Some(uri) = navigation.request().and_then(|r| r.uri()) else {
+                tracing::debug!("AI Chat link click had no request URI");
+                return false;
+            };
+            if let Some((action, payload)) = crate::chat_links::parse(&uri) {
+                tracing::debug!("AI Chat link click: dispatching app.{action} (payload {payload:?})");
+                app_for_chat_links.activate_action(&action, Some(&glib::Variant::from(payload)));
+            } else {
+                tracing::debug!("AI Chat link click: not a lookout-action link, opening externally: {uri}");
+                open_uri_in_default_browser(&uri);
+            }
+            decision.ignore();
+            true
+        });
     }
 
     // --- Compose button -> new-message composer in the reading pane,
@@ -13020,8 +13139,12 @@ fn select_mailbox(
         glib::spawn_future_local(async move {
             let Ok(Some(cached)) = reply_rx.recv().await else { return };
             // Discard a reply for a mailbox the user has since switched away
-            // from - applying it now would repaint the wrong folder.
+            // from - applying it now would repaint the wrong folder. Also
+            // drop any pending `open-message` selection: it was queued for
+            // whatever navigation triggered *that* switch, and leaving it
+            // stashed could misfire on some later, unrelated load.
             if state.borrow().current_mailbox.as_ref() != Some(&mailbox_id) {
+                state.borrow_mut().pending_message_selection = None;
                 return;
             }
             let (key, descending) = current_sort(&state);
@@ -13033,6 +13156,13 @@ fn select_mailbox(
             // back, even though the correct rows are already on screen
             // underneath it.
             refresh_message_loading_state(&state, &message_list, &message_list_stack);
+            // Consume a pending `app.open-message` selection (an AI Chat
+            // link click) now that this mailbox's data has actually landed.
+            if let Some((pending_mailbox, pending_uid)) = state.borrow_mut().pending_message_selection.take() {
+                if pending_mailbox == mailbox_id {
+                    message_list.select_uid(&pending_mailbox, pending_uid);
+                }
+            }
         });
     }
 }
@@ -16594,6 +16724,7 @@ mod tests {
             goa_client: None,
             current_account: None,
             current_mailbox: None,
+            pending_message_selection: None,
             mail_view: MailView::Single,
             unified_snapshots: HashMap::new(),
             pending_optimistic_removals: HashMap::new(),

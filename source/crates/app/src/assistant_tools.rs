@@ -18,11 +18,11 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, CalendarTask, EmailAddress, EmailSummary, TaskStatus};
+use lookout_core::{AccountId, CalendarId, CalendarTask, EmailAddress, EmailSummary, EventOccurrence, TaskStatus};
 use lookout_mail::Cache;
 
 use crate::contacts_view::ContactsAccountSnapshot;
@@ -34,11 +34,12 @@ use crate::contacts_view::ContactsAccountSnapshot;
 /// and links). Graphics are allowed: markdown images (`![alt](url)`) or
 /// inline SVG inside a ```html fenced block. The tool descriptions carry
 /// the rest of the instructions.
-pub const SYSTEM_PROMPT: &str = "You are Lookout's local assistant, helping the user work with their own email, contacts, and tasks. \
-Use the provided tools to look up their real data whenever the question involves specific messages, people, or tasks. \
+pub const SYSTEM_PROMPT: &str = "You are Lookout's local assistant, helping the user work with their own email, contacts, tasks, and calendar. \
+Use the provided tools to look up their real data whenever the question involves specific messages, people, tasks, or events. \
 Answer plainly from what the tools return; if a tool fails or finds nothing, say so. \
 Never claim access to anything the tools don't cover. \
 Format your answer with markdown: headings, **bold**, lists, `code`, links, and tables where they help. \
+When you mention a specific email or calendar event a tool returned, link to it using that item's own `link` field verbatim as the markdown link's URL, e.g. `[Team sync](<link value>)` - never invent, alter, or guess a link; only use a `link` value a tool actually returned. \
 For graphics (charts, diagrams, icons), use markdown images or inline SVG inside a ```html fenced block - never scripts.";
 
 /// The most tool-call rounds a single conversation may take before we give
@@ -65,6 +66,16 @@ pub struct ToolContext {
     pub contacts: Vec<(AccountId, ContactsAccountSnapshot)>,
     /// The merged task set from every source (CalDAV, Google Tasks, local).
     pub tasks: Vec<CalendarTask>,
+    /// Every synced calendar occurrence across accounts, webcal
+    /// subscriptions, and birthdays - the `upcoming_events` tool's source,
+    /// gathered the same way the dashboard's own "Upcoming events" card
+    /// does.
+    pub occurrences: Vec<EventOccurrence>,
+    /// The calendars the user has checked visible in "My calendars" -
+    /// `upcoming_events` filters to these, same as the dashboard card, so
+    /// the assistant never surfaces an event from a calendar the user has
+    /// hidden.
+    pub checked_calendars: HashSet<CalendarId>,
 }
 
 /// The OpenAI-style `tools` payload describing every function the agent may
@@ -141,6 +152,21 @@ fn tool_definitions() -> serde_json::Value {
                     "properties": {
                         "status": {"type": "string", "enum": ["outstanding", "all"], "description": "\"outstanding\" (the default) hides completed tasks; \"all\" includes them"},
                         "limit": {"type": "integer", "description": "How many tasks to return (default 10, at most 50)", "minimum": 1, "maximum": 50}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "upcoming_events",
+                "description": "Upcoming calendar events from every synced, currently-visible calendar (accounts, webcal subscriptions, birthdays), soonest first. Only covers events already synced locally within the app's sync horizon.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "days": {"type": "integer", "description": "How many days ahead to look (default 14, at most 90)", "minimum": 1, "maximum": 90},
+                        "limit": {"type": "integer", "description": "How many events to return (default 10, at most 50)", "minimum": 1, "maximum": 50}
                     },
                     "additionalProperties": false
                 }
@@ -237,6 +263,7 @@ async fn execute_tool(ctx: &ToolContext, name: &str, args: &serde_json::Value) -
         "top_contacts" => top_contacts(ctx, args).await,
         "list_contacts" => list_contacts(ctx, args),
         "list_tasks" => list_tasks(ctx, args),
+        "upcoming_events" => upcoming_events(ctx, args),
         other => Err(format!("Unknown tool {other:?}")),
     }
 }
@@ -415,6 +442,45 @@ fn serialize_emails(messages: &[EmailSummary]) -> serde_json::Value {
                 "unread": message.is_unread(),
                 "preview": message.preview.clone().unwrap_or_default(),
                 "mailbox": message.mailbox.0,
+                "uid": message.uid.0,
+                "link": crate::chat_links::open_message_link(&message.mailbox, message.uid),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(entries)
+}
+
+/// The default horizon `upcoming_events` looks ahead when the caller
+/// doesn't specify `days`, and the hard cap on that argument.
+const DEFAULT_EVENT_HORIZON_DAYS: i64 = 14;
+const MAX_EVENT_HORIZON_DAYS: i64 = 90;
+
+/// The next occurrences across every checked calendar, soonest first,
+/// within `days` of now. Reuses `lookout_view::upcoming_occurrences` - the
+/// same filter/sort the dashboard's own "Upcoming events" card runs -
+/// rather than re-deriving it.
+fn upcoming_events(ctx: &ToolContext, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let limit = arg_limit(args);
+    let days = args.get("days").and_then(|days| days.as_i64()).unwrap_or(DEFAULT_EVENT_HORIZON_DAYS).clamp(1, MAX_EVENT_HORIZON_DAYS);
+    let now = chrono::Local::now();
+    let horizon = chrono::Duration::days(days);
+    let occurrences = crate::lookout_view::upcoming_occurrences(ctx.occurrences.iter(), now, horizon, &ctx.checked_calendars, limit);
+    Ok(serialize_events(&occurrences))
+}
+
+/// A tool result entry for one calendar occurrence: the fields the agent
+/// can answer from, plus a precomputed link back to the event.
+fn serialize_events(occurrences: &[&EventOccurrence]) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = occurrences
+        .iter()
+        .map(|occ| {
+            serde_json::json!({
+                "summary": occ.summary.clone().unwrap_or_default(),
+                "start": occ.start.to_rfc3339(),
+                "end": occ.end.to_rfc3339(),
+                "all_day": occ.all_day,
+                "location": occ.location.clone(),
+                "link": crate::chat_links::open_event_link(occ),
             })
         })
         .collect();
@@ -452,11 +518,13 @@ mod tests {
             caches: Vec::new(),
             contacts: Vec::new(),
             tasks: Vec::new(),
+            occurrences: Vec::new(),
+            checked_calendars: HashSet::new(),
         }
     }
 
     #[test]
-    fn tool_definitions_cover_all_five_tools() {
+    fn tool_definitions_cover_all_six_tools() {
         let definitions = tool_definitions();
         let names: Vec<&str> = definitions
             .as_array()
@@ -464,7 +532,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
             .collect();
-        assert_eq!(names, vec!["recent_emails", "search_emails", "top_contacts", "list_contacts", "list_tasks"]);
+        assert_eq!(names, vec!["recent_emails", "search_emails", "top_contacts", "list_contacts", "list_tasks", "upcoming_events"]);
         // The search tool's query is required; the row caps stay bounded.
         let search = &definitions[1]["function"]["parameters"];
         assert_eq!(search["required"][0], "query");
@@ -505,6 +573,53 @@ mod tests {
         let all = list_tasks(&ctx, &serde_json::json!({"status": "all", "limit": 2})).unwrap();
         assert_eq!(all.as_array().unwrap().len(), 2, "the limit is honored");
         assert_eq!(all[0]["summary"], "done", "completed tasks join when asked");
+    }
+
+    fn occurrence(uid: &str, start: DateTime<Utc>) -> EventOccurrence {
+        EventOccurrence {
+            uid: lookout_core::EventUid(uid.to_string()),
+            calendar_id: lookout_core::CalendarId("cal-1".to_string()),
+            summary: Some(uid.to_string()),
+            description: None,
+            location: None,
+            start,
+            end: start + chrono::Duration::hours(1),
+            all_day: false,
+            rrule: None,
+            recurrence_id: None,
+            exdates: Vec::new(),
+            master_start: None,
+            master_end: None,
+            href: None,
+            etag: None,
+            master_href: None,
+            master_etag: None,
+            attendees: Vec::new(),
+            organizer: None,
+            categories: Vec::new(),
+            sensitivity: Default::default(),
+            transparency: Default::default(),
+            reminder_minutes_before: None,
+            conference_url: None,
+        }
+    }
+
+    #[test]
+    fn upcoming_events_filters_to_checked_calendars_sorts_and_carries_a_link() {
+        let mut ctx = context();
+        let soon = occurrence("soon", Utc::now() + chrono::Duration::hours(1));
+        let later = occurrence("later", Utc::now() + chrono::Duration::days(2));
+        let mut hidden = occurrence("hidden", Utc::now() + chrono::Duration::hours(2));
+        hidden.calendar_id = lookout_core::CalendarId("cal-hidden".to_string());
+        ctx.occurrences = vec![later.clone(), hidden, soon.clone()];
+        ctx.checked_calendars = std::iter::once(soon.calendar_id.clone()).collect();
+
+        let result = upcoming_events(&ctx, &serde_json::json!({})).unwrap();
+        let entries = result.as_array().unwrap();
+        assert_eq!(entries.len(), 2, "the unchecked calendar's event is excluded");
+        assert_eq!(entries[0]["summary"], "soon", "soonest first");
+        assert_eq!(entries[1]["summary"], "later");
+        assert!(entries[0]["link"].as_str().unwrap().starts_with("lookout-action:open-event?data="), "an event carries a ready-to-use deep link");
     }
 
     #[tokio::test]
@@ -588,7 +703,7 @@ mod tests {
         });
 
         let (_, cache) = temp_cache_with_messages();
-        let ctx = ToolContext { caches: vec![cache], contacts: Vec::new(), tasks: Vec::new() };
+        let ctx = ToolContext { caches: vec![cache], ..context() };
         let result = chat_with_tools(&format!("http://127.0.0.1:{port}"), "sk-test", "gpt-4o", "What's new in my inbox?", SYSTEM_PROMPT, &ctx).await;
         let requests = server.await.unwrap();
         (result, requests)
@@ -681,11 +796,7 @@ mod tests {
     #[tokio::test]
     async fn recent_emails_returns_newest_first_with_labels() {
         let (account_id, cache) = temp_cache_with_messages();
-        let ctx = ToolContext {
-            caches: vec![cache],
-            contacts: Vec::new(),
-            tasks: Vec::new(),
-        };
+        let ctx = ToolContext { caches: vec![cache], ..context() };
 
         let result = recent_emails(&ctx, &serde_json::json!({})).await.unwrap();
         let entries = result.as_array().unwrap();
@@ -695,6 +806,7 @@ mod tests {
         assert_eq!(entries[1]["unread"], true);
         assert_eq!(entries[0]["from"], "Ada Lovelace <ada@example.org>");
         assert_eq!(entries[0]["mailbox"], format!("{}:INBOX", account_id.0));
+        assert!(entries[0]["link"].as_str().unwrap().starts_with("lookout-action:open-message?data="), "a message carries a ready-to-use deep link");
 
         let limited = recent_emails(&ctx, &serde_json::json!({"limit": 1})).await.unwrap();
         assert_eq!(limited.as_array().unwrap().len(), 1);
@@ -703,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn search_emails_finds_body_and_subject_terms() {
         let (_, cache) = temp_cache_with_messages();
-        let ctx = ToolContext { caches: vec![cache], contacts: Vec::new(), tasks: Vec::new() };
+        let ctx = ToolContext { caches: vec![cache], ..context() };
 
         let by_subject = search_emails(&ctx, &serde_json::json!({"query": "truffle"})).await.unwrap();
         assert_eq!(by_subject.as_array().unwrap().len(), 1);
@@ -746,7 +858,7 @@ mod tests {
         second.replace_messages(&second_mailbox, UidValidity(1), std::slice::from_ref(&message)).unwrap();
         second.record_addresses(std::slice::from_ref(&message)).unwrap();
 
-        let ctx = ToolContext { caches: vec![cache, second], contacts: Vec::new(), tasks: Vec::new() };
+        let ctx = ToolContext { caches: vec![cache, second], ..context() };
         let result = top_contacts(&ctx, &serde_json::json!({})).await.unwrap();
         let entries = result.as_array().unwrap();
         let ada = entries.iter().find(|entry| entry["address"] == "ada@example.org").unwrap();

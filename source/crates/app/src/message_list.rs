@@ -1606,6 +1606,106 @@ impl MessageListModel {
             MessageItem::Section(_) | MessageItem::Thread(_) => None,
         }
     }
+
+    /// Selects the message identified by `(mailbox, uid)`, force-expanding
+    /// its containing date section and/or thread first if either is
+    /// currently collapsed - a deep link (an AI Chat reply's link, say)
+    /// naming a message under a collapsed header would otherwise have no
+    /// flat row position to select. Returns whether the message was found
+    /// (and thus selected) at all.
+    ///
+    /// Searches `self.sections`/`self.threads` directly rather than the flat
+    /// `self.selection` - those per-bucket/per-thread stores are populated
+    /// regardless of the containing row's current expand state, so the
+    /// message can be located without expanding anything first; only
+    /// *selecting* it afterward needs the row to actually be flat.
+    ///
+    /// A message hidden by the active `ListFilter` (e.g. "Unread only")
+    /// isn't in these stores at all - an accepted v1 limitation, not a bug:
+    /// this returns `false` rather than silently resetting the user's
+    /// filter as a side effect of a chat link click.
+    pub fn select_uid(&self, mailbox: &MailboxId, uid: Uid) -> bool {
+        let mut target_section: Option<DateBucket> = None;
+        let mut target_thread: Option<ThreadId> = None;
+        let mut located = false;
+
+        'search: for i in 0..self.root.n_items() {
+            let Some(boxed) = self.root.item(i).and_downcast::<glib::BoxedAnyObject>() else { continue };
+            let item = boxed.borrow::<MessageItem>();
+            match &*item {
+                // Flat (ungrouped) mode: messages sit directly at root.
+                MessageItem::Message(summary) if summary.mailbox == *mailbox && summary.uid == uid => {
+                    located = true;
+                    break 'search;
+                }
+                MessageItem::Section(section) => {
+                    let sections = self.sections.borrow();
+                    let Some(tracked) = sections.get(&section.bucket) else { continue };
+                    for j in 0..tracked.store.n_items() {
+                        let Some(sboxed) = tracked.store.item(j).and_downcast::<glib::BoxedAnyObject>() else { continue };
+                        let sitem = sboxed.borrow::<MessageItem>();
+                        match &*sitem {
+                            MessageItem::Message(summary) if summary.mailbox == *mailbox && summary.uid == uid => {
+                                target_section = Some(section.bucket);
+                                located = true;
+                            }
+                            MessageItem::Thread(thread) => {
+                                let threads = self.threads.borrow();
+                                if let Some(tstore) = threads.get(&thread.id) {
+                                    for k in 0..tstore.store.n_items() {
+                                        let Some(mboxed) = tstore.store.item(k).and_downcast::<glib::BoxedAnyObject>() else { continue };
+                                        let mitem = mboxed.borrow::<MessageItem>();
+                                        if let MessageItem::Message(summary) = &*mitem {
+                                            if summary.mailbox == *mailbox && summary.uid == uid {
+                                                target_section = Some(section.bucket);
+                                                target_thread = Some(thread.id.clone());
+                                                located = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        if located {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if located {
+                break 'search;
+            }
+        }
+
+        if !located {
+            return false;
+        }
+
+        let mut changed = false;
+        if let Some(bucket) = target_section {
+            if self.collapsed.borrow_mut().remove(&bucket) {
+                changed = true;
+            }
+        }
+        if let Some(id) = &target_thread {
+            if self.collapsed_threads.borrow_mut().remove(id) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.apply_expansion();
+        }
+
+        for i in 0..self.selection.n_items() {
+            if self.message_at(i) == Some((mailbox.clone(), uid)) {
+                self.selection.select_item(i, true);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// The date bucket a root-level `TreeListRow` heads, or `None` if the row is
@@ -2056,6 +2156,48 @@ mod tests {
             guarded.repopulate_unified_slice(&MailboxId("b:INBOX".into()), wrong_mailbox, SortKey::Date, true)
         }));
         assert!(result.is_err(), "repopulate_unified_slice accepted a message from the wrong mailbox");
+
+        // --- select_uid finds a message hidden by a collapsed date section,
+        // force-expanding it before selecting the row. Own model, appended
+        // here for the same gtk::init()-once-per-process reason as the rest
+        // of this function. ---
+        let mailbox = MailboxId("acct:INBOX".into());
+        let section_target = MessageListModel::build();
+        section_target.repopulate(vec![summary(1, today), summary(2, older)], SortKey::Date, true);
+        section_target.tree.child_row(1).expect("Older row").set_expanded(false);
+        // A genuine content change re-triggers `capture_collapsed`,
+        // snapshotting the collapse into `self.collapsed` - an identical
+        // repopulate would short-circuit as a no-op and never capture it.
+        section_target.repopulate(vec![summary(1, today), summary(3, today), summary(2, older)], SortKey::Date, true);
+        assert!(!section_target.tree.child_row(1).expect("Older row").is_expanded(), "sanity: Older starts collapsed");
+
+        assert!(section_target.select_uid(&mailbox, Uid(2)), "a message under a collapsed section must still be found");
+        assert!(section_target.tree.child_row(1).expect("Older row").is_expanded(), "select_uid must expand the collapsed section");
+        assert_eq!(section_target.selected_summary().map(|s| s.uid), Some(Uid(2)));
+        assert!(!section_target.select_uid(&mailbox, Uid(999)), "a uid absent from the list must report not-found");
+
+        // --- select_uid finds a message inside a collapsed thread,
+        // force-expanding both its section and the thread ---
+        let thread_target = MessageListModel::build();
+        let root_msg = in_thread(summary(1, yesterday), "t");
+        let reply_msg = in_thread(summary(2, today), "t");
+        thread_target.repopulate(vec![reply_msg, root_msg], SortKey::Date, true);
+        let thread_row = thread_target.tree.child_row(0).expect("Today row").child_row(0).expect("thread row");
+        thread_row.set_expanded(false);
+        // Same reasoning as above: a genuine content change is needed to
+        // re-trigger `capture_collapsed` and snapshot the collapse.
+        thread_target.repopulate(
+            vec![in_thread(summary(1, yesterday), "t"), in_thread(summary(2, today), "t"), summary(3, today)],
+            SortKey::Date,
+            true,
+        );
+        let thread_row = thread_target.tree.child_row(0).expect("Today row").child_row(0).expect("thread row");
+        assert!(!thread_row.is_expanded(), "sanity: the thread starts collapsed");
+
+        assert!(thread_target.select_uid(&mailbox, Uid(1)), "a message inside a collapsed thread must still be found");
+        let thread_row = thread_target.tree.child_row(0).expect("Today row").child_row(0).expect("thread row");
+        assert!(thread_row.is_expanded(), "select_uid must expand the collapsed thread");
+        assert_eq!(thread_target.selected_summary().map(|s| s.uid), Some(Uid(1)));
     }
 
     #[test]
