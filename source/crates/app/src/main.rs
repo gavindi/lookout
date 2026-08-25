@@ -4,6 +4,7 @@
 /// Software released under the GPL3 license
 mod app_config;
 mod assistant;
+mod assistant_tools;
 mod background;
 mod background_image;
 mod calendar_colors;
@@ -17,6 +18,8 @@ mod folder_tree;
 mod goa_calendar_credentials;
 mod goa_credentials;
 mod google_tasks;
+#[cfg(test)]
+mod gtk_test;
 mod graph_pin;
 mod identities;
 mod last_view;

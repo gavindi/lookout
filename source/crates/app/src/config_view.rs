@@ -1252,15 +1252,12 @@ mod tests {
     fn settings_window_reopen_reparents_the_config_root() {
         // Same convention as the window.rs GTK tests: libtest gives each
         // test its own thread, GTK may only be initialized on one - if
-        // another test thread got there first, skip rather than panic.
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            eprintln!("skipping: GTK initialized on another test thread");
-            return;
-        }
-        if gtk::init().is_err() {
-            // Headless environments (CI) can't initialize GTK; the
-            // lifecycle is exercised where a display exists.
-            eprintln!("skipping: no display available");
+        // another test thread got there first, skip rather than panic. The
+        // shared `gtk_test::gtk_ready` lock also serializes the init itself.
+        // Headless environments (CI) can't initialize GTK at all; the
+        // lifecycle is exercised where a display exists.
+        if !crate::gtk_test::gtk_ready() {
+            eprintln!("skipping: no display available, or GTK initialized on another test thread");
             return;
         }
         let config_view = Rc::new(build());

@@ -1,6 +1,7 @@
 //! The Lookout module: a dashboard tab snapshotting the user's connected
-//! accounts - people most contacted, emails by time of day, outstanding
-//! tasks, and upcoming calendar events. Follows the same
+//! accounts - an AI Chat card (a prompt field wired by the caller to the
+//! configured assistant API), people most contacted, emails by time of day,
+//! outstanding tasks, and upcoming calendar events. Follows the same
 //! data-in/widget-state-out convention as `tasks_view`: the caller owns
 //! the data and pushes it via [`LookoutView::set_data`]; the view owns
 //! only widget state. Selection and ordering logic live in pure,
@@ -16,6 +17,7 @@ use std::rc::Rc;
 use chrono::{DateTime, Duration, Local, NaiveDateTime};
 use gtk::prelude::*;
 use lookout_core::{CalendarId, CalendarTask, EmailAddress, EventOccurrence};
+use webkit::prelude::*;
 
 use crate::calendar_colors::{CalendarColorMap, DEFAULT_CHECK_COLOR};
 use crate::tasks_view::{self, ActivateHandler, TaskBucket, ToggleHandler};
@@ -23,7 +25,7 @@ use crate::tasks_view::{self, ActivateHandler, TaskBucket, ToggleHandler};
 /// How many rows each dashboard section shows. `TOP_CONTACTS_LIMIT` is
 /// `pub(crate)` because the caller unions each account's top list and needs
 /// the same cap to re-rank by.
-pub(crate) const TOP_CONTACTS_LIMIT: usize = 8;
+pub(crate) const TOP_CONTACTS_LIMIT: usize = 5;
 const OUTSTANDING_TASKS_LIMIT: usize = 8;
 const UPCOMING_EVENTS_LIMIT: usize = 10;
 /// How far ahead the events section looks (bounded by what the sessions
@@ -96,6 +98,16 @@ pub fn upcoming_occurrences<'a>(
 /// about the window or the session routing.
 pub struct LookoutView {
     pub root: gtk::ScrolledWindow,
+    /// The AI Chat card's prompt field, Go button, and reply view. The
+    /// caller wires the button (and the entry's Enter key) to the assistant
+    /// API and loads each reply into `chat_output` as HTML (the output of
+    /// [`chat_reply_html`], wrapped in the reading pane's CSP document by
+    /// the caller, so a reply can carry formatting and graphics but never
+    /// scripts or navigation); the dashboard's data repaints never touch
+    /// these widgets, so an in-flight conversation survives every refresh.
+    pub chat_entry: gtk::Entry,
+    pub chat_button: gtk::Button,
+    pub chat_output: webkit::WebView,
     contacts_list: gtk::Box,
     histogram_area: gtk::DrawingArea,
     histogram: Rc<RefCell<[i64; 24]>>,
@@ -106,15 +118,51 @@ pub struct LookoutView {
     activate: RefCell<Option<ActivateHandler>>,
 }
 
-/// Builds a fresh Lookout dashboard: a scrollable two-column grid of four
-/// cards (contacts, hour histogram, outstanding tasks, upcoming events),
-/// each with an empty-state placeholder.
+/// Builds a fresh Lookout dashboard: a scrollable two-column grid - left,
+/// the AI Chat card; right, the hour histogram over people-most-contacted
+/// over outstanding-tasks over upcoming events - each card with an
+/// empty-state placeholder.
 pub fn build_lookout_view() -> LookoutView {
     install_lookout_css();
 
-    let (contacts_card, contacts_list) = section_card("People most contacted");
+    // --- AI Chat: a prompt field (placeholder "Summarize my inbox") with
+    // a green Go button, over the assistant's reply rendered in a read-only
+    // WebKit view - so the agent can answer with formatted text, tables,
+    // and embedded graphics (markdown images or inline SVG in a ```html
+    // fence) instead of a plain label. The caller loads each reply through
+    // the same CSP wrapper as the reading pane, keeping scripts, frames,
+    // and navigation off whatever HTML arrives. The card (and the reply
+    // view inside it) expands vertically so the AI Chat card fills the
+    // whole height of its column.
+    let (chat_card, chat_box) = section_card("AI Chat");
+    chat_card.set_vexpand(true);
+    chat_box.set_vexpand(true);
+    let chat_entry = gtk::Entry::builder().placeholder_text("Summarize my inbox").hexpand(true).build();
+    let chat_button = gtk::Button::with_label("Go");
+    chat_button.add_css_class("suggested-action");
+    chat_button.set_tooltip_text(Some("Ask the configured assistant"));
+    let chat_input_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    chat_input_row.append(&chat_entry);
+    chat_input_row.append(&chat_button);
+    chat_box.append(&chat_input_row);
+    let chat_settings = webkit::Settings::new();
+    chat_settings.set_enable_javascript(false);
+    chat_settings.set_enable_developer_extras(false);
+    let chat_output = webkit::WebView::builder()
+        .settings(&chat_settings)
+        .editable(false)
+        .height_request(220)
+        .vexpand(true)
+        .build();
+    // The card sits on the dashboard's dark scrim; a transparent view
+    // background (plus the document's own `background: transparent` rule,
+    // see `chat_document`) keeps WebKit from painting its default white.
+    chat_output.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+    chat_output.load_html(&chat_empty_document(), None);
+    chat_box.append(&chat_output);
+
     let (histogram_card, histogram_box) = section_card("Emails by time of day");
-    // The histogram card sits beside the contacts card, which is usually
+    // The histogram card sits above the contacts card, which is usually
     // taller; expand the box and the chart area so the painted chart fills
     // the card instead of leaving a dead band below the caption.
     histogram_box.set_vexpand(true);
@@ -129,19 +177,21 @@ pub fn build_lookout_view() -> LookoutView {
     let histogram_caption = gtk::Label::builder().css_classes(["dim-label", "caption"]).xalign(0.0).build();
     histogram_box.append(&histogram_caption);
 
+    let (contacts_card, contacts_list) = section_card("People most contacted");
     let (tasks_card, tasks_list) = section_card("Outstanding tasks");
     let (events_card, events_list) = section_card("Upcoming events");
 
-    let row_top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    row_top.append(&contacts_card);
-    row_top.append(&histogram_card);
-    let row_bottom = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    row_bottom.append(&tasks_card);
-    row_bottom.append(&events_card);
+    let column_left = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).hexpand(true).vexpand(true).build();
+    column_left.append(&chat_card);
+    let column_right = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).hexpand(true).vexpand(true).build();
+    column_right.append(&histogram_card);
+    column_right.append(&contacts_card);
+    column_right.append(&tasks_card);
+    column_right.append(&events_card);
 
-    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
-    content.append(&row_top);
-    content.append(&row_bottom);
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    content.append(&column_left);
+    content.append(&column_right);
     let root = gtk::ScrolledWindow::builder()
         .child(&content)
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -150,6 +200,9 @@ pub fn build_lookout_view() -> LookoutView {
 
     LookoutView {
         root,
+        chat_entry,
+        chat_button,
+        chat_output,
         contacts_list,
         histogram_area,
         histogram,
@@ -434,6 +487,277 @@ fn install_lookout_css() {
     });
 }
 
+/// The assistant's reply as renderable HTML: a tiny markdown-to-HTML
+/// renderer over fully escaped text, so a reply can never smuggle in
+/// markup the caller didn't ask for. The caller wraps the result in the
+/// reading pane's CSP document before loading it into the chat WebView -
+/// this function is deliberately *not* the security boundary, only the
+/// formatting pass.
+///
+/// Supported: `#`-`####` headings, `**bold**`, `*italic*`, `` `code` ``
+/// and fenced ``` fences, `[text](url)` links, `![alt](url)` images,
+/// `-`/`*` bullet and `1.` numbered lists, and blank-line paragraphs with
+/// single newlines as line breaks. A fenced block tagged ```html is the
+/// one passthrough: its contents are inserted verbatim (still under the
+/// caller's CSP), which is how the agent embeds graphics - inline SVG,
+/// `<table>`s, `<img>` - that markdown can't express.
+pub fn chat_reply_html(reply: &str) -> String {
+    let mut out = String::new();
+    let mut paragraph = String::new();
+    let mut lines = reply.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim().is_empty() {
+            flush_paragraph(&mut paragraph, &mut out);
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            flush_paragraph(&mut paragraph, &mut out);
+            let fence_lang = trimmed.trim_start_matches('`').trim();
+            let mut code: Vec<&str> = Vec::new();
+            for code_line in lines.by_ref() {
+                if code_line.trim_start().starts_with("```") {
+                    break;
+                }
+                code.push(code_line);
+            }
+            let code_text = code.join("\n");
+            if fence_lang.eq_ignore_ascii_case("html") {
+                // The graphics passthrough: verbatim HTML, CSP-guarded by
+                // the caller when it loads the document.
+                out.push_str(&code_text);
+                out.push('\n');
+            } else {
+                out.push_str("<pre><code>");
+                out.push_str(&escape_html(&code_text));
+                out.push_str("</code></pre>\n");
+            }
+            continue;
+        }
+        if let Some((level, content)) = heading(trimmed) {
+            flush_paragraph(&mut paragraph, &mut out);
+            out.push_str(&format!("<h{level}>{}</h{level}>\n", inline_html(content)));
+            continue;
+        }
+        if let Some((ordered, content)) = list_item(trimmed) {
+            flush_paragraph(&mut paragraph, &mut out);
+            let mut items: Vec<String> = vec![inline_html(content)];
+            while let Some(next) = lines.peek().map(|l| l.trim_start()) {
+                let Some((same_kind, item_content)) = list_item(next) else { break };
+                if same_kind != ordered {
+                    break;
+                }
+                items.push(inline_html(item_content));
+                lines.next();
+            }
+            let tag = if ordered { "ol" } else { "ul" };
+            out.push_str(&format!("<{tag}>\n"));
+            for item in &items {
+                out.push_str(&format!("<li>{item}</li>\n"));
+            }
+            out.push_str(&format!("</{tag}>\n"));
+            continue;
+        }
+        if !paragraph.is_empty() {
+            paragraph.push('\n');
+        }
+        paragraph.push_str(&inline_html(trimmed));
+    }
+    flush_paragraph(&mut paragraph, &mut out);
+    out
+}
+
+/// The full document the caller loads into the chat WebView: a rendered
+/// reply (`chat_reply_html` output or a plain status string) inside the
+/// reading pane's CSP wrapper at the images-allowed level - remote images
+/// may load, everything else remote stays blocked - with an explicit
+/// `background: transparent` rule so the card shows the dashboard's dark
+/// scrim behind the reply instead of WebKit's default white, and a grey
+/// default text colour (`#e5e5e5`, the 90% grey of the CSS/SVG grey ramp)
+/// so uncoloured reply text is readable on that scrim without being stark
+/// white. Links keep the theme's accent via the `a { color: ... }` from
+/// the UA stylesheet; everything the agent styles itself still wins.
+pub fn chat_document(html: &str) -> String {
+    let styled = format!("<style>html, body {{ background: transparent; color: #e5e5e5; }}</style>{html}");
+    crate::window::wrap_message_with_csp(&styled, true, false)
+}
+
+/// The empty-state document shown in the chat view before the first
+/// question is asked: no placeholder text, just the assistant robot glyph
+/// centred in the view. The artwork's strokes are drawn black (the SVG's
+/// own `stroke-opacity="0.9"`), so the document lightens it with an
+/// `invert(1)` filter plus a 60% opacity - the app's `flat-dark` dashboard
+/// is a dark pane, and black-on-dark would be invisible (the same reasoning
+/// that drew the empty-folder bird white). The first real load
+/// ("Asking the assistant…", then the reply) replaces this document.
+pub fn chat_empty_document() -> String {
+    let fragment = concat!(
+        "<style>",
+        "body { margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100%; }",
+        ".chat-empty-icon { width: 88px; height: 88px; opacity: 0.6; filter: invert(1); }",
+        "</style>",
+        "<svg class=\"chat-empty-icon\" viewBox=\"0 0 400 400\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">",
+        "<path d=\"M97.8357 54.6682C177.199 59.5311 213.038 52.9891 238.043 52.9891C261.298 52.9891 272.24 129.465 262.683 152.048C253.672 173.341 100.331 174.196 93.1919 165.763C84.9363 156.008 89.7095 115.275 89.7095 101.301\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M98.3318 190.694C-10.6597 291.485 121.25 273.498 148.233 295.083\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M98.3301 190.694C99.7917 213.702 101.164 265.697 100.263 272.898\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M208.308 136.239C208.308 131.959 208.308 127.678 208.308 123.396\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M177.299 137.271C177.035 133.883 177.3 126.121 177.3 123.396\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M203.398 241.72C352.097 239.921 374.881 226.73 312.524 341.851\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M285.55 345.448C196.81 341.85 136.851 374.229 178.223 264.504\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M180.018 345.448C160.77 331.385 139.302 320.213 120.658 304.675\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M218.395 190.156C219.024 205.562 219.594 220.898 219.594 236.324\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M218.395 190.156C225.896 202.037 232.97 209.77 241.777 230.327\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M80.1174 119.041C75.5996 120.222 71.0489 119.99 66.4414 120.41\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M59.5935 109.469C59.6539 117.756 59.5918 125.915 58.9102 134.086\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M277.741 115.622C281.155 115.268 284.589 114.823 287.997 114.255\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M291.412 104.682C292.382 110.109 292.095 115.612 292.095 121.093\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "<path d=\"M225.768 116.466C203.362 113.993 181.657 115.175 160.124 118.568\" stroke=\"#000000\" stroke-opacity=\"0.9\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+        "</svg>",
+    );
+    chat_document(fragment)
+}
+
+/// Flushes a completed paragraph: `<p>` around its inline HTML, with each
+/// source newline a `<br>` (a blank line ends a paragraph, a single
+/// newline breaks the line).
+fn flush_paragraph(paragraph: &mut String, out: &mut String) {
+    if paragraph.is_empty() {
+        return;
+    }
+    out.push_str("<p>");
+    for (index, line) in paragraph.split('\n').enumerate() {
+        if index > 0 {
+            out.push_str("<br>");
+        }
+        out.push_str(line);
+    }
+    out.push_str("</p>\n");
+    paragraph.clear();
+}
+
+/// `#`-`####` heading lines: `Some((level, content))` when the line is one,
+/// with the marker stripped.
+fn heading(line: &str) -> Option<(usize, &str)> {
+    let hashes = line.chars().take_while(|ch| *ch == '#').count();
+    if (1..=4).contains(&hashes) && line[hashes..].starts_with(' ') {
+        Some((hashes, &line[hashes + 1..]))
+    } else {
+        None
+    }
+}
+
+/// A list-item line: `Some((ordered, content))` for `- ` / `* ` bullets
+/// (ordered = false) and any `N. `-style numbered item (ordered = true).
+/// The rendered `<ol>` re-numbers, so the source's specific digits don't
+/// need preserving.
+fn list_item(line: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        return Some((false, rest));
+    }
+    let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits > 0 && line[digits..].starts_with(". ") {
+        return Some((true, &line[digits + 2..]));
+    }
+    None
+}
+
+/// One line's inline formatting: code spans first (their content is
+/// escaped verbatim, so markup inside them stays literal), then images and
+/// links, then `**bold**` / `*italic*`. Everything else is escaped, so the
+/// output's only tags are the ones this function writes.
+fn inline_html(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        if let Some(after_backtick) = rest.strip_prefix('`') {
+            let Some(end) = after_backtick.find('`') else {
+                out.push_str(&escape_html(rest));
+                break;
+            };
+            out.push_str("<code>");
+            out.push_str(&escape_html(&after_backtick[..end]));
+            out.push_str("</code>");
+            rest = &after_backtick[end + 1..];
+            continue;
+        }
+        if let Some(after_bang) = rest.strip_prefix("![") {
+            if let Some((alt, (url, after))) = bracket_paren(after_bang) {
+                out.push_str(&format!(
+                    "<img src=\"{}\" alt=\"{}\">",
+                    escape_attribute(url),
+                    escape_attribute(alt)
+                ));
+                rest = after;
+                continue;
+            }
+        }
+        if let Some(after_bracket) = rest.strip_prefix('[') {
+            if let Some((text, (url, after))) = bracket_paren(after_bracket) {
+                out.push_str(&format!("<a href=\"{}\">{}</a>", escape_attribute(url), inline_html(text)));
+                rest = after;
+                continue;
+            }
+        }
+        if let Some(after_stars) = rest.strip_prefix("**") {
+            if let Some(end) = after_stars.find("**") {
+                out.push_str("<strong>");
+                out.push_str(&inline_html(&after_stars[..end]));
+                out.push_str("</strong>");
+                rest = &after_stars[end + 2..];
+                continue;
+            }
+        }
+        if let Some(after_star) = rest.strip_prefix('*') {
+            if let Some(end) = after_star.find('*') {
+                out.push_str("<em>");
+                out.push_str(&escape_html(&after_star[..end]));
+                out.push_str("</em>");
+                rest = &after_star[end + 1..];
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("rest is non-empty");
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// Parses the `text](url)` half of a `[text](url)` / `![alt](url)`
+/// construct, given the text already past the opening `[`: the text up to
+/// the closing `]`, then the URL between the following `(` and `)`.
+fn bracket_paren(s: &str) -> Option<(&str, (&str, &str))> {
+    let close = s.find(']')?;
+    let after = s[close + 1..].strip_prefix('(')?;
+    let end = after.find(')')?;
+    Some((&s[..close], (&after[..end], &after[end + 1..])))
+}
+
+/// Escapes text for the document body: `&`, `<`, `>` only, so the renderer
+/// keeps its own tags while everything the reply said stays literal.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escapes text for a quoted attribute value: `escape_html` plus quotes.
+fn escape_attribute(s: &str) -> String {
+    escape_html(s).replace('"', "&quot;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +861,75 @@ mod tests {
         let limited = upcoming_occurrences([&occurrences[1], &hidden, &occurrences[4]], now, Duration::days(14), &checked, 1);
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].summary.as_deref(), Some("soon"));
+    }
+
+    #[test]
+    fn chat_reply_html_escapes_plain_text_and_builds_paragraphs() {
+        // Everything the reply says is escaped, so a reply can never smuggle
+        // in its own tags.
+        let html = chat_reply_html("Hello <b>world</b> & friends\nsecond line\n\nNew paragraph.");
+        assert_eq!(html, "<p>Hello &lt;b&gt;world&lt;/b&gt; &amp; friends<br>second line</p>\n<p>New paragraph.</p>\n");
+    }
+
+    #[test]
+    fn chat_reply_html_renders_headings_bold_italic_links_and_code() {
+        let html = chat_reply_html("# Heading\n\n**bold** and *italic* and `code` and [a link](https://example.org).");
+        assert_eq!(
+            html,
+            "<h1>Heading</h1>\n<p><strong>bold</strong> and <em>italic</em> and <code>code</code> and <a href=\"https://example.org\">a link</a>.</p>\n"
+        );
+    }
+
+    #[test]
+    fn chat_reply_html_escapes_fenced_code_but_passes_html_fences_verbatim() {
+        let code = chat_reply_html("```\nlet x = 1 < 2;\n```");
+        assert_eq!(code, "<pre><code>let x = 1 &lt; 2;</code></pre>\n");
+
+        // The ```html fence is the graphics passthrough: verbatim, so the
+        // agent can embed SVG/tables/imgs that markdown can't express (the
+        // caller's CSP wrapper is the actual safety boundary).
+        let graphic = chat_reply_html("```html\n<svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n```");
+        assert_eq!(graphic, "<svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n");
+    }
+
+    #[test]
+    fn chat_reply_html_renders_bullet_and_numbered_lists() {
+        let bullets = chat_reply_html("- one\n- two\n\n1. first\n2. second");
+        assert_eq!(bullets, "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n<ol>\n<li>first</li>\n<li>second</li>\n</ol>\n");
+    }
+
+    #[test]
+    fn chat_reply_html_renders_images_and_escapes_their_attributes() {
+        let html = chat_reply_html("![a \"quote\" & chart](https://example.org/chart?x=1&y=2)");
+        assert_eq!(
+            html,
+            "<p><img src=\"https://example.org/chart?x=1&amp;y=2\" alt=\"a &quot;quote&quot; &amp; chart\"></p>\n"
+        );
+    }
+
+    #[test]
+    fn chat_reply_html_handles_empty_and_code_only_replies() {
+        assert_eq!(chat_reply_html(""), "");
+        assert_eq!(chat_reply_html("   \n\n"), "");
+    }
+
+    #[test]
+    fn chat_document_leads_with_the_csp_meta_and_makes_the_background_transparent() {
+        let doc = chat_document("<p>hi</p>");
+        assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\" content=\""), "the CSP meta leads the document");
+        assert!(doc.contains("img-src * data: cid:"), "remote images are allowed at the chat level");
+        assert!(doc.contains("script-src 'none'"), "scripts stay off");
+        assert!(doc.ends_with("<style>html, body { background: transparent; color: #e5e5e5; }</style><p>hi</p>"), "the transparent-background and grey-text rules ride in ahead of the content");
+    }
+
+    #[test]
+    fn chat_empty_document_centres_the_robot_glyph_with_no_placeholder_text() {
+        let doc = chat_empty_document();
+        assert!(!doc.contains("reply appears here"), "the placeholder text is gone");
+        assert!(doc.contains("class=\"chat-empty-icon\""), "the robot glyph is present");
+        assert!(doc.contains("display: flex; align-items: center; justify-content: center"), "the glyph is centred");
+        assert!(doc.contains("filter: invert(1)"), "the black-stroked artwork is lightened for the dark pane");
+        assert!(doc.contains("stroke-opacity=\"0.9\""), "the artwork's own strokes ride along");
+        assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""), "the empty state loads through the same CSP document");
     }
 }

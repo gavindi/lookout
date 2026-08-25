@@ -1741,12 +1741,13 @@ mod tests {
     /// collapse surviving rebuilds, and the flat (non-date) layout.
     ///
     /// One test rather than three because GTK may only be initialised on a
-    /// single thread, and libtest gives each `#[test]` its own - so several
-    /// GTK-touching tests race to `gtk::init()` and whichever loses panics.
-    /// Skipped when the host has no display to initialise against.
+    /// single thread, and libtest gives each `#[test]` its own - so the
+    /// GTK-touching tests contend on a shared init lock and every thread
+    /// that doesn't own GTK skips (see `gtk_test::gtk_ready`). Skipped when
+    /// the host has no display to initialise against.
     #[test]
     fn tree_model_expansion_and_layout() {
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
         let today = Utc::now();

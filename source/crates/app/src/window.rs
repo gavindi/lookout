@@ -7104,6 +7104,72 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
     }
 
+    // --- Lookout tab → AI Chat: the card's Go button (and the prompt
+    // field's Enter key) asks the configured assistant - the Settings →
+    // Assistant URL, agent, and keyring token - and shows the reply in the
+    // card's HTML output view (markdown-formatted by `chat_reply_html`,
+    // loaded through the reading pane's CSP wrapper so the agent can use
+    // formatting and graphics but never scripts). The prompt defaults to
+    // "Summarize my inbox" when the field is left empty. The assistant
+    // answers with function calling over the same local data the dashboard
+    // shows: the mail caches, the contact snapshots, and the merged task
+    // set (see `assistant_tools`), captured fresh at ask time so the reply
+    // reflects the latest syncs.
+    {
+        let settings = state.borrow().settings.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let worker = worker.clone();
+        let chat_entry = lookout_view.chat_entry.clone();
+        let chat_button = lookout_view.chat_button.clone();
+        let chat_output = lookout_view.chat_output.clone();
+        let chat_button_for_click = chat_button.clone();
+        let chat_entry_for_activate = chat_entry.clone();
+        let ask_assistant: Rc<dyn Fn()> = Rc::new(move || {
+            let prompt = chat_entry.text().trim().to_string();
+            let prompt = if prompt.is_empty() { "Summarize my inbox".to_string() } else { prompt };
+            chat_button.set_sensitive(false);
+            let placeholder = crate::lookout_view::chat_reply_html("Asking the assistant…");
+            chat_output.load_html(&crate::lookout_view::chat_document(&placeholder), None);
+            let context = crate::assistant_tools::ToolContext {
+                caches: state.borrow().accounts.values().filter_map(|h| h.address_cache.clone()).collect(),
+                contacts: state.borrow().contacts_by_account.iter().map(|(id, snapshot)| (id.clone(), snapshot.clone())).collect(),
+                tasks: merged_tasks(&calendar_state),
+            };
+            let url = settings.get_string(crate::settings::ASSISTANT_API_URL);
+            let agent = settings.get_string(crate::settings::ASSISTANT_AGENT);
+            let (result_tx, result_rx) = async_channel::bounded(1);
+            worker.spawn(async move {
+                let result = async {
+                    let token = crate::assistant::load_token().await?.unwrap_or_default();
+                    crate::assistant_tools::chat_with_tools(&url, &token, &agent, &prompt, crate::assistant_tools::SYSTEM_PROMPT, &context).await
+                }
+                .await;
+                let _ = result_tx.send(result).await;
+            });
+            let chat_output = chat_output.clone();
+            let chat_button = chat_button.clone();
+            glib::spawn_future_local(async move {
+                let Ok(result) = result_rx.recv().await else { return };
+                let label = match result {
+                    Ok(reply) => reply,
+                    Err(e) => format!("Failed: {e}"),
+                };
+                let html = crate::lookout_view::chat_reply_html(&label);
+                chat_output.load_html(&crate::lookout_view::chat_document(&html), None);
+                chat_button.set_sensitive(true);
+            });
+        });
+        {
+            let ask_assistant = ask_assistant.clone();
+            chat_button_for_click.connect_clicked(move |_| ask_assistant());
+        }
+        {
+            let ask_assistant = ask_assistant.clone();
+            chat_entry_for_activate.connect_activate(move |_| ask_assistant());
+        }
+    }
+
     // --- Compose button -> new-message composer in the reading pane,
     // "From" = the account owning the selected message (falling back to the
     // currently-open mailbox's account, then any connected account). The
@@ -15325,7 +15391,10 @@ fn message_content_security_policy(images_allowed: bool, all_allowed: bool) -> &
 /// after the opening doctype when one leads the body, so a doctyped message
 /// keeps its standards-mode rendering (a meta before the doctype would trip
 /// the HTML5 parser into quirks mode and the doctype would then be ignored).
-fn wrap_message_with_csp(html: &str, images_allowed: bool, all_allowed: bool) -> String {
+/// `pub(crate)` because the Lookout tab's chat output loads through the same
+/// wrapper (`images_allowed`, never `all_allowed`, so a reply may hotlink
+/// images but nothing else remote).
+pub(crate) fn wrap_message_with_csp(html: &str, images_allowed: bool, all_allowed: bool) -> String {
     let csp_tag = format!(
         "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">",
         message_content_security_policy(images_allowed, all_allowed)
@@ -16612,10 +16681,7 @@ mod tests {
     /// convention as the other GTK-touching tests in this module.
     #[test]
     fn optimistic_remove_and_restore_round_trips_the_list_and_unified_snapshot() {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 
@@ -16666,10 +16732,7 @@ mod tests {
     /// GTK-touching tests in this module.
     #[test]
     fn optimistic_toggle_read_and_restore_round_trips_flags_and_unified_snapshot() {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 
@@ -16721,10 +16784,7 @@ mod tests {
     /// back and clears that stash without touching the other one.
     #[test]
     fn optimistic_toggle_pinned_and_restore_round_trips_flags_and_unified_snapshot() {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 
@@ -16780,10 +16840,7 @@ mod tests {
     /// snapshot actually omits the uid.
     #[test]
     fn reconcile_optimistic_removals_survives_a_stale_racing_sync() {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 
@@ -16833,10 +16890,7 @@ mod tests {
     /// snapshot's flag actually matches.
     #[test]
     fn reconcile_optimistic_flag_changes_survives_a_stale_racing_sync() {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 
@@ -16885,10 +16939,7 @@ mod tests {
     /// stash `reconcile_optimistic_flag_changes` owns.
     #[test]
     fn reconcile_optimistic_pinned_changes_survives_a_stale_racing_sync() {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 
@@ -16956,10 +17007,7 @@ mod tests {
     /// not a false no-op.
     #[test]
     fn patch_previews_updates_the_matching_row_and_leaves_others_untouched() {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 
@@ -16992,10 +17040,7 @@ mod tests {
     /// unrelated change.
     #[test]
     fn patch_previews_ignores_uids_not_in_the_displayed_list() {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 
@@ -17088,10 +17133,7 @@ mod tests {
         // `gtk::init()` panics if another test thread got there first, so the
         // suite skips instead of failing (same self-skipping convention as
         // `theme.rs`'s `gtk_ok`).
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return;
-        }
-        if gtk::init().is_err() {
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
 

@@ -145,16 +145,14 @@ mod tests {
     use gtk::prelude::*;
 
     /// GTK's display-dependent tests can only run when the host has a display
-    /// AND this test's thread is the one that initialized GTK - gtk::init()
+    /// AND this test's thread is the one that initialized GTK - `gtk::init()`
     /// panics (it doesn't return an error) if another test thread got there
     /// first, so the suite skips instead of failing on whichever thread the
     /// harness happened to use. Same self-skipping convention as
-    /// `calendar_view.rs`'s display tests.
+    /// `calendar_view.rs`'s display tests, routed through the shared
+    /// `gtk_test::gtk_ready` lock that serialises the init itself.
     fn gtk_ok() -> bool {
-        if gtk::is_initialized() && !gtk::is_initialized_main_thread() {
-            return false;
-        }
-        gtk::init().is_ok()
+        crate::gtk_test::gtk_ready()
     }
 
     #[test]

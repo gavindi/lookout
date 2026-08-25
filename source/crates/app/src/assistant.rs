@@ -161,11 +161,61 @@ pub async fn list_models(base_url: &str, token: &str) -> Result<Vec<String>, Str
 /// The `/models` endpoint URL for a base URL, tolerating whitespace and a
 /// trailing slash. Empty input is rejected before any network I/O.
 fn models_url(base_url: &str) -> Result<String, String> {
+    endpoint_url(base_url, "models")
+}
+
+/// The endpoint URL for a base URL and relative path (e.g. `models`,
+/// `chat/completions`), tolerating whitespace and a trailing slash on the
+/// base. Empty input is rejected before any network I/O.
+fn endpoint_url(base_url: &str, path: &str) -> Result<String, String> {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("Enter an API URL first".to_string());
     }
-    Ok(format!("{base}/models"))
+    Ok(format!("{base}/{path}"))
+}
+
+/// One raw `POST {base}/chat/completions` round trip, returning the
+/// server's parsed JSON body. The single-turn path (a bare user message,
+/// plain-text reply) is the Lookout tab's caller's job to shape from this:
+/// the tool-calling loop in `assistant_tools` POSTs the same endpoint with
+/// `tools` in the body and reads `tool_calls` back from the reply. The
+/// timeout is long because a request may itself be an LLM-internal
+/// multi-step answer (the loop's per-round-trip budget, not the whole
+/// conversation's).
+pub async fn chat_completions(base_url: &str, token: &str, agent: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if agent.is_empty() {
+        return Err("No agent selected - choose one in Settings → Assistant".to_string());
+    }
+    let url = endpoint_url(base_url, "chat/completions")?;
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .json(body);
+    if !token.is_empty() {
+        request = request.bearer_auth(token);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) if e.is_builder() => return Err(format!("Invalid API URL {url:?}: {e}")),
+        Err(e) => return Err(format!("Connection failed: {e}")),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let mut snippet: String = body.chars().take(200).collect();
+        if snippet.chars().count() < body.chars().count() {
+            snippet.push('…');
+        }
+        let detail = if snippet.trim().is_empty() { String::new() } else { format!(" — {snippet}") };
+        return Err(format!("The server answered {status}{detail}"));
+    }
+    let body: serde_json::Value = match response.json().await {
+        Ok(body) => body,
+        Err(e) => return Err(format!("The server's answer wasn't a JSON chat reply: {e}")),
+    };
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -281,5 +331,56 @@ mod tests {
         let message = result.unwrap_err();
         assert!(message.contains("403"), "the status must be in the message: {message}");
         assert!(message.contains("no access"), "a short body snippet must ride along: {message}");
+    }
+
+    /// Serves one `POST /chat/completions` request, returning the raw reply
+    /// body and the request's request line (so tests can see the path).
+    async fn serve_chat_once(status: &'static str, body: &'static str) -> (Result<serde_json::Value, String>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = socket.write_all(response.as_bytes()).await;
+            request
+        });
+
+        let body = serde_json::json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "Summarize my inbox"}], "stream": false});
+        let result = chat_completions(&format!("http://127.0.0.1:{port}"), "sk-test", "gpt-4o", &body).await;
+        let request = server.await.unwrap();
+        let request_line = request.lines().next().unwrap().to_string();
+        (result, request_line)
+    }
+
+    #[test]
+    fn chat_completions_returns_the_parsed_reply_body() {
+        let (result, request_line) = block_on(serve_chat_once("200 OK", r#"{"choices":[{"message":{"role":"assistant","content":"You have 12 unread messages."}}]}"#));
+        let reply = result.unwrap();
+        assert_eq!(reply["choices"][0]["message"]["content"], "You have 12 unread messages.");
+        assert_eq!(request_line, "POST /chat/completions HTTP/1.1");
+    }
+
+    #[test]
+    fn chat_completions_rejects_missing_agent_or_url_before_any_network_io() {
+        let body = serde_json::json!({"model": "gpt-4o", "messages": []});
+        assert!(block_on(chat_completions("http://127.0.0.1:1", "sk-test", "", &body)).unwrap_err().contains("agent"));
+        assert!(block_on(chat_completions("", "sk-test", "gpt-4o", &body)).unwrap_err().contains("URL"));
+    }
+
+    #[test]
+    fn chat_completions_reports_non_2xx_with_status_and_snippet() {
+        let (result, _) = block_on(serve_chat_once("429 Too Many Requests", "{\"error\":\"slow down\"}"));
+        let message = result.unwrap_err();
+        assert!(message.contains("429"), "the status must be in the message: {message}");
+        assert!(message.contains("slow down"), "a short body snippet must ride along: {message}");
+
+        let (malformed, _) = block_on(serve_chat_once("200 OK", "not json"));
+        assert!(malformed.unwrap_err().contains("JSON"));
     }
 }

@@ -3249,8 +3249,9 @@ mod tests {
         // `load_from_string` swallows parse errors (logging them to GLib), so
         // assert on `to_str()` instead: a provider that failed to parse the
         // rules round-trips to an empty string. Skipped when the test host has
-        // no display to initialise GTK against.
-        if gtk::init().is_err() {
+        // no display to initialise GTK against, or when another test thread
+        // owns GTK (the shared `gtk_test::gtk_ready` lock serialises init).
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
         let provider = gtk::CssProvider::new();
@@ -3272,8 +3273,10 @@ mod tests {
         // The custom checklist rows are plain ToggleButtons with a drawn
         // indicator; verify they seed the given checked state and fire
         // `on_toggle` with the new state as they flip. Skipped when the test
-        // host has no display to initialise GTK against.
-        if gtk::init().is_err() {
+        // host has no display to initialise GTK against, or when another test
+        // thread owns GTK (the shared `gtk_test::gtk_ready` lock serialises
+        // init).
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
         let calls: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3303,8 +3306,9 @@ mod tests {
         // beat the active libadwaita/Yaru theme (precedence). Uses the
         // deprecated GtkStyleContext lookup because gtk4-rs 0.11 does not wrap
         // gtk_widget_css_lookup_color; skipped when the test host has no
-        // display to initialise GTK against.
-        if gtk::init().is_err() {
+        // display to initialise GTK against, or when another test thread owns
+        // GTK (the shared `gtk_test::gtk_ready` lock serialises init).
+        if !crate::gtk_test::gtk_ready() {
             return;
         }
         let provider = gtk::CssProvider::new();

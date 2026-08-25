@@ -1267,6 +1267,54 @@ impl Cache {
         Ok(out)
     }
 
+    /// The newest cached messages across every mailbox of this
+    /// account, most-recent-first - the assistant's "recent mail" feed (the
+    /// Lookout tab's chat can summarize the inbox without touching the
+    /// network, since it only sees what's already been synced). The stored
+    /// dates are RFC 3339 UTC with a trailing `Z`, so the SQL order is
+    /// lexicographic; rows whose date can't be parsed are skipped. Snoozed
+    /// messages stay hidden, matching what the message list and `search`
+    /// show, so the result can fall short of `limit` when the newest rows
+    /// are snoozed.
+    pub fn recent_messages(&self, limit: usize) -> Result<Vec<EmailSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT data FROM messages \
+             ORDER BY json_extract(data, '$.date') DESC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
+        let mut data_by_key: Vec<(String, u32, String)> = Vec::new();
+        for row in rows {
+            let Ok(data) = row else { continue };
+            let Ok(msg) = serde_json::from_str::<EmailSummary>(&data) else {
+                continue;
+            };
+            data_by_key.push((msg.mailbox.0.clone(), msg.uid.0, data));
+        }
+
+        // Same active-snooze set as `search`, so a snoozed message doesn't
+        // surface in the assistant's feed either.
+        let now = Utc::now().timestamp();
+        let mut snoozed: HashSet<(String, u32)> = HashSet::new();
+        {
+            let mut stmt = conn.prepare("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
+            let rows = stmt.query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
+            for row in rows {
+                snoozed.insert(row?);
+            }
+        }
+
+        let mut out = Vec::new();
+        for (mailbox, uid, data) in data_by_key {
+            if snoozed.contains(&(mailbox, uid)) {
+                continue;
+            }
+            out.push(serde_json::from_str(&data)?);
+        }
+        Ok(out)
+    }
+
     /// Applies a flag change to one cached summary, mirroring the `STORE`
     /// the session just issued against the server. Returns `false` if the
     /// message isn't in the cached window (nothing to update).
@@ -2971,6 +3019,37 @@ mod tests {
         cache.backfill_search_index().unwrap();
         assert_eq!(cache.search("ancient", 10).unwrap().len(), 1);
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `recent_messages` returns the newest messages first, honors the limit,
+    /// and keeps snoozed messages out of the feed.
+    #[test]
+    fn recent_messages_returns_newest_first_and_hides_snoozed() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let mut old = sample_summary(&mailbox_id, 1, Some("old"));
+        old.date = Utc::now() - chrono::Duration::days(2);
+        let mut mid = sample_summary(&mailbox_id, 2, Some("mid"));
+        mid.date = Utc::now() - chrono::Duration::days(1);
+        let mut new = sample_summary(&mailbox_id, 3, Some("new"));
+        new.date = Utc::now();
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[old, mid, new]).unwrap();
+
+        let all = cache.recent_messages(10).unwrap();
+        assert_eq!(all.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![3, 2, 1], "newest first");
+
+        let limited = cache.recent_messages(2).unwrap();
+        assert_eq!(limited.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![3, 2], "the limit is honored");
+
+        // A snoozed message is hidden from the feed even when it's the newest.
+        cache.snooze_message(&mailbox_id, Uid(3), Utc::now() + chrono::Duration::hours(1)).unwrap();
+        let filtered = cache.recent_messages(10).unwrap();
+        assert_eq!(filtered.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![2, 1]);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
     }
 }
