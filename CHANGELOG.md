@@ -1,5 +1,22 @@
 # Changelog
 
+All notable changes to the Lookout project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+New entries follow this style:
+
+```
+## [vX.Y.Z] - yyyy-mm-dd
+**Reference**: Category — short title
+**Summary**: scope/files touched; a plain, human-readable description of the change.
+```
+
+## [v0.9.115] - 2026-08-26
+**Reference**: Fixed API key field crash; Added search to the Assistant Agent dropdown
+**Summary**: Confined to `crates/app/src/window.rs` and `crates/app/src/config_view.rs`; no data-format change. Editing the Assistant settings' API key field could crash the app: typing a key, pausing briefly, then typing more could abort the app instead of just saving the change. Separately, the Settings → Assistant "Agent" dropdown, which lists model ids fetched live from the configured API's `/models` endpoint, now shows a search box in its popover so a long list can be filtered by typing instead of scrolled. Uses `adw::ComboRow`'s built-in `enable-search`, matched against each entry via a `GtkPropertyExpression` on the underlying `GtkStringList` item's `string` property.
+
 ## 0.9.114 (2026-08-25)
 
 ### Added

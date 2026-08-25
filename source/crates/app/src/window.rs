@@ -7075,7 +7075,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 let worker = worker.clone();
                 let token = row.text().to_string();
+                let pending_token_write_done = pending_token_write.clone();
                 *pending_token_write.borrow_mut() = Some(glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+                    // The source has already fired, so GLib has destroyed it;
+                    // clear the handle now or a later keystroke's `.take()`
+                    // will try to remove a source that no longer exists and
+                    // panic in the (non-unwindable) GTK signal trampoline.
+                    pending_token_write_done.borrow_mut().take();
                     worker.spawn(async move {
                         let result = if token.is_empty() {
                             crate::assistant::delete_token().await
