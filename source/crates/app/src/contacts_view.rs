@@ -1249,6 +1249,7 @@ pub fn spawn_contacts_discovery(
     current_contacts_page: Rc<Cell<&'static str>>,
     contacts_view_button: gtk::ToggleButton,
     refresh_contacts_ui: Rc<dyn Fn(Option<i32>)>,
+    refresh_config: Rc<dyn Fn()>,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -1317,7 +1318,12 @@ pub fn spawn_contacts_discovery(
             Ok(_) => show_page("contacts-empty"),
             Err(e) => {
                 show_page("contacts-empty");
-                toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts contacts: {e}"))));
+                if e.is_service_unavailable() {
+                    state.borrow_mut().goa_unavailable = true;
+                    refresh_config();
+                } else {
+                    toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts contacts: {e}"))));
+                }
             }
         }
     });

@@ -8,4 +8,17 @@ pub enum Error {
     WrongAuthMethod,
 }
 
+impl Error {
+    /// True when the failure means GNOME Online Accounts simply isn't
+    /// registered on the session bus - the expected case on a desktop that
+    /// doesn't ship it (KDE has no GOA daemon) - rather than some other
+    /// D-Bus or protocol error worth surfacing to the user.
+    pub fn is_service_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Error::DBus(zbus::Error::MethodError(name, _, _)) if name.as_str() == "org.freedesktop.DBus.Error.ServiceUnknown"
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

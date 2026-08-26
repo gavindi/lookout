@@ -484,6 +484,12 @@ pub(crate) struct UiState {
     /// reconnect a re-enabled account without opening another session-bus
     /// connection. `None` until mail discovery runs (or fails).
     pub(crate) goa_client: Option<GoaClient>,
+    /// Set once any discovery pass (mail/calendar/contacts) finds GOA simply
+    /// isn't on the session bus (`Error::is_service_unavailable`) - the
+    /// normal case on KDE, which has no GOA daemon. Config reads this to
+    /// hide the "GNOME Online Accounts" section instead of showing it empty,
+    /// and the discovery passes skip their "couldn't reach GOA" toast.
+    pub(crate) goa_unavailable: bool,
     /// Which account owns the currently-open mailbox - drives command
     /// routing (FetchBody, compose "From") and which account's
     /// `MessagesUpdated` events are allowed to update the message list (a
@@ -1792,6 +1798,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contact_cmd_tx: HashMap::new(),
         goa_accounts: HashMap::new(),
         goa_client: None,
+        goa_unavailable: false,
         current_account: None,
         current_mailbox: None,
         pending_message_selection: None,
@@ -6292,6 +6299,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let webcal_list = st.app_config.borrow().webcal_subscriptions.clone();
             let signatures_list = st.app_config.borrow().signatures.clone();
             let signature_defaults = st.app_config.borrow().signature_defaults.clone();
+            let goa_unavailable = st.goa_unavailable;
             drop(st);
             mail.sort_by_key(|a| a.email.to_lowercase());
             let mut calendar: Vec<crate::config_view::CalendarAccountInfo> = calendar_state
@@ -6655,6 +6663,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             crate::config_view::refresh(
                 &config_view,
                 &goa,
+                goa_unavailable,
                 &mail,
                 &calendar,
                 &webcal,
@@ -8409,6 +8418,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         current_contacts_page,
         contacts_view_button,
         refresh_contacts_ui,
+        refresh_config.clone(),
     );
     spawn_google_tasks_discovery(worker.clone(), state.clone(), calendar_state.clone(), tasks_view.clone(), toast_overlay.clone());
     spawn_calendar_discovery(
@@ -8654,8 +8664,16 @@ fn spawn_account_discovery(
                     show_page("mail");
                     show_lookout_page("lookout");
                 }
-                let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
-                toast_overlay.add_toast(adw::Toast::new(&title));
+                if e.is_service_unavailable() {
+                    // Expected on a desktop with no GOA daemon (e.g. KDE) -
+                    // silently note it so Config can hide the GOA section
+                    // instead of nagging with a toast every launch.
+                    state.borrow_mut().goa_unavailable = true;
+                    refresh_config();
+                } else {
+                    let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
+                }
             }
         }
     });
@@ -9861,8 +9879,13 @@ fn spawn_calendar_discovery(
             Err(e) => {
                 show_page("calendar-empty");
                 show_tasks_page("tasks-empty");
-                let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
-                toast_overlay.add_toast(adw::Toast::new(&title));
+                if e.is_service_unavailable() {
+                    state.borrow_mut().goa_unavailable = true;
+                    refresh_config();
+                } else {
+                    let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
+                    toast_overlay.add_toast(adw::Toast::new(&title));
+                }
             }
         }
     });
@@ -16727,6 +16750,7 @@ mod tests {
             contact_cmd_tx: HashMap::new(),
             goa_accounts: HashMap::new(),
             goa_client: None,
+            goa_unavailable: false,
             current_account: None,
             current_mailbox: None,
             pending_message_selection: None,

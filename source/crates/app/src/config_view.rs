@@ -875,6 +875,7 @@ pub fn build() -> ConfigView {
 pub fn refresh(
     view: &ConfigView,
     goa: &[GoaAccountInfo],
+    goa_unavailable: bool,
     mail: &[MailAccountInfo],
     calendar: &[CalendarAccountInfo],
     webcal: &[WebcalSubscriptionInfo],
@@ -895,10 +896,16 @@ pub fn refresh(
     enable_graph_pin: &OtherAccountAction,
     toggle_goa: &AccountToggle,
 ) {
+    // No GOA daemon on the session bus at all (the normal case on KDE) -
+    // hide the section rather than showing it permanently empty with a
+    // "No GNOME Online Accounts accounts" placeholder that can never fill in.
+    view.goa_group.set_visible(!goa_unavailable);
     for row in view.goa_rows.borrow_mut().drain(..) {
         view.goa_group.remove(&row);
     }
-    if goa.is_empty() {
+    if goa_unavailable {
+        // Nothing to populate - the group above is hidden anyway.
+    } else if goa.is_empty() {
         let row = adw::SwitchRow::builder().title("No GNOME Online Accounts accounts").sensitive(false).build();
         view.goa_group.add(&row);
         view.goa_rows.borrow_mut().push(row);
