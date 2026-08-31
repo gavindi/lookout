@@ -51,7 +51,7 @@ impl Read for MockStream {
             return Poll::Ready(Ok(()));
         }
         if self.err_on_read {
-            return Poll::Ready(Err(Error::new(ErrorKind::Other, "MockStream Error")));
+            return Poll::Ready(Err(Error::other("MockStream Error")));
         }
         if self.read_pos >= self.read_buf.len() {
             return Poll::Ready(Err(Error::new(ErrorKind::UnexpectedEof, "EOF")));

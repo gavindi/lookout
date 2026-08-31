@@ -146,13 +146,7 @@ pub async fn list_models(base_url: &str, token: &str) -> Result<Vec<String>, Str
     let mut models: Vec<String> = body
         .get("data")
         .and_then(|data| data.as_array())
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
-                .map(str::to_string)
-                .collect()
-        })
+        .map(|entries| entries.iter().filter_map(|entry| entry.get("id").and_then(|id| id.as_str())).map(str::to_string).collect())
         .unwrap_or_default();
     models.sort();
     Ok(models)
@@ -189,10 +183,7 @@ pub async fn chat_completions(base_url: &str, token: &str, agent: &str, body: &s
     }
     let url = endpoint_url(base_url, "chat/completions")?;
     let client = reqwest::Client::new();
-    let mut request = client
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(30))
-        .json(body);
+    let mut request = client.post(&url).timeout(std::time::Duration::from_secs(30)).json(body);
     if !token.is_empty() {
         request = request.bearer_auth(token);
     }
@@ -360,7 +351,10 @@ mod tests {
 
     #[test]
     fn chat_completions_returns_the_parsed_reply_body() {
-        let (result, request_line) = block_on(serve_chat_once("200 OK", r#"{"choices":[{"message":{"role":"assistant","content":"You have 12 unread messages."}}]}"#));
+        let (result, request_line) = block_on(serve_chat_once(
+            "200 OK",
+            r#"{"choices":[{"message":{"role":"assistant","content":"You have 12 unread messages."}}]}"#,
+        ));
         let reply = result.unwrap();
         assert_eq!(reply["choices"][0]["message"]["content"], "You have 12 unread messages.");
         assert_eq!(request_line, "POST /chat/completions HTTP/1.1");

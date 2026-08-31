@@ -603,11 +603,7 @@ pub fn build() -> ConfigView {
         .subtitle("Refresh to list the API's available agents")
         .model(&assistant_agent_model)
         .enable_search(true)
-        .expression(&gtk::PropertyExpression::new(
-            gtk::StringObject::static_type(),
-            gtk::Expression::NONE,
-            "string",
-        ))
+        .expression(gtk::PropertyExpression::new(gtk::StringObject::static_type(), gtk::Expression::NONE, "string"))
         .sensitive(false)
         .build();
     let assistant_agent_refresh_button = gtk::Button::from_icon_name("view-refresh-symbolic");

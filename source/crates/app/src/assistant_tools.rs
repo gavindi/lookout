@@ -182,14 +182,7 @@ fn tool_definitions() -> serde_json::Value {
 /// reply. The one `system` message is fixed at call time (the UI passes a
 /// small persona note); the agent's own tool descriptions carry the rest of
 /// the instructions, so no per-tool prompt text is needed here.
-pub async fn chat_with_tools(
-    base_url: &str,
-    token: &str,
-    agent: &str,
-    prompt: &str,
-    system: &str,
-    ctx: &ToolContext,
-) -> Result<String, String> {
+pub async fn chat_with_tools(base_url: &str, token: &str, agent: &str, prompt: &str, system: &str, ctx: &ToolContext) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("Type something to ask the assistant".to_string());
     }
@@ -355,10 +348,7 @@ async fn top_contacts(ctx: &ToolContext, args: &serde_json::Value) -> Result<ser
             }
         }
     }
-    let mut ranked: Vec<(String, String, i64)> = by_address
-        .into_iter()
-        .map(|(address, (name, count))| (name, address, count))
-        .collect();
+    let mut ranked: Vec<(String, String, i64)> = by_address.into_iter().map(|(address, (name, count))| (name, address, count)).collect();
     // Count descending, ties broken by address so the output is stable (the
     // hash map's iteration order is not).
     ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
@@ -406,11 +396,7 @@ fn list_contacts(ctx: &ToolContext, args: &serde_json::Value) -> Result<serde_js
 fn list_tasks(ctx: &ToolContext, args: &serde_json::Value) -> Result<serde_json::Value, String> {
     let limit = arg_limit(args);
     let include_completed = args.get("status").and_then(|status| status.as_str()) == Some("all");
-    let mut tasks: Vec<&CalendarTask> = ctx
-        .tasks
-        .iter()
-        .filter(|task| include_completed || task.status != TaskStatus::Completed)
-        .collect();
+    let mut tasks: Vec<&CalendarTask> = ctx.tasks.iter().filter(|task| include_completed || task.status != TaskStatus::Completed).collect();
     // Tasks without a due date sort last.
     tasks.sort_by_key(|task| task.due.unwrap_or(DateTime::<Utc>::MAX_UTC));
     tasks.truncate(limit);
@@ -463,7 +449,11 @@ const MAX_EVENT_HORIZON_DAYS: i64 = 90;
 /// rather than re-deriving it.
 fn upcoming_events(ctx: &ToolContext, args: &serde_json::Value) -> Result<serde_json::Value, String> {
     let limit = arg_limit(args);
-    let days = args.get("days").and_then(|days| days.as_i64()).unwrap_or(DEFAULT_EVENT_HORIZON_DAYS).clamp(1, MAX_EVENT_HORIZON_DAYS);
+    let days = args
+        .get("days")
+        .and_then(|days| days.as_i64())
+        .unwrap_or(DEFAULT_EVENT_HORIZON_DAYS)
+        .clamp(1, MAX_EVENT_HORIZON_DAYS);
     let now = chrono::Local::now();
     let horizon = chrono::Duration::days(days);
     let occurrences = crate::lookout_view::upcoming_occurrences(ctx.occurrences.iter(), now, horizon, &ctx.checked_calendars, limit);
@@ -492,9 +482,7 @@ fn serialize_events(occurrences: &[&EventOccurrence]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lookout_core::{
-        EmailField, MailboxId, SystemFlagBit, TaskPriority, Uid, UidValidity, VCard,
-    };
+    use lookout_core::{EmailField, MailboxId, SystemFlagBit, TaskPriority, Uid, UidValidity, VCard};
     use lookout_dav::ContactRecord;
 
     fn task(summary: &str, due: Option<DateTime<Utc>>, completed: bool) -> CalendarTask {
@@ -534,7 +522,10 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
             .collect();
-        assert_eq!(names, vec!["recent_emails", "search_emails", "top_contacts", "list_contacts", "list_tasks", "upcoming_events"]);
+        assert_eq!(
+            names,
+            vec!["recent_emails", "search_emails", "top_contacts", "list_contacts", "list_tasks", "upcoming_events"]
+        );
         // The search tool's query is required; the row caps stay bounded.
         let search = &definitions[1]["function"]["parameters"];
         assert_eq!(search["required"][0], "query");
@@ -564,12 +555,7 @@ mod tests {
         ];
 
         let outstanding = list_tasks(&ctx, &serde_json::json!({})).unwrap();
-        let summaries: Vec<&str> = outstanding
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|entry| entry["summary"].as_str())
-            .collect();
+        let summaries: Vec<&str> = outstanding.as_array().unwrap().iter().filter_map(|entry| entry["summary"].as_str()).collect();
         assert_eq!(summaries, vec!["soon", "later", "undated"], "completed hidden, soonest-due first, undated last");
 
         let all = list_tasks(&ctx, &serde_json::json!({"status": "all", "limit": 2})).unwrap();
@@ -621,7 +607,10 @@ mod tests {
         assert_eq!(entries.len(), 2, "the unchecked calendar's event is excluded");
         assert_eq!(entries[0]["summary"], "soon", "soonest first");
         assert_eq!(entries[1]["summary"], "later");
-        assert!(entries[0]["link"].as_str().unwrap().starts_with("lookout-action:open-event?data="), "an event carries a ready-to-use deep link");
+        assert!(
+            entries[0]["link"].as_str().unwrap().starts_with("lookout-action:open-event?data="),
+            "an event carries a ready-to-use deep link"
+        );
     }
 
     #[tokio::test]
@@ -656,16 +645,29 @@ mod tests {
             categories: Vec::new(),
             other: Vec::new(),
         };
-        let snapshot = test_snapshot("Test", vec![ContactRecord {
-            href: "ada.vcf".to_string(),
-            etag: None,
-            card: card.clone(),
-        }]);
+        let snapshot = test_snapshot(
+            "Test",
+            vec![ContactRecord {
+                href: "ada.vcf".to_string(),
+                etag: None,
+                card: card.clone(),
+            }],
+        );
         ctx.contacts.push((AccountId("/test/books".to_string()), snapshot));
         card.full_name = Some("Grace Hopper".to_string());
         card.uid = Some("c2".to_string());
-        card.emails = vec![EmailField { types: vec!["work".to_string()], address: "grace@example.org".to_string() }];
-        let snapshot = test_snapshot("Test", vec![ContactRecord { href: "grace.vcf".to_string(), etag: None, card }]);
+        card.emails = vec![EmailField {
+            types: vec!["work".to_string()],
+            address: "grace@example.org".to_string(),
+        }];
+        let snapshot = test_snapshot(
+            "Test",
+            vec![ContactRecord {
+                href: "grace.vcf".to_string(),
+                etag: None,
+                card,
+            }],
+        );
         ctx.contacts.push((AccountId("/test/books".to_string()), snapshot));
 
         let all = list_contacts(&ctx, &serde_json::json!({})).unwrap();
@@ -732,7 +734,10 @@ mod tests {
         assert!(requests[1].contains("\"role\":\"tool\""), "a tool message must follow the call");
         assert!(requests[1].contains("\"tool_call_id\":\"call_1\""));
         assert!(requests[1].contains("Truffle weekly roundup"), "the executed cache result must ride along");
-        assert!(requests[1].contains("\"role\":\"assistant\""), "the assistant's tool-call message must stay in the transcript");
+        assert!(
+            requests[1].contains("\"role\":\"assistant\""),
+            "the assistant's tool-call message must stay in the transcript"
+        );
     }
 
     /// A reply whose message has no `content` and no `tool_calls` is a
@@ -766,8 +771,14 @@ mod tests {
             references: Vec::new(),
             thread_key: lookout_core::ThreadKey(String::new()),
             subject: Some("Truffle weekly roundup".to_string()),
-            from: vec![EmailAddress { name: Some("Truffle Security".to_string()), address: "no-reply@truffle.example".to_string() }],
-            to: vec![EmailAddress { name: None, address: "me@example.org".to_string() }],
+            from: vec![EmailAddress {
+                name: Some("Truffle Security".to_string()),
+                address: "no-reply@truffle.example".to_string(),
+            }],
+            to: vec![EmailAddress {
+                name: None,
+                address: "me@example.org".to_string(),
+            }],
             cc: Vec::new(),
             date: Utc::now() - chrono::Duration::days(2),
             flags: Default::default(),
@@ -781,17 +792,17 @@ mod tests {
         let mut newer = older.clone();
         newer.uid = Uid(2);
         newer.subject = Some("Lunch on Friday?".to_string());
-        newer.from = vec![EmailAddress { name: Some("Ada Lovelace".to_string()), address: "ada@example.org".to_string() }];
+        newer.from = vec![EmailAddress {
+            name: Some("Ada Lovelace".to_string()),
+            address: "ada@example.org".to_string(),
+        }];
         newer.date = Utc::now();
         newer.flags.insert(SystemFlagBit::Seen);
         newer.preview = Some("Catching up over tacos".to_string());
         cache.replace_messages(&mailbox_id, UidValidity(1), &[older, newer]).unwrap();
         // The session's sync calls `record_addresses` separately from the
         // envelope write - replicate that so `top_addresses` has data.
-        cache
-            .load_messages(&mailbox_id)
-            .and_then(|messages| cache.record_addresses(&messages))
-            .unwrap();
+        cache.load_messages(&mailbox_id).and_then(|messages| cache.record_addresses(&messages)).unwrap();
         (account_id, cache)
     }
 
@@ -808,7 +819,10 @@ mod tests {
         assert_eq!(entries[1]["unread"], true);
         assert_eq!(entries[0]["from"], "Ada Lovelace <ada@example.org>");
         assert_eq!(entries[0]["mailbox"], format!("{}:INBOX", account_id.0));
-        assert!(entries[0]["link"].as_str().unwrap().starts_with("lookout-action:open-message?data="), "a message carries a ready-to-use deep link");
+        assert!(
+            entries[0]["link"].as_str().unwrap().starts_with("lookout-action:open-message?data="),
+            "a message carries a ready-to-use deep link"
+        );
 
         let limited = recent_emails(&ctx, &serde_json::json!({"limit": 1})).await.unwrap();
         assert_eq!(limited.as_array().unwrap().len(), 1);
@@ -845,7 +859,10 @@ mod tests {
             references: Vec::new(),
             thread_key: lookout_core::ThreadKey(String::new()),
             subject: Some("Re: lunch".to_string()),
-            from: vec![EmailAddress { name: Some("Ada Lovelace".to_string()), address: "ada@example.org".to_string() }],
+            from: vec![EmailAddress {
+                name: Some("Ada Lovelace".to_string()),
+                address: "ada@example.org".to_string(),
+            }],
             to: Vec::new(),
             cc: Vec::new(),
             date: Utc::now(),
@@ -860,13 +877,19 @@ mod tests {
         second.replace_messages(&second_mailbox, UidValidity(1), std::slice::from_ref(&message)).unwrap();
         second.record_addresses(std::slice::from_ref(&message)).unwrap();
 
-        let ctx = ToolContext { caches: vec![cache, second], ..context() };
+        let ctx = ToolContext {
+            caches: vec![cache, second],
+            ..context()
+        };
         let result = top_contacts(&ctx, &serde_json::json!({})).await.unwrap();
         let entries = result.as_array().unwrap();
         let ada = entries.iter().find(|entry| entry["address"] == "ada@example.org").unwrap();
         assert_eq!(ada["count"], 2, "the same address in two caches counts once");
         assert_eq!(ada["name"], "Ada Lovelace");
-        assert!(entries[0]["count"].as_i64().unwrap() >= entries[1]["count"].as_i64().unwrap(), "ranked by count, descending");
+        assert!(
+            entries[0]["count"].as_i64().unwrap() >= entries[1]["count"].as_i64().unwrap(),
+            "ranked by count, descending"
+        );
         // The count-2 ties (ada, me) sort deterministically by address.
         let first: Vec<String> = entries.iter().take(2).filter_map(|entry| entry["address"].as_str().map(str::to_string)).collect();
         assert_eq!(first, vec!["ada@example.org".to_string(), "me@example.org".to_string()]);

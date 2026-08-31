@@ -1630,7 +1630,9 @@ impl MessageListModel {
         let mut located = false;
 
         'search: for i in 0..self.root.n_items() {
-            let Some(boxed) = self.root.item(i).and_downcast::<glib::BoxedAnyObject>() else { continue };
+            let Some(boxed) = self.root.item(i).and_downcast::<glib::BoxedAnyObject>() else {
+                continue;
+            };
             let item = boxed.borrow::<MessageItem>();
             match &*item {
                 // Flat (ungrouped) mode: messages sit directly at root.
@@ -1642,7 +1644,9 @@ impl MessageListModel {
                     let sections = self.sections.borrow();
                     let Some(tracked) = sections.get(&section.bucket) else { continue };
                     for j in 0..tracked.store.n_items() {
-                        let Some(sboxed) = tracked.store.item(j).and_downcast::<glib::BoxedAnyObject>() else { continue };
+                        let Some(sboxed) = tracked.store.item(j).and_downcast::<glib::BoxedAnyObject>() else {
+                            continue;
+                        };
                         let sitem = sboxed.borrow::<MessageItem>();
                         match &*sitem {
                             MessageItem::Message(summary) if summary.mailbox == *mailbox && summary.uid == uid => {
@@ -1653,7 +1657,9 @@ impl MessageListModel {
                                 let threads = self.threads.borrow();
                                 if let Some(tstore) = threads.get(&thread.id) {
                                     for k in 0..tstore.store.n_items() {
-                                        let Some(mboxed) = tstore.store.item(k).and_downcast::<glib::BoxedAnyObject>() else { continue };
+                                        let Some(mboxed) = tstore.store.item(k).and_downcast::<glib::BoxedAnyObject>() else {
+                                            continue;
+                                        };
                                         let mitem = mboxed.borrow::<MessageItem>();
                                         if let MessageItem::Message(summary) = &*mitem {
                                             if summary.mailbox == *mailbox && summary.uid == uid {
@@ -2172,7 +2178,10 @@ mod tests {
         assert!(!section_target.tree.child_row(1).expect("Older row").is_expanded(), "sanity: Older starts collapsed");
 
         assert!(section_target.select_uid(&mailbox, Uid(2)), "a message under a collapsed section must still be found");
-        assert!(section_target.tree.child_row(1).expect("Older row").is_expanded(), "select_uid must expand the collapsed section");
+        assert!(
+            section_target.tree.child_row(1).expect("Older row").is_expanded(),
+            "select_uid must expand the collapsed section"
+        );
         assert_eq!(section_target.selected_summary().map(|s| s.uid), Some(Uid(2)));
         assert!(!section_target.select_uid(&mailbox, Uid(999)), "a uid absent from the list must report not-found");
 

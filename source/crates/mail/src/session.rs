@@ -3351,7 +3351,7 @@ async fn sync_mailbox(
     mailbox_id: &MailboxId,
     events: &async_channel::Sender<AccountEvent>,
     cache: &CacheHandle,
-    folders: &mut Vec<Mailbox>,
+    folders: &mut [Mailbox],
     interactive_commands: &async_channel::Receiver<AccountCommand>,
     session_selected: Option<&MailboxId>,
     condstore: bool,

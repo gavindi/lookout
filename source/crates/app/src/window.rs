@@ -430,6 +430,13 @@ impl BodyCache {
     }
 }
 
+/// `UiState::follow_up_status`'s callback: does the given message-id already
+/// have a follow-up task?
+type FollowUpStatusFn = Rc<dyn Fn(&str) -> bool>;
+/// `UiState::follow_up_toggle`'s callback: creates or removes the follow-up
+/// task for a message, returning the new has-task state.
+type FollowUpToggleFn = Rc<dyn Fn(&EmailSummary, Option<AccountId>, Option<String>) -> bool>;
+
 /// Mutable UI-thread state the various signal handlers close over. Plain
 /// `Rc<RefCell<_>>` is fine here - GTK is single-threaded, so there's no
 /// need for `Arc<Mutex<_>>` on this side of the worker-thread boundary.
@@ -764,13 +771,13 @@ pub(crate) struct UiState {
     /// need this are built before `calendar_state` exists, so this hook is
     /// filled in once it does (same ordering problem `task_button_refresh`
     /// solves for the toolbar's own Follow-up button). `None` until then.
-    follow_up_status: Option<Rc<dyn Fn(&str) -> bool>>,
+    follow_up_status: Option<FollowUpStatusFn>,
     /// The message row hover-quickmenu's Follow-up toggle: creates or
     /// removes the follow-up task for a message (with an optional preferred
     /// account/email to default the task's calendar into, same as
     /// `show_create_task_for_email`), returning the new has-task state.
     /// Late-bound for the same reason as `follow_up_status`.
-    follow_up_toggle: Option<Rc<dyn Fn(&EmailSummary, Option<AccountId>, Option<String>) -> bool>>,
+    follow_up_toggle: Option<FollowUpToggleFn>,
     /// Which compose session's relays (`draft_saved_tx` and
     /// `composer_identities_refresh`) are currently installed. Every composer
     /// bumps this when it opens and remembers its own value; a finishing

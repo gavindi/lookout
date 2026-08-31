@@ -66,6 +66,7 @@ pub trait KeyringStore: Send + Sync {
 pub struct SecretServiceKeyring;
 
 impl SecretServiceKeyring {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<dyn KeyringStore> {
         Arc::new(SecretServiceKeyring)
     }
@@ -98,7 +99,8 @@ fn account_attributes(account_id: &AccountId) -> HashMap<&str, &str> {
 pub(crate) fn keyring_error(e: secret_service::Error) -> String {
     match e {
         secret_service::Error::Unavailable => {
-            "No keyring is available - enable a Secret Service provider (KWallet's Secret Service integration on KDE, or gnome-keyring elsewhere) to store account passwords.".to_string()
+            "No keyring is available - enable a Secret Service provider (KWallet's Secret Service integration on KDE, or gnome-keyring elsewhere) to store account passwords."
+                .to_string()
         }
         secret_service::Error::NoResult => "The keyring has no default collection - create one (for example with Seahorse) to store account passwords.".to_string(),
         secret_service::Error::Prompt => "The keyring unlock prompt was dismissed.".to_string(),

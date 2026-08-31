@@ -268,11 +268,11 @@ fn to_utc(dpt: &DatePerhapsTime) -> Option<(DateTime<Utc>, bool)> {
 
 /// Resolves a `DTSTART`/`DTEND`/`RECURRENCE-ID`/`EXDATE`/`RDATE` date-time to
 /// its UTC instant. IANA `TZID`s resolve through chrono-tz directly; Windows
-/// timezone IDs (Outlook/Exchange iMIP invitations - Teams meetings included
-/// - stamp their events with `TZID=W. Europe Standard Time` and friends) are
+/// timezone IDs (Outlook/Exchange iMIP invitations, Teams meetings included,
+/// stamp their events with `TZID=W. Europe Standard Time` and friends) are
 /// looked up in the CLDR mapping first, since chrono-tz only knows IANA
 /// names. A `TZID` neither set understands is dropped with a warning rather
-/// than guessed - the caller then discards the event the same way it does
+/// than guessed, the caller then discards the event the same way it does
 /// any other unresolvable one.
 fn resolve_datetime_utc(cdt: &CalendarDateTime) -> Option<DateTime<Utc>> {
     match cdt {

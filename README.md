@@ -6,7 +6,7 @@
 
 A native GNOME mail client written in Rust, built on GTK 4, libadwaita, and WebKitGTK. Lookout is a reimplementation of Microsoft Outlook as a desktop application, talking to your mail directly over IMAP/SMTP (plus CalDAV for calendars and CardDAV for contacts), with accounts sourced from **GNOME Online Accounts**.
 
-For the marketing story and a feature walkthrough, see [MARKETING.md](MARKETING.md).
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/P5P21M7MBS)
 
 ## Features
 
@@ -91,7 +91,7 @@ dbus-run-session -- cargo test -p lookout-goa --test fake_goa
 cargo test -p lookout-mail --features test-utils --test imap_integration -- --ignored
 
 # Linting / formatting
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 

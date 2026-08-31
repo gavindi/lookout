@@ -2849,7 +2849,7 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         let msg = searchable_summary(&mailbox_id, 1, "Quarterly report", "ada@example.com", Some("The numbers"));
-        cache.replace_messages(&mailbox_id, UidValidity(1), &[msg.clone()]).unwrap();
+        cache.replace_messages(&mailbox_id, UidValidity(1), std::slice::from_ref(&msg)).unwrap();
         cache
             .store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("This document is confidential."))
             .unwrap();
@@ -2883,7 +2883,7 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         let msg = searchable_summary(&mailbox_id, 1, "Quarterly report", "ada@example.com", None);
-        cache.replace_messages(&mailbox_id, UidValidity(1), &[msg.clone()]).unwrap();
+        cache.replace_messages(&mailbox_id, UidValidity(1), std::slice::from_ref(&msg)).unwrap();
         assert!(cache.search("snippetword", 10).unwrap().is_empty());
 
         let mut with_preview = msg.clone();

@@ -575,8 +575,8 @@ mod tests {
         let now = chrono::Local::now();
         let event = occ("removed", &(now + Duration::minutes(30)).with_timezone(&Utc).to_rfc3339(), Some(15));
         let other = occ("other", &(now + Duration::minutes(30)).with_timezone(&Utc).to_rfc3339(), Some(15));
-        let (mut engine, db) = engine_with("remove-account", &[event.clone()]);
-        engine.ingest(&AccountId("other-account".into()), &[other.clone()]);
+        let (mut engine, db) = engine_with("remove-account", std::slice::from_ref(&event));
+        engine.ingest(&AccountId("other-account".into()), std::slice::from_ref(&other));
         // A previous session had fired the disabled account's alert; its
         // persisted row must not survive the teardown.
         let event_start = event.start.format("%Y-%m-%dT%H:%M:%SZ").to_string();

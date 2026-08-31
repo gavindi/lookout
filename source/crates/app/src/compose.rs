@@ -1371,7 +1371,7 @@ pub fn build_compose_view(
             // exactly the entries' width. Runs while the popover is
             // mapping, before its size is measured, so the new width lands
             // on the menu that's about to open.
-            let width = (fields_group.width() as i32 / 2).max(240);
+            let width = (fields_group.width() / 2).max(240);
             signature_scroller.set_min_content_width(width);
             (rebuild_handle.borrow())();
         });

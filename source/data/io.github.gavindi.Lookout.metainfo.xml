@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.120" date="2026-09-01">
+      <description>
+        <p>Delinted the workspace: fixed a broken CI clippy/test/build gate (caused by an `--all-features` flag that force-enabled two mutually exclusive features on a vendored dependency) and cleared all outstanding clippy warnings and formatting drift.</p>
+      </description>
+    </release>
     <release version="0.9.119" date="2026-09-01">
       <description>
         <p>Fixed the reading pane sometimes rendering a new message blended together with the previous one instead of cleanly replacing it, caused by forcing software rendering on the reused reading-pane WebView.</p>

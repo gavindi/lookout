@@ -560,7 +560,10 @@ fn parse_blocks(reply: &str) -> Vec<Block> {
         }
         if let Some((level, content)) = heading(trimmed) {
             flush_paragraph_block(&mut paragraph, &mut blocks);
-            blocks.push(Block::Heading { level, title_html: inline_html(content) });
+            blocks.push(Block::Heading {
+                level,
+                title_html: inline_html(content),
+            });
             continue;
         }
         if let Some((ordered, content)) = list_item(trimmed) {
@@ -611,11 +614,18 @@ pub fn chat_reply_cards_html(reply: &str) -> String {
                 if claim_first {
                     sections[0].title = Some((level, title_html));
                 } else {
-                    sections.push(Section { title: Some((level, title_html)), body: String::new() });
+                    sections.push(Section {
+                        title: Some((level, title_html)),
+                        body: String::new(),
+                    });
                 }
             }
             Block::Heading { level, title_html } => {
-                sections.last_mut().expect("always at least one section").body.push_str(&format!("<h{level}>{title_html}</h{level}>\n"));
+                sections
+                    .last_mut()
+                    .expect("always at least one section")
+                    .body
+                    .push_str(&format!("<h{level}>{title_html}</h{level}>\n"));
             }
             Block::Html(html) => {
                 sections.last_mut().expect("always at least one section").body.push_str(&html);
@@ -846,11 +856,7 @@ fn inline_html(line: &str) -> String {
         }
         if let Some(after_bang) = rest.strip_prefix("![") {
             if let Some((alt, (url, after))) = bracket_paren(after_bang) {
-                out.push_str(&format!(
-                    "<img src=\"{}\" alt=\"{}\">",
-                    escape_attribute(url),
-                    escape_attribute(alt)
-                ));
+                out.push_str(&format!("<img src=\"{}\" alt=\"{}\">", escape_attribute(url), escape_attribute(alt)));
                 rest = after;
                 continue;
             }
@@ -1068,7 +1074,10 @@ mod tests {
     #[test]
     fn chat_reply_cards_html_strips_angle_brackets_around_a_link_destination() {
         let cards = chat_reply_cards_html("[Team sync](<lookout-action:open-event?data=a%3Ab>)");
-        assert_eq!(cards, "<div class=\"lookout-card\"><p><a href=\"lookout-action:open-event?data=a%3Ab\">Team sync</a></p>\n</div>");
+        assert_eq!(
+            cards,
+            "<div class=\"lookout-card\"><p><a href=\"lookout-action:open-event?data=a%3Ab\">Team sync</a></p>\n</div>"
+        );
     }
 
     #[test]
@@ -1080,7 +1089,10 @@ mod tests {
         // agent can embed SVG/tables/imgs that markdown can't express (the
         // caller's CSP wrapper is the actual safety boundary).
         let graphic = chat_reply_cards_html("```html\n<svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n```");
-        assert_eq!(graphic, "<div class=\"lookout-card\"><svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n</div>");
+        assert_eq!(
+            graphic,
+            "<div class=\"lookout-card\"><svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n</div>"
+        );
     }
 
     #[test]
@@ -1152,16 +1164,25 @@ mod tests {
     #[test]
     fn chat_document_gives_links_a_high_contrast_colour() {
         let doc = chat_document("");
-        assert!(doc.contains("a, a:visited { color: #4d9dff; }"), "links get an explicit accent colour instead of the low-contrast UA default");
+        assert!(
+            doc.contains("a, a:visited { color: #4d9dff; }"),
+            "links get an explicit accent colour instead of the low-contrast UA default"
+        );
     }
 
     #[test]
     fn chat_document_leads_with_the_csp_meta_and_makes_the_background_transparent() {
         let doc = chat_document("<p>hi</p>");
-        assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\" content=\""), "the CSP meta leads the document");
+        assert!(
+            doc.starts_with("<meta http-equiv=\"Content-Security-Policy\" content=\""),
+            "the CSP meta leads the document"
+        );
         assert!(doc.contains("img-src * data: cid:"), "remote images are allowed at the chat level");
         assert!(doc.contains("script-src 'none'"), "scripts stay off");
-        assert!(doc.contains("html, body { background: transparent; color: #e5e5e5; }"), "the transparent-background and grey-text rules are present");
+        assert!(
+            doc.contains("html, body { background: transparent; color: #e5e5e5; }"),
+            "the transparent-background and grey-text rules are present"
+        );
         assert!(doc.ends_with("</style><p>hi</p>"), "the style block rides in ahead of the content");
     }
 
@@ -1175,7 +1196,10 @@ mod tests {
         assert!(doc.contains("stroke-opacity=\"0.9\""), "the artwork's own strokes ride along");
         assert!(doc.contains("viewBox=\"0 0 400 400\""), "the bundled ai-1.svg artwork is inlined");
         assert!(!doc.contains("<?xml"), "the XML declaration is stripped so the artwork embeds cleanly");
-        assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""), "the empty state loads through the same CSP document");
+        assert!(
+            doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""),
+            "the empty state loads through the same CSP document"
+        );
     }
 
     #[test]
@@ -1187,7 +1211,10 @@ mod tests {
         assert!(doc.contains("@keyframes chat-icon-pulse"), "the pulse keyframes are defined");
         assert!(doc.contains("viewBox=\"0 0 400 400\""), "the bundled ai-1.svg artwork is inlined");
         assert!(!doc.contains("<?xml"), "the XML declaration is stripped so the artwork embeds cleanly");
-        assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""), "the loading state loads through the same CSP document");
+        assert!(
+            doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""),
+            "the loading state loads through the same CSP document"
+        );
     }
 
     #[test]
@@ -1195,11 +1222,17 @@ mod tests {
         let doc = chat_error_document("Failed: connection refused & timed out <retry>");
         assert!(doc.contains("class=\"chat-error-icon\""), "the robot glyph is present, recolored");
         assert!(doc.contains("background-color: #e01b24"), "the app's standard error red");
-        assert!(doc.contains("mask-image: url(\"data:image/svg+xml;base64,"), "the artwork is masked, not filtered, for an exact color");
+        assert!(
+            doc.contains("mask-image: url(\"data:image/svg+xml;base64,"),
+            "the artwork is masked, not filtered, for an exact color"
+        );
         assert!(
             doc.contains("<p class=\"chat-error-message\">Failed: connection refused &amp; timed out &lt;retry&gt;</p>"),
             "the failure reason stays visible, HTML-escaped"
         );
-        assert!(doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""), "the error state loads through the same CSP document");
+        assert!(
+            doc.starts_with("<meta http-equiv=\"Content-Security-Policy\""),
+            "the error state loads through the same CSP document"
+        );
     }
 }

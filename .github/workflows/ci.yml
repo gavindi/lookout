@@ -41,7 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: source
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -62,7 +62,7 @@ jobs:
         with:
           workspaces: source
       - name: Unit tests (whole workspace)
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
       - name: Fake-GOA D-Bus test (isolated session bus)
         run: dbus-run-session -- cargo test -p lookout-goa --test fake_goa
 
@@ -98,4 +98,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: source
-      - run: cargo build --workspace --all-features
+      - run: cargo build --workspace

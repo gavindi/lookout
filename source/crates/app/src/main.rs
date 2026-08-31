@@ -19,9 +19,9 @@ mod folder_tree;
 mod goa_calendar_credentials;
 mod goa_credentials;
 mod google_tasks;
+mod graph_pin;
 #[cfg(test)]
 mod gtk_test;
-mod graph_pin;
 mod identities;
 mod last_view;
 mod launcher_entry;
