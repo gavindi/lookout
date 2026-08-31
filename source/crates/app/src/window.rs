@@ -3020,7 +3020,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let webkit_settings = webkit::Settings::new();
     webkit_settings.set_enable_javascript(false);
     webkit_settings.set_enable_developer_extras(false);
-    webkit_settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never);
+    // Deliberately *not* forced to `Never` here, unlike the other three
+    // WebViews in this app: under WebKitGTK's software-rendering path,
+    // navigating this long-lived, reused WebView straight from one
+    // message's HTML to the next can render two different messages'
+    // documents simultaneously blended together on screen - not just a
+    // stale-frame timing artifact (a "clear" load-and-await sequence ahead
+    // of the real content was tried and did not fix it), but an apparent
+    // bug in WebKit's own software/threaded compositor when this policy is
+    // forced. Left at the default (on-demand) policy, which only engages
+    // accelerated compositing when a page actually needs it - plain mail
+    // essentially never does - so this should cost little of the GPU-memory
+    // win the `Never` policy was introduced for on the other WebViews.
+    // webkit_settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never);
     // The "Switch message theme" toggle lives on the user content manager:
     // its override stylesheet is added/removed there so WebKit re-applies the
     // style to the document already on screen the moment the toggle flips
@@ -15860,15 +15872,16 @@ fn render_body(
         // `wrap_message_with_csp`).
         let loaded_html = wrap_message_with_csp(html, images_allowed, all_allowed);
         if let Some(web_view) = content_stack.child_by_name("html").and_downcast::<webkit::WebView>() {
-            if !animated {
-                web_view.load_html(&loaded_html, None);
-                content_stack.set_visible_child_name("html");
-                reading_stack.set_visible_child_name("message");
-                return;
-            }
-            // Re-render of the same page: GTK only transitions when the
-            // visible child actually changes, so drop back to "empty" first
-            // and let the reveal crossfade the fresh body in.
+            // Drop back to "empty" first, whether or not transitions are
+            // animated: the WebView is a single long-lived widget reused for
+            // every message, and `load_html` paints asynchronously, so
+            // leaving it mapped/visible across the swap would show the
+            // previous message's last-painted frame until WebKit catches up
+            // (with "Animate transitions" off this was previously
+            // deterministic - see the reveal-gating below, which now applies
+            // uniformly). GTK also only transitions when the visible child
+            // actually changes, so this doubles as the re-render-of-the-
+            // same-page case.
             if reading_stack.visible_child_name().as_deref() == Some("message") {
                 reading_stack.set_visible_child_name("empty");
             }

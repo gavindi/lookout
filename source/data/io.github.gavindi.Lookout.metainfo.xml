@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.119" date="2026-09-01">
+      <description>
+        <p>Fixed the reading pane sometimes rendering a new message blended together with the previous one instead of cleanly replacing it, caused by forcing software rendering on the reused reading-pane WebView.</p>
+      </description>
+    </release>
     <release version="0.9.118" date="2026-08-31">
       <description>
         <p>Cut idle GPU memory usage by disabling WebKitGTK hardware-accelerated compositing on all four of the app's WebViews (reading pane, assistant chat, compose editor, print), which previously ran on WebKitGTK's default accelerated-compositing mode even when displaying plain text.</p>
