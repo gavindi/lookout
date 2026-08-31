@@ -148,6 +148,7 @@ pub fn build_lookout_view() -> LookoutView {
     let chat_settings = webkit::Settings::new();
     chat_settings.set_enable_javascript(false);
     chat_settings.set_enable_developer_extras(false);
+    chat_settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never);
     let chat_output = webkit::WebView::builder()
         .settings(&chat_settings)
         .editable(false)

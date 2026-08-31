@@ -659,7 +659,10 @@ fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
 /// WebView (which the caller keeps alive for send-time content reads) plus
 /// the toolbar.
 pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
-    let settings = webkit::Settings::builder().enable_javascript(true).build();
+    let settings = webkit::Settings::builder()
+        .enable_javascript(true)
+        .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
+        .build();
     let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).build());
 
     {

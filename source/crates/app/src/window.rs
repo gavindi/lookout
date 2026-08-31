@@ -3020,6 +3020,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let webkit_settings = webkit::Settings::new();
     webkit_settings.set_enable_javascript(false);
     webkit_settings.set_enable_developer_extras(false);
+    webkit_settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never);
     // The "Switch message theme" toggle lives on the user content manager:
     // its override stylesheet is added/removed there so WebKit re-applies the
     // style to the document already on screen the moment the toggle flips
@@ -12770,7 +12771,9 @@ fn print_visible_message(reading_stack: &gtk::Stack, parent: &gtk::Window) {
 /// parsed far enough to lay out - it never appears on screen.
 pub(crate) fn print_html_once<T: IsA<gtk::Window>>(html: &str, parent: &T) {
     let parent = parent.clone();
-    let web_view = webkit::WebView::builder().build();
+    let print_settings = webkit::Settings::new();
+    print_settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never);
+    let web_view = webkit::WebView::builder().settings(&print_settings).build();
     web_view.connect_load_changed(move |web_view, event| {
         if event == webkit::LoadEvent::Finished {
             let _ = webkit::PrintOperation::new(web_view).run_dialog(Some(&parent));

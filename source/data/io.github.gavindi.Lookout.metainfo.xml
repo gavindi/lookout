@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.118" date="2026-08-31">
+      <description>
+        <p>Cut idle GPU memory usage by disabling WebKitGTK hardware-accelerated compositing on all four of the app's WebViews (reading pane, assistant chat, compose editor, print), which previously ran on WebKitGTK's default accelerated-compositing mode even when displaying plain text.</p>
+      </description>
+    </release>
     <release version="0.9.117" date="2026-08-31">
       <description>
         <p>Added a "Background wallpaper" switch to Settings → Appearance: turning it off hides the window's wallpaper entirely and disables the background image picker, dimming slider, and restore-default options, which only matter when a wallpaper is shown.</p>
