@@ -5866,14 +5866,38 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // Config → Appearance → "Window background": reflect a stored custom
     // background (if one applied at startup) in the row subtitle and arm the
-    // restore row, seed the (always-enabled) dimming slider with the stored
-    // brightness regardless of which background is in use, then wire the
-    // picker to a file chooser, the dimming slider into the background's
-    // brightness, and "Restore default background" back to the bundled
-    // artwork (which also resets dimming to its own default).
+    // restore row, seed the (always-enabled, wallpaper permitting) dimming
+    // slider with the stored brightness regardless of which background is in
+    // use, then wire the picker to a file chooser, the dimming slider into
+    // the background's brightness, and "Restore default background" back to
+    // the bundled artwork (which also resets dimming to its own default).
     let apply_background_brightness = {
         let background_dim = background_dim.clone();
         move |brightness: f64| background_dim.set_opacity(1.0 - brightness.clamp(0.0, 1.0))
+    };
+    // Tracks whether a custom background is currently in use, independent of
+    // the "Background wallpaper" switch below - `apply_wallpaper_enabled`
+    // reads it to decide "Restore default background"'s sensitivity on
+    // re-enable, since that can't be inferred from the switch state alone.
+    let has_custom_background = Rc::new(Cell::new(custom_background_name.is_some()));
+    // Config → Appearance → "Background wallpaper": off hides the wallpaper
+    // (and its dimming overlay) entirely, falling back to the window's own
+    // plain theme background, and greys out the three rows below it - none
+    // of them mean anything without a wallpaper to apply to.
+    let apply_wallpaper_enabled = {
+        let background = background.clone();
+        let background_dim = background_dim.clone();
+        let background_image_row = config_view.background_image_row.clone();
+        let background_brightness_row = config_view.background_brightness_row.clone();
+        let restore_background_row = config_view.restore_background_row.clone();
+        let has_custom_background = has_custom_background.clone();
+        move |enabled: bool| {
+            background.set_visible(enabled);
+            background_dim.set_visible(enabled);
+            background_image_row.set_sensitive(enabled);
+            background_brightness_row.set_sensitive(enabled);
+            restore_background_row.set_sensitive(enabled && has_custom_background.get());
+        }
     };
     {
         let brightness = settings.get_double(crate::settings::BACKGROUND_BRIGHTNESS);
@@ -5885,6 +5909,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.restore_background_row.set_sensitive(true);
     }
     {
+        let wallpaper_enabled = settings.get_bool(crate::settings::BACKGROUND_WALLPAPER_ENABLED);
+        config_view.wallpaper_enabled_row.set_active(wallpaper_enabled);
+        apply_wallpaper_enabled(wallpaper_enabled);
+    }
+    {
         let background_image_row = config_view.background_image_row.clone();
         let restore_background_row = config_view.restore_background_row.clone();
         let background_brightness_scale = config_view.background_brightness_scale.clone();
@@ -5892,6 +5921,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let window = window.clone();
         let toast_overlay = toast_overlay.clone();
         let settings = settings.clone();
+        let has_custom_background = has_custom_background.clone();
         background_image_row.connect_activated(move |row| {
             let row = row.clone();
             let window = window.clone();
@@ -5900,6 +5930,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let restore_background_row = restore_background_row.clone();
             let background_brightness_scale = background_brightness_scale.clone();
             let settings = settings.clone();
+            let has_custom_background = has_custom_background.clone();
             glib::spawn_future_local(async move {
                 let filter = gtk::FileFilter::new();
                 filter.add_pixbuf_formats();
@@ -5917,6 +5948,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
                         row.set_subtitle(&name);
                         restore_background_row.set_sensitive(true);
+                        has_custom_background.set(true);
                         // Every freshly-picked image starts at 50% brightness
                         // (the `value-changed` handler persists it and applies
                         // it to the overlay).
@@ -5947,6 +5979,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let background = background.clone();
         let settings = settings.clone();
         let apply_background_brightness = apply_background_brightness.clone();
+        let has_custom_background = has_custom_background.clone();
         restore_background_row.connect_activated(move |row| {
             crate::background_image::clear(&settings);
             background.set_paintable(Some(&default_bg_texture));
@@ -5957,6 +5990,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             background_brightness_scale.set_value(0.75);
             apply_background_brightness(0.75);
             row.set_sensitive(false);
+            has_custom_background.set(false);
+        });
+    }
+    {
+        let settings = settings.clone();
+        let apply_wallpaper_enabled = apply_wallpaper_enabled.clone();
+        config_view.wallpaper_enabled_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            settings.set_bool(crate::settings::BACKGROUND_WALLPAPER_ENABLED, enabled);
+            apply_wallpaper_enabled(enabled);
         });
     }
 

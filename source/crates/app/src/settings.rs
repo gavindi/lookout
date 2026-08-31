@@ -35,6 +35,12 @@ pub const SCHEMA_ID: &str = "io.github.gavindi.Lookout";
 pub const ANIMATE_TRANSITIONS: &str = "animate-transitions";
 pub const START_AT_LOGIN: &str = "start-at-login";
 pub const CLOSE_TO_BACKGROUND: &str = "close-to-background";
+/// Config → Appearance → "Background wallpaper": whether the window shows a
+/// wallpaper (bundled artwork or a user-picked image) behind the app
+/// content at all. Off disables the image picker, dimming slider and
+/// restore-default row below it too - none of them mean anything without a
+/// wallpaper to apply to.
+pub const BACKGROUND_WALLPAPER_ENABLED: &str = "background-wallpaper-enabled";
 pub const WINDOW_BACKGROUND_PATH: &str = "window-background-path";
 pub const BACKGROUND_BRIGHTNESS: &str = "background-brightness";
 pub const THEME_ID: &str = "theme-id";
@@ -171,6 +177,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(ANIMATE_TRANSITIONS, Value::Bool(true));
     map.insert(START_AT_LOGIN, Value::Bool(false));
     map.insert(CLOSE_TO_BACKGROUND, Value::Bool(true));
+    map.insert(BACKGROUND_WALLPAPER_ENABLED, Value::Bool(true));
     map.insert(WINDOW_BACKGROUND_PATH, Value::String(String::new()));
     map.insert(BACKGROUND_BRIGHTNESS, Value::Double(0.75));
     map.insert(THEME_ID, Value::String(crate::theme::DEFAULT_THEME.into()));
@@ -479,6 +486,7 @@ mod tests {
         assert!(!store.get_bool(MAIL_LOAD_REMOTE_IMAGES));
         assert!(store.get_bool(ANIMATE_TRANSITIONS));
         assert!(store.get_bool(CALENDAR_ALERTS_ENABLED));
+        assert!(store.get_bool(BACKGROUND_WALLPAPER_ENABLED));
         assert_eq!(store.get_string(LAST_VIEW_MAILBOX), "");
         assert_eq!(store.get_string(SORT_KEY), "date");
         assert_eq!(store.get_string(ASSISTANT_API_URL), "");

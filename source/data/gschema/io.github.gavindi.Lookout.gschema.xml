@@ -26,6 +26,11 @@
       <summary>Animate transitions</summary>
       <description>Fade between views when switching messages.</description>
     </key>
+    <key name="background-wallpaper-enabled" type="b">
+      <default>true</default>
+      <summary>Show background wallpaper</summary>
+      <description>Whether the window shows a wallpaper (bundled artwork or a user-picked image) behind the app content; when off, the window background image, dimming and restore options are unavailable.</description>
+    </key>
     <key name="window-background-path" type="s">
       <default>''</default>
       <summary>Custom window background image</summary>

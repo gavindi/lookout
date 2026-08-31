@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.117" date="2026-08-31">
+      <description>
+        <p>Added a "Background wallpaper" switch to Settings → Appearance: turning it off hides the window's wallpaper entirely and disables the background image picker, dimming slider, and restore-default options, which only matter when a wallpaper is shown.</p>
+      </description>
+    </release>
     <release version="0.9.116" date="2026-08-26">
       <description>
         <p>Fixed two rough edges on desktops without GNOME Online Accounts or a GNOME-flavoured keyring, such as KDE Plasma: a spurious "Couldn't reach GNOME Online Accounts" toast and a permanently-empty accounts section in Settings no longer appear when the service simply isn't installed, and the keyring-unavailable error message no longer assumes GNOME Keyring is the only fix.</p>

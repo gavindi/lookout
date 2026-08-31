@@ -1,6 +1,7 @@
 //! Config view: a read-only overview of the Mail/Calendar accounts Lookout
 //! is connected to, a live Appearance section (the smooth-transitions
-//! preference, the window-background image picker and its dimming slider), live Mail and Calendar
+//! preference, the background-wallpaper switch, the window-background image
+//! picker and its dimming slider), live Mail and Calendar
 //! preference groups (the remote-images/rich-text toggles and the event-alerts
 //! toggle), a live Keyboard-shortcuts section (per-action
 //! capture rows over the `shortcuts` GSettings key), the Appearance page
@@ -210,15 +211,24 @@ pub struct ConfigView {
     /// button into the `ThemeManager`; disabled until the switch above is on.
     pub accent_color_row: adw::ActionRow,
     pub accent_color_button: gtk::ColorDialogButton,
+    /// "Background wallpaper" switch, exposed so the caller can wire its
+    /// `active` state into showing/hiding the window background image
+    /// entirely and gating the sensitivity of the three rows below it - none
+    /// of them mean anything without a wallpaper to apply to.
+    pub wallpaper_enabled_row: adw::SwitchRow,
     /// "Window background" row, exposed so the caller can wire its `activated`
     /// signal to a file chooser and update its subtitle to reflect the image
     /// currently in use.
     pub background_image_row: adw::ActionRow,
+    /// The "Background dimming" row, exposed (alongside the scale below) so
+    /// the caller can grey out the row - title included - when the
+    /// "Background wallpaper" switch above is off.
+    pub background_brightness_row: adw::ActionRow,
     /// The "Background dimming" slider, exposed so the caller can wire its
     /// `value-changed` signal into the window background's brightness and
-    /// seed it with the stored value. Always enabled - dimming applies to
-    /// the bundled artwork as well as a custom background - so the row
-    /// itself needs no caller-side wiring beyond this.
+    /// seed it with the stored value. Enabled whenever wallpapers are - the
+    /// bundled artwork as well as a custom background - so beyond that gate
+    /// the row itself needs no further caller-side wiring.
     pub background_brightness_scale: gtk::Scale,
     /// "Restore default background" row, exposed so the caller can wire its
     /// `activated` signal back to the bundled artwork (and re-enable it only
@@ -469,6 +479,12 @@ pub fn build() -> ConfigView {
     accent_color_row.set_child(Some(&accent_color_button));
     accent_color_row.set_sensitive(false);
     appearance_group.add(&accent_color_row);
+    let wallpaper_enabled_row = adw::SwitchRow::builder()
+        .title("Background wallpaper")
+        .subtitle("Show a wallpaper behind the app content")
+        .active(true)
+        .build();
+    appearance_group.add(&wallpaper_enabled_row);
     let background_image_row = adw::ActionRow::builder()
         .title("Window background")
         .subtitle("Default Lookout artwork")
@@ -818,7 +834,9 @@ pub fn build() -> ConfigView {
         accent_switch_row,
         accent_color_row,
         accent_color_button,
+        wallpaper_enabled_row,
         background_image_row,
+        background_brightness_row,
         background_brightness_scale,
         restore_background_row,
         remote_images_row,
