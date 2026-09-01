@@ -428,6 +428,25 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         messages: Vec<EmailSummary>,
     },
+    /// The background body prefetch (see `PrefetchState`) has just SELECTed
+    /// `mailbox` and begun warming its bodies. Distinct from
+    /// `MessagesUpdated` - a prefetch pass never re-syncs or repaints a
+    /// mailbox's envelope list, it only fills the body cache - so the UI's
+    /// only use for this is a "background activity" indicator (the
+    /// folder-pane spinner) rather than anything that touches the message
+    /// list.
+    PrefetchStarted {
+        mailbox: MailboxId,
+    },
+    /// `mailbox`'s prefetch pass is done - either every wanted body was
+    /// fetched, or the batch fetch failed and there was nothing left to
+    /// retry this pass. Always paired with an earlier `PrefetchStarted` for
+    /// the same mailbox; never emitted for a mailbox prefetch skipped
+    /// outright (deleted since the folder list was built), since that
+    /// mailbox never got a `PrefetchStarted` either.
+    PrefetchFinished {
+        mailbox: MailboxId,
+    },
     /// A subset of a `MessagesUpdated` sync: just the messages that are both
     /// genuinely new (their UID wasn't cached before this sync) and still
     /// unread, for a desktop "new mail" notification. Never emitted on a
@@ -2292,6 +2311,11 @@ async fn connect_and_run(
                     if let Some(mailbox) = folders.iter().find(|m| m.id == pf.mailboxes[pf.current]) {
                         pf.current_folder_name = pf.mailboxes[pf.current].0.strip_prefix(&format!("{}:", account_id.0)).unwrap_or(&mailbox.name).to_string();
                         pf.uidvalidity = mailbox.uidvalidity;
+                        let _ = events
+                            .send(AccountEvent::PrefetchStarted {
+                                mailbox: pf.mailboxes[pf.current].clone(),
+                            })
+                            .await;
                     } else {
                         // Mailbox not found (deleted since list); skip it.
                         pf.advance();
@@ -2425,7 +2449,9 @@ async fn connect_and_run(
 
                 // If all UIDs for this mailbox are done, advance to the next.
                 if pf.pending_uids.is_empty() {
+                    let finished_mailbox = pf.mailboxes[pf.current].clone();
                     pf.advance();
+                    let _ = events.send(AccountEvent::PrefetchFinished { mailbox: finished_mailbox }).await;
                     if pf.is_done() {
                         tracing::info!("background body prefetch complete");
                     }

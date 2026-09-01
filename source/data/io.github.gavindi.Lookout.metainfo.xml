@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.124" date="2026-09-02">
+      <description>
+        <p>Added a small spinner to each folder in the sidebar while it's syncing or being prefetched in the background, so that activity is now visible instead of invisible until its unread count happens to change.</p>
+      </description>
+    </release>
     <release version="0.9.123" date="2026-09-01">
       <description>
         <p>Fixed the launcher/taskbar badge staying stuck at "1" unread even with no unread mail, caused by a "new mail" desktop notification that was never withdrawn once its mailbox was read.</p>

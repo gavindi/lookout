@@ -151,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::DraftSaved { message_id } => println!("draft saved: {message_id}"),
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
                     AccountEvent::PreviewsFetched { .. } => {}
+                    AccountEvent::PrefetchStarted { .. } | AccountEvent::PrefetchFinished { .. } => {}
                     AccountEvent::NewMessages { .. } => {}
                     AccountEvent::SearchResults { .. } => {}
                     AccountEvent::PartFetched { part, bytes, .. } => println!("part {} fetched ({} bytes)", part.part_number, bytes.len()),

@@ -690,6 +690,26 @@ pub(crate) struct UiState {
     /// reconnects and sends fresh folders, so a request that dies with a
     /// dropped connection can't suppress a later one.
     syncing: HashSet<MailboxId>,
+    /// Mailboxes the background body prefetch (see `PrefetchState` in
+    /// `lookout_mail::session`) is currently warming - between its
+    /// `AccountEvent::PrefetchStarted` and the matching `PrefetchFinished`.
+    /// Kept separate from `syncing` above rather than folded into it: the two
+    /// only share a UI surface (the folder-pane spinner, see
+    /// `folder_row_spinners`/`set_mailbox_prefetching`), and if a mailbox
+    /// mid-prefetch were marked `syncing` too, `request_mailbox_sync`'s dedup
+    /// check would wrongly suppress a real user-initiated sync for it.
+    prefetching: HashSet<MailboxId>,
+    /// The folder-pane row spinner currently bound to each mailbox that may
+    /// show one (i.e. is `syncing` or `prefetching`), if that row is in
+    /// view - refreshed on every `bind` (see `folder_factory`'s setup/bind
+    /// in `build_ui`). `GtkListView` recycles row widgets as they scroll, so
+    /// an entry can go stale (still pointing at a spinner that's since been
+    /// rebound to a different folder); a stamped `"lookout-sync-mailbox"`
+    /// qdata on the spinner itself is checked before every toggle to guard
+    /// against that. Read and written by `set_mailbox_syncing`/
+    /// `set_mailbox_prefetching` via `refresh_folder_spinner`, the only
+    /// places `syncing`/`prefetching` above should be mutated from.
+    folder_row_spinners: HashMap<MailboxId, glib::WeakRef<gtk::Spinner>>,
     /// How the message list is ordered, set from the list header's sort
     /// controls. Applied in `repopulate_message_list` - the single choke point
     /// every list rebuild passes through - so the order is uniform no matter
@@ -1520,10 +1540,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["folder-row-label"])
                 .build();
+            // Shown only while this row's mailbox is syncing or being
+            // prefetched (see `UiState::syncing`/`prefetching` and
+            // `refresh_folder_spinner`); sits right of the name and left of
+            // the unread count, both of which trail behind it since `label`
+            // is the box's only hexpanding child.
+            let spinner = gtk::Spinner::builder()
+                .visible(false)
+                .valign(gtk::Align::Center)
+                .width_request(14)
+                .height_request(14)
+                .build();
             let count = gtk::Label::builder().xalign(1.0).css_classes(["folder-unread-count"]).build();
             let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
             row_box.append(&icon);
             row_box.append(&label);
+            row_box.append(&spinner);
             row_box.append(&count);
             expander.set_child(Some(&row_box));
             // Drop target: a folder row accepts the internal message-drag
@@ -1655,101 +1687,128 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&overlay));
         });
     }
-    folder_factory.connect_bind(|_, list_item| {
-        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-        let Some(row) = list_item.item().and_downcast::<gtk::TreeListRow>() else { return };
-        let Some(overlay) = list_item.child().and_downcast::<gtk::Overlay>() else {
-            return;
-        };
-        let Some(expander) = overlay.child().and_downcast::<gtk::TreeExpander>() else {
-            return;
-        };
-        expander.set_list_row(Some(&row));
-        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
-        let tree_item = boxed.borrow::<TreeItem>();
-        let Some(row_box) = expander.child().and_downcast::<gtk::Box>() else { return };
-        let Some(icon) = row_box.first_child().and_downcast::<gtk::Image>() else { return };
-        let Some(label) = icon.next_sibling().and_downcast::<gtk::Label>() else { return };
-        let Some(count) = row_box.last_child().and_downcast::<gtk::Label>() else { return };
-        // A zero count is hidden rather than blanked: an empty label still
-        // reserves its spacing, which would leave every quiet folder's name
-        // ending short of the ones beside it.
-        let set_count = |unread: u32| {
-            count.set_visible(unread > 0);
-            if unread > 0 {
-                count.set_label(&unread.to_string());
-            }
-        };
-        match &*tree_item {
-            TreeItem::Unified(unread) => {
-                icon.set_visible(true);
-                icon.set_icon_name(Some("mail-inbox-symbolic"));
-                label.set_label("All Inboxes");
-                label.set_css_classes(&["heading", "folder-row-label"]);
-                set_count(*unread);
-            }
-            TreeItem::Favorites => {
-                icon.set_visible(true);
-                icon.set_icon_name(Some(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])));
-                label.set_label("Favorites");
-                label.set_css_classes(&["heading", "folder-row-label"]);
-                // A pure grouping row: every folder under it shows its own.
-                set_count(0);
-            }
-            TreeItem::Account(account) => {
-                icon.set_visible(false);
-                label.set_label(&account.label);
-                label.set_css_classes(&["heading", "folder-row-label"]);
-                set_count(account.unread);
-            }
-            // A favorite renders exactly like the folder it duplicates.
-            TreeItem::Folder(node) | TreeItem::Favorite(node) => {
-                icon.set_visible(true);
-                icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
-                label.set_label(&display_name(&node.mailbox.name));
-                label.set_css_classes(&["folder-row-label"]);
-                set_count(node.mailbox.unread);
-            }
-        }
-        // Refresh the row's drag-drop identity: folder rows accept moves
-        // into that folder, everything else accepts nothing.
-        if let Some(drop_data) = unsafe { expander.data::<Rc<RefCell<Option<Mailbox>>>>("lookout-drop-target") } {
-            let mut slot = unsafe { drop_data.as_ref() }.borrow_mut();
-            *slot = match &*tree_item {
-                TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.clone()),
-                _ => None,
+    {
+        let state_slot = state_slot.clone();
+        folder_factory.connect_bind(move |_, list_item| {
+            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+            let Some(row) = list_item.item().and_downcast::<gtk::TreeListRow>() else { return };
+            let Some(overlay) = list_item.child().and_downcast::<gtk::Overlay>() else {
+                return;
             };
-        }
-        // Refresh the row's expunge quick action: Trash and Junk rows get the
-        // button (with a role-named tooltip), everything else hides it.
-        let role = match &*tree_item {
-            TreeItem::Folder(node) | TreeItem::Favorite(node) => node.mailbox.role,
-            _ => MailboxRole::Custom,
-        };
-        let expunge_eligible = matches!(role, MailboxRole::Trash | MailboxRole::Junk);
-        if let Some(widgets) = unsafe { expander.data::<FolderRowWidgets>("lookout-expunge-widgets") } {
-            let widgets = unsafe { widgets.as_ref() };
-            widgets.expunge_enabled.set(expunge_eligible);
-            // Defensive: a recycled row may still carry a visible box from a
-            // stale hover; only hover on an eligible row ever re-shows it.
-            if !expunge_eligible {
-                widgets.action_box.set_visible(false);
+            let Some(expander) = overlay.child().and_downcast::<gtk::TreeExpander>() else {
+                return;
+            };
+            expander.set_list_row(Some(&row));
+            let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { return };
+            let tree_item = boxed.borrow::<TreeItem>();
+            let Some(row_box) = expander.child().and_downcast::<gtk::Box>() else { return };
+            let Some(icon) = row_box.first_child().and_downcast::<gtk::Image>() else { return };
+            let Some(label) = icon.next_sibling().and_downcast::<gtk::Label>() else { return };
+            let Some(spinner) = label.next_sibling().and_downcast::<gtk::Spinner>() else { return };
+            let Some(count) = row_box.last_child().and_downcast::<gtk::Label>() else { return };
+            // A zero count is hidden rather than blanked: an empty label still
+            // reserves its spacing, which would leave every quiet folder's name
+            // ending short of the ones beside it.
+            let set_count = |unread: u32| {
+                count.set_visible(unread > 0);
+                if unread > 0 {
+                    count.set_label(&unread.to_string());
+                }
+            };
+            match &*tree_item {
+                TreeItem::Unified(unread) => {
+                    icon.set_visible(true);
+                    icon.set_icon_name(Some("mail-inbox-symbolic"));
+                    label.set_label("All Inboxes");
+                    label.set_css_classes(&["heading", "folder-row-label"]);
+                    set_count(*unread);
+                }
+                TreeItem::Favorites => {
+                    icon.set_visible(true);
+                    icon.set_icon_name(Some(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])));
+                    label.set_label("Favorites");
+                    label.set_css_classes(&["heading", "folder-row-label"]);
+                    // A pure grouping row: every folder under it shows its own.
+                    set_count(0);
+                }
+                TreeItem::Account(account) => {
+                    icon.set_visible(false);
+                    label.set_label(&account.label);
+                    label.set_css_classes(&["heading", "folder-row-label"]);
+                    set_count(account.unread);
+                }
+                // A favorite renders exactly like the folder it duplicates.
+                TreeItem::Folder(node) | TreeItem::Favorite(node) => {
+                    icon.set_visible(true);
+                    icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
+                    label.set_label(&display_name(&node.mailbox.name));
+                    label.set_css_classes(&["folder-row-label"]);
+                    set_count(node.mailbox.unread);
+                }
             }
-            *widgets.expunge_data.borrow_mut() = if expunge_eligible {
-                match &*tree_item {
+            // Refresh the row's drag-drop identity: folder rows accept moves
+            // into that folder, everything else accepts nothing.
+            if let Some(drop_data) = unsafe { expander.data::<Rc<RefCell<Option<Mailbox>>>>("lookout-drop-target") } {
+                let mut slot = unsafe { drop_data.as_ref() }.borrow_mut();
+                *slot = match &*tree_item {
                     TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.clone()),
                     _ => None,
-                }
-            } else {
-                None
+                };
+            }
+            // Refresh the row's expunge quick action: Trash and Junk rows get the
+            // button (with a role-named tooltip), everything else hides it.
+            let role = match &*tree_item {
+                TreeItem::Folder(node) | TreeItem::Favorite(node) => node.mailbox.role,
+                _ => MailboxRole::Custom,
             };
-            widgets.expunge_btn.set_tooltip_text(Some(match role {
-                MailboxRole::Trash => "Empty Trash",
-                MailboxRole::Junk => "Empty Junk",
-                _ => "Empty folder",
-            }));
-        }
-    });
+            let expunge_eligible = matches!(role, MailboxRole::Trash | MailboxRole::Junk);
+            if let Some(widgets) = unsafe { expander.data::<FolderRowWidgets>("lookout-expunge-widgets") } {
+                let widgets = unsafe { widgets.as_ref() };
+                widgets.expunge_enabled.set(expunge_eligible);
+                // Defensive: a recycled row may still carry a visible box from a
+                // stale hover; only hover on an eligible row ever re-shows it.
+                if !expunge_eligible {
+                    widgets.action_box.set_visible(false);
+                }
+                *widgets.expunge_data.borrow_mut() = if expunge_eligible {
+                    match &*tree_item {
+                        TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                widgets.expunge_btn.set_tooltip_text(Some(match role {
+                    MailboxRole::Trash => "Empty Trash",
+                    MailboxRole::Junk => "Empty Junk",
+                    _ => "Empty folder",
+                }));
+            }
+            // Refresh the row's sync/prefetch spinner: register it under its
+            // mailbox id (for `set_mailbox_syncing`/`set_mailbox_prefetching`
+            // to reach it live) and stamp which mailbox it now represents, so
+            // a toggle arriving for a mailbox this row was recycled away from
+            // (see `folder_row_spinners`'s doc comment) is recognized as
+            // stale and skipped.
+            let spinner_mailbox = match &*tree_item {
+                TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.id.clone()),
+                _ => None,
+            };
+            unsafe {
+                spinner.set_data("lookout-sync-mailbox", spinner_mailbox.clone());
+            }
+            if let (Some(mailbox_id), Some(state)) = (&spinner_mailbox, state_slot.borrow().clone()) {
+                let mut st = state.borrow_mut();
+                st.folder_row_spinners.insert(mailbox_id.clone(), spinner.downgrade());
+                let active = st.syncing.contains(mailbox_id) || st.prefetching.contains(mailbox_id);
+                spinner.set_visible(active);
+                spinner.set_spinning(active);
+            } else {
+                spinner.set_visible(false);
+                spinner.set_spinning(false);
+            }
+        });
+    }
 
     let folder_list_view = gtk::ListView::new(Some(folder_selection.clone()), Some(folder_factory));
     let folder_scroller = gtk::ScrolledWindow::builder().child(&folder_list_view).vexpand(true).build();
@@ -1844,6 +1903,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         restore_pending: last_selection.is_some(),
         rendered_message: None,
         syncing: HashSet::new(),
+        prefetching: HashSet::new(),
+        folder_row_spinners: HashMap::new(),
         sort_key: SortKey::from_action_state(&settings.get_string(crate::settings::SORT_KEY)).unwrap_or(SortKey::Date),
         sort_descending: settings.get_bool(crate::settings::SORT_DESCENDING),
         favorites: settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId).collect(),
@@ -9015,12 +9076,12 @@ fn spawn_account_event_loop(
                             if let Some(handle) = st.accounts.get_mut(&account_id) {
                                 handle.folders = folders;
                             }
-                            // Fresh folder list means the account just (re)connected;
-                            // any sync requests it left unanswered are dead - clear
-                            // them so a later request for the same mailbox isn't
-                            // wrongly suppressed by an entry that'll never resolve.
-                            st.syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
                         }
+                        // Fresh folder list means the account just (re)connected;
+                        // any sync requests it left unanswered are dead - clear
+                        // them so a later request for the same mailbox isn't
+                        // wrongly suppressed by an entry that'll never resolve.
+                        clear_account_syncing(&state, &account_id);
                         // Fresh folder list also means a brand-new session: re-send
                         // the stored prefetch policy (Config → Advanced →
                         // "Aggressive prefetch") so a reconnect never leaves the
@@ -9056,7 +9117,7 @@ fn spawn_account_event_loop(
                         reconcile_optimistic_flag_changes(&state, &message_list, &mailbox, &mut messages);
                         reconcile_optimistic_pinned_changes(&state, &message_list, &mailbox, &mut messages);
                         // The sync this mailbox was asked for (if any) has landed.
-                        state.borrow_mut().syncing.remove(&mailbox);
+                        set_mailbox_syncing(&state, &mailbox, false);
                         refresh_message_loading_state(&state, &message_list, &message_list_stack);
                         // A sync means the envelope cache this dashboard reads
                         // changed - repaint its mail sections. (The calendar
@@ -9151,6 +9212,20 @@ fn spawn_account_event_loop(
                                 }
                             }
                         }
+                    }
+                    // The background body prefetch is otherwise silent (it
+                    // only warms the body cache, never touches the message
+                    // list), so `syncing`'s folder-pane spinner is its only
+                    // UI surface - `prefetching` is a separate set from
+                    // `syncing` rather than folding into it, so a mailbox
+                    // mid-prefetch can never suppress a real
+                    // `request_mailbox_sync` dedup check for the same
+                    // mailbox (see `set_mailbox_prefetching`).
+                    AccountEvent::PrefetchStarted { mailbox } => {
+                        set_mailbox_prefetching(&state, &mailbox, true);
+                    }
+                    AccountEvent::PrefetchFinished { mailbox } => {
+                        set_mailbox_prefetching(&state, &mailbox, false);
                     }
                     AccountEvent::PreviewsFetched { mailbox, previews } => {
                         // Keep the unified-view snapshot current regardless of
@@ -9648,7 +9723,6 @@ fn teardown_goa_account(
         st.accounts.remove(account_id);
         let belongs = |mailbox: &MailboxId| mailbox_account_id(mailbox).as_ref() == Some(account_id);
         st.unified_snapshots.retain(|mailbox, _| !belongs(mailbox));
-        st.syncing.retain(|mailbox| !belongs(mailbox));
         st.pending_optimistic_removals.retain(|mailbox, _| !belongs(mailbox));
         st.pending_optimistic_flag_changes.retain(|mailbox, _| !belongs(mailbox));
         st.pending_optimistic_pinned_changes.retain(|mailbox, _| !belongs(mailbox));
@@ -9656,6 +9730,7 @@ fn teardown_goa_account(
         st.search_pending.retain(|(_, mailbox)| !belongs(mailbox));
         st.current_mailbox.as_ref().is_some_and(belongs)
     };
+    clear_account_syncing(state, account_id);
     if open_mailbox_was_this_account {
         enter_unified_inbox(state, message_list, message_list_stack);
     }
@@ -13276,15 +13351,96 @@ fn select_mailbox(
 /// (every reconnect re-lists folders), so a request that dies with a dropped
 /// connection can never permanently suppress a later one.
 fn request_mailbox_sync(state: &Rc<RefCell<UiState>>, account_id: &AccountId, mailbox_id: &MailboxId) -> bool {
-    let mut st = state.borrow_mut();
-    if st.syncing.contains(mailbox_id) {
+    if state.borrow().syncing.contains(mailbox_id) {
         return false;
     }
-    st.syncing.insert(mailbox_id.clone());
-    if let Some(handle) = st.accounts.get(account_id) {
-        let _ = handle.cmd_tx.send_blocking(AccountCommand::SyncMailbox(mailbox_id.clone()));
+    set_mailbox_syncing(state, mailbox_id, true);
+    let cmd_tx = state.borrow().accounts.get(account_id).map(|handle| handle.cmd_tx.clone());
+    if let Some(cmd_tx) = cmd_tx {
+        let _ = cmd_tx.send_blocking(AccountCommand::SyncMailbox(mailbox_id.clone()));
     }
     true
+}
+
+/// Marks `mailbox_id` syncing or not in `UiState::syncing`, then repaints its
+/// folder-pane spinner via `refresh_folder_spinner`. Nothing else prompts a
+/// rebind for a syncing-only change: `rebuild_folder_tree`'s signature guard
+/// deliberately excludes `syncing`, since folding it in would trigger a full
+/// model swap (and the flicker that comes with it) on every sync start/stop,
+/// which happens far too often for that. So this is the only path that keeps
+/// the sidebar indicator live for a real sync - every mutation of `syncing`
+/// should go through it rather than touching the set directly.
+fn set_mailbox_syncing(state: &Rc<RefCell<UiState>>, mailbox_id: &MailboxId, syncing: bool) {
+    {
+        let mut st = state.borrow_mut();
+        if syncing {
+            st.syncing.insert(mailbox_id.clone());
+        } else {
+            st.syncing.remove(mailbox_id);
+        }
+    }
+    refresh_folder_spinner(state, mailbox_id);
+}
+
+/// `set_mailbox_syncing`'s counterpart for the background body prefetch (see
+/// `AccountEvent::PrefetchStarted`/`PrefetchFinished`): marks `mailbox_id` in
+/// `UiState::prefetching` rather than `syncing`, so a mailbox mid-prefetch
+/// can never suppress `request_mailbox_sync`'s dedup check for a real sync of
+/// the same mailbox, then repaints its spinner the same way.
+fn set_mailbox_prefetching(state: &Rc<RefCell<UiState>>, mailbox_id: &MailboxId, prefetching: bool) {
+    {
+        let mut st = state.borrow_mut();
+        if prefetching {
+            st.prefetching.insert(mailbox_id.clone());
+        } else {
+            st.prefetching.remove(mailbox_id);
+        }
+    }
+    refresh_folder_spinner(state, mailbox_id);
+}
+
+/// Shared repaint step for `set_mailbox_syncing`/`set_mailbox_prefetching`:
+/// if `mailbox_id`'s folder-pane row is currently bound (in view), shows its
+/// spinner exactly while the mailbox is syncing and/or prefetching.
+fn refresh_folder_spinner(state: &Rc<RefCell<UiState>>, mailbox_id: &MailboxId) {
+    let (spinner, active) = {
+        let st = state.borrow();
+        let active = st.syncing.contains(mailbox_id) || st.prefetching.contains(mailbox_id);
+        (st.folder_row_spinners.get(mailbox_id).and_then(|weak| weak.upgrade()), active)
+    };
+    let Some(spinner) = spinner else { return };
+    // The map can hold a stale entry for a row GTK has since recycled to show
+    // a different mailbox as the pane scrolls - only apply the toggle if this
+    // spinner is still stamped for `mailbox_id` (stamped on every `bind`).
+    let stamped = unsafe { spinner.data::<Option<MailboxId>>("lookout-sync-mailbox") };
+    let still_current = stamped.is_some_and(|ptr| unsafe { ptr.as_ref() }.as_ref() == Some(mailbox_id));
+    if still_current {
+        spinner.set_visible(active);
+        spinner.set_spinning(active);
+    }
+}
+
+/// Clears every outstanding sync and prefetch entry belonging to
+/// `account_id` - a reconnect (fresh `FoldersUpdated`) or account removal
+/// invalidates them all at once, since whatever they were waiting on can now
+/// never land (a dropped connection also silently kills the prefetch pass
+/// mid-mailbox, with no `PrefetchFinished` ever coming for it) - and turns
+/// off any of their folder-pane spinners that are currently bound, the same
+/// "don't leave the spinner running for a request that'll never land" case
+/// `refresh_message_loading_state` already guards against for the message
+/// list.
+fn clear_account_syncing(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    let cleared: Vec<MailboxId> = {
+        let mut st = state.borrow_mut();
+        let belongs = |mailbox: &MailboxId| mailbox_account_id(mailbox).as_ref() == Some(account_id);
+        let before: HashSet<MailboxId> = st.syncing.iter().chain(st.prefetching.iter()).cloned().collect();
+        st.syncing.retain(|mailbox| !belongs(mailbox));
+        st.prefetching.retain(|mailbox| !belongs(mailbox));
+        before.into_iter().filter(|mailbox| belongs(mailbox)).collect()
+    };
+    for mailbox_id in cleared {
+        refresh_folder_spinner(state, &mailbox_id);
+    }
 }
 
 /// Shows the "Fetching message list." spinner in place of the message list
@@ -16877,6 +17033,8 @@ mod tests {
             restore_pending: false,
             rendered_message: None,
             syncing: HashSet::new(),
+            prefetching: HashSet::new(),
+            folder_row_spinners: HashMap::new(),
             sort_key: SortKey::Date,
             sort_descending: true,
             favorites: HashSet::new(),
