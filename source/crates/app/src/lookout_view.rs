@@ -148,7 +148,13 @@ pub fn build_lookout_view() -> LookoutView {
     let chat_settings = webkit::Settings::new();
     chat_settings.set_enable_javascript(false);
     chat_settings.set_enable_developer_extras(false);
-    chat_settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never);
+    // Left at WebKit's default (on-demand) hardware-acceleration policy,
+    // like the reading pane's `web_view` (`window.rs`) - not `Never`. Both
+    // are long-lived WebViews reused across many document loads and
+    // internal scrolls; under `Never`, WebKit's software compositor ghosts/
+    // blends on reload, in-page animation, and internal scroll alike (see
+    // the webkit-hwaccel-never-ghosting-bug memory) - a defect in WebKit's
+    // own software/threaded compositor, not fixable from this app's side.
     let chat_output = webkit::WebView::builder()
         .settings(&chat_settings)
         .editable(false)

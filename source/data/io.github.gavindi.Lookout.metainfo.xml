@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.122" date="2026-09-01">
+      <description>
+        <p>Fixed the Lookout tab's "Ask" reply view ghosting/oversaturating during its loading animation and while scrolling a long reply, caused by forcing software rendering on that reused WebView.</p>
+      </description>
+    </release>
     <release version="0.9.121" date="2026-09-01">
       <description>
         <p>Replaced the app icon with a new logo, used for both the app launcher and the tray/app-indicator icon.</p>
