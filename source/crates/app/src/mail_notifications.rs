@@ -66,6 +66,16 @@ pub fn show_new_mail_notification(app: &adw::Application, mailbox_label: &str, m
     app.send_notification(Some(&new_mail_notification_id(mailbox)), &notification);
 }
 
+/// Withdraws `mailbox`'s outstanding "new mail" notification, if any -
+/// called once its unread count is back to 0 so the notification doesn't
+/// linger and keep some desktop shells' per-app notification-count badge
+/// (a different mechanism from the `LauncherEntry` count in
+/// `launcher_entry.rs`) stuck showing it as unread forever. Withdrawing an
+/// id with nothing outstanding is a harmless no-op.
+pub fn withdraw_new_mail_notification(app: &adw::Application, mailbox: &MailboxId) {
+    app.withdraw_notification(&new_mail_notification_id(mailbox));
+}
+
 /// Builds and sends a "message not sent" notification. The default action
 /// just raises the window (`app.raise-window`) - there's no specific place
 /// to navigate to for a send failure.

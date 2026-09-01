@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.123" date="2026-09-01">
+      <description>
+        <p>Fixed the launcher/taskbar badge staying stuck at "1" unread even with no unread mail, caused by a "new mail" desktop notification that was never withdrawn once its mailbox was read.</p>
+      </description>
+    </release>
     <release version="0.9.122" date="2026-09-01">
       <description>
         <p>Fixed the Lookout tab's "Ask" reply view ghosting/oversaturating during its loading animation and while scrolling a long reply, caused by forcing software rendering on that reused WebView.</p>

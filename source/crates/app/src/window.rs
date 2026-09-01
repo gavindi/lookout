@@ -577,6 +577,11 @@ pub(crate) struct UiState {
     /// runs from widget callbacks, not the account event loop) can surface
     /// fetch-timeout feedback. `None` only in tests, where no window exists.
     toast_overlay: Option<adw::ToastOverlay>,
+    /// The running application, kept so `refresh_unread_indicators` can
+    /// withdraw a mailbox's "new mail" notification once its unread count
+    /// is back to 0 - see `mail_notifications::withdraw_new_mail_notification`.
+    /// `None` only in tests, where no real `Application` exists.
+    app: Option<adw::Application>,
     /// Persistent "Sending: <subject>" toasts shown while a `SendMessage`
     /// command is outstanding, queued per account in the order their sends
     /// were dispatched. The per-account session loop processes commands
@@ -1806,6 +1811,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         goa_accounts: HashMap::new(),
         goa_client: None,
         goa_unavailable: false,
+        app: Some(app.clone()),
         current_account: None,
         current_mailbox: None,
         pending_message_selection: None,
@@ -14138,9 +14144,23 @@ fn folder_tree_signature(accounts: &[(AccountId, String, Vec<Mailbox>)], favorit
 /// (the only thing that changes the underlying counts) and on either
 /// toggle flipping; the indicator modules dedupe unchanged values and fail
 /// silently without a bus or a listener that speaks the protocol.
+///
+/// Also withdraws the "new mail" notification (see `mail_notifications`) for
+/// any notification-worthy folder whose unread count is back to 0 - some
+/// desktop shells paint their own taskbar/dock badge from outstanding
+/// notification counts, a mechanism separate from `LauncherEntry` above,
+/// and `mail_notifications` never withdraws on its own since it has no
+/// "message read" event to hook.
 fn refresh_unread_indicators(state: &Rc<RefCell<UiState>>) {
-    let (dock_enabled, tray_enabled, total) = {
+    let (dock_enabled, tray_enabled, total, app, cleared_mailboxes) = {
         let st = state.borrow();
+        let cleared_mailboxes: Vec<MailboxId> = st
+            .accounts
+            .values()
+            .flat_map(|handle| handle.folders.iter())
+            .filter(|m| crate::mail_notifications::should_notify_role(m.role) && m.unread == 0)
+            .map(|m| m.id.clone())
+            .collect();
         (
             st.settings.get_bool(crate::settings::DOCK_BADGE_ENABLED),
             st.settings.get_bool(crate::settings::TRAY_ICON_ENABLED),
@@ -14148,11 +14168,18 @@ fn refresh_unread_indicators(state: &Rc<RefCell<UiState>>) {
                 .values()
                 .filter_map(|handle| handle.folders.iter().find(|m| matches!(m.role, MailboxRole::Inbox)).map(|m| m.unread))
                 .sum::<u32>(),
+            st.app.clone(),
+            cleared_mailboxes,
         )
     };
     crate::launcher_entry::set_unread_count(if dock_enabled { total } else { 0 });
     if tray_enabled {
         crate::tray::set_unread_count(total);
+    }
+    if let Some(app) = &app {
+        for mailbox in &cleared_mailboxes {
+            crate::mail_notifications::withdraw_new_mail_notification(app, mailbox);
+        }
     }
 }
 
@@ -16817,6 +16844,7 @@ mod tests {
             goa_accounts: HashMap::new(),
             goa_client: None,
             goa_unavailable: false,
+            app: None,
             current_account: None,
             current_mailbox: None,
             pending_message_selection: None,
