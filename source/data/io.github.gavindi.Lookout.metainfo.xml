@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.125" date="2026-09-02">
+      <description>
+        <p>The message list's Sync button now also bumps the account's standard background refresh along (a folder-list relist plus resync), instead of only resyncing the highlighted folder.</p>
+      </description>
+    </release>
     <release version="0.9.124" date="2026-09-02">
       <description>
         <p>Added a small spinner to each folder in the sidebar while it's syncing or being prefetched in the background, so that activity is now visible instead of invisible until its unread count happens to change.</p>

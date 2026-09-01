@@ -710,6 +710,17 @@ pub(crate) struct UiState {
     /// `set_mailbox_prefetching` via `refresh_folder_spinner`, the only
     /// places `syncing`/`prefetching` above should be mutated from.
     folder_row_spinners: HashMap<MailboxId, glib::WeakRef<gtk::Spinner>>,
+    /// Accounts with an `AccountCommand::Refresh` outstanding - sent but not
+    /// yet answered by a `FoldersUpdated` (`Refresh`'s own first step is a
+    /// folder relist). Dedupes `request_account_refresh` the same way
+    /// `syncing` dedupes `request_mailbox_sync`: the message list's Sync
+    /// button fires both together on every click, so without this a
+    /// double-click (or clicking again before the first refresh lands) would
+    /// queue a redundant full relist behind the one already in flight.
+    /// Cleared on the answering `FoldersUpdated`, or on reconnect/removal
+    /// (also a `FoldersUpdated`/account-removal event), so a request that
+    /// dies with a dropped connection can't suppress a later one.
+    refreshing: HashSet<AccountId>,
     /// How the message list is ordered, set from the list header's sort
     /// controls. Applied in `repopulate_message_list` - the single choke point
     /// every list rebuild passes through - so the order is uniform no matter
@@ -1905,6 +1916,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         syncing: HashSet::new(),
         prefetching: HashSet::new(),
         folder_row_spinners: HashMap::new(),
+        refreshing: HashSet::new(),
         sort_key: SortKey::from_action_state(&settings.get_string(crate::settings::SORT_KEY)).unwrap_or(SortKey::Date),
         sort_descending: settings.get_bool(crate::settings::SORT_DESCENDING),
         favorites: settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId).collect(),
@@ -9082,6 +9094,12 @@ fn spawn_account_event_loop(
                         // them so a later request for the same mailbox isn't
                         // wrongly suppressed by an entry that'll never resolve.
                         clear_account_syncing(&state, &account_id);
+                        // This is also `request_account_refresh`'s own answer
+                        // (a `Refresh` command relists before resyncing), and
+                        // - like `syncing` above - a reconnect kills any
+                        // `Refresh` this account had outstanding, so either
+                        // way there's nothing left to dedupe against.
+                        state.borrow_mut().refreshing.remove(&account_id);
                         // Fresh folder list also means a brand-new session: re-send
                         // the stored prefetch policy (Config → Advanced →
                         // "Aggressive prefetch") so a reconnect never leaves the
@@ -9721,6 +9739,7 @@ fn teardown_goa_account(
     let open_mailbox_was_this_account = {
         let mut st = state.borrow_mut();
         st.accounts.remove(account_id);
+        st.refreshing.remove(account_id);
         let belongs = |mailbox: &MailboxId| mailbox_account_id(mailbox).as_ref() == Some(account_id);
         st.unified_snapshots.retain(|mailbox, _| !belongs(mailbox));
         st.pending_optimistic_removals.retain(|mailbox, _| !belongs(mailbox));
@@ -13487,14 +13506,20 @@ fn account_inboxes(state: &Rc<RefCell<UiState>>) -> Vec<(AccountId, MailboxId)> 
 }
 
 /// Re-syncs whatever the message list is currently showing: the open mailbox,
-/// or every account's Inbox in the unified view. `request_mailbox_sync`
-/// dedupes against in-flight requests, so pressing Sync while a sync is
-/// already outstanding is deliberately a no-op rather than a second round
-/// trip.
+/// or every account's Inbox in the unified view - then, for the same
+/// account(s), bumps their standard background refresh along too
+/// (`request_account_refresh`) rather than waiting for it to fall due on its
+/// own IDLE cadence. Both dedupe against a request already outstanding
+/// (`request_mailbox_sync` against `syncing`, `request_account_refresh`
+/// against `refreshing`), so pressing Sync repeatedly is a no-op rather than
+/// queuing repeat round trips, and each account's background command channel
+/// being FIFO means the highlighted folder's own sync always lands first,
+/// with the account-wide relist following behind it.
 fn resync_current_view(state: &Rc<RefCell<UiState>>) {
     if matches!(state.borrow().mail_view, MailView::UnifiedInbox) {
         for (account_id, inbox_id) in account_inboxes(state) {
             request_mailbox_sync(state, &account_id, &inbox_id);
+            request_account_refresh(state, &account_id);
         }
         return;
     }
@@ -13504,6 +13529,26 @@ fn resync_current_view(state: &Rc<RefCell<UiState>>) {
     };
     if let Some((account_id, mailbox_id)) = current {
         request_mailbox_sync(state, &account_id, &mailbox_id);
+        request_account_refresh(state, &account_id);
+    }
+}
+
+/// Sends `AccountCommand::Refresh` - a folder-list relist plus a resync of
+/// whatever mailbox the session currently considers open, outside of IDLE's
+/// own cadence - deduplicating against one already outstanding for
+/// `account_id` via `UiState::refreshing`, cleared when the account's
+/// answering `FoldersUpdated` lands (`Refresh`'s own first step). Without the
+/// dedupe, clicking the message list's Sync button again before the previous
+/// refresh's relist has landed would queue a second one behind it for no
+/// benefit.
+fn request_account_refresh(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    if state.borrow().refreshing.contains(account_id) {
+        return;
+    }
+    state.borrow_mut().refreshing.insert(account_id.clone());
+    let cmd_tx = state.borrow().accounts.get(account_id).map(|handle| handle.cmd_tx.clone());
+    if let Some(cmd_tx) = cmd_tx {
+        let _ = cmd_tx.send_blocking(AccountCommand::Refresh);
     }
 }
 
@@ -17035,6 +17080,7 @@ mod tests {
             syncing: HashSet::new(),
             prefetching: HashSet::new(),
             folder_row_spinners: HashMap::new(),
+            refreshing: HashSet::new(),
             sort_key: SortKey::Date,
             sort_descending: true,
             favorites: HashSet::new(),
