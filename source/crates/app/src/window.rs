@@ -699,17 +699,24 @@ pub(crate) struct UiState {
     /// mid-prefetch were marked `syncing` too, `request_mailbox_sync`'s dedup
     /// check would wrongly suppress a real user-initiated sync for it.
     prefetching: HashSet<MailboxId>,
-    /// The folder-pane row spinner currently bound to each mailbox that may
-    /// show one (i.e. is `syncing` or `prefetching`), if that row is in
-    /// view - refreshed on every `bind` (see `folder_factory`'s setup/bind
-    /// in `build_ui`). `GtkListView` recycles row widgets as they scroll, so
-    /// an entry can go stale (still pointing at a spinner that's since been
-    /// rebound to a different folder); a stamped `"lookout-sync-mailbox"`
+    /// The folder-pane row spinner(s) currently bound to each mailbox that
+    /// may show one (i.e. is `syncing` or `prefetching`), if a row for it is
+    /// in view - refreshed on every `bind` (see `folder_factory`'s setup/
+    /// bind in `build_ui`). A `Vec` rather than a single entry because a
+    /// starred mailbox is bound to *two* simultaneous rows - its place in
+    /// the account's own tree (`TreeItem::Folder`) and its pinned copy in
+    /// the Favorites section (`TreeItem::Favorite`) - each with its own
+    /// spinner widget; a single-valued map would only ever track whichever
+    /// row bound last, leaving the other's spinner stuck at its state from
+    /// its own last bind. `GtkListView` recycles row widgets as they scroll,
+    /// so an entry can go stale (still pointing at a spinner that's since
+    /// been rebound to a different folder); a stamped `"lookout-sync-mailbox"`
     /// qdata on the spinner itself is checked before every toggle to guard
-    /// against that. Read and written by `set_mailbox_syncing`/
-    /// `set_mailbox_prefetching` via `refresh_folder_spinner`, the only
-    /// places `syncing`/`prefetching` above should be mutated from.
-    folder_row_spinners: HashMap<MailboxId, glib::WeakRef<gtk::Spinner>>,
+    /// against that, and dead/stale weak refs are pruned on each refresh.
+    /// Read and written by `set_mailbox_syncing`/`set_mailbox_prefetching`
+    /// via `refresh_folder_spinner`, the only places `syncing`/`prefetching`
+    /// above should be mutated from.
+    folder_row_spinners: HashMap<MailboxId, Vec<glib::WeakRef<gtk::Spinner>>>,
     /// Accounts with an `AccountCommand::Refresh` outstanding - sent but not
     /// yet answered by a `FoldersUpdated` (`Refresh`'s own first step is a
     /// folder relist). Dedupes `request_account_refresh` the same way
@@ -1810,7 +1817,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
             if let (Some(mailbox_id), Some(state)) = (&spinner_mailbox, state_slot.borrow().clone()) {
                 let mut st = state.borrow_mut();
-                st.folder_row_spinners.insert(mailbox_id.clone(), spinner.downgrade());
+                let entry = st.folder_row_spinners.entry(mailbox_id.clone()).or_default();
+                // Drop dead weak refs and any existing entry for this exact
+                // widget (a rebind of the same row) before re-adding it, so a
+                // row that toggles between mailboxes doesn't accumulate
+                // duplicate entries for the mailboxes it's passed through.
+                entry.retain(|weak| weak.upgrade().is_some_and(|s| s != spinner));
+                entry.push(spinner.downgrade());
                 let active = st.syncing.contains(mailbox_id) || st.prefetching.contains(mailbox_id);
                 spinner.set_visible(active);
                 spinner.set_spinning(active);
@@ -13461,23 +13474,37 @@ fn set_mailbox_prefetching(state: &Rc<RefCell<UiState>>, mailbox_id: &MailboxId,
 }
 
 /// Shared repaint step for `set_mailbox_syncing`/`set_mailbox_prefetching`:
-/// if `mailbox_id`'s folder-pane row is currently bound (in view), shows its
-/// spinner exactly while the mailbox is syncing and/or prefetching.
+/// if `mailbox_id` has any folder-pane row(s) currently bound (in view) -
+/// a starred mailbox can have two at once, its own tree row and its
+/// Favorites pinned row - shows their spinner exactly while the mailbox is
+/// syncing and/or prefetching.
 fn refresh_folder_spinner(state: &Rc<RefCell<UiState>>, mailbox_id: &MailboxId) {
-    let (spinner, active) = {
-        let st = state.borrow();
+    let (spinners, active) = {
+        let mut st = state.borrow_mut();
         let active = st.syncing.contains(mailbox_id) || st.prefetching.contains(mailbox_id);
-        (st.folder_row_spinners.get(mailbox_id).and_then(|weak| weak.upgrade()), active)
+        let spinners = match st.folder_row_spinners.get_mut(mailbox_id) {
+            Some(weaks) => {
+                let live: Vec<gtk::Spinner> = weaks.iter().filter_map(|weak| weak.upgrade()).collect();
+                // Prune dead entries now so the vec doesn't grow unbounded as
+                // rows are recycled away over the pane's lifetime.
+                weaks.retain(|weak| weak.upgrade().is_some());
+                live
+            }
+            None => Vec::new(),
+        };
+        (spinners, active)
     };
-    let Some(spinner) = spinner else { return };
-    // The map can hold a stale entry for a row GTK has since recycled to show
-    // a different mailbox as the pane scrolls - only apply the toggle if this
-    // spinner is still stamped for `mailbox_id` (stamped on every `bind`).
-    let stamped = unsafe { spinner.data::<Option<MailboxId>>("lookout-sync-mailbox") };
-    let still_current = stamped.is_some_and(|ptr| unsafe { ptr.as_ref() }.as_ref() == Some(mailbox_id));
-    if still_current {
-        spinner.set_visible(active);
-        spinner.set_spinning(active);
+    for spinner in spinners {
+        // The map can hold a stale entry for a row GTK has since recycled to
+        // show a different mailbox as the pane scrolls - only apply the
+        // toggle if this spinner is still stamped for `mailbox_id` (stamped
+        // on every `bind`).
+        let stamped = unsafe { spinner.data::<Option<MailboxId>>("lookout-sync-mailbox") };
+        let still_current = stamped.is_some_and(|ptr| unsafe { ptr.as_ref() }.as_ref() == Some(mailbox_id));
+        if still_current {
+            spinner.set_visible(active);
+            spinner.set_spinning(active);
+        }
     }
 }
 

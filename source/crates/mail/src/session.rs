@@ -1113,10 +1113,27 @@ async fn connect_and_run(
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
-                    // Rebuild the prefetch list to include any new folders.
+                    // Add any newly-discovered folders to the prefetch queue
+                    // rather than discarding whatever pass is already in
+                    // flight: `Refresh` fires far more often than "a folder
+                    // was added" now (the periodic account refresh, the
+                    // message list's Sync button, "Clear cache"), and
+                    // replacing `prefetch` wholesale on every one of those
+                    // reset the current mailbox's progress back to the start
+                    // - for a large folder that never lets it finish, which
+                    // silently strands its `PrefetchStarted` (no matching
+                    // `PrefetchFinished` ever follows) and leaves the
+                    // folder-pane spinner stuck on forever.
                     let new_mailboxes: Vec<MailboxId> = folders.iter().filter(|m| m.id != current_mailbox_id).map(|m| m.id.clone()).collect();
-                    if !new_mailboxes.is_empty() {
-                        prefetch = Some(PrefetchState::new(new_mailboxes));
+                    match prefetch.as_mut() {
+                        Some(pf) => {
+                            let existing: HashSet<MailboxId> = pf.mailboxes.iter().cloned().collect();
+                            pf.mailboxes.extend(new_mailboxes.into_iter().filter(|m| !existing.contains(m)));
+                        }
+                        None if !new_mailboxes.is_empty() => {
+                            prefetch = Some(PrefetchState::new(new_mailboxes));
+                        }
+                        None => {}
                     }
                 }
                 AccountCommand::SyncMailbox(mailbox_id) => {

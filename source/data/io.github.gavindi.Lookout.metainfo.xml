@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.128" date="2026-09-02">
+      <description>
+        <p>Fixed the folder-pane activity spinner getting stuck on past when a folder's sync or prefetch had actually finished.</p>
+      </description>
+    </release>
     <release version="0.9.127" date="2026-09-02">
       <description>
         <p>Fixed the message list's loading spinner dropping to an empty-folder view before a folder's sync had actually finished populating the list, most noticeable on large mailboxes.</p>
