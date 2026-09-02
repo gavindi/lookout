@@ -69,6 +69,15 @@ echo
 echo "Built binary: $BINARY_PATH"
 
 if [ "$DEB" = true ]; then
+    # cargo-deb stamps every file in the package with a single reproducible
+    # timestamp. Absent SOURCE_DATE_EPOCH, it falls back to the mtime of the
+    # packaged crate's own Cargo.toml (crates/app/Cargo.toml) - which, since
+    # its version is inherited via `version.workspace = true`, never actually
+    # changes at release time and so stays pinned to whenever the repo was
+    # checked out, not any real build or release date. Pin it to the last
+    # git commit instead: still reproducible for a given commit, but an
+    # accurate date rather than an arbitrary checkout-time one.
+    export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$WORKSPACE_DIR" log -1 --format=%ct)}"
     cargo deb --no-build -p lookout-app
     DEB_PATH="$(ls -t "$WORKSPACE_DIR"/target/debian/*.deb | head -n1)"
     echo "Built package: $DEB_PATH"

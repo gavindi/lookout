@@ -7718,6 +7718,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // --- Message list model contents changed -> re-check the loading spinner ---
+    // `repopulate`/`repopulate_unified_slice` (message_list.rs) splice a large
+    // mailbox's computed layout onto the model asynchronously, off the GTK
+    // main thread - by the time that dispatch is even started, the
+    // `MessagesUpdated` handler that triggered it has already returned, so
+    // nothing there can re-check `refresh_message_loading_state` once the
+    // splice actually lands. `items-changed` (from `gio::ListModel`, distinct
+    // from `MultiSelection`'s own `selection-changed`) fires synchronously
+    // from every splice, sync or async, so hooking it here is the one place
+    // that catches both paths without every `repopulate` call site needing to
+    // remember to re-check itself.
+    {
+        let state = state.clone();
+        let message_list_for_items_changed = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
+        message_list.selection.connect_items_changed(move |_model, _pos, _removed, _added| {
+            refresh_message_loading_state(&state, &message_list_for_items_changed, &message_list_stack);
+        });
+    }
+
     // --- Message selection -> AccountCommand::FetchBody on the current account ---
     {
         let state = state.clone();
@@ -9136,7 +9156,6 @@ fn spawn_account_event_loop(
                         reconcile_optimistic_pinned_changes(&state, &message_list, &mailbox, &mut messages);
                         // The sync this mailbox was asked for (if any) has landed.
                         set_mailbox_syncing(&state, &mailbox, false);
-                        refresh_message_loading_state(&state, &message_list, &message_list_stack);
                         // A sync means the envelope cache this dashboard reads
                         // changed - repaint its mail sections. (The calendar
                         // sections repaint via their own event loops.)
@@ -9230,6 +9249,13 @@ fn spawn_account_event_loop(
                                 }
                             }
                         }
+                        // Re-check now that `repopulate`/`repopulate_unified_slice`
+                        // (if this mailbox was the one on screen) has actually
+                        // landed - checking right after `set_mailbox_syncing`
+                        // above would still see the pre-sync (often empty) list
+                        // and briefly flash the "empty" state before the real
+                        // content arrives.
+                        refresh_message_loading_state(&state, &message_list, &message_list_stack);
                     }
                     // The shared `sync_mailbox` fires this at the start of
                     // every full envelope re-sync it does, for any trigger -
