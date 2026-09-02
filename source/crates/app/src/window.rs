@@ -4812,10 +4812,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Lookout")
-        .default_width(1600)
-        .default_height(900)
+        .default_width(settings.get_int(crate::settings::WINDOW_WIDTH))
+        .default_height(settings.get_int(crate::settings::WINDOW_HEIGHT))
         .content(&window_overlay)
         .build();
+    // Restored once here, at construction - the window object then lives for
+    // the app's lifetime, so this never needs to run again (tray show/hide
+    // just toggles visibility on the same window).
+    if settings.get_bool(crate::settings::WINDOW_MAXIMIZED) {
+        window.maximize();
+    }
     // The message list's sort menu is built long before the window exists;
     // `win.`-scoped actions resolve through the widget hierarchy when the menu
     // item is activated, so registering it here is in time.
@@ -4833,6 +4839,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         window.connect_close_request({
             let worker = worker.clone();
             move |win| {
+                // Flush geometry synchronously rather than relying on the
+                // debounced resize/maximize saves below, in case the window
+                // closes right as a resize is still settling.
+                if !win.is_maximized() {
+                    settings.set_int(crate::settings::WINDOW_WIDTH, win.width());
+                    settings.set_int(crate::settings::WINDOW_HEIGHT, win.height());
+                }
+                settings.set_bool(crate::settings::WINDOW_MAXIMIZED, win.is_maximized());
                 if !settings.get_bool(crate::settings::CLOSE_TO_BACKGROUND) {
                     return glib::Propagation::Proceed;
                 }
@@ -5067,6 +5081,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let apply_stored_pane_widths = apply_stored_pane_widths.clone();
         let check_overview_fits = check_overview_fits.clone();
+        let settings = settings.clone();
         let wired: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         window.connect_map(move |window| {
             let Some(surface) = window.surface() else {
@@ -5076,29 +5091,60 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 return;
             }
             wired.set(true);
-            let apply_for_notify = apply_stored_pane_widths.clone();
-            let check_for_notify = check_overview_fits.clone();
-            let window_for_width = window.clone();
             let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-            surface.connect_width_notify(move |_| {
-                if let Some(id) = debounce.take() {
-                    id.remove();
+            // Width and height changes both funnel into the same debounced
+            // save/reapply - a resize that changes both only needs to settle
+            // once, and dragging just one edge still triggers this via
+            // whichever of the two notifies fires.
+            let on_notify = {
+                let apply_for_notify = apply_stored_pane_widths.clone();
+                let check_for_notify = check_overview_fits.clone();
+                let settings_for_notify = settings.clone();
+                let window_for_width = window.clone();
+                let debounce = debounce.clone();
+                move || {
+                    if let Some(id) = debounce.take() {
+                        id.remove();
+                    }
+                    let window_for_timeout = window_for_width.clone();
+                    let apply_for_timeout = apply_for_notify.clone();
+                    let check_for_timeout = check_for_notify.clone();
+                    let settings_for_timeout = settings_for_notify.clone();
+                    let debounce_for_timeout = debounce.clone();
+                    debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                        debounce_for_timeout.set(None);
+                        apply_for_timeout(window_for_timeout.width());
+                        check_for_timeout();
+                        // Only the un-maximized size is worth restoring to -
+                        // GTK4's own `default-width`/`default-height` follow
+                        // the same rule (see comment above).
+                        if !window_for_timeout.is_maximized() {
+                            settings_for_timeout.set_int(crate::settings::WINDOW_WIDTH, window_for_timeout.width());
+                            settings_for_timeout.set_int(crate::settings::WINDOW_HEIGHT, window_for_timeout.height());
+                        }
+                    })));
                 }
-                let window_for_timeout = window_for_width.clone();
-                let apply_for_timeout = apply_for_notify.clone();
-                let check_for_timeout = check_for_notify.clone();
-                let debounce_for_timeout = debounce.clone();
-                debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                    debounce_for_timeout.set(None);
-                    apply_for_timeout(window_for_timeout.width());
-                    check_for_timeout();
-                })));
-            });
+            };
+            {
+                let on_notify = on_notify.clone();
+                surface.connect_width_notify(move |_| on_notify());
+            }
+            surface.connect_height_notify(move |_| on_notify());
             // The window can also come up already too narrow (a restored
             // geometry) with no subsequent resize to trigger the check, so
             // run it once the initial allocation settles too.
             let check_initial = check_overview_fits.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(150), check_initial);
+        });
+    }
+    // Maximize/unmaximize toggles immediately (not a drag stream like a
+    // resize, so no debounce needed) - separate from the width/height save
+    // above since GTK4 doesn't report a width/height surface-notify purely
+    // from maximizing.
+    {
+        let settings = settings.clone();
+        window.connect_maximized_notify(move |win| {
+            settings.set_bool(crate::settings::WINDOW_MAXIMIZED, win.is_maximized());
         });
     }
     // The calendar and people panes live in `root_stack`, so they're only

@@ -58,6 +58,13 @@ pub const PANE_CALENDAR_SIDEBAR_WIDTH_PCT: &str = "pane-calendar-sidebar-width-p
 pub const PANE_CONTACTS_SIDEBAR_WIDTH_PCT: &str = "pane-contacts-sidebar-width-percent";
 pub const PANE_CONFIG_SIDEBAR_WIDTH_PCT: &str = "pane-config-sidebar-width-percent";
 pub const PANE_MAIL_OVERVIEW_WIDTH_PCT: &str = "pane-mail-overview-width-percent";
+/// Main window's last non-maximized width/height in pixels, and whether it
+/// was maximized. Restored once at window construction; width/height are
+/// only saved while un-maximized, since a maximized size isn't the size to
+/// restore to.
+pub const WINDOW_WIDTH: &str = "window-width";
+pub const WINDOW_HEIGHT: &str = "window-height";
+pub const WINDOW_MAXIMIZED: &str = "window-maximized";
 pub const SORT_KEY: &str = "sort-key";
 pub const SORT_DESCENDING: &str = "sort-descending";
 pub const MAIL_FAVORITES: &str = "mail-favorites";
@@ -192,6 +199,9 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(PANE_CALENDAR_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_CONTACTS_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_MAIL_OVERVIEW_WIDTH_PCT, Value::Double(-1.0));
+    map.insert(WINDOW_WIDTH, Value::Int(1600));
+    map.insert(WINDOW_HEIGHT, Value::Int(900));
+    map.insert(WINDOW_MAXIMIZED, Value::Bool(false));
     map.insert(SORT_KEY, Value::String("date".into()));
     map.insert(SORT_DESCENDING, Value::Bool(true));
     map.insert(MAIL_FAVORITES, Value::Strv(Vec::new()));
@@ -437,6 +447,20 @@ mod tests {
         assert_eq!(store.get_int(PREFETCH_BATCH_SIZE), 10);
         store.set_int(PREFETCH_REFRESH_INTERVAL_MINUTES, 120);
         assert_eq!(store.get_int(PREFETCH_REFRESH_INTERVAL_MINUTES), 120);
+    }
+
+    #[test]
+    fn window_geometry_round_trip() {
+        let store = resolve();
+        assert_eq!(store.get_int(WINDOW_WIDTH), 1600);
+        assert_eq!(store.get_int(WINDOW_HEIGHT), 900);
+        assert!(!store.get_bool(WINDOW_MAXIMIZED));
+        store.set_int(WINDOW_WIDTH, 1200);
+        store.set_int(WINDOW_HEIGHT, 800);
+        store.set_bool(WINDOW_MAXIMIZED, true);
+        assert_eq!(store.get_int(WINDOW_WIDTH), 1200);
+        assert_eq!(store.get_int(WINDOW_HEIGHT), 800);
+        assert!(store.get_bool(WINDOW_MAXIMIZED));
     }
 
     #[test]

@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.131" date="2026-09-03">
+      <description>
+        <p>Added persistence of the main window's size and maximized state, so it comes back the way you left it instead of resetting to the default size on every launch.</p>
+      </description>
+    </release>
     <release version="0.9.130" date="2026-09-03">
       <description>
         <p>Fixed the mail tab's mini-calendar overview pane not remembering a dragged width and not resizing proportionally with the window, unlike every other resizable pane.</p>

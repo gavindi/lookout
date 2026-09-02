@@ -101,6 +101,21 @@
       <summary>Mail overview pane width as a percentage of the window width</summary>
       <description>Last width the mail-tab mini-calendar overview pane was dragged to, as a percentage of the application window width; -1 means never set. Reapplied when the window is resized.</description>
     </key>
+    <key name="window-width" type="i">
+      <default>1600</default>
+      <summary>Main window width</summary>
+      <description>Last non-maximized width of the main window in pixels. Restored at startup.</description>
+    </key>
+    <key name="window-height" type="i">
+      <default>900</default>
+      <summary>Main window height</summary>
+      <description>Last non-maximized height of the main window in pixels. Restored at startup.</description>
+    </key>
+    <key name="window-maximized" type="b">
+      <default>false</default>
+      <summary>Main window was maximized</summary>
+      <description>Whether the main window was maximized when last closed. Restored at startup.</description>
+    </key>
 
     <!-- Mail list -->
     <key name="sort-key" enum="io.github.gavindi.Lookout.SortKey">
