@@ -428,6 +428,19 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         messages: Vec<EmailSummary>,
     },
+    /// The shared `sync_mailbox` has begun a full envelope re-fetch of
+    /// `mailbox` - whatever triggered it: an explicit `SyncMailbox`/
+    /// `Refresh` command, an IDLE push, or a background move/flag/keyword/
+    /// snooze/send/draft-save/STATUS-drain resync of the mailbox on screen.
+    /// Paired with `mailbox`'s next `MessagesUpdated` as this event's
+    /// "finished" signal - there's no separate one, since `sync_mailbox`
+    /// always ends in exactly one `MessagesUpdated`. Not emitted by the
+    /// `SyncMailbox` handler's cache-hit shortcut (`emit_cached_messages`),
+    /// which answers from the cache without ever calling `sync_mailbox` - no
+    /// real round trip happens there.
+    MailboxSyncStarted {
+        mailbox: MailboxId,
+    },
     /// The background body prefetch (see `PrefetchState`) has just SELECTed
     /// `mailbox` and begun warming its bodies. Distinct from
     /// `MessagesUpdated` - a prefetch pass never re-syncs or repaints a
@@ -3383,6 +3396,7 @@ async fn sync_mailbox(
     condstore: bool,
     qresync: bool,
 ) -> Result<()> {
+    let _ = events.send(AccountEvent::MailboxSyncStarted { mailbox: mailbox_id.clone() }).await;
     let is_sent = folders.iter().find(|f| f.id == *mailbox_id).is_some_and(|f| matches!(f.role, MailboxRole::Sent));
     // `None` = a fresh session with nothing SELECTed yet (the connect-time
     // INBOX sync). Otherwise, when the session is already on this folder -

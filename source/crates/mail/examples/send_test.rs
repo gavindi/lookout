@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     AccountEvent::MessagesUpdated { .. } => {}
                     AccountEvent::PreviewsFetched { .. } => {}
+                    AccountEvent::MailboxSyncStarted { .. } => {}
                     AccountEvent::PrefetchStarted { .. } | AccountEvent::PrefetchFinished { .. } => {}
                     AccountEvent::NewMessages { .. } => {}
                     AccountEvent::BodyFetched { .. } => {}

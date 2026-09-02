@@ -9231,6 +9231,22 @@ fn spawn_account_event_loop(
                             }
                         }
                     }
+                    // The shared `sync_mailbox` fires this at the start of
+                    // every full envelope re-sync it does, for any trigger -
+                    // an explicit request is only one of them (IDLE pushes,
+                    // moves, flag/keyword changes, snoozes, drafts, sends,
+                    // and `Refresh` all resync the open mailbox too). Folded
+                    // straight into `syncing` rather than a separate set
+                    // (unlike `prefetching` below): this is exactly the same
+                    // kind of activity `request_mailbox_sync` already tracks
+                    // there, just from more triggers, so deduping a fresh
+                    // explicit request against one already in flight for any
+                    // reason is correct - the in-flight round trip answers
+                    // both. The matching "finished" signal is the mailbox's
+                    // next `MessagesUpdated`, handled above.
+                    AccountEvent::MailboxSyncStarted { mailbox } => {
+                        set_mailbox_syncing(&state, &mailbox, true);
+                    }
                     // The background body prefetch is otherwise silent (it
                     // only warms the body cache, never touches the message
                     // list), so `syncing`'s folder-pane spinner is its only

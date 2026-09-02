@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.126" date="2026-09-02">
+      <description>
+        <p>The folder-pane spinner now shows for any background sync of a folder - new mail arriving, moving or flagging a message, snoozing, saving a draft, sending - not just an explicit sync or the background prefetch.</p>
+      </description>
+    </release>
     <release version="0.9.125" date="2026-09-02">
       <description>
         <p>The message list's Sync button now also bumps the account's standard background refresh along (a folder-list relist plus resync), instead of only resyncing the highlighted folder.</p>
