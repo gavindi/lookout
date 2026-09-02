@@ -1028,7 +1028,7 @@ pub fn refresh(
             view.mail_group.add(&new_default);
             view.signature_default_rows.borrow_mut().push(new_default);
             let reply_default = signature_default_dropdown(
-                "Default for replies & forwards",
+                "Default for replies &amp; forwards",
                 "Use this signature when replying to or forwarding from this account",
                 &info.account_id,
                 account_defaults.reply,
@@ -1304,5 +1304,32 @@ mod tests {
         let card2 = card_section(&config_view.root);
         assert!(config_view.root.parent().is_some(), "root must re-attach to the second window");
         let _ = (card, card2);
+    }
+
+    /// `AdwPreferencesRow::title`/`subtitle` are rendered as Pango markup, so
+    /// a literal "&" (as "Default for replies & forwards" used to be) fails
+    /// to parse and GTK logs a "Gtk-WARNING **: Failed to set text ... from
+    /// markup" instead of showing the row's title at all. Same
+    /// display/single-thread convention as `settings_window_reopen_...`
+    /// above.
+    #[ignore = "needs a display and a single test thread; run with --ignored --test-threads=1"]
+    #[test]
+    fn signature_default_dropdown_title_survives_markup_parsing() {
+        if !crate::gtk_test::gtk_ready() {
+            eprintln!("skipping: no display available, or GTK initialized on another test thread");
+            return;
+        }
+        let warnings: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warnings_for_handler = warnings.clone();
+        let handler_id = glib::log_set_handler(Some("Gtk"), glib::LogLevels::all(), false, false, move |_domain, _level, message| {
+            warnings_for_handler.lock().unwrap().push(message.to_string());
+        });
+
+        let set_default: SetAccountSignatureDefault = Rc::new(|_, _, _| {});
+        let row = signature_default_dropdown("Default for replies &amp; forwards", "subtitle", "acct", None, &[], SignatureDefault::Reply, &set_default);
+
+        glib::log_remove_handler(Some("Gtk"), handler_id);
+        assert_eq!(row.title(), "Default for replies & forwards", "the markup escape must render back to a plain ampersand");
+        assert!(warnings.lock().unwrap().is_empty(), "setting the title must not trip a markup-parsing Gtk-WARNING: {:?}", warnings.lock().unwrap());
     }
 }

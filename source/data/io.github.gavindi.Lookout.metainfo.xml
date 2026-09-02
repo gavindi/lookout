@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.129" date="2026-09-03">
+      <description>
+        <p>Fixed a "failed to run cache maintenance" warning logged on every session that had actually freed cache pages to reclaim.</p>
+      </description>
+    </release>
     <release version="0.9.128" date="2026-09-02">
       <description>
         <p>Fixed the folder-pane activity spinner getting stuck on past when a folder's sync or prefetch had actually finished.</p>

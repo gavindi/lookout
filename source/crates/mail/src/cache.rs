@@ -1032,7 +1032,14 @@ impl Cache {
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
             conn.execute("VACUUM", [])?;
         }
-        conn.execute("PRAGMA incremental_vacuum", [])?;
+        // `execute`, not `query`: unlike `PRAGMA auto_vacuum` above, this
+        // pragma emits one output row per page it actually reclaims (empty
+        // rows, but rows all the same) whenever there's anything to reclaim,
+        // which makes rusqlite's `execute` reject it with "Execute returned
+        // results" the moment a real cache has freed pages to sweep.
+        // `execute_batch` runs via `sqlite3_exec`, which drains and discards
+        // any rows instead of erroring on them.
+        conn.execute_batch("PRAGMA incremental_vacuum")?;
         Ok(())
     }
 
@@ -1862,6 +1869,40 @@ mod tests {
         let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0)).unwrap();
         assert_eq!(mode, 2, "run_maintenance migrates the database to incremental auto_vacuum");
         drop(conn);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `PRAGMA incremental_vacuum` emits one output row per page it actually
+    /// reclaims - nothing when there's nothing to reclaim, which is why the
+    /// prior `conn.execute` (rusqlite errors on `execute` seeing a row) only
+    /// surfaced once a real cache had freed pages to sweep. Deleting a large
+    /// blob is what leaves incremental_vacuum something to do.
+    #[test]
+    fn run_maintenance_reclaims_freed_pages_without_erroring() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+
+        // First call migrates a fresh database to incremental auto_vacuum
+        // (a plain `VACUUM`, which leaves nothing behind to reclaim); only
+        // once that's settled does inserting-then-deleting a large blob
+        // leave the free pages that made the pre-fix `execute` choke.
+        cache.run_maintenance().unwrap();
+        {
+            let conn = cache.conn.lock().unwrap();
+            let big = vec![0u8; 200_000];
+            for uid in 0..20 {
+                conn.execute(
+                    "INSERT INTO bodies (mailbox_id, uid, uidvalidity, data) VALUES ('m', ?1, 1, ?2)",
+                    rusqlite::params![uid, big],
+                )
+                .unwrap();
+            }
+            conn.execute("DELETE FROM bodies", []).unwrap();
+        }
+
+        cache.run_maintenance().unwrap();
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
