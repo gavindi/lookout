@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.130" date="2026-09-03">
+      <description>
+        <p>Fixed the mail tab's mini-calendar overview pane not remembering a dragged width and not resizing proportionally with the window, unlike every other resizable pane.</p>
+      </description>
+    </release>
     <release version="0.9.129" date="2026-09-03">
       <description>
         <p>Fixed a "failed to run cache maintenance" warning logged on every session that had actually freed cache pages to reclaim.</p>

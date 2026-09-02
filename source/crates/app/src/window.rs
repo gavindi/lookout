@@ -4862,6 +4862,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_paned = calendar_paned.clone();
         let contacts_paned = contacts_paned.clone();
         let config_paned = config_view.paned.clone();
+        let content_and_overview_paned = content_and_overview_paned.clone();
         let state = state.clone();
         move |window_width: i32| {
             if window_width <= 0 {
@@ -4912,6 +4913,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let max = config_paned.width().saturating_sub(end_min).max(min);
                 let target = (config_pct / 100.0 * window_width as f64) as i32;
                 config_paned.set_position(target.clamp(min, max));
+            }
+            // The overview pane is the paned's *end* child, so its stored
+            // percentage is of its own width rather than its position - the
+            // position is derived by subtracting that from the window width.
+            let overview_pct = settings.get_double(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT);
+            if overview_pct > 0.0 && content_and_overview_paned.is_mapped() {
+                let start_min = content_and_overview_paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let end_min = content_and_overview_paned.end_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                let max = content_and_overview_paned.width().saturating_sub(start_min).max(end_min);
+                let target_end_width = (overview_pct / 100.0 * window_width as f64) as i32;
+                let target_end_width = target_end_width.clamp(end_min, max);
+                content_and_overview_paned.set_position(content_and_overview_paned.width().saturating_sub(target_end_width));
             }
         }
     };
@@ -5016,6 +5029,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 if window_width > 0 {
                     let pct = width as f64 * 100.0 / window_width as f64;
                     state_for_timeout.borrow().settings.set_double(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT, pct);
+                }
+            })));
+        });
+        let window_for_debug = window.clone();
+        let state_for_save = state.clone();
+        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        content_and_overview_paned.connect_notify_local(Some("position"), move |paned, _| {
+            if let Some(id) = debounce.take() {
+                id.remove();
+            }
+            // The overview pane is the end child, so its width - not the
+            // position itself - is what should stay a constant percentage of
+            // the window width as the window is resized.
+            let end_width = paned.width().saturating_sub(paned.position());
+            let window_width = window_for_debug.width();
+            let state_for_timeout = state_for_save.clone();
+            let debounce_for_timeout = debounce.clone();
+            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                debounce_for_timeout.set(None);
+                if window_width > 0 {
+                    let pct = end_width as f64 * 100.0 / window_width as f64;
+                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT, pct);
                 }
             })));
         });
