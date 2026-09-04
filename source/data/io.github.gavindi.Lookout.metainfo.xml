@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.133" date="2026-09-05">
+      <description>
+        <p>Added multi-select checkboxes and Edit/Delete actions to the People tab's contact list: check one contact to edit or delete it, check several to delete them all at once.</p>
+      </description>
+    </release>
     <release version="0.9.132" date="2026-09-05">
       <description>
         <p>Added initial avatars to the People tab's contact list, so each contact shows a colored initial badge to the left of their name, matching the message list in the mail tab.</p>

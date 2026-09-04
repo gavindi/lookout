@@ -24,9 +24,10 @@ use webkit::prelude::*;
 use crate::calendar_colors;
 use crate::calendar_view::{self, CalendarMain};
 use crate::contacts_view::{
-    calendar_attendee_suggestions, export_current_contacts, find_contact_by_address, merge_contact_suggestions, rebuild_contacts_list_ui, refresh_contacts_category_ui,
-    show_contact_details_dialog, show_contact_editor_for, show_contacts_import_dialog, show_create_contact_for, show_manage_groups_dialog, show_new_contact_editor,
-    spawn_contacts_discovery, sync_contacts_account, ContactCommand, ContactsAccountSnapshot, ContactsCategoryChoice, ContactsListEntry, SnapshotContactsProvider,
+    calendar_attendee_suggestions, contact_identity, delete_contact_entries, export_current_contacts, find_contact_by_address, merge_contact_suggestions, rebuild_contacts_list_ui,
+    refresh_contacts_category_ui, show_contact_details_dialog, show_contact_editor_for, show_contacts_import_dialog, show_create_contact_for, show_manage_groups_dialog,
+    show_new_contact_editor, spawn_contacts_discovery, sync_contacts_account, ContactCommand, ContactsAccountSnapshot, ContactsCategoryChoice, ContactsListEntry,
+    SnapshotContactsProvider,
 };
 use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
@@ -4166,6 +4167,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_command_toolbar.append(&contacts_toolbar_label);
     let new_contact_button = gtk::Button::with_label("New contact");
     contacts_command_toolbar.append(&new_contact_button);
+    // Edit/Delete for the contacts checked in the list, gated by
+    // `refresh_contacts_actions`: Edit enables only when exactly one contact
+    // is selected, Delete for any number; both start disabled.
+    let contacts_edit_button = gtk::Button::with_label("Edit");
+    contacts_edit_button.set_sensitive(false);
+    contacts_command_toolbar.append(&contacts_edit_button);
+    let contacts_delete_button = gtk::Button::with_label("Delete");
+    contacts_delete_button.set_sensitive(false);
+    contacts_command_toolbar.append(&contacts_delete_button);
     let import_contacts_button = gtk::Button::with_label("Import…");
     contacts_command_toolbar.append(&import_contacts_button);
     let export_contacts_button = gtk::Button::with_label("Export…");
@@ -5538,11 +5548,42 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let contacts_categories: Rc<RefCell<Vec<ContactsCategoryChoice>>> = Rc::new(RefCell::new(Vec::new()));
     let contacts_entries: Rc<RefCell<Vec<ContactsListEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    // Which contacts are checked in the right-hand list, keyed the same way
+    // as `starred_contacts` (`(account_id, identity)`), so a selection
+    // survives the list's full rebuilds. Pruned to the visible entries inside
+    // `rebuild_contacts_list_ui`; drives the ribbon's Edit/Delete via
+    // `refresh_contacts_actions`.
+    let contacts_selected: Rc<RefCell<HashSet<(AccountId, String)>>> = Rc::new(RefCell::new(HashSet::new()));
+    let refresh_contacts_actions: Rc<dyn Fn()> = Rc::new({
+        let contacts_selected = contacts_selected.clone();
+        let contacts_entries = contacts_entries.clone();
+        let contacts_edit_button = contacts_edit_button.clone();
+        let contacts_delete_button = contacts_delete_button.clone();
+        move || {
+            let entries = contacts_entries.borrow();
+            let selected_entries: Vec<ContactsListEntry> = entries
+                .iter()
+                .filter(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(&entry.card))))
+                .cloned()
+                .collect();
+            // Edit needs exactly one selected contact; Delete any number.
+            // Deleted-bucket cards (`href` empty) are display-only and can be
+            // neither edited nor deleted, so they don't arm either button.
+            let single = match selected_entries.len() {
+                1 => selected_entries.first(),
+                _ => None,
+            };
+            contacts_edit_button.set_sensitive(single.is_some_and(|entry| !entry.href.is_empty()));
+            contacts_delete_button.set_sensitive(!selected_entries.is_empty() && selected_entries.iter().any(|entry| !entry.href.is_empty()));
+        }
+    });
     {
         let contacts_categories = contacts_categories.clone();
         let contacts_entries = contacts_entries.clone();
         let contacts_list = contacts_list.clone();
         let state = state.clone();
+        let contacts_selected = contacts_selected.clone();
+        let refresh_contacts_actions = refresh_contacts_actions.clone();
         contacts_category_list.connect_row_selected(move |_list, row| {
             let Some(row) = row else { return };
             // Header rows ("gavindi@outlook.com", "Categories") sit in the
@@ -5552,7 +5593,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // `refresh_contacts_category_ui`.
             let Some(idx) = (unsafe { row.data::<usize>("contacts-choice-index") }) else { return };
             let idx = unsafe { *idx.as_ref() };
-            rebuild_contacts_list_ui(&contacts_list, &contacts_categories, &contacts_entries, idx as i32, &state);
+            rebuild_contacts_list_ui(
+                &contacts_list,
+                &contacts_categories,
+                &contacts_entries,
+                idx as i32,
+                &state,
+                &contacts_selected,
+                &refresh_contacts_actions,
+            );
         });
     }
     let refresh_contacts_ui: Rc<dyn Fn(Option<i32>)> = Rc::new({
@@ -5561,6 +5610,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let contacts_list = contacts_list.clone();
         let contacts_categories = contacts_categories.clone();
         let contacts_entries = contacts_entries.clone();
+        let contacts_selected = contacts_selected.clone();
+        let refresh_contacts_actions = refresh_contacts_actions.clone();
         let calendar_state = calendar_state.clone();
         let calendar_main = calendar_main.clone();
         let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
@@ -5569,7 +5620,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mail_overview_day_list = mail_overview_day_list.clone();
         let reminders_engine = reminders_engine.clone();
         move |selected_index: Option<i32>| {
-            refresh_contacts_category_ui(&state, &contacts_category_list, &contacts_list, &contacts_categories, &contacts_entries, selected_index);
+            refresh_contacts_category_ui(
+                &state,
+                &contacts_category_list,
+                &contacts_list,
+                &contacts_categories,
+                &contacts_entries,
+                selected_index,
+                &contacts_selected,
+                &refresh_contacts_actions,
+            );
             // Contacts are the birthdays calendar's only data source, so
             // every snapshot (startup cache paint, poll tick, post-write
             // resync) refreshes the synthesized calendar and everything that
@@ -5587,6 +5647,46 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
     });
     refresh_contacts_ui(None);
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let contacts_entries = contacts_entries.clone();
+        let contacts_selected = contacts_selected.clone();
+        contacts_edit_button.connect_clicked(move |_| {
+            // Enabled only when exactly one contact is checked (see
+            // `refresh_contacts_actions`), so the first selected entry is the
+            // one to edit.
+            let Some(entry) = contacts_entries
+                .borrow()
+                .iter()
+                .find(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(&entry.card))))
+                .cloned()
+            else {
+                return;
+            };
+            if entry.href.is_empty() {
+                show_contact_details_dialog(&window, &entry);
+            } else {
+                show_contact_editor_for(&window, &state, &toast_overlay, &entry);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let contacts_entries = contacts_entries.clone();
+        let contacts_selected = contacts_selected.clone();
+        contacts_delete_button.connect_clicked(move |_| {
+            let entries: Vec<ContactsListEntry> = contacts_entries
+                .borrow()
+                .iter()
+                .filter(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(&entry.card))))
+                .cloned()
+                .collect();
+            delete_contact_entries(&state, &toast_overlay, &entries);
+        });
+    }
     {
         let window = window.clone();
         let state = state.clone();

@@ -360,6 +360,52 @@ fn route_contact_delete(state: &Rc<RefCell<UiState>>, account_id: AccountId, hre
     });
 }
 
+/// Deletes every writable contact in `entries` through its account's
+/// session, toasting a single aggregate outcome instead of one toast per
+/// card. Deleted-bucket cards (`href` empty, display-only) are skipped.
+pub fn delete_contact_entries(state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, entries: &[ContactsListEntry]) {
+    let writable: Vec<ContactsListEntry> = entries.iter().filter(|entry| !entry.href.is_empty()).cloned().collect();
+    if writable.is_empty() {
+        toast_overlay.add_toast(adw::Toast::new("No deletable contacts selected."));
+        return;
+    }
+    let mut replies = Vec::new();
+    for entry in &writable {
+        let Some(reply_rx) = dispatch_contact_command(state, &entry.account_id, move |reply| ContactCommand::Delete {
+            href: entry.href.clone(),
+            etag: entry.etag.clone(),
+            reply,
+        }) else {
+            toast_overlay.add_toast(adw::Toast::new("The contacts session isn't running."));
+            continue;
+        };
+        replies.push(reply_rx);
+    }
+    if replies.is_empty() {
+        return;
+    }
+    let toast_overlay = toast_overlay.clone();
+    glib::spawn_future_local(async move {
+        let mut ok = 0usize;
+        let mut failures = Vec::new();
+        for reply_rx in replies {
+            match reply_rx.recv().await {
+                Ok(Ok(())) => ok += 1,
+                Ok(Err(message)) => failures.push(message),
+                // The session died mid-write; its error handling owns the toast.
+                Err(_) => {}
+            }
+        }
+        if failures.is_empty() {
+            let text = if ok == 1 { "Contact deleted".to_string() } else { format!("{ok} contacts deleted") };
+            toast_overlay.add_toast(adw::Toast::new(&text));
+        } else {
+            let text = glib::markup_escape_text(&format!("Couldn't delete {} contact(s): {}", failures.len(), failures.join("; ")));
+            toast_overlay.add_toast(adw::Toast::new(&text));
+        }
+    });
+}
+
 /// Opens the contact editor for an existing, writable contact - the write
 /// target (account, address books, href/etag) is taken from the entry's
 /// account snapshot.
@@ -923,9 +969,10 @@ pub fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>, worker: &Rc<W
 }
 
 /// A stable-ish key for a contact, used for UI state (`starred_contacts`,
-/// deletion diffing) that has nowhere else to hang off of: the vCard's
-/// `UID`, or its first email address if the server didn't send one.
-fn contact_identity(card: &VCard) -> String {
+/// deletion diffing, the contact-list multi-select) that has nowhere else
+/// to hang off of: the vCard's `UID`, or its first email address if the
+/// server didn't send one.
+pub(crate) fn contact_identity(card: &VCard) -> String {
     card.uid.clone().unwrap_or_else(|| vcard_primary_email(card))
 }
 
@@ -973,6 +1020,7 @@ fn append_contacts_choice_row(list: &gtk::ListBox, label: &str) -> gtk::ListBoxR
 /// `contacts_category_list.connect_row_selected` in `build`), since a row's
 /// position in the widget no longer matches its index in that list once
 /// headers are mixed in.
+#[allow(clippy::too_many_arguments)]
 pub fn refresh_contacts_category_ui(
     state: &Rc<RefCell<UiState>>,
     category_list: &gtk::ListBox,
@@ -980,6 +1028,8 @@ pub fn refresh_contacts_category_ui(
     categories: &Rc<RefCell<Vec<ContactsCategoryChoice>>>,
     contacts: &Rc<RefCell<Vec<ContactsListEntry>>>,
     selected_index: Option<i32>,
+    selected: &Rc<RefCell<HashSet<(AccountId, String)>>>,
+    refresh_actions: &Rc<dyn Fn()>,
 ) {
     while let Some(child) = category_list.first_child() {
         category_list.remove(&child);
@@ -1105,6 +1155,8 @@ pub fn refresh_contacts_category_ui(
             contact_list.remove(&child);
         }
         contacts.borrow_mut().clear();
+        selected.borrow_mut().clear();
+        refresh_actions();
         let label = gtk::Label::builder().label("No contacts available yet").xalign(0.0).css_classes(["dim-label"]).build();
         label.set_margin_start(10);
         label.set_margin_end(10);
@@ -1118,7 +1170,7 @@ pub fn refresh_contacts_category_ui(
     if let Some((row, _)) = row_widgets.iter().find(|(_, idx)| *idx == Some(desired as usize)) {
         category_list.select_row(Some(row));
     }
-    rebuild_contacts_list_ui(contact_list, categories, contacts, desired, state);
+    rebuild_contacts_list_ui(contact_list, categories, contacts, desired, state, selected, refresh_actions);
 }
 
 /// Rebuilds the People screen's right-hand contact list for whichever
@@ -1133,6 +1185,8 @@ pub fn rebuild_contacts_list_ui(
     contacts: &Rc<RefCell<Vec<ContactsListEntry>>>,
     selected_category_index: i32,
     state: &Rc<RefCell<UiState>>,
+    selected: &Rc<RefCell<HashSet<(AccountId, String)>>>,
+    refresh_actions: &Rc<dyn Fn()>,
 ) {
     while let Some(child) = contact_list.first_child() {
         contact_list.remove(&child);
@@ -1140,6 +1194,8 @@ pub fn rebuild_contacts_list_ui(
 
     let Some(choice) = categories.borrow().get(selected_category_index as usize).cloned() else {
         contacts.borrow_mut().clear();
+        selected.borrow_mut().clear();
+        refresh_actions();
         return;
     };
 
@@ -1164,6 +1220,16 @@ pub fn rebuild_contacts_list_ui(
     };
     entries.sort_by_key(|entry| vcard_display_name(&entry.card).to_lowercase());
 
+    // Drop any selection whose contact isn't in this list - a category
+    // switch, or an unstar removing a contact from Favourites - so the
+    // checkboxes and the action bar never point at a contact that isn't
+    // visible. Keyed by `(account_id, identity)`, so a star-toggle rebuild
+    // (which re-sorts the same entries) leaves selections untouched.
+    {
+        let live: HashSet<(AccountId, String)> = entries.iter().map(|entry| (entry.account_id.clone(), contact_identity(&entry.card))).collect();
+        selected.borrow_mut().retain(|key| live.contains(key));
+    }
+
     if entries.is_empty() {
         let label = gtk::Label::builder().label("No contacts in this category").xalign(0.0).css_classes(["dim-label"]).build();
         label.set_margin_start(10);
@@ -1172,6 +1238,7 @@ pub fn rebuild_contacts_list_ui(
         label.set_margin_bottom(10);
         contact_list.append(&label);
         contacts.borrow_mut().clear();
+        refresh_actions();
         return;
     }
 
@@ -1197,6 +1264,32 @@ pub fn rebuild_contacts_list_ui(
         text_box.append(&email);
 
         let identity = contact_identity(&entry.card);
+        // Multi-select checkbox, left of the avatar: toggling it adds the
+        // contact to (or removes it from) `selected`, driving the ribbon's
+        // Edit/Delete sensitivity. Deliberately a checkbox rather than
+        // the `gtk::ListBox`'s own selection - the list stays single-select
+        // and row-activation keeps opening the editor, so checking a box
+        // never conflicts with opening a contact.
+        let checkbox = gtk::CheckButton::builder()
+            .valign(gtk::Align::Center)
+            .tooltip_text("Select for multi-select actions")
+            .build();
+        checkbox.set_active(selected.borrow().contains(&(entry.account_id.clone(), identity.clone())));
+        {
+            let selected = selected.clone();
+            let refresh_actions = refresh_actions.clone();
+            let account_id = entry.account_id.clone();
+            let identity = identity.clone();
+            checkbox.connect_toggled(move |btn| {
+                let key = (account_id.clone(), identity.clone());
+                if btn.is_active() {
+                    selected.borrow_mut().insert(key);
+                } else {
+                    selected.borrow_mut().remove(&key);
+                }
+                refresh_actions();
+            });
+        }
         let is_starred = state.borrow().starred_contacts.contains(&(entry.account_id.clone(), identity.clone()));
         let star_button = gtk::ToggleButton::builder()
             .icon_name("starred-symbolic")
@@ -1210,6 +1303,8 @@ pub fn rebuild_contacts_list_ui(
             let contact_list = contact_list.clone();
             let categories = categories.clone();
             let contacts = contacts.clone();
+            let selected = selected.clone();
+            let refresh_actions = refresh_actions.clone();
             let account_id = entry.account_id.clone();
             star_button.connect_toggled(move |btn| {
                 let key = (account_id.clone(), identity.clone());
@@ -1224,7 +1319,7 @@ pub fn rebuild_contacts_list_ui(
                 if let Some(db) = state.borrow().ui_db.clone() {
                     let _ = db.set_starred(&account_id, &identity, btn.is_active());
                 }
-                rebuild_contacts_list_ui(&contact_list, &categories, &contacts, selected_category_index, &state);
+                rebuild_contacts_list_ui(&contact_list, &categories, &contacts, selected_category_index, &state, &selected, &refresh_actions);
             });
         }
 
@@ -1245,12 +1340,14 @@ pub fn rebuild_contacts_list_ui(
         row_box.set_margin_end(10);
         row_box.set_margin_top(6);
         row_box.set_margin_bottom(6);
+        row_box.append(&checkbox);
         row_box.append(&avatar);
         row_box.append(&text_box);
         row_box.append(&star_button);
         contact_list.append(&row_box);
     }
     *contacts.borrow_mut() = entries;
+    refresh_actions();
 }
 
 #[allow(clippy::too_many_arguments)]
