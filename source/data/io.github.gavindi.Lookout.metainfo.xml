@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.132" date="2026-09-05">
+      <description>
+        <p>Added initial avatars to the People tab's contact list, so each contact shows a colored initial badge to the left of their name, matching the message list in the mail tab.</p>
+      </description>
+    </release>
     <release version="0.9.131" date="2026-09-03">
       <description>
         <p>Added persistence of the main window's size and maximized state, so it comes back the way you left it instead of resetting to the default size on every launch.</p>

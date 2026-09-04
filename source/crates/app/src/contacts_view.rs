@@ -1228,11 +1228,24 @@ pub fn rebuild_contacts_list_ui(
             });
         }
 
+        let display_name = vcard_display_name(&entry.card);
+        let primary_email = vcard_primary_email(&entry.card);
+        let avatar = gtk::Label::builder()
+            .css_classes(["avatar-circle"])
+            .label(crate::message_header::initials(Some(&display_name), &primary_email))
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .build();
+        avatar.add_css_class(crate::message_header::avatar_color_class(&primary_email));
+
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
         row_box.set_margin_start(10);
         row_box.set_margin_end(10);
         row_box.set_margin_top(6);
         row_box.set_margin_bottom(6);
+        row_box.append(&avatar);
         row_box.append(&text_box);
         row_box.append(&star_button);
         contact_list.append(&row_box);
