@@ -290,6 +290,14 @@ pub struct MonthGrid {
 }
 
 fn build_month_grid() -> MonthGrid {
+    let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).build();
+    for label in WEEKDAY_LABELS.iter() {
+        let weekday_label = gtk::Label::builder().label(*label).css_classes(["dim-label", "caption-heading"]).build();
+        let cell = gtk::Box::builder().css_classes(["calendar-day-cell"]).hexpand(true).build();
+        cell.append(&weekday_label);
+        header_row.append(&cell);
+    }
+
     let grid = gtk::Grid::builder()
         .row_homogeneous(true)
         .column_homogeneous(true)
@@ -298,11 +306,6 @@ fn build_month_grid() -> MonthGrid {
         .vexpand(true)
         .hexpand(true)
         .build();
-
-    for (col, label) in WEEKDAY_LABELS.iter().enumerate() {
-        let weekday_label = gtk::Label::builder().label(*label).css_classes(["dim-label", "caption-heading"]).build();
-        grid.attach(&weekday_label, col as i32, 0, 1, 1);
-    }
 
     let mut day_cells = Vec::with_capacity(42);
     let anchor_month = Rc::new(RefCell::new(first_of_month(chrono::Utc::now().date_naive())));
@@ -317,7 +320,7 @@ fn build_month_grid() -> MonthGrid {
         let container = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["calendar-day-cell"]).build();
         container.append(&date_label);
         container.append(&events_box);
-        grid.attach(&container, col as i32, row as i32 + 1, 1, 1);
+        grid.attach(&container, col as i32, row as i32, 1, 1);
         // Clicking a day cell selects it and re-anchors every view to that
         // date (the same action the sidebar mini-calendar's day buttons take);
         // clicking the already-selected cell again opens a new-event editor
@@ -362,7 +365,8 @@ fn build_month_grid() -> MonthGrid {
         });
     }
 
-    let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
+    let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).vexpand(true).hexpand(true).build();
+    root_box.append(&header_row);
     root_box.append(&grid);
 
     let on_activate: PendingActivate = Rc::new(RefCell::new(None));
@@ -538,20 +542,16 @@ pub(crate) fn covered_local_dates(occ: &EventOccurrence, window_start: NaiveDate
 }
 
 /// The 0-based index into `day_cells` (row-major, Sunday-first) of the month
-/// grid cell under the grid-relative point `(x, y)`, or `None` for points in
-/// the weekday-header row or outside the grid. The grid's seven columns and
-/// seven rows (one header + six week rows) are all homogeneous. Pure - the
-/// caller passes the grid's allocated size.
+/// grid cell under the grid-relative point `(x, y)`, or `None` for points
+/// outside the grid. The grid's seven columns and six week rows are all
+/// homogeneous. Pure - the caller passes the grid's allocated size.
 fn cell_index_at_point(width: f64, height: f64, x: f64, y: f64) -> Option<usize> {
     if width <= 0.0 || height <= 0.0 || x < 0.0 || y < 0.0 || x >= width || y >= height {
         return None;
     }
     let col = (x / (width / 7.0)) as usize;
-    let row = (y / (height / 7.0)) as usize;
-    if row == 0 {
-        return None;
-    }
-    Some((row - 1) * 7 + col)
+    let row = (y / (height / 6.0)) as usize;
+    Some(row * 7 + col)
 }
 
 /// Attaches the month grid's chip-drag gesture: a press landing on a chip
@@ -3618,18 +3618,17 @@ mod tests {
 
     #[test]
     fn cell_index_at_point_maps_grid_coordinates_to_day_cells() {
-        // A 700x700 grid (7 homogeneous rows/columns of 100px each).
-        assert_eq!(cell_index_at_point(700.0, 700.0, 0.0, 100.0), Some(0));
-        assert_eq!(cell_index_at_point(700.0, 700.0, 650.0, 100.0), Some(6));
-        assert_eq!(cell_index_at_point(700.0, 700.0, 0.0, 690.0), Some(42 - 7));
-        assert_eq!(cell_index_at_point(700.0, 700.0, 650.0, 690.0), Some(41));
-        // The weekday header row (top 100px) is not a day cell.
-        assert_eq!(cell_index_at_point(700.0, 700.0, 50.0, 50.0), None);
+        // A 700x600 grid (7 homogeneous columns of 100px, 6 week rows of 100px).
+        assert_eq!(cell_index_at_point(700.0, 600.0, 0.0, 50.0), Some(0));
+        assert_eq!(cell_index_at_point(700.0, 600.0, 650.0, 50.0), Some(6));
+        assert_eq!(cell_index_at_point(700.0, 600.0, 0.0, 550.0), Some(42 - 7));
+        assert_eq!(cell_index_at_point(700.0, 600.0, 650.0, 550.0), Some(41));
+        assert_eq!(cell_index_at_point(700.0, 600.0, 0.0, 100.0), Some(7));
         // Outside the grid.
-        assert_eq!(cell_index_at_point(700.0, 700.0, -1.0, 100.0), None);
-        assert_eq!(cell_index_at_point(700.0, 700.0, 700.0, 100.0), None);
-        assert_eq!(cell_index_at_point(700.0, 700.0, 50.0, 700.0), None);
+        assert_eq!(cell_index_at_point(700.0, 600.0, -1.0, 100.0), None);
+        assert_eq!(cell_index_at_point(700.0, 600.0, 700.0, 100.0), None);
+        assert_eq!(cell_index_at_point(700.0, 600.0, 50.0, 600.0), None);
         // Degenerate sizes.
-        assert_eq!(cell_index_at_point(0.0, 700.0, 0.0, 0.0), None);
+        assert_eq!(cell_index_at_point(0.0, 600.0, 0.0, 0.0), None);
     }
 }

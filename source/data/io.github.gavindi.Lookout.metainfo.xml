@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.134" date="2026-09-06">
+      <description>
+        <p>Fixed the folder pane collapsing subfolders you had expanded whenever it rebuilt itself, which coincided with the folder-pane activity spinner - the account groups now reopen before the expanded subfolders are restored, so an expanded folder tree survives background count refreshes.</p>
+      </description>
+    </release>
     <release version="0.9.133" date="2026-09-05">
       <description>
         <p>Added multi-select checkboxes and Edit/Delete actions to the People tab's contact list: check one contact to edit or delete it, check several to delete them all at once.</p>

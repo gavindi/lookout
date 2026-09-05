@@ -14749,8 +14749,13 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
     // fires it, autoselecting row 0 and thereby entering the unified view.
     state.borrow_mut().suppress_folder_selection = true;
     folder_selection.set_model(Some(&model));
-    expand_mailboxes(&model, &expanded);
+    // Account groups must be expanded *before* `expand_mailboxes`: rows start
+    // collapsed, so a fresh model's flattened list holds only depth-0 rows
+    // until the groups are opened - `expand_mailboxes` could never reach a
+    // `TreeItem::Folder` (all of them sit under a group) and every rebuild
+    // would silently collapse the user's expanded subfolders.
     apply_account_group_expansion(&model, &collapsed_groups);
+    expand_mailboxes(&model, &expanded);
     folder_scroller.vadjustment().set_value(scroll_value);
     match restore_to {
         Some(SelectionTarget::Unified) => folder_selection.set_selected(0),
@@ -14802,6 +14807,9 @@ fn expanded_mailboxes(folder_selection: &gtk::SingleSelection) -> HashSet<Mailbo
 /// Re-expands the rows named by `expanded` in a freshly built model. Walks by
 /// index rather than over a snapshot because expanding a row inserts its
 /// children into the model, and those children may themselves need expanding.
+/// Must run *after* `apply_account_group_expansion`: the new model's rows all
+/// start collapsed, so the flattened list only reaches folder rows once their
+/// account group (and any ancestor folder) is expanded.
 fn expand_mailboxes(model: &gtk::TreeListModel, expanded: &HashSet<MailboxId>) {
     if expanded.is_empty() {
         return;
@@ -14867,7 +14875,9 @@ fn collapsed_account_groups(folder_selection: &gtk::SingleSelection) -> HashSet<
 /// unconditional expand-all. Rows the user collapsed stay collapsed;
 /// everything else - including accounts that just connected - defaults to
 /// expanded, the long-standing look of the pane. Only depth-0 rows are
-/// touched: subfolders are the caller's `expand_mailboxes` restore's job.
+/// touched: subfolders are the caller's `expand_mailboxes` restore's job,
+/// which must run *after* this (its rows only materialize once their group
+/// is open).
 /// Walks by index with `n_items` re-evaluated (like `expand_mailboxes`)
 /// because expanding a row inserts its children into the flat model, shifting
 /// every later row's position; a fixed range would silently skip them.
@@ -17831,9 +17841,10 @@ mod tests {
     /// surviving the constant `FoldersUpdated` rebuilds (with the Favorites
     /// section's own collapse riding along under its reserved key), (2) a
     /// slow-connecting account rendering *expandable but empty* rather than a
-    /// chevron-less leaf and popping open when its folders land, and (3) the
+    /// chevron-less leaf and popping open when its folders land, (3) the
     /// end-to-end `rebuild_folder_tree` path preserving collapse, selection,
-    /// and scroll.
+    /// and scroll, and (4) user-expanded subfolders (2nd tier and deeper)
+    /// surviving the same rebuilds.
     #[test]
     fn folder_tree_rebuild_preserves_collapse_state_and_scroll() {
         // GTK's display-dependent tests can only run when the host has a
@@ -17946,6 +17957,41 @@ mod tests {
         assert!(!account_row(&model, &acc_b).is_expanded(), "account B's collapse survives the rebuild");
         assert_eq!(selected_mailbox(&folder_selection), Some(MailboxId("acc_a:INBOX".into())), "the selection is restored");
         assert_eq!(adjustment.value(), 42.0, "the scroll position survives the model swap");
+
+        // --- (4) Expanded subfolders (2nd tier and deeper) survive a rebuild ---
+        let state = test_state(vec![(
+            acc_a.clone(),
+            vec![
+                test_mailbox(&acc_a, "INBOX", 0),
+                test_mailbox(&acc_a, "Projects", 0),
+                test_mailbox(&acc_a, "Projects/Active", 0),
+                test_mailbox(&acc_a, "Projects/Active/Team", 0),
+            ],
+        )]);
+        state.borrow_mut().current_account = Some(acc_a.clone());
+        state.borrow_mut().current_mailbox = Some(MailboxId("acc_a:INBOX".into()));
+
+        let folder_selection = gtk::SingleSelection::new(None::<gio::ListModel>);
+        let folder_scroller = gtk::ScrolledWindow::new();
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+        let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
+        // The user expands "Projects" and, beneath it, "Projects/Active".
+        let folder_row = |model: &gtk::TreeListModel, id: &str| {
+            let idx = find_mailbox_index(model, &MailboxId(id.into())).expect("folder row");
+            model.item(idx).and_downcast::<gtk::TreeListRow>().expect("TreeListRow")
+        };
+        folder_row(&model, "acc_a:Projects").set_expanded(true);
+        folder_row(&model, "acc_a:Projects/Active").set_expanded(true);
+        folder_row(&model, "acc_a:Projects/Active/Team");
+
+        // A count refresh lands: the signature changes, so the rebuild runs.
+        state.borrow_mut().accounts.get_mut(&acc_a).unwrap().folders[0].unread = 7;
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+
+        let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
+        assert!(folder_row(&model, "acc_a:Projects").is_expanded(), "an expanded top-level folder survives a rebuild");
+        assert!(folder_row(&model, "acc_a:Projects/Active").is_expanded(), "an expanded 2nd-tier subfolder survives a rebuild");
+        folder_row(&model, "acc_a:Projects/Active/Team"); // still materialized under its expanded parent
     }
 
     fn summary(uid: Uid, mailbox: &str, year: i32, month: u32, day: u32, hour: u32) -> EmailSummary {
