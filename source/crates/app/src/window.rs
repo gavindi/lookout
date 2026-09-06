@@ -8393,6 +8393,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             show_anchor(&calendar_state, &calendar_main, &mini_calendar);
         });
     }
+    // --- Header current-month dropdown -> the same re-anchor as the sidebar
+    // mini-calendar: clicking a day in the dropdown's mini grid navigates the
+    // whole panel there (and `build_main` closes the popover itself on pick).
+    {
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
+        let month_mini = calendar_main.month_mini.clone();
+        calendar_view::connect_day_selected(&month_mini, move |date| {
+            calendar_view::set_anchor(&calendar_main, date);
+            show_anchor(&calendar_state, &calendar_main, &mini_calendar);
+        });
+    }
     // --- Mail-screen overview mini-calendar -> re-show that day's events
     // (from whatever's already cached) and ask every connected calendar
     // account to resync that month in the background, without touching the
@@ -8827,6 +8840,9 @@ fn show_anchor(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_main: &Ca
     drop(st);
     let event_days = calendar_event_days(calendar_state, month);
     calendar_view::set_mini_month(mini_calendar, day, &event_days);
+    // The header's current-month dropdown holds its own mini grid; keep it
+    // showing the same month as the main panel so the dropdown is never stale.
+    calendar_view::set_mini_month(&calendar_main.month_mini, day, &event_days);
 }
 
 /// The local dates within `month` that have at least one occurrence from a

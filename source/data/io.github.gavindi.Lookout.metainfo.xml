@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.136" date="2026-09-06">
+      <description>
+        <p>Reordered the Calendar header to Today, previous-month, next-month, then the current month as a dropdown: clicking it opens a mini month grid in a popover, so you can browse months and click a day to jump the whole view there.</p>
+      </description>
+    </release>
     <release version="0.9.135" date="2026-09-06">
       <description>
         <p>Fixed the Calendar month view's weekday header boxes drifting a few pixels off the day columns below, and the same misalignment in the Week/Work-week views' headers - the weekday labels now line up exactly with the day boxes they head.</p>

@@ -259,7 +259,8 @@ fn install_calendar_css() {
 
 /// A single 6-week, Sunday-first month grid. Deliberately dumb and read-only:
 /// no drag/resize/creation, no per-event click handling, and no header row -
-/// the header (label + Today/prev/next) is owned by [`CalendarMain`], which
+/// the header (Today/prev/next + current-month dropdown) is owned by
+/// [`CalendarMain`], which
 /// shares it across every view. Kept as plain data-in/widget-state-out
 /// functions (`set_month`/`set_month_occurrences`), mirroring
 /// `folder_tree.rs`'s `build_multi_account_tree_model` precedent, so the
@@ -2056,8 +2057,9 @@ fn build_split_view() -> SplitView {
     }
 }
 
-/// The calendar view's main panel: a shared header row (title + Today +
-/// prev/next) above a stack of the five views - Month, Work week, Week, Day,
+/// The calendar view's main panel: a shared header row (Today + prev/next +
+/// a current-month dropdown whose popover holds a mini month grid) above a
+/// stack of the five views - Month, Work week, Week, Day,
 /// and Split - all anchored to a single date so they always agree on what's
 /// displayed. `window.rs` drives it the same way it drove the old standalone
 /// [`MonthGrid`]: `set_anchor`/`set_occurrences` in, read the anchor back
@@ -2068,6 +2070,12 @@ pub struct CalendarMain {
     pub prev_button: gtk::Button,
     pub next_button: gtk::Button,
     pub today_button: gtk::Button,
+    /// The mini month grid living inside the header's current-month dropdown
+    /// (a `MenuButton` whose popover holds it). Clicking a day in it re-anchors
+    /// the whole panel, so it doubles as the month selector the user asked
+    /// the header dropdown to be. Synced to the anchor by the caller's
+    /// `show_anchor` alongside the sidebar mini-calendar.
+    pub month_mini: MiniCalendar,
     stack: gtk::Stack,
     month: MonthGrid,
     workweek: TimeGrid,
@@ -2108,6 +2116,23 @@ pub fn build_main() -> CalendarMain {
     let next_button = gtk::Button::from_icon_name("go-next-symbolic");
     let today_button = gtk::Button::builder().label("Today").build();
 
+    // The header's current-month title is a dropdown: clicking it opens a
+    // popover holding the same mini month grid the sidebar uses, so the user
+    // can browse months with its prev/next buttons and click a day to jump the
+    // whole panel there. The caller (`window.rs`) registers that navigation via
+    // `connect_day_selected`; the popover closes itself on a day pick here.
+    let month_mini = build_mini();
+    let month_popover = gtk::Popover::builder().child(&month_mini.root).build();
+    {
+        let month_popover = month_popover.clone();
+        connect_day_selected(&month_mini, move |_| month_popover.popdown());
+    }
+    let month_button = gtk::MenuButton::builder()
+        .popover(&month_popover)
+        .child(&header_label)
+        .css_classes(["calendar-toggle"])
+        .build();
+
     let header_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -2116,10 +2141,10 @@ pub fn build_main() -> CalendarMain {
         .margin_top(6)
         .margin_bottom(6)
         .build();
-    header_row.append(&header_label);
     header_row.append(&today_button);
     header_row.append(&prev_button);
     header_row.append(&next_button);
+    header_row.append(&month_button);
 
     let month = build_month_grid();
     let workweek = build_time_grid(&WORK_WEEK_DAYS, false);
@@ -2167,6 +2192,7 @@ pub fn build_main() -> CalendarMain {
         prev_button,
         next_button,
         today_button,
+        month_mini,
         stack,
         month,
         workweek,
