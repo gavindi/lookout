@@ -88,6 +88,12 @@ pub struct ContactsCategoryChoice {
     contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)>,
 }
 
+impl ContactsCategoryChoice {
+    pub fn label(&self) -> String {
+        contacts_bucket_label(&self.kind)
+    }
+}
+
 #[derive(Clone)]
 pub struct ContactsListEntry {
     pub account_id: AccountId,
@@ -1201,6 +1207,7 @@ pub fn rebuild_contacts_list_ui(
 
     let category_label = contacts_bucket_label(&choice.kind);
     let favourites_only = matches!(choice.kind, ContactsBucketKind::Favourites);
+    let contact_lists_only = matches!(choice.kind, ContactsBucketKind::ContactLists);
 
     let mut entries: Vec<ContactsListEntry> = {
         let st = state.borrow();
@@ -1231,12 +1238,64 @@ pub fn rebuild_contacts_list_ui(
     }
 
     if entries.is_empty() {
-        let label = gtk::Label::builder().label("No contacts in this category").xalign(0.0).css_classes(["dim-label"]).build();
-        label.set_margin_start(10);
-        label.set_margin_end(10);
-        label.set_margin_top(10);
-        label.set_margin_bottom(10);
-        contact_list.append(&label);
+        if favourites_only {
+            let icon = crate::window::svg_image(
+                "/io/github/gavindi/Lookout/icons/no-favourite-contacts.svg",
+                include_bytes!("../../../data/resources/icons/no-favourite-contacts.svg"),
+                96,
+            );
+            icon.add_css_class("empty-state-icon");
+            let label = gtk::Label::builder()
+                .label("No stars in the sky. Makes me wonder why, I'm still gazing.")
+                .wrap(true)
+                .halign(gtk::Align::Center)
+                .css_classes(["dim-label"])
+                .build();
+            let empty_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(12)
+                .halign(gtk::Align::Center)
+                .valign(gtk::Align::Center)
+                .build();
+            empty_box.append(&icon);
+            empty_box.append(&label);
+            contact_list.append(&empty_box);
+            if let Some(row) = empty_box.parent() {
+                row.set_vexpand(true);
+            }
+        } else if contact_lists_only {
+            let icon = crate::window::svg_image(
+                "/io/github/gavindi/Lookout/icons/no-contact-groups.svg",
+                include_bytes!("../../../data/resources/icons/no-contact-groups.svg"),
+                96,
+            );
+            icon.add_css_class("empty-state-icon");
+            let label = gtk::Label::builder()
+                .label("Listen to all the translations of the stories across the sky\nWe drew our own constellations")
+                .wrap(true)
+                .halign(gtk::Align::Center)
+                .css_classes(["dim-label"])
+                .build();
+            let empty_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(12)
+                .halign(gtk::Align::Center)
+                .valign(gtk::Align::Center)
+                .build();
+            empty_box.append(&icon);
+            empty_box.append(&label);
+            contact_list.append(&empty_box);
+            if let Some(row) = empty_box.parent() {
+                row.set_vexpand(true);
+            }
+        } else {
+            let label = gtk::Label::builder().label("No contacts in this category").xalign(0.0).css_classes(["dim-label"]).build();
+            label.set_margin_start(10);
+            label.set_margin_end(10);
+            label.set_margin_top(10);
+            label.set_margin_bottom(10);
+            contact_list.append(&label);
+        }
         contacts.borrow_mut().clear();
         refresh_actions();
         return;

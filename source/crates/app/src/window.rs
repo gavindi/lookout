@@ -1285,9 +1285,9 @@ fn install_paned_css() {
         .message-list > row {
             padding: 0;
         }
-        /* The empty-folder placeholder's icon: the artwork is drawn black,
-           so it reads best at reduced opacity against the pane in both
-           schemes. */
+        /* The empty-state placeholder's icon (empty mail folders, the empty
+           Favourites bucket): the artwork is drawn white, so it reads best at
+           reduced opacity against the pane in both schemes. */
         .empty-state-icon {
             opacity: 0.5;
         }
@@ -3862,12 +3862,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_right_box.set_margin_end(8);
     contacts_right_box.set_margin_top(8);
     contacts_right_box.set_margin_bottom(8);
-    contacts_right_box.append(&gtk::Label::builder().label("People").xalign(0.0).css_classes(["heading"]).build());
+    let contacts_heading_label = gtk::Label::builder().label("People").xalign(0.0).css_classes(["heading"]).build();
+    contacts_right_box.append(&contacts_heading_label);
     contacts_right_box.append(&contacts_scroller);
 
     let contacts_left_card = card_section(&contacts_left_box);
     contacts_left_card.add_css_class("folder-pane");
     let contacts_right_card = card_section(&contacts_right_box);
+    contacts_right_card.add_css_class("folder-pane");
     let contacts_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .start_child(&contacts_left_card)
@@ -5584,6 +5586,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let contacts_selected = contacts_selected.clone();
         let refresh_contacts_actions = refresh_contacts_actions.clone();
+        let contacts_heading_label = contacts_heading_label.clone();
         contacts_category_list.connect_row_selected(move |_list, row| {
             let Some(row) = row else { return };
             // Header rows ("gavindi@outlook.com", "Categories") sit in the
@@ -5593,6 +5596,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // `refresh_contacts_category_ui`.
             let Some(idx) = (unsafe { row.data::<usize>("contacts-choice-index") }) else { return };
             let idx = unsafe { *idx.as_ref() };
+            contacts_heading_label.set_label(&contacts_categories.borrow()[idx].label());
             rebuild_contacts_list_ui(
                 &contacts_list,
                 &contacts_categories,
