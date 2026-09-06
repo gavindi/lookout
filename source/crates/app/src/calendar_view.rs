@@ -290,7 +290,7 @@ pub struct MonthGrid {
 }
 
 fn build_month_grid() -> MonthGrid {
-    let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).build();
+    let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).homogeneous(true).build();
     for label in WEEKDAY_LABELS.iter() {
         let weekday_label = gtk::Label::builder().label(*label).css_classes(["dim-label", "caption-heading"]).build();
         let cell = gtk::Box::builder().css_classes(["calendar-day-cell"]).hexpand(true).build();
@@ -891,7 +891,7 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
     let mut headers = Vec::new();
     let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
     if !day_view {
-        let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).build();
+        let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).homogeneous(true).build();
         header_row.append(&gtk::Label::builder().width_request(HOUR_GUTTER_WIDTH as i32).build());
         for _ in weekdays {
             let label = gtk::Label::builder().css_classes(["dim-label", "caption-heading"]).hexpand(true).build();
