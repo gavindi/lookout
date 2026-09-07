@@ -31,6 +31,16 @@
 //! as its integer column. A preference like favourites, so it must survive
 //! both the "Clear all caches" action and a `user_version` bump.
 //!
+//! Folder-expansion state is the folder pane's collapsed/expanded memory:
+//! which subfolders the user left expanded, and which account groups (and the
+//! Favorites section) they left collapsed. Like favourites it's a preference,
+//! not a cache - it must survive "Clear all caches" and a `user_version`
+//! bump - and it's two unbounded sets of compound keys (`{account}:{path}`
+//! mailbox ids, and bare account ids plus the Favorites sentinel), which is
+//! why it lives here rather than in a GSettings strv. The stored shape is the
+//! two sets `rebuild_folder_tree` already carries across rebuilds, so
+//! persisting is a straight capture of the session's expansion state.
+//!
 //! Best-effort like the rest of the config modules: an unreadable or
 //! unwritable database just means favourites don't persist and reminders can
 //! fire again.
@@ -40,8 +50,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use lookout_core::AccountId;
+use lookout_core::{AccountId, MailboxId};
 use rusqlite::Connection;
+
+/// The `kind` column values of the `folder_expansion_state` table: an
+/// expanded subfolder row keyed by its `MailboxId`, or a collapsed account
+/// group (or the Favorites section) keyed by its `AccountId`.
+const EXPANDED_FOLDER: &str = "expanded_folder";
+const COLLAPSED_GROUP: &str = "collapsed_group";
 
 /// On-disk format version. Bumping it wipes the `starred_contacts` table once,
 /// mirroring `lookout-mail`'s cache convention, so a schema change can never
@@ -118,6 +134,11 @@ impl UiStateDb {
                 level INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (account, entry)
             );
+            CREATE TABLE IF NOT EXISTS folder_expansion_state (
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                PRIMARY KEY (kind, key)
+            );
             ",
         )?;
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
@@ -188,6 +209,68 @@ impl UiStateDb {
     pub fn remove_trusted_sender(&self, account: &AccountId, entry: &str) -> rusqlite::Result<()> {
         self.conn
             .execute("DELETE FROM trusted_senders WHERE account = ?1 AND entry = ?2", rusqlite::params![account.0, entry])?;
+        Ok(())
+    }
+
+    /// The folder pane's persisted expansion memory: the subfolders the user
+    /// left expanded (`MailboxId` keys), and the account groups - plus the
+    /// Favorites section, under its reserved sentinel key - they left
+    /// collapsed (`AccountId` keys). The two sets `rebuild_folder_tree`'s
+    /// session restore already carries, so a fresh session can re-seed the
+    /// first build from them. Rows written by a future build that names a
+    /// folder or account no longer present are simply never matched by the
+    /// restore walk, so they are harmless rather than an error.
+    pub fn load_folder_expansion(&self) -> rusqlite::Result<(HashSet<MailboxId>, HashSet<AccountId>)> {
+        let mut stmt = self.conn.prepare("SELECT kind, key FROM folder_expansion_state")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut expanded = HashSet::new();
+        let mut collapsed = HashSet::new();
+        for row in rows {
+            let (kind, key) = row?;
+            match kind.as_str() {
+                EXPANDED_FOLDER => {
+                    expanded.insert(MailboxId(key));
+                }
+                COLLAPSED_GROUP => {
+                    collapsed.insert(AccountId(key));
+                }
+                _ => {}
+            }
+        }
+        Ok((expanded, collapsed))
+    }
+
+    /// Replaces the folder pane's persisted expansion memory wholesale. The
+    /// whole state is always known (the restore capture runs over the live
+    /// tree), so replace semantics - wipe, then insert - keep the table
+    /// exactly equal to the current session state with no diffing; writing an
+    /// unchanged state back is a no-op row-wise. `expanded` names the
+    /// subfolders whose rows are expanded; `collapsed` names the account
+    /// groups (and the Favorites sentinel) left collapsed.
+    pub fn set_folder_expansion(&self, expanded: &HashSet<MailboxId>, collapsed: &HashSet<AccountId>) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM folder_expansion_state", [])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO folder_expansion_state (kind, key) VALUES (?1, ?2)")?;
+            for mailbox in expanded {
+                stmt.execute(rusqlite::params![EXPANDED_FOLDER, mailbox.0])?;
+            }
+            for account in collapsed {
+                stmt.execute(rusqlite::params![COLLAPSED_GROUP, account.0])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Prunes every folder-expansion row belonging to `account`: its account
+    /// group row and every mailbox row under its id prefix. Called when an
+    /// account is removed so the table can't accumulate stale rows for
+    /// folders that no longer exist. A missing row is not an error.
+    pub fn remove_account_folder_expansion(&self, account: &AccountId) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM folder_expansion_state WHERE (kind = ?1 AND key = ?2) OR (kind = ?3 AND key LIKE ?4 || ':%')",
+            rusqlite::params![COLLAPSED_GROUP, account.0, EXPANDED_FOLDER, account.0],
+        )?;
         Ok(())
     }
 
@@ -281,6 +364,11 @@ pub(crate) static CACHE_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The reserved key under which the folder pane's Favorites section is
+    // recorded as a collapsed group - the same sentinel `window.rs`'s
+    // `FAVORITES_GROUP_KEY` uses.
+    const FAVORITES_SENTINEL_TEST: &str = "\u{0}favorites";
 
     // A single test owns `XDG_CACHE_HOME`: the env var is process-global and
     // parallel test threads would race over it otherwise (the same rule as
@@ -509,6 +597,70 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, "@news.example");
         assert_eq!(loaded[0].2, lookout_core::TrustLevel::Images);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_expansion_round_trip_replace_and_wipe_survival() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id()));
+        let dir = dir.join("folder-expansion");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        let (empty_expanded, empty_collapsed) = db.load_folder_expansion().unwrap();
+        assert!(empty_expanded.is_empty());
+        assert!(empty_collapsed.is_empty());
+
+        let account_a = AccountId("/org/gnome/OnlineAccounts/Accounts/account_1".into());
+        let account_b = AccountId("/org/gnome/OnlineAccounts/Accounts/account_2".into());
+        let expanded: HashSet<MailboxId> = HashSet::from([MailboxId(format!("{}:Projects", account_a.0)), MailboxId(format!("{}:Projects/Active", account_a.0))]);
+        let collapsed: HashSet<AccountId> = HashSet::from([account_b.clone(), AccountId(FAVORITES_SENTINEL_TEST.into())]);
+        db.set_folder_expansion(&expanded, &collapsed).unwrap();
+
+        let (loaded_expanded, loaded_collapsed) = db.load_folder_expansion().unwrap();
+        assert_eq!(loaded_expanded, expanded);
+        assert_eq!(loaded_collapsed, collapsed);
+
+        // Replace semantics: a smaller write drops the rows the new state
+        // doesn't name rather than accumulating them.
+        let fewer_expanded: HashSet<MailboxId> = HashSet::from([MailboxId(format!("{}:Projects", account_a.0))]);
+        db.set_folder_expansion(&fewer_expanded, &HashSet::new()).unwrap();
+        let (loaded_expanded, loaded_collapsed) = db.load_folder_expansion().unwrap();
+        assert_eq!(loaded_expanded, fewer_expanded);
+        assert!(loaded_collapsed.is_empty());
+
+        // A fresh session (restart) reads the same rows.
+        let reopened = UiStateDb::open().expect("existing database should reopen");
+        assert_eq!(reopened.load_folder_expansion().unwrap(), (fewer_expanded.clone(), HashSet::new()));
+
+        // Re-adding both sets, then pruning one account removes exactly its
+        // group row and the mailbox rows under its id prefix.
+        reopened.set_folder_expansion(&expanded, &collapsed).unwrap();
+        reopened.remove_account_folder_expansion(&account_a).unwrap();
+        let (loaded_expanded, loaded_collapsed) = reopened.load_folder_expansion().unwrap();
+        assert!(loaded_expanded.is_empty(), "account A's mailbox rows are pruned");
+        assert_eq!(loaded_collapsed, HashSet::from([account_b.clone(), AccountId(FAVORITES_SENTINEL_TEST.into())]));
+        reopened.remove_account_folder_expansion(&account_b).unwrap();
+        let (loaded_expanded, loaded_collapsed) = reopened.load_folder_expansion().unwrap();
+        assert!(loaded_expanded.is_empty());
+        assert_eq!(
+            loaded_collapsed,
+            HashSet::from([AccountId(FAVORITES_SENTINEL_TEST.into())]),
+            "the Favorites sentinel survives account pruning"
+        );
+
+        // Expansion memory is a preference like favourites: the version-wipe
+        // path must not touch it (only `starred_contacts` is wiped).
+        reopened.set_folder_expansion(&fewer_expanded, &HashSet::new()).unwrap();
+        reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
+        drop(reopened);
+        let upgraded = UiStateDb::open().unwrap();
+        let (loaded_expanded, loaded_collapsed) = upgraded.load_folder_expansion().unwrap();
+        assert_eq!(loaded_expanded, fewer_expanded);
+        assert!(loaded_collapsed.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

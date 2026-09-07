@@ -855,6 +855,18 @@ pub(crate) struct UiState {
     /// nothing the tree draws; comparing against this skips the rebuild
     /// entirely for them. `None` until the first tree is built.
     folder_tree: Option<FolderTreeSignature>,
+    /// The folder pane's subfolders the user left expanded - the persisted
+    /// counterpart of the session capture `rebuild_folder_tree` takes, so the
+    /// first build of a fresh session can re-seed from it instead of the
+    /// empty pre-model capture. Written back on every rebuild and on window
+    /// close. Persisted in the UI-state database (`ui_state_db`), loaded at
+    /// startup; survives "Clear all caches" like `starred_contacts`.
+    expanded_folders: HashSet<MailboxId>,
+    /// The folder pane's account groups (and the Favorites section, under its
+    /// reserved key) the user left collapsed - the other half of the pane's
+    /// expansion memory, defaulting every other group to expanded exactly as
+    /// the session restore does. Persisted alongside `expanded_folders`.
+    collapsed_groups: HashSet<AccountId>,
     /// Set while `rebuild_folder_tree` is putting the selection back after
     /// swapping the model, so the `selected-item` handler doesn't mistake the
     /// restore for the user clicking a folder. Without it, re-selecting the
@@ -1879,6 +1891,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .flatten()
         .map(|(account, entry, level)| ((account, entry), level))
         .collect();
+    // The folder pane's expansion memory: which subfolders the user left
+    // expanded and which account groups collapsed. Loaded from the same
+    // UI-state database so the first `rebuild_folder_tree` of a fresh session
+    // can re-seed the pane's collapse state instead of starting all-default.
+    let (expanded_folders, collapsed_groups) = ui_db.as_ref().and_then(|db| db.load_folder_expansion().ok()).unwrap_or_default();
     // Shared keyring handle for manually-added ("other") IMAP/SMTP accounts -
     // see `other_accounts.rs`. Cloned into the add-account dialog, the
     // startup connect loop, and the Config view's edit/remove actions.
@@ -1951,6 +1968,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         compose_popout_window: None,
         compose_action_bar: None,
         folder_tree: None,
+        expanded_folders,
+        collapsed_groups,
         suppress_folder_selection: false,
         search_active: false,
         search_query: String::new(),
@@ -4848,8 +4867,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // hidden app is doing; clearing it on show keeps that list honest.
     {
         let settings = settings.clone();
+        let state = state.clone();
+        let folder_selection = folder_selection.clone();
+        // Flush the folder pane's expansion state: the user's last chevron
+        // toggle might not have been followed by a rebuild (the other
+        // write-back point), so fold the live model into the session memory
+        // and write it out. Shared by the two flush points below (window
+        // close and app quit). The merge is a no-op when the pane has no
+        // model, so a flush before the first build can't wipe anything.
+        let flush_folder_expansion = {
+            let state = state.clone();
+            let folder_selection = folder_selection.clone();
+            move || {
+                merge_folder_expansion(&state, &folder_selection);
+                persist_folder_expansion(&state);
+            }
+        };
         window.connect_close_request({
             let worker = worker.clone();
+            let flush_folder_expansion = flush_folder_expansion.clone();
             move |win| {
                 // Flush geometry synchronously rather than relying on the
                 // debounced resize/maximize saves below, in case the window
@@ -4859,6 +4895,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     settings.set_int(crate::settings::WINDOW_HEIGHT, win.height());
                 }
                 settings.set_bool(crate::settings::WINDOW_MAXIMIZED, win.is_maximized());
+                flush_folder_expansion();
                 if !settings.get_bool(crate::settings::CLOSE_TO_BACKGROUND) {
                     return glib::Propagation::Proceed;
                 }
@@ -4866,6 +4903,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 win.set_visible(false);
                 glib::Propagation::Stop
             }
+        });
+        // The real exit paths - Ctrl+Q / File → Quit, and the tray icon's
+        // Quit - call `app.quit()` directly, so the close-request handler
+        // (and with it the flush above) never runs for them. The `shutdown`
+        // signal reaches every quit, and GTK emits it before its default
+        // handler closes the windows, so the tree is still alive to capture.
+        app.connect_shutdown({
+            let flush_folder_expansion = flush_folder_expansion.clone();
+            move |_| flush_folder_expansion()
         });
         window.connect_show({
             let worker = worker.clone();
@@ -6849,6 +6895,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         let app_config = state.borrow().app_config.clone();
                         app_config.borrow_mut().other_accounts.retain(|a| a.id != account_id.0);
                         crate::app_config::save(&app_config.borrow());
+                    }
+                    // The account is gone for good (unlike a Config disable,
+                    // which keeps the on-disk state for a re-enable), so prune
+                    // its folder-pane expansion rows too - the mailbox ids
+                    // would otherwise linger forever in the UI-state DB.
+                    if let Some(db) = state.borrow().ui_db.clone() {
+                        if let Err(e) = db.remove_account_folder_expansion(&account_id) {
+                            tracing::warn!("could not prune folder expansion for removed account {account_id}: {e}");
+                        }
                     }
                     let keyring = keyring.clone();
                     let account_id_for_worker = account_id.clone();
@@ -14747,8 +14802,17 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
     // `GtkSingleSelection` autoselects row 0 ("All Inboxes") on `set_model`,
     // and without a restore the pane can end up jumped to the top, leaving a
     // scrolled-down account's subtree looking collapsed.
-    let expanded = expanded_mailboxes(folder_selection);
-    let collapsed_groups = collapsed_account_groups(folder_selection);
+    // The capture folds the outgoing model's state into the session's durable
+    // expansion memory rather than replacing it (see
+    // `merge_folder_expansion`), and the restore then works from that memory.
+    // On the *first* build there is no model yet (the `SingleSelection` was
+    // created with `None`), so the merge is a no-op and the memory is exactly
+    // what the last session left in the UI-state database.
+    merge_folder_expansion(state, folder_selection);
+    let (expanded, collapsed_groups) = {
+        let st = state.borrow();
+        (st.expanded_folders.clone(), st.collapsed_groups.clone())
+    };
     let scroll_value = folder_scroller.vadjustment().value();
     let restore_to = {
         let st = state.borrow();
@@ -14789,6 +14853,10 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
     state.borrow_mut().suppress_folder_selection = false;
 
     state.borrow_mut().folder_tree = Some(signature);
+    // Write the merged memory back on every rebuild, so the pane's collapse
+    // state survives a restart even if the app never reaches its exit flush
+    // (a crash, a kill, a session logout).
+    persist_folder_expansion(state);
     if auto_select_inbox {
         restore_or_default_initial_view(state, &model, folder_selection);
     }
@@ -14801,27 +14869,109 @@ enum SelectionTarget {
     Mailbox(MailboxId),
 }
 
-/// The mailboxes whose rows are currently expanded, so a rebuild can restore
-/// them. Only `TreeItem::Folder` rows are collected - account groups and the
-/// Favorites section carry their own collapse state (see
-/// `collapsed_account_groups`), and `Favorite` rows are leaves.
-fn expanded_mailboxes(folder_selection: &gtk::SingleSelection) -> HashSet<MailboxId> {
-    let mut expanded = HashSet::new();
-    let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() else {
-        return expanded;
+/// One walk of the live folder pane, recording both halves of what the pane
+/// can currently say about its own collapse state: which rows are
+/// expanded/collapsed, *and* which rows were there to be asked at all.
+///
+/// The second half is what makes the memory safe to merge. A `TreeListModel`
+/// only materializes rows whose ancestors are expanded, and an account only
+/// grows folder rows once its folder list has arrived - so at any moment the
+/// pane is silent about most of what the user has ever expanded. Treating
+/// that silence as "not expanded" is what wiped the memory: the empty tree
+/// the app builds before any account has connected would answer "nothing is
+/// expanded, nothing is collapsed" and overwrite the previous session's
+/// state within milliseconds of launch. A row the model can't speak for is
+/// left exactly as the memory has it.
+struct FolderExpansionCapture {
+    /// Materialized `TreeItem::Folder` rows that are expanded.
+    expanded: HashSet<MailboxId>,
+    /// Materialized `TreeItem::Folder` rows that *could* be expanded - the
+    /// only mailboxes this capture is entitled to overwrite. A folder with no
+    /// subfolders has no expansion state to record, so it is excluded and its
+    /// remembered state survives until its subfolders come back.
+    expandable: HashSet<MailboxId>,
+    /// Depth-0 account groups (and the Favorites section, under
+    /// `FAVORITES_GROUP_KEY`) that are collapsed.
+    collapsed_groups: HashSet<AccountId>,
+    /// Depth-0 groups that are genuinely collapsible - the groups this
+    /// capture may overwrite. An account whose folders haven't landed yet
+    /// renders as a non-expandable row that the user cannot have collapsed,
+    /// so it is excluded and keeps whatever the memory holds for it.
+    collapsible_groups: HashSet<AccountId>,
+}
+
+fn capture_folder_expansion(folder_selection: &gtk::SingleSelection) -> Option<FolderExpansionCapture> {
+    let model = folder_selection.model().and_downcast::<gtk::TreeListModel>()?;
+    let mut capture = FolderExpansionCapture {
+        expanded: HashSet::new(),
+        expandable: HashSet::new(),
+        collapsed_groups: HashSet::new(),
+        collapsible_groups: HashSet::new(),
     };
     for i in 0..model.n_items() {
         let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
-        if !row.is_expanded() {
-            continue;
-        }
         let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { continue };
         let tree_item = boxed.borrow::<TreeItem>();
-        if let TreeItem::Folder(node) = &*tree_item {
-            expanded.insert(node.mailbox.id.clone());
+        match &*tree_item {
+            TreeItem::Folder(node) => {
+                if row.is_expanded() {
+                    capture.expanded.insert(node.mailbox.id.clone());
+                }
+                if row.is_expandable() {
+                    capture.expandable.insert(node.mailbox.id.clone());
+                }
+            }
+            item @ (TreeItem::Account(_) | TreeItem::Favorites) => {
+                if row.depth() != 0 || !row.is_expandable() {
+                    continue;
+                }
+                let key = match item {
+                    TreeItem::Account(acc) => acc.account_id.clone(),
+                    _ => AccountId(FAVORITES_GROUP_KEY.into()),
+                };
+                if !row.is_expanded() {
+                    capture.collapsed_groups.insert(key.clone());
+                }
+                capture.collapsible_groups.insert(key);
+            }
+            _ => {}
         }
     }
-    expanded
+    Some(capture)
+}
+
+/// Folds the live pane's collapse state into the session's durable expansion
+/// memory (`UiState::expanded_folders` / `collapsed_groups`), which is what
+/// both the rebuild restore and the database write work from.
+///
+/// Merge, never replace: only the rows the capture actually saw are
+/// overwritten (see [`FolderExpansionCapture`]). A no-op before the first
+/// model exists, so the startup memory loaded from the database reaches the
+/// first build intact.
+fn merge_folder_expansion(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::SingleSelection) {
+    let Some(capture) = capture_folder_expansion(folder_selection) else {
+        return;
+    };
+    let mut st = state.borrow_mut();
+    st.expanded_folders.retain(|id| !capture.expandable.contains(id));
+    st.expanded_folders.extend(capture.expanded);
+    st.collapsed_groups.retain(|id| !capture.collapsible_groups.contains(id));
+    st.collapsed_groups.extend(capture.collapsed_groups);
+}
+
+/// Writes the session's expansion memory to the UI-state database.
+/// Best-effort like the other UI-state tables: a failed open or write means
+/// the pane's collapse state is session-only, never an error.
+fn persist_folder_expansion(state: &Rc<RefCell<UiState>>) {
+    let (db, expanded, collapsed) = {
+        let st = state.borrow();
+        (st.ui_db.clone(), st.expanded_folders.clone(), st.collapsed_groups.clone())
+    };
+    if let Some(db) = db {
+        if let Err(e) = db.set_folder_expansion(&expanded, &collapsed) {
+            tracing::warn!("folder expansion state won't persist: {e}");
+        }
+    }
 }
 
 /// Re-expands the rows named by `expanded` in a freshly built model. Walks by
@@ -14849,45 +14999,18 @@ fn expand_mailboxes(model: &gtk::TreeListModel, expanded: &HashSet<MailboxId>) {
 }
 
 /// The reserved pseudo-account key under which the Favorites section's group
-/// state is carried by `collapsed_account_groups` - the same sentinel
+/// state is carried by `capture_folder_expansion` - the same sentinel
 /// `folder_tree_signature` uses to fold the favorites section into its
 /// comparison.
 const FAVORITES_GROUP_KEY: &str = "\u{0}favorites";
 
 /// The account groups (and the Favorites section) the user has collapsed in
-/// the current tree, so a rebuild can keep them collapsed - the account-level
-/// counterpart of `expanded_mailboxes`, which covers subfolders only.
-///
-/// Only rows that are genuinely collapsible are recorded: an account whose
-/// folder list hasn't arrived yet renders as a row that can't have been
-/// collapsed by the user, so it must never be captured - otherwise a slow
-/// account's pre-connect state would be remembered as "the user collapsed
-/// it", and its subtree would reopen collapsed once its folders landed. The
-/// Favorites section is keyed under `FAVORITES_GROUP_KEY`, mirroring
-/// `folder_tree_signature`.
+/// the current tree. Test-only sugar over [`capture_folder_expansion`]; the
+/// pane itself never asks the live model directly, it works from the merged
+/// session memory (see [`merge_folder_expansion`]).
+#[cfg(test)]
 fn collapsed_account_groups(folder_selection: &gtk::SingleSelection) -> HashSet<AccountId> {
-    let mut collapsed = HashSet::new();
-    let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() else {
-        return collapsed;
-    };
-    for i in 0..model.n_items() {
-        let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
-        if row.depth() != 0 || row.is_expanded() || !row.is_expandable() {
-            continue;
-        }
-        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { continue };
-        let tree_item = boxed.borrow::<TreeItem>();
-        match &*tree_item {
-            TreeItem::Account(acc) => {
-                collapsed.insert(acc.account_id.clone());
-            }
-            TreeItem::Favorites => {
-                collapsed.insert(AccountId(FAVORITES_GROUP_KEY.into()));
-            }
-            _ => {}
-        }
-    }
-    collapsed
+    capture_folder_expansion(folder_selection).map(|c| c.collapsed_groups).unwrap_or_default()
 }
 
 /// Applies the account groups' (and the Favorites section's) collapse state
@@ -17381,6 +17504,8 @@ mod tests {
             compose_popout_window: None,
             compose_action_bar: None,
             folder_tree: None,
+            expanded_folders: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             suppress_folder_selection: false,
             search_active: false,
             search_query: String::new(),
@@ -18012,6 +18137,156 @@ mod tests {
         assert!(folder_row(&model, "acc_a:Projects").is_expanded(), "an expanded top-level folder survives a rebuild");
         assert!(folder_row(&model, "acc_a:Projects/Active").is_expanded(), "an expanded 2nd-tier subfolder survives a rebuild");
         folder_row(&model, "acc_a:Projects/Active/Team"); // still materialized under its expanded parent
+
+        // --- (5) A fresh session (restart) re-seeds the first build from the
+        // persisted expansion memory, which is exactly what survives a restart ---
+        let state = test_state(vec![
+            (
+                acc_a.clone(),
+                vec![
+                    test_mailbox(&acc_a, "INBOX", 0),
+                    test_mailbox(&acc_a, "Projects", 0),
+                    test_mailbox(&acc_a, "Projects/Active", 0),
+                    test_mailbox(&acc_a, "Projects/Active/Team", 0),
+                ],
+            ),
+            (acc_b.clone(), vec![test_mailbox(&acc_b, "INBOX", 0)]),
+        ]);
+        state.borrow_mut().current_account = Some(acc_a.clone());
+        state.borrow_mut().current_mailbox = Some(MailboxId("acc_a:INBOX".into()));
+        // The last session left "Projects" expanded, "Projects/Active" too,
+        // and account B collapsed - the persisted `UiState` fields a startup
+        // `build_window` fills from the UI-state database.
+        state.borrow_mut().expanded_folders = HashSet::from([MailboxId("acc_a:Projects".into()), MailboxId("acc_a:Projects/Active".into())]);
+        state.borrow_mut().collapsed_groups = HashSet::from([acc_b.clone()]);
+
+        let folder_selection = gtk::SingleSelection::new(None::<gio::ListModel>);
+        let folder_scroller = gtk::ScrolledWindow::new();
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+
+        let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
+        assert!(
+            account_row(&model, &acc_a).is_expanded(),
+            "an account group the last session left expanded stays expanded on the first build"
+        );
+        assert!(
+            !account_row(&model, &acc_b).is_expanded(),
+            "an account group the last session left collapsed stays collapsed on the first build"
+        );
+        assert!(
+            folder_row(&model, "acc_a:Projects").is_expanded(),
+            "a persisted expanded subfolder opens on the first build"
+        );
+        assert!(folder_row(&model, "acc_a:Projects/Active").is_expanded(), "a persisted 2nd-tier subfolder opens too");
+        folder_row(&model, "acc_a:Projects/Active/Team"); // materialized under its restored expanded parents
+
+        // --- (6) The real startup order: the first builds run before any
+        // account has connected, so the pane is empty and can say nothing
+        // about what the user expanded. That silence must not be recorded as
+        // "nothing is expanded" - doing so wiped the restored memory within
+        // milliseconds of launch, and the expansion state never survived a
+        // restart even though it had been written correctly on exit ---
+        let state = test_state(Vec::new());
+        state.borrow_mut().expanded_folders = HashSet::from([MailboxId("acc_a:Projects".into()), MailboxId("acc_a:Projects/Active".into())]);
+        state.borrow_mut().collapsed_groups = HashSet::from([acc_b.clone()]);
+        let remembered_folders = state.borrow().expanded_folders.clone();
+        let remembered_groups = state.borrow().collapsed_groups.clone();
+
+        let folder_selection = gtk::SingleSelection::new(None::<gio::ListModel>);
+        let folder_scroller = gtk::ScrolledWindow::new();
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+        // A second empty build (the pane rebuilds on every `FoldersUpdated`)
+        // now has a live - but still accountless - model to capture from.
+        state.borrow_mut().folder_tree = None;
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+        assert_eq!(state.borrow().expanded_folders, remembered_folders, "an accountless pane must not wipe the expanded-folder memory");
+        assert_eq!(state.borrow().collapsed_groups, remembered_groups, "an accountless pane must not wipe the collapsed-group memory");
+
+        // The accounts connect and their folders land: the memory the empty
+        // builds preserved is what the pane opens with.
+        let arrived = test_state(vec![
+            (
+                acc_a.clone(),
+                vec![
+                    test_mailbox(&acc_a, "INBOX", 0),
+                    test_mailbox(&acc_a, "Projects", 0),
+                    test_mailbox(&acc_a, "Projects/Active", 0),
+                    test_mailbox(&acc_a, "Projects/Active/Team", 0),
+                ],
+            ),
+            (acc_b.clone(), vec![test_mailbox(&acc_b, "INBOX", 0)]),
+        ]);
+        state.borrow_mut().accounts = std::mem::take(&mut arrived.borrow_mut().accounts);
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+
+        let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
+        assert!(!account_row(&model, &acc_b).is_expanded(), "the remembered account-group collapse applies once the account connects");
+        assert!(folder_row(&model, "acc_a:Projects").is_expanded(), "the remembered subfolder expansion applies once the folders land");
+        assert!(folder_row(&model, "acc_a:Projects/Active").is_expanded(), "and so does the remembered 2nd-tier one");
+
+        // Collapsing is still recorded: the memory only ignores rows the pane
+        // couldn't speak for, never a row the user actually toggled.
+        folder_row(&model, "acc_a:Projects/Active").set_expanded(false);
+        state.borrow_mut().folder_tree = None;
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+        assert_eq!(
+            state.borrow().expanded_folders,
+            HashSet::from([MailboxId("acc_a:Projects".into())]),
+            "a collapsed subfolder is dropped from the memory"
+        );
+
+        // Collapsing the account group hides its subfolder rows entirely, so
+        // the capture can't see them any more - and must therefore leave
+        // their remembered state alone. Otherwise collapsing an account would
+        // silently forget every subfolder the user had opened inside it.
+        let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
+        account_row(&model, &acc_a).set_expanded(false);
+        state.borrow_mut().folder_tree = None;
+        rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+        assert_eq!(
+            state.borrow().collapsed_groups,
+            HashSet::from([acc_a.clone(), acc_b.clone()]),
+            "a collapsed account group is added to the memory"
+        );
+        assert_eq!(
+            state.borrow().expanded_folders,
+            HashSet::from([MailboxId("acc_a:Projects".into())]),
+            "the subfolders hidden by that collapse keep their remembered expansion"
+        );
+    }
+
+    /// The folder-expansion flush hangs off `Application::shutdown` because
+    /// the real exit paths (Ctrl+Q, File → Quit, the tray's Quit) call
+    /// `app.quit()` and never run the window's close-request handler. That
+    /// only works if `shutdown` is emitted while the folder tree's model is
+    /// still alive - GTK's default handler closes the windows *after* the
+    /// signal - so this pins the ordering the flush depends on. Like the
+    /// other GTK-touching tests it self-skips when this thread doesn't own
+    /// GTK (see `gtk_test::gtk_ready`).
+    #[test]
+    fn shutdown_signal_fires_with_tree_still_alive() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let app = adw::Application::builder().application_id("org.example.lookout-shutdown-order-test").build();
+        let win = gtk::ApplicationWindow::new(&app);
+        let model = build_multi_account_tree_model(Vec::new(), Vec::new());
+        let selection = gtk::SingleSelection::new(Some(model));
+        let seen: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        let seen2 = seen.clone();
+        app.connect_shutdown(move |_| {
+            *seen2.borrow_mut() = Some(selection.model().is_some());
+        });
+        app.connect_activate({
+            let app = app.clone();
+            move |_| app.quit()
+        });
+        // Empty argv: `run()` would hand GApplication libtest's own command
+        // line (`--nocapture`, a filter string) and fail to parse it.
+        app.run_with_args::<&str>(&[]);
+        let seen = *seen.borrow();
+        win.close();
+        assert_eq!(seen, Some(true), "the tree model must still be alive when shutdown fires");
     }
 
     fn summary(uid: Uid, mailbox: &str, year: i32, month: u32, day: u32, hour: u32) -> EmailSummary {

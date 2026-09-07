@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.138" date="2026-09-08">
+      <description>
+        <p>The mail folder pane now remembers which subfolders you left expanded and which account groups you left collapsed, and restores them the next time you start Lookout. The state is saved as you go and again on exit, including when you quit from the tray icon.</p>
+      </description>
+    </release>
     <release version="0.9.137" date="2026-09-06">
       <description>
         <p>The People tab's empty Favourites and "Your contact lists" buckets now show centred placeholder artwork and quotes instead of a generic "No contacts" label - a moon-and-stars artwork over "No stars in the sky. Makes me wonder why, I'm still gazing." for Favourites, and a constellation artwork over "Listen to all the translations of the stories across the sky / We drew our own constellations" for your contact lists. The contacts pane's heading also now shows the selected bucket's name instead of always reading "People".</p>
