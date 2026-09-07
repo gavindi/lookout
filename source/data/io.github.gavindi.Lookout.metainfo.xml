@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.140" date="2026-09-08">
+      <description>
+        <p>The About Lookout dialog now shows everything on a single page. The version, description, links, copyright and licence used to sit behind "Details" and "Legal" buttons that you had to click through; they are all visible at once now.</p>
+      </description>
+    </release>
     <release version="0.9.138" date="2026-09-08">
       <description>
         <p>The mail folder pane now remembers which subfolders you left expanded and which account groups you left collapsed, and restores them the next time you start Lookout. The state is saved as you go and again on exit, including when you quit from the tray icon.</p>

@@ -1478,16 +1478,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     app.add_action(&quit_action);
 
     let about_action = gio::SimpleAction::new("about", None);
-    about_action.connect_activate(|_, _| {
-        adw::AboutDialog::builder()
-            .application_name("Lookout")
-            .version(env!("CARGO_PKG_VERSION"))
-            .developer_name("Gavin Graham")
-            .license_type(gtk::License::Gpl30)
-            .comments("A native GNOME mail client for GNOME Online Accounts.")
-            .build()
-            .present(gtk::Window::NONE);
-    });
+    about_action.connect_activate(|_, _| show_about_dialog());
     app.add_action(&about_action);
 
     // Phase 5: the process-wide preference store, resolved once up front
@@ -15151,6 +15142,93 @@ fn card_section(content: &impl IsA<gtk::Widget>) -> gtk::Box {
         .build();
     card.append(content);
     card
+}
+
+/// Help → "About Lookout": everything the dialog has to say, on one page.
+///
+/// `AdwAboutDialog` is deliberately not used here. It is a navigation widget:
+/// its main page carries only the icon, name, developer and version, and files
+/// `comments` behind a "Details" row and the licence behind a "Legal" row.
+/// Those subpages are structural - no builder property flattens them - so the
+/// handful of facts below are laid out directly in a plain `AdwDialog`, which
+/// has no navigation stack at all.
+fn show_about_dialog() {
+    let dialog = adw::Dialog::builder().title("About Lookout").content_width(400).build();
+
+    let header = adw::HeaderBar::builder().show_title(false).build();
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .halign(gtk::Align::Center)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+
+    content.append(&svg_image(
+        "/io/github/gavindi/Lookout/icons/io.github.gavindi.Lookout.svg",
+        include_bytes!("../../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg"),
+        128,
+    ));
+    content.append(&gtk::Label::builder().label("Lookout").css_classes(["title-1"]).build());
+    content.append(
+        &gtk::Label::builder()
+            .label(format!("Version {}", env!("CARGO_PKG_VERSION")))
+            .css_classes(["dim-label"])
+            .build(),
+    );
+    content.append(&gtk::Label::builder().label("Gavin Graham").css_classes(["dim-label"]).build());
+    content.append(
+        &gtk::Label::builder()
+            .label("A native GNOME mail client for GNOME Online Accounts.")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .margin_top(12)
+            .build(),
+    );
+
+    let links = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::Center)
+        .margin_top(6)
+        .build();
+    links.append(&gtk::LinkButton::with_label("https://github.com/gavindi/lookout", "Website"));
+    links.append(&gtk::LinkButton::with_label("https://github.com/gavindi/lookout/issues", "Report an Issue"));
+    content.append(&links);
+
+    // The former "Legal" subpage, inlined. Markup is on for the licence link,
+    // so the copyright line's ampersand has to be escaped.
+    content.append(
+        &gtk::Label::builder()
+            .label(
+                "© 2026 Gavin Graham &amp; Contributors\n\
+                 Licensed under the <a href=\"https://www.gnu.org/licenses/gpl-3.0.html\">GNU General Public \
+                 License, version 3 or later</a>. This application comes with absolutely no warranty.",
+            )
+            .use_markup(true)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["caption", "dim-label"])
+            .margin_top(12)
+            .build(),
+    );
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .child(&content)
+        .build();
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&scroller));
+    dialog.set_child(Some(&toolbar_view));
+
+    dialog.present(gtk::Window::NONE);
 }
 
 /// Config → Google Tasks → "OAuth client id": a small modal dialog with an
