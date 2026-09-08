@@ -837,6 +837,12 @@ pub struct MessageListModel {
     /// always take the inline path, so no test needs a real `Worker` (an OS
     /// thread plus a tokio runtime) just to construct a model.
     worker: Option<Rc<Worker>>,
+    /// The widgets this model is rendered through, set once by `window.rs`
+    /// via `attach_scroller` right after it builds them - the only reason the
+    /// model knows about widgets at all is `apply_layout`'s stay-at-the-top
+    /// re-pin (see `pin_to_top`). `None` in every test-built model, and in a
+    /// model whose widgets haven't been wired yet; both simply skip the pin.
+    scroller: Rc<RefCell<Option<(gtk::ScrolledWindow, gtk::ListView)>>>,
 }
 
 /// Above this many messages, `repopulate`'s pure-data prefix (filter + sort +
@@ -851,6 +857,11 @@ pub struct MessageListModel {
 /// under that budget once the still-inline splice/`capture_collapsed`/
 /// `restore_selection` cost is added on top.
 const BACKGROUND_REPOPULATE_THRESHOLD: usize = 5_000;
+
+/// How far down the list still counts as "at the top" for `apply_layout`'s
+/// re-pin - roughly one row's height, so a sub-pixel residue left by kinetic
+/// scrolling (or a few pixels of overscroll) can't silently disable it.
+const AT_TOP_THRESHOLD_PX: f64 = 48.0;
 
 impl MessageListModel {
     /// Builds a model that always computes `repopulate`'s layout inline,
@@ -914,7 +925,55 @@ impl MessageListModel {
             filter: Rc::new(RefCell::new(ListFilter::All)),
             generation: Rc::new(Cell::new(0)),
             worker,
+            scroller: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Tells the model which widgets it is being rendered through, so
+    /// `apply_layout` can keep the list pinned to the top when new mail lands
+    /// while the user is already there (see `pin_to_top`). Called once, from
+    /// `window.rs`'s `build_ui`, immediately after the `ListView` and its
+    /// `ScrolledWindow` are built; a model that never gets this call behaves
+    /// exactly as it did before the pin existed.
+    pub fn attach_scroller(&self, scroller: &gtk::ScrolledWindow, view: &gtk::ListView) {
+        *self.scroller.borrow_mut() = Some((scroller.clone(), view.clone()));
+    }
+
+    /// Whether the list is currently scrolled to (or within one row of) the
+    /// top. `false` when no widgets are attached - nothing to pin, and no way
+    /// to know. Read *before* `apply_layout` splices anything, because the
+    /// splice itself is what moves the adjustment.
+    fn scroll_at_top(&self) -> bool {
+        match &*self.scroller.borrow() {
+            Some((scroller, _)) => scroller.vadjustment().value() <= AT_TOP_THRESHOLD_PX,
+            None => false,
+        }
+    }
+
+    /// Puts the viewport back at row 0 after a rebuild that started there.
+    ///
+    /// `GtkListView` anchors its viewport to an *item*, not to a pixel offset:
+    /// when a rebuild splices new rows in above the anchored (focused or
+    /// selected) row, `GtkListBase` compensates by raising the scroll value so
+    /// that row stays visually still - which pushes the newly arrived mail off
+    /// the top of the view, exactly where the user was looking. `scroll_to` is
+    /// the load-bearing call here rather than a bare `set_value`: it re-points
+    /// that anchor at item 0, so the next size-allocate doesn't simply undo the
+    /// adjustment. The flags are empty on purpose - `FOCUS`/`SELECT` would move
+    /// the highlight, and the user's selected message must keep both its
+    /// highlight and the reading pane it drives. The `set_value` afterwards
+    /// covers the case where the view isn't allocated yet and so has no anchor
+    /// to move.
+    fn pin_to_top(&self) {
+        let Some((scroller, view)) = self.scroller.borrow().clone() else {
+            return;
+        };
+        // `scroll_to` on an empty model is a programming error to GTK.
+        if self.selection.n_items() == 0 {
+            return;
+        }
+        view.scroll_to(0, gtk::ListScrollFlags::empty(), None);
+        scroller.vadjustment().set_value(0.0);
     }
 
     /// Every message the list is currently backed by, before filtering - the
@@ -1124,6 +1183,11 @@ impl MessageListModel {
             return;
         }
 
+        // Whether the user is sitting at the top of the list, read before the
+        // splices move the adjustment - see `pin_to_top` for why arriving mail
+        // otherwise lands off-screen above them.
+        let was_at_top = self.scroll_at_top();
+
         // Snapshot what the user has collapsed before anything is spliced.
         self.capture_collapsed();
 
@@ -1283,6 +1347,12 @@ impl MessageListModel {
         }
 
         self.restore_selection(previous_selection, previous_single_index);
+
+        // Last, after `restore_selection`: that call can `select_item`, which
+        // moves focus and with it the anchor `pin_to_top` is correcting.
+        if was_at_top {
+            self.pin_to_top();
+        }
     }
 
     /// Switches which messages the list shows and re-renders from the stored
@@ -2207,6 +2277,48 @@ mod tests {
         let thread_row = thread_target.tree.child_row(0).expect("Today row").child_row(0).expect("thread row");
         assert!(thread_row.is_expanded(), "select_uid must expand the collapsed thread");
         assert_eq!(thread_target.selected_summary().map(|s| s.uid), Some(Uid(1)));
+
+        // --- New mail arriving while the user is at the top of the list puts
+        // them back at the top; arriving while they're scrolled down leaves
+        // their place alone. Own model, appended here for the same
+        // gtk::init()-once-per-process reason as the rest of this function.
+        //
+        // What these lock is the *decision* - the at-top capture taken before
+        // the splice, and the re-pin (or lack of one) after it. They can't
+        // reproduce the bug itself: an unrealized `ListView` never runs the
+        // size-allocate in which `GtkListBase` re-anchors the viewport and
+        // pushes newly spliced rows off the top.
+        //
+        // The view is deliberately *not* made the scroller's child here. A
+        // `GtkListView` inside a `GtkScrolledWindow` owns that scroller's
+        // adjustment, and an unallocated one publishes upper = page_size = 0,
+        // which clamps every value the test sets back to 0 - so the two cases
+        // below would be indistinguishable. Kept apart, the adjustment reads
+        // back exactly what the model did to it. ---
+        let scrolled = MessageListModel::build();
+        let scroller = gtk::ScrolledWindow::new();
+        let list_view = gtk::ListView::new(Some(scrolled.selection.clone()), None::<gtk::SignalListItemFactory>);
+        scroller.set_vadjustment(Some(&gtk::Adjustment::new(0.0, 0.0, 1000.0, 0.0, 0.0, 0.0)));
+        let adjustment = scroller.vadjustment();
+        scrolled.attach_scroller(&scroller, &list_view);
+        scrolled.repopulate(vec![summary(1, yesterday), summary(2, older)], SortKey::Date, true);
+
+        // Scrolled well down: a rebuild must not drag the view to the top.
+        adjustment.set_value(500.0);
+        scrolled.repopulate(vec![summary(3, today), summary(1, yesterday), summary(2, older)], SortKey::Date, true);
+        assert_eq!(adjustment.value(), 500.0, "a rebuild must not snap a scrolled-down list to the top");
+
+        // Within one row of the top: the same rebuild pins back to 0.
+        adjustment.set_value(10.0);
+        scrolled.repopulate(vec![summary(4, today), summary(3, today), summary(1, yesterday), summary(2, older)], SortKey::Date, true);
+        assert_eq!(adjustment.value(), 0.0, "new mail arriving at the top must leave the list pinned there");
+
+        // A model with no widgets attached - every other test in this file,
+        // and the model between construction and `attach_scroller` - must
+        // rebuild without reaching for a scroller it hasn't got.
+        let detached = MessageListModel::build();
+        detached.repopulate(vec![summary(1, today)], SortKey::Date, true);
+        assert_eq!(detached.selection.n_items(), 2, "an unattached model still rebuilds normally");
     }
 
     #[test]

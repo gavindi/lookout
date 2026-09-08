@@ -2789,6 +2789,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
+    // The model's one window onto its widgets: it needs the adjustment to tell
+    // whether the user is at the top of the list when a rebuild lands, and the
+    // view to put them back there if they were (see `pin_to_top`).
+    message_list.attach_scroller(&message_scroller, &message_list_view);
     // Shown instead of the list while the folder on screen is empty and its
     // sync is still outstanding - see `refresh_message_loading_state`.
     // Without this, the empty list a folder switch eagerly paints (see
