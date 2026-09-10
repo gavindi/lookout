@@ -152,6 +152,12 @@ pub fn html_remote_content_scan(html: &str) -> RemoteContentScan {
             }
             context_start -= 1;
         }
+        // The byte-bounded walk above can stop mid-way through a multi-byte
+        // UTF-8 character; snap forward to the next char boundary so the
+        // slice below never panics.
+        while !html.is_char_boundary(context_start) {
+            context_start += 1;
+        }
         let tight: String = html[context_start..rel].chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
         let has_href = tight.contains("href=");
         let is_link_tag = tight.contains("<link");
@@ -275,5 +281,17 @@ mod tests {
         assert!(scan.has_images);
         assert!(scan.has_other);
         assert!(scan.any());
+    }
+
+    #[test]
+    fn scan_handles_multibyte_chars_near_context_window_boundary() {
+        // The context walk-back is bounded to 48 bytes; a multi-byte char
+        // (en dash, 3 bytes) landing right at that boundary used to slice
+        // the string mid-character and panic. Sweep padding lengths so the
+        // dash lands at every possible offset within the window.
+        for padding in 0..60 {
+            let html = format!("<p>{}\u{2013}src=\"http://example.com/a.png\">", "a".repeat(padding));
+            let _ = html_remote_content_scan(&html);
+        }
     }
 }

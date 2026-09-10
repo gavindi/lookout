@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.142" date="2026-09-10">
+      <description>
+        <p>Fixed a crash that could happen when opening certain messages containing an en dash or other multi-byte character near a link in the message body.</p>
+      </description>
+    </release>
     <release version="0.9.141" date="2026-09-09">
       <description>
         <p>The mail list now stays at the top when new messages arrive while you are already there, so new mail is the first thing you see instead of landing off the top of the view. Scrolled further down, the list keeps your place exactly as before.</p>
