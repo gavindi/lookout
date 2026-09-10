@@ -262,16 +262,23 @@ fn flush_paragraph(out: &mut String, lines: &mut Vec<String>) {
 /// start a new paragraph and single newlines become `<br>`s. The plain-text
 /// prefill is the source for the HTML mode too (the original message's HTML
 /// is deliberately not reused for quoting), so both modes start from the
-/// same content.
+/// same content. Leading blank lines (before any real content) become
+/// explicit empty paragraphs rather than being dropped, since the reply and
+/// forward prefills lead with blank lines to leave room for the user to type
+/// above the quoted content - CSS margins between `<p>` tags already cover
+/// spacing *between* paragraphs, but there's nothing to put a margin next to
+/// at the very top of the document.
 fn text_to_html(text: &str) -> String {
     let mut out = String::new();
     let mut para_lines: Vec<String> = Vec::new();
     let mut quote_lines: Vec<String> = Vec::new();
+    let mut seen_content = false;
 
     for raw in text.lines() {
         if let Some(rest) = raw.strip_prefix('>') {
             flush_paragraph(&mut out, &mut para_lines);
             quote_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            seen_content = true;
             continue;
         }
         if !quote_lines.is_empty() {
@@ -282,10 +289,16 @@ fn text_to_html(text: &str) -> String {
         if trimmed.len() >= 3 && trimmed.chars().all(|c| matches!(c, '-' | '_' | '*')) {
             flush_paragraph(&mut out, &mut para_lines);
             out.push_str("<hr>");
+            seen_content = true;
         } else if trimmed.is_empty() {
-            flush_paragraph(&mut out, &mut para_lines);
+            if seen_content {
+                flush_paragraph(&mut out, &mut para_lines);
+            } else {
+                out.push_str("<p><br></p>");
+            }
         } else {
             para_lines.push(raw.to_string());
+            seen_content = true;
         }
     }
     if !quote_lines.is_empty() {
@@ -1159,7 +1172,13 @@ pub fn build_compose_view(
         .bottom_margin(8)
         .build();
     if let Some(body) = &prefill.body {
-        body_view.buffer().set_text(body);
+        let buffer = body_view.buffer();
+        buffer.set_text(body);
+        // `set_text` leaves the "insert" mark wherever GtkTextBuffer's mark
+        // gravity happens to land after a full delete+insert - not reliably
+        // the top. Reply/forward bodies lead with blank lines so the user
+        // can type above the quote, so the caret needs to start there too.
+        buffer.place_cursor(&buffer.start_iter());
     }
     let text_scroller = gtk::ScrolledWindow::builder().child(&body_view).hexpand(true).vexpand(true).build();
 
@@ -1179,6 +1198,22 @@ pub fn build_compose_view(
     // same `insertHTML`-at-end script path the paste handler and the
     // signature menu use - the rich content must not round-trip through
     // `text_to_html`, which would flatten its formatting).
+    //
+    // Reply/forward prefills lead with blank lines so the user can type
+    // above the quoted/forwarded content - `text_to_html` now renders those
+    // as leading empty paragraphs, and once the document has loaded the
+    // caret needs to be parked there too (WebKit doesn't otherwise put it
+    // anywhere in particular). That has to happen *after* any signature
+    // append below, not race it.
+    let has_prefill_body = prefill.body.as_deref().is_some_and(|b| !b.trim().is_empty());
+    let caret_to_top_script = r#"(function () {
+                var range = document.createRange();
+                range.selectNodeContents(document.body);
+                range.collapse(true);
+                var sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+            })()"#;
     if let Some(signature) = default_signature {
         let signature_text = signature.text.trim();
         if !signature_text.is_empty() {
@@ -1190,6 +1225,7 @@ pub fn build_compose_view(
         }
         let signature_html = signature.html;
         let html_json = serde_json::to_string(&signature_html).unwrap_or_else(|_| "\"\"".to_string());
+        let caret_suffix = if has_prefill_body { format!(";\n{caret_to_top_script}") } else { String::new() };
         let script = format!(
             r#"(function () {{
                 var range = document.createRange();
@@ -1199,7 +1235,7 @@ pub fn build_compose_view(
                 sel.removeAllRanges();
                 sel.addRange(range);
                 document.execCommand('insertHTML', false, {html_json});
-            }})()"#
+            }})(){caret_suffix}"#
         );
         let appended = Rc::new(Cell::new(false));
         let appended_for_handler = appended.clone();
@@ -1210,6 +1246,21 @@ pub fn build_compose_view(
                 return;
             }
             appended_for_handler.set(true);
+            let view = view.clone();
+            let script = script.clone();
+            glib::spawn_future_local(async move {
+                let _ = view.evaluate_javascript_future(&script, None, None).await;
+            });
+        });
+    } else if has_prefill_body {
+        let script = caret_to_top_script.to_string();
+        let placed = Rc::new(Cell::new(false));
+        let placed_for_handler = placed.clone();
+        rich_web_view.connect_load_changed(move |view, event| {
+            if event != webkit::LoadEvent::Finished || placed_for_handler.get() {
+                return;
+            }
+            placed_for_handler.set(true);
             let view = view.clone();
             let script = script.clone();
             glib::spawn_future_local(async move {
@@ -1938,7 +1989,7 @@ mod tests {
     #[test]
     fn text_to_html_empty_and_blank() {
         assert_eq!(text_to_html(""), "");
-        assert_eq!(text_to_html("\n\n"), "");
+        assert_eq!(text_to_html("\n\n"), "<p><br></p><p><br></p>");
     }
 
     #[test]
