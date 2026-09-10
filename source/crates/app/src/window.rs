@@ -18217,7 +18217,10 @@ mod tests {
 
         let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
         assert!(folder_row(&model, "acc_a:Projects").is_expanded(), "an expanded top-level folder survives a rebuild");
-        assert!(folder_row(&model, "acc_a:Projects/Active").is_expanded(), "an expanded 2nd-tier subfolder survives a rebuild");
+        assert!(
+            folder_row(&model, "acc_a:Projects/Active").is_expanded(),
+            "an expanded 2nd-tier subfolder survives a rebuild"
+        );
         folder_row(&model, "acc_a:Projects/Active/Team"); // still materialized under its expanded parent
 
         // --- (5) A fresh session (restart) re-seeds the first build from the
@@ -18281,8 +18284,16 @@ mod tests {
         // now has a live - but still accountless - model to capture from.
         state.borrow_mut().folder_tree = None;
         rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
-        assert_eq!(state.borrow().expanded_folders, remembered_folders, "an accountless pane must not wipe the expanded-folder memory");
-        assert_eq!(state.borrow().collapsed_groups, remembered_groups, "an accountless pane must not wipe the collapsed-group memory");
+        assert_eq!(
+            state.borrow().expanded_folders,
+            remembered_folders,
+            "an accountless pane must not wipe the expanded-folder memory"
+        );
+        assert_eq!(
+            state.borrow().collapsed_groups,
+            remembered_groups,
+            "an accountless pane must not wipe the collapsed-group memory"
+        );
 
         // The accounts connect and their folders land: the memory the empty
         // builds preserved is what the pane opens with.
@@ -18302,8 +18313,14 @@ mod tests {
         rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
 
         let model = folder_selection.model().and_downcast::<gtk::TreeListModel>().expect("tree model");
-        assert!(!account_row(&model, &acc_b).is_expanded(), "the remembered account-group collapse applies once the account connects");
-        assert!(folder_row(&model, "acc_a:Projects").is_expanded(), "the remembered subfolder expansion applies once the folders land");
+        assert!(
+            !account_row(&model, &acc_b).is_expanded(),
+            "the remembered account-group collapse applies once the account connects"
+        );
+        assert!(
+            folder_row(&model, "acc_a:Projects").is_expanded(),
+            "the remembered subfolder expansion applies once the folders land"
+        );
         assert!(folder_row(&model, "acc_a:Projects/Active").is_expanded(), "and so does the remembered 2nd-tier one");
 
         // Collapsing is still recorded: the memory only ignores rows the pane

@@ -204,6 +204,18 @@ pub struct MicrosoftOAuth {
     account_id: AccountId,
     cached_exchange: Mutex<Option<(String, Instant)>>,
     cached_graph: Mutex<Option<(String, Instant)>>,
+    // Serializes `access_token`/`graph_access_token` per audience so two
+    // callers racing on an expired token (the mail session's primary
+    // connection and its dedicated IDLE connection can now both reconnect
+    // around the same time) don't both miss the cache and both fire a
+    // concurrent refresh-token exchange - the second one Microsoft would
+    // reject via rotation, or which would pop a duplicate browser window if
+    // the refresh token was already gone. A distinct lock from the cache
+    // storage above: it's held across the whole check-then-refresh sequence
+    // (including any network round trip), whereas the storage mutex is only
+    // ever held for a quick, synchronous read/write.
+    refresh_exchange: tokio::sync::Mutex<()>,
+    refresh_graph: tokio::sync::Mutex<()>,
 }
 
 impl MicrosoftOAuth {
@@ -212,6 +224,8 @@ impl MicrosoftOAuth {
             account_id,
             cached_exchange: Mutex::new(None),
             cached_graph: Mutex::new(None),
+            refresh_exchange: tokio::sync::Mutex::new(()),
+            refresh_graph: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -222,6 +236,13 @@ impl MicrosoftOAuth {
         }
     }
 
+    fn refresh_lock(&self, audience: TokenAudience) -> &tokio::sync::Mutex<()> {
+        match audience {
+            TokenAudience::Exchange => &self.refresh_exchange,
+            TokenAudience::Graph => &self.refresh_graph,
+        }
+    }
+
     /// Returns a fresh Exchange-audience access token (for IMAP/SMTP),
     /// cached until ~a minute before expiry. Behavior is unchanged from
     /// before Graph support existed: a rejected stored refresh token is
@@ -229,6 +250,7 @@ impl MicrosoftOAuth {
     /// `EXCHANGE_SCOPES` alone - this path never asks for the Graph
     /// permission on its own.
     pub async fn access_token(&self) -> Result<String, String> {
+        let _serialize = self.refresh_lock(TokenAudience::Exchange).lock().await;
         if let Some((token, expires_at)) = self.cache_slot(TokenAudience::Exchange).lock().unwrap().clone() {
             if Instant::now() < expires_at {
                 return Ok(token);
@@ -257,6 +279,7 @@ impl MicrosoftOAuth {
     /// from a background pin action, which must not surprise-launch a
     /// browser.
     pub async fn graph_access_token(&self) -> Result<String, GraphAuthError> {
+        let _serialize = self.refresh_lock(TokenAudience::Graph).lock().await;
         if let Some((token, expires_at)) = self.cache_slot(TokenAudience::Graph).lock().unwrap().clone() {
             if Instant::now() < expires_at {
                 return Ok(token);

@@ -1330,6 +1330,10 @@ mod tests {
 
         glib::log_remove_handler(Some("Gtk"), handler_id);
         assert_eq!(row.title(), "Default for replies & forwards", "the markup escape must render back to a plain ampersand");
-        assert!(warnings.lock().unwrap().is_empty(), "setting the title must not trip a markup-parsing Gtk-WARNING: {:?}", warnings.lock().unwrap());
+        assert!(
+            warnings.lock().unwrap().is_empty(),
+            "setting the title must not trip a markup-parsing Gtk-WARNING: {:?}",
+            warnings.lock().unwrap()
+        );
     }
 }

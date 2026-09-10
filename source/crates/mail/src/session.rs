@@ -613,14 +613,41 @@ where
     tokio::task::spawn_blocking(move || (*cache).as_ref().map(op)).await.ok().flatten()
 }
 
-/// True when neither the background command queue nor the interactive one
-/// holds anything, so background work (a STATUS drain, a prefetch batch) may
-/// take another round trip. Background work checks this before every round
-/// trip: a user command arriving mid-flight still has to wait out the one
-/// round trip already in hand (the connection is one-command-at-a-time, so
-/// an in-flight command can't be interrupted), but never more than that.
-fn no_commands_pending(commands: &async_channel::Receiver<AccountCommand>, interactive_commands: &async_channel::Receiver<AccountCommand>) -> bool {
-    commands.is_empty() && interactive_commands.is_empty()
+/// True when neither the background command queue, the interactive one, nor
+/// a pending push from the dedicated IDLE connection (see
+/// `run_idle_supervisor`) holds anything, so background work (a STATUS
+/// drain, a prefetch batch) may take another round trip. Background work
+/// checks this before every round trip: a user command - or a real
+/// server-observed change reported by the IDLE connection - arriving
+/// mid-flight still has to wait out the one round trip already in hand (the
+/// connection is one-command-at-a-time, so an in-flight command can't be
+/// interrupted), but never more than that.
+fn no_work_pending(
+    commands: &async_channel::Receiver<AccountCommand>,
+    interactive_commands: &async_channel::Receiver<AccountCommand>,
+    idle_notify: &async_channel::Receiver<MailboxId>,
+) -> bool {
+    commands.is_empty() && interactive_commands.is_empty() && idle_notify.is_empty()
+}
+
+/// What to do with a mailbox the dedicated IDLE connection just reported as
+/// changed. Mirrors the STATUS drain's own on-screen/off-screen split
+/// (`relist_folders`'s caller and the STATUS drain in `connect_and_run`): the
+/// mailbox the user is actually looking at is resynced immediately, while any
+/// other mailbox is just flagged so a later switch to it doesn't serve a
+/// stale cache.
+#[derive(Debug, PartialEq, Eq)]
+enum PushOutcome {
+    ResyncNow,
+    MarkDirty,
+}
+
+fn idle_push_outcome(pushed: &MailboxId, current: &MailboxId) -> PushOutcome {
+    if pushed == current {
+        PushOutcome::ResyncNow
+    } else {
+        PushOutcome::MarkDirty
+    }
 }
 
 /// Runs one account's IMAP connection lifecycle on the calling task (spawn
@@ -670,7 +697,12 @@ pub async fn run_account_session(
     .await
     {
         if !messages.is_empty() {
-            let _ = events.send(AccountEvent::MessagesUpdated { mailbox: inbox_id, messages }).await;
+            let _ = events
+                .send(AccountEvent::MessagesUpdated {
+                    mailbox: inbox_id.clone(),
+                    messages,
+                })
+                .await;
         }
     }
 
@@ -715,11 +747,39 @@ pub async fn run_account_session(
     // right after connecting.
     let mut carried_command: Option<AccountCommand> = None;
 
+    // The dedicated IDLE-only connection's coordination channels (see
+    // `run_idle_supervisor`/`run_idle_connection` and the design note above
+    // `no_work_pending`). `mailbox_tx` is kept alive here, for the account's
+    // whole lifetime, so `connect_and_run` can tell the IDLE connection which
+    // mailbox to watch on every folder switch. `idle_notify_tx` is likewise
+    // kept alive here (in addition to the clone handed to the supervisor
+    // task) so the channel never closes for the account's lifetime even if
+    // the supervisor exits for good (no IDLE capability) - see
+    // `no_work_pending` and the `Wake::IdlePush` select arm in
+    // `connect_and_run` for why a closed `idle_notify` must never be
+    // mistaken for a shutdown signal.
+    let (mailbox_tx, mailbox_rx) = tokio::sync::watch::channel(inbox_id.clone());
+    let (idle_notify_tx, idle_notify_rx) = async_channel::unbounded::<MailboxId>();
+    let mut idle_task = tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_rx, idle_notify_tx.clone()));
+
     loop {
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
-        match connect_and_run(&config, credentials.as_ref(), &commands, &interactive_commands, &events, &cache, carried_command.take()).await {
+        match connect_and_run(
+            &config,
+            credentials.as_ref(),
+            &commands,
+            &interactive_commands,
+            &events,
+            &cache,
+            &mailbox_tx,
+            &idle_notify_rx,
+            carried_command.take(),
+        )
+        .await
+        {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                idle_task.abort();
                 return;
             }
             Err(e) => {
@@ -734,6 +794,14 @@ pub async fn run_account_session(
                         retryable: true,
                     }))
                     .await;
+                // A panic only kills the supervisor's own task (tokio
+                // isolates panics per task); since the primary loop never
+                // otherwise awaits it, respawn here so a silently-dead IDLE
+                // connection doesn't linger unnoticed for the rest of the
+                // session.
+                if idle_task.is_finished() {
+                    idle_task = tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_tx.subscribe(), idle_notify_tx.clone()));
+                }
             }
         }
 
@@ -755,6 +823,7 @@ pub async fn run_account_session(
                 match cmd {
                     Ok(AccountCommand::Shutdown) => {
                         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                        idle_task.abort();
                         return;
                     }
                     Ok(other) => carried_command = Some(other),
@@ -775,6 +844,10 @@ enum ShutdownReason {
     Requested,
 }
 
+// The two dedicated-IDLE-connection parameters (`mailbox_tx`/`idle_notify`)
+// push this over clippy's default limit; each is single-purpose plumbing
+// shared with `run_idle_supervisor`, not a case for a bundling struct.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     config: &AccountConfig,
     credentials: &dyn CredentialProvider,
@@ -782,10 +855,24 @@ async fn connect_and_run(
     interactive_commands: &async_channel::Receiver<AccountCommand>,
     events: &async_channel::Sender<AccountEvent>,
     cache: &CacheHandle,
+    mailbox_tx: &tokio::sync::watch::Sender<MailboxId>,
+    idle_notify: &async_channel::Receiver<MailboxId>,
     mut carried_command: Option<AccountCommand>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
-    let (mut session, has_move, condstore, has_list_status, qresync, has_uidplus) = login(config, credential).await?;
+    let (mut session, caps) = login(config, credential).await?;
+    // `has_idle` isn't consulted here - the primary connection's own IDLE
+    // wait is unconditional, as before. It's only used by the dedicated
+    // IDLE-only connection's own `login()` (see `run_idle_supervisor`) to
+    // decide whether that second connection is worth attempting at all.
+    let ServerCapabilities {
+        has_move,
+        condstore,
+        has_list_status,
+        qresync,
+        has_uidplus,
+        has_idle: _,
+    } = caps;
 
     let account_id = config.account_id.clone();
     let (mut folders, list_counts_supplied) = list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?;
@@ -898,15 +985,22 @@ async fn connect_and_run(
     enum Wake {
         Idle(std::result::Result<async_imap::extensions::idle::IdleResponse, async_imap::error::Error>),
         Command(AccountCommand),
+        /// The dedicated IDLE-only connection (`run_idle_supervisor`) saw a
+        /// change on the mailbox it's watching. Carries just the mailbox id -
+        /// the two connections share no protocol state, so this session
+        /// re-derives everything itself via its own SELECT/FETCH rather than
+        /// trying to hand over parsed IMAP data from the other connection.
+        IdlePush(MailboxId),
         ChannelClosed,
     }
 
     loop {
-        // Take a command that's *already* queued without entering IDLE first.
-        // Establishing an IDLE and tearing it down again costs two round
-        // trips, and the previous shape paid them both before the wake select
-        // could even look at the queue - so every command that arrived while
-        // the session was busy with background work (a prefetch batch, a
+        // Take a command - or a push from the dedicated IDLE connection -
+        // that's *already* queued without entering IDLE first. Establishing
+        // an IDLE and tearing it down again costs two round trips, and the
+        // previous shape paid them both before the wake select could even
+        // look at the queue - so every command that arrived while the
+        // session was busy with background work (a prefetch batch, a
         // folder-count STATUS) waited on a SELECT plus those two round trips
         // purely to be handed something already in hand. That is most of what
         // made a folder click land a beat late while counts were filling in.
@@ -914,7 +1008,10 @@ async fn connect_and_run(
         // (see `run_account_session`) takes priority over the queue - it's
         // already the oldest thing waiting to be answered. The interactive
         // channel is checked first: user-facing fetches are never made to
-        // wait behind queued background work.
+        // wait behind queued background work. A pending IDLE-connection push
+        // is checked next, ahead of the background command queue: a real
+        // server-observed change outranks queued busywork (a sync, a move, a
+        // search), but never outranks an explicit user click already queued.
         let wake = match carried_command.take() {
             Some(cmd) => Wake::Command(cmd),
             None => match interactive_commands.try_recv() {
@@ -922,97 +1019,119 @@ async fn connect_and_run(
                 // A closed interactive channel just means no interactive
                 // commands will ever arrive again; the background channel
                 // still drives the session exactly as before.
-                Err(async_channel::TryRecvError::Closed) | Err(async_channel::TryRecvError::Empty) => match commands.try_recv() {
-                    Ok(cmd) => Wake::Command(cmd),
-                    Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
-                    Err(async_channel::TryRecvError::Empty) => {
-                        let idle_entry_started = std::time::Instant::now();
-                        let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
+                Err(async_channel::TryRecvError::Closed) | Err(async_channel::TryRecvError::Empty) => match idle_notify.try_recv() {
+                    Ok(mailbox_id) => Wake::IdlePush(mailbox_id),
+                    // A closed `idle_notify` just means the dedicated IDLE
+                    // connection isn't running (no IDLE capability, still
+                    // reconnecting, or permanently unavailable) - the
+                    // primary's own IDLE wait below is unaffected.
+                    Err(async_channel::TryRecvError::Closed) | Err(async_channel::TryRecvError::Empty) => match commands.try_recv() {
+                        Ok(cmd) => Wake::Command(cmd),
+                        Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
+                        Err(async_channel::TryRecvError::Empty) => {
+                            let idle_entry_started = std::time::Instant::now();
+                            let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
-                        // A cache-served folder switch (or an interrupted prefetch) can
-                        // leave the session SELECTed on a different folder than the one
-                        // the user is viewing. IDLE only reports changes to the
-                        // currently-selected folder, so bring the session back in line
-                        // before the wait. This is a cheap round trip (no FETCH) and is
-                        // skipped whenever the session already matches. Only reached on
-                        // the way *into* IDLE, so a queued command never pays for it -
-                        // its own handler selects whatever folder it needs.
-                        if session_selected != current_mailbox_id {
-                            let meta = session.select(&current_mailbox_name).await?;
-                            session_selected = current_mailbox_id.clone();
-                            // Keep the folder list's `uidvalidity`/`uidnext` fresh so a
-                            // sync that skips its SELECT (the session is already on the
-                            // folder, see `sync_mailbox`) still keys the cache correctly
-                            // instead of falling back to a stale pre-connect value.
-                            if let Some(f) = folders.iter_mut().find(|f| f.id == current_mailbox_id) {
-                                if let Some(v) = meta.uid_validity {
-                                    f.uidvalidity = UidValidity(v);
-                                }
-                                if let Some(next) = meta.uid_next {
-                                    f.uidnext = next;
-                                }
-                                if let Some(modseq) = meta.highest_modseq {
-                                    f.highest_modseq = Some(modseq);
+                            // A cache-served folder switch (or an interrupted prefetch) can
+                            // leave the session SELECTed on a different folder than the one
+                            // the user is viewing. IDLE only reports changes to the
+                            // currently-selected folder, so bring the session back in line
+                            // before the wait. This is a cheap round trip (no FETCH) and is
+                            // skipped whenever the session already matches. Only reached on
+                            // the way *into* IDLE, so a queued command never pays for it -
+                            // its own handler selects whatever folder it needs.
+                            if session_selected != current_mailbox_id {
+                                let meta = session.select(&current_mailbox_name).await?;
+                                session_selected = current_mailbox_id.clone();
+                                // Keep the folder list's `uidvalidity`/`uidnext` fresh so a
+                                // sync that skips its SELECT (the session is already on the
+                                // folder, see `sync_mailbox`) still keys the cache correctly
+                                // instead of falling back to a stale pre-connect value.
+                                if let Some(f) = folders.iter_mut().find(|f| f.id == current_mailbox_id) {
+                                    if let Some(v) = meta.uid_validity {
+                                        f.uidvalidity = UidValidity(v);
+                                    }
+                                    if let Some(next) = meta.uid_next {
+                                        f.uidnext = next;
+                                    }
+                                    if let Some(modseq) = meta.highest_modseq {
+                                        f.highest_modseq = Some(modseq);
+                                    }
                                 }
                             }
+
+                            let mut handle = session.idle();
+                            handle.init().await?;
+                            // Aggressive prefetch paces the session with a short IDLE
+                            // slice so batches keep flowing on a quiet session (a
+                            // timeout wake runs the next prefetch batch), and the
+                            // short slice also keeps the periodic re-scan tick alive
+                            // once a pass is done. Otherwise the wait is the usual
+                            // keepalive slice.
+                            let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
+                            let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
+
+                            // Race the IDLE wait against the next command so an on-demand
+                            // request (open a message, switch folders, ...) doesn't wait for
+                            // IDLE_SLICE to elapse. Both channels race the wait: the
+                            // interactive one exists so a user-facing fetch isn't queued
+                            // behind background commands (and vice versa). If a command
+                            // branch wins, `wait_fut` is dropped along with `stop_source`;
+                            // dropping a `StopSource` cancels its associated wait
+                            // immediately (see `stop_token::StopSource`'s docs) - but since
+                            // we're also dropping `wait_fut` itself here, we don't even need
+                            // to observe that cancellation, we just move straight on to
+                            // `handle.done()` below to send IMAP's `DONE` and reclaim the
+                            // session.
+                            let wake = tokio::select! {
+                                r = wait_fut => Wake::Idle(r),
+                                c = interactive_commands.recv() => match c {
+                                    Ok(cmd) => Wake::Command(cmd),
+                                    Err(_) => Wake::ChannelClosed,
+                                },
+                                m = idle_notify.recv() => match m {
+                                    Ok(mailbox_id) => Wake::IdlePush(mailbox_id),
+                                    // `idle_notify` closing mid-race (the spare
+                                    // sender `run_account_session` holds is only
+                                    // ever dropped on account shutdown, alongside
+                                    // `commands`/`interactive_commands`, which
+                                    // will themselves produce `ChannelClosed` on
+                                    // the very next iteration) is treated as a
+                                    // no-op rather than tearing the session down
+                                    // over an unrelated channel - `continue`
+                                    // isn't safe here, since it would skip the
+                                    // `handle.done()` teardown below and leave
+                                    // the connection still mid-IDLE.
+                                    Err(_) => Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)),
+                                },
+                                c = commands.recv() => match c {
+                                    Ok(cmd) => Wake::Command(cmd),
+                                    Err(_) => Wake::ChannelClosed,
+                                },
+                            };
+
+                            // How long a command that arrived while we were entering
+                            // IDLE (the SELECT-if-needed above, plus `handle.init()`'s
+                            // own round trip) had to wait before it was even noticed -
+                            // independent of any background prefetch batch, which has
+                            // its own elapsed logging. Not logged for an `Idle`/
+                            // `ChannelClosed` wake since nothing was waiting on those.
+                            if let Wake::Command(_) = &wake {
+                                tracing::debug!(elapsed_ms = idle_entry_started.elapsed().as_millis(), "idle-entry: command noticed after SELECT+IDLE-init");
+                            }
+
+                            // Emit cached messages for instant display the instant a folder
+                            // switch arrives, *before* the IDLE teardown (handle.done().await)
+                            // so the UI paints from disk while we wait for the network round-trip.
+                            if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
+                                emit_cached_messages(cache, mailbox_id, events).await;
+                            }
+
+                            drop(stop_source);
+                            session = handle.done().await?;
+                            wake
                         }
-
-                        let mut handle = session.idle();
-                        handle.init().await?;
-                        // Aggressive prefetch paces the session with a short IDLE
-                        // slice so batches keep flowing on a quiet session (a
-                        // timeout wake runs the next prefetch batch), and the
-                        // short slice also keeps the periodic re-scan tick alive
-                        // once a pass is done. Otherwise the wait is the usual
-                        // keepalive slice.
-                        let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
-                        let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
-
-                        // Race the IDLE wait against the next command so an on-demand
-                        // request (open a message, switch folders, ...) doesn't wait for
-                        // IDLE_SLICE to elapse. Both channels race the wait: the
-                        // interactive one exists so a user-facing fetch isn't queued
-                        // behind background commands (and vice versa). If a command
-                        // branch wins, `wait_fut` is dropped along with `stop_source`;
-                        // dropping a `StopSource` cancels its associated wait
-                        // immediately (see `stop_token::StopSource`'s docs) - but since
-                        // we're also dropping `wait_fut` itself here, we don't even need
-                        // to observe that cancellation, we just move straight on to
-                        // `handle.done()` below to send IMAP's `DONE` and reclaim the
-                        // session.
-                        let wake = tokio::select! {
-                            r = wait_fut => Wake::Idle(r),
-                            c = interactive_commands.recv() => match c {
-                                Ok(cmd) => Wake::Command(cmd),
-                                Err(_) => Wake::ChannelClosed,
-                            },
-                            c = commands.recv() => match c {
-                                Ok(cmd) => Wake::Command(cmd),
-                                Err(_) => Wake::ChannelClosed,
-                            },
-                        };
-
-                        // How long a command that arrived while we were entering
-                        // IDLE (the SELECT-if-needed above, plus `handle.init()`'s
-                        // own round trip) had to wait before it was even noticed -
-                        // independent of any background prefetch batch, which has
-                        // its own elapsed logging. Not logged for an `Idle`/
-                        // `ChannelClosed` wake since nothing was waiting on those.
-                        if let Wake::Command(_) = &wake {
-                            tracing::debug!(elapsed_ms = idle_entry_started.elapsed().as_millis(), "idle-entry: command noticed after SELECT+IDLE-init");
-                        }
-
-                        // Emit cached messages for instant display the instant a folder
-                        // switch arrives, *before* the IDLE teardown (handle.done().await)
-                        // so the UI paints from disk while we wait for the network round-trip.
-                        if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
-                            emit_cached_messages(cache, mailbox_id, events).await;
-                        }
-
-                        drop(stop_source);
-                        session = handle.done().await?;
-                        wake
-                    }
+                    },
                 },
             },
         };
@@ -1049,6 +1168,30 @@ async fn connect_and_run(
                 session_selected = current_mailbox_id.clone();
             }
             Wake::Idle(Err(e)) => return Err(Error::Imap(e)),
+            Wake::IdlePush(mailbox_id) => match idle_push_outcome(&mailbox_id, &current_mailbox_id) {
+                PushOutcome::ResyncNow => {
+                    tracing::debug!(mailbox = %mailbox_id, "idle-push: resyncing currently-open mailbox");
+                    sync_mailbox(
+                        &mut session,
+                        &account_id,
+                        &current_mailbox_name,
+                        &current_mailbox_id,
+                        events,
+                        cache,
+                        &mut folders,
+                        interactive_commands,
+                        Some(&session_selected),
+                        condstore,
+                        qresync,
+                    )
+                    .await?;
+                    dirty_mailboxes.remove(&current_mailbox_id);
+                    session_selected = current_mailbox_id.clone();
+                }
+                PushOutcome::MarkDirty => {
+                    dirty_mailboxes.insert(mailbox_id);
+                }
+            },
             Wake::Command(cmd) => woke_on_command = Some(cmd),
             Wake::ChannelClosed => return Ok(ShutdownReason::Requested),
         }
@@ -1141,6 +1284,12 @@ async fn connect_and_run(
                     if let Some(path) = mailbox_id.0.strip_prefix(&format!("{}:", account_id.0)) {
                         current_mailbox_name = path.to_string();
                         current_mailbox_id = mailbox_id;
+                        // Tell the dedicated IDLE connection (if running)
+                        // which mailbox to watch now - see `run_idle_connection`.
+                        // `send_replace` never blocks and simply overwrites
+                        // the previous value; only the latest folder switch
+                        // matters.
+                        mailbox_tx.send_replace(current_mailbox_id.clone());
                         // If the cache already has envelope summaries for this
                         // mailbox, emit them and skip the full IMAP sync to
                         // avoid blocking the session for seconds on a network
@@ -2244,7 +2393,7 @@ async fn connect_and_run(
         if !counts_pending.is_empty() {
             let mut since_emit = 0usize;
             let mut dirty = false;
-            while no_commands_pending(commands, interactive_commands) {
+            while no_work_pending(commands, interactive_commands, idle_notify) {
                 let Some(mailbox_id) = counts_pending.pop_front() else { break };
                 // The folder may have vanished from a re-list between being
                 // queued and being drained; skip it rather than miscounting.
@@ -2331,7 +2480,7 @@ async fn connect_and_run(
                 // Check before starting any batch work (SELECT, envelope
                 // fetch, body fetch) so a rapid stream of user clicks
                 // never waits for even one IMAP round trip.
-                if !no_commands_pending(commands, interactive_commands) {
+                if !no_work_pending(commands, interactive_commands, idle_notify) {
                     continue;
                 }
 
@@ -2360,7 +2509,7 @@ async fn connect_and_run(
                 if !pf.envelopes_fetched {
                     // Check before SELECT to avoid blocking the session if a
                     // user command arrived during the previous body fetch.
-                    if !no_commands_pending(commands, interactive_commands) {
+                    if !no_work_pending(commands, interactive_commands, idle_notify) {
                         continue;
                     }
                     let folder_name = pf.current_folder_name.clone();
@@ -2445,7 +2594,7 @@ async fn connect_and_run(
                 // raise it.
                 if !pf.pending_uids.is_empty() {
                     // Check before starting the batch fetch.
-                    if !no_commands_pending(commands, interactive_commands) {
+                    if !no_work_pending(commands, interactive_commands, idle_notify) {
                         continue;
                     }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(prefetch_policy.batch_size)).collect();
@@ -2495,9 +2644,146 @@ async fn connect_and_run(
         // fetch or body fetches). Skip if a user command is pending — the
         // command handler will SELECT the folder it needs, and the top-of-loop
         // check re-selects the user's folder anyway.
-        if did_prefetch_work && no_commands_pending(commands, interactive_commands) {
+        if did_prefetch_work && no_work_pending(commands, interactive_commands, idle_notify) {
             session.select(&current_mailbox_name).await?;
             session_selected = current_mailbox_id.clone();
+        }
+    }
+}
+
+/// Backoff curve for the dedicated IDLE-only connection's own reconnect loop
+/// (`run_idle_supervisor`), independent of the primary connection's backoff.
+/// Same shape for the first few attempts - starts at 1s, doubles - but after
+/// `COOLDOWN_THRESHOLD` consecutive failures it stops doubling and settles
+/// into a long, infrequent probe instead of retrying forever at a short
+/// interval. This stands in for "fall back to single-connection behavior"
+/// when the second connection just isn't going to work (a provider's
+/// simultaneous-connection cap that isn't going away): cheap enough to be
+/// harmless if the server later allows it, rare enough not to be spammy if
+/// it never does. Never reset once it reaches the cooldown floor, matching
+/// `run_account_session`'s own backoff, which likewise only ratchets up and
+/// plateaus rather than resetting after a successful run.
+fn next_idle_probe_delay(consecutive_failures: u32) -> Duration {
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+    const COOLDOWN_THRESHOLD: u32 = 5;
+    const COOLDOWN: Duration = Duration::from_secs(30 * 60);
+    if consecutive_failures >= COOLDOWN_THRESHOLD {
+        return COOLDOWN;
+    }
+    let secs = 1u64.checked_shl(consecutive_failures).unwrap_or(u64::MAX);
+    std::cmp::min(Duration::from_secs(secs), MAX_BACKOFF)
+}
+
+/// How one attempt of the dedicated IDLE-only connection ended.
+enum IdleConnectionOutcome {
+    /// The server doesn't advertise IDLE. Capabilities don't change
+    /// mid-lifetime, so `run_idle_supervisor` stops retrying permanently -
+    /// the primary connection's own IDLE wait remains the sole mechanism for
+    /// this account, exactly as before this feature existed.
+    NoIdleCapability,
+}
+
+/// Owns a second IMAP connection whose only job is watching whatever mailbox
+/// the user currently has open and reporting changes to `idle_notify` - see
+/// the module-level design note above `no_work_pending`. Never touches the
+/// cache, the folder list, or CONDSTORE/QRESYNC bookkeeping, and never issues
+/// `FETCH`/`SEARCH`/`STORE`; the primary connection (`connect_and_run`)
+/// re-derives everything itself once notified. Runs its own reconnect loop
+/// independent of the primary's (`run_account_session`'s outer loop) - the
+/// two connections' failure causes are uncorrelated in practice, and neither
+/// needs the other to be healthy: see `run_idle_connection`'s doc comment.
+async fn run_idle_supervisor(
+    config: AccountConfig,
+    credentials: std::sync::Arc<dyn CredentialProvider>,
+    mut mailbox_rx: tokio::sync::watch::Receiver<MailboxId>,
+    idle_notify: async_channel::Sender<MailboxId>,
+) {
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        match run_idle_connection(&config, credentials.as_ref(), &mut mailbox_rx, &idle_notify).await {
+            Ok(IdleConnectionOutcome::NoIdleCapability) => {
+                tracing::warn!(account = %config.account_id, "server doesn't advertise IDLE; dedicated IDLE connection disabled for this account");
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(account = %config.account_id, error = %e, consecutive_failures, "dedicated IDLE connection error, will retry");
+            }
+        }
+        consecutive_failures += 1;
+        tokio::time::sleep(next_idle_probe_delay(consecutive_failures)).await;
+    }
+}
+
+/// One connection attempt's lifetime for the dedicated IDLE-only connection.
+/// Logs in independently of the primary connection (same `login()`, same
+/// credentials - a stale/expired token is refreshed the same way the primary
+/// would) and then loops: SELECT whichever mailbox `mailbox_rx` currently
+/// names (re-SELECTing whenever it changes), IDLE, and on a real change push
+/// that mailbox id to `idle_notify`. Returns only on error, or once at
+/// startup if the server lacks IDLE entirely.
+///
+/// This needs no cache handle and no knowledge of the account's folder list:
+/// unlike the primary connection, it never resolves a `MailboxId` against
+/// `folders` to find a display name, since the folder path is already
+/// embedded in the `MailboxId` string itself (`<account_id>:<folder path>`).
+async fn run_idle_connection(
+    config: &AccountConfig,
+    credentials: &dyn CredentialProvider,
+    mailbox_rx: &mut tokio::sync::watch::Receiver<MailboxId>,
+    idle_notify: &async_channel::Sender<MailboxId>,
+) -> Result<IdleConnectionOutcome> {
+    let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
+    let (mut session, caps) = login(config, credential).await?;
+    if !caps.has_idle {
+        return Ok(IdleConnectionOutcome::NoIdleCapability);
+    }
+
+    let prefix = format!("{}:", config.account_id.0);
+    let mut selected: Option<MailboxId> = None;
+
+    loop {
+        let watched = mailbox_rx.borrow_and_update().clone();
+        let Some(path) = watched.0.strip_prefix(&prefix) else {
+            // Can't happen in practice - every `MailboxId` in this codebase
+            // is synthesized via `MailboxId::new(account_id, path)` - but if
+            // it ever did, there's nothing sane to SELECT; wait for the next
+            // change rather than erroring the whole connection out over it.
+            if mailbox_rx.changed().await.is_err() {
+                return Err(Error::LoginFailed("mailbox watch channel closed".to_string()));
+            }
+            continue;
+        };
+        if selected.as_ref() != Some(&watched) {
+            session.select(path).await?;
+            selected = Some(watched.clone());
+        }
+
+        let mut handle = session.idle();
+        handle.init().await?;
+        let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
+        // A mailbox switch mid-wait re-selects the new target on the next
+        // loop iteration; dropping `wait_fut`/`stop_source` (via `select!`'s
+        // implicit drop of the losing branch) cancels the IDLE wait
+        // immediately, same as the primary connection's own race.
+        let idle_result = tokio::select! {
+            r = wait_fut => Some(r),
+            changed = mailbox_rx.changed() => {
+                if changed.is_err() {
+                    return Err(Error::LoginFailed("mailbox watch channel closed".to_string()));
+                }
+                None
+            }
+        };
+        drop(stop_source);
+        session = handle.done().await?;
+
+        match idle_result {
+            None => {}
+            Some(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
+            Some(Ok(_)) => {
+                let _ = idle_notify.send(watched.clone()).await;
+            }
+            Some(Err(e)) => return Err(Error::Imap(e)),
         }
     }
 }
@@ -2777,7 +3063,23 @@ async fn delete_draft(session: &mut Session<SessionStream>, folders: &[Mailbox],
     purge_by_message_id(session, message_id, has_uidplus).await
 }
 
-async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, bool, bool, bool, bool, bool)> {
+/// Server capabilities detected once after login and cached for the
+/// connection's whole lifetime (see `login`'s comment on why these are never
+/// re-queried mid-session).
+struct ServerCapabilities {
+    has_move: bool,
+    condstore: bool,
+    has_list_status: bool,
+    qresync: bool,
+    has_uidplus: bool,
+    /// RFC 2177 IDLE. Gates both the primary connection's own IDLE wait (a
+    /// server lacking it falls back to a plain timed sleep) and whether the
+    /// dedicated IDLE-only connection (`run_idle_supervisor`) is worth
+    /// attempting at all.
+    has_idle: bool,
+}
+
+async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {
     let stream = connect_tls(&config.imap.host, config.imap.port).await?;
     tracing::debug!("login: creating client, reading greeting");
     let mut client = async_imap::Client::new(stream);
@@ -2807,7 +3109,8 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     // to (documented as "harmless" only because nothing else in this crate
     // sets `\Deleted` outside the uids it means to remove).
     let has_uidplus = capabilities.has_str("UIDPLUS");
-    tracing::debug!(has_move, has_list_status, has_uidplus, "cached server capabilities after login");
+    let has_idle = capabilities.has_str("IDLE");
+    tracing::debug!(has_move, has_list_status, has_uidplus, has_idle, "cached server capabilities after login");
 
     // CONDSTORE (RFC 7162): enables the per-mailbox `highest_modseq` bookkeeping
     // that incremental sync (`CHANGEDSINCE`) builds on. `ENABLE` applies to the
@@ -2873,7 +3176,17 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     } else {
         session.map_stream(|stream| Box::new(stream) as SessionStream)
     };
-    Ok((session, has_move, condstore, has_list_status, qresync, has_uidplus))
+    Ok((
+        session,
+        ServerCapabilities {
+            has_move,
+            condstore,
+            has_list_status,
+            qresync,
+            has_uidplus,
+            has_idle,
+        },
+    ))
 }
 
 /// Builds a `Mailbox` from one LIST response entry, minus the count fields
@@ -4814,5 +5127,61 @@ mod tests {
         assert_eq!(m.name, "Sent");
         assert_eq!(m.delimiter, '/');
         assert_eq!(m.role, MailboxRole::Sent);
+    }
+
+    #[test]
+    fn idle_probe_delay_doubles_then_settles_into_a_long_cooldown() {
+        assert_eq!(next_idle_probe_delay(0), Duration::from_secs(1));
+        assert_eq!(next_idle_probe_delay(1), Duration::from_secs(2));
+        assert_eq!(next_idle_probe_delay(2), Duration::from_secs(4));
+        assert_eq!(next_idle_probe_delay(3), Duration::from_secs(8));
+        assert_eq!(next_idle_probe_delay(4), Duration::from_secs(16));
+        // From here on it stops doubling and settles into the cooldown floor
+        // rather than retrying forever at a short interval - this is what
+        // stands in for "fall back to single-connection behavior" once a
+        // second connection just isn't going to work.
+        assert_eq!(next_idle_probe_delay(5), Duration::from_secs(30 * 60));
+        assert_eq!(next_idle_probe_delay(6), Duration::from_secs(30 * 60));
+        assert_eq!(next_idle_probe_delay(1000), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn idle_push_resyncs_the_open_mailbox_and_marks_others_dirty() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let work = MailboxId::new(&account, "Work");
+        assert_eq!(idle_push_outcome(&inbox, &inbox), PushOutcome::ResyncNow);
+        assert_eq!(idle_push_outcome(&work, &inbox), PushOutcome::MarkDirty);
+    }
+
+    #[test]
+    fn no_work_pending_is_false_if_any_channel_holds_something() {
+        let account = AccountId("acc".into());
+        let mailbox_id = MailboxId::new(&account, "INBOX");
+
+        // All empty: background work may proceed.
+        let (commands_tx, commands_rx) = async_channel::unbounded::<AccountCommand>();
+        let (interactive_tx, interactive_rx) = async_channel::unbounded::<AccountCommand>();
+        let (idle_tx, idle_rx) = async_channel::unbounded::<MailboxId>();
+        assert!(no_work_pending(&commands_rx, &interactive_rx, &idle_rx));
+
+        // A queued background command blocks it.
+        commands_tx.try_send(AccountCommand::Refresh).unwrap();
+        assert!(!no_work_pending(&commands_rx, &interactive_rx, &idle_rx));
+        commands_rx.try_recv().unwrap();
+
+        // A queued interactive command blocks it.
+        interactive_tx.try_send(AccountCommand::Refresh).unwrap();
+        assert!(!no_work_pending(&commands_rx, &interactive_rx, &idle_rx));
+        interactive_rx.try_recv().unwrap();
+
+        // A pending IDLE-connection push blocks it too - this is the whole
+        // point of the change: prefetch must yield to a real server-observed
+        // update just as readily as to a queued command.
+        idle_tx.try_send(mailbox_id).unwrap();
+        assert!(!no_work_pending(&commands_rx, &interactive_rx, &idle_rx));
+        idle_rx.try_recv().unwrap();
+
+        assert!(no_work_pending(&commands_rx, &interactive_rx, &idle_rx));
     }
 }

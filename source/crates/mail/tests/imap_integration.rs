@@ -381,14 +381,135 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
 
+/// Regression test for the dedicated IMAP IDLE connection
+/// (`run_idle_supervisor`/`run_idle_connection` in `session.rs`): new mail
+/// arriving on the mailbox the session has open must be noticed promptly
+/// even while the background body prefetch pass is mid-flight on another
+/// folder. Before that connection existed, the primary connection's IDLE
+/// wait and the prefetch's `UID FETCH` batches shared one connection, so a
+/// slow prefetch round trip already in flight could delay how soon the
+/// session even got back to a point where it could notice new mail - this
+/// seeds a folder with enough messages that prefetch's one-body-per-round-
+/// trip default (`PREFETCH_BATCH_SIZE`) takes a real, measurable amount of
+/// wall time, then asserts the new mail is noticed well before that pass
+/// could possibly have finished.
+#[tokio::test]
+#[ignore = "requires Docker; run explicitly with `cargo test -- --ignored`"]
+async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
+    std::env::set_var("LOOKOUT_INSECURE_TLS_FOR_TESTS", "1");
+
+    let container = GenericImage::new("greenmail/standalone", "2.1.11")
+        .with_wait_for(WaitFor::message_on_stdout("Starting GreenMail standalone"))
+        .with_exposed_port(3993.tcp())
+        .with_exposed_port(3465.tcp())
+        .with_exposed_port(3143.tcp())
+        .start()
+        .await
+        .expect("failed to start GreenMail container - is Docker running?");
+
+    let host = container.get_host().await.unwrap().to_string();
+    let imaps_port = container.get_host_port_ipv4(3993).await.unwrap();
+    let smtps_port = container.get_host_port_ipv4(3465).await.unwrap();
+    let imap_plain_port = container.get_host_port_ipv4(3143).await.unwrap();
+
+    // Seed a second folder with enough messages that the background prefetch
+    // pass (one body per round trip at the default, non-aggressive
+    // `PREFETCH_BATCH_SIZE`) takes a real amount of wall time to drain - the
+    // window this test needs new mail to cut through. Raw plain-TCP, same
+    // approach as `append_raw`: the session API has no way to seed messages
+    // ahead of the account actually connecting.
+    {
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), imap_plain_port)).await.expect("plain IMAP connect");
+        let client = async_imap::Client::new(tcp);
+        let mut session = client.login("testuser", "testpass").await.map_err(|e| e.0).expect("plain IMAP login");
+        session.create("Big").await.expect("CREATE Big");
+        session.logout().await.expect("plain IMAP logout");
+    }
+    const SEEDED_MESSAGES: usize = 200;
+    for i in 0..SEEDED_MESSAGES {
+        let raw = format!("From: sender@example.com\r\nTo: testuser@localhost\r\nSubject: seed {i}\r\n\r\nbody {i}\r\n");
+        append_raw_to(&host, imap_plain_port, "Big", raw.as_bytes()).await;
+    }
+
+    let config = AccountConfig {
+        account_id: AccountId("test-account".to_string()),
+        display_name: "Test Account".to_string(),
+        email: "testuser@localhost".to_string(),
+        imap: EndpointConfig {
+            host: host.clone(),
+            port: imaps_port,
+            use_tls: true,
+            username: "testuser".to_string(),
+        },
+        smtp: EndpointConfig {
+            host: host.clone(),
+            port: smtps_port,
+            use_tls: true,
+            username: "testuser".to_string(),
+        },
+    };
+
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (_interactive_tx, interactive_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let credentials: Arc<dyn CredentialProvider> = Arc::new(FixedCredentialProvider);
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx));
+
+    // Wait for the folder list (must include "Big", or prefetch never
+    // starts) and the initial (empty) INBOX sync.
+    let folders = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::FoldersUpdated(f) if f.iter().any(|m| m.name == "Big"))).await;
+    let AccountEvent::FoldersUpdated(folders) = folders else { unreachable!() };
+    let big_id = folders.iter().find(|m| m.name == "Big").expect("Big folder missing from list").id.clone();
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::MessagesUpdated { .. })).await;
+
+    // Wait for prefetch to actually start on "Big" - only then is a prefetch
+    // round trip guaranteed to be either in flight or about to be.
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::PrefetchStarted { mailbox } if *mailbox == big_id)).await;
+
+    // New mail on the currently-open mailbox (INBOX), while 200 seeded
+    // messages' worth of prefetch body fetches are being drained one round
+    // trip at a time in the background.
+    let raw = b"From: sender@example.com\r\nTo: testuser@localhost\r\nSubject: new mail during prefetch\r\n\r\nhi\r\n";
+    let started = std::time::Instant::now();
+    append_raw(&host, imap_plain_port, raw).await;
+
+    let inbox_id = MailboxId::new(&AccountId("test-account".to_string()), "INBOX");
+    // Generous relative to how fast a dedicated IDLE connection (or even the
+    // primary's own IDLE, between round trips) should notice a change, but
+    // tight relative to how long 200 sequential one-body-per-round-trip
+    // prefetch fetches take to fully drain - if this fires, the new mail was
+    // stuck behind the prefetch pass rather than noticed independently of it.
+    let updated = wait_for_event_within(
+        &evt_rx,
+        |e| matches!(e, AccountEvent::MessagesUpdated { mailbox, messages } if *mailbox == inbox_id && messages.iter().any(|m| m.subject.as_deref() == Some("new mail during prefetch"))),
+        Duration::from_secs(10),
+    )
+    .await;
+    let AccountEvent::MessagesUpdated { messages, .. } = updated else { unreachable!() };
+    assert!(
+        messages.iter().any(|m| m.subject.as_deref() == Some("new mail during prefetch")),
+        "new message missing from resync: {messages:?}"
+    );
+    tracing::info!(elapsed_ms = started.elapsed().as_millis(), "new mail noticed while prefetch was in flight");
+
+    let _ = cmd_tx.send(AccountCommand::Shutdown).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
 /// Opens a plain-TCP IMAP session to GreenMail (auth is disabled in its test
-/// setup, so any credentials authenticate) and `APPEND`s `raw` to INBOX.
-async fn append_raw(host: &str, port: u16, raw: &[u8]) {
+/// setup, so any credentials authenticate) and `APPEND`s `raw` to `mailbox`.
+async fn append_raw_to(host: &str, port: u16, mailbox: &str, raw: &[u8]) {
     let tcp = tokio::net::TcpStream::connect((host, port)).await.expect("plain IMAP connect");
     let client = async_imap::Client::new(tcp);
     let mut session = client.login("testuser", "testpass").await.map_err(|e| e.0).expect("plain IMAP login");
-    session.append("INBOX", None, None, raw).await.expect("APPEND to INBOX");
+    session.append(mailbox, None, None, raw).await.expect("APPEND");
     session.logout().await.expect("plain IMAP logout");
+}
+
+/// `append_raw_to` against INBOX, the common case every test but the
+/// dedicated-IDLE one below uses.
+async fn append_raw(host: &str, port: u16, raw: &[u8]) {
+    append_raw_to(host, port, "INBOX", raw).await;
 }
 
 /// Drains events until one matches `pred` (discarding the rest), panicking
@@ -398,11 +519,20 @@ async fn wait_for_event<F>(evt_rx: &async_channel::Receiver<AccountEvent>, pred:
 where
     F: Fn(&AccountEvent) -> bool,
 {
-    let deadline = tokio::time::sleep(Duration::from_secs(60));
+    wait_for_event_within(evt_rx, pred, Duration::from_secs(60)).await
+}
+
+/// `wait_for_event` with an explicit deadline, for assertions where the
+/// *speed* of the response - not just its eventual arrival - is the point.
+async fn wait_for_event_within<F>(evt_rx: &async_channel::Receiver<AccountEvent>, pred: F, timeout: Duration) -> AccountEvent
+where
+    F: Fn(&AccountEvent) -> bool,
+{
+    let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _ = &mut deadline => panic!("timed out waiting for a matching account event"),
+            _ = &mut deadline => panic!("timed out waiting for a matching account event within {timeout:?}"),
             event = evt_rx.recv() => {
                 let Ok(event) = event else { panic!("account session channel closed unexpectedly") };
                 if let AccountEvent::Error(e) = &event {
