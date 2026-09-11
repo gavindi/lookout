@@ -23,7 +23,7 @@ A native GNOME mail client written in Rust, built on GTK 4, libadwaita, and WebK
 ## Features
 
 - **Mail** — multi-account IMAP sync with IDLE live updates, folder tree with per-role icons and Favorites, collapsible conversations, message list, and an HTML/plain-text reading pane rendered in a sandboxed WebKit view. Full-text search across every account from a local SQLite FTS5 index, per-message color tags, a pinned-to-top section, print, list-unsubscribe, and read receipts.
-- **Compose** — new/reply/reply-all/forward with correct threading headers, rich HTML editing with inline images and attachments, recipient chips with address-book autocomplete, multiple identities, draft autosave, and a pop-out window. While composing in the reading pane the formatting toolbar takes over the main action bar; popping the composer out moves the controls into its own window. Sent via SMTP (XOAUTH2 or password) and copied into your Sent mailbox.
+- **Compose** — new/reply/reply-all/forward (caret starts above the quoted content, ready to type) with correct threading headers, rich HTML editing with inline images and attachments, To/Cc/Bcc address lines with inline autocomplete and a searchable address-book picker, multiple identities, draft autosave, and a pop-out window. While composing in the reading pane the formatting toolbar takes over the main action bar; popping the composer out moves the controls into its own window. Sent via SMTP (XOAUTH2 or password) and copied into your Sent mailbox.
 - **Mail actions** — delete (move-to-Trash), archive, report-as-junk, pin, mark read/unread, snooze, and batch actions on multi-selection, all backed by real IMAP MOVE/COPY+EXPUNGE. Drag messages onto folders or tags, or out of the window as `.eml` files.
 - **Calendar** — a CalDAV-backed Outlook-style calendar: month/week/day/agenda/split views, mini-calendar sidebar, an upcoming-events overview on the Mail screen, event create/edit with recurrence (editable per occurrence) and attendee invites, drag-to-reschedule, iMIP invitations from the mail viewer, `.ics` import and webcal subscriptions, a synthesized birthday calendar, and event alerts.
 - **People** — CardDAV contacts with full create/edit/delete, groups, favorites, per-account buckets, a Deleted list, and `.vcf` import/export; autocomplete across the composer, invites, and the People tab.
@@ -49,6 +49,7 @@ See [TODO.md](TODO.md) for the full, completed Phases 1–5 breakdown.
 │   │   ├── mail/             # IMAP/SMTP account-session actor + SQLite cache
 │   │   ├── dav/              # CalDAV/CardDAV client + iCalendar/vCard/recurrence handling
 │   │   ├── imap-proto/       # Vendored imap-proto fork (UTF-8 envelope fix, patched via Cargo)
+│   │   ├── async-imap/       # Vendored async-imap fork (COMPRESS stream swap, buffer perf fix)
 │   │   └── app/              # GTK4/libadwaita UI (lookout binary)
 │   ├── data/                 # .desktop file, AppStream metainfo, icons, GSettings schema, GResource bundle, themes
 │   ├── test-fixtures/        # Sample .eml and .ics fixtures for the debug viewer
@@ -107,7 +108,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, unit tests, the fake-GOA D-Bus test, the Docker-gated GreenMail test, and a full build; `.github/workflows/build.yaml` packages `.deb`/`.rpm` artifacts and builds the Flatpak bundle.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, unit tests, the fake-GOA D-Bus test, the Docker-gated GreenMail test, and a full build; `.github/workflows/release.yml` packages `.deb`/`.rpm` artifacts and builds the Flatpak and Snap bundles for each release.
 
 ## Roadmap
 

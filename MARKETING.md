@@ -18,7 +18,7 @@ Every account, every message, every meeting, every contact and task — together
 
 ## Mail
 
-- **All your accounts, live.** Multi-account IMAP sync keeps every folder current in real time — new mail simply appears.
+- **All your accounts, live.** Multi-account IMAP sync keeps every folder current in real time — new mail simply appears, and if you're already sitting at the top of your inbox it arrives right where you're looking instead of pushing your place down the list.
 - **Conversations.** Replies group under collapsible thread headers, so a busy discussion reads as one conversation, not a wall of messages.
 - **Instant search.** Full-text search across every account and folder, answered from a local index in milliseconds.
 - **The full action set.** Delete to Trash, archive, report as junk, pin, mark read or unread, and snooze — applied to one message or a whole selection at once. Pinned messages float to their own section at the top of the list, always in reach.
@@ -28,9 +28,9 @@ Every account, every message, every meeting, every contact and task — together
 
 ## Compose
 
-- **A composer that keeps up with you.** Rich HTML editing with formatted text, tables, links, and inline images — and a plain-text copy rides along automatically for recipients on older clients.
+- **A composer that keeps up with you.** Rich HTML editing with formatted text, tables, links, and inline images — and a plain-text copy rides along automatically for recipients on older clients. Reply and forward drop your cursor right above the quoted message, ready for you to start typing.
 - **The tools where your hands already are.** Compose in the reading pane and the formatting toolbar takes over the main action bar — bold, italic, lists, font sizes and colors, alignment, links, tables, images. Pop the composer out into its own window and the controls come with it.
-- **Recipients as chips.** To, Cc, and Bcc as removable chips, with autocomplete from your address books and recent mail history.
+- **Recipients, fast.** Type into To, Cc, or Bcc and get autocomplete from your address books and recent mail history as you go — or click To to open a searchable picker and check off everyone you need at once.
 - **Pop it out, keep working.** Pop the composer into its own window and carry on — it pops right back in whenever you like, and drafts autosave the whole time, so nothing is ever lost.
 - **Send as you.** Multiple identities per account, with display names, Reply-To, and per-identity blind copies — ideal for work accounts, personal aliases, and mailing-list personas.
 

@@ -157,6 +157,10 @@ and JS-disable still apply regardless). `sender_matches_trust_entry` supports ex
 decoded HTML for `http(s)://` refs behind a subresource marker (`src=`, `srcset=`, CSS `url()`,
 `@import`, `poster=`, `<link href>`), classifying by extension into images vs. other — plain
 `<a href>` navigation is excluded, and `cid:`/`data:`/relative URLs never match by construction.
+Context collection walks backward from each URL up to 48 *bytes* looking for a structural break
+(`>`/`{`/`;`); since that bound is byte- not char-based, `context_start` is snapped forward to the
+next `is_char_boundary` afterward so a multi-byte character (e.g. an en dash) straddling the
+48-byte cutoff can't produce a non-UTF-8-boundary slice and panic.
 
 ### 3.6 Contacts (`vcard.rs`)
 
@@ -223,12 +227,39 @@ flight.
   3. **Main loop**: checks for an already-queued command *before* entering IDLE (avoids paying two
      round trips for work already in hand); otherwise enters IMAP IDLE with a timeout slice
      (25 min normally, or the prefetch policy's `batch_interval` — default 30s — when aggressive
-     prefetch is on), racing the IDLE wait against both command channels via `tokio::select!`. A
-     server push (EXISTS/EXPUNGE/etc.) re-runs `sync_mailbox` on the current folder; a command
-     dispatches through one large `match` over every `AccountCommand` variant, draining both
-     channels to empty before returning to IDLE so a burst of commands is serviced in one pass.
+     prefetch is on), racing the IDLE wait against both command channels **and a third,
+     `Wake::IdlePush` channel** (§4.2.1) via `tokio::select!`. A server push (EXISTS/EXPUNGE/etc.)
+     re-runs `sync_mailbox` on the current folder; a command dispatches through one large `match`
+     over every `AccountCommand` variant, draining both command channels to empty before returning
+     to IDLE so a burst of commands is serviced in one pass.
      A cooperative folder-count STATUS drain and the background body-prefetch batch (§4.3) run at
      the tail of each iteration, each yielding back to command-dispatch if anything is queued.
+
+#### 4.2.1 The dedicated IDLE connection
+
+Because IMAP is one-command-at-a-time per connection, the primary connection above timeshares
+IDLE against prefetch and on-demand fetches — a prefetch `UID FETCH` already in flight can't be
+aborted mid-stream (canceling a response mid-stream would corrupt protocol state), so a slow round
+trip could delay how soon the session got back to IDLE and noticed new mail. Each account now also
+runs a **second, lightweight IMAP connection** whose only job is SELECT + IDLE on whichever
+mailbox the primary connection currently has open:
+
+- **`run_idle_supervisor`** — an outer reconnect-with-backoff wrapper around
+  `run_idle_connection`, spawned via `tokio::spawn` (not the primary's own future) both at session
+  start and on every primary reconnect. Backoff is independent of the primary connection's.
+- **`run_idle_connection`** — connects, logs in, and loops SELECT+IDLE, restarting IDLE whenever
+  the primary tells it (over a `tokio::sync::watch`-style `mailbox_rx`) that the visible mailbox
+  changed. On seeing a push, it sends `Wake::IdlePush(MailboxId)` back to the primary loop, which
+  either resyncs the mailbox immediately (if it's the one currently open) or marks it dirty for
+  next visit — the same routing an out-of-IDLE-view STATUS change already used.
+- If the server doesn't advertise IDLE (checked once against the capability list read at primary
+  login), or the second connection can't be established at all (a provider's simultaneous-
+  connection cap), the supervisor logs once and backs off to an infrequent 30-minute probe rather
+  than retrying forever — this is a pure accelerant, and the primary connection's own IDLE stays
+  fully capable without it.
+- `no_work_pending` (checked before every prefetch/STATUS round trip) reads all three channels —
+  the two command channels plus `idle_notify` — so a push from the dedicated connection also makes
+  the primary loop yield promptly instead of finishing an in-flight prefetch step first.
 
 - **`sync_mailbox`** — the shared full/delta envelope sync (called at connect, on IDLE wake, on
   `Refresh`/`SyncMailbox`, and after mutations). Three phases:
@@ -355,6 +386,14 @@ Message-ID.
 (`XOAuth2Authenticator`). TLS is built from OS-native root certs (`rustls_native_certs`, skipping
 individual bad certs rather than failing the whole store) with TCP keepalive tuned specifically to
 detect a silently-dropped connection during a long IDLE wait.
+
+Now that an account routinely holds two simultaneous connections (§4.2.1), `MicrosoftOAuth`
+(`crates/app/src/microsoft_oauth.rs`) serializes its check-then-refresh sequence per audience
+(Exchange/Graph) behind a `tokio::sync::Mutex` (`refresh_exchange`/`refresh_graph`) held across the
+whole cache-check-and-refresh — the token cache itself (`cached_exchange`/`cached_graph`, a plain
+`std::sync::Mutex<Option<(String, Instant)>>`) is only ever mutated by whichever caller wins that
+lock, so the primary and IDLE connections reconnecting around the same time (e.g. after a network
+blip) can no longer both miss the cache and both fire a duplicate refresh-token exchange.
 
 ## 5. Calendar/contacts engine — `lookout-dav`
 
@@ -619,6 +658,20 @@ stale reply from a superseded call is discarded. A `RowDiff`/`TrackedStore` pair
 prefix/suffix between old and new layouts so only the changed middle range is spliced into the
 live `gio::ListStore`.
 
+`attach_scroller` (called once from `build_ui`, right after the `ScrolledWindow`/`ListView` are
+built; `None` in every test-built model, which simply skips this) hands the model a handle on the
+widgets it renders through so `apply_layout` can keep the list pinned to the top across a rebuild.
+`GtkListView` anchors its viewport to whichever row is focused/selected rather than to a pixel
+offset, so splicing a new message in at index 0 (plus, possibly, a new date-section header) would
+otherwise push already-visible rows out of the viewport to keep the anchored row visually still —
+most obvious as new mail appearing to scroll off the top while the first row's highlight stays put.
+`apply_layout` reads `scroll_at_top()` (within `AT_TOP_THRESHOLD_PX` = 48px, so kinetic-scroll
+sub-pixel residue can't silently disable it) *before* the splices run, and if `was_at_top`,
+re-pins via `ListView::scroll_to(0, ListScrollFlags::empty(), None)` *after* `restore_selection`
+— `scroll_to` rather than a bare `set_value` because only it re-points `GtkListBase`'s anchor at
+item 0 (surviving the next size-allocate), and empty flags specifically to avoid `FOCUS`/`SELECT`
+moving the highlight along with the scroll position.
+
 **`calendar_view.rs`** — five view modes as `gtk::Stack` children: `workweek`/`week`/`day` (all
 built via a shared time-grid builder), `split` (a `MonthGrid` + `AgendaView` side-by-side pane —
 there's no standalone "agenda" stack entry), and `month` (default). Time-grid views use two
@@ -631,9 +684,32 @@ two inputs, both triggering a full `refresh`.
 `hardware_acceleration_policy(Never)`) editors coexist, one live at a time; HTML mode sends
 `multipart/alternative` with both. `text_to_html` converts a plain-text prefill (quoted replies
 included) into simple HTML to seed the rich editor — notably the *plain-text* prefill is always
-the seed, not the original message's HTML. Draft autosave runs every 5s, diffing against a
-snapshot and appending via `AccountCommand::SaveDraft` keyed by a stable per-session Message-ID;
-Send first issues `DeleteDraft` (same command channel, so ordering holds) before sending.
+the seed, not the original message's HTML; leading blank lines in the prefill render as explicit
+`<p><br></p>` paragraphs (tracked via a `seen_content` flag) rather than being dropped, so the
+two-blank-line gap `build_reply_prefill`/`build_forward_prefill` leave above a quote actually
+renders. Reply/forward composes place the caret at the top of that gap on open — an explicit
+`place_cursor` to the buffer start for the plain `GtkTextView`, and a one-shot `load-changed`
+JS snippet (`Range`/`Selection`, folded into the signature-insert script when a default signature
+is also being appended, so the two don't race over the selection) collapsing the caret to
+document-start for the rich WebView — both gated on the prefill actually carrying a non-empty
+body. Draft autosave runs every 5s, diffing against a snapshot and appending via
+`AccountCommand::SaveDraft` keyed by a stable per-session Message-ID; Send first issues
+`DeleteDraft` (same command channel, so ordering holds) before sending.
+
+To/Cc/Bcc are plain single-line fields (`RecipientEntry::new_plain`, `recipient_entry.rs`) rather
+than the removable-pill/`FlowBox` chip mode `RecipientEntry::new` still provides — the calendar
+event editor's attendees field keeps using chip mode unchanged; `new_plain` is compose-only. A
+plain line has no separate committed-vs-pending text the way chips did, so the inline autocomplete
+popover keys off just the segment currently being typed: `current_segment_start` walks back to the
+last top-level comma/semicolon (sharing `parse_address_tokens`'s quote/angle-bracket awareness) to
+find where that segment starts, and `finish_plain_segment` normalizes a manually typed address into
+a `", "`-separated one on Enter/Tab so the user doesn't have to type their own comma. A "To" button
+leads the row, doubling as the field's label, and opens **`contact_picker::show_contact_picker`**
+— a modal, searchable checkbox multi-select over every connected account's contacts
+(`ContactsAccountSnapshot::suggestions`, the same field autocomplete already uses; that field and
+`contacts_view::dedupe_addresses` are `pub(crate)` so the picker can reuse them), whose "Add"
+button inserts every checked address. Cc/Bcc keep their own smaller reveal-link buttons, trailing
+on the right of the To line.
 
 **`contacts_view.rs`** / **`contacts_editor.rs`** — CardDAV account discovery + per-account
 `sync_contacts_account` poll loop (RFC 6578 deltas), a left category tree (`ContactsBucketKind`:
@@ -668,7 +744,9 @@ approach Thunderbird uses), persisting a refresh token under `$XDG_DATA_HOME/loo
 `PR_RENEW_TIME` property via Microsoft Graph (write-only; reading real-Outlook-made pins back is
 explicitly out of scope), since IMAP has no way to reach that property and EWS is being retired.
 
-**Smaller modules** (one line each): `reminders.rs` — VALARM-driven desktop notifications, fire/
+**Smaller modules** (one line each): `contact_picker.rs` — the compose "To" button's modal
+address-book picker (§8.5 above, `compose.rs`), modeled on `identities.rs::show_manage_dialog`'s
+dialog skeleton; `reminders.rs` — VALARM-driven desktop notifications, fire/
 snooze state in `ui_state_db`; `recipient_entry.rs` — composer chip fields, repopulate-from-truth
 like `MessageListModel`; `signatures.rs`/`identities.rs` — Config editors writing through to
 `AppConfig`; `tags.rs` — client-side color-tag definitions (JSON file), applied server-side as
