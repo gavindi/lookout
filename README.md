@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icons/lookout-logo.svg" alt="Lookout" width="256">
+  <img src="assets/icons/Lookout_App_3.svg" alt="Lookout" width="256">
 </p>
 
 # Lookout
@@ -7,6 +7,18 @@
 A native GNOME mail client written in Rust, built on GTK 4, libadwaita, and WebKitGTK. Lookout is a reimplementation of Microsoft Outlook as a desktop application, talking to your mail directly over IMAP/SMTP (plus CalDAV for calendars and CardDAV for contacts), with accounts sourced from **GNOME Online Accounts**.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/P5P21M7MBS)
+
+
+**Platform:**
+[![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](https://github.com/gavindi/lookout)
+
+**Packages:**
+[![Fedora](https://img.shields.io/badge/Fedora-RPM-51A2DA?logo=fedora&logoColor=white)](https://github.com/gavindi/lookout/releases/latest)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-DEB-E95420?logo=ubuntu&logoColor=white)](https://github.com/gavindi/lookout/releases/latest)
+[![Flatpak](https://img.shields.io/badge/Flatpak-bundle-4A90D9?logo=flatpak&logoColor=white)](https://github.com/gavindi/lookout/releases/latest)
+[![Snap](https://img.shields.io/badge/Snap-package-82BEA0?logo=snapcraft&logoColor=white)](https://github.com/gavindi/lookout/releases/latest)
+
 
 ## Features
 
@@ -104,3 +116,5 @@ All five phases of the roadmap in [TODO.md](TODO.md) are complete: Mail MVP (Pha
 ## License
 
 GPL-3.0-or-later.
+
+[![Buy Me a Beer](https://img.shields.io/badge/Buy_Me_a_Beer-🍺-FF5F5F?style=flat)](https://buymeacoffee.com/gavindi)
