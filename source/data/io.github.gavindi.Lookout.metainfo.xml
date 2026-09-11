@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.145" date="2026-09-11">
+      <description>
+        <p>Compose window: To/Cc/Bcc are now plain address lines instead of chips, with a new "To" button that opens an address-book picker to add recipients. Also adds a heads-up on the From field when sending from an alternate address that isn't registered with your mail provider, which can cause recipients to see your main address instead.</p>
+      </description>
+    </release>
     <release version="0.9.144" date="2026-09-11">
       <description>
         <p>Replying to or forwarding a message now puts the cursor above the quoted content, ready for you to start typing, in both plain-text and rich-text compose.</p>

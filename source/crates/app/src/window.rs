@@ -17043,6 +17043,14 @@ fn show_composer_in_reading_pane(
             }
         })
     };
+    // Backs the To row's address-book button: opens `contact_picker` over
+    // whichever window currently hosts the composer (main window or a
+    // popped-out compose window, resolved from `anchor` at click time), and
+    // hands back whatever the user checked.
+    let open_contact_picker: crate::contact_picker::ContactPickerOpener = {
+        let state = state.clone();
+        Rc::new(move |anchor, on_add| crate::contact_picker::show_contact_picker(&anchor, state.clone(), on_add))
+    };
     let (composer, editor_toolbar, draft_tx, identities_refresh) = crate::compose::build_compose_view(
         title,
         // The composer's From dropdown re-reads from here whenever the
@@ -17095,6 +17103,7 @@ fn show_composer_in_reading_pane(
         on_done,
         rich_text_default,
         suggestions,
+        open_contact_picker,
         on_pop_out,
         on_send_started,
     );

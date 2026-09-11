@@ -41,7 +41,9 @@ pub struct ContactsAccountSnapshot {
     /// `pub(crate)` so the birthdays calendar can read the same contact
     /// set the People screen shows.
     pub(crate) contacts: Vec<lookout_dav::ContactRecord>,
-    suggestions: Vec<EmailAddress>,
+    /// `pub(crate)` so the compose window's contact picker can list every
+    /// known address without re-deriving it from `contacts`/vCards itself.
+    pub(crate) suggestions: Vec<EmailAddress>,
 }
 
 /// A bare snapshot for tests: no books (the write path's pickers aren't
@@ -886,7 +888,7 @@ pub fn export_current_contacts(window: &adw::ApplicationWindow, entries: &Rc<Ref
     });
 }
 
-fn dedupe_addresses(addresses: Vec<EmailAddress>, limit: usize) -> Vec<EmailAddress> {
+pub(crate) fn dedupe_addresses(addresses: Vec<EmailAddress>, limit: usize) -> Vec<EmailAddress> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for addr in addresses {

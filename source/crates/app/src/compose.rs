@@ -7,7 +7,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use base64::Engine;
 use gtk::{gio, glib};
-use lookout_core::{header_value, AccountId, EmailBody, EmailSummary, Identity, Signature};
+use lookout_core::{header_value, AccountId, EmailAddress, EmailBody, EmailSummary, Identity, Signature};
 use lookout_mail::session::AccountCommand;
 use lookout_mail::{new_message_id, Attachment, ComposedMessage, InlineImage};
 use webkit::prelude::*;
@@ -1054,34 +1054,52 @@ pub fn build_compose_view(
     on_done: Rc<dyn Fn()>,
     rich_text_default: bool,
     suggestions: SuggestionSource,
+    open_contact_picker: crate::contact_picker::ContactPickerOpener,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
     on_send_started: Rc<dyn Fn(String)>,
 ) -> (gtk::Box, gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
-    let to_row = RecipientEntry::new("To");
+    // Plain single-line fields (no chips) - see `RecipientEntry::new_plain`.
+    // The To row has no caption label of its own: the To button beside it
+    // (below) both labels the row and opens the address-book picker.
+    let to_row = RecipientEntry::new_plain("");
     if let Some(to) = &prefill.to {
         to_row.set_from_text(to);
     }
-    let cc_row = RecipientEntry::new("Cc");
+    let cc_row = RecipientEntry::new_plain("Cc");
     let cc_prefilled = prefill.cc.as_ref().is_some_and(|cc| !cc.trim().is_empty());
     if let Some(cc) = &prefill.cc {
         cc_row.set_from_text(cc);
     }
     // Bcc has no prefill: neither Reply nor Forward can know a blind copy
     // list, by definition.
-    let bcc_row = RecipientEntry::new("Bcc");
+    let bcc_row = RecipientEntry::new_plain("Bcc");
     for row in [&to_row, &cc_row, &bcc_row] {
         row.set_suggestion_source(suggestions.clone());
     }
 
-    // --- Cc/Bcc reveal buttons: right-aligned on the To row, each hiding
-    // itself and showing its row once clicked (Gmail's classic Cc/Bcc
-    // links). A row that already has prefilled content (e.g. Reply All's Cc
-    // list) starts shown, with its button skipped so there's nothing to
+    // --- To/Cc/Bcc buttons: To leads the row (it doubles as the field's
+    // label, since the plain-line To field has no caption of its own) and
+    // opens the address-book picker; Cc/Bcc trail on the right, Gmail's
+    // classic reveal links, each hiding itself and showing its row once
+    // clicked. A row that already has prefilled content (e.g. Reply All's
+    // Cc list) starts shown, with its button skipped so there's nothing to
     // click for a field the user can already see.
+    let to_button = gtk::Button::builder().label("To").css_classes(["flat"]).tooltip_text("Add recipients from address book").build();
     let cc_button = gtk::Button::builder().label("Cc").css_classes(["flat", "caption"]).tooltip_text("Show Cc").build();
     let bcc_button = gtk::Button::builder().label("Bcc").css_classes(["flat", "caption"]).tooltip_text("Show Bcc").build();
+    to_row.widget().prepend(&to_button);
     to_row.add_header_suffix(&cc_button);
     to_row.add_header_suffix(&bcc_button);
+    {
+        let to_row = to_row.clone();
+        to_button.connect_clicked(move |button| {
+            let on_add = {
+                let to_row = to_row.clone();
+                Rc::new(move |addrs: Vec<EmailAddress>| to_row.append_addresses(&addrs))
+            };
+            open_contact_picker(button.clone().upcast(), on_add);
+        });
+    }
     cc_row.widget().set_visible(cc_prefilled);
     cc_button.set_visible(!cc_prefilled);
     bcc_row.widget().set_visible(false);
@@ -1114,9 +1132,33 @@ pub fn build_compose_view(
     // list immediately.
     let identities = Rc::new(RefCell::new(identities_source()));
     let from_dropdown = gtk::DropDown::builder().selected(0).build();
+    // `identities_for_account` always inserts the account's own default
+    // identity at index 0, so anything else selected is an alternate one.
+    // Providers (Gmail in particular) silently substitute the account's own
+    // address on delivery unless that alternate address is registered and
+    // verified as a "send as"/alias address server-side, which is easy to
+    // forget and looks like a Lookout bug when it bites - this icon is just
+    // a nudge to check that, not a guarantee the address will work.
+    let identity_hint_icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+    identity_hint_icon.set_tooltip_text(Some(
+        "Sending as an alternate address. Make sure it's registered and verified as a \"send as\"/alias address with your mail provider, or recipients may see your account's own address instead.",
+    ));
+    identity_hint_icon.set_visible(false);
+    let update_identity_hint: Rc<dyn Fn()> = {
+        let from_dropdown = from_dropdown.clone();
+        let identity_hint_icon = identity_hint_icon.clone();
+        Rc::new(move || {
+            identity_hint_icon.set_visible(from_dropdown.selected() != 0);
+        })
+    };
+    {
+        let update_identity_hint = update_identity_hint.clone();
+        from_dropdown.connect_selected_notify(move |_| update_identity_hint());
+    }
     let refresh_from_dropdown: Rc<dyn Fn()> = {
         let identities = identities.clone();
         let from_dropdown = from_dropdown.clone();
+        let update_identity_hint = update_identity_hint.clone();
         Rc::new(move || {
             let list = identities_source();
             let labels: Vec<String> = list.iter().map(|i| i.label()).collect();
@@ -1127,6 +1169,7 @@ pub fn build_compose_view(
             if !labels.is_empty() && from_dropdown.selected() as usize >= labels.len() {
                 from_dropdown.set_selected(0);
             }
+            update_identity_hint();
         })
     };
     refresh_from_dropdown();
@@ -1601,6 +1644,7 @@ pub fn build_compose_view(
         .build();
     top_row.append(&send_button);
     top_row.append(&from_dropdown);
+    top_row.append(&identity_hint_icon);
     top_row.append(&header_spacer);
     top_row.append(&title_label);
     top_row.append(&status_label);

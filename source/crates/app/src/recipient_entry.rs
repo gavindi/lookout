@@ -7,6 +7,11 @@
 //! the app crate has no GObject subclassing anywhere, and this needs none.
 //! Chips are recreated from the canonical address list on every change, the
 //! same repopulate-from-truth approach the message list uses.
+//!
+//! A second "plain" mode (`new_plain`) drops the chips entirely in favour of
+//! a single line of comma-separated text, still backed by the same
+//! autocomplete popover - used by the compose window's To/Cc/Bcc fields. The
+//! calendar event editor's attendees field keeps the original chip mode.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -66,6 +71,28 @@ pub fn parse_address_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
+/// The byte index right after the last top-level comma/semicolon in `text`
+/// (0 if there is none) - i.e. where the address currently being typed
+/// starts. Shares `parse_address_tokens`'s quote/angle-bracket awareness so a
+/// display name like `"Lovelace, Ada" <ada@example.com>` isn't split
+/// mid-name. Used by plain-mode fields, which have no separate "committed
+/// vs. pending" text to consult.
+fn current_segment_start(text: &str) -> usize {
+    let mut in_quotes = false;
+    let mut in_angles = false;
+    let mut start = 0;
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '<' if !in_quotes => in_angles = true,
+            '>' if !in_quotes => in_angles = false,
+            ',' | ';' if !in_quotes && !in_angles => start = i + ch.len_utf8(),
+            _ => {}
+        }
+    }
+    start
+}
+
 /// The bare addr-spec inside a token: `Ada <ada@example.com>` yields
 /// `ada@example.com`, a bare address yields itself. Used for both validation
 /// and what actually goes into the message's recipient list.
@@ -103,16 +130,23 @@ pub type SuggestionSource = Rc<dyn Fn(&str, Box<dyn FnOnce(Vec<EmailAddress>)>)>
 #[derive(Clone)]
 pub struct RecipientEntry {
     root: gtk::Box,
-    /// The title row: the field's caption label plus, on the To row, the
-    /// Cc/Bcc reveal buttons appended via `add_header_suffix`.
+    /// Where suffix widgets land - the To row's Cc/Bcc reveal buttons (and,
+    /// in plain mode, the To button) via `add_header_suffix`. In chip mode
+    /// this is the title row above the chips; in plain mode there is no
+    /// separate title row, so it's `root` itself.
     header: gtk::Box,
     /// Wraps chips onto further lines as they accumulate, with the text entry
     /// as the final child so typing always continues after the last chip.
-    flow: gtk::FlowBox,
+    /// `None` in plain mode, which has no chips to wrap.
+    flow: Option<gtk::FlowBox>,
     entry: gtk::Text,
+    /// Chip mode: whether pills are rendered, with `tokens` as the
+    /// canonical committed list. Plain mode: a single line of raw text -
+    /// `entry`'s text is the only state, `tokens` stays empty and unused.
+    plain: bool,
     /// The canonical contents - full tokens (`Ada <ada@example.com>` or a
     /// bare address), in the order the user entered them. The chip widgets
-    /// are rebuilt from this, never read back out of.
+    /// are rebuilt from this, never read back out of. Unused in plain mode.
     tokens: Rc<RefCell<Vec<String>>>,
     popover: gtk::Popover,
     suggestion_list: gtk::ListBox,
@@ -126,30 +160,55 @@ pub struct RecipientEntry {
 }
 
 impl RecipientEntry {
+    /// A chip-mode field: each recipient is a removable pill. Used by the
+    /// calendar event editor's attendees field.
     pub fn new(title: &str) -> Self {
-        let title_label = gtk::Label::builder().label(title).xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
-        let header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-        header.append(&title_label);
+        Self::build(title, false)
+    }
 
-        let flow = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .row_spacing(4)
-            .column_spacing(4)
-            .min_children_per_line(1)
-            .max_children_per_line(64)
-            .homogeneous(false)
-            .build();
+    /// A plain-line field: recipients are raw comma-separated text, no
+    /// chips. Used by the compose window's To/Cc/Bcc. An empty `title`
+    /// omits the caption label (the compose window's To field instead
+    /// labels itself via the To button placed as a suffix, plus a
+    /// placeholder string).
+    pub fn new_plain(title: &str) -> Self {
+        Self::build(title, true)
+    }
 
+    fn build(title: &str, plain: bool) -> Self {
         let entry = gtk::Text::builder().hexpand(true).width_request(120).build();
-        flow.append(&entry);
 
-        let root = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
-            .css_classes(["recipient-field"])
-            .build();
-        root.append(&header);
-        root.append(&flow);
+        let (root, header, flow) = if plain {
+            let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["recipient-field"]).build();
+            if title.is_empty() {
+                entry.set_placeholder_text(Some("Recipients"));
+            } else {
+                let caption = gtk::Label::builder().label(title).css_classes(["caption", "dim-label"]).valign(gtk::Align::Center).build();
+                root.append(&caption);
+            }
+            root.append(&entry);
+            let header = root.clone();
+            (root, header, None)
+        } else {
+            let title_label = gtk::Label::builder().label(title).xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+            let header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+            header.append(&title_label);
+
+            let flow = gtk::FlowBox::builder()
+                .selection_mode(gtk::SelectionMode::None)
+                .row_spacing(4)
+                .column_spacing(4)
+                .min_children_per_line(1)
+                .max_children_per_line(64)
+                .homogeneous(false)
+                .build();
+            flow.append(&entry);
+
+            let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).css_classes(["recipient-field"]).build();
+            root.append(&header);
+            root.append(&flow);
+            (root, header, Some(flow))
+        };
 
         let suggestion_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
         let scroller = gtk::ScrolledWindow::builder()
@@ -175,6 +234,7 @@ impl RecipientEntry {
             header,
             flow,
             entry,
+            plain,
             tokens: Rc::new(RefCell::new(Vec::new())),
             popover,
             suggestion_list,
@@ -191,9 +251,8 @@ impl RecipientEntry {
         &self.root
     }
 
-    /// Appends a widget to the field's title row, right-aligned by the title
-    /// label's `hexpand`. The composer uses this to put the Cc/Bcc reveal
-    /// buttons on the To row.
+    /// Appends a widget after the entry, right-aligned by the entry's
+    /// `hexpand`. The composer uses this for the To row's To/Cc/Bcc buttons.
     pub fn add_header_suffix(&self, widget: &impl IsA<gtk::Widget>) {
         self.header.append(widget);
     }
@@ -201,6 +260,10 @@ impl RecipientEntry {
     /// Replaces the field's contents from a comma-separated string - how
     /// `ComposePrefill` carries Reply/Reply-All/Forward recipients.
     pub fn set_from_text(&self, text: &str) {
+        if self.plain {
+            self.entry.set_text(text);
+            return;
+        }
         *self.tokens.borrow_mut() = parse_address_tokens(text);
         self.rebuild_chips();
     }
@@ -209,6 +272,9 @@ impl RecipientEntry {
     /// committed to a chip - a Send click must not silently drop a
     /// half-entered address just because the user didn't press Enter.
     pub fn addresses(&self) -> Vec<String> {
+        if self.plain {
+            return parse_address_tokens(&self.entry.text());
+        }
         let mut out: Vec<String> = self.tokens.borrow().clone();
         let pending = self.entry.text().trim().to_string();
         if !pending.is_empty() {
@@ -229,27 +295,87 @@ impl RecipientEntry {
 
     /// Commits whatever is typed, then reports the tokens. Called by Send so
     /// the field ends up visually consistent with what was actually sent.
+    /// A no-op in plain mode - the entry's text is already canonical, there's
+    /// no separate chip step to finalize.
     pub fn commit_pending(&self) {
-        self.commit_entry_text();
+        if !self.plain {
+            self.commit_entry_text();
+        }
+    }
+
+    /// Appends addresses not already present (case-insensitive on the bare
+    /// address) to the field - used by the compose window's To button after
+    /// picking contacts from the address book.
+    pub fn append_addresses(&self, addrs: &[EmailAddress]) {
+        if addrs.is_empty() {
+            return;
+        }
+        if self.plain {
+            let existing: Vec<String> = self.addresses().iter().map(|t| address_of(t).to_lowercase()).collect();
+            let mut text = self.entry.text().trim_end().trim_end_matches(',').trim_end().to_string();
+            for addr in addrs {
+                if existing.contains(&addr.address.to_lowercase()) {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push_str(", ");
+                }
+                text.push_str(&token_for(addr));
+            }
+            self.entry.set_text(&text);
+            self.entry.set_position(-1);
+            self.popover.popdown();
+            return;
+        }
+        let existing: Vec<String> = self.tokens.borrow().iter().map(|t| address_of(t).to_lowercase()).collect();
+        {
+            let mut tokens = self.tokens.borrow_mut();
+            for addr in addrs {
+                if existing.contains(&addr.address.to_lowercase()) {
+                    continue;
+                }
+                tokens.push(token_for(addr));
+            }
+        }
+        self.rebuild_chips();
     }
 
     fn connect_handlers(&self) {
         // Enter commits either the highlighted completion or the typed text.
+        // Chip mode turns it into a chip; plain mode normalizes the trailing
+        // text into "address, " so every address added - typed and
+        // confirmed, or picked from the popover - ends up comma-separated
+        // from whatever comes next.
         {
             let this = self.clone();
             self.entry.connect_activate(move |_| {
-                if !this.take_selected_suggestion() {
+                if this.take_selected_suggestion() {
+                    return;
+                }
+                if this.plain {
+                    this.finish_plain_segment();
+                } else {
                     this.commit_entry_text();
                 }
             });
         }
 
-        // Typing a separator commits the token before it, so pasting
-        // "a@x.com, b@y.com" lands as two chips without any keypress.
+        // Chip mode: typing a separator commits the token before it, so
+        // pasting "a@x.com, b@y.com" lands as two chips without any
+        // keypress. Plain mode: suggestions are always keyed to just the
+        // segment currently being typed (the text after the last top-level
+        // comma/semicolon), since there's no separate pending-text buffer to
+        // consult.
         {
             let this = self.clone();
             self.entry.connect_changed(move |entry| {
                 let text = entry.text().to_string();
+                if this.plain {
+                    let start = current_segment_start(&text);
+                    let segment = text[start..].trim_start().to_string();
+                    this.refresh_suggestions(&segment);
+                    return;
+                }
                 if text.contains(',') || text.contains(';') {
                     this.commit_entry_text();
                     return;
@@ -262,15 +388,27 @@ impl RecipientEntry {
             let this = self.clone();
             let keys = gtk::EventControllerKey::new();
             keys.connect_key_pressed(move |_, key, _, _| match key {
-                gtk::gdk::Key::BackSpace if this.entry.text().is_empty() => {
+                gtk::gdk::Key::BackSpace if !this.plain && this.entry.text().is_empty() => {
                     this.tokens.borrow_mut().pop();
                     this.rebuild_chips();
                     glib::Propagation::Stop
                 }
-                // Tab would otherwise move focus with a token half-entered.
-                gtk::gdk::Key::Tab if !this.entry.text().trim().is_empty() => {
+                // Tab would otherwise move focus with a token half-entered
+                // (chip mode) or a completion left un-accepted (plain mode).
+                gtk::gdk::Key::Tab if !this.plain && !this.entry.text().trim().is_empty() => {
                     this.commit_entry_text();
                     glib::Propagation::Stop
+                }
+                gtk::gdk::Key::Tab if this.plain && this.popover.is_visible() => {
+                    this.take_selected_suggestion();
+                    glib::Propagation::Stop
+                }
+                // Tabbing away from a manually typed (not suggestion-picked)
+                // address still comma-separates it, same as Enter - but lets
+                // focus actually move on, unlike Enter.
+                gtk::gdk::Key::Tab if this.plain && !this.entry.text().trim().is_empty() => {
+                    this.finish_plain_segment();
+                    glib::Propagation::Proceed
                 }
                 gtk::gdk::Key::Down => {
                     this.move_suggestion_selection(1);
@@ -309,7 +447,7 @@ impl RecipientEntry {
         }
     }
 
-    /// Turns the entry's current text into chips.
+    /// Turns the entry's current text into chips. Chip mode only.
     fn commit_entry_text(&self) {
         let text = self.entry.text().to_string();
         let tokens = parse_address_tokens(&text);
@@ -327,25 +465,43 @@ impl RecipientEntry {
         self.rebuild_chips();
     }
 
+    /// Plain mode's counterpart to `commit_entry_text`: normalizes the
+    /// entry's trailing text into `"...address, "` so an address the user
+    /// typed and confirmed (Enter/Tab), not just one picked from the
+    /// popover or the address-book picker, still ends up comma-separated
+    /// from whatever comes next. A no-op on empty/whitespace-only text.
+    fn finish_plain_segment(&self) {
+        let trimmed = self.entry.text().trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let mut text = trimmed.trim_end_matches(',').trim_end().to_string();
+        text.push_str(", ");
+        self.entry.set_text(&text);
+        self.entry.set_position(-1);
+        self.popover.popdown();
+    }
+
     /// Rebuilds every chip from `tokens`. Wholesale rather than incremental:
     /// the list is a handful of items, and rebuilding keeps the widgets and
-    /// the canonical list impossible to desynchronise.
+    /// the canonical list impossible to desynchronise. Chip mode only.
     fn rebuild_chips(&self) {
+        let Some(flow) = &self.flow else { return };
         // Drop every child but the one wrapping the text entry - it's the
         // only `gtk::Text` in the flow, which is what identifies it.
-        let mut child = self.flow.first_child();
+        let mut child = flow.first_child();
         while let Some(widget) = child {
             let next = widget.next_sibling();
             let holds_entry = widget.downcast_ref::<gtk::FlowBoxChild>().and_then(|c| c.child()).is_some_and(|c| c.is::<gtk::Text>());
             if !holds_entry {
-                self.flow.remove(&widget);
+                flow.remove(&widget);
             }
             child = next;
         }
         // Everything except the entry is gone; re-insert chips ahead of it.
         for (index, token) in self.tokens.borrow().iter().enumerate() {
             let chip = self.build_chip(index, token);
-            self.flow.insert(&chip, index as i32);
+            flow.insert(&chip, index as i32);
         }
     }
 
@@ -423,8 +579,10 @@ impl RecipientEntry {
             return;
         }
 
-        // Anything already chipped is not a useful suggestion.
-        let existing: Vec<String> = self.tokens.borrow().iter().map(|t| address_of(t).to_lowercase()).collect();
+        // Anything already entered is not a useful suggestion. `addresses()`
+        // covers both modes: chip mode's committed tokens plus any pending
+        // text, and plain mode's whole entry.
+        let existing: Vec<String> = self.addresses().iter().map(|t| address_of(t).to_lowercase()).collect();
         let matches: Vec<EmailAddress> = matches
             .into_iter()
             .filter(|m| !existing.contains(&m.address.to_lowercase()))
@@ -486,11 +644,36 @@ impl RecipientEntry {
         let Some(candidate) = self.suggestions.borrow().get(index.max(0) as usize).cloned() else {
             return false;
         };
-        self.tokens.borrow_mut().push(token_for(&candidate));
-        self.entry.set_text("");
+        if self.plain {
+            self.replace_current_segment(&token_for(&candidate));
+        } else {
+            self.tokens.borrow_mut().push(token_for(&candidate));
+            self.entry.set_text("");
+            self.rebuild_chips();
+        }
         self.popover.popdown();
-        self.rebuild_chips();
         true
+    }
+
+    /// Plain mode only: swaps the segment currently being typed (the text
+    /// after the last top-level comma/semicolon) for the accepted
+    /// completion, and parks the caret at the end so typing continues into a
+    /// fresh segment.
+    fn replace_current_segment(&self, token: &str) {
+        let text = self.entry.text().to_string();
+        let start = current_segment_start(&text);
+        let mut new_text = text[..start].to_string();
+        // `start` lands right after the separator itself (see
+        // `current_segment_start`), before any space that followed it in the
+        // replaced segment - so a preceding recipient needs its own space
+        // reinstated here, or the result reads "a@x.com,b@y.com".
+        if !new_text.is_empty() && !new_text.ends_with(' ') {
+            new_text.push(' ');
+        }
+        new_text.push_str(token);
+        new_text.push_str(", ");
+        self.entry.set_text(&new_text);
+        self.entry.set_position(-1);
     }
 }
 
@@ -569,5 +752,70 @@ mod tests {
         assert_eq!(chip_label("Ada Lovelace <ada@example.com>"), "Ada Lovelace");
         assert_eq!(chip_label("ada@example.com"), "ada@example.com");
         assert_eq!(chip_label("<ada@example.com>"), "ada@example.com");
+    }
+
+    #[test]
+    fn current_segment_start_finds_the_last_top_level_separator() {
+        // Asserted as the trimmed trailing segment rather than a raw byte
+        // offset - what `connect_changed` actually consumes - since the
+        // offset itself lands right after the separator, ahead of any
+        // following space.
+        let segment = |text: &str| text[current_segment_start(text)..].trim_start().to_string();
+        assert_eq!(segment("ada@x.com"), "ada@x.com");
+        assert_eq!(segment("ada@x.com, bob@y.com"), "bob@y.com");
+        assert_eq!(segment("ada@x.com;bob@y.com"), "bob@y.com");
+        // A comma inside a display name isn't a separator.
+        assert_eq!(segment("\"Lovelace, Ada\" <ada@x.com>, bob"), "bob");
+        assert_eq!(current_segment_start(""), 0);
+    }
+
+    #[test]
+    fn plain_mode_addresses_reads_straight_from_the_entry_text() {
+        // Builds real GTK widgets - skipped on a thread that doesn't own GTK
+        // (see `gtk_test::gtk_ready`).
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new_plain("");
+        field.set_from_text("ada@x.com, bob@y.com");
+        assert_eq!(field.addresses(), vec!["ada@x.com", "bob@y.com"]);
+        assert_eq!(field.text_value(), "ada@x.com, bob@y.com");
+    }
+
+    #[test]
+    fn finish_plain_segment_normalizes_trailing_text_into_a_comma_separator() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new_plain("");
+        field.set_from_text("alice@x.com");
+        field.finish_plain_segment();
+        assert_eq!(field.entry.text(), "alice@x.com, ");
+        // Idempotent - pressing Enter again with nothing new typed doesn't
+        // pile up separators.
+        field.finish_plain_segment();
+        assert_eq!(field.entry.text(), "alice@x.com, ");
+    }
+
+    #[test]
+    fn replace_current_segment_keeps_a_space_after_the_prior_comma() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new_plain("");
+        field.set_from_text("alice@x.com,");
+        field.replace_current_segment("bob@y.com");
+        assert_eq!(field.entry.text(), "alice@x.com, bob@y.com, ");
+    }
+
+    #[test]
+    fn append_addresses_skips_duplicates_in_plain_mode() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new_plain("");
+        field.set_from_text("ada@x.com");
+        field.append_addresses(&[EmailAddress::new("ada@x.com"), EmailAddress::new("bob@y.com")]);
+        assert_eq!(field.addresses(), vec!["ada@x.com", "bob@y.com"]);
     }
 }

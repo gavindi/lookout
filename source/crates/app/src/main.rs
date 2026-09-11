@@ -12,6 +12,7 @@ mod calendar_view;
 mod chat_links;
 mod compose;
 mod config_view;
+mod contact_picker;
 mod contacts_editor;
 mod contacts_view;
 mod event_editor;
