@@ -14,7 +14,18 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
     let message = MessageParser::default().parse(raw)?;
 
     let text_body = message.body_text(0).map(|c| c.into_owned());
-    let html_body = message.body_html(0).map(|c| c.into_owned());
+    // `body_html(0)` returns either a genuine `text/html` part or, for a
+    // plain-text-only message, mail_parser's own bare-bones synthesis of the
+    // text part (escapes `<`, turns `\n` into `<br/>`, never linkifies).
+    // Telling the two apart by inspecting the part itself picks the matching
+    // linkifier: a genuine part's own markup must stay intact except for
+    // bare links in its text nodes (`linkify_html_text_nodes`), while a
+    // plain-text-only message is free to be rebuilt from scratch
+    // (`linkify_to_html`) since there's no markup to preserve.
+    let html_body = match message.html_part(0).map(|p| &p.body) {
+        Some(PartType::Html(html)) => Some(linkify_html_text_nodes(html.as_ref())),
+        _ => text_body.as_deref().map(linkify_to_html),
+    };
 
     // The iMIP payload: the first `text/calendar` leaf in the part tree
     // (invitations carry exactly one). `part.contents()` is already
@@ -274,14 +285,319 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
     }
 }
 
+/// One piece of `scan_links`'s walk over a text run: a literal stretch with
+/// no link in it, a matched URL, or a matched email address (still just the
+/// bare address - turning it into a `mailto:` href is the caller's job).
+enum Segment<'a> {
+    Plain(&'a str),
+    Url(&'a str),
+    Email(&'a str),
+}
+
+/// Shared trigger-detection walk (`match_url`/`match_email`) over `text`,
+/// reporting each piece to `on_segment` in order. Escaping is entirely the
+/// caller's job via `on_segment` - this just finds the boundaries, since the
+/// two callers need opposite treatment of the text: `linkify_to_html` is
+/// building HTML from raw plain text and must escape everything as it goes,
+/// while `linkify_html_text_nodes` is walking text nodes that are already
+/// valid (already-escaped) HTML and must copy them through verbatim.
+fn scan_links<'a>(text: &'a str, mut on_segment: impl FnMut(Segment<'a>)) {
+    let mut plain_start = 0usize;
+    let mut i = 0usize;
+    while i < text.len() {
+        if let Some(end) = match_url(text, i) {
+            if plain_start < i {
+                on_segment(Segment::Plain(&text[plain_start..i]));
+            }
+            let url = &text[i..end];
+            on_segment(Segment::Url(url));
+            i = end;
+            plain_start = end;
+            continue;
+        }
+        if text.as_bytes()[i] == b'@' {
+            if let Some((start, end)) = match_email(text, i) {
+                if plain_start < start {
+                    on_segment(Segment::Plain(&text[plain_start..start]));
+                }
+                let email = &text[start..end];
+                on_segment(Segment::Email(email));
+                i = end;
+                plain_start = end;
+                continue;
+            }
+        }
+        i += text[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    if plain_start < text.len() {
+        on_segment(Segment::Plain(&text[plain_start..]));
+    }
+}
+
+/// Wraps a plain-text body as minimal HTML - escaping `&`/`<`/`>` and
+/// turning `\n` into `<br/>`, the same shape as mail_parser's own fallback
+/// synthesis - but additionally turns bare `http://`/`https://` URLs and
+/// bare email addresses into clickable `<a>` tags. Callers (`parse_body`,
+/// `decode_text_part`) only ever reach for this when the message has no
+/// genuine `text/html` part, so this never runs over sender-authored markup
+/// (that goes through `linkify_html_text_nodes` instead).
+///
+/// URL matching deliberately does not require whitespace (or any other word
+/// boundary) before the scheme, so a URL glued directly onto preceding
+/// punctuation (`Info:http://example.com`, `Click here!http://example.com`)
+/// is still recognized; the scan just looks for the scheme substring
+/// wherever it occurs.
+fn linkify_to_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    scan_links(text, |segment| match segment {
+        Segment::Plain(s) => out.push_str(&escape_text(s)),
+        Segment::Url(url) => push_link(&mut out, url, url),
+        Segment::Email(email) => push_link(&mut out, &format!("mailto:{email}"), email),
+    });
+    out
+}
+
+fn push_link(out: &mut String, href: &str, display: &str) {
+    out.push_str("<a href=\"");
+    out.push_str(&escape_attr(href));
+    out.push_str("\">");
+    out.push_str(&escape_text(display));
+    out.push_str("</a>");
+}
+
+/// Turns bare `http(s)` URLs and email addresses found in a genuine
+/// sender-authored HTML body's *text nodes* into clickable `<a>` tags,
+/// leaving all markup - tags, attributes, comments, and the content of any
+/// existing `<a>`, `<script>` or `<style>` element - completely untouched.
+///
+/// Unlike `linkify_to_html`, this never escapes anything: a text node here
+/// is already valid HTML (entities and all), so a matched span is copied
+/// straight into both the link's `href` and its display text without
+/// modification, and re-escaping it would double-encode existing entities.
+///
+/// Tag boundaries are found the same lightweight way
+/// `trust::html_remote_content_scan` scans for subresource URLs - a plain
+/// `<...>` walk, not a real parser - which is enough to keep out of
+/// attribute values and skip elements whose content must never be touched.
+fn linkify_html_text_nodes(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 64);
+    let mut skip_stack: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let mut text_start = 0usize;
+
+    while i < html.len() {
+        if html[i..].starts_with("<!--") {
+            flush_html_text(&mut out, &html[text_start..i], &skip_stack);
+            let end = html[i..].find("-->").map_or(html.len(), |p| i + p + 3);
+            out.push_str(&html[i..end]);
+            i = end;
+            text_start = end;
+            continue;
+        }
+        if html.as_bytes()[i] == b'<' {
+            match html[i..].find('>') {
+                Some(rel) => {
+                    let tag_end = i + rel + 1;
+                    flush_html_text(&mut out, &html[text_start..i], &skip_stack);
+                    let tag = &html[i..tag_end];
+                    out.push_str(tag);
+                    update_skip_stack(&mut skip_stack, tag);
+                    i = tag_end;
+                    text_start = i;
+                }
+                // An unterminated tag: nothing sensible to do but stop
+                // scanning and copy the remainder through untouched.
+                None => {
+                    flush_html_text(&mut out, &html[text_start..i], &skip_stack);
+                    out.push_str(&html[i..]);
+                    return out;
+                }
+            }
+            continue;
+        }
+        i += html[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    flush_html_text(&mut out, &html[text_start..], &skip_stack);
+    out
+}
+
+fn flush_html_text(out: &mut String, text: &str, skip_stack: &[String]) {
+    if text.is_empty() {
+        return;
+    }
+    if !skip_stack.is_empty() {
+        out.push_str(text);
+        return;
+    }
+    scan_links(text, |segment| match segment {
+        Segment::Plain(s) => out.push_str(s),
+        Segment::Url(url) => {
+            out.push_str("<a href=\"");
+            out.push_str(url);
+            out.push_str("\">");
+            out.push_str(url);
+            out.push_str("</a>");
+        }
+        Segment::Email(email) => {
+            out.push_str("<a href=\"mailto:");
+            out.push_str(email);
+            out.push_str("\">");
+            out.push_str(email);
+            out.push_str("</a>");
+        }
+    });
+}
+
+/// Pushes or pops `tag`'s name onto `skip_stack` when it's an opening or
+/// closing `<a>`, `<script>` or `<style>` tag - the elements whose content
+/// must never be linkified (an existing link's own text, or non-markup code
+/// that merely happens to contain "http"/"@").
+fn update_skip_stack(skip_stack: &mut Vec<String>, tag: &str) {
+    let Some(inner) = tag.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else { return };
+    let is_close = inner.starts_with('/');
+    let name_src = inner.strip_prefix('/').unwrap_or(inner);
+    let name: String = name_src.chars().take_while(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+    if !matches!(name.as_str(), "a" | "script" | "style") {
+        return;
+    }
+    if is_close {
+        if let Some(pos) = skip_stack.iter().rposition(|n| n == &name) {
+            skip_stack.remove(pos);
+        }
+    } else if !inner.trim_end().ends_with('/') {
+        skip_stack.push(name);
+    }
+}
+
+/// Escapes text for use as element content, and folds in the same
+/// `\n`-to-`<br/>` conversion mail_parser's synthesized rendering used, so
+/// non-link text keeps rendering exactly as it did before linkification.
+fn escape_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\r' => {}
+            '\n' => out.push_str("<br/>"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escapes text for use inside a double-quoted HTML attribute value.
+fn escape_attr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// If `text[start..]` begins with `http://`/`https://` (case-insensitively),
+/// returns the end of the URL: the following run of non-whitespace
+/// characters, with trailing sentence punctuation and unbalanced closing
+/// brackets trimmed off (so "(see https://example.com)" doesn't pull the
+/// sentence's closing paren into the link, but a URL whose own path
+/// legitimately contains balanced parens keeps them).
+fn match_url(text: &str, start: usize) -> Option<usize> {
+    let rest = &text[start..];
+    let scheme_len = ["http://", "https://"].iter().find_map(|s| rest.get(..s.len()).filter(|r| r.eq_ignore_ascii_case(s)).map(|_| s.len()))?;
+    let after_scheme = start + scheme_len;
+    let mut end = after_scheme;
+    for (offset, c) in text[after_scheme..].char_indices() {
+        if c.is_whitespace() {
+            break;
+        }
+        end = after_scheme + offset + c.len_utf8();
+    }
+    if end <= after_scheme {
+        return None;
+    }
+    end = trim_trailing_punctuation(text, after_scheme, end);
+    (end > after_scheme).then_some(end)
+}
+
+fn trim_trailing_punctuation(text: &str, match_start: usize, mut end: usize) -> usize {
+    while let Some(last) = text[match_start..end].chars().next_back() {
+        let span = &text[match_start..end];
+        let strip = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '*' => true,
+            ')' => span.matches('(').count() < span.matches(')').count(),
+            ']' => span.matches('[').count() < span.matches(']').count(),
+            '}' => span.matches('{').count() < span.matches('}').count(),
+            _ => false,
+        };
+        if !strip {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    end
+}
+
+/// If `text[at]` is the `@` of what looks like an email address, returns its
+/// `(start, end)` byte range - scanning backward over local-part characters
+/// and forward over domain-label characters, requiring the final label to
+/// look like a TLD (2+ letters) and at least one earlier `.` in the domain.
+fn match_email(text: &str, at: usize) -> Option<(usize, usize)> {
+    let mut start = at;
+    for (idx, c) in text[..at].char_indices().rev() {
+        if !is_local_part_char(c) {
+            break;
+        }
+        start = idx;
+    }
+    if start == at {
+        return None;
+    }
+
+    let mut domain_end = at + 1;
+    for (idx, c) in text[at + 1..].char_indices() {
+        if !is_domain_char(c) {
+            break;
+        }
+        domain_end = at + 1 + idx + c.len_utf8();
+    }
+    // '.' is a domain char, so a greedy scan swallows a trailing sentence
+    // period too - shed those before validating the domain shape.
+    while domain_end > at + 1 && text[..domain_end].ends_with('.') {
+        domain_end -= 1;
+    }
+    let domain = &text[at + 1..domain_end];
+    is_valid_domain(domain).then_some((start, domain_end))
+}
+
+fn is_local_part_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')
+}
+
+fn is_domain_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-')
+}
+
+fn is_valid_domain(domain: &str) -> bool {
+    let labels: Vec<&str> = domain.split('.').collect();
+    labels.len() >= 2 && labels.iter().all(|l| !l.is_empty()) && labels.last().is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
 /// Decodes one text part's raw bytes (as returned by `BODY.PEEK[<part>]`)
 /// into its text and html renderings. The part is wrapped in a minimal
 /// single-part message - `Content-Type` (with its charset parameter) and
 /// `Content-Transfer-Encoding` from the body structure - and parsed with
 /// `mail_parser`, which handles base64/quoted-printable decoding and charset
-/// conversion. Returns `(text, html)` in `mail_parser`'s sense: the html half
-/// of a plain part is its synthesized rendering, the text half of an html
-/// part is its converted text.
+/// conversion. Returns `(text, html)`: the html half of a `text/html` part is
+/// its own markup with bare links in its text nodes linkified
+/// (`linkify_html_text_nodes`), while a `text/plain` part's html half is
+/// built from scratch via `linkify_to_html` from its converted text.
 fn decode_text_part(part: &BodyPart, bytes: &[u8]) -> (Option<String>, Option<String>) {
     let mut headers = String::from("Content-Type: ");
     headers.push_str(&part.content_type);
@@ -295,7 +611,17 @@ fn decode_text_part(part: &BodyPart, bytes: &[u8]) -> (Option<String>, Option<St
     raw.extend_from_slice(b"\r\n\r\n");
     raw.extend_from_slice(bytes);
     let Some(message) = MessageParser::default().parse(&raw) else { return (None, None) };
-    (message.body_text(0).map(|c| c.into_owned()), message.body_html(0).map(|c| c.into_owned()))
+    let text = message.body_text(0).map(|c| c.into_owned());
+    // A genuine `text/html` part's own markup only gets its text nodes
+    // linkified; a `text/plain` part's html half is mail_parser's
+    // unlinkified synthesis (see `parse_body`), so it's rebuilt via
+    // `linkify_to_html` instead.
+    let html = if part.content_type == "text/html" {
+        message.body_html(0).map(|c| linkify_html_text_nodes(&c))
+    } else {
+        text.as_deref().map(linkify_to_html)
+    };
+    (text, html)
 }
 
 /// Decodes a fetched MIME part's *wire* bytes (as returned by
@@ -464,13 +790,107 @@ mod tests {
     fn plain_text_fixture_has_text_body() {
         let body = parse_body(Uid(0), &fixture("plain-text.eml")).expect("parses");
         assert!(body.text_body.is_some());
-        // Note: mail_parser's body_html(0) synthesizes an HTML rendering of
-        // the plain-text body as a convenience fallback (wraps it in
-        // <html><body>...<br/> tags), so html_body is Some here too - a
-        // genuinely plain-text-only message doesn't actually leave
-        // html_body unset. render_body() in the app crate prefers
-        // html_body when present, so this fixture in practice renders via
-        // the WebKit view, not the Gtk.TextView fallback path.
+        // A genuinely plain-text-only message doesn't leave html_body unset:
+        // parse_body synthesizes one via linkify_to_html (see that
+        // function's doc comment), so render_body() in the app crate - which
+        // prefers html_body when present - renders this fixture via the
+        // WebKit view, not the Gtk.TextView fallback path.
+        assert!(body.html_body.is_some());
+    }
+
+    #[test]
+    fn plain_text_fixture_linkifies_urls_and_email_addresses() {
+        let body = parse_body(Uid(0), &fixture("plain-text-with-link.eml")).expect("parses");
+        let html = body.html_body.expect("has synthesized html body");
+        // "Details here!http://..." - no whitespace before the scheme - is
+        // exactly the reported case; the URL is recognized anyway, and its
+        // query string's `&` is escaped in the emitted href.
+        assert!(html.contains(r#"<a href="http://example.com/path?a=1&amp;b=2">http://example.com/path?a=1&amp;b=2</a>"#), "html was: {html}");
+        assert!(html.contains(r#"<a href="mailto:carol@example.org">carol@example.org</a>"#), "html was: {html}");
+    }
+
+    #[test]
+    fn linkify_to_html_recognizes_a_url_glued_to_punctuation() {
+        assert_eq!(linkify_to_html("Info:http://example.com end"), r#"Info:<a href="http://example.com">http://example.com</a> end"#);
+        assert_eq!(linkify_to_html("Click here!https://example.com end"), r#"Click here!<a href="https://example.com">https://example.com</a> end"#);
+    }
+
+    #[test]
+    fn linkify_to_html_trims_trailing_sentence_punctuation() {
+        assert_eq!(linkify_to_html("see http://example.com."), r#"see <a href="http://example.com">http://example.com</a>."#);
+        assert_eq!(linkify_to_html("see http://example.com, ok"), r#"see <a href="http://example.com">http://example.com</a>, ok"#);
+        assert_eq!(linkify_to_html("(see http://example.com)"), r#"(see <a href="http://example.com">http://example.com</a>)"#);
+    }
+
+    #[test]
+    fn linkify_to_html_keeps_a_urls_own_balanced_parens() {
+        assert_eq!(
+            linkify_to_html("http://example.com/wiki/Rust_(programming_language)"),
+            r#"<a href="http://example.com/wiki/Rust_(programming_language)">http://example.com/wiki/Rust_(programming_language)</a>"#
+        );
+    }
+
+    #[test]
+    fn linkify_to_html_escapes_ampersand_in_link_and_plain_text() {
+        assert_eq!(
+            linkify_to_html("Terms & Conditions: http://example.com?a=1&b=2"),
+            r#"Terms &amp; Conditions: <a href="http://example.com?a=1&amp;b=2">http://example.com?a=1&amp;b=2</a>"#
+        );
+    }
+
+    #[test]
+    fn linkify_to_html_links_a_bare_email_address() {
+        assert_eq!(linkify_to_html("reach carol@example.org today"), r#"reach <a href="mailto:carol@example.org">carol@example.org</a> today"#);
+    }
+
+    #[test]
+    fn linkify_to_html_leaves_plain_text_unchanged_besides_escaping() {
+        assert_eq!(linkify_to_html("Hello Bob,\nno links here.\n\n- Alice"), "Hello Bob,<br/>no links here.<br/><br/>- Alice");
+    }
+
+    #[test]
+    fn linkify_html_text_nodes_links_a_bare_url_in_a_text_node() {
+        let html = linkify_html_text_nodes("<p>Info:http://example.com/a?x=1&amp;y=2 for details.</p>");
+        assert_eq!(html, r#"<p>Info:<a href="http://example.com/a?x=1&amp;y=2">http://example.com/a?x=1&amp;y=2</a> for details.</p>"#);
+    }
+
+    #[test]
+    fn linkify_html_text_nodes_does_not_touch_an_existing_link() {
+        let html = linkify_html_text_nodes(r#"<a href="http://example.com/existing?x=1&amp;y=2">click here http://not-a-real-link.example</a>"#);
+        assert_eq!(html, r#"<a href="http://example.com/existing?x=1&amp;y=2">click here http://not-a-real-link.example</a>"#);
+    }
+
+    #[test]
+    fn linkify_html_text_nodes_does_not_touch_style_or_script_content() {
+        let html = linkify_html_text_nodes(
+            r#"<style>body { background: url(http://example.com/bg.png); }</style><script>var u = "http://example.com/js";</script>"#,
+        );
+        assert_eq!(
+            html,
+            r#"<style>body { background: url(http://example.com/bg.png); }</style><script>var u = "http://example.com/js";</script>"#
+        );
+    }
+
+    #[test]
+    fn linkify_html_text_nodes_does_not_touch_attribute_values() {
+        let html = linkify_html_text_nodes(r#"<img src="http://example.com/pixel.png" alt="see http://example.com/info">"#);
+        assert_eq!(html, r#"<img src="http://example.com/pixel.png" alt="see http://example.com/info">"#);
+    }
+
+    #[test]
+    fn html_with_unlinked_url_fixture_gets_its_bare_url_linkified() {
+        let body = parse_body(Uid(0), &fixture("html-with-unlinked-url.eml")).expect("parses");
+        let html = body.html_body.expect("has html body");
+        // The bug this fixture reproduces: a genuine sender text/html part
+        // whose own markup never wraps its URL in <a> - "link:http://..."
+        // with no space, exactly the reported case.
+        assert!(html.contains(r#"link:<a href="http://example.com/track?a=1&amp;b=2">http://example.com/track?a=1&amp;b=2</a>"#), "html was: {html}");
+        // The sender's own existing link and its display text must survive
+        // untouched - no nested <a>, no altered href.
+        assert!(html.contains(r#"<a href="http://example.com/existing?x=1&amp;y=2">click here http://not-a-real-link.example</a>"#), "html was: {html}");
+        // A CSS `url(...)` inside <style> must never become a link.
+        assert!(html.contains("background: url(http://example.com/bg.png)"), "html was: {html}");
+        assert!(!html.contains(r#"url(<a href"#), "html was: {html}");
     }
 
     #[test]

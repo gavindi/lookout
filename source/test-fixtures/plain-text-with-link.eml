@@ -1,0 +1,14 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: Plain text fixture with a link
+Date: Tue, 28 Jul 2026 09:00:00 +0000
+Message-ID: <plain-text-with-link-fixture@lookout.test>
+Content-Type: text/plain; charset=utf-8
+
+Hello Bob,
+
+Details here!http://example.com/path?a=1&b=2 for the agenda.
+
+Reach out to carol@example.org with questions.
+
+- Alice

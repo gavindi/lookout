@@ -1,0 +1,24 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Subject: HTML fixture with an unlinked URL in a text node
+Date: Tue, 28 Jul 2026 09:00:00 +0000
+Message-ID: <html-with-unlinked-url-fixture@lookout.test>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="BOUNDARY"
+
+--BOUNDARY
+Content-Type: text/plain; charset=utf-8
+
+Track your parcel using the link:http://example.com/track?a=1&b=2 . Thanks!
+
+--BOUNDARY
+Content-Type: text/html; charset=utf-8
+
+<html><body>
+<p>Track your parcel using the link:http://example.com/track?a=1&amp;b=2 .</p>
+<p>Already linked: <a href="http://example.com/existing?x=1&amp;y=2">click here http://not-a-real-link.example</a></p>
+<style>body { background: url(http://example.com/bg.png); }</style>
+<script>var u = "http://example.com/should-not-linkify";</script>
+</body></html>
+
+--BOUNDARY--
