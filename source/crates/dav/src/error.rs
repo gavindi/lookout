@@ -18,6 +18,8 @@ pub enum Error {
     Recurrence(String),
     #[error("login failed: {0}")]
     LoginFailed(String),
+    #[error("not authorized: {0}")]
+    Unauthorized(String),
     #[error("account does not use this authentication method")]
     WrongAuthMethod,
     #[error("CalDAV discovery failed: {0}")]

@@ -240,8 +240,8 @@ async fn connect_and_run(
     let _ = events.send(CalendarSessionEvent::CalendarsUpdated(calendars.clone())).await;
 
     let mut current_month = first_of_month(chrono::Utc::now().date_naive());
-    sync_month(&client, &calendars, &credential, current_month, events, cache).await;
-    sync_tasks(&client, &calendars, &credential, events, cache).await;
+    sync_month(&client, &calendars, &credential, current_month, events, cache).await?;
+    sync_tasks(&client, &calendars, &credential, events, cache).await?;
 
     loop {
         let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
@@ -264,25 +264,30 @@ async fn connect_and_run(
         let mut woke_on_command = None;
         match wake {
             Wake::Poll => {
-                sync_month(&client, &calendars, &credential, current_month, events, cache).await;
-                sync_tasks(&client, &calendars, &credential, events, cache).await;
+                sync_month(&client, &calendars, &credential, current_month, events, cache).await?;
+                sync_tasks(&client, &calendars, &credential, events, cache).await?;
             }
             Wake::Command(cmd) => woke_on_command = Some(cmd),
             Wake::ChannelClosed => return Ok(ShutdownReason::Requested),
         }
 
         // Process the command that woke us (if any), then drain any further
-        // commands queued up while we were mid-sync.
+        // commands queued up while we were mid-sync. A `?` here on an
+        // `Unauthorized` error from `sync_month`/`sync_tasks` deliberately
+        // exits this connection (see their doc comments): it propagates up
+        // to `run_calendar_session`'s reconnect loop, which re-fetches
+        // credentials on the next attempt rather than continuing to poll
+        // with a token that every remaining calendar would also reject.
         for command in woke_on_command.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
             match command {
                 CalendarCommand::Shutdown => return Ok(ShutdownReason::Requested),
-                CalendarCommand::Refresh => sync_month(&client, &calendars, &credential, current_month, events, cache).await,
+                CalendarCommand::Refresh => sync_month(&client, &calendars, &credential, current_month, events, cache).await?,
                 CalendarCommand::SyncMonth(date) => {
                     current_month = first_of_month(date);
-                    sync_month(&client, &calendars, &credential, current_month, events, cache).await;
+                    sync_month(&client, &calendars, &credential, current_month, events, cache).await?;
                 }
                 CalendarCommand::FetchMonth(date) => {
-                    sync_month(&client, &calendars, &credential, first_of_month(date), events, cache).await;
+                    sync_month(&client, &calendars, &credential, first_of_month(date), events, cache).await?;
                 }
                 CalendarCommand::CreateEvent { event } => {
                     write_event(&client, &calendars, &credential, &event, current_month, events, cache).await;
@@ -291,12 +296,12 @@ async fn connect_and_run(
                     write_event(&client, &calendars, &credential, &event, current_month, events, cache).await;
                 }
                 CalendarCommand::DeleteEvent { calendar_id: _, href, etag } => match client.delete_calendar_object(&href, &credential, etag.as_deref()).await {
-                    Ok(()) => sync_month(&client, &calendars, &credential, current_month, events, cache).await,
+                    Ok(()) => sync_month(&client, &calendars, &credential, current_month, events, cache).await?,
                     Err(e) => {
                         let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete event: {e}"))).await;
                     }
                 },
-                CalendarCommand::SyncTasks => sync_tasks(&client, &calendars, &credential, events, cache).await,
+                CalendarCommand::SyncTasks => sync_tasks(&client, &calendars, &credential, events, cache).await?,
                 CalendarCommand::CreateTask { task } => {
                     write_task(&client, &calendars, &credential, &task, events, cache).await;
                 }
@@ -304,7 +309,7 @@ async fn connect_and_run(
                     write_task(&client, &calendars, &credential, &task, events, cache).await;
                 }
                 CalendarCommand::DeleteTask { calendar_id: _, href, etag } => match client.delete_calendar_object(&href, &credential, etag.as_deref()).await {
-                    Ok(()) => sync_tasks(&client, &calendars, &credential, events, cache).await,
+                    Ok(()) => sync_tasks(&client, &calendars, &credential, events, cache).await?,
                     Err(e) => {
                         let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete task: {e}"))).await;
                     }
@@ -333,7 +338,16 @@ async fn connect_and_run(
 /// is logged and skipped rather than aborting the whole sync - unlike
 /// `lookout_mail::session`'s single-mailbox-at-a-time design, one account
 /// here can have several independent calendar collections, and one flaky
-/// collection shouldn't blank out every other calendar's events.
+/// collection shouldn't blank out every other calendar's events. Two
+/// exceptions to that isolation, both to avoid the account's events silently
+/// going blank while the session otherwise looks "connected":
+/// - If *every* calendar fails, the merged (empty) result is not sent or
+///   cached - the last-known-good state is left alone rather than being
+///   overwritten by a transient outage.
+/// - `Error::Unauthorized` (a stale/expired credential) means every
+///   remaining calendar will fail identically, so it's returned immediately
+///   instead of being treated as a per-calendar failure - the caller
+///   propagates it to force a reconnect that fetches a fresh credential.
 async fn sync_month(
     client: &DavClient,
     calendars: &[CalendarInfo],
@@ -341,7 +355,7 @@ async fn sync_month(
     month: NaiveDate,
     events: &async_channel::Sender<CalendarSessionEvent>,
     cache: Option<&CalendarCache>,
-) {
+) -> Result<()> {
     if let Some(cache) = cache {
         if let Ok(Some(occurrences)) = cache.load_month(month) {
             let _ = events.send(CalendarSessionEvent::OccurrencesUpdated { month, occurrences }).await;
@@ -355,9 +369,11 @@ async fn sync_month(
     let window_end = month_end.and_time(NaiveTime::MIN).and_utc();
 
     let mut occurrences = Vec::new();
+    let mut any_succeeded = false;
     for calendar in calendars {
         match client.fetch_events_in_range(calendar, fetch_start, fetch_end, credential).await {
             Ok(calendar_events) => {
+                any_succeeded = true;
                 // Group by UID: a recurring master and its per-occurrence
                 // overrides (VEVENTs sharing the UID with RECURRENCE-ID) must
                 // be expanded together, or the override would double-render
@@ -388,10 +404,18 @@ async fn sync_month(
                     }
                 }
             }
+            Err(e @ Error::Unauthorized(_)) => {
+                tracing::warn!("failed to fetch events for calendar {:?}: {e}", calendar.display_name);
+                return Err(e);
+            }
             Err(e) => {
                 tracing::warn!("failed to fetch events for calendar {:?}: {e}", calendar.display_name);
             }
         }
+    }
+
+    if !calendars.is_empty() && !any_succeeded {
+        return Ok(());
     }
 
     let _ = events
@@ -405,6 +429,7 @@ async fn sync_month(
             tracing::warn!("failed to cache occurrences for {month}: {e}");
         }
     }
+    Ok(())
 }
 
 /// Creates or updates `event` on the server, sharing one code path: serialize
@@ -452,7 +477,10 @@ async fn write_event(
                 months.push(event_month);
             }
             for month in months {
-                sync_month(client, calendars, credential, month, events, cache).await;
+                // A resync failure here (including an expired credential)
+                // doesn't unwind the write that just succeeded - it'll be
+                // retried on the next poll or an explicit reconnect.
+                let _ = sync_month(client, calendars, credential, month, events, cache).await;
             }
         }
         Err(e) => {
@@ -472,7 +500,7 @@ async fn write_event(
 /// temporal span, so the whole set is always refetched (they're small).
 /// Same cache-first fast-paint and per-collection failure isolation as
 /// `sync_month`.
-async fn sync_tasks(client: &DavClient, calendars: &[CalendarInfo], credential: &Credential, events: &async_channel::Sender<CalendarSessionEvent>, cache: Option<&CalendarCache>) {
+async fn sync_tasks(client: &DavClient, calendars: &[CalendarInfo], credential: &Credential, events: &async_channel::Sender<CalendarSessionEvent>, cache: Option<&CalendarCache>) -> Result<()> {
     if let Some(cache) = cache {
         if let Ok(Some(tasks)) = cache.load_tasks() {
             let _ = events.send(CalendarSessionEvent::TasksUpdated(tasks)).await;
@@ -480,17 +508,31 @@ async fn sync_tasks(client: &DavClient, calendars: &[CalendarInfo], credential: 
     }
 
     let mut tasks = Vec::new();
+    let mut any_attempted = false;
+    let mut any_succeeded = false;
     for calendar in calendars {
         if !calendar.supports_tasks {
             tracing::debug!("skipping task sync for calendar {:?}: server advertises no VTODO support", calendar.display_name);
             continue;
         }
+        any_attempted = true;
         match client.fetch_tasks(calendar, credential).await {
-            Ok(calendar_tasks) => tasks.extend(calendar_tasks),
+            Ok(calendar_tasks) => {
+                any_succeeded = true;
+                tasks.extend(calendar_tasks);
+            }
+            Err(e @ Error::Unauthorized(_)) => {
+                tracing::warn!("failed to fetch tasks for calendar {:?}: {e}", calendar.display_name);
+                return Err(e);
+            }
             Err(e) => {
                 tracing::warn!("failed to fetch tasks for calendar {:?}: {e}", calendar.display_name);
             }
         }
+    }
+
+    if any_attempted && !any_succeeded {
+        return Ok(());
     }
 
     let _ = events.send(CalendarSessionEvent::TasksUpdated(tasks.clone())).await;
@@ -499,6 +541,7 @@ async fn sync_tasks(client: &DavClient, calendars: &[CalendarInfo], credential: 
             tracing::warn!("failed to cache tasks: {e}");
         }
     }
+    Ok(())
 }
 
 /// Creates or updates `task` on the server - the `write_event` counterpart,
@@ -538,7 +581,9 @@ async fn write_task(
     };
 
     match client.put_calendar_object(&href, &ics, credential, task.etag.as_deref()).await {
-        Ok(_new_etag) => sync_tasks(client, calendars, credential, events, cache).await,
+        Ok(_new_etag) => {
+            let _ = sync_tasks(client, calendars, credential, events, cache).await;
+        }
         Err(e) => {
             let _ = events.send(CalendarSessionEvent::Error(format!("failed to save task \"{}\": {e}", task.uid))).await;
         }
@@ -583,7 +628,90 @@ fn next_month(date: NaiveDate) -> NaiveDate {
 
 #[cfg(test)]
 mod tests {
+    use lookout_core::{AccountId, CalendarId};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    fn test_calendar(href: &str) -> CalendarInfo {
+        CalendarInfo {
+            id: CalendarId("cal-1".to_string()),
+            account_id: AccountId("test-account".to_string()),
+            display_name: "Personal".to_string(),
+            color: None,
+            href: href.to_string(),
+            supports_tasks: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_month_leaves_prior_state_untouched_when_every_calendar_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("REPORT"))
+            .and(path("/calendars/personal/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let client = DavClient::new(&format!("{}/dav/", server.uri()), false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+        let calendars = vec![test_calendar("/calendars/personal/")];
+        let (tx, rx) = async_channel::unbounded();
+        let month = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+
+        let result = sync_month(&client, &calendars, &credential, month, &tx, None).await;
+
+        assert!(result.is_ok(), "a non-auth per-calendar failure must not abort the session: {result:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "no OccurrencesUpdated should be sent when every calendar failed - it would overwrite last-known-good state with an empty list"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_month_propagates_unauthorized_to_force_a_reconnect() {
+        let server = MockServer::start().await;
+        Mock::given(method("REPORT"))
+            .and(path("/calendars/personal/"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token expired"))
+            .mount(&server)
+            .await;
+
+        let client = DavClient::new(&format!("{}/dav/", server.uri()), false, "alice".to_string()).unwrap();
+        let credential = Credential::OAuth2AccessToken("stale".to_string());
+        let calendars = vec![test_calendar("/calendars/personal/")];
+        let (tx, rx) = async_channel::unbounded();
+        let month = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+
+        let err = sync_month(&client, &calendars, &credential, month, &tx, None).await.unwrap_err();
+
+        assert!(matches!(err, Error::Unauthorized(_)), "expected Unauthorized, got {err:?}");
+        assert!(rx.try_recv().is_err(), "no OccurrencesUpdated should be sent on an auth failure either");
+    }
+
+    #[tokio::test]
+    async fn sync_tasks_leaves_prior_state_untouched_when_every_calendar_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("REPORT"))
+            .and(path("/calendars/personal/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let client = DavClient::new(&format!("{}/dav/", server.uri()), false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+        let calendars = vec![test_calendar("/calendars/personal/")];
+        let (tx, rx) = async_channel::unbounded();
+
+        let result = sync_tasks(&client, &calendars, &credential, &tx, None).await;
+
+        assert!(result.is_ok(), "a non-auth per-calendar failure must not abort the session: {result:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "no TasksUpdated should be sent when every calendar failed - it would overwrite last-known-good state with an empty list"
+        );
+    }
 
     #[test]
     fn first_of_month_normalizes_any_day() {

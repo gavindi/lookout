@@ -555,6 +555,14 @@ impl DavClient {
             // control-character-laden, so it's sanitized before it can land
             // in a GTK toast or label.
             let snippet = sanitize_snippet(&text);
+            // 401/403 get their own variant, distinct from a generic
+            // Discovery error: the caller (the calendar session loop) needs
+            // to tell "this credential is stale, stop polling with it and
+            // reconnect to fetch a fresh one" apart from an ordinary
+            // per-request failure.
+            if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                return Err(Error::Unauthorized(format!("HTTP {status} for {request_url}: {snippet}")));
+            }
             return Err(Error::Discovery(format!("HTTP {status} for {request_url}: {snippet}")));
         }
         Ok(response)
@@ -676,6 +684,40 @@ mod tests {
         let url = format!("{}/huge.ics", server.uri()).parse().unwrap();
         let err = fetch_webcal_ics(&http, &url).await.unwrap_err();
         assert!(err.to_string().contains("size limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn send_request_classifies_401_and_403_as_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPFIND"))
+            .and(path("/dav/"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token expired"))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::OAuth2AccessToken("stale-token".to_string());
+
+        let err = client.discover_calendar_home(&credential).await.unwrap_err();
+        assert!(matches!(err, Error::Unauthorized(_)), "expected Unauthorized, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn send_request_keeps_other_statuses_as_discovery_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPFIND"))
+            .and(path("/dav/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("server exploded"))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        let err = client.discover_calendar_home(&credential).await.unwrap_err();
+        assert!(matches!(err, Error::Discovery(_)), "expected Discovery, got {err:?}");
     }
 
     #[tokio::test]

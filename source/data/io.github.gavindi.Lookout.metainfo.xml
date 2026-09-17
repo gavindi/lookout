@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.147" date="2026-09-17">
+      <description>
+        <p>Fixed a bug where the calendar could go completely blank after the app had been running for a long time (most commonly after the computer had been asleep), only recovering on a restart. Calendar sync now detects an expired sign-in and reconnects automatically instead of silently failing, and a temporary sync failure no longer clears events that were already loaded.</p>
+      </description>
+    </release>
     <release version="0.9.146" date="2026-09-16">
       <description>
         <p>Bare URLs and email addresses in the message viewer are now clickable links, including when a link is glued directly onto punctuation with no space (e.g. "Info:http://example.com"). This covers both plain-text messages and HTML messages whose sender never linked their own URL.</p>
