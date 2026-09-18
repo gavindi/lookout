@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.148" date="2026-09-19">
+      <description>
+        <p>Fixed the mail tab's message list not coming back at its remembered width when the window starts maximized, and not resizing to match when the window is maximized or unmaximized. Every resizable pane now restores as soon as it appears, and a pane whose width had to be squeezed to fit a narrow window no longer forgets the width you dragged it to.</p>
+      </description>
+    </release>
     <release version="0.9.147" date="2026-09-17">
       <description>
         <p>Fixed a bug where the calendar could go completely blank after the app had been running for a long time (most commonly after the computer had been asleep), only recovering on a restart. Calendar sync now detects an expired sign-in and reconnects automatically instead of silently failing, and a temporary sync failure no longer clears events that were already loaded.</p>
