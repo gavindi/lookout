@@ -198,6 +198,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(PANE_MESSAGE_LIST_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_CALENDAR_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_CONTACTS_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
+    map.insert(PANE_CONFIG_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_MAIL_OVERVIEW_WIDTH_PCT, Value::Double(-1.0));
     map.insert(WINDOW_WIDTH, Value::Int(1600));
     map.insert(WINDOW_HEIGHT, Value::Int(900));
@@ -433,6 +434,27 @@ mod tests {
         assert_eq!(store.get_double(PANE_MESSAGE_LIST_WIDTH_PCT), 30.0);
         store.set_double(BACKGROUND_BRIGHTNESS, 0.4);
         assert_eq!(store.get_double(BACKGROUND_BRIGHTNESS), 0.4);
+    }
+
+    #[test]
+    fn every_pane_width_key_has_the_same_never_set_default() {
+        // All six must be declared in `defaults()`, not left to the getter's
+        // catch-all: the memory backend is meant to mirror the schema exactly,
+        // and a key missing here is indistinguishable from one that is present
+        // until someone changes that catch-all.
+        let store = resolve();
+        for key in [
+            PANE_FOLDER_WIDTH_PCT,
+            PANE_MESSAGE_LIST_WIDTH_PCT,
+            PANE_CALENDAR_SIDEBAR_WIDTH_PCT,
+            PANE_CONTACTS_SIDEBAR_WIDTH_PCT,
+            PANE_CONFIG_SIDEBAR_WIDTH_PCT,
+            PANE_MAIL_OVERVIEW_WIDTH_PCT,
+        ] {
+            assert_eq!(store.get_double(key), -1.0, "{key} should default to the never-set sentinel");
+            store.set_double(key, 21.5);
+            assert_eq!(store.get_double(key), 21.5, "{key} should round-trip");
+        }
     }
 
     #[test]

@@ -26,6 +26,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.149" date="2026-09-19">
+      <description>
+        <p>Follow-up fix for remembered pane widths, which still came back at their defaults on some computers when the window starts maximized. Panes now wait for the window and their own layout to settle before restoring, so a width is never restored against the size the window had for a moment before it maximized, and the layout corrections GTK makes when the window resizes are no longer saved over the width you dragged to. Also fixes a pane creeping one pixel narrower on every launch.</p>
+      </description>
+    </release>
     <release version="0.9.148" date="2026-09-19">
       <description>
         <p>Fixed the mail tab's message list not coming back at its remembered width when the window starts maximized, and not resizing to match when the window is maximized or unmaximized. Every resizable pane now restores as soon as it appears, and a pane whose width had to be squeezed to fit a narrow window no longer forgets the width you dragged it to.</p>

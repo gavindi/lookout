@@ -239,11 +239,71 @@ const FOLDER_PANE_MIN_WIDTH: i32 = 200;
 /// an unreadably wide column.
 const FOLDER_PANE_MAX_WIDTH: i32 = 320;
 
-/// How many times a pane-width restore retries while a pane is mapped but not
-/// yet allocated, at the same 150 ms settle interval as everything else in that
-/// block - about a second, far longer than the frame or two an allocation
-/// actually takes. A pane still unallocated after that is left alone.
-const PANE_RESTORE_ATTEMPTS: u8 = 8;
+/// How many times a pane-width restore retries at the same 150 ms settle
+/// interval as everything else in that block - about three seconds.
+///
+/// Two separate things are being waited on, and the slower one sets the bound.
+/// A pane that is mapped but not yet allocated only needs a frame or two. The
+/// window width settling is what actually takes time: `window.maximize()` runs
+/// before `present()`, so the window is first allocated at its stored
+/// un-maximized width and only reaches the real maximized width once the
+/// compositor has acted on the request - which is a round trip, and behind a
+/// maximize animation on some desktops. Restoring against that transient width
+/// is precisely the bug this bound exists to avoid, so it is generous.
+const PANE_RESTORE_ATTEMPTS: u8 = 20;
+
+/// Per-pane bookkeeping for what a restore last put on screen: the paned's own
+/// allocated width at the time, and the position that was set against it.
+///
+/// This is what tells a user's drag apart from GTK's own re-clamp. GtkPaned
+/// clamps its position during a layout pass whenever its allocation changes,
+/// and emits `notify::position` from there - asynchronously, long after the
+/// restore's `pane_widths_applying` flag has been cleared, so that flag alone
+/// cannot catch it. But a clamp only ever happens *because* the allocation
+/// changed, and a drag never changes it, so comparing the paned's current width
+/// against the width recorded here separates the two exactly. See
+/// [`pane_change_is_a_drag`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneRestoreState {
+    /// `paned.width()` when the position below was applied.
+    paned_width: i32,
+    /// The position the restore set, or the clamp last observed.
+    position: i32,
+}
+
+/// Whether a `notify::position` on a restored pane is a user's drag, and so
+/// worth persisting, or GTK re-clamping the position to fit a new allocation,
+/// which must never be persisted.
+///
+/// `None` for `recorded` means the pane has not been restored during this map
+/// cycle: it is still showing its built-in default, or GTK's own
+/// allocation-time clamp of that default, and neither is a width the user
+/// chose. Saving then would overwrite the remembered percentage with a number
+/// that never came from them.
+///
+/// A changed `paned_width` is the signature of a clamp - the allocation moved,
+/// so GTK re-fitted the separator. The reading pane's minimum growing when a
+/// wide HTML message loads does this, as does every window resize and stack
+/// page switch. An unchanged `paned_width` with a moved position can only be
+/// the user dragging the separator.
+fn pane_change_is_a_drag(recorded: Option<PaneRestoreState>, paned_width: i32, position: i32) -> bool {
+    match recorded {
+        Some(recorded) => recorded.paned_width == paned_width && recorded.position != position,
+        None => false,
+    }
+}
+
+/// Whether the window width has stopped changing, which is the precondition for
+/// restoring a pane against it (and for marking the pane restored, which is
+/// what reopens its saves).
+///
+/// `previous` is the width seen on the last attempt, `None` on the first. A
+/// width is only trusted once two consecutive attempts agree on it: a single
+/// reading cannot distinguish the final maximized width from the transient
+/// un-maximized one the window is created at.
+fn window_width_is_stable(previous: Option<i32>, current: i32) -> bool {
+    current > 0 && previous == Some(current)
+}
 
 /// Where a paned's separator goes so its *start* child ends up `pct` of the
 /// window's width - the maths behind every pane-width restore, kept out of the
@@ -269,7 +329,13 @@ fn paned_position_for_percent(pct: f64, window_width: i32, paned_width: i32, sta
     if let Some(cap) = cap {
         max = max.min(cap).max(min);
     }
-    Some(((pct / 100.0 * window_width as f64) as i32).clamp(min, max))
+    // Rounded, not truncated: the stored percentage came from dividing an
+    // integer pixel width by an integer window width, so multiplying it back
+    // out lands a hair under the original (232/2880 replayed against 2880 is
+    // 231.99999999999997). Truncating that loses a pixel, which is then saved
+    // back as a slightly smaller percentage - a pane that creeps one pixel
+    // narrower on every launch.
+    Some(((pct / 100.0 * window_width as f64).round() as i32).clamp(min, max))
 }
 
 /// [`paned_position_for_percent`] for a pane that is its paned's *end* child -
@@ -281,7 +347,8 @@ fn paned_position_for_end_percent(pct: f64, window_width: i32, paned_width: i32,
         return None;
     }
     let max = paned_width.saturating_sub(start_min).max(end_min);
-    let target_end_width = ((pct / 100.0 * window_width as f64) as i32).clamp(end_min, max);
+    // Rounded for the same reason as `paned_position_for_percent`.
+    let target_end_width = ((pct / 100.0 * window_width as f64).round() as i32).clamp(end_min, max);
     // `.max(0)`: when the paned is narrower than the pane's own minimum there
     // is no room left for the start child at all, and a negative position is
     // not a position.
@@ -4989,40 +5056,61 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `set_position`. GTK emits `notify::position` *synchronously* from
     // `set_position`, so without it every restore writes its own - possibly
     // clamped - result straight back over the percentage the user dragged to.
+    // It only covers that synchronous re-entry, though: GTK *also* re-clamps a
+    // position from its layout pass whenever a paned's allocation changes, and
+    // that notify lands long after the flag has been cleared.
     //
-    // `panes_restored` records which panes have had their stored percentage put
-    // back during their current map cycle. Until that has happened a pane is
-    // still showing its built-in default (or GTK's own allocation-time clamp),
-    // and saving that would overwrite the remembered width with a number the
-    // user never chose. Cleared on unmap, because a pane that maps again goes
-    // through the same unrestored-then-clamped sequence.
+    // `panes_restored` is what catches those. Per pane it records the paned's
+    // allocated width and the position last put on screen, so a later notify
+    // can be classified: an unchanged allocation with a moved position is the
+    // user dragging, anything else is GTK re-fitting (see
+    // `pane_change_is_a_drag`). An absent entry means the pane has not been
+    // restored during this map cycle and is still showing its built-in default,
+    // which is equally not a width to persist. Cleared on unmap, because a pane
+    // that maps again goes through the same unrestored-then-clamped sequence.
     //
-    // The three accessor closures are the *only* places either cell is
-    // borrowed, and each holds its borrow for a single statement: the save
-    // handlers run re-entrantly inside `set_position`, so a borrow held across
-    // one would be an immediate `BorrowMutError`.
+    // The accessor closures are the *only* places the map is borrowed, and each
+    // holds its borrow for a single statement: the save handlers run
+    // re-entrantly inside `set_position`, so a borrow held across one would be
+    // an immediate `BorrowMutError`.
     let pane_widths_applying: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let panes_restored: Rc<RefCell<HashSet<&'static str>>> = Rc::new(RefCell::new(HashSet::new()));
+    let panes_restored: Rc<RefCell<HashMap<&'static str, PaneRestoreState>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Each pane's allocated width as of the previous restore attempt, so an
+    // attempt can tell a settled allocation from one still catching up with
+    // the window. Cleared on unmap with the restore record, since a remap
+    // starts the whole settle sequence again.
+    let pane_alloc_seen: Rc<RefCell<HashMap<&'static str, i32>>> = Rc::new(RefCell::new(HashMap::new()));
     let mark_pane_restored = {
         let panes_restored = panes_restored.clone();
-        move |key: &'static str| {
-            panes_restored.borrow_mut().insert(key);
+        move |key: &'static str, paned_width: i32, position: i32| {
+            panes_restored.borrow_mut().insert(key, PaneRestoreState { paned_width, position });
         }
     };
     let clear_pane_restored = {
         let panes_restored = panes_restored.clone();
+        let pane_alloc_seen = pane_alloc_seen.clone();
         move |key: &'static str| {
             panes_restored.borrow_mut().remove(key);
+            pane_alloc_seen.borrow_mut().remove(key);
         }
     };
-    let pane_is_restored = {
+    let pane_restore_state = {
         let panes_restored = panes_restored.clone();
-        move |key: &'static str| panes_restored.borrow().contains(key)
+        move |key: &'static str| panes_restored.borrow().get(key).copied()
     };
     // Returns whether every mapped pane settled: a pane that is mapped but not
     // yet allocated (no width to compute against) reports `false` so the
     // scheduler below can try again on the next tick, which is what makes the
     // restore deterministic instead of dependent on an incidental resize.
+    //
+    // `stable` says whether `window_width` has been confirmed by two
+    // consecutive attempts. Until it has, positions are still applied - it is
+    // better for a pane to be approximately right for one frame than to sit at
+    // its built-in default - but no pane is *marked* restored, so nothing that
+    // happens against a transient width can be persisted. `window.maximize()`
+    // runs before `present()`, so the first width a maximized window reports is
+    // the stored un-maximized one; persisting a percentage of that is how the
+    // remembered widths got corrupted.
     let apply_stored_pane_widths = {
         let main_paned = main_paned.clone();
         let messages_reading_paned = messages_reading_paned.clone();
@@ -5033,11 +5121,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let pane_widths_applying = pane_widths_applying.clone();
         let mark_pane_restored = mark_pane_restored.clone();
+        let pane_alloc_seen = pane_alloc_seen.clone();
+        let apply_generation: Rc<Cell<u32>> = Rc::new(Cell::new(0));
         // `give_up` is the scheduler's last attempt: a pane that still has no
         // allocation by then is counted as restored anyway, so its saves
         // reopen. Suppressing a real drag forever would be a worse failure
         // than restoring one pane late.
-        move |window_width: i32, give_up: bool| -> bool {
+        move |window_width: i32, stable: bool, give_up: bool| -> bool {
             if window_width <= 0 {
                 return false;
             }
@@ -5045,55 +5135,101 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // reset at the bottom would leave the flag stuck on and silently
             // disable every pane-width save for the rest of the session.
             pane_widths_applying.set(true);
+            let generation = apply_generation.get().wrapping_add(1);
+            apply_generation.set(generation);
             let settings = state.borrow().settings.clone();
-            let mut settled = true;
+            let mut settled = stable;
             {
                 // `end_child` marks the one pane (the mail tab's overview) that
                 // is its paned's end child, so its stored percentage is its own
                 // width rather than the separator's position.
                 let mut restore = |paned: &gtk::Paned, key: &'static str, cap: Option<i32>, end_child: bool| {
                     if !paned.is_mapped() {
+                        tracing::debug!(pane = key, "pane width restore skipped: not mapped");
                         return;
                     }
                     let pct = settings.get_double(key);
+                    let paned_width = paned.width();
+                    // A paned's own allocation lags the window's, and by a lot:
+                    // a window already reporting its full maximized width can
+                    // still hold paneds sized for the pre-maximize one, several
+                    // frames later. A position computed against that gets
+                    // clamped to a floor that has nothing to do with the final
+                    // layout, so - exactly like the window width - an
+                    // allocation is only trusted once two attempts agree on it.
+                    let previous_alloc = pane_alloc_seen.borrow().get(key).copied();
+                    pane_alloc_seen.borrow_mut().insert(key, paned_width);
+                    let trusted = stable && paned_width > 0 && previous_alloc == Some(paned_width);
                     let start_min = paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
                     let end_min = paned.end_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
                     let position = if end_child {
-                        paned_position_for_end_percent(pct, window_width, paned.width(), start_min, end_min)
+                        paned_position_for_end_percent(pct, window_width, paned_width, start_min, end_min)
                     } else {
-                        paned_position_for_percent(pct, window_width, paned.width(), start_min, end_min, cap)
+                        paned_position_for_percent(pct, window_width, paned_width, start_min, end_min, cap)
                     };
-                    match position {
-                        Some(position) => {
-                            // Marked *before* the move, never after:
-                            // `set_position` runs the save handler
-                            // synchronously and that handler reads this set.
-                            mark_pane_restored(key);
-                            paned.set_position(position);
+                    tracing::debug!(pane = key, pct, window_width, paned_width, start_min, end_min, stable, trusted, give_up, ?position, "pane width restore");
+                    // The position is applied on every attempt, trusted or not:
+                    // a pane that looks approximately right for one frame beats
+                    // one sitting at its built-in default. What waits for trust
+                    // is the *record*, since that is what reopens this pane's
+                    // saves - and a record made against a transient width or a
+                    // half-settled allocation would let the clamp that follows
+                    // be persisted as though the user had dragged it.
+                    if let Some(position) = position {
+                        // Recorded *before* the move, never after:
+                        // `set_position` runs the save handler synchronously
+                        // and that handler reads this map.
+                        if trusted || give_up {
+                            mark_pane_restored(key, paned_width, position);
                         }
-                        // Mapped, with a width worth restoring, but no
-                        // allocation to measure against yet - a pane's
-                        // allocation lands a frame or two after its map, so
-                        // report back and let the caller come round again.
-                        None if pct > 0.0 => {
-                            settled = false;
-                            if give_up {
-                                mark_pane_restored(key);
-                            }
-                        }
+                        paned.set_position(position);
+                    } else if pct <= 0.0 && (trusted || give_up) {
                         // Never dragged: nothing stored, so nothing to protect,
                         // and the pane's first drag should save normally.
-                        None => mark_pane_restored(key),
+                        mark_pane_restored(key, paned_width, paned.position());
+                    } else if give_up {
+                        // Something to restore but still no allocation to
+                        // measure against, and out of attempts. Suppressing a
+                        // real drag forever would be worse than giving up.
+                        mark_pane_restored(key, paned_width, paned.position());
+                    }
+                    if !trusted {
+                        settled = false;
                     }
                 };
+                // The outermost split goes first: setting it changes the width
+                // the inner paneds are measured against, so restoring it last
+                // would leave every inner position computed against a stale
+                // allocation and guarantee a follow-up clamp.
+                restore(&content_and_overview_paned, crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT, None, true);
                 restore(&main_paned, crate::settings::PANE_FOLDER_WIDTH_PCT, Some(FOLDER_PANE_MAX_WIDTH), false);
                 restore(&messages_reading_paned, crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT, None, false);
                 restore(&calendar_paned, crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT, None, false);
                 restore(&contacts_paned, crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT, None, false);
                 restore(&config_paned, crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT, None, false);
-                restore(&content_and_overview_paned, crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT, None, true);
             }
-            pane_widths_applying.set(false);
+            // The flag is cleared from an idle, not here, so it also covers the
+            // layout pass these `set_position` calls just queued. GtkPaned
+            // re-clamps its position during that pass and notifies from there,
+            // and the clamp can land on a paned whose allocation has *not*
+            // changed - `paned_position_for_percent` doesn't model the handle's
+            // own width, so a position near the end child's floor can come back
+            // a few pixels short. The allocation comparison in the save handlers
+            // cannot see that one, since nothing it compares has moved.
+            //
+            // GTK4 lays out at `GDK_PRIORITY_REDRAW`, which is a higher priority
+            // than the default idle, so this runs after the layout it is waiting
+            // on. The generation guard means overlapping applies don't let an
+            // earlier one's idle clear a later one's flag - and because a later
+            // apply always sets the flag again, a dropped idle can never leave
+            // saves disabled for good.
+            let generation_for_idle = apply_generation.clone();
+            let applying_for_idle = pane_widths_applying.clone();
+            glib::idle_add_local_once(move || {
+                if generation_for_idle.get() == generation {
+                    applying_for_idle.set(false);
+                }
+            });
             settled
         }
     };
@@ -5102,9 +5238,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // resize can all land within a few frames of each other, and only the last
     // one is worth acting on - the positions are only meaningful once the
     // allocation they're computed against has settled. When a pane is mapped
-    // but still unallocated the apply reports back and the timer runs again,
-    // up to a second or so, rather than leaving the pane at its built-in
-    // default until something else happens to resize the window.
+    // but still unallocated, or the window width is still moving, the apply
+    // reports back and the timer runs again, rather than leaving the pane at
+    // its built-in default until something else happens to resize the window.
+    //
+    // The window width is the slow one. A maximized window is created at its
+    // stored *un-maximized* width and only reaches the real one once the
+    // compositor has acted, so a width is only trusted once two consecutive
+    // attempts agree on it (`window_width_is_stable`). Restoring - and worse,
+    // persisting - against that first transient width is the whole bug.
     let schedule_apply_pane_widths = {
         let apply_stored_pane_widths = apply_stored_pane_widths.clone();
         let window_for_apply = window.clone();
@@ -5117,9 +5259,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let window = window_for_apply.clone();
             let debounce_for_timeout = debounce.clone();
             let attempts = Cell::new(0u8);
+            let previous_width: Cell<Option<i32>> = Cell::new(None);
             debounce.set(Some(glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
                 let last_attempt = attempts.get() + 1 >= PANE_RESTORE_ATTEMPTS;
-                let settled = apply(window.width(), last_attempt);
+                let width = window.width();
+                // On the final attempt the width is taken as-is: one pane
+                // restored against a slightly stale width is a far better
+                // failure than a pane left at its default forever.
+                let stable = window_width_is_stable(previous_width.replace(Some(width)), width) || last_attempt;
+                let settled = apply(width, stable, last_attempt);
                 attempts.set(attempts.get() + 1);
                 if settled || last_attempt {
                     debounce_for_timeout.set(None);
@@ -5129,165 +5277,79 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             })));
         }
     };
+    // One wiring for all six panes: a `position` notify that is genuinely the
+    // user dragging the separator stores the pane's width as a percentage of
+    // the window width, 150 ms after the drag settles.
+    //
+    // `end_child` marks the mail tab's overview pane, whose stored percentage
+    // is its own width rather than the separator's position. `cap` marks the
+    // folder pane, the one pane with a hard ceiling.
     {
-        let window_for_debug = window.clone();
-        let state_for_save = state.clone();
-        let applying = pane_widths_applying.clone();
-        let is_restored = pane_is_restored.clone();
-        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-        main_paned.connect_notify_local(Some("position"), move |paned, _| {
-            // Cap the folder pane's width: the drag itself is only bounded
-            // by the paned's natural minimums, so snap any overshoot here.
-            // Returning lets the re-entrant notify (from `set_position`)
-            // run the settle/save logic with the capped value. This stays
-            // ahead of the save guard below so the ceiling still holds for a
-            // pane GTK has laid out but nothing has restored yet; a restore's
-            // own positions are already capped, so it never fires from one.
-            if paned.position() > FOLDER_PANE_MAX_WIDTH {
-                paned.set_position(FOLDER_PANE_MAX_WIDTH);
-                return;
-            }
-            // Only a user's drag is worth storing. A restore's own
-            // `set_position` lands here synchronously (and may have been
-            // clamped), and a pane that hasn't been restored yet is still
-            // showing its built-in default - saving either would overwrite the
-            // width the user actually chose. Bailing before `debounce.take()`
-            // leaves a genuine drag's pending save, and its value, alone.
-            if applying.get() || !is_restored(crate::settings::PANE_FOLDER_WIDTH_PCT) {
-                return;
-            }
-            if let Some(id) = debounce.take() {
-                id.remove();
-            }
-            let width = paned.position();
-            let window_width = window_for_debug.width();
-            let state_for_timeout = state_for_save.clone();
-            let debounce_for_timeout = debounce.clone();
-            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                debounce_for_timeout.set(None);
-                if let Some(pct) = pane_width_percent(width, window_width) {
-                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_FOLDER_WIDTH_PCT, pct);
+        let wire_pane_width_save = |paned: &gtk::Paned, key: &'static str, end_child: bool, cap: bool| {
+            let window_for_save = window.clone();
+            let state_for_save = state.clone();
+            let applying = pane_widths_applying.clone();
+            let restore_state = pane_restore_state.clone();
+            let record_pane_state = mark_pane_restored.clone();
+            let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+            paned.connect_notify_local(Some("position"), move |paned, _| {
+                // Cap the folder pane's width: the drag itself is only bounded
+                // by the paned's natural minimums, so snap any overshoot here.
+                // Returning lets the re-entrant notify (from `set_position`)
+                // run the settle/save logic with the capped value. This stays
+                // ahead of the guards below so the ceiling still holds for a
+                // pane GTK has laid out but nothing has restored yet; a
+                // restore's own positions are already capped, so it never
+                // fires from one.
+                if cap && paned.position() > FOLDER_PANE_MAX_WIDTH {
+                    paned.set_position(FOLDER_PANE_MAX_WIDTH);
+                    return;
                 }
-            })));
-        });
-        let window_for_debug = window.clone();
-        let state_for_save = state.clone();
-        let applying = pane_widths_applying.clone();
-        let is_restored = pane_is_restored.clone();
-        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-        messages_reading_paned.connect_notify_local(Some("position"), move |paned, _| {
-            if applying.get() || !is_restored(crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT) {
-                return;
-            }
-            if let Some(id) = debounce.take() {
-                id.remove();
-            }
-            let width = paned.position();
-            let window_width = window_for_debug.width();
-            let state_for_timeout = state_for_save.clone();
-            let debounce_for_timeout = debounce.clone();
-            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                debounce_for_timeout.set(None);
-                if let Some(pct) = pane_width_percent(width, window_width) {
-                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT, pct);
+                // A restore's own `set_position` lands here synchronously.
+                if applying.get() {
+                    return;
                 }
-            })));
-        });
-        let window_for_debug = window.clone();
-        let state_for_save = state.clone();
-        let applying = pane_widths_applying.clone();
-        let is_restored = pane_is_restored.clone();
-        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-        calendar_paned.connect_notify_local(Some("position"), move |paned, _| {
-            if applying.get() || !is_restored(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT) {
-                return;
-            }
-            if let Some(id) = debounce.take() {
-                id.remove();
-            }
-            let width = paned.position();
-            let window_width = window_for_debug.width();
-            let state_for_timeout = state_for_save.clone();
-            let debounce_for_timeout = debounce.clone();
-            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                debounce_for_timeout.set(None);
-                if let Some(pct) = pane_width_percent(width, window_width) {
-                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT, pct);
+                let paned_width = paned.width();
+                let position = paned.position();
+                let recorded = restore_state(key);
+                if !pane_change_is_a_drag(recorded, paned_width, position) {
+                    // Either the pane has not been restored during this map
+                    // cycle - it is still showing its built-in default, which
+                    // the user never chose - or GTK has re-clamped the position
+                    // to fit a new allocation. The clamp case still updates the
+                    // record, so the next genuine drag is measured against what
+                    // is actually on screen now.
+                    if recorded.is_some() {
+                        tracing::debug!(pane = key, paned_width, position, "pane position re-clamped by GTK, not saving");
+                        record_pane_state(key, paned_width, position);
+                    }
+                    // Bailing before `debounce.take()` leaves a genuine drag's
+                    // pending save, and its value, alone.
+                    return;
                 }
-            })));
-        });
-        let window_for_debug = window.clone();
-        let state_for_save = state.clone();
-        let applying = pane_widths_applying.clone();
-        let is_restored = pane_is_restored.clone();
-        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-        contacts_paned.connect_notify_local(Some("position"), move |paned, _| {
-            if applying.get() || !is_restored(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT) {
-                return;
-            }
-            if let Some(id) = debounce.take() {
-                id.remove();
-            }
-            let width = paned.position();
-            let window_width = window_for_debug.width();
-            let state_for_timeout = state_for_save.clone();
-            let debounce_for_timeout = debounce.clone();
-            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                debounce_for_timeout.set(None);
-                if let Some(pct) = pane_width_percent(width, window_width) {
-                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT, pct);
+                record_pane_state(key, paned_width, position);
+                if let Some(id) = debounce.take() {
+                    id.remove();
                 }
-            })));
-        });
-        let window_for_debug = window.clone();
-        let state_for_save = state.clone();
-        let applying = pane_widths_applying.clone();
-        let is_restored = pane_is_restored.clone();
-        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-        config_view.paned.connect_notify_local(Some("position"), move |paned, _| {
-            if applying.get() || !is_restored(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT) {
-                return;
-            }
-            if let Some(id) = debounce.take() {
-                id.remove();
-            }
-            let width = paned.position();
-            let window_width = window_for_debug.width();
-            let state_for_timeout = state_for_save.clone();
-            let debounce_for_timeout = debounce.clone();
-            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                debounce_for_timeout.set(None);
-                if let Some(pct) = pane_width_percent(width, window_width) {
-                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT, pct);
-                }
-            })));
-        });
-        let window_for_debug = window.clone();
-        let state_for_save = state.clone();
-        let applying = pane_widths_applying.clone();
-        let is_restored = pane_is_restored.clone();
-        let debounce: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-        content_and_overview_paned.connect_notify_local(Some("position"), move |paned, _| {
-            if applying.get() || !is_restored(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT) {
-                return;
-            }
-            if let Some(id) = debounce.take() {
-                id.remove();
-            }
-            // The overview pane is the end child, so its width - not the
-            // position itself - is what should stay a constant percentage of
-            // the window width as the window is resized.
-            let end_width = paned.width().saturating_sub(paned.position());
-            let window_width = window_for_debug.width();
-            let state_for_timeout = state_for_save.clone();
-            let debounce_for_timeout = debounce.clone();
-            debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                debounce_for_timeout.set(None);
-                if let Some(pct) = pane_width_percent(end_width, window_width) {
-                    state_for_timeout.borrow().settings.set_double(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT, pct);
-                }
-            })));
-        });
+                let width = if end_child { paned_width.saturating_sub(position) } else { position };
+                let window_width = window_for_save.width();
+                let state_for_timeout = state_for_save.clone();
+                let debounce_for_timeout = debounce.clone();
+                debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                    debounce_for_timeout.set(None);
+                    if let Some(pct) = pane_width_percent(width, window_width) {
+                        tracing::debug!(pane = key, width, window_width, pct, "saving dragged pane width");
+                        state_for_timeout.borrow().settings.set_double(key, pct);
+                    }
+                })));
+            });
+        };
+        wire_pane_width_save(&main_paned, crate::settings::PANE_FOLDER_WIDTH_PCT, false, true);
+        wire_pane_width_save(&messages_reading_paned, crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT, false, false);
+        wire_pane_width_save(&calendar_paned, crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT, false, false);
+        wire_pane_width_save(&contacts_paned, crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT, false, false);
+        wire_pane_width_save(&config_view.paned, crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT, false, false);
+        wire_pane_width_save(&content_and_overview_paned, crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT, true, false);
     }
     // Each pane restores itself the moment it maps. This is what makes the
     // restore deterministic: every branch of `apply_stored_pane_widths` is
@@ -5327,7 +5389,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // so the applied percentages are against the final window size. Debounced
     // so the stored percentages are applied once the window stops resizing.
     {
-        let apply_stored_pane_widths = apply_stored_pane_widths.clone();
         let check_overview_fits = check_overview_fits.clone();
         let settings = settings.clone();
         let wired: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -5352,7 +5413,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // once, and dragging just one edge still triggers this via
             // whichever of the two notifies fires.
             let on_notify = {
-                let apply_for_notify = apply_stored_pane_widths.clone();
+                let schedule_for_notify = schedule_apply_pane_widths.clone();
                 let check_for_notify = check_overview_fits.clone();
                 let settings_for_notify = settings.clone();
                 let window_for_width = window.clone();
@@ -5362,15 +5423,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         id.remove();
                     }
                     let window_for_timeout = window_for_width.clone();
-                    let apply_for_timeout = apply_for_notify.clone();
+                    let schedule_for_timeout = schedule_for_notify.clone();
                     let check_for_timeout = check_for_notify.clone();
                     let settings_for_timeout = settings_for_notify.clone();
                     let debounce_for_timeout = debounce.clone();
                     debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
                         debounce_for_timeout.set(None);
-                        // A resize is its own retry: the next one comes with
-                        // the next notify, so nothing is given up on here.
-                        let _ = apply_for_timeout(window_for_timeout.width(), false);
+                        // Through the shared scheduler rather than straight to
+                        // the apply, so a resize gets the same settle-and-retry
+                        // treatment as every other trigger. The window width has
+                        // stopped moving by now, but the paneds' own allocations
+                        // trail it by several frames, and a single shot here
+                        // would restore them against half-settled widths.
+                        schedule_for_timeout();
                         check_for_timeout();
                         // Only the un-maximized size is worth restoring to -
                         // GTK4's own `default-width`/`default-height` follow
@@ -5408,6 +5473,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
         window.connect_maximized_notify(move |win| {
             settings.set_bool(crate::settings::WINDOW_MAXIMIZED, win.is_maximized());
+            schedule_apply_pane_widths();
+        });
+    }
+    // A third width signal, because neither of the two above is guaranteed to
+    // fire. The GdkSurface notify is wired from the window's `map`, so a
+    // compositor that maps the window *already* at its final maximized size
+    // produces no post-map surface resize at all; and `notify::maximized` can
+    // arrive before the new allocation, which is the race the width-stability
+    // check in the scheduler exists to survive. GtkWindow's own `default-width`
+    // moves on an ordinary resize, so listening here as well means a width
+    // change has to evade all three to go unnoticed. Everything shares the one
+    // debounce, so the redundancy costs nothing.
+    {
+        let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
+        window.connect_notify_local(Some("default-width"), move |_, _| {
             schedule_apply_pane_widths();
         });
     }
@@ -17392,6 +17472,62 @@ mod tests {
     fn nothing_is_stored_for_a_window_with_no_width() {
         assert_eq!(pane_width_percent(400, 0), None);
         assert_eq!(pane_width_percent(400, -1), None);
+    }
+
+    #[test]
+    fn a_restored_width_does_not_creep_a_pixel_on_every_launch() {
+        // Taken from a real session: a 232px overview pane in a 2880px window
+        // stores 8.055555555555555%, and replaying that against 2880 gives
+        // 231.99999999999997. Truncating lost the pixel, and the narrower pane
+        // was then saved as a smaller percentage - so the pane shrank by one
+        // pixel every launch. Both directions of the round trip must be exact.
+        let pct = pane_width_percent(232, 2880).expect("a real window has a width");
+        assert_eq!(paned_position_for_end_percent(pct, 2880, 2818, 1174, 226), Some(2818 - 232));
+        let pct = pane_width_percent(934, 2880).expect("a real window has a width");
+        assert_eq!(paned_position_for_percent(pct, 2880, 2260, 387, 563, None), Some(934));
+    }
+
+    #[test]
+    fn only_a_drag_within_an_unchanged_allocation_is_saved() {
+        let restored = Some(PaneRestoreState { paned_width: 1500, position: 400 });
+        assert!(pane_change_is_a_drag(restored, 1500, 520), "the separator moved while the paned stayed the same size: a drag");
+        assert!(!pane_change_is_a_drag(restored, 1500, 400), "the position didn't actually change");
+    }
+
+    #[test]
+    fn a_gtk_reclamp_after_an_allocation_change_is_never_saved() {
+        // The regression this whole change exists for. GtkPaned re-clamps its
+        // position from a layout pass whenever its allocation changes, and
+        // emits `notify::position` from there - asynchronously, after the
+        // restore's `pane_widths_applying` flag has already been cleared. The
+        // changed `paned_width` is what gives it away.
+        let restored = Some(PaneRestoreState { paned_width: 1500, position: 400 });
+        assert!(!pane_change_is_a_drag(restored, 2400, 400), "window widened: the paned grew, so this is a re-fit");
+        assert!(!pane_change_is_a_drag(restored, 900, 300), "window narrowed: the position was clamped down to fit");
+    }
+
+    #[test]
+    fn a_pane_that_has_not_been_restored_yet_never_saves() {
+        // No record means the pane is still showing its built-in default, or
+        // GTK's allocation-time clamp of it - neither is a width the user
+        // chose, and saving one would overwrite the remembered percentage.
+        assert!(!pane_change_is_a_drag(None, 1500, 400));
+        assert!(!pane_change_is_a_drag(None, 0, 0));
+    }
+
+    #[test]
+    fn a_window_width_is_only_trusted_once_two_attempts_agree() {
+        assert!(!window_width_is_stable(None, 1600), "the first reading could be the pre-maximize width");
+        assert!(!window_width_is_stable(Some(1600), 2880), "still moving: the maximize just landed");
+        assert!(window_width_is_stable(Some(2880), 2880), "two attempts agree, so this is the settled width");
+    }
+
+    #[test]
+    fn a_window_with_no_width_is_never_stable() {
+        // An unallocated window reports 0, and two zeroes in a row still say
+        // nothing about the width the panes will end up being laid out in.
+        assert!(!window_width_is_stable(Some(0), 0));
+        assert!(!window_width_is_stable(Some(-1), -1));
     }
 
     fn test_mailbox(account: &AccountId, name: &str, unread: u32) -> Mailbox {
