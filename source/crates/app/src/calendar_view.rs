@@ -43,16 +43,20 @@ const TIME_SLOT_HEIGHT: f64 = 48.0;
 /// Height of the "All day" band above the 24-hour timeline.
 const ALL_DAY_BAND_HEIGHT: f64 = 26.0;
 /// The time grids are drawn on a single Cairo canvas (so event chips can be
-/// positioned by their start/end times and multi-day events can span columns),
-/// which means the old `.calendar-hour-cell*` CSS tones are needed in Cairo
-/// form. `#26262a` off-hours background...
-const GRID_BACKGROUND_RGB: (f64, f64, f64) = (0.149, 0.149, 0.165);
-/// ...`#3d3d44` business-hours stripe...
-const GRID_BUSINESS_RGB: (f64, f64, f64) = (0.239, 0.239, 0.267);
-/// ...and `#2e2e32` for the all-day band (the main panel's own background).
-const GRID_ALL_DAY_RGB: (f64, f64, f64) = (0.180, 0.180, 0.196);
-/// Dim-label tone for the custom-drawn gutter text.
-const GRID_DIM_TEXT_RGBA: (f64, f64, f64, f64) = (0.66, 0.66, 0.72, 1.0);
+/// positioned by their start/end times and multi-day events can span columns).
+/// The canvas paints no background of its own - the main panel's translucent
+/// `@lookout-pane-bg` (and so the window background image) shows through, the
+/// same as every other pane - and every tone below is the canvas's own theme
+/// foreground colour at a given alpha, so the grid reads on the dark and light
+/// themes alike. The business-hours stripe...
+const GRID_BUSINESS_ALPHA: f64 = 0.06;
+/// ...the hour and column hairlines...
+const GRID_LINE_ALPHA: f64 = 0.06;
+/// ...the dim-label gutter text...
+const GRID_DIM_TEXT_ALPHA: f64 = 0.6;
+/// ...and the highlighted slot range's fill and outline.
+const GRID_SELECTION_FILL_ALPHA: f64 = 0.14;
+const GRID_SELECTION_STROKE_ALPHA: f64 = 0.3;
 /// Pixels of slack the text baseline sits above a chip's vertical centre.
 const CHIP_TEXT_BASELINE_OFFSET: f64 = 0.36;
 /// Pointer travel (pixels) before a press on an event chip becomes a drag
@@ -188,8 +192,10 @@ fn install_calendar_css() {
         .calendar-drag-target {
             border: 2px solid alpha(currentColor, 0.45);
         }
+        /* The same translucent fill as every other pane (`.folder-pane`), so
+           the window background image shows through every calendar view. */
         .calendar-main-background {
-            background-color: @lookout-calendar-bg;
+            background-color: @lookout-pane-bg;
             border-radius: 12px;
         }
         .calendar-toggle {
@@ -872,15 +878,15 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
     {
         let data = data.clone();
         let hover = hover.clone();
-        band.set_draw_func(move |_band, cr, width, height| {
-            paint_all_day_band(cr, width as f64, height as f64, &data, hover.get());
+        band.set_draw_func(move |band, cr, width, height| {
+            paint_all_day_band(cr, width as f64, height as f64, &data, hover.get(), foreground_rgb(band));
         });
     }
     {
         let data = data.clone();
         let hover = hover.clone();
-        canvas.set_draw_func(move |_canvas, cr, width, height| {
-            paint_time_grid(cr, width as f64, height as f64, &data, hover.get());
+        canvas.set_draw_func(move |canvas, cr, width, height| {
+            paint_time_grid(cr, width as f64, height as f64, &data, hover.get(), foreground_rgb(canvas));
         });
     }
 
@@ -1660,10 +1666,10 @@ fn chip_tooltip(occ: &EventOccurrence, chip: &TimeChip) -> String {
 /// positioned event chip. Fully custom-drawn so chips sit at their exact
 /// start/end times and multi-day events can span columns; text uses cairo's
 /// toy font API since themed widget labels can't be placed inside a canvas.
-/// Paints the fixed all-day band: the band's background, its column
-/// separators, the "All day" gutter label, and every all-day chip. It sits
+/// Paints the fixed all-day band: its column separators, the "All day"
+/// gutter label, and every all-day chip. It sits
 /// above the scroller so these chips stay visible while the timeline scrolls.
-fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &TimeGridData, hover: Option<usize>) {
+fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &TimeGridData, hover: Option<usize>, fg: (f64, f64, f64)) {
     let dates = data.dates.borrow();
     let chips = data.chips.borrow();
     let occurrences = data.occurrences.borrow();
@@ -1672,14 +1678,10 @@ fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &
     let columns_width = (width - HOUR_GUTTER_WIDTH).max(0.0);
     let col_width = if n > 0 { columns_width / n as f64 } else { 0.0 };
 
-    cr.set_source_rgb(GRID_BACKGROUND_RGB.0, GRID_BACKGROUND_RGB.1, GRID_BACKGROUND_RGB.2);
-    let _ = cr.paint();
-    cr.rectangle(HOUR_GUTTER_WIDTH, 0.0, columns_width, height);
-    cr.set_source_rgb(GRID_ALL_DAY_RGB.0, GRID_ALL_DAY_RGB.1, GRID_ALL_DAY_RGB.2);
-    let _ = cr.fill();
-
-    // Column separators, aligned with the timeline's below.
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.06);
+    // No background fill: the band is the main panel's own (translucent)
+    // background, see `GRID_BUSINESS_ALPHA`. Column separators, aligned with
+    // the timeline's below.
+    cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_LINE_ALPHA);
     cr.set_line_width(1.0);
     for col in 0..=n {
         let x = HOUR_GUTTER_WIDTH + col as f64 * col_width;
@@ -1688,7 +1690,8 @@ fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &
     }
     let _ = cr.stroke();
 
-    paint_right_text(cr, "All day", HOUR_GUTTER_WIDTH - 5.0, 3.0, 10.0, GRID_DIM_TEXT_RGBA, FontWeight::Normal);
+    let dim_text = (fg.0, fg.1, fg.2, GRID_DIM_TEXT_ALPHA);
+    paint_right_text(cr, "All day", HOUR_GUTTER_WIDTH - 5.0, 3.0, 10.0, dim_text, FontWeight::Normal);
 
     let dragged = data.drag.borrow().map(|d| d.chip);
     for (i, chip) in chips.iter().enumerate() {
@@ -1707,13 +1710,13 @@ fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &
     }
 }
 
-/// Paints the scrollable 24-hour timeline: the dark off-hours background with
-/// the business-hours stripe and hairlines, the hour-gutter labels, and every
-/// timed event chip (single-day and multi-day spans) positioned at its exact
-/// start/end times. Fully custom-drawn so chips sit by the clock and multi-day
-/// events can span columns; text uses cairo's toy font API since themed widget
-/// labels can't be placed inside a canvas.
-fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &TimeGridData, hover: Option<usize>) {
+/// Paints the scrollable 24-hour timeline: the business-hours stripe and
+/// hairlines over the main panel's own translucent background, the hour-gutter
+/// labels, and every timed event chip (single-day and multi-day spans)
+/// positioned at its exact start/end times. Fully custom-drawn so chips sit by
+/// the clock and multi-day events can span columns; text uses cairo's toy font
+/// API since themed widget labels can't be placed inside a canvas.
+fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &TimeGridData, hover: Option<usize>, fg: (f64, f64, f64)) {
     let dates = data.dates.borrow();
     let chips = data.chips.borrow();
     let occurrences = data.occurrences.borrow();
@@ -1722,18 +1725,17 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
     let columns_width = (width - HOUR_GUTTER_WIDTH).max(0.0);
     let col_width = if n > 0 { columns_width / n as f64 } else { 0.0 };
 
-    // Background: the dark off-hours tone, then the business-hours stripe (the
-    // same tones the old `.calendar-hour-cell` CSS rules used).
-    cr.set_source_rgb(GRID_BACKGROUND_RGB.0, GRID_BACKGROUND_RGB.1, GRID_BACKGROUND_RGB.2);
-    let _ = cr.paint();
+    // No background fill (see `GRID_BUSINESS_ALPHA`): off-hours are the main
+    // panel's own translucent background, with a foreground tint marking the
+    // business-hours stripe.
     let business_top = BUSINESS_HOURS_START as f64 * TIME_SLOT_HEIGHT;
     let business_height = (BUSINESS_HOURS_END as f64 - BUSINESS_HOURS_START as f64) * TIME_SLOT_HEIGHT;
     cr.rectangle(HOUR_GUTTER_WIDTH, business_top, columns_width, business_height);
-    cr.set_source_rgb(GRID_BUSINESS_RGB.0, GRID_BUSINESS_RGB.1, GRID_BUSINESS_RGB.2);
+    cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_BUSINESS_ALPHA);
     let _ = cr.fill();
 
     // Hairline gridlines: hour rows across the columns, plus column separators.
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.06);
+    cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_LINE_ALPHA);
     cr.set_line_width(1.0);
     for hh in 0..=HOURS_PER_DAY {
         let y = hh as f64 * TIME_SLOT_HEIGHT;
@@ -1751,9 +1753,10 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
     let _ = cr.stroke();
 
     // Gutter labels: right-aligned hour markers beside their rows.
+    let dim_text = (fg.0, fg.1, fg.2, GRID_DIM_TEXT_ALPHA);
     for hh in 0..HOURS_PER_DAY {
         let y = hh as f64 * TIME_SLOT_HEIGHT + 3.0;
-        paint_right_text(cr, &hour_gutter_text(hh), HOUR_GUTTER_WIDTH - 5.0, y, 10.0, GRID_DIM_TEXT_RGBA, FontWeight::Normal);
+        paint_right_text(cr, &hour_gutter_text(hh), HOUR_GUTTER_WIDTH - 5.0, y, 10.0, dim_text, FontWeight::Normal);
     }
 
     // The highlighted slot range (from a click, or a click-and-drag): a
@@ -1779,10 +1782,10 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
                 continue;
             }
             cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 1.0, top + 1.0, col_width - 2.0, height - 2.0);
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
+            cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_SELECTION_FILL_ALPHA);
             let _ = cr.fill();
             cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 0.5, top + 0.5, col_width - 1.0, height - 1.0);
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.3);
+            cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_SELECTION_STROKE_ALPHA);
             cr.set_line_width(1.0);
             let _ = cr.stroke();
         }
@@ -1803,6 +1806,13 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
             paint_chip(cr, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
         }
     }
+}
+
+/// The time-grid canvas's current theme foreground colour, which every
+/// grid tone is an alpha of (see `GRID_BUSINESS_ALPHA`).
+fn foreground_rgb(widget: &impl IsA<gtk::Widget>) -> (f64, f64, f64) {
+    let color = widget.as_ref().color();
+    (color.red() as f64, color.green() as f64, color.blue() as f64)
 }
 
 /// Paints one event chip (fill, hairline border, hover ring, and its label).

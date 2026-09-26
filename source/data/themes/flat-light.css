@@ -5,7 +5,6 @@
 @define-color lookout-pane-bg alpha(@theme_bg_color, 0.85);
 @define-color lookout-toolbar-band @theme_bg_color;
 @define-color lookout-icon-toolbar-bg @theme_bg_color;
-@define-color lookout-calendar-bg @theme_bg_color;
 @define-color lookout-header-search-bg @theme_base_color;
 @define-color lookout-section-header-bg alpha(@theme_bg_color, 0.9);
 @define-color lookout-column-header-bg alpha(@theme_bg_color, 0.85);

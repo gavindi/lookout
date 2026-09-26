@@ -12,8 +12,9 @@
 
 /* --- Surfaces ---------------------------------------------------------- */
 
-/* The translucent folder/config card: fixed black so the window background
-   artwork reads through identically in both schemes. */
+/* The translucent pane fill (the folder/config cards and the Calendar view's
+   main panel): fixed black so the window background artwork reads through
+   identically in both schemes. */
 @define-color lookout-pane-bg rgba(0, 0, 0, 0.5);
 /* The overlay that dims the window background toward black. */
 @define-color lookout-dim #000000;
@@ -21,8 +22,6 @@
 @define-color lookout-toolbar-band #000000;
 /* The icon toolbar strip and the checked ribbon tab. */
 @define-color lookout-icon-toolbar-bg #2e2e32;
-/* The Calendar view's main background. */
-@define-color lookout-calendar-bg #2e2e32;
 /* The search entry in the message-list pane header. */
 @define-color lookout-header-search-bg #202020;
 /* Message-list section header bands. */
