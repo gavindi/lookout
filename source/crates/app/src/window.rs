@@ -15479,7 +15479,7 @@ fn show_about_dialog() {
         .halign(gtk::Align::Center)
         .margin_top(6)
         .build();
-    links.append(&gtk::LinkButton::with_label("https://github.com/gavindi/lookout", "Website"));
+    links.append(&gtk::LinkButton::with_label("https://lookout-mail.com/", "Website"));
     links.append(&gtk::LinkButton::with_label("https://github.com/gavindi/lookout/issues", "Report an Issue"));
     content.append(&links);
 

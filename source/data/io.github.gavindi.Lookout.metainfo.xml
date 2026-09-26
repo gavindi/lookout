@@ -7,25 +7,79 @@
   <summary>A native mail client for GNOME</summary>
   <description>
     <p>
-      Lookout is a native GNOME/libadwaita mail client. It connects to your
-      mail accounts through GNOME Online Accounts, so there is no separate
-      sign-in - add an account in Settings and Lookout picks it up
-      automatically.
+      Lookout is a modern, familiar email client for GNOME, written in Rust
+      on GTK 4 and libadwaita. Mail, calendar, contacts and tasks live in one
+      window, laid out in three panes: folders on the left, the message list
+      in the middle, and the reading pane on the right.
     </p>
+    <p>
+      Accounts come from GNOME Online Accounts, so there is no separate
+      sign-in - add an account in Settings and Lookout picks it up
+      automatically. Plain IMAP/SMTP accounts can be added directly too.
+    </p>
+    <ul>
+      <li>Mail: a unified inbox, threaded conversations, pins, tags, snooze and follow-up tasks</li>
+      <li>Rich-text or plain-text compose with inline images, attachments and signatures</li>
+      <li>Calendar: day, week, work-week, month and agenda views, with drag-to-reschedule, recurring events, invitations and reminders</li>
+      <li>People: editable CardDAV contacts with favourites, groups, vCard import and export, and a birthdays calendar</li>
+      <li>Tasks from CalDAV, Google Tasks, or stored locally on this device</li>
+      <li>A local cache, so your mail opens instantly and stays readable offline</li>
+      <li>Remote images are blocked until you trust the sender</li>
+    </ul>
   </description>
   <launchable type="desktop-id">io.github.gavindi.Lookout.desktop</launchable>
   <content_rating type="oars-1.1"/>
   <developer id="io.github.gavindi">
     <name>Gavin Graham</name>
   </developer>
-  <url type="homepage">https://github.com/gavindi/lookout</url>
+  <url type="homepage">https://lookout-mail.com/</url>
   <url type="bugtracker">https://github.com/gavindi/lookout/issues</url>
   <url type="vcs-browser">https://github.com/gavindi/lookout</url>
+  <url type="donation">https://ko-fi.com/P5P21M7MBS</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Reading a message in the three-pane mail view</caption>
+      <image type="source" width="1599" height="900">https://lookout-mail.com/assets/mail_read_light_1.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The same message with the dark message theme</caption>
+      <image type="source" width="1599" height="900">https://lookout-mail.com/assets/mail_read_dark_1.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Composing in a separate window</caption>
+      <image type="source" width="1767" height="1140">https://lookout-mail.com/assets/email_compose_pop_out_1.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Calendar month view</caption>
+      <image type="source" width="1599" height="900">https://lookout-mail.com/assets/calendar_month_1.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Calendar work-week view</caption>
+      <image type="source" width="1599" height="900">https://lookout-mail.com/assets/calendar_work_week_1.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Contacts in the People screen</caption>
+      <image type="source" width="1599" height="900">https://lookout-mail.com/assets/contacts_1.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Tasks grouped by due date</caption>
+      <image type="source" width="1599" height="900">https://lookout-mail.com/assets/tasks_1.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The Lookout dashboard</caption>
+      <image type="source" width="1599" height="900">https://lookout-mail.com/assets/observatory_1.png</image>
+    </screenshot>
+  </screenshots>
   <branding>
     <color type="primary" scheme_preference="light">#299acc</color>
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.150" date="2026-09-26">
+      <description>
+        <p>Lookout now has a website at lookout-mail.com: the About dialog's Website link and the app's software-store listing point there. The store listing also gains screenshots, a fuller description and a donation link.</p>
+      </description>
+    </release>
     <release version="0.9.149" date="2026-09-19">
       <description>
         <p>Follow-up fix for remembered pane widths, which still came back at their defaults on some computers when the window starts maximized. Panes now wait for the window and their own layout to settle before restoring, so a width is never restored against the size the window had for a moment before it maximized, and the layout corrections GTK makes when the window resizes are no longer saved over the width you dragged to. Also fixes a pane creeping one pixel narrower on every launch.</p>
@@ -43,7 +97,7 @@
     </release>
     <release version="0.9.146" date="2026-09-16">
       <description>
-        <p>Bare URLs and email addresses in the message viewer are now clickable links, including when a link is glued directly onto punctuation with no space (e.g. "Info:http://example.com"). This covers both plain-text messages and HTML messages whose sender never linked their own URL.</p>
+        <p>Bare URLs and email addresses in the message viewer are now clickable links, including when a link is glued directly onto punctuation with no space (e.g. a web address typed straight after "Info:"). This covers both plain-text messages and HTML messages whose sender never linked their own URL.</p>
       </description>
     </release>
     <release version="0.9.145" date="2026-09-11">

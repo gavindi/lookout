@@ -1,11 +1,12 @@
 name: lookout
 base: core24
-version: 0.9.149
+version: 0.9.150
 summary: Native GNOME mail client built on GNOME Online Accounts
 description: |
   Lookout is a native GNOME/libadwaita mail client. It connects to your mail
   accounts through GNOME Online Accounts, so there is no separate sign-in -
   add an account in Settings and Lookout picks it up automatically.
+website: https://lookout-mail.com/
 grade: devel
 confinement: strict
 platforms:

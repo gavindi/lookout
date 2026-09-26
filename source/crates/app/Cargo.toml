@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Native GNOME mail client built on GNOME Online Accounts"
 repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "lookout"
@@ -64,7 +65,7 @@ assets = [
 name = "lookout"
 license = "GPL-3.0-or-later"
 summary = "Native GNOME mail client built on GNOME Online Accounts"
-url = "https://github.com/gavindi/lookout"
+url = "https://lookout-mail.com/"
 group = "Applications/Internet"
 assets = [
     { source = "target/release/lookout", dest = "/usr/bin/lookout", mode = "755" },
