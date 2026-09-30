@@ -574,6 +574,8 @@ pub(crate) struct UiState {
     /// whose attendee autocomplete unions the mail-history caches across
     /// every connected account.
     pub(crate) accounts: HashMap<AccountId, AccountHandle>,
+    /// A launcher compose request waiting for the first mail account.
+    pending_launcher_compose: bool,
     /// CardDAV-derived contacts discovered per account, including both
     /// category buckets (for Contacts UI) and flattened suggestions (for
     /// composer autocomplete). Owned by the People screen module
@@ -2019,6 +2021,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let keyring = crate::other_accounts::SecretServiceKeyring::new();
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
+        pending_launcher_compose: false,
         contacts_by_account: HashMap::new(),
         starred_contacts,
         ui_db,
@@ -7988,6 +7991,41 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Desktop launcher requests reuse the toolbar and navigation handlers.
+    let compose_action = gio::SimpleAction::new("compose", None);
+    compose_action.connect_activate({
+        let window = window.clone();
+        let state = state.clone();
+        let mail_view_button = mail_view_button.clone();
+        let compose_button = compose_button.clone();
+        move |_, _| {
+            window.present();
+            mail_view_button.set_active(true);
+            if state.borrow().accounts.is_empty() {
+                state.borrow_mut().pending_launcher_compose = true;
+                return;
+            }
+            compose_button.emit_clicked();
+        }
+    });
+    app.add_action(&compose_action);
+
+    let contacts_action = gio::SimpleAction::new("contacts", None);
+    contacts_action.connect_activate({
+        let window = window.clone();
+        let contacts_view_button = contacts_view_button.clone();
+        let contacts_window = contacts_window.clone();
+        move |_, _| {
+            window.present();
+            contacts_view_button.set_active(true);
+            // set_active does not emit toggled when Contacts is already active.
+            if let Some(win) = contacts_window.borrow().as_ref() {
+                win.present();
+            }
+        }
+    });
+    app.add_action(&contacts_action);
+
     // --- Reply/Reply-All/Forward -> opens the composer in the reading pane
     // pre-filled from whatever message is currently selected and has a body
     // loaded. Silent no-op if nothing's selected or the body hasn't arrived
@@ -9488,6 +9526,7 @@ fn connect_account(
             graph_pin: is_microsoft_365.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
         },
     );
+    resume_launcher_compose(&state, &app);
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
         let state = state.clone();
@@ -10260,6 +10299,7 @@ fn connect_other_account(
             graph_pin: None,
         },
     );
+    resume_launcher_compose(&state, &app);
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
         let state = state.clone();
@@ -14895,6 +14935,15 @@ fn compose_new_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, readin
     );
 }
 
+/// Finish account setup before opening a composer requested during startup.
+fn resume_launcher_compose(state: &Rc<RefCell<UiState>>, app: &adw::Application) {
+    let pending = std::mem::take(&mut state.borrow_mut().pending_launcher_compose);
+    if pending {
+        let app = app.clone();
+        glib::idle_add_local_once(move || app.activate_action("compose", None));
+    }
+}
+
 fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> String {
     state
         .borrow()
@@ -17929,6 +17978,7 @@ mod tests {
             .collect();
         Rc::new(RefCell::new(UiState {
             accounts,
+            pending_launcher_compose: false,
             contacts_by_account: HashMap::new(),
             starred_contacts: HashSet::new(),
             ui_db: None,

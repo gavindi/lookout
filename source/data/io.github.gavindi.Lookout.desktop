@@ -10,3 +10,14 @@ Categories=GNOME;GTK;Network;Email;
 Keywords=Mail;Email;IMAP;SMTP;
 StartupNotify=true
 StartupWMClass=lookout
+Actions=compose;contacts;
+
+[Desktop Action compose]
+Name=Compose New Message
+Exec=lookout --compose
+Icon=mail-message-new-symbolic
+
+[Desktop Action contacts]
+Name=Contacts
+Exec=lookout --contacts
+Icon=avatar-default-symbolic
