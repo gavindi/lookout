@@ -98,7 +98,12 @@ fn main() -> glib::ExitCode {
             "Start without showing the main window",
             None,
         );
-        for (name, description) in [("compose", "Compose a new message"), ("contacts", "Open Contacts")] {
+        for (name, description) in [
+            ("compose", "Compose a new message"),
+            ("contacts", "Open Contacts"),
+            ("calendar", "Open Calendar"),
+            ("tasks", "Open Tasks"),
+        ] {
             app.add_main_option(name, 0.into(), glib::OptionFlags::NONE, glib::OptionArg::None, description, None);
         }
         // GApplication forwards the parsed options to the primary instance.
@@ -107,7 +112,7 @@ fn main() -> glib::ExitCode {
             let options = command_line.options_dict();
             hidden.set(options.lookup_value("hidden", None).is_some());
             app.activate();
-            for action in ["compose", "contacts"] {
+            for action in ["compose", "contacts", "calendar", "tasks"] {
                 if options.lookup_value(action, None).is_some() {
                     app.activate_action(action, None);
                 }

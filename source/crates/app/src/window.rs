@@ -8026,6 +8026,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     });
     app.add_action(&contacts_action);
 
+    for (name, button) in [("calendar", &calendar_view_button), ("tasks", &tasks_view_button)] {
+        let action = gio::SimpleAction::new(name, None);
+        action.connect_activate({
+            let window = window.clone();
+            let button = button.clone();
+            move |_, _| {
+                window.present();
+                button.set_active(true);
+            }
+        });
+        app.add_action(&action);
+    }
+
     // --- Reply/Reply-All/Forward -> opens the composer in the reading pane
     // pre-filled from whatever message is currently selected and has a body
     // loaded. Silent no-op if nothing's selected or the body hasn't arrived
