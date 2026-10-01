@@ -145,6 +145,14 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/oauth_account").unwrap(), oauth_ifaces);
 
     let mut pw_ifaces = mail_account_props("password@example.com", true);
+    // Generic GOA mail accounts often use STARTTLS with no port override.
+    let mail = pw_ifaces.get_mut("org.gnome.OnlineAccounts.Mail").unwrap();
+    mail.insert("ImapHost".into(), prop("imap.example.com".to_string()));
+    mail.insert("ImapUseSsl".into(), prop(false));
+    mail.insert("ImapUseTls".into(), prop(true));
+    mail.insert("SmtpHost".into(), prop("smtp.example.com".to_string()));
+    mail.insert("SmtpUseSsl".into(), prop(false));
+    mail.insert("SmtpUseTls".into(), prop(true));
     pw_ifaces.insert("org.gnome.OnlineAccounts.PasswordBased".to_string(), HashMap::new());
     add_calendar_iface(&mut pw_ifaces, "https://caldav.example.com/dav/password@example.com/", true);
     add_contacts_iface(&mut pw_ifaces, "https://carddav.example.com/dav/password@example.com/", true);
@@ -263,6 +271,14 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     assert_eq!(accounts[0].email, "oauth@example.com");
     assert!(matches!(accounts[0].auth, AuthMethod::OAuth2));
     assert_eq!(accounts[1].email, "password@example.com");
+    assert!(accounts[0].imap.use_ssl);
+    assert!(!accounts[0].imap.use_tls);
+    assert!(!accounts[1].imap.use_ssl);
+    assert!(accounts[1].imap.use_tls);
+    assert_eq!(accounts[1].imap.port, None);
+    assert!(!accounts[1].smtp.use_ssl);
+    assert!(accounts[1].smtp.use_tls);
+    assert_eq!(accounts[1].smtp.port, None);
     assert!(matches!(accounts[1].auth, AuthMethod::Password { .. }));
 
     // The Microsoft 365 account gets hardcoded Exchange Online endpoints
@@ -272,7 +288,8 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     assert!(matches!(accounts[2].auth, AuthMethod::OAuth2));
     assert_eq!(accounts[2].imap.host, "outlook.office365.com");
     assert_eq!(accounts[2].imap.port, Some(993));
-    assert!(accounts[2].imap.use_tls);
+    assert!(accounts[2].imap.use_ssl);
+    assert!(!accounts[2].imap.use_tls);
     assert_eq!(accounts[2].imap.username, "work@contoso.com");
     assert_eq!(accounts[2].smtp.host, "smtp.office365.com");
     assert_eq!(accounts[2].smtp.port, Some(587));
