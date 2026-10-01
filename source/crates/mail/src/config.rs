@@ -7,6 +7,8 @@ pub struct EndpointConfig {
     pub host: String,
     pub port: u16,
     pub use_tls: bool,
+    /// Upgrade the initial plaintext connection before authenticating.
+    pub use_starttls: bool,
     pub username: String,
 }
 

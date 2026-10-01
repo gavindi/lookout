@@ -110,7 +110,7 @@ pub(crate) fn tls_connector() -> Result<TlsConnector> {
 
 /// Wraps an already-connected plain `TcpStream` in TLS (the STARTTLS upgrade
 /// path), reusing the same connector as [`connect_tls`].
-pub(crate) async fn tls_connect_over(tcp: TcpStream, host: &str) -> Result<ImapStream> {
+pub(crate) async fn tls_connect_over<S: AsyncStream>(tcp: S, host: &str) -> Result<TlsStream<S>> {
     ensure_crypto_provider_installed();
     let connector = tls_connector()?;
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| Error::InvalidServerName(host.to_string()))?;
