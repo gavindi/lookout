@@ -18,6 +18,7 @@ mod config;
 mod connection;
 mod envelope;
 mod error;
+mod mailbox_encoding;
 pub mod send;
 pub mod session;
 mod structure;

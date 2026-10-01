@@ -14,7 +14,7 @@
 //! providers), so this talks to GreenMail's IMAPS/SMTPS ports (3993/3465,
 //! included in its default `-Dgreenmail.setup.test.all` setup) with the
 //! `test-utils`-gated insecure certificate verifier (see
-//! `connection::connect_tls_insecure_for_tests`) to accept its self-signed
+//! `connection::upgrade_tls_insecure_for_tests`) to accept its self-signed
 //! cert - `LOOKOUT_INSECURE_TLS_FOR_TESTS` opts into that path. The raw
 //! APPEND (below) uses GreenMail's plain IMAP port (3143) over plain TCP
 //! instead - the same container, no TLS needed.
@@ -84,12 +84,14 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
             host: host.clone(),
             port: imaps_port,
             use_tls: true,
+            use_starttls: false,
             username: "testuser".to_string(),
         },
         smtp: EndpointConfig {
             host: host.clone(),
             port: smtps_port,
             use_tls: true,
+            use_starttls: false,
             username: "testuser".to_string(),
         },
     };
@@ -439,12 +441,14 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
             host: host.clone(),
             port: imaps_port,
             use_tls: true,
+            use_starttls: false,
             username: "testuser".to_string(),
         },
         smtp: EndpointConfig {
             host: host.clone(),
             port: smtps_port,
             use_tls: true,
+            use_starttls: false,
             username: "testuser".to_string(),
         },
     };

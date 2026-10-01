@@ -13,7 +13,7 @@ use lookout_core::{AccountId, BodyPart, EmailBody, EmailSummary, Mailbox, Mailbo
 use crate::auth::XOAuth2Authenticator;
 use crate::body::{parse_body, preview_from_raw};
 use crate::config::{AccountConfig, Credential};
-use crate::connection::{connect_tls, SessionStream};
+use crate::connection::{connect_tcp, connect_tls, upgrade_tls, SessionStream};
 use crate::envelope::{flags_from_fetch, summary_from_fetch};
 use crate::error::{Error, Result};
 use crate::send::{build_raw_message, send_smtp, ComposedMessage};
@@ -3080,11 +3080,20 @@ struct ServerCapabilities {
 }
 
 async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {
-    let stream = connect_tls(&config.imap.host, config.imap.port).await?;
-    tracing::debug!("login: creating client, reading greeting");
+    let stream: SessionStream = if config.imap.use_tls && !config.imap.use_starttls {
+        Box::new(connect_tls(&config.imap.host, config.imap.port).await?)
+    } else {
+        Box::new(connect_tcp(&config.imap.host, config.imap.port).await?)
+    };
     let mut client = async_imap::Client::new(stream);
-    let greeting = client.read_response().await;
-    tracing::debug!("login: greeting = {greeting:?}");
+    client.read_response().await?.ok_or_else(|| Error::LoginFailed("server closed before IMAP greeting".into()))?;
+    if config.imap.use_tls && config.imap.use_starttls {
+        // Never send credentials unless the server accepts the upgrade and
+        // the TLS handshake (including certificate validation) succeeds.
+        client.run_command_and_check_ok("STARTTLS", None).await?;
+        let tls = upgrade_tls(&config.imap.host, client.into_inner()).await?;
+        client = async_imap::Client::new(Box::new(tls) as SessionStream);
+    }
 
     tracing::debug!("login: authenticating as {}", config.imap.username);
     let session = match credential {
@@ -3199,7 +3208,7 @@ fn mailbox_from_list_parts(account_id: &AccountId, name: &str, delimiter: Option
         return None;
     }
     let delimiter = delimiter.and_then(|d| d.chars().next()).unwrap_or('/');
-    let display_name = name.rsplit(delimiter).next().unwrap_or(name).to_string();
+    let display_name = crate::mailbox_encoding::decode_mailbox_name(name.rsplit(delimiter).next().unwrap_or(name));
     let role = role_from_special_use(&attrs, &display_name);
 
     Some(Mailbox {
@@ -5127,6 +5136,49 @@ mod tests {
         assert_eq!(m.name, "Sent");
         assert_eq!(m.delimiter, '/');
         assert_eq!(m.role, MailboxRole::Sent);
+        let m = mailbox_from_list_parts(&account, "INBOX/Entw&APw-rfe", Some("/"), &[]).unwrap();
+        assert_eq!(m.name, "Entwürfe");
+        assert_eq!(m.id, MailboxId::new(&account, "INBOX/Entw&APw-rfe"));
+    }
+
+    #[tokio::test]
+    async fn rejected_starttls_never_sends_credentials() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"* OK test server\r\n").await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            let tag = command.split_whitespace().next().unwrap();
+            assert_eq!(command.trim_end(), format!("{tag} STARTTLS"));
+            reader.get_mut().write_all(format!("{tag} NO TLS unavailable\r\n").as_bytes()).await.unwrap();
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).await.unwrap();
+            assert!(rest.is_empty(), "client sent data after rejected STARTTLS");
+        });
+        let endpoint = crate::EndpointConfig {
+            host: "127.0.0.1".into(),
+            port,
+            use_tls: true,
+            use_starttls: true,
+            username: "test-user".into(),
+        };
+        let config = AccountConfig {
+            account_id: AccountId("test".into()),
+            display_name: "Test".into(),
+            email: "test@example.com".into(),
+            imap: endpoint.clone(),
+            smtp: endpoint,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert!(login(&config, Credential::Password("secret".into())).await.is_err());
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

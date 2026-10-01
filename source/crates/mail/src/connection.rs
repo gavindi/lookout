@@ -103,6 +103,18 @@ fn root_cert_store() -> Result<RootCertStore> {
 /// Opens a TLS connection to `host:port` suitable for wrapping in an
 /// `async_imap::Client` or driving an SMTP `AUTH`/submission session.
 pub async fn connect_tls(host: &str, port: u16) -> Result<ImapStream> {
+    let tcp = connect_tcp(host, port).await?;
+    upgrade_tls(host, tcp).await
+}
+
+pub(crate) async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
+    let tcp = TcpStream::connect((host, port)).await?;
+    enable_keepalive(&tcp);
+    Ok(tcp)
+}
+
+/// Wrap an existing connection after the server has accepted STARTTLS.
+pub(crate) async fn upgrade_tls<S: AsyncStream>(host: &str, tcp: S) -> Result<TlsStream<S>> {
     ensure_crypto_provider_installed();
 
     // Test-only escape hatch so lookout-mail's own integration tests (see
@@ -117,7 +129,7 @@ pub async fn connect_tls(host: &str, port: u16) -> Result<ImapStream> {
     #[cfg(feature = "test-utils")]
     if std::env::var_os("LOOKOUT_INSECURE_TLS_FOR_TESTS").is_some() {
         tracing::warn!("LOOKOUT_INSECURE_TLS_FOR_TESTS set: skipping TLS certificate verification");
-        return connect_tls_insecure_for_tests(host, port).await;
+        return upgrade_tls_insecure_for_tests(host, tcp).await;
     }
 
     tracing::debug!("connect_tls: building root store");
@@ -125,9 +137,6 @@ pub async fn connect_tls(host: &str, port: u16) -> Result<ImapStream> {
     let config = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
 
-    tracing::debug!("connect_tls: tcp connecting to {host}:{port}");
-    let tcp = TcpStream::connect((host, port)).await?;
-    enable_keepalive(&tcp);
     tracing::debug!("connect_tls: tcp connected, starting tls handshake");
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| Error::InvalidServerName(host.to_string()))?;
     let tls = connector.connect(server_name, tcp).await?;
@@ -136,7 +145,7 @@ pub async fn connect_tls(host: &str, port: u16) -> Result<ImapStream> {
 }
 
 #[cfg(feature = "test-utils")]
-async fn connect_tls_insecure_for_tests(host: &str, port: u16) -> Result<ImapStream> {
+async fn upgrade_tls_insecure_for_tests<S: AsyncStream>(host: &str, tcp: S) -> Result<TlsStream<S>> {
     use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use tokio_rustls::rustls::crypto::CryptoProvider;
     use tokio_rustls::rustls::pki_types::{CertificateDer, UnixTime};
@@ -194,8 +203,6 @@ async fn connect_tls_insecure_for_tests(host: &str, port: u16) -> Result<ImapStr
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
 
-    let tcp = TcpStream::connect((host, port)).await?;
-    enable_keepalive(&tcp);
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| Error::InvalidServerName(host.to_string()))?;
     let tls = connector.connect(server_name, tcp).await?;
     Ok(tls)

@@ -21,16 +21,18 @@ async fn main() -> anyhow::Result<()> {
         println!("--- {} <{}> ---", account.display_name, account.email);
         println!("  path: {}", account.object_path);
         println!(
-            "  imap: {}:{} tls={} user={}",
+            "  imap: {}:{} ssl={} starttls={} user={}",
             account.imap.host,
             account.imap.port.map(|p| p.to_string()).unwrap_or_else(|| "default".into()),
+            account.imap.use_ssl,
             account.imap.use_tls,
             account.imap.username
         );
         println!(
-            "  smtp: {}:{} tls={} user={}",
+            "  smtp: {}:{} ssl={} starttls={} user={}",
             account.smtp.host,
             account.smtp.port.map(|p| p.to_string()).unwrap_or_else(|| "default".into()),
+            account.smtp.use_ssl,
             account.smtp.use_tls,
             account.smtp.username
         );

@@ -9413,14 +9413,16 @@ fn connect_account(
         email: account.email.clone(),
         imap: EndpointConfig {
             host: account.imap.host.clone(),
-            port: account.imap.port.unwrap_or(993),
-            use_tls: account.imap.use_tls,
+            port: account.imap.port.unwrap_or(if account.imap.use_ssl { 993 } else { 143 }),
+            use_tls: account.imap.use_ssl || account.imap.use_tls,
+            use_starttls: account.imap.use_tls && (!account.imap.use_ssl || account.imap.port == Some(143)),
             username: account.imap.username.clone(),
         },
         smtp: EndpointConfig {
             host: account.smtp.host.clone(),
-            port: account.smtp.port.unwrap_or(587),
-            use_tls: account.smtp.use_tls,
+            port: account.smtp.port.unwrap_or(if account.smtp.use_ssl { 465 } else { 587 }),
+            use_tls: account.smtp.use_ssl || account.smtp.use_tls,
+            use_starttls: account.smtp.use_tls && (!account.smtp.use_ssl || account.smtp.port == Some(587)),
             username: account.smtp.username.clone(),
         },
     };
@@ -10212,12 +10214,14 @@ fn connect_other_account(
             host: account.imap_host.clone(),
             port: account.imap_port,
             use_tls: account.imap_use_tls,
+            use_starttls: account.imap_port != 993,
             username: account.imap_username.clone(),
         },
         smtp: EndpointConfig {
             host: account.smtp_host.clone(),
             port: account.smtp_port,
             use_tls: account.smtp_use_tls,
+            use_starttls: account.smtp_port != 465,
             username: account.smtp_username.clone(),
         },
     };

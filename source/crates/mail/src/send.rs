@@ -348,14 +348,12 @@ fn raw_header(value: impl Into<String>) -> HeaderType<'static> {
     HeaderType::Raw(Raw::new(value.into()))
 }
 
-/// Submits `raw` over SMTP. `port == 465` is treated as implicit TLS
-/// (SMTPS); anything else uses STARTTLS, which covers the common 587/25
-/// configurations - GOA's `SmtpUseSsl`/`SmtpUseTls` flags don't map cleanly
-/// enough onto lettre's implicit-vs-STARTTLS split to trust directly (Gmail
-/// reports both as true), so the port is the more reliable signal here.
+/// Submits `raw` using the endpoint's implicit TLS or STARTTLS settings.
 pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: &str, recipients: &[String], raw: &[u8]) -> Result<()> {
     crate::connection::ensure_crypto_provider_installed();
-    let builder = if endpoint.port == 465 {
+    let builder = if !endpoint.use_tls {
+        Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&endpoint.host))
+    } else if !endpoint.use_starttls {
         AsyncSmtpTransport::<Tokio1Executor>::relay(&endpoint.host)
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&endpoint.host)
