@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::SendFailed(e) => println!("send failed: {e}"),
                     AccountEvent::DraftSaved { message_id } => println!("draft saved: {message_id}"),
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
+                    AccountEvent::MailboxCreated { .. } | AccountEvent::MailboxRenamed { .. } | AccountEvent::MailboxDeleted { .. } => {}
                     AccountEvent::PreviewsFetched { .. } => {}
                     AccountEvent::MailboxSyncStarted { .. } => {}
                     AccountEvent::PrefetchStarted { .. } | AccountEvent::PrefetchFinished { .. } => {}

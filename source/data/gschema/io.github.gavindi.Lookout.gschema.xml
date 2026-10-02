@@ -131,6 +131,11 @@
       <summary>Favorite mailboxes</summary>
       <description>MailboxIds of folders pinned to the top of the folder tree.</description>
     </key>
+    <key name="mail-favorites-custom-order" type="b">
+      <default>false</default>
+      <summary>Favorites keep a custom order</summary>
+      <description>Set once a favorite folder is moved up or down: the Favorites section then follows the order of mail-favorites instead of sorting alphabetically.</description>
+    </key>
     <key name="accounts-disabled" type="as">
       <default>[]</default>
       <summary>Disabled GNOME Online Accounts accounts</summary>

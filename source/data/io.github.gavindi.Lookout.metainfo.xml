@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.152" date="2026-10-03">
+      <description>
+        <p>Folders in the Mail tab now have a "⋯" menu: hover over a folder to create a subfolder, rename, move or delete it, empty Trash or Junk, mark everything in it as read, add it to or remove it from Favorites and reorder your favorites, or give it a colour and choose whether it shows its unread or total count. Deleting a folder moves it to Trash, so it can still be recovered. Folders with accented or non-Latin names now also display correctly.</p>
+      </description>
+    </release>
     <release version="0.9.151" date="2026-09-26">
       <description>
         <p>Every Calendar view - Day, Week, Work week, Month, Split and Agenda - now shows the window's background wallpaper through a translucent panel, matching the Mail, People and Tasks tabs, instead of sitting on a solid grey. The Day and Week grids also follow the Flat Light theme's colours now.</p>

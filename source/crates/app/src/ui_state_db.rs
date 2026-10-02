@@ -95,6 +95,51 @@ pub struct ReminderStateRow {
     pub snooze_until_utc: Option<String>,
 }
 
+/// Which number a folder row shows beside its name (the folder pane's
+/// "⋯" menu → Change folder count).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum FolderCountMode {
+    /// The unread count, bold in the accent colour - every folder's default.
+    #[default]
+    Unread,
+    /// The total message count, muted.
+    Total,
+}
+
+impl FolderCountMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            FolderCountMode::Unread => "unread",
+            FolderCountMode::Total => "total",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "total" => FolderCountMode::Total,
+            _ => FolderCountMode::Unread,
+        }
+    }
+}
+
+/// A folder's local display preferences, set from the folder pane's "⋯"
+/// menu: an icon colour (`#rrggbb`, or none) and which count it shows. Purely
+/// client-side - IMAP has no folder colour - and keyed by `MailboxId`, so the
+/// UI re-keys them when a folder is renamed or moved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct FolderPrefs {
+    pub color: Option<String>,
+    pub count_mode: FolderCountMode,
+}
+
+impl FolderPrefs {
+    /// Whether these are the defaults - a folder with default prefs needs no
+    /// row at all.
+    pub fn is_default(&self) -> bool {
+        *self == FolderPrefs::default()
+    }
+}
+
 impl UiStateDb {
     /// Opens (creating if needed) the UI-state database. Any failure is
     /// reported as an error; callers treat it as "favourites won't persist"
@@ -138,6 +183,11 @@ impl UiStateDb {
                 kind TEXT NOT NULL,
                 key TEXT NOT NULL,
                 PRIMARY KEY (kind, key)
+            );
+            CREATE TABLE IF NOT EXISTS folder_prefs (
+                mailbox_id TEXT PRIMARY KEY,
+                color TEXT,
+                count_mode TEXT NOT NULL DEFAULT 'unread'
             );
             ",
         )?;
@@ -262,6 +312,36 @@ impl UiStateDb {
         tx.commit()
     }
 
+    /// Every folder's stored display preferences.
+    pub fn load_folder_prefs(&self) -> rusqlite::Result<HashMap<MailboxId, FolderPrefs>> {
+        let mut stmt = self.conn.prepare("SELECT mailbox_id, color, count_mode FROM folder_prefs")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                MailboxId(row.get::<_, String>(0)?),
+                FolderPrefs {
+                    color: row.get::<_, Option<String>>(1)?,
+                    count_mode: FolderCountMode::parse(&row.get::<_, String>(2)?),
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Replaces the stored folder preferences wholesale with `prefs` (the
+    /// session's in-memory map is the source of truth, as with the expansion
+    /// state above). Default entries are skipped rather than stored.
+    pub fn set_folder_prefs(&self, prefs: &HashMap<MailboxId, FolderPrefs>) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM folder_prefs", [])?;
+        {
+            let mut stmt = tx.prepare("INSERT INTO folder_prefs (mailbox_id, color, count_mode) VALUES (?1, ?2, ?3)")?;
+            for (mailbox, pref) in prefs.iter().filter(|(_, pref)| !pref.is_default()) {
+                stmt.execute(rusqlite::params![mailbox.0, pref.color, pref.count_mode.as_str()])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// Prunes every folder-expansion row belonging to `account`: its account
     /// group row and every mailbox row under its id prefix. Called when an
     /// account is removed so the table can't accumulate stale rows for
@@ -373,6 +453,44 @@ mod tests {
     // A single test owns `XDG_CACHE_HOME`: the env var is process-global and
     // parallel test threads would race over it otherwise (the same rule as
     // the `XDG_CONFIG_HOME` tests in `background_image`/`tags`).
+    #[test]
+    fn folder_prefs_round_trip_and_skip_defaults() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("folder-prefs");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_folder_prefs().unwrap().is_empty());
+        let colored = MailboxId("acc:Work".into());
+        let total = MailboxId("acc:Archive".into());
+        let plain = MailboxId("acc:Plain".into());
+        let prefs = HashMap::from([
+            (
+                colored.clone(),
+                FolderPrefs {
+                    color: Some("#e01b24".into()),
+                    count_mode: FolderCountMode::Unread,
+                },
+            ),
+            (
+                total.clone(),
+                FolderPrefs {
+                    color: None,
+                    count_mode: FolderCountMode::Total,
+                },
+            ),
+            (plain, FolderPrefs::default()),
+        ]);
+        db.set_folder_prefs(&prefs).unwrap();
+        let loaded = UiStateDb::open().unwrap().load_folder_prefs().unwrap();
+        assert_eq!(loaded.len(), 2, "a folder left at the defaults stores no row");
+        assert_eq!(loaded[&colored].color.as_deref(), Some("#e01b24"));
+        assert_eq!(loaded[&total].count_mode, FolderCountMode::Total);
+        db.set_folder_prefs(&HashMap::new()).unwrap();
+        assert!(db.load_folder_prefs().unwrap().is_empty(), "replace semantics");
+    }
+
     #[test]
     fn starred_contacts_round_trip_and_version_wipe() {
         let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -68,6 +68,10 @@ pub const WINDOW_MAXIMIZED: &str = "window-maximized";
 pub const SORT_KEY: &str = "sort-key";
 pub const SORT_DESCENDING: &str = "sort-descending";
 pub const MAIL_FAVORITES: &str = "mail-favorites";
+/// Set the first time a favourite is moved up or down (the folder pane's
+/// "⋯" menu): from then on the Favorites section follows `mail-favorites`'
+/// stored order instead of sorting alphabetically.
+pub const MAIL_FAVORITES_CUSTOM_ORDER: &str = "mail-favorites-custom-order";
 /// AccountIds (GOA object paths) of accounts the user disabled in Config →
 /// Accounts; everything else is enabled by default.
 pub const ACCOUNTS_DISABLED: &str = "accounts-disabled";
@@ -206,6 +210,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(SORT_KEY, Value::String("date".into()));
     map.insert(SORT_DESCENDING, Value::Bool(true));
     map.insert(MAIL_FAVORITES, Value::Strv(Vec::new()));
+    map.insert(MAIL_FAVORITES_CUSTOM_ORDER, Value::Bool(false));
     map.insert(ACCOUNTS_DISABLED, Value::Strv(Vec::new()));
     map.insert(MAIL_THREADED, Value::Bool(true));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
@@ -422,6 +427,7 @@ mod tests {
         assert_eq!(store.get_strv(MAIL_FAVORITES), vec!["a:Inbox", "b:Projects"]);
         store.set_strv(MAIL_FAVORITES, Vec::new());
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());
+        assert!(!store.get_bool(MAIL_FAVORITES_CUSTOM_ORDER));
     }
 
     #[test]
@@ -549,6 +555,7 @@ mod tests {
         assert_eq!(store.get_int(PREFETCH_REFRESH_INTERVAL_MINUTES), 60);
         assert!(!store.get_bool(PREFETCH_AGGRESSIVE));
         assert!(store.get_strv(MAIL_FAVORITES).is_empty());
+        assert!(!store.get_bool(MAIL_FAVORITES_CUSTOM_ORDER));
         assert!(store.get_strv(ACCOUNTS_DISABLED).is_empty());
         assert!(store.get_strv(SHORTCUTS).is_empty());
     }

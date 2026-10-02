@@ -164,6 +164,48 @@ impl PrefetchState {
         self.current_folder_name.clear();
         self.structures.clear();
     }
+
+    /// Drops the folder `root` and everything beneath it from the pass, after
+    /// that subtree was renamed, moved or deleted (a renamed folder rejoins
+    /// under its new id with the next re-list). If the in-flight mailbox was
+    /// one of them its per-mailbox progress is reset - its later body fetches
+    /// would otherwise run against whatever mailbox is SELECTed now - and its
+    /// id is returned when it had already announced `PrefetchStarted`, so the
+    /// caller can send the matching `PrefetchFinished`.
+    fn forget_tree(&mut self, root: &MailboxId, delimiter: char) -> Option<MailboxId> {
+        let affected = |id: &MailboxId| crate::mailbox_name::is_same_or_descendant(id, root, delimiter);
+        let in_flight = self.mailboxes.get(self.current).filter(|id| affected(id)).cloned();
+        let announced = in_flight.clone().filter(|_| !self.current_folder_name.is_empty());
+        let kept_before_current = self.mailboxes[..self.current.min(self.mailboxes.len())].iter().filter(|id| !affected(id)).count();
+        self.mailboxes.retain(|id| !affected(id));
+        self.current = kept_before_current;
+        if in_flight.is_some() {
+            self.pending_uids.clear();
+            self.uidvalidity = UidValidity(0);
+            self.envelopes_fetched = false;
+            self.current_folder_name.clear();
+            self.structures.clear();
+        }
+        announced
+    }
+}
+
+/// Adds every folder in `folders` the prefetch pass doesn't already know
+/// about (other than the open one, which `sync_mailbox` covers) to the end
+/// of the pass, starting a pass if none is running. Extends rather than
+/// replaces, so a pass already in flight keeps its progress.
+fn queue_new_prefetch_mailboxes(prefetch: &mut Option<PrefetchState>, folders: &[Mailbox], current: &MailboxId) {
+    let new_mailboxes: Vec<MailboxId> = folders.iter().filter(|m| &m.id != current).map(|m| m.id.clone()).collect();
+    match prefetch.as_mut() {
+        Some(pf) => {
+            let existing: HashSet<MailboxId> = pf.mailboxes.iter().cloned().collect();
+            pf.mailboxes.extend(new_mailboxes.into_iter().filter(|m| !existing.contains(m)));
+        }
+        None if !new_mailboxes.is_empty() => {
+            *prefetch = Some(PrefetchState::new(new_mailboxes));
+        }
+        None => {}
+    }
 }
 
 /// The background body prefetch's behavior, settable live from the app (Config
@@ -318,6 +360,39 @@ pub enum AccountCommand {
     /// `\Deleted` caveat of `move_uids_to_path` is exactly the intent here).
     /// Irreversible: no move-to-Trash fallback for this one.
     EmptyMailbox {
+        mailbox: MailboxId,
+    },
+    /// The folder pane's "Mark all as read": `UID STORE 1:* +FLAGS (\Seen)`
+    /// over the whole of `mailbox`, SELECTing it on demand.
+    MarkMailboxRead {
+        mailbox: MailboxId,
+    },
+    /// `CREATE`s (and `SUBSCRIBE`s) a folder called `name` - as typed, encoded
+    /// to modified UTF-7 here - directly under `parent`, or at the top level
+    /// (see `mailbox_name::top_level_prefix`) when `parent` is `None`. Answered
+    /// with `MailboxCreated` and a re-list.
+    CreateMailbox {
+        parent: Option<MailboxId>,
+        name: String,
+    },
+    /// `RENAME`s `mailbox` to `new_name` (as typed) under the same parent.
+    /// Answered with `MailboxRenamed`; the folder's subtree moves with it.
+    RenameMailbox {
+        mailbox: MailboxId,
+        new_name: String,
+    },
+    /// `RENAME`s `mailbox` (keeping its own name) to sit under `new_parent`,
+    /// or at the top level when `None`. Answered with `MailboxRenamed`.
+    MoveMailbox {
+        mailbox: MailboxId,
+        new_parent: Option<MailboxId>,
+    },
+    /// Deletes `mailbox` and its subfolders. Outside Trash it is moved under
+    /// the account's Trash (a recoverable `RENAME`, answered with
+    /// `MailboxRenamed { to_trash: true }`); a folder already inside Trash -
+    /// or on an account with no Trash - is `DELETE`d permanently, deepest
+    /// subfolder first, answered with `MailboxDeleted`.
+    DeleteMailbox {
         mailbox: MailboxId,
     },
     /// Client-side only - IMAP has no native snooze. Records `until` in the
@@ -566,6 +641,28 @@ pub enum AccountEvent {
     /// so the UI can name the confirmation toast.
     MailboxExpunged {
         role: MailboxRole,
+    },
+    /// The answer to an `AccountCommand::CreateMailbox`: `mailbox` now exists
+    /// (the re-list that follows brings it into `FoldersUpdated`).
+    MailboxCreated {
+        mailbox: MailboxId,
+    },
+    /// The folder `from` - and every folder beneath it, by the same path
+    /// prefix - now lives at `to`, after a rename, a move, or a delete that
+    /// moved it under Trash (`to_trash`). Anything the UI keys by mailbox id
+    /// (favourites, folder colours, expansion state, the open folder) is
+    /// re-keyed with `mailbox_name::rekey_mailbox_id`.
+    MailboxRenamed {
+        from: MailboxId,
+        to: MailboxId,
+        delimiter: char,
+        to_trash: bool,
+    },
+    /// The folder `mailbox` and everything beneath it were permanently
+    /// deleted.
+    MailboxDeleted {
+        mailbox: MailboxId,
+        delimiter: char,
     },
     /// The answer to an `AccountCommand::SearchMailbox`: the envelopes of
     /// every message in `mailbox` whose headers/body matched `query` per the
@@ -1267,17 +1364,7 @@ async fn connect_and_run(
                     // silently strands its `PrefetchStarted` (no matching
                     // `PrefetchFinished` ever follows) and leaves the
                     // folder-pane spinner stuck on forever.
-                    let new_mailboxes: Vec<MailboxId> = folders.iter().filter(|m| m.id != current_mailbox_id).map(|m| m.id.clone()).collect();
-                    match prefetch.as_mut() {
-                        Some(pf) => {
-                            let existing: HashSet<MailboxId> = pf.mailboxes.iter().cloned().collect();
-                            pf.mailboxes.extend(new_mailboxes.into_iter().filter(|m| !existing.contains(m)));
-                        }
-                        None if !new_mailboxes.is_empty() => {
-                            prefetch = Some(PrefetchState::new(new_mailboxes));
-                        }
-                        None => {}
-                    }
+                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id);
                 }
                 AccountCommand::SyncMailbox(mailbox_id) => {
                     // MailboxId is "<account_id>:<folder path>"; recover the folder path.
@@ -2015,6 +2102,200 @@ async fn connect_and_run(
                             let _ = events.send(AccountEvent::Error(format!("Couldn't empty folder: {e}"))).await;
                         }
                     }
+                }
+                AccountCommand::MarkMailboxRead { mailbox } => {
+                    let Some(path) = crate::mailbox_name::mailbox_path(&account_id, &mailbox).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    match mark_mailbox_read(&mut session).await {
+                        Ok(count) => {
+                            if count > 0 {
+                                if let Some(Err(e)) = cache_op(cache, {
+                                    let mailbox = mailbox.clone();
+                                    move |c| c.mark_mailbox_seen(&mailbox)
+                                })
+                                .await
+                                {
+                                    tracing::warn!("failed to mark cached mailbox read: {e}");
+                                }
+                            }
+                            refresh_folders_targeted(
+                                &mut session,
+                                &mut folders,
+                                &account_id,
+                                std::slice::from_ref(&mailbox),
+                                &current_mailbox_id,
+                                condstore,
+                                cache,
+                                events,
+                                &mut dirty_mailboxes,
+                            )
+                            .await;
+                            sync_mailbox(
+                                &mut session,
+                                &account_id,
+                                &current_mailbox_name,
+                                &current_mailbox_id,
+                                events,
+                                cache,
+                                &mut folders,
+                                interactive_commands,
+                                Some(&session_selected),
+                                condstore,
+                                qresync,
+                            )
+                            .await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't mark folder as read: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::CreateMailbox { parent, name } => {
+                    let path = match plan_create_mailbox(parent.as_ref(), &name, &account_id, &folders) {
+                        Ok(path) => path,
+                        Err(reason) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't create folder: {reason}"))).await;
+                            continue;
+                        }
+                    };
+                    match session.create(&path).await {
+                        Ok(()) => {
+                            let _ = session.subscribe(&path).await;
+                            let _ = events
+                                .send(AccountEvent::MailboxCreated {
+                                    mailbox: MailboxId::new(&account_id, &path),
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't create folder: {e}"))).await;
+                        }
+                    }
+                    relist_folders(
+                        &mut session,
+                        &mut folders,
+                        &mut counts_pending,
+                        &account_id,
+                        &current_mailbox_id,
+                        cache,
+                        events,
+                        condstore,
+                        has_list_status,
+                        &mut dirty_mailboxes,
+                    )
+                    .await?;
+                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id);
+                }
+                command @ (AccountCommand::RenameMailbox { .. } | AccountCommand::MoveMailbox { .. } | AccountCommand::DeleteMailbox { .. }) => {
+                    let change = match plan_folder_change(&command, &account_id, &folders) {
+                        Ok(Some(change)) => change,
+                        Ok(None) => continue,
+                        Err(reason) => {
+                            let verb = if matches!(command, AccountCommand::DeleteMailbox { .. }) { "delete" } else { "rename" };
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't {verb} folder: {reason}"))).await;
+                            continue;
+                        }
+                    };
+                    let root = change.root().clone();
+                    let delimiter = change.delimiter();
+                    // Step out of the subtree first: servers may refuse to
+                    // rename or delete the SELECTed mailbox, and an IDLE left
+                    // watching a path that's about to vanish would error.
+                    if crate::mailbox_name::is_same_or_descendant(&session_selected, &root, delimiter) {
+                        let inbox_path = crate::mailbox_name::mailbox_path(&account_id, &inbox_id).unwrap_or("INBOX").to_string();
+                        session.select(&inbox_path).await?;
+                        session_selected = inbox_id.clone();
+                    }
+                    match apply_folder_change(&mut session, &change).await {
+                        Ok(()) => {
+                            let current_before = current_mailbox_id.clone();
+                            match &change {
+                                FolderChange::Rename { from, to_path, to_trash, .. } => {
+                                    let to = MailboxId::new(&account_id, to_path);
+                                    if let Some(Err(e)) = cache_op(cache, {
+                                        let (from, to) = (from.clone(), to.clone());
+                                        move |c| c.rekey_snoozed(&from, &to, delimiter).and_then(|()| c.forget_mailbox_tree(&from, delimiter))
+                                    })
+                                    .await
+                                    {
+                                        tracing::warn!("failed to re-key the renamed folder's cache: {e}");
+                                    }
+                                    if let Some(rekeyed) = crate::mailbox_name::rekey_mailbox_id(&current_mailbox_id, from, &to, delimiter) {
+                                        current_mailbox_id = rekeyed;
+                                    }
+                                    let _ = events
+                                        .send(AccountEvent::MailboxRenamed {
+                                            from: from.clone(),
+                                            to,
+                                            delimiter,
+                                            to_trash: *to_trash,
+                                        })
+                                        .await;
+                                }
+                                FolderChange::Delete { root, .. } => {
+                                    if let Some(Err(e)) = cache_op(cache, {
+                                        let root = root.clone();
+                                        move |c| c.forget_mailbox_tree(&root, delimiter)
+                                    })
+                                    .await
+                                    {
+                                        tracing::warn!("failed to clear the deleted folder's cache: {e}");
+                                    }
+                                    if crate::mailbox_name::is_same_or_descendant(&current_mailbox_id, root, delimiter) {
+                                        current_mailbox_id = inbox_id.clone();
+                                    }
+                                    let _ = events.send(AccountEvent::MailboxDeleted { mailbox: root.clone(), delimiter }).await;
+                                }
+                            }
+                            if current_mailbox_id != current_before {
+                                current_mailbox_name = crate::mailbox_name::mailbox_path(&account_id, &current_mailbox_id).unwrap_or("INBOX").to_string();
+                                mailbox_tx.send_replace(current_mailbox_id.clone());
+                            }
+                            if let Some(finished) = prefetch.as_mut().and_then(|pf| pf.forget_tree(&root, delimiter)) {
+                                let _ = events.send(AccountEvent::PrefetchFinished { mailbox: finished }).await;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't {} folder: {e}", change.verb()))).await;
+                        }
+                    }
+                    // Re-list either way: a failed multi-folder delete may
+                    // have got part of the way.
+                    relist_folders(
+                        &mut session,
+                        &mut folders,
+                        &mut counts_pending,
+                        &account_id,
+                        &current_mailbox_id,
+                        cache,
+                        events,
+                        condstore,
+                        has_list_status,
+                        &mut dirty_mailboxes,
+                    )
+                    .await?;
+                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id);
+                    sync_mailbox(
+                        &mut session,
+                        &account_id,
+                        &current_mailbox_name,
+                        &current_mailbox_id,
+                        events,
+                        cache,
+                        &mut folders,
+                        interactive_commands,
+                        Some(&session_selected),
+                        condstore,
+                        qresync,
+                    )
+                    .await?;
+                    session_selected = current_mailbox_id.clone();
                 }
                 AccountCommand::SnoozeMessage { mailbox, uid, until } => {
                     if let Some(Err(e)) = cache_op(cache, {
@@ -2965,6 +3246,185 @@ fn drafts_path<'a>(folders: &'a [Mailbox], account_id: &AccountId) -> Option<&'a
     drafts.id.0.strip_prefix(&format!("{}:", account_id.0))
 }
 
+/// What a folder rename, move or delete does on the server, decided up front
+/// from the folder list by [`plan_folder_change`] so the IMAP side is a plain
+/// replay and the decision itself is unit-testable.
+#[derive(Debug, Clone, PartialEq)]
+enum FolderChange {
+    /// `RENAME from_path to_path`; the folder's subtree moves with it.
+    Rename {
+        from: MailboxId,
+        from_path: String,
+        to_path: String,
+        delimiter: char,
+        to_trash: bool,
+    },
+    /// `DELETE` each path, deepest subfolder first (servers differ on whether
+    /// deleting a parent takes its children with it, so they go explicitly).
+    Delete {
+        root: MailboxId,
+        paths_deepest_first: Vec<String>,
+        delimiter: char,
+    },
+}
+
+impl FolderChange {
+    fn root(&self) -> &MailboxId {
+        match self {
+            FolderChange::Rename { from, .. } => from,
+            FolderChange::Delete { root, .. } => root,
+        }
+    }
+
+    fn delimiter(&self) -> char {
+        match self {
+            FolderChange::Rename { delimiter, .. } | FolderChange::Delete { delimiter, .. } => *delimiter,
+        }
+    }
+
+    /// The verb a failure toast uses ("Couldn't rename folder: ...").
+    fn verb(&self) -> &'static str {
+        match self {
+            FolderChange::Rename { to_trash: true, .. } => "delete",
+            FolderChange::Rename { .. } => "rename",
+            FolderChange::Delete { .. } => "delete",
+        }
+    }
+}
+
+/// Decides what a `RenameMailbox`/`MoveMailbox`/`DeleteMailbox` command
+/// does, or why it can't - the special folders (Inbox, Sent, Trash, ...) are
+/// never renamed, moved or deleted, and a folder can't move into itself.
+/// `Ok(None)` is a no-op (renaming or moving a folder to where it already is).
+fn plan_folder_change(command: &AccountCommand, account_id: &AccountId, folders: &[Mailbox]) -> std::result::Result<Option<FolderChange>, String> {
+    use crate::mailbox_name::{is_same_or_descendant, leaf, mailbox_path, renamed_path, top_level_prefix, trash_target_path};
+    let target = match command {
+        AccountCommand::RenameMailbox { mailbox, .. } | AccountCommand::MoveMailbox { mailbox, .. } | AccountCommand::DeleteMailbox { mailbox } => mailbox,
+        _ => return Ok(None),
+    };
+    let folder = folders.iter().find(|m| &m.id == target).ok_or("the folder no longer exists")?;
+    if folder.role != MailboxRole::Custom {
+        return Err(format!("{} is a special folder", folder.name));
+    }
+    let from_path = mailbox_path(account_id, &folder.id).ok_or("the folder belongs to another account")?.to_string();
+    let delimiter = folder.delimiter;
+    let rename = |to_path: String, to_trash: bool| {
+        (to_path != from_path).then(|| FolderChange::Rename {
+            from: folder.id.clone(),
+            from_path: from_path.clone(),
+            to_path,
+            delimiter,
+            to_trash,
+        })
+    };
+    match command {
+        AccountCommand::RenameMailbox { new_name, .. } => {
+            let new_name = new_name.trim();
+            if new_name.is_empty() {
+                return Err("the name can't be empty".to_string());
+            }
+            if new_name.contains(delimiter) {
+                return Err(format!("the name can't contain \"{delimiter}\""));
+            }
+            Ok(rename(renamed_path(&from_path, delimiter, new_name), false))
+        }
+        AccountCommand::MoveMailbox { new_parent, .. } => {
+            let raw_leaf = leaf(&from_path, delimiter);
+            let to_path = match new_parent {
+                Some(parent) => {
+                    if is_same_or_descendant(parent, &folder.id, delimiter) {
+                        return Err("a folder can't be moved into itself".to_string());
+                    }
+                    let parent_path = mailbox_path(account_id, parent).ok_or("the destination belongs to another account")?;
+                    format!("{parent_path}{delimiter}{raw_leaf}")
+                }
+                None => format!("{}{raw_leaf}", top_level_prefix(account_id, folders)),
+            };
+            Ok(rename(to_path, false))
+        }
+        AccountCommand::DeleteMailbox { .. } => {
+            let trash = folders.iter().find(|m| m.role == MailboxRole::Trash);
+            if let Some(trash) = trash.filter(|t| !is_same_or_descendant(&folder.id, &t.id, delimiter)) {
+                let trash_path = mailbox_path(account_id, &trash.id).ok_or("the Trash folder belongs to another account")?;
+                let existing: Vec<&str> = folders.iter().filter_map(|m| mailbox_path(account_id, &m.id)).collect();
+                return Ok(rename(trash_target_path(trash_path, delimiter, leaf(&from_path, delimiter), &existing), true));
+            }
+            let mut paths: Vec<String> = folders
+                .iter()
+                .filter(|m| is_same_or_descendant(&m.id, &folder.id, delimiter))
+                .filter_map(|m| mailbox_path(account_id, &m.id).map(str::to_string))
+                .collect();
+            paths.sort_by_key(|path| std::cmp::Reverse(path.matches(delimiter).count()));
+            Ok(Some(FolderChange::Delete {
+                root: folder.id.clone(),
+                paths_deepest_first: paths,
+                delimiter,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The wire path a `CreateMailbox { parent, name }` creates, or why it can't.
+fn plan_create_mailbox(parent: Option<&MailboxId>, name: &str, account_id: &AccountId, folders: &[Mailbox]) -> std::result::Result<String, String> {
+    use crate::mailbox_name::{child_path, mailbox_path, top_level_prefix};
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("the name can't be empty".to_string());
+    }
+    let (parent_path, delimiter) = match parent {
+        Some(parent) => {
+            let folder = folders.iter().find(|m| &m.id == parent).ok_or("the parent folder no longer exists")?;
+            if folder.flags.iter().any(|flag| flag.eq_ignore_ascii_case("NoInferiors")) {
+                return Err(format!("{} can't hold subfolders", folder.name));
+            }
+            (Some(mailbox_path(account_id, parent).ok_or("the parent belongs to another account")?), folder.delimiter)
+        }
+        None => (None, folders.iter().find(|m| m.role == MailboxRole::Inbox).map_or('/', |inbox| inbox.delimiter)),
+    };
+    if name.contains(delimiter) {
+        return Err(format!("the name can't contain \"{delimiter}\""));
+    }
+    let path = child_path(parent_path, &top_level_prefix(account_id, folders), delimiter, name);
+    if folders.iter().any(|m| mailbox_path(account_id, &m.id) == Some(path.as_str())) {
+        return Err(format!("a folder called \"{name}\" already exists there"));
+    }
+    Ok(path)
+}
+
+/// Replays a [`FolderChange`] against the server.
+async fn apply_folder_change(session: &mut Session<SessionStream>, change: &FolderChange) -> Result<()> {
+    match change {
+        FolderChange::Rename { from_path, to_path, .. } => {
+            session.rename(from_path, to_path).await?;
+            // A renamed folder keeps its subscription on most servers, but
+            // some (RFC 3501 leaves it open) drop it - and an unsubscribed
+            // folder vanishes from clients that list subscriptions only.
+            let _ = session.subscribe(to_path).await;
+        }
+        FolderChange::Delete { paths_deepest_first, .. } => {
+            for path in paths_deepest_first {
+                session.delete(path).await?;
+                let _ = session.unsubscribe(path).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Marks every unread message in the *currently selected* mailbox `\Seen`:
+/// the server side of `AccountCommand::MarkMailboxRead`. Searches for the
+/// unseen uids first (rather than a blind `1:*`, which some servers reject
+/// on an empty mailbox) and stores them in command-line-safe chunks. Returns
+/// how many messages it marked.
+async fn mark_mailbox_read(session: &mut Session<SessionStream>) -> Result<u32> {
+    let uids: Vec<Uid> = session.uid_search("UNSEEN").await?.into_iter().map(Uid).collect();
+    for uid_set in &uid_set_chunks(&uids) {
+        let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Seen)").await?.try_collect().await?;
+    }
+    Ok(uids.len() as u32)
+}
+
 /// Permanently removes every message in the *currently selected* mailbox -
 /// the server side of `AccountCommand::EmptyMailbox`. `UID SEARCH ALL` +
 /// STORE `\Deleted` + EXPUNGE, reusing the same wire pattern as
@@ -3199,7 +3659,9 @@ fn mailbox_from_list_parts(account_id: &AccountId, name: &str, delimiter: Option
         return None;
     }
     let delimiter = delimiter.and_then(|d| d.chars().next()).unwrap_or('/');
-    let display_name = name.rsplit(delimiter).next().unwrap_or(name).to_string();
+    // The id keeps the raw wire path; only the displayed segment is decoded
+    // from modified UTF-7, so a non-ASCII folder name reads as typed.
+    let display_name = crate::mailbox_name::decode(crate::mailbox_name::leaf(name, delimiter));
     let role = role_from_special_use(&attrs, &display_name);
 
     Some(Mailbox {
@@ -5127,6 +5589,134 @@ mod tests {
         assert_eq!(m.name, "Sent");
         assert_eq!(m.delimiter, '/');
         assert_eq!(m.role, MailboxRole::Sent);
+    }
+
+    #[test]
+    fn mailbox_from_list_parts_decodes_a_modified_utf7_display_name() {
+        let account = AccountId("acc".into());
+        let m = mailbox_from_list_parts(&account, "Projects/Caf&AOk-", Some("/"), &[]).unwrap();
+        assert_eq!(m.id, MailboxId::new(&account, "Projects/Caf&AOk-"), "the id keeps the wire path");
+        assert_eq!(m.name, "Café");
+    }
+
+    fn folder_tree(account: &AccountId) -> Vec<Mailbox> {
+        vec![
+            mailbox(account, "INBOX", MailboxRole::Inbox, 0),
+            mailbox(account, "Trash", MailboxRole::Trash, 0),
+            mailbox(account, "Trash/Old", MailboxRole::Custom, 0),
+            mailbox(account, "Work", MailboxRole::Custom, 0),
+            mailbox(account, "Work/2026", MailboxRole::Custom, 0),
+            mailbox(account, "Work/2026/Q1", MailboxRole::Custom, 0),
+            mailbox(account, "Old", MailboxRole::Custom, 0),
+        ]
+    }
+
+    #[test]
+    fn folder_changes_are_planned_from_the_folder_list() {
+        let account = AccountId("acc".into());
+        let folders = folder_tree(&account);
+        let id = |path: &str| MailboxId::new(&account, path);
+        let rename = |from: &str, to: &str, to_trash: bool| {
+            Ok(Some(FolderChange::Rename {
+                from: id(from),
+                from_path: from.to_string(),
+                to_path: to.to_string(),
+                delimiter: '/',
+                to_trash,
+            }))
+        };
+
+        let command = AccountCommand::RenameMailbox {
+            mailbox: id("Work/2026"),
+            new_name: " Café ".into(),
+        };
+        assert_eq!(plan_folder_change(&command, &account, &folders), rename("Work/2026", "Work/Caf&AOk-", false));
+        let command = AccountCommand::RenameMailbox {
+            mailbox: id("Work"),
+            new_name: "Work".into(),
+        };
+        assert_eq!(plan_folder_change(&command, &account, &folders), Ok(None), "renaming to the same name is a no-op");
+        let command = AccountCommand::RenameMailbox {
+            mailbox: id("Work"),
+            new_name: "a/b".into(),
+        };
+        assert!(plan_folder_change(&command, &account, &folders).is_err(), "the delimiter is refused");
+
+        let command = AccountCommand::MoveMailbox {
+            mailbox: id("Work/2026"),
+            new_parent: None,
+        };
+        assert_eq!(plan_folder_change(&command, &account, &folders), rename("Work/2026", "2026", false));
+        let command = AccountCommand::MoveMailbox {
+            mailbox: id("Old"),
+            new_parent: Some(id("Work")),
+        };
+        assert_eq!(plan_folder_change(&command, &account, &folders), rename("Old", "Work/Old", false));
+        let command = AccountCommand::MoveMailbox {
+            mailbox: id("Work"),
+            new_parent: Some(id("Work/2026")),
+        };
+        assert!(plan_folder_change(&command, &account, &folders).is_err(), "a folder can't move into its own subtree");
+
+        let command = AccountCommand::DeleteMailbox { mailbox: id("Old") };
+        assert_eq!(plan_folder_change(&command, &account, &folders), rename("Old", "Trash/Old (2)", true), "Trash/Old is taken");
+        let command = AccountCommand::DeleteMailbox { mailbox: id("Trash/Old") };
+        assert_eq!(
+            plan_folder_change(&command, &account, &folders),
+            Ok(Some(FolderChange::Delete {
+                root: id("Trash/Old"),
+                paths_deepest_first: vec!["Trash/Old".into()],
+                delimiter: '/',
+            })),
+            "a folder already in Trash is deleted for good"
+        );
+
+        for special in ["INBOX", "Trash"] {
+            let command = AccountCommand::DeleteMailbox { mailbox: id(special) };
+            assert!(plan_folder_change(&command, &account, &folders).is_err(), "{special} is locked");
+        }
+    }
+
+    #[test]
+    fn a_permanent_delete_removes_subfolders_first() {
+        let account = AccountId("acc".into());
+        let folders: Vec<Mailbox> = folder_tree(&account).into_iter().filter(|m| m.role != MailboxRole::Trash).collect();
+        let command = AccountCommand::DeleteMailbox {
+            mailbox: MailboxId::new(&account, "Work"),
+        };
+        let Ok(Some(FolderChange::Delete { paths_deepest_first, .. })) = plan_folder_change(&command, &account, &folders) else {
+            panic!("an account with no Trash deletes permanently");
+        };
+        assert_eq!(paths_deepest_first, vec!["Work/2026/Q1".to_string(), "Work/2026".into(), "Work".into()]);
+    }
+
+    #[test]
+    fn create_plans_validate_the_name_and_parent() {
+        let account = AccountId("acc".into());
+        let mut folders = folder_tree(&account);
+        let id = |path: &str| MailboxId::new(&account, path);
+        assert_eq!(plan_create_mailbox(Some(&id("Work")), "Reports", &account, &folders), Ok("Work/Reports".into()));
+        assert_eq!(plan_create_mailbox(None, "Café", &account, &folders), Ok("Caf&AOk-".into()));
+        assert!(plan_create_mailbox(Some(&id("Work")), "2026", &account, &folders).is_err(), "duplicate sibling");
+        assert!(plan_create_mailbox(Some(&id("Work")), "  ", &account, &folders).is_err(), "empty name");
+        assert!(plan_create_mailbox(Some(&id("Work")), "a/b", &account, &folders).is_err(), "delimiter in the name");
+        folders.iter_mut().find(|m| m.id == id("Old")).unwrap().flags.push("NoInferiors".into());
+        assert!(plan_create_mailbox(Some(&id("Old")), "Child", &account, &folders).is_err(), "\\Noinferiors parent");
+    }
+
+    #[test]
+    fn prefetch_forgets_a_renamed_subtree_and_reports_the_in_flight_folder() {
+        let account = AccountId("acc".into());
+        let id = |path: &str| MailboxId::new(&account, path);
+        let mut pf = PrefetchState::new(vec![id("A"), id("Work"), id("Work/2026"), id("Work2"), id("B")]);
+        pf.advance();
+        pf.current_folder_name = "Work".into();
+        assert_eq!(pf.forget_tree(&id("Work"), '/'), Some(id("Work")), "Work had announced PrefetchStarted");
+        assert_eq!(pf.mailboxes, vec![id("A"), id("Work2"), id("B")], "a shared-prefix sibling stays");
+        assert_eq!(pf.mailboxes[pf.current], id("Work2"), "the pass carries on with the next folder");
+        assert!(pf.current_folder_name.is_empty());
+        assert_eq!(pf.forget_tree(&id("A"), '/'), None, "an already-finished folder has nothing to announce");
+        assert_eq!(pf.mailboxes[pf.current], id("Work2"));
     }
 
     #[test]

@@ -1605,6 +1605,96 @@ impl Cache {
         conn.execute("DELETE FROM snoozed WHERE snoozed_until <= ?1", rusqlite::params![now.timestamp()])?;
         Ok(())
     }
+
+    /// Every distinct mailbox id with a cached row (messages, bodies, the
+    /// folder list or snoozes) that is `root` itself or lies beneath it.
+    /// Filtered in Rust with `is_same_or_descendant` rather than a SQL `LIKE`,
+    /// so a `%` or `_` in a folder name can't widen the match.
+    fn cached_ids_in_tree(conn: &Connection, root: &MailboxId, delimiter: char) -> Result<Vec<MailboxId>> {
+        let mut ids: HashSet<String> = HashSet::new();
+        for table in ["messages", "bodies", "mailboxes", "snoozed"] {
+            let mut stmt = conn.prepare(&format!("SELECT DISTINCT mailbox_id FROM {table}"))?;
+            for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                ids.insert(id?);
+            }
+        }
+        Ok(ids
+            .into_iter()
+            .map(MailboxId)
+            .filter(|id| crate::mailbox_name::is_same_or_descendant(id, root, delimiter))
+            .collect())
+    }
+
+    /// Forgets everything cached for the folder `root` and every folder
+    /// beneath it - envelopes, bodies, search-index rows, snoozes, the folder
+    /// list's own rows, and the attachment/raw-message files - after that
+    /// subtree was renamed, moved or deleted on the server. Envelope rows
+    /// carry their mailbox id inside their serialized data, so a rename is
+    /// handled by forgetting the old ids and letting the folder resync under
+    /// its new one rather than by rewriting every row; call `rekey_snoozed`
+    /// first to carry snoozes across a rename.
+    pub fn forget_mailbox_tree(&self, root: &MailboxId, delimiter: char) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let ids = Self::cached_ids_in_tree(&conn, root, delimiter)?;
+        let tx = conn.transaction()?;
+        let mut purged_by_mailbox: Vec<(MailboxId, HashSet<(u32, u32)>)> = Vec::new();
+        for id in &ids {
+            let mut purged = HashSet::new();
+            {
+                let mut stmt = tx.prepare_cached("SELECT uid, uidvalidity FROM messages WHERE mailbox_id = ?1")?;
+                for row in stmt.query_map([&id.0], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)))? {
+                    purged.insert(row?);
+                }
+            }
+            for table in ["messages", "bodies", "search_fts", "mailboxes", "snoozed"] {
+                tx.execute(&format!("DELETE FROM {table} WHERE mailbox_id = ?1"), [&id.0])?;
+            }
+            purged_by_mailbox.push((id.clone(), purged));
+        }
+        tx.commit()?;
+        drop(conn);
+        for (id, purged) in &purged_by_mailbox {
+            self.purge_message_files(id, purged);
+        }
+        Ok(())
+    }
+
+    /// Moves the snoozes recorded under the folder `from` (and beneath it)
+    /// across to the same places under `to`, so a renamed or moved folder's
+    /// snoozed messages stay hidden. IMAP keeps a mailbox's UIDs across a
+    /// `RENAME` (RFC 3501 §6.3.5), so each `(mailbox, uid)` stays valid.
+    pub fn rekey_snoozed(&self, from: &MailboxId, to: &MailboxId, delimiter: char) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let ids = Self::cached_ids_in_tree(&conn, from, delimiter)?;
+        let tx = conn.transaction()?;
+        for id in &ids {
+            if let Some(new_id) = crate::mailbox_name::rekey_mailbox_id(id, from, to, delimiter) {
+                tx.execute("UPDATE OR REPLACE snoozed SET mailbox_id = ?1 WHERE mailbox_id = ?2", rusqlite::params![new_id.0, id.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Marks every cached message in `mailbox_id` `\Seen`, mirroring the
+    /// whole-mailbox `UID STORE 1:* +FLAGS (\Seen)` behind "Mark all as read".
+    pub fn mark_mailbox_seen(&self, mailbox_id: &MailboxId) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut select = tx.prepare("SELECT uid, data FROM messages WHERE mailbox_id = ?1")?;
+            let mut update = tx.prepare("UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3")?;
+            let rows: Vec<(u32, String)> = select.query_map([&mailbox_id.0], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (uid, data) in rows {
+                let Ok(mut summary) = serde_json::from_str::<EmailSummary>(&data) else { continue };
+                if summary.flags.insert(SystemFlagBit::Seen) {
+                    update.execute(rusqlite::params![serde_json::to_string(&summary)?, mailbox_id.0, uid])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 impl ContactsProvider for Cache {
@@ -2081,6 +2171,47 @@ mod tests {
             preview: preview.map(|p| p.to_string()),
             structure: None,
         }
+    }
+
+    #[test]
+    fn forgetting_a_folder_tree_spares_siblings_and_keeps_rekeyed_snoozes() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let work = MailboxId::new(&account_id, "Work");
+        let work_child = MailboxId::new(&account_id, "Work/2026");
+        let work2 = MailboxId::new(&account_id, "Work2");
+        for id in [&work, &work_child, &work2] {
+            cache.replace_messages(id, UidValidity(1), &[sample_summary(id, 1, None)]).unwrap();
+            cache.store_body(id, Uid(1), UidValidity(1), &sample_body("hello")).unwrap();
+        }
+        let until = Utc::now() + chrono::Duration::days(1);
+        cache.snooze_message(&work_child, Uid(1), until).unwrap();
+
+        let renamed = MailboxId::new(&account_id, "Archive/Work");
+        cache.rekey_snoozed(&work, &renamed, '/').unwrap();
+        cache.forget_mailbox_tree(&work, '/').unwrap();
+
+        assert!(!cache.has_messages(&work).unwrap());
+        assert!(!cache.has_messages(&work_child).unwrap());
+        assert!(!cache.has_body(&work_child, Uid(1), UidValidity(1)).unwrap());
+        assert!(cache.has_messages(&work2).unwrap(), "a sibling sharing the prefix is untouched");
+        assert!(cache.has_body(&work2, Uid(1), UidValidity(1)).unwrap());
+        let moved = MailboxId::new(&account_id, "Archive/Work/2026");
+        assert!(cache.active_snoozed_uids(&moved, Utc::now()).unwrap().contains(&Uid(1)), "the snooze followed the rename");
+        assert!(cache.active_snoozed_uids(&work_child, Utc::now()).unwrap().is_empty());
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn mark_mailbox_seen_flags_every_cached_message() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let inbox = MailboxId::new(&account_id, "INBOX");
+        let messages: Vec<EmailSummary> = (1..=3).map(|uid| sample_summary(&inbox, uid, None)).collect();
+        cache.replace_messages(&inbox, UidValidity(1), &messages).unwrap();
+        cache.mark_mailbox_seen(&inbox).unwrap();
+        assert!(cache.load_messages(&inbox).unwrap().iter().all(|m| m.flags.contains(&SystemFlagBit::Seen)));
+        let _ = remove_account_cache(&account_id);
     }
 
     fn sample_body(text: &str) -> EmailBody {

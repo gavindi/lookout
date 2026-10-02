@@ -16,6 +16,7 @@ mod contact_picker;
 mod contacts_editor;
 mod contacts_view;
 mod event_editor;
+mod folder_menu;
 mod folder_tree;
 mod goa_calendar_credentials;
 mod goa_credentials;

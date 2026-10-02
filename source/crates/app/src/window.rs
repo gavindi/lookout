@@ -202,14 +202,22 @@ struct MessageRowWidgets {
 /// target at click time.
 #[derive(Clone)]
 struct FolderRowWidgets {
-    action_box: gtk::Box,
     expunge_btn: gtk::Button,
     /// Which mailbox the expunge button acts on - `None` on rows that aren't
     /// Trash/Junk (where the button never shows anyway).
     expunge_data: Rc<RefCell<Option<Mailbox>>>,
-    /// Whether this row's folder can be expunged; gates the hover reveal so
-    /// ordinary folders never flash an empty action box.
+    /// Whether this row's folder can be expunged; shows or hides the button
+    /// inside the action box.
     expunge_enabled: Rc<Cell<bool>>,
+    /// The row's "⋯" menu (see `folder_menu`).
+    menu: crate::folder_menu::RowMenu,
+    /// Which folder the menu acts on - `None` on rows that aren't a folder
+    /// (All Inboxes, account groups, the Favorites heading), which show no
+    /// action box at all.
+    menu_data: Rc<RefCell<Option<Mailbox>>>,
+    /// Re-evaluates whether the action box shows: on a folder row while it's
+    /// hovered or its menu is open.
+    refresh_actions: Rc<dyn Fn()>,
 }
 
 /// How many recently-viewed message bodies to keep in memory. Every message
@@ -866,8 +874,18 @@ pub(crate) struct UiState {
     /// Mailboxes the user has starred in the message-list header, rendered as
     /// a "Favorites" section pinned to the top of the folder tree. Persisted
     /// via the `mail-favorites` GSettings key, loaded at startup and written
-    /// through on every star toggle (see `settings`).
-    favorites: HashSet<MailboxId>,
+    /// through on every star toggle (see `settings`). Ordered: once the user
+    /// has moved a favourite up or down (`mail-favorites-custom-order`) this
+    /// is the Favorites section's display order; before that the section
+    /// sorts alphabetically and new favourites are simply appended.
+    favorites: Vec<MailboxId>,
+    /// The Favorites section's rows as last drawn, in order - what the "⋯"
+    /// menu's Move up/down act on, and how a row knows its place there.
+    /// Written by `rebuild_folder_tree`.
+    favorite_display_order: Vec<MailboxId>,
+    /// Each folder's local display preferences (icon colour, count mode),
+    /// from the folder pane's "⋯" menu. Persisted in the UI-state database.
+    folder_prefs: HashMap<MailboxId, crate::ui_state_db::FolderPrefs>,
     /// Config → Mail → "Load images from the web": whether the reading pane's
     /// WebView may load remote `image/*` subresources. Consulted by the
     /// load-policy handler on every resource decision. Persisted via the
@@ -1583,8 +1601,33 @@ fn install_paned_css() {
             background-color: @lookout-header-search-bg;
         }",
     );
+    // The folder rows' "⋯" menu: per-folder icon colours and the menu's
+    // swatches (one class pair per palette colour, generated), plus the
+    // total-count variant of the trailing count.
+    let folder_menu_provider = gtk::CssProvider::new();
+    folder_menu_provider.load_from_string(&format!(
+        "{}
+        /* A folder switched to its total count (Change folder count): muted
+           and regular weight, so it doesn't read as unread mail. */
+        .folder-unread-count.folder-count-total {{
+            color: @lookout-muted;
+            font-weight: normal;
+        }}
+        button.folder-color-swatch {{
+            min-width: 22px;
+            min-height: 22px;
+            padding: 0;
+            border-radius: 50%;
+        }}
+        button.folder-color-swatch.selected {{
+            outline: 2px solid @theme_fg_color;
+            outline-offset: 2px;
+        }}",
+        crate::folder_menu::palette_css()
+    ));
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk::style_context_add_provider_for_display(&display, &folder_menu_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 }
 
@@ -1674,8 +1717,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // down, once the mail accounts are wired up), so the drop target reaches
     // it through this slot, filled right after `state` is created.
     let state_slot: Rc<RefCell<Option<Rc<RefCell<UiState>>>>> = Rc::new(RefCell::new(None));
+    // What the rows' "⋯" menu (and Empty button) actions do - installed by
+    // `install_folder_menu_handler` once `state` and the list header exist.
+    let menu_handler: crate::folder_menu::FolderMenuHandler = Rc::new(RefCell::new(None));
     {
         let state_slot = state_slot.clone();
+        let menu_handler = menu_handler.clone();
         folder_factory.connect_setup(move |_, list_item| {
             let expander = gtk::TreeExpander::new();
             let icon = gtk::Image::builder().icon_size(gtk::IconSize::Normal).build();
@@ -1742,24 +1789,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 });
             }
             expander.add_controller(drop_target);
-            // Expunge quick action (initially hidden), mirroring the message
-            // rows' hover quick actions: a button that appears on hover over
-            // a Trash/Junk row and empties that folder. `bind` writes which
-            // folder the button acts on and whether the row is eligible into
-            // `expunge_data`/`expunge_enabled`, read at click time - the same
-            // slot pattern as the drop target above.
+            // Quick actions (initially hidden), mirroring the message rows'
+            // hover quick actions: on Trash/Junk a button that empties the
+            // folder, and on every folder row the "⋯" menu (see
+            // `folder_menu`). `bind` writes which folder the row shows into
+            // `menu_data` (and whether it can be emptied into
+            // `expunge_enabled`), read at click time - the same slot pattern
+            // as the drop target above. Both route through `menu_handler`,
+            // installed once the window state exists.
             let expunge_btn = gtk::Button::from_icon_name("user-trash-full-symbolic");
             expunge_btn.add_css_class("hover-quick-action");
             expunge_btn.set_tooltip_text(Some("Empty folder"));
+            expunge_btn.set_visible(false);
+            let menu_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+            let menu = crate::folder_menu::build_row_menu(menu_data.clone(), menu_handler.clone());
             let action_box = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
-                .spacing(0)
+                .spacing(2)
                 .halign(gtk::Align::End)
                 .valign(gtk::Align::Center)
                 .margin_end(8)
                 .build();
             action_box.add_css_class("hover-quick-actions");
             action_box.append(&expunge_btn);
+            action_box.append(&menu.button);
             action_box.set_visible(false);
             let overlay = gtk::Overlay::new();
             overlay.set_child(Some(&expander));
@@ -1768,64 +1821,59 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let expunge_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
             {
                 let expunge_data = expunge_data.clone();
-                let state_slot = state_slot.clone();
-                let expunge_btn_for_dialog = expunge_btn.clone();
-                expunge_btn.connect_clicked(move |_| {
-                    let Some(mailbox) = expunge_data.borrow().clone() else {
-                        return;
-                    };
-                    // Irreversible, so confirm first - unlike delete-to-Trash
-                    // there's no undo for an expunge.
-                    let dialog = adw::AlertDialog::builder()
-                        .heading(format!("Empty {}?", display_name(&mailbox.name)))
-                        .body("All messages in this folder will be permanently deleted. This cannot be undone.")
-                        .default_response("cancel")
-                        .close_response("cancel")
-                        .build();
-                    dialog.add_response("cancel", "Cancel");
-                    dialog.add_response("empty", "Empty");
-                    dialog.set_response_appearance("empty", adw::ResponseAppearance::Destructive);
-                    let expunge_data = expunge_data.clone();
-                    let state_slot = state_slot.clone();
-                    dialog.connect_response(None, move |_dialog, response| {
-                        if response != "empty" {
-                            return;
-                        }
-                        let Some(mailbox) = expunge_data.borrow().clone() else { return };
-                        let Some(account_id) = mailbox_account_id(&mailbox.id) else { return };
-                        let Some(state) = state_slot.borrow().clone() else { return };
-                        let state = state.borrow();
-                        if let Some(handle) = state.accounts.get(&account_id) {
-                            let _ = handle.cmd_tx.send_blocking(AccountCommand::EmptyMailbox { mailbox: mailbox.id });
-                        }
-                    });
-                    dialog.present(Some(&expunge_btn_for_dialog));
-                });
-            }
-            {
-                let action_box = action_box.clone();
-                let expunge_enabled = expunge_enabled.clone();
-                let hover_controller = gtk::EventControllerMotion::new();
-                let action_box_for_leave = action_box.clone();
-                hover_controller.connect_enter(move |_, _, _| {
-                    // Only Trash/Junk rows carry an expunge action.
-                    if expunge_enabled.get() {
-                        action_box.set_visible(true);
+                let menu_handler = menu_handler.clone();
+                expunge_btn.connect_clicked(move |button| {
+                    let mailbox = expunge_data.borrow().clone();
+                    let handler = menu_handler.borrow().clone();
+                    if let (Some(mailbox), Some(handler)) = (mailbox, handler) {
+                        handler(crate::folder_menu::FolderMenuAction::Empty, mailbox, button.clone().upcast());
                     }
                 });
+            }
+            // The action box shows on a folder row only while the pointer is
+            // over it - or while its menu is open, so that moving the pointer
+            // from the row into the menu doesn't hide the button the menu
+            // hangs off (closing it). Selecting a row doesn't show it.
+            let hovered = Rc::new(Cell::new(false));
+            let refresh_actions: Rc<dyn Fn()> = {
+                let action_box = action_box.clone();
+                let menu_data = menu_data.clone();
+                let hovered = hovered.clone();
+                let menu_button = menu.button.clone();
+                Rc::new(move || {
+                    let menu_open = menu_button.popover().is_some_and(|popover| popover.is_visible());
+                    action_box.set_visible(menu_data.borrow().is_some() && (hovered.get() || menu_open));
+                })
+            };
+            {
+                let hovered_enter = hovered.clone();
+                let refresh_enter = refresh_actions.clone();
+                let refresh_leave = refresh_actions.clone();
+                let hover_controller = gtk::EventControllerMotion::new();
+                hover_controller.connect_enter(move |_, _, _| {
+                    hovered_enter.set(true);
+                    refresh_enter();
+                });
                 hover_controller.connect_leave(move |_| {
-                    action_box_for_leave.set_visible(false);
+                    hovered.set(false);
+                    refresh_leave();
                 });
                 overlay.add_controller(hover_controller);
+            }
+            if let Some(popover) = menu.button.popover() {
+                let refresh = refresh_actions.clone();
+                popover.connect_closed(move |_| refresh());
             }
             unsafe {
                 expander.set_data(
                     "lookout-expunge-widgets",
                     FolderRowWidgets {
-                        action_box,
                         expunge_btn,
                         expunge_data,
                         expunge_enabled,
+                        menu,
+                        menu_data,
+                        refresh_actions,
                     },
                 );
             }
@@ -1863,6 +1911,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     count.set_label(&unread.to_string());
                 }
             };
+            // A recycled row may carry the previous folder's colour or count
+            // mode; only a folder row puts its own back (below).
+            icon.set_css_classes(&[]);
+            count.set_css_classes(&["folder-unread-count"]);
+            // The folder's local display prefs and its place in the Favorites
+            // section, for the colour/count below and the "⋯" menu further on.
+            let folder_view = match &*tree_item {
+                TreeItem::Folder(node) | TreeItem::Favorite(node) => state_slot.borrow().as_ref().map(|state| {
+                    let st = state.borrow();
+                    let prefs = st.folder_prefs.get(&node.mailbox.id).cloned().unwrap_or_default();
+                    let order = &st.favorite_display_order;
+                    let favorite_pos = order.iter().position(|m| m == &node.mailbox.id).map(|index| (index, order.len()));
+                    (prefs, favorite_pos)
+                }),
+                _ => None,
+            };
             match &*tree_item {
                 TreeItem::Unified(unread) => {
                     icon.set_visible(true);
@@ -1891,7 +1955,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
                     label.set_label(&display_name(&node.mailbox.name));
                     label.set_css_classes(&["folder-row-label"]);
-                    set_count(node.mailbox.unread);
+                    let prefs = folder_view.as_ref().map(|(prefs, _)| prefs.clone()).unwrap_or_default();
+                    if let Some(color) = &prefs.color {
+                        icon.add_css_class(&crate::folder_menu::color_class(color));
+                    }
+                    match prefs.count_mode {
+                        crate::ui_state_db::FolderCountMode::Unread => set_count(node.mailbox.unread),
+                        crate::ui_state_db::FolderCountMode::Total => {
+                            count.add_css_class("folder-count-total");
+                            set_count(node.mailbox.total);
+                        }
+                    }
                 }
             }
             // Refresh the row's drag-drop identity: folder rows accept moves
@@ -1903,34 +1977,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     _ => None,
                 };
             }
-            // Refresh the row's expunge quick action: Trash and Junk rows get the
-            // button (with a role-named tooltip), everything else hides it.
-            let role = match &*tree_item {
-                TreeItem::Folder(node) | TreeItem::Favorite(node) => node.mailbox.role,
-                _ => MailboxRole::Custom,
+            // Refresh the row's quick actions: every folder row gets the "⋯"
+            // menu, pointed at this folder; Trash and Junk rows also get the
+            // Empty button (with a role-named tooltip). Other rows get none.
+            let row_mailbox = match &*tree_item {
+                TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.clone()),
+                _ => None,
             };
-            let expunge_eligible = matches!(role, MailboxRole::Trash | MailboxRole::Junk);
             if let Some(widgets) = unsafe { expander.data::<FolderRowWidgets>("lookout-expunge-widgets") } {
                 let widgets = unsafe { widgets.as_ref() };
+                let role = row_mailbox.as_ref().map_or(MailboxRole::Custom, |m| m.role);
+                let expunge_eligible = matches!(role, MailboxRole::Trash | MailboxRole::Junk);
                 widgets.expunge_enabled.set(expunge_eligible);
-                // Defensive: a recycled row may still carry a visible box from a
-                // stale hover; only hover on an eligible row ever re-shows it.
-                if !expunge_eligible {
-                    widgets.action_box.set_visible(false);
-                }
-                *widgets.expunge_data.borrow_mut() = if expunge_eligible {
-                    match &*tree_item {
-                        TreeItem::Folder(node) | TreeItem::Favorite(node) => Some(node.mailbox.clone()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
+                widgets.expunge_btn.set_visible(expunge_eligible);
+                *widgets.expunge_data.borrow_mut() = row_mailbox.clone().filter(|_| expunge_eligible);
                 widgets.expunge_btn.set_tooltip_text(Some(match role {
                     MailboxRole::Trash => "Empty Trash",
                     MailboxRole::Junk => "Empty Junk",
                     _ => "Empty folder",
                 }));
+                if let Some(mailbox) = &row_mailbox {
+                    let (prefs, favorite_pos) = folder_view.clone().unwrap_or_default();
+                    let menu_state = crate::folder_menu::folder_menu_state(mailbox, favorite_pos);
+                    widgets.menu.refresh(mailbox, menu_state, prefs.color.as_deref(), prefs.count_mode);
+                }
+                *widgets.menu_data.borrow_mut() = row_mailbox;
+                (widgets.refresh_actions)();
             }
             // Refresh the row's sync/prefetch spinner: register it under its
             // mailbox id (for `set_mailbox_syncing`/`set_mailbox_prefetching`
@@ -2013,6 +2085,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // UI-state database so the first `rebuild_folder_tree` of a fresh session
     // can re-seed the pane's collapse state instead of starting all-default.
     let (expanded_folders, collapsed_groups) = ui_db.as_ref().and_then(|db| db.load_folder_expansion().ok()).unwrap_or_default();
+    let folder_prefs = ui_db.as_ref().and_then(|db| db.load_folder_prefs().ok()).unwrap_or_default();
     // Shared keyring handle for manually-added ("other") IMAP/SMTP accounts -
     // see `other_accounts.rs`. Cloned into the add-account dialog, the
     // startup connect loop, and the Config view's edit/remove actions.
@@ -2067,7 +2140,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         refreshing: HashSet::new(),
         sort_key: SortKey::from_action_state(&settings.get_string(crate::settings::SORT_KEY)).unwrap_or(SortKey::Date),
         sort_descending: settings.get_bool(crate::settings::SORT_DESCENDING),
-        favorites: settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId).collect(),
+        favorites: crate::folder_menu::dedup_in_order(settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId)),
+        favorite_display_order: Vec::new(),
+        folder_prefs,
         load_remote_images: settings.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES),
         rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
         trusted_senders,
@@ -3219,18 +3294,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 return;
             }
             let Some(mailbox) = state.borrow().current_mailbox.clone() else { return };
-            {
-                let mut st = state.borrow_mut();
-                if button.is_active() {
-                    st.favorites.insert(mailbox.clone());
-                } else {
-                    st.favorites.remove(&mailbox);
-                }
-            }
-            // Phase 5: write the whole favorites set through, so the tree's
-            // Favorites section survives restarts.
-            let favorites: Vec<String> = state.borrow().favorites.iter().map(|m| m.0.clone()).collect();
-            state.borrow().settings.set_strv(crate::settings::MAIL_FAVORITES, favorites);
+            set_folder_favorite(&state, &mailbox, button.is_active());
             apply_favorite_visual(button, button.is_active());
             // The tree grows/loses a whole section, so it has to be rebuilt -
             // which swaps the model and drops the highlight. Put it back on the
@@ -3243,6 +3307,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
+
+    // --- Folder rows' "⋯" menu (and Empty button) -> folder actions. ---
+    install_folder_menu_handler(&menu_handler, &state, &folder_selection, &folder_scroller, &list_header);
 
     let compose_button = gtk::Button::from_icon_name("mail-message-new-symbolic");
     compose_button.set_tooltip_text(Some("New Message"));
@@ -10135,6 +10202,47 @@ fn spawn_account_event_loop(
                     AccountEvent::MessageSnoozed => {
                         toast_overlay.add_toast(adw::Toast::new("Snoozed until tomorrow 9:00 AM"));
                     }
+                    AccountEvent::MailboxCreated { mailbox } => {
+                        // Open the new folder's parent, so it's visible once the
+                        // re-list that follows lands in `FoldersUpdated`.
+                        let delimiter = state
+                            .borrow()
+                            .accounts
+                            .get(&account_id)
+                            .and_then(|handle| handle.folders.first().map(|m| m.delimiter))
+                            .unwrap_or('/');
+                        if let Some(parent) = lookout_mail::mailbox_name::parent_mailbox_id(&account_id, &mailbox, delimiter) {
+                            // Both halves: the rebuild's capture overrides the
+                            // memory for a parent that's expandable-but-collapsed
+                            // now, so open its live row too; a parent that had no
+                            // subfolders yet only exists in the memory.
+                            if let Some(model) = folder_selection.model().and_downcast::<gtk::TreeListModel>() {
+                                if let Some(row) = find_mailbox_index(&model, &parent).and_then(|index| model.item(index)).and_downcast::<gtk::TreeListRow>() {
+                                    row.set_expanded(true);
+                                }
+                            }
+                            state.borrow_mut().expanded_folders.insert(parent);
+                        }
+                        let name = lookout_mail::mailbox_name::display_leaf(&account_id, &mailbox, delimiter);
+                        toast_overlay.add_toast(adw::Toast::new(&format!("Created \u{201c}{name}\u{201d}")));
+                    }
+                    AccountEvent::MailboxRenamed { from, to, delimiter, to_trash } => {
+                        rekey_renamed_folder(&state, &from, &to, delimiter);
+                        if to_trash {
+                            let name = lookout_mail::mailbox_name::display_leaf(&account_id, &from, delimiter);
+                            toast_overlay.add_toast(adw::Toast::new(&format!("Moved \u{201c}{name}\u{201d} to Trash")));
+                        }
+                        // The header names the open folder, which may be the
+                        // renamed one; the `FoldersUpdated` that follows
+                        // redraws the tree under the new names.
+                        refresh_list_header(&state, &list_header);
+                    }
+                    AccountEvent::MailboxDeleted { mailbox, delimiter } => {
+                        forget_deleted_folder(&state, &mailbox, delimiter);
+                        let name = lookout_mail::mailbox_name::display_leaf(&account_id, &mailbox, delimiter);
+                        toast_overlay.add_toast(adw::Toast::new(&format!("Deleted \u{201c}{name}\u{201d}")));
+                        refresh_list_header(&state, &list_header);
+                    }
                     AccountEvent::SearchResults { mailbox, query, messages } => {
                         // An answer to the live IMAP pass. `mailbox` matches a
                         // `search_pending` entry (the session always answers, even
@@ -14911,17 +15019,27 @@ type FolderTreeSnapshot = (bool, Vec<(AccountId, String, Vec<Mailbox>)>, Vec<Mai
 
 /// Exactly the data the sidebar draws - per account its id and label, and per
 /// folder the id, display name, icon-selecting role, delimiter (the tree's
-/// parent/child structure is derived from it) and unread count - plus the
-/// favorites section's membership. Compared against the previous rebuild's
+/// parent/child structure is derived from it), unread and total counts (the
+/// row's number and its "⋯" menu heading) and local display prefs (icon
+/// colour, which count shows) - plus the favorites section's membership and
+/// order. Compared against the previous rebuild's
 /// value to decide whether a `FoldersUpdated` needs a rebuild at all.
 ///
 /// Deliberately *not* the whole `Mailbox`: a STATUS refresh writes `uidnext`
 /// and `uidvalidity` on every pass, and including fields the tree never
 /// renders would make the guard fire on changes that can't be seen.
-type FolderTreeSignature = Vec<(AccountId, String, Vec<(MailboxId, String, MailboxRole, char, u32)>)>;
+type FolderTreeSignature = Vec<(AccountId, String, Vec<FolderRowSignature>)>;
+type FolderRowSignature = (MailboxId, String, MailboxRole, char, u32, u32, crate::ui_state_db::FolderPrefs);
 
-fn folder_tree_signature(accounts: &[(AccountId, String, Vec<Mailbox>)], favorites: &[Mailbox]) -> FolderTreeSignature {
-    let row = |m: &Mailbox| (m.id.clone(), m.name.clone(), m.role, m.delimiter, m.unread);
+fn folder_tree_signature(
+    accounts: &[(AccountId, String, Vec<Mailbox>)],
+    favorites: &[Mailbox],
+    prefs: &HashMap<MailboxId, crate::ui_state_db::FolderPrefs>,
+) -> FolderTreeSignature {
+    let row = |m: &Mailbox| {
+        let pref = prefs.get(&m.id).cloned().unwrap_or_default();
+        (m.id.clone(), m.name.clone(), m.role, m.delimiter, m.unread, m.total, pref)
+    };
     let mut signature: FolderTreeSignature = accounts
         .iter()
         .map(|(id, label, folders)| (id.clone(), label.clone(), folders.iter().map(row).collect()))
@@ -15029,7 +15147,12 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
         (auto_select_inbox, accounts, favorites)
     };
     accounts.sort_by_key(|a| a.1.to_lowercase());
-    favorites.sort_by_key(|m| m.name.to_lowercase());
+    // Alphabetical until the user first moves a favourite up or down, then
+    // the stored order (see `move_favorite`).
+    if !state.borrow().settings.get_bool(crate::settings::MAIL_FAVORITES_CUSTOM_ORDER) {
+        favorites.sort_by_key(|m| m.name.to_lowercase());
+    }
+    state.borrow_mut().favorite_display_order = favorites.iter().map(|m| m.id.clone()).collect();
 
     // While the unified view is active, any account whose Inbox just appeared
     // (or reconnected) gets asked to sync so it populates the merged list.
@@ -15060,7 +15183,7 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
     // it rebuilds every row, collapses whatever subfolders the user had
     // expanded, and drops the selection (see the restore below), so skipping
     // it outright is what keeps the pane still while counts fill in.
-    let signature = folder_tree_signature(&accounts, &favorites);
+    let signature = folder_tree_signature(&accounts, &favorites, &state.borrow().folder_prefs);
     {
         let st = state.borrow();
         if st.folder_tree.as_ref() == Some(&signature) && !auto_select_inbox && !st.restore_pending {
@@ -15135,6 +15258,257 @@ fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection: &gtk::Sin
     if auto_select_inbox {
         restore_or_default_initial_view(state, &model, folder_selection);
     }
+}
+
+/// Fills the folder rows' shared [`crate::folder_menu::FolderMenuHandler`]
+/// slot: what each "⋯" menu item (and the Trash/Junk Empty button) does. The
+/// server-side actions confirm or ask for a name first where needed, then go
+/// to the folder's account session as `AccountCommand`s - the tree catches up
+/// from the `FoldersUpdated` that answers them. Favorites membership and
+/// order, and the folder's colour and count mode, are local and apply at once.
+fn install_folder_menu_handler(
+    slot: &crate::folder_menu::FolderMenuHandler,
+    state: &Rc<RefCell<UiState>>,
+    folder_selection: &gtk::SingleSelection,
+    folder_scroller: &gtk::ScrolledWindow,
+    list_header: &ListHeader,
+) {
+    use crate::folder_menu::{present_delete_dialog, present_empty_dialog, present_move_dialog, present_name_dialog, FolderMenuAction};
+    let state = state.clone();
+    let folder_selection = folder_selection.clone();
+    let folder_scroller = folder_scroller.clone();
+    let list_header = list_header.clone();
+    let handler = move |action: FolderMenuAction, mailbox: Mailbox, anchor: gtk::Widget| {
+        let Some(account_id) = mailbox_account_id(&mailbox.id) else { return };
+        let send: Rc<dyn Fn(AccountCommand)> = {
+            let state = state.clone();
+            let account_id = account_id.clone();
+            Rc::new(move |command| {
+                if let Some(handle) = state.borrow().accounts.get(&account_id) {
+                    let _ = handle.cmd_tx.send_blocking(command);
+                }
+            })
+        };
+        let folders = state.borrow().accounts.get(&account_id).map(|handle| handle.folders.clone()).unwrap_or_default();
+        // The display names of the folders directly under `parent` (`None`:
+        // the top level), for the name dialogs' duplicate check. Parents come
+        // from the folder *path* - the account id itself may contain the
+        // delimiter (GOA ids are object paths).
+        let parent_of = |id: &MailboxId| lookout_mail::mailbox_name::parent_mailbox_id(&account_id, id, mailbox.delimiter);
+        let children_of = |parent: Option<&MailboxId>| -> Vec<String> {
+            folders
+                .iter()
+                .filter(|m| lookout_mail::mailbox_name::parent_mailbox_id(&account_id, &m.id, m.delimiter).as_ref() == parent)
+                .map(|m| display_name(&m.name))
+                .collect()
+        };
+        match action {
+            FolderMenuAction::CreateSubfolder => {
+                let siblings = children_of(Some(&mailbox.id));
+                let parent = mailbox.id.clone();
+                present_name_dialog(&anchor, "Create new subfolder", "Create", "", mailbox.delimiter, siblings, move |name| {
+                    send(AccountCommand::CreateMailbox {
+                        parent: Some(parent.clone()),
+                        name,
+                    });
+                });
+            }
+            FolderMenuAction::Rename => {
+                let siblings = children_of(parent_of(&mailbox.id).as_ref());
+                let target = mailbox.id.clone();
+                present_name_dialog(
+                    &anchor,
+                    "Rename folder",
+                    "Rename",
+                    &display_name(&mailbox.name),
+                    mailbox.delimiter,
+                    siblings,
+                    move |new_name| {
+                        send(AccountCommand::RenameMailbox {
+                            mailbox: target.clone(),
+                            new_name,
+                        });
+                    },
+                );
+            }
+            FolderMenuAction::Move => {
+                let target = mailbox.id.clone();
+                present_move_dialog(&anchor, &mailbox, folders.clone(), move |new_parent| {
+                    send(AccountCommand::MoveMailbox {
+                        mailbox: target.clone(),
+                        new_parent,
+                    });
+                });
+            }
+            FolderMenuAction::Delete => {
+                // Mirrors the session's choice (`plan_folder_change`): moved
+                // under Trash, unless it's already there or there's no Trash.
+                let permanent = folders
+                    .iter()
+                    .find(|m| m.role == MailboxRole::Trash)
+                    .is_none_or(|trash| lookout_mail::mailbox_name::is_same_or_descendant(&mailbox.id, &trash.id, mailbox.delimiter));
+                let target = mailbox.id.clone();
+                present_delete_dialog(&anchor, &mailbox, permanent, move || send(AccountCommand::DeleteMailbox { mailbox: target.clone() }));
+            }
+            FolderMenuAction::Empty => {
+                let target = mailbox.id.clone();
+                present_empty_dialog(&anchor, &mailbox, move || send(AccountCommand::EmptyMailbox { mailbox: target.clone() }));
+            }
+            FolderMenuAction::MarkAllRead => send(AccountCommand::MarkMailboxRead { mailbox: mailbox.id.clone() }),
+            FolderMenuAction::AddFavorite | FolderMenuAction::RemoveFavorite => {
+                set_folder_favorite(&state, &mailbox.id, action == FolderMenuAction::AddFavorite);
+                // The header's star follows when this is the open folder.
+                refresh_list_header(&state, &list_header);
+                rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+            }
+            FolderMenuAction::MoveFavoriteUp | FolderMenuAction::MoveFavoriteDown => {
+                let delta = if action == FolderMenuAction::MoveFavoriteUp { -1 } else { 1 };
+                if move_favorite(&state, &mailbox.id, delta) {
+                    rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+                }
+            }
+            FolderMenuAction::SetColor(_) | FolderMenuAction::SetCountMode(_) => {
+                {
+                    let mut st = state.borrow_mut();
+                    let prefs = st.folder_prefs.entry(mailbox.id.clone()).or_default();
+                    match action {
+                        FolderMenuAction::SetColor(color) => prefs.color = color,
+                        FolderMenuAction::SetCountMode(mode) => prefs.count_mode = mode,
+                        _ => unreachable!("matched above"),
+                    }
+                    if prefs.is_default() {
+                        st.folder_prefs.remove(&mailbox.id);
+                    }
+                }
+                persist_folder_prefs(&state);
+                rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
+            }
+        }
+    };
+    *slot.borrow_mut() = Some(Rc::new(handler));
+}
+
+fn persist_folder_prefs(state: &Rc<RefCell<UiState>>) {
+    let st = state.borrow();
+    if let Some(db) = &st.ui_db {
+        if let Err(e) = db.set_folder_prefs(&st.folder_prefs) {
+            tracing::warn!("folder colours and count modes won't persist: {e}");
+        }
+    }
+}
+
+/// Re-keys everything the UI holds by mailbox id after the folder `from` was
+/// renamed or moved to `to` (its subfolders move with it): the Favorites
+/// list, the folder prefs, the expanded-subfolder memory, and the open folder
+/// (with its remembered last view). The session has already re-pointed its
+/// own open folder and resyncs it under the new id.
+fn rekey_renamed_folder(state: &Rc<RefCell<UiState>>, from: &MailboxId, to: &MailboxId, delimiter: char) {
+    use lookout_mail::mailbox_name::rekey_mailbox_id;
+    {
+        let mut st = state.borrow_mut();
+        st.favorites = crate::folder_menu::rekey_ids(&st.favorites, from, to, delimiter);
+        st.folder_prefs = std::mem::take(&mut st.folder_prefs)
+            .into_iter()
+            .map(|(id, prefs)| (rekey_mailbox_id(&id, from, to, delimiter).unwrap_or(id), prefs))
+            .collect();
+        st.expanded_folders = std::mem::take(&mut st.expanded_folders)
+            .into_iter()
+            .map(|id| rekey_mailbox_id(&id, from, to, delimiter).unwrap_or(id))
+            .collect();
+        if let Some(current) = st.current_mailbox.as_ref().and_then(|current| rekey_mailbox_id(current, from, to, delimiter)) {
+            st.current_mailbox = Some(current.clone());
+            if matches!(st.mail_view, MailView::Single) {
+                last_view::save(
+                    &st.settings,
+                    &LastSelection {
+                        unified: false,
+                        mailbox: Some(current.0),
+                    },
+                );
+            }
+        }
+    }
+    persist_favorites(state);
+    persist_folder_prefs(state);
+    persist_folder_expansion(state);
+}
+
+/// Forgets everything the UI holds for the folder `root` and its subfolders
+/// after they were permanently deleted. If the open folder was among them,
+/// the view moves to the account's Inbox (which the session resyncs).
+fn forget_deleted_folder(state: &Rc<RefCell<UiState>>, root: &MailboxId, delimiter: char) {
+    use lookout_mail::mailbox_name::is_same_or_descendant;
+    {
+        let mut st = state.borrow_mut();
+        st.favorites.retain(|id| !is_same_or_descendant(id, root, delimiter));
+        st.folder_prefs.retain(|id, _| !is_same_or_descendant(id, root, delimiter));
+        st.expanded_folders.retain(|id| !is_same_or_descendant(id, root, delimiter));
+        let open_was_deleted = st.current_mailbox.as_ref().is_some_and(|current| is_same_or_descendant(current, root, delimiter));
+        if open_was_deleted {
+            let inbox = mailbox_account_id(root)
+                .and_then(|account_id| st.accounts.get(&account_id))
+                .and_then(|handle| handle.folders.iter().find(|m| m.role == MailboxRole::Inbox))
+                .map(|inbox| inbox.id.clone());
+            st.current_mailbox = inbox.clone();
+            if matches!(st.mail_view, MailView::Single) {
+                last_view::save(
+                    &st.settings,
+                    &LastSelection {
+                        unified: false,
+                        mailbox: inbox.map(|id| id.0),
+                    },
+                );
+            }
+        }
+    }
+    persist_favorites(state);
+    persist_folder_prefs(state);
+    persist_folder_expansion(state);
+}
+
+/// Adds `mailbox` to, or removes it from, the folder tree's Favorites
+/// section, writing the whole list through to `mail-favorites` so it survives
+/// restarts. A new favourite goes at the end. Shared by the message-list
+/// header's star and the folder rows' "⋯" menu; the caller rebuilds the tree.
+fn set_folder_favorite(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, favorite: bool) {
+    {
+        let mut st = state.borrow_mut();
+        if favorite {
+            if !st.favorites.contains(mailbox) {
+                st.favorites.push(mailbox.clone());
+            }
+        } else {
+            st.favorites.retain(|m| m != mailbox);
+        }
+    }
+    persist_favorites(state);
+}
+
+fn persist_favorites(state: &Rc<RefCell<UiState>>) {
+    let st = state.borrow();
+    st.settings.set_strv(crate::settings::MAIL_FAVORITES, st.favorites.iter().map(|m| m.0.clone()).collect());
+}
+
+/// Moves a favourite one place up (`-1`) or down (`+1`) in the Favorites
+/// section as the user sees it. The first reorder switches the section from
+/// alphabetical to the stored order (`mail-favorites-custom-order`), so the
+/// move starts from the order on screen; favourites whose folder isn't
+/// listed right now (an account still connecting) keep their place at the
+/// end. Returns whether anything moved; the caller rebuilds the tree.
+fn move_favorite(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, delta: isize) -> bool {
+    {
+        let mut st = state.borrow_mut();
+        let mut order = st.favorite_display_order.clone();
+        if !crate::folder_menu::move_in_order(&mut order, mailbox, delta) {
+            return false;
+        }
+        let unlisted: Vec<MailboxId> = st.favorites.iter().filter(|m| !order.contains(m)).cloned().collect();
+        order.extend(unlisted);
+        st.favorites = order;
+        st.settings.set_bool(crate::settings::MAIL_FAVORITES_CUSTOM_ORDER, true);
+    }
+    persist_favorites(state);
+    true
 }
 
 /// Where `rebuild_folder_tree` puts the sidebar highlight back after swapping
@@ -17551,8 +17925,8 @@ mod tests {
     #[test]
     fn folder_tree_signature_tracks_the_unread_count() {
         let account = AccountId("acc".into());
-        let before = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[]);
-        let after = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 4)])], &[]);
+        let before = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[], &HashMap::new());
+        let after = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 4)])], &[], &HashMap::new());
         assert_ne!(before, after, "a changed count must rebuild the tree - it's what the row draws");
     }
 
@@ -17697,18 +18071,40 @@ mod tests {
         let mut noisy = test_mailbox(&account, "INBOX", 3);
         noisy.uidnext = 999;
         noisy.uidvalidity = UidValidity(42);
-        noisy.total = 1234;
-        let quiet = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[]);
-        let churned = folder_tree_signature(&[(account.clone(), "Me".into(), vec![noisy])], &[]);
+        noisy.highest_modseq = Some(7);
+        let quiet = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[], &HashMap::new());
+        let churned = folder_tree_signature(&[(account.clone(), "Me".into(), vec![noisy])], &[], &HashMap::new());
         assert_eq!(quiet, churned);
+    }
+
+    #[test]
+    fn folder_tree_signature_tracks_totals_and_display_prefs() {
+        // The total is drawn too now - by a row set to show it, and in every
+        // row's "⋯" menu heading - and a colour or count-mode change has to
+        // repaint the row it belongs to.
+        let account = AccountId("acc".into());
+        let inbox = test_mailbox(&account, "INBOX", 3);
+        let accounts = vec![(account.clone(), "Me".to_string(), vec![inbox.clone()])];
+        let base = folder_tree_signature(&accounts, &[], &HashMap::new());
+        let mut grown = inbox.clone();
+        grown.total += 1;
+        assert_ne!(base, folder_tree_signature(&[(account.clone(), "Me".into(), vec![grown])], &[], &HashMap::new()));
+        let colored = HashMap::from([(
+            inbox.id.clone(),
+            crate::ui_state_db::FolderPrefs {
+                color: Some("#3584e4".into()),
+                ..Default::default()
+            },
+        )]);
+        assert_ne!(base, folder_tree_signature(&accounts, &[], &colored));
     }
 
     #[test]
     fn folder_tree_signature_tracks_the_favorites_section() {
         let account = AccountId("acc".into());
         let accounts = [(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 0)])];
-        let without = folder_tree_signature(&accounts, &[]);
-        let with = folder_tree_signature(&accounts, &[test_mailbox(&account, "INBOX", 0)]);
+        let without = folder_tree_signature(&accounts, &[], &HashMap::new());
+        let with = folder_tree_signature(&accounts, &[test_mailbox(&account, "INBOX", 0)], &HashMap::new());
         assert_ne!(without, with, "starring a folder adds a whole section and must rebuild");
     }
 
@@ -17977,7 +18373,9 @@ mod tests {
             refreshing: HashSet::new(),
             sort_key: SortKey::Date,
             sort_descending: true,
-            favorites: HashSet::new(),
+            favorites: Vec::new(),
+            favorite_display_order: Vec::new(),
+            folder_prefs: HashMap::new(),
             load_remote_images: false,
             rich_text_default: true,
             trusted_senders: HashMap::new(),
