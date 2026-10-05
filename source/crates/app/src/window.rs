@@ -235,6 +235,19 @@ const BODY_CACHE_IN_MEMORY: usize = 25;
 /// remote resources) must not hold the pane blank indefinitely.
 const HTML_REVEAL_TIMEOUT_MS: u64 = 400;
 
+/// How long an uncached message body may stay in flight before the reading
+/// pane gives up and shows the "message unavailable" page instead of spinning
+/// forever. Generous enough that a slow link isn't mistaken for a failure; the
+/// reconnect path (see `FoldersUpdated`) retries automatically once the
+/// connection comes back, and the page's Retry button re-requests on demand.
+const BODY_FETCH_TIMEOUT_MS: u64 = 30_000;
+
+/// The same backstop as `BODY_FETCH_TIMEOUT_MS`, used when the network is
+/// already known to be down: local disk-cache reads answer in milliseconds, so
+/// the pane can report the outage almost immediately instead of spinning for
+/// the full timeout. Long enough that a disk hit still wins the race.
+const BODY_FETCH_OFFLINE_TIMEOUT_MS: u64 = 1_000;
+
 /// How narrow the mail screen's folder pane may be dragged, in pixels. The
 /// pane holds a `Gtk.ScrolledWindow`, which reports no meaningful minimum
 /// width of its own, so without this the separator can be dragged until the
@@ -678,6 +691,19 @@ pub(crate) struct UiState {
     /// `BodyFetched` updates that arrive after the user has moved on to a
     /// different message.
     pending_body_request: Option<(MailboxId, Uid)>,
+    /// The `(mailbox, uid)` whose body fetch failed while it was still the
+    /// message on the reading pane (the connection dropped, the server was
+    /// unreachable, or the fetch timed out). The reading pane shows its
+    /// "error" page for this message and its Retry button re-requests it.
+    /// Cleared whenever a body renders, the selection changes, or a retry is
+    /// dispatched.
+    body_fetch_error: Option<(MailboxId, Uid)>,
+    /// Bumped every time a body fetch is dispatched or abandoned. The
+    /// fetch-timeout backstop captures the value it was armed under and only
+    /// fails the pane if it's unchanged, so a timeout armed for a message the
+    /// user has already navigated away from (or one that has since rendered)
+    /// can never raise a stale error.
+    body_fetch_generation: u64,
     /// An attachment-part fetch currently in flight for the reading pane's
     /// row - its menu button is disabled while the bytes are coming, and
     /// re-enabled when `AccountEvent::PartFetched` lands (or discarded if the
@@ -2112,6 +2138,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         pending_optimistic_flag_changes: HashMap::new(),
         pending_optimistic_pinned_changes: HashMap::new(),
         pending_body_request: None,
+        body_fetch_error: None,
+        body_fetch_generation: 0,
         pending_attachment: None,
         pending_raw_message: None,
         unsubscribe_info: None,
@@ -3702,7 +3730,51 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let reading_multi = gtk::Box::builder().orientation(gtk::Orientation::Vertical).valign(gtk::Align::Center).vexpand(true).build();
     reading_multi.append(&reading_multi_label);
     reading_stack.add_named(&reading_multi, Some("multi"));
+    // A spinner page distinct from "empty": "empty" is a true blank used for
+    // the momentary crossfade between messages, whereas an uncached body fetch
+    // can take a real round trip. Showing feedback here (rather than a blank
+    // pane) lets the "message unavailable" page below read as a *failure*
+    // instead of looking like the app simply has nothing to say.
+    let reading_loading = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .spacing(12)
+        .build();
+    let reading_loading_spinner = gtk::Spinner::new();
+    reading_loading_spinner.set_widget_name("body-loading-spinner");
+    let reading_loading_label = gtk::Label::builder().label("Loading message…").css_classes(["dim-label"]).build();
+    reading_loading.append(&reading_loading_spinner);
+    reading_loading.append(&reading_loading_label);
+    reading_stack.add_named(&reading_loading, Some("loading"));
+    // The failure page: shown when an uncached body fetch can't complete -
+    // the server is unreachable or the network is down. `show_body_fetch_error`
+    // updates the description to name whichever of the two it looks like; the
+    // Retry button re-dispatches the fetch for the message that failed.
+    let reading_error_retry = gtk::Button::builder().label("Retry").halign(gtk::Align::Center).css_classes(["pill"]).build();
+    reading_error_retry.set_widget_name("body-error-retry");
+    let reading_error_page = adw::StatusPage::builder()
+        .icon_name("network-offline-symbolic")
+        .title("Message unavailable")
+        .description(body_fetch_error_description(true))
+        .build();
+    reading_error_page.set_child(Some(&reading_error_retry));
+    reading_error_page.set_widget_name("body-error-page");
+    reading_stack.add_named(&reading_error_page, Some("error"));
     reading_stack.set_visible_child_name("empty");
+    // Retry acts on whatever fetch most recently failed, re-arming the whole
+    // dispatch (pending request + timeout + loading page).
+    {
+        let state = state.clone();
+        let worker = worker.clone();
+        let reading_stack = reading_stack.clone();
+        let message_header = message_header.clone();
+        reading_error_retry.connect_clicked(move |_| {
+            let Some((mailbox, uid)) = state.borrow().body_fetch_error.clone() else { return };
+            request_body_fetch(&state, &worker, &reading_stack, &message_header, mailbox, uid);
+        });
+    }
     // Interpolated crossfade between the reading pane's pages so a
     // message's header + body fade out and the next fades in instead of
     // snapping. Message switches already pass through the "empty" page
@@ -8378,6 +8450,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let default_dark = {
                         let mut st = state.borrow_mut();
                         st.pending_body_request = None;
+                        st.body_fetch_error = None;
+                        st.body_fetch_generation += 1;
                         st.pending_html_reveal = false;
                         st.reveal_generation += 1;
                         st.pending_header = None;
@@ -8399,6 +8473,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     };
                     drop_pending_cid(&state);
                     set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
+                    stop_body_loading(&reading_stack);
                     reading_multi_label.set_label(&format!("{} messages selected", summaries.len()));
                     reading_stack.set_visible_child_name("multi");
                     return;
@@ -8431,6 +8506,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         let default_dark = {
                             let mut st = state.borrow_mut();
                             st.pending_body_request = None;
+                            st.body_fetch_error = None;
+                            st.body_fetch_generation += 1;
                             st.pending_html_reveal = false;
                             st.reveal_generation += 1;
                             st.pending_header = None;
@@ -8452,6 +8529,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         };
                         drop_pending_cid(&state);
                         set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
+                        stop_body_loading(&reading_stack);
                         reading_stack.set_visible_child_name("empty");
                     });
                     return;
@@ -8529,76 +8607,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 !body_is_cached && !is_same_request
             };
             if should_request {
-                let st = state.borrow();
-                if let Some(account_id) = mailbox_account_id(&mailbox) {
-                    if let Some(handle) = st.accounts.get(&account_id) {
-                        tracing::debug!(?mailbox, uid = uid.0, "FetchBody: dispatching to account actor");
-                        let _ = handle.interactive_cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox.clone(), uid });
-                        // Parallel disk fast-path: a body cached on disk but
-                        // not in the 25-entry in-memory LRU renders the
-                        // instant this read lands, without waiting for the
-                        // command to round-trip through the session (the
-                        // session's own FetchBody still serves the same row
-                        // from its own cache check and answers without a
-                        // network round trip; whichever lands first renders
-                        // and the other is deduped by `pending_body_request`).
-                        // The `address_cache` handle may still be opening
-                        // right after connect, and a mailbox not yet in
-                        // `folders` falls back to `UidValidity(0)` - a
-                        // deliberate cache-miss sentinel, so neither case can
-                        // serve a wrong body.
-                        let cache = handle.address_cache.clone();
-                        let uidvalidity = handle.folders.iter().find(|f| f.id == mailbox).map(|f| f.uidvalidity).unwrap_or(UidValidity(0));
-                        drop(st);
-                        if let Some(cache) = cache {
-                            let reply_rx = spawn_cache_read(&worker, cache, {
-                                let mailbox = mailbox.clone();
-                                move |c| c.load_bodies(&mailbox, &[uid], uidvalidity)
-                            });
-                            let state = state.clone();
-                            let reading_stack = reading_stack.clone();
-                            let message_header = message_header.clone();
-                            let request_key = request.clone();
-                            let mailbox_for_render = mailbox.clone();
-                            glib::spawn_future_local(async move {
-                                let Ok(result) = reply_rx.recv().await else { return };
-                                let Ok(bodies) = result else { return };
-                                let Some(body) = bodies.get(&uid).cloned() else { return };
-                                // The selection may have moved on while the
-                                // read ran, or the session's own BodyFetched
-                                // may already have rendered the message.
-                                let still_current = state.borrow().pending_body_request.as_ref() == Some(&request_key);
-                                if !still_current {
-                                    return;
-                                }
-                                // Serving from disk: clear the pending request
-                                // so the session's own BodyFetched for this
-                                // message is treated as a stale duplicate,
-                                // then render immediately.
-                                state.borrow_mut().pending_body_request = None;
-                                tracing::debug!(?mailbox_for_render, uid = uid.0, "FetchBody: serving from disk cache");
-                                render_body(&state, &reading_stack, &message_header, mailbox_for_render, uid, body);
-                            });
-                        }
-                    } else {
-                        drop(st);
-                    }
-                } else {
-                    drop(st);
-                }
+                // `request_body_fetch` sends the command, arms the failure
+                // backstop, shows the loading page, and starts the parallel
+                // disk-cache read.
+                request_body_fetch(&state, &worker, &reading_stack, &message_header, mailbox.clone(), uid);
             }
             // Also silently abandons an in-progress composer in the reading
             // pane, if one's open - no "discard draft?" prompt, consistent
             // with this app's existing no-confirmation-dialog convention.
-            // The pane sits on "empty" while an uncached body is in flight -
-            // the crossfade through it is fast enough to cover the fetch.
-            reading_stack.set_visible_child_name("empty");
             // Every navigation resets the per-message override to the
             // configured default (Config → Appearance → "Dark message
             // theme"), so the next message opens in that default rather than
             // inheriting the previous message's manual toggle - the physical
             // sheet/canvas are re-armed to match before the new body renders
-            // (or while the pane sits on "empty" waiting for a fetch).
+            // (or while the pane sits on "loading" waiting for a fetch).
             {
                 let mut st = state.borrow_mut();
                 let default_dark = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
@@ -8607,6 +8629,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 set_message_theme_armed(default_dark, &web_view, &user_content_manager, &theme_override_sheet);
             }
             if body_is_cached {
+                // Route through the blank page so the new body crossfades in
+                // rather than swapping in place.
+                reading_stack.set_visible_child_name("empty");
                 let body = state.borrow_mut().body_cache.get(&mailbox, &uid);
                 if let Some(body) = body {
                     tracing::debug!(?mailbox, uid = uid.0, "FetchBody: serving from in-memory cache");
@@ -9586,6 +9611,7 @@ fn connect_account(
         dashboard_refresh,
         mark_read_button,
         pin_button,
+        worker,
     );
 }
 
@@ -9689,6 +9715,7 @@ fn spawn_account_event_loop(
     dashboard_refresh: Rc<dyn Fn()>,
     mark_read_button: gtk::Button,
     pin_button: gtk::Button,
+    worker: Rc<Worker>,
 ) {
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
@@ -9710,6 +9737,14 @@ fn spawn_account_event_loop(
                         if !retryable {
                             let title = glib::markup_escape_text(&format!("{}: {message}", account_label(&state, &account_id)));
                             toast_overlay.add_toast(adw::Toast::new(&title));
+                        }
+                        // A dropped connection while an uncached body was still
+                        // loading is why that message never arrived: surface the
+                        // unavailable page now instead of leaving the pane
+                        // spinning until the fetch timeout fires.
+                        let pending = state.borrow().pending_body_request.clone();
+                        if let Some((mailbox, uid)) = pending.filter(|(m, _)| mailbox_account_id(m).as_ref() == Some(&account_id)) {
+                            show_body_fetch_error(&state, &reading_stack, mailbox, uid);
                         }
                     }
                     AccountEvent::ConnectionStateChanged(_) => {}
@@ -9754,6 +9789,14 @@ fn spawn_account_event_loop(
                         // don't leave the spinner running for a request that will
                         // never land.
                         refresh_message_loading_state(&state, &message_list, &message_list_stack);
+                        // A reconnect also means a body fetch that failed while
+                        // the connection was down can be retried: re-arm it
+                        // automatically so the message loads once connectivity
+                        // is back, without the user having to press Retry.
+                        let failed = state.borrow().body_fetch_error.clone();
+                        if let Some((mailbox, uid)) = failed.filter(|(m, _)| mailbox_account_id(m).as_ref() == Some(&account_id)) {
+                            request_body_fetch(&state, &worker, &reading_stack, &message_header, mailbox, uid);
+                        }
                     }
                     AccountEvent::MessagesUpdated { mailbox, mut messages } => {
                         // A sync can land for reasons unrelated to a pending
@@ -9950,7 +9993,13 @@ fn spawn_account_event_loop(
                     AccountEvent::BodyFetched { mailbox, uid, body } => {
                         let should_render = {
                             let mut st = state.borrow_mut();
-                            let is_current = body_request_matches(&mailbox, &uid, st.pending_body_request.as_ref());
+                            // Render if this is the request still in flight, or
+                            // if it's the message the error page is currently
+                            // showing for - a slow fetch that lands after the
+                            // timeout has already raised the error page should
+                            // still replace it with the real message.
+                            let is_current =
+                                body_request_matches(&mailbox, &uid, st.pending_body_request.as_ref()) || st.body_fetch_error.as_ref() == Some(&(mailbox.clone(), uid));
                             tracing::debug!(
                                 ?mailbox,
                                 uid = uid.0,
@@ -10399,6 +10448,7 @@ fn connect_other_account(
         dashboard_refresh,
         mark_read_button,
         pin_button,
+        worker,
     );
 }
 
@@ -15985,6 +16035,161 @@ fn body_request_matches(mailbox: &MailboxId, uid: &Uid, pending_request: Option<
     pending_request.is_some_and(|(pending_mailbox, pending_uid)| pending_mailbox == mailbox && pending_uid == uid)
 }
 
+/// The reading pane's "message unavailable" text. `network_available`
+/// distinguishes a down connection from an unreachable server, so the message
+/// points the user at the right thing to check.
+fn body_fetch_error_description(network_available: bool) -> &'static str {
+    if network_available {
+        "The message couldn't be loaded. The server may be unavailable — try again in a moment."
+    } else {
+        "The message couldn't be loaded. You appear to be offline — check your network connection."
+    }
+}
+
+/// Stops the reading pane's body-loading spinner, if it's mounted.
+fn stop_body_loading(reading_stack: &gtk::Stack) {
+    if let Some(spinner) = find_named_descendant(reading_stack, "body-loading-spinner").and_then(|c| c.downcast::<gtk::Spinner>().ok()) {
+        spinner.stop();
+    }
+}
+
+/// Puts the reading pane on its loading page and starts the spinner.
+fn show_body_fetch_loading(reading_stack: &gtk::Stack) {
+    if let Some(spinner) = find_named_descendant(reading_stack, "body-loading-spinner").and_then(|c| c.downcast::<gtk::Spinner>().ok()) {
+        spinner.start();
+    }
+    reading_stack.set_visible_child_name("loading");
+}
+
+/// Clears every trace of an in-flight or failed body fetch - the pending
+/// request, the error marker, the loading spinner - and bumps
+/// `body_fetch_generation` so a timeout armed for the abandoned fetch can't
+/// fire. Called once a body actually renders (see `render_body`).
+fn clear_body_fetch_state(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack) {
+    {
+        let mut st = state.borrow_mut();
+        st.pending_body_request = None;
+        st.body_fetch_error = None;
+        st.body_fetch_generation += 1;
+    }
+    stop_body_loading(reading_stack);
+}
+
+/// Shows the reading pane's "message unavailable" page for a body fetch that
+/// failed while it was still the message on screen. No-op once the user has
+/// moved on (the pending request no longer matches).
+fn show_body_fetch_error(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, mailbox: MailboxId, uid: Uid) {
+    {
+        let mut st = state.borrow_mut();
+        if st.pending_body_request.as_ref() != Some(&(mailbox.clone(), uid)) {
+            return;
+        }
+        st.pending_body_request = None;
+        st.body_fetch_error = Some((mailbox, uid));
+        st.body_fetch_generation += 1;
+    }
+    stop_body_loading(reading_stack);
+    let network_available = gio::NetworkMonitor::default().is_network_available();
+    if let Some(page) = reading_stack.child_by_name("error").and_then(|c| c.downcast::<adw::StatusPage>().ok()) {
+        page.set_description(Some(body_fetch_error_description(network_available)));
+    }
+    reading_stack.set_visible_child_name("error");
+}
+
+/// Arms the fetch-failure backstop. `generation` is the value captured when
+/// the fetch was dispatched; the callback only raises the error page while the
+/// request is still pending under that same generation, so a fetch that
+/// rendered, was superseded, or was abandoned can't be reported as failed.
+fn arm_body_fetch_timeout(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, generation: u64, delay_ms: u64) {
+    let state_for_timeout = state.clone();
+    let reading_stack_for_timeout = reading_stack.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(delay_ms), move || {
+        let request = {
+            let st = state_for_timeout.borrow();
+            if st.body_fetch_generation != generation {
+                return;
+            }
+            st.pending_body_request.clone()
+        };
+        let Some((mailbox, uid)) = request else { return };
+        tracing::debug!(?mailbox, uid = uid.0, "FetchBody: timed out; showing unavailable page");
+        show_body_fetch_error(&state_for_timeout, &reading_stack_for_timeout, mailbox, uid);
+    });
+}
+
+/// Dispatches an `AccountCommand::FetchBody` for `(mailbox, uid)` and wires the
+/// reading pane's loading/error lifecycle around it: the pending-request
+/// marker, the failure backstop, the loading page, and the parallel disk-cache
+/// read that can render without waiting for the session. Shared by the
+/// message-selection handler, the error page's Retry button, and the automatic
+/// retry that follows a reconnect.
+fn request_body_fetch(
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    reading_stack: &gtk::Stack,
+    message_header: &crate::message_header::MessageHeader,
+    mailbox: MailboxId,
+    uid: Uid,
+) {
+    let (cmd_tx, cache, uidvalidity) = {
+        let st = state.borrow();
+        let Some(account_id) = mailbox_account_id(&mailbox) else { return };
+        let Some(handle) = st.accounts.get(&account_id) else { return };
+        let uidvalidity = handle.folders.iter().find(|f| f.id == mailbox).map(|f| f.uidvalidity).unwrap_or(UidValidity(0));
+        (handle.interactive_cmd_tx.clone(), handle.address_cache.clone(), uidvalidity)
+    };
+    // A fresh request supersedes any earlier failure and arms the backstop
+    // under a new generation. When the network is already known to be down,
+    // use a short grace period: a local disk-cache hit normally answers in
+    // milliseconds, so the pane can report the outage quickly instead of
+    // spinning for the full timeout.
+    let network_available = gio::NetworkMonitor::default().is_network_available();
+    let generation = {
+        let mut st = state.borrow_mut();
+        st.body_fetch_error = None;
+        st.pending_body_request = Some((mailbox.clone(), uid));
+        st.body_fetch_generation += 1;
+        st.body_fetch_generation
+    };
+    tracing::debug!(?mailbox, uid = uid.0, "FetchBody: dispatching to account actor");
+    let _ = cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox.clone(), uid });
+    show_body_fetch_loading(reading_stack);
+    arm_body_fetch_timeout(
+        state,
+        reading_stack,
+        generation,
+        if network_available { BODY_FETCH_TIMEOUT_MS } else { BODY_FETCH_OFFLINE_TIMEOUT_MS },
+    );
+    // Parallel disk fast-path: a body cached on disk but not in the 25-entry
+    // in-memory LRU renders the instant this read lands, without waiting for
+    // the command to round-trip through the session (the session's own
+    // `FetchBody` still serves the same row from its own cache check and
+    // answers without a network round trip; whichever lands first renders and
+    // the other is deduped by `pending_body_request`).
+    let Some(cache) = cache else { return };
+    let reply_rx = spawn_cache_read(worker, cache, {
+        let mailbox = mailbox.clone();
+        move |c| c.load_bodies(&mailbox, &[uid], uidvalidity)
+    });
+    let state = state.clone();
+    let reading_stack = reading_stack.clone();
+    let message_header = message_header.clone();
+    let request_key = (mailbox.clone(), uid);
+    let mailbox_for_render = mailbox;
+    glib::spawn_future_local(async move {
+        let Ok(result) = reply_rx.recv().await else { return };
+        let Ok(bodies) = result else { return };
+        let Some(body) = bodies.get(&uid).cloned() else { return };
+        let still_current = state.borrow().pending_body_request.as_ref() == Some(&request_key);
+        if !still_current {
+            return;
+        }
+        state.borrow_mut().pending_body_request = None;
+        tracing::debug!(?mailbox_for_render, uid = uid.0, "FetchBody: serving from disk cache");
+        render_body(&state, &reading_stack, &message_header, mailbox_for_render, uid, body);
+    });
+}
+
 /// Finishes a WebKit URI-scheme request with an error, so the browser renders
 /// a broken image instead of hanging the page's load on the subresource.
 fn finish_cid_request_error(request: &webkit::URISchemeRequest, message: &str) {
@@ -16103,6 +16308,25 @@ fn find_named_child(reading_stack: &gtk::Stack, name: &str) -> Option<gtk::Widge
     while let Some(c) = child {
         if c.widget_name() == name {
             return Some(c);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// Walks the widget tree under `root` depth-first looking for the first widget
+/// whose `widget_name()` is `name`. Used to reach into the reading stack's
+/// less-structured pages (a spinner nested in a box, a `StatusPage` with its
+/// own internal tree) without depending on their sibling order.
+fn find_named_descendant(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
+    let root: &gtk::Widget = root.upcast_ref();
+    if root.widget_name() == name {
+        return Some(root.clone());
+    }
+    let mut child = root.first_child();
+    while let Some(c) = child {
+        if let Some(found) = find_named_descendant(&c, name) {
+            return Some(found);
         }
         child = c.next_sibling();
     }
@@ -17032,6 +17256,11 @@ fn render_body(
     // message (see the selection handler's `already_shown` guard) can be
     // recognized as a no-op instead of another crossfade.
     state.borrow_mut().rendered_message = Some((mailbox.clone(), uid));
+    // The body arrived: drop the pending request marker and disable any
+    // still-armed failure backstop, and stop the loading spinner. Without this
+    // the timeout could fire after a successful (if slow) fetch and show the
+    // unavailable page over an already-rendered message.
+    clear_body_fetch_state(state, reading_stack);
     // The trust banner's `html_remote_content_scan` re-parses the message's
     // whole HTML, which is unchanged across re-renders of the same message
     // (theme toggle, list repopulate keeping the selection). Compute it once
@@ -18120,6 +18349,17 @@ mod tests {
         assert!(!body_request_matches(&MailboxId("acc:inbox".into()), &Uid(42), None));
     }
 
+    /// The unavailable page blames the right thing: an offline device gets
+    /// told to check its connection, while a reachable network points at the
+    /// server instead.
+    #[test]
+    fn body_fetch_error_description_names_offline_vs_server() {
+        let offline = body_fetch_error_description(false);
+        assert!(offline.contains("offline") && offline.contains("network connection"));
+        let server = body_fetch_error_description(true);
+        assert!(server.contains("server") && !server.contains("offline"));
+    }
+
     #[test]
     fn mailbox_account_id_splits_the_account_prefix() {
         assert_eq!(
@@ -18345,6 +18585,8 @@ mod tests {
             pending_optimistic_flag_changes: HashMap::new(),
             pending_optimistic_pinned_changes: HashMap::new(),
             pending_body_request: None,
+            body_fetch_error: None,
+            body_fetch_generation: 0,
             pending_attachment: None,
             pending_raw_message: None,
             unsubscribe_info: None,
