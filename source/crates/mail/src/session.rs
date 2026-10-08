@@ -91,6 +91,17 @@ const PREFETCH_BATCH_SIZE: usize = 1;
 /// `RFC822.SIZE` value comes free with the prefetch's envelope pass.
 const PREFETCH_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024;
 
+/// How many times in a row a folder's background-prefetch envelope `FETCH`
+/// may fail before the prefetch stops trying it for the rest of the process's
+/// lifetime. A malformed message that aborts the IMAP response stream takes
+/// the whole connection down with it, and the reconnect re-fetches the same
+/// message - an infinite loop that starves the entire account. Two strikes
+/// (not one) so a transient network blip during a prefetch never permanently
+/// sidelines a folder; once skipped the folder is only left out of the
+/// *background* pass, and opening it still fetches it on demand. The count is
+/// cleared whenever a prefetch fetch for the folder succeeds.
+const PREFETCH_FAILURE_LIMIT: u32 = 2;
+
 /// How many of a sync's genuinely-new messages get their bodies fetched
 /// immediately, inline in the sync, so a brand-new email is cached (and the
 /// reading pane opens it instantly) without waiting for the background
@@ -193,9 +204,15 @@ impl PrefetchState {
 /// Adds every folder in `folders` the prefetch pass doesn't already know
 /// about (other than the open one, which `sync_mailbox` covers) to the end
 /// of the pass, starting a pass if none is running. Extends rather than
-/// replaces, so a pass already in flight keeps its progress.
-fn queue_new_prefetch_mailboxes(prefetch: &mut Option<PrefetchState>, folders: &[Mailbox], current: &MailboxId) {
-    let new_mailboxes: Vec<MailboxId> = folders.iter().filter(|m| &m.id != current).map(|m| m.id.clone()).collect();
+/// replaces, so a pass already in flight keeps its progress. Folders in
+/// `skip` (those whose prefetch has repeatedly failed - see
+/// `PREFETCH_FAILURE_LIMIT`) are never queued.
+fn queue_new_prefetch_mailboxes(prefetch: &mut Option<PrefetchState>, folders: &[Mailbox], current: &MailboxId, skip: &HashMap<MailboxId, u32>) {
+    let new_mailboxes: Vec<MailboxId> = folders
+        .iter()
+        .filter(|m| &m.id != current && skip.get(&m.id).copied().unwrap_or(0) < PREFETCH_FAILURE_LIMIT)
+        .map(|m| m.id.clone())
+        .collect();
     match prefetch.as_mut() {
         Some(pf) => {
             let existing: HashSet<MailboxId> = pf.mailboxes.iter().cloned().collect();
@@ -206,6 +223,24 @@ fn queue_new_prefetch_mailboxes(prefetch: &mut Option<PrefetchState>, folders: &
         }
         None => {}
     }
+}
+
+/// Records a failed background-prefetch envelope fetch for `mailbox_id` and
+/// returns the error unchanged so the caller can still tear the (desynced)
+/// connection down. The count persists across reconnects, so once a folder
+/// reaches [`PREFETCH_FAILURE_LIMIT`] consecutive failures the rebuilt
+/// prefetch pass skips it instead of looping the account on the one message
+/// that can't be parsed.
+fn note_prefetch_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &MailboxId, error: Error) -> Error {
+    let count = failures.entry(mailbox_id.clone()).or_insert(0);
+    *count += 1;
+    tracing::warn!(
+        mailbox = %mailbox_id,
+        failures = *count,
+        limit = PREFETCH_FAILURE_LIMIT,
+        "prefetch: envelope fetch failed for {mailbox_id}; the account will keep working and skip this folder in the background once it reaches the limit: {error}"
+    );
+    error
 }
 
 /// The background body prefetch's behavior, settable live from the app (Config
@@ -536,8 +571,8 @@ pub enum AccountEvent {
         mailbox: MailboxId,
     },
     /// A subset of a `MessagesUpdated` sync: just the messages that are both
-    /// genuinely new (their UID wasn't cached before this sync) and still
-    /// unread, for a desktop "new mail" notification. Never emitted on a
+    /// genuinely new (their UID is above every UID cached before this sync)
+    /// and still unread, for a desktop "new mail" notification. Never emitted on a
     /// mailbox's first-ever sync (nothing cached yet to compare against) -
     /// see `new_unread_for_notification` - so connecting an account doesn't
     /// notify once per message already sitting in the inbox.
@@ -844,6 +879,14 @@ pub async fn run_account_session(
     // right after connecting.
     let mut carried_command: Option<AccountCommand> = None;
 
+    // Folders whose background-prefetch envelope `FETCH` keeps failing,
+    // keyed to a consecutive-failure count. Deliberately lives outside the
+    // reconnect loop: a parse failure desyncs the connection and forces a
+    // reconnect, so this is what lets the *next* session's prefetch skip a
+    // folder whose message can never be parsed instead of looping on it
+    // forever (see `PREFETCH_FAILURE_LIMIT`).
+    let mut prefetch_failures: HashMap<MailboxId, u32> = HashMap::new();
+
     // The dedicated IDLE-only connection's coordination channels (see
     // `run_idle_supervisor`/`run_idle_connection` and the design note above
     // `no_work_pending`). `mailbox_tx` is kept alive here, for the account's
@@ -871,6 +914,7 @@ pub async fn run_account_session(
             &mailbox_tx,
             &idle_notify_rx,
             carried_command.take(),
+            &mut prefetch_failures,
         )
         .await
         {
@@ -955,6 +999,7 @@ async fn connect_and_run(
     mailbox_tx: &tokio::sync::watch::Sender<MailboxId>,
     idle_notify: &async_channel::Receiver<MailboxId>,
     mut carried_command: Option<AccountCommand>,
+    prefetch_failures: &mut HashMap<MailboxId, u32>,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
     let (mut session, caps) = login(config, credential).await?;
@@ -1060,9 +1105,14 @@ async fn connect_and_run(
     let mut session_selected = inbox_id.clone();
 
     // Build the initial prefetch list from all selectable mailboxes except
-    // INBOX (already synced above). The prefetch will run cooperatively in
-    // batches between IDLE cycles.
-    let prefetch_mailboxes: Vec<MailboxId> = folders.iter().filter(|m| m.id != inbox_id).map(|m| m.id.clone()).collect();
+    // INBOX (already synced above) and any a previous session gave up on
+    // (`prefetch_failures` - see `PREFETCH_FAILURE_LIMIT`). The prefetch will
+    // run cooperatively in batches between IDLE cycles.
+    let prefetch_mailboxes: Vec<MailboxId> = folders
+        .iter()
+        .filter(|m| m.id != inbox_id && prefetch_failures.get(&m.id).copied().unwrap_or(0) < PREFETCH_FAILURE_LIMIT)
+        .map(|m| m.id.clone())
+        .collect();
     let mut prefetch = if prefetch_mailboxes.is_empty() {
         None
     } else {
@@ -1364,7 +1414,7 @@ async fn connect_and_run(
                     // silently strands its `PrefetchStarted` (no matching
                     // `PrefetchFinished` ever follows) and leaves the
                     // folder-pane spinner stuck on forever.
-                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id);
+                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures);
                 }
                 AccountCommand::SyncMailbox(mailbox_id) => {
                     // MailboxId is "<account_id>:<folder path>"; recover the folder path.
@@ -1394,7 +1444,9 @@ async fn connect_and_run(
                         // format version changes, and every `sync_mailbox`
                         // since then writes the whole folder - so a non-empty
                         // cache is a complete snapshot, never a pre-fix
-                        // windowed subset. (A `STATUS (MESSAGES)` count is
+                        // windowed subset. (The prefetch's search-index window
+                        // for a never-opened folder is stored `partial`, which
+                        // `has_messages` doesn't count.) (A `STATUS (MESSAGES)` count is
                         // *not* a safe completeness reference: on Gmail's All
                         // Mail it over-reports vs. what a fetch returns, which
                         // would force a pointless full re-sync every open.)
@@ -2190,7 +2242,7 @@ async fn connect_and_run(
                         &mut dirty_mailboxes,
                     )
                     .await?;
-                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id);
+                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures);
                 }
                 command @ (AccountCommand::RenameMailbox { .. } | AccountCommand::MoveMailbox { .. } | AccountCommand::DeleteMailbox { .. }) => {
                     let change = match plan_folder_change(&command, &account_id, &folders) {
@@ -2280,7 +2332,7 @@ async fn connect_and_run(
                         &mut dirty_mailboxes,
                     )
                     .await?;
-                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id);
+                    queue_new_prefetch_mailboxes(&mut prefetch, &folders, &current_mailbox_id, prefetch_failures);
                     sync_mailbox(
                         &mut session,
                         &account_id,
@@ -2748,7 +2800,11 @@ async fn connect_and_run(
         // re-download.
         if let Some(pf) = prefetch.as_ref() {
             if pf.is_done() && prefetch_policy.aggressive && pf.started.elapsed() >= prefetch_policy.refresh_interval {
-                let mailboxes: Vec<MailboxId> = folders.iter().filter(|m| m.id != inbox_id).map(|m| m.id.clone()).collect();
+                let mailboxes: Vec<MailboxId> = folders
+                    .iter()
+                    .filter(|m| m.id != inbox_id && prefetch_failures.get(&m.id).copied().unwrap_or(0) < PREFETCH_FAILURE_LIMIT)
+                    .map(|m| m.id.clone())
+                    .collect();
                 if !mailboxes.is_empty() {
                     tracing::info!(count = mailboxes.len(), "restarting background body prefetch");
                     prefetch = Some(PrefetchState::new(mailboxes));
@@ -2806,13 +2862,73 @@ async fn connect_and_run(
                             f.highest_modseq = Some(modseq);
                         }
                     }
+                    // The SELECT's own UIDVALIDITY is authoritative; the folder
+                    // list's copy may predate it (or be 0 before any STATUS),
+                    // and the envelopes indexed below must be keyed by the
+                    // value `sync_mailbox` will look them up under.
+                    if let Some(validity) = mailbox_meta.uid_validity {
+                        pf.uidvalidity = UidValidity(validity);
+                    }
+                    // A folder with no full-sync snapshot (never opened) isn't
+                    // in the search index at all. Its envelopes ride along on
+                    // this same newest-N fetch and are indexed as `partial`
+                    // rows (see `Cache::store_partial_messages`), so the
+                    // global search finds its recent mail. An opened folder's
+                    // own syncs already keep its full snapshot indexed.
+                    let mailbox_id = pf.mailboxes[pf.current].clone();
+                    let index_envelopes = !cache_op(cache, {
+                        let mailbox_id = mailbox_id.clone();
+                        move |c| c.has_messages(&mailbox_id)
+                    })
+                    .await
+                    .and_then(|r| r.ok())
+                    .unwrap_or(true);
                     let fetch_from = mailbox_meta.exists.saturating_sub(prefetch_policy.folder_limit.saturating_sub(1)).max(1);
                     let seq_range = format!("{fetch_from}:*");
                     let started = std::time::Instant::now();
                     // `RFC822.SIZE` rides along so the oversized-message
-                    // filter below has a size to compare against.
-                    let fetches: Vec<_> = session.fetch(&seq_range, "(UID RFC822.SIZE BODYSTRUCTURE)").await?.try_collect().await?;
+                    // filter below has a size to compare against; indexing
+                    // adds the items `summary_from_fetch` builds a summary from.
+                    let items = if index_envelopes {
+                        "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)"
+                    } else {
+                        "(UID RFC822.SIZE BODYSTRUCTURE)"
+                    };
+                    let fetches: Vec<_> = match session.fetch(&seq_range, items).await {
+                        Ok(stream) => match stream.try_collect().await {
+                            Ok(fetches) => {
+                                // A clean pass clears any prior failures, so a
+                                // one-off blip never accumulates toward the
+                                // skip limit.
+                                prefetch_failures.remove(&mailbox_id);
+                                fetches
+                            }
+                            Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, e.into())),
+                        },
+                        Err(e) => return Err(note_prefetch_failure(prefetch_failures, &mailbox_id, e.into())),
+                    };
                     let envelope_fetch_elapsed_ms = started.elapsed().as_millis();
+
+                    if index_envelopes {
+                        let mut summaries: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(&mailbox_id, f)).collect();
+                        let keys = lookout_core::thread::compute_thread_keys(&summaries);
+                        for msg in &mut summaries {
+                            if let Some(key) = keys.get(&msg.uid) {
+                                msg.thread_key = key.clone();
+                            }
+                        }
+                        let count = summaries.len();
+                        let uidvalidity = pf.uidvalidity;
+                        match cache_op(cache, {
+                            let mailbox_id = mailbox_id.clone();
+                            move |c| c.store_partial_messages(&mailbox_id, uidvalidity, &summaries)
+                        })
+                        .await
+                        {
+                            Some(Err(e)) => tracing::warn!("prefetch: failed to index envelopes for {mailbox_id}: {e}"),
+                            _ => tracing::debug!(mailbox = %mailbox_id, count, "prefetch: indexed envelopes for search"),
+                        }
+                    }
 
                     // Collect UIDs, newest first.
                     let mut uids: Vec<Uid> = fetches.iter().filter_map(|f| f.uid.map(Uid)).collect();
@@ -4385,7 +4501,7 @@ async fn sync_mailbox(
             }
         }
 
-        let notify = new_unread_for_notification(cached.is_empty(), &new_messages);
+        let notify = new_unread_for_notification(cached.keys().max().copied(), &new_messages);
         if !notify.is_empty() {
             let _ = events
                 .send(AccountEvent::NewMessages {
@@ -4576,16 +4692,24 @@ async fn sync_mailbox(
 
 /// Which of a sync's genuinely-new messages (UIDs `sync_mailbox` didn't find
 /// in the pre-sync cache) are worth an `AccountEvent::NewMessages` desktop
-/// notification: unread ones, but only once the mailbox has synced before.
-/// `cached_is_empty` true means this is the mailbox's first-ever sync (or a
+/// notification: unread ones that arrived after the newest cached message.
+/// `newest_cached` is `None` on the mailbox's first-ever sync (or after a
 /// `UIDVALIDITY` change invalidated everything cached) - notifying once per
 /// message already sitting in the folder would be spam, not a signal, so
 /// nothing is returned in that case.
-fn new_unread_for_notification(cached_is_empty: bool, new_messages: &[EmailSummary]) -> Vec<EmailSummary> {
-    if cached_is_empty {
+///
+/// The UID bound matters for a folder the background prefetch indexed but
+/// the user never opened: its cache holds only the newest-N window (see
+/// `Cache::store_partial_messages`), so the first full sync "discovers" all
+/// the older mail too. UIDs only ever grow within a `UIDVALIDITY`, so mail
+/// that genuinely arrived since the cache was written is exactly what sits
+/// above its newest UID - for a complete cache that's every uncached UID,
+/// the same set as before the bound existed.
+fn new_unread_for_notification(newest_cached: Option<Uid>, new_messages: &[EmailSummary]) -> Vec<EmailSummary> {
+    let Some(newest_cached) = newest_cached else {
         return Vec::new();
-    }
-    new_messages.iter().filter(|m| m.is_unread()).cloned().collect()
+    };
+    new_messages.iter().filter(|m| m.uid > newest_cached && m.is_unread()).cloned().collect()
 }
 
 /// Emits whatever envelope summaries are cached on disk for `mailbox_id`,
@@ -5386,21 +5510,33 @@ mod tests {
         let account = AccountId("acc".into());
         let mailbox = MailboxId::new(&account, "INBOX");
         let new_messages = vec![summary(1, &mailbox, false), summary(2, &mailbox, false)];
-        assert!(new_unread_for_notification(true, &new_messages).is_empty());
+        assert!(new_unread_for_notification(None, &new_messages).is_empty());
     }
 
     #[test]
     fn resync_notifies_only_unread_new_messages() {
         let account = AccountId("acc".into());
         let mailbox = MailboxId::new(&account, "INBOX");
-        let new_messages = vec![summary(1, &mailbox, false), summary(2, &mailbox, true)];
-        let notify = new_unread_for_notification(false, &new_messages);
-        assert_eq!(notify.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![Uid(1)]);
+        let new_messages = vec![summary(11, &mailbox, false), summary(12, &mailbox, true)];
+        let notify = new_unread_for_notification(Some(Uid(10)), &new_messages);
+        assert_eq!(notify.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![Uid(11)]);
     }
 
     #[test]
     fn resync_with_no_new_messages_notifies_nothing() {
-        assert!(new_unread_for_notification(false, &[]).is_empty());
+        assert!(new_unread_for_notification(Some(Uid(10)), &[]).is_empty());
+    }
+
+    #[test]
+    fn backfilling_older_mail_below_a_partial_window_never_notifies() {
+        // A prefetch-indexed folder caches only its newest window (uids
+        // 50..=60 here); its first full sync fetches the older mail as
+        // "new", but only a uid above the window actually arrived since.
+        let account = AccountId("acc".into());
+        let mailbox = MailboxId::new(&account, "Projects");
+        let new_messages = vec![summary(3, &mailbox, false), summary(49, &mailbox, false), summary(61, &mailbox, false)];
+        let notify = new_unread_for_notification(Some(Uid(60)), &new_messages);
+        assert_eq!(notify.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![Uid(61)]);
     }
 
     #[test]

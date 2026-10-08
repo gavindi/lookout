@@ -75,6 +75,16 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.155" date="2026-10-09">
+      <description>
+        <p>Fixed a Gmail "All Mail" folder - or any large folder - staying empty when the account contained an older message that Gmail describes in a way Lookout couldn't read; one such message no longer stops the whole folder from loading. Large folders also open much faster, since the first sync of a big folder (such as All Mail) no longer stalls for over a minute while it is saved to disk.</p>
+      </description>
+    </release>
+    <release version="0.9.154" date="2026-10-09">
+      <description>
+        <p>Searching mail now finds messages in folders and subfolders you have never opened, not just the ones you have browsed. Lookout indexes the newest messages of every folder in the background, so they turn up in search as soon as it has caught up. A message that lives in several folders - such as a Gmail message in your Inbox, a label and All Mail - now appears in the results only once.</p>
+      </description>
+    </release>
     <release version="0.9.153" date="2026-10-05">
       <description>
         <p>Opening a message that isn't already saved on your computer now shows a loading spinner, and if it can't be fetched because you're offline or the server is unreachable, the reading pane says so - with a Retry button - instead of staying blank. The message loads by itself once your connection is back.</p>

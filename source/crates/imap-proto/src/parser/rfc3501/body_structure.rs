@@ -25,10 +25,10 @@ fn body_fields(i: &[u8]) -> IResult<&[u8], BodyFields<'_>> {
         // body id seems to refer to the Message-ID or possibly Content-ID header, which
         // by the definition in RFC 2822 seems to resolve to all ASCII characters (through
         // a large amount of indirection which I did not have the patience to fully explore)
-        nstring_utf8,
+        nstring_lossy,
         tag(" "),
         // Per https://tools.ietf.org/html/rfc2045#section-8, description should be all ASCII
-        nstring_utf8,
+        nstring_lossy,
         tag(" "),
         body_encoding,
         tag(" "),
@@ -38,8 +38,8 @@ fn body_fields(i: &[u8]) -> IResult<&[u8], BodyFields<'_>> {
         i,
         BodyFields {
             param,
-            id: id.map(Cow::Borrowed),
-            description: description.map(Cow::Borrowed),
+            id,
+            description,
             transfer_encoding,
             octets,
         },
@@ -53,20 +53,20 @@ fn body_fields(i: &[u8]) -> IResult<&[u8], BodyFields<'_>> {
 fn body_ext_1part(i: &[u8]) -> IResult<&[u8], BodyExt1Part<'_>> {
     let (i, (md5, disposition, language, location, extension)) = tuple((
         // Per RFC 1864, MD5 values are base64-encoded
-        opt_opt(preceded(tag(" "), nstring_utf8)),
+        opt_opt(preceded(tag(" "), nstring_lossy)),
         opt_opt(preceded(tag(" "), body_disposition)),
         opt_opt(preceded(tag(" "), body_lang)),
         // Location appears to reference a URL, which by RFC 1738 (section 2.2) should be ASCII
-        opt_opt(preceded(tag(" "), nstring_utf8)),
+        opt_opt(preceded(tag(" "), nstring_lossy)),
         opt(preceded(tag(" "), body_extension)),
     ))(i)?;
     Ok((
         i,
         BodyExt1Part {
-            md5: md5.map(Cow::Borrowed),
+            md5,
             disposition,
             language,
-            location: location.map(Cow::Borrowed),
+            location,
             extension,
         },
     ))
@@ -82,7 +82,7 @@ fn body_ext_mpart(i: &[u8]) -> IResult<&[u8], BodyExtMPart<'_>> {
         opt_opt(preceded(tag(" "), body_disposition)),
         opt_opt(preceded(tag(" "), body_lang)),
         // Location appears to reference a URL, which by RFC 1738 (section 2.2) should be ASCII
-        opt_opt(preceded(tag(" "), nstring_utf8)),
+        opt_opt(preceded(tag(" "), nstring_lossy)),
         opt(preceded(tag(" "), body_extension)),
     ))(i)?;
     Ok((
@@ -91,7 +91,7 @@ fn body_ext_mpart(i: &[u8]) -> IResult<&[u8], BodyExtMPart<'_>> {
             param,
             disposition,
             language,
-            location: location.map(Cow::Borrowed),
+            location,
             extension,
         },
     ))
@@ -112,8 +112,8 @@ fn body_encoding(i: &[u8]) -> IResult<&[u8], ContentEncoding<'_>> {
             )),
             char('"'),
         ),
-        map(string_utf8, |enc| {
-            ContentEncoding::Other(Cow::Borrowed(enc))
+        map(string_lossy, |enc| {
+            ContentEncoding::Other(enc)
         }),
     ))(i)
 }
@@ -121,9 +121,9 @@ fn body_encoding(i: &[u8]) -> IResult<&[u8], ContentEncoding<'_>> {
 fn body_lang(i: &[u8]) -> IResult<&[u8], Option<Vec<Cow<'_, str>>>> {
     alt((
         // body language seems to refer to RFC 3066 language tags, which should be ASCII-only
-        map(nstring_utf8, |v| v.map(|s| vec![Cow::Borrowed(s)])),
+        map(nstring_lossy, |v| v.map(|s| vec![s])),
         map(
-            parenthesized_nonempty_list(map(string_utf8, Cow::Borrowed)),
+            parenthesized_nonempty_list(string_lossy),
             Option::from,
         ),
     ))(i)
@@ -134,8 +134,8 @@ fn body_param(i: &[u8]) -> IResult<&[u8], BodyParams<'_>> {
         map(nil, |_| None),
         map(
             parenthesized_nonempty_list(map(
-                tuple((string_utf8, tag(" "), string_utf8)),
-                |(key, _, val)| (Cow::Borrowed(key), Cow::Borrowed(val)),
+                tuple((string_lossy, tag(" "), string_lossy)),
+                |(key, _, val)| (key, val),
             )),
             Option::from,
         ),
@@ -147,7 +147,7 @@ fn body_extension(i: &[u8]) -> IResult<&[u8], BodyExtension<'_>> {
         map(number, BodyExtension::Num),
         // Cannot find documentation on character encoding for body extension values.
         // So far, assuming UTF-8 seems fine, please report if you run into issues here.
-        map(nstring_utf8, |v| BodyExtension::Str(v.map(Cow::Borrowed))),
+        map(nstring_lossy, |v| BodyExtension::Str(v)),
         map(
             parenthesized_nonempty_list(body_extension),
             BodyExtension::List,
@@ -159,10 +159,10 @@ fn body_disposition(i: &[u8]) -> IResult<&[u8], Option<ContentDisposition<'_>>> 
     alt((
         map(nil, |_| None),
         paren_delimited(map(
-            tuple((string_utf8, tag(" "), body_param)),
+            tuple((string_lossy, tag(" "), body_param)),
             |(ty, _, params)| {
                 Some(ContentDisposition {
-                    ty: Cow::Borrowed(ty),
+                    ty,
                     params,
                 })
             },
@@ -173,9 +173,9 @@ fn body_disposition(i: &[u8]) -> IResult<&[u8], Option<ContentDisposition<'_>>> 
 fn body_type_basic(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     map(
         tuple((
-            string_utf8,
+            string_lossy,
             tag(" "),
-            string_utf8,
+            string_lossy,
             tag(" "),
             body_fields,
             body_ext_1part,
@@ -183,8 +183,8 @@ fn body_type_basic(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
         |(ty, _, subtype, _, fields, ext)| BodyStructure::Basic {
             common: BodyContentCommon {
                 ty: ContentType {
-                    ty: Cow::Borrowed(ty),
-                    subtype: Cow::Borrowed(subtype),
+                    ty,
+                    subtype,
                     params: fields.param,
                 },
                 disposition: ext.disposition,
@@ -208,7 +208,7 @@ fn body_type_text(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
         tuple((
             tag_no_case("\"TEXT\""),
             tag(" "),
-            string_utf8,
+            string_lossy,
             tag(" "),
             body_fields,
             tag(" "),
@@ -219,7 +219,7 @@ fn body_type_text(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
             common: BodyContentCommon {
                 ty: ContentType {
                     ty: Cow::Borrowed("TEXT"),
-                    subtype: Cow::Borrowed(subtype),
+                    subtype,
                     params: fields.param,
                 },
                 disposition: ext.disposition,
@@ -281,12 +281,12 @@ fn body_type_message(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
 
 fn body_type_multipart(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     map(
-        tuple((many1(body), tag(" "), string_utf8, body_ext_mpart)),
+        tuple((many1(body), tag(" "), string_lossy, body_ext_mpart)),
         |(bodies, _, subtype, ext)| BodyStructure::Multipart {
             common: BodyContentCommon {
                 ty: ContentType {
                     ty: Cow::Borrowed("MULTIPART"),
-                    subtype: Cow::Borrowed(subtype),
+                    subtype,
                     params: ext.param,
                 },
                 disposition: ext.disposition,
@@ -299,12 +299,46 @@ fn body_type_multipart(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     )(i)
 }
 
+/// A real-world non-conformance: Gmail emits a *partless* multipart body
+/// structure for some legacy messages whose declared multipart had no
+/// discoverable child parts. Where the RFC grammar is
+/// `(1*body SP subtype ...)`, Gmail sends the subtype in the first position
+/// and omits the child list entirely, e.g.
+/// `("MIXED" ("BOUNDARY" "----xxxx") NIL NIL)`. That shape fails every spec
+/// arm above (`body_type_basic` expects a subtype right after the type,
+/// `body_type_multipart` requires at least one `(...)` child), which aborts
+/// the whole FETCH response, drops the connection, and - because the
+/// reconnect re-fetches the same message - loops the session forever. Accept
+/// it as a multipart with no children: the message reports no parts and
+/// opening it falls back to a whole-message fetch, which is exactly what a
+/// body with no locatable parts needs.
+fn body_type_partless_multipart(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+    map(
+        tuple((string_lossy, body_ext_mpart)),
+        |(subtype, ext)| BodyStructure::Multipart {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: Cow::Borrowed("MULTIPART"),
+                    subtype,
+                    params: ext.param,
+                },
+                disposition: ext.disposition,
+                language: ext.language,
+                location: ext.location,
+            },
+            bodies: Vec::new(),
+            extension: ext.extension,
+        },
+    )(i)
+}
+
 pub(crate) fn body(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     paren_delimited(alt((
         body_type_text,
         body_type_message,
         body_type_basic,
         body_type_multipart,
+        body_type_partless_multipart,
     )))(i)
 }
 
@@ -317,6 +351,7 @@ pub(crate) fn msg_att_body_structure(i: &[u8]) -> IResult<&[u8], AttributeValue<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::parse_response;
     use assert_matches::assert_matches;
 
     const EMPTY: &[u8] = &[];
@@ -533,5 +568,79 @@ mod tests {
                 });
             }
         );
+    }
+
+    /// A filename parameter carried in a legacy 8-bit encoding (here
+    /// `caf\xe9.pdf`, Latin-1) must not reject the body structure. Before the
+    /// lossy decoders, the strict `from_utf8` in `body_param` failed on the
+    /// `\xe9` byte, which aborted the entire FETCH response and looped the
+    /// session on the same message - the same class of bug `is_char` fixed
+    /// for ENVELOPE subjects.
+    #[test]
+    fn test_body_structure_with_legacy_encoded_filename_parses_lossily() {
+        let body_str = b"(\"APPLICATION\" \"PDF\" (\"name\" \"caf\xe9.pdf\") NIL NIL \"BASE64\" 1337 NIL NIL NIL NIL)";
+        let (remaining, parsed) = body(body_str).expect("a Latin-1 filename must not abort the parse");
+        assert!(remaining.is_empty());
+        let BodyStructure::Basic { common, .. } = parsed else {
+            panic!("expected a basic body structure, got {parsed:?}");
+        };
+        assert_eq!(
+            common.ty.params,
+            Some(vec![(Cow::Borrowed("name"), Cow::Owned("caf\u{fffd}.pdf".to_string()))])
+        );
+    }
+
+    /// The regression at the level it actually bit: one FETCH response among
+    /// many. `parse_response` must return the body structure rather than an
+    /// error that would desync and drop the whole connection.
+    #[test]
+    fn test_fetch_response_with_legacy_encoded_filename_parses() {
+        let raw = b"* 1 FETCH (UID 1 BODYSTRUCTURE (\"APPLICATION\" \"PDF\" (\"name\" \"caf\xe9.pdf\") NIL NIL \"BASE64\" 1337 NIL NIL NIL NIL))\r\n";
+        let (remaining, response) = parse_response(raw).expect("the FETCH response must parse");
+        assert!(remaining.is_empty());
+        let Response::Fetch(_, attrs) = response else {
+            panic!("expected a FETCH response, got {response:?}");
+        };
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, AttributeValue::BodyStructure(BodyStructure::Basic { .. }))));
+    }
+
+    /// Gmail's partless multipart: the subtype sits where the child list
+    /// should be and there are no children at all. This exact structure
+    /// (UID 50229 in a real All Mail) aborted the FETCH response and looped
+    /// the session; it must parse as an empty multipart instead.
+    #[test]
+    fn test_partless_multipart_body_structure_parses() {
+        let body_str = b"(\"MIXED\" (\"BOUNDARY\" \"----G3J67ODWVWRYJFR6A2NEX6PFP2I587\") NIL NIL)";
+        let (remaining, parsed) = body(body_str).expect("a partless multipart must not abort the parse");
+        assert!(remaining.is_empty());
+        let BodyStructure::Multipart { common, bodies, .. } = parsed else {
+            panic!("expected a multipart body structure, got {parsed:?}");
+        };
+        assert!(bodies.is_empty());
+        assert_eq!(common.ty.subtype, Cow::Borrowed("MIXED"));
+        assert_eq!(
+            common.ty.params,
+            Some(vec![(
+                Cow::Borrowed("BOUNDARY"),
+                Cow::Borrowed("----G3J67ODWVWRYJFR6A2NEX6PFP2I587")
+            )])
+        );
+    }
+
+    /// The whole FETCH response from the field, so a future refactor can't
+    /// reintroduce the abort one layer up.
+    #[test]
+    fn test_fetch_response_with_partless_multipart_parses() {
+        let raw = b"* 2524 FETCH (UID 50229 RFC822.SIZE 2541 MODSEQ (51822430) INTERNALDATE \"31-Oct-2009 06:19:44 +0000\" FLAGS (\\Seen) ENVELOPE (\"Sat, 31 Oct 2009 16:18:52 +1100\" \"Hi bro what is your address\" ((\"Stephen Graham\" NIL \"stepheng9\" \"gmail.com\")) ((\"Stephen Graham\" NIL \"stepheng9\" \"gmail.com\")) ((\"Stephen Graham\" NIL \"stepheng9\" \"gmail.com\")) ((NIL NIL \"gavindi\" \"gmail.com\")) NIL NIL NIL \"<ajlxmwkj59rw619ghly48c4s.1256966332973@email.android.com>\") BODYSTRUCTURE (\"MIXED\" (\"BOUNDARY\" \"----G3J67ODWVWRYJFR6A2NEX6PFP2I587\") NIL NIL))\r\n";
+        let (remaining, response) = parse_response(raw).expect("the real-world FETCH response must parse");
+        assert!(remaining.is_empty());
+        let Response::Fetch(_, attrs) = response else {
+            panic!("expected a FETCH response, got {response:?}");
+        };
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, AttributeValue::BodyStructure(BodyStructure::Multipart { .. }))));
     }
 }

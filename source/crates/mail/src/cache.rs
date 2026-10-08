@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Local, Timelike, Utc};
 use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailBody, EmailSummary, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
 
@@ -222,6 +222,82 @@ fn index_upsert_message(conn: &rusqlite::Connection, msg: &EmailSummary, body: &
     index_message(conn, msg, body)
 }
 
+/// Re-indexes `msg` after its envelope row was inserted or changed (flags,
+/// preview, ...). An envelope never carries the body text `store_body`
+/// indexed, so the existing index row's text is kept - a flag-only rewrite
+/// must not downgrade a full-body index back to the preview. A message with
+/// no index row yet indexes its preview.
+///
+/// `is_new` says the message had no `messages` row before this write (and so
+/// no index row). Both the body lookup and the delete half of
+/// `index_upsert_message` filter on the FTS table's `mailbox_id`/`uid`
+/// columns, which are `UNINDEXED`: each is a full scan of the whole index. A
+/// large folder's first sync inserts every message, so doing the lookup and
+/// delete per row is O(n²) - 12k messages took over a minute before this
+/// short-circuit. A new message has nothing to look up or delete, so it
+/// takes the plain INSERT-only path instead.
+fn index_preserving_body(conn: &rusqlite::Connection, msg: &EmailSummary, is_new: bool) -> Result<()> {
+    let existing_body: Option<String> = if is_new {
+        None
+    } else {
+        conn.query_row(
+            "SELECT body FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2",
+            rusqlite::params![msg.mailbox.0, msg.uid.0],
+            |row| row.get(0),
+        )
+        .ok()
+    };
+    let body = match existing_body.as_deref() {
+        Some(existing) if !existing.is_empty() => existing.to_string(),
+        _ => msg.preview.as_deref().unwrap_or("").to_string(),
+    };
+    if is_new {
+        index_message(conn, msg, &body)
+    } else {
+        index_upsert_message(conn, msg, &body)
+    }
+}
+
+/// Re-indexes `(mailbox_id, uid)` with the full text of its just-stored (or,
+/// for `store_partial_messages`, already-cached) `body`, but only if the
+/// envelope is cached - a stray body for a wiped envelope has no
+/// subject/sender to index against. The preview text rides along so
+/// previously-indexed phrasing stays findable.
+///
+/// A prefetch-indexed `partial` row with no preview yet also gets one derived
+/// from the body: such a folder never runs `sync_mailbox`'s preview fetch, so
+/// this is the only way a search hit from it shows a snippet.
+fn index_stored_body(conn: &rusqlite::Connection, mailbox_id: &MailboxId, uid: Uid, body: &EmailBody) -> Result<()> {
+    let row: Option<(String, bool)> = conn
+        .query_row(
+            "SELECT data, partial FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+            rusqlite::params![mailbox_id.0, uid.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some(mut summary) = row.as_ref().and_then(|(data, _)| serde_json::from_str::<EmailSummary>(data).ok()) else {
+        return Ok(());
+    };
+    let partial = row.is_some_and(|(_, partial)| partial);
+    if partial && summary.preview.is_none() {
+        if let Some(preview) = crate::body::preview_from_body(body) {
+            summary.preview = Some(preview);
+            conn.execute(
+                "UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3",
+                rusqlite::params![serde_json::to_string(&summary)?, mailbox_id.0, uid.0],
+            )?;
+        }
+    }
+    let mut indexed = body_index_text(body).unwrap_or_default();
+    if let Some(preview) = &summary.preview {
+        if !indexed.is_empty() {
+            indexed.push(' ');
+        }
+        indexed.push_str(preview);
+    }
+    index_upsert_message(conn, &summary, &indexed)
+}
+
 /// The searchable body text of an assembled [`EmailBody`]: the plain-text
 /// part, or a stripped-HTML rendering when there's no text part. Mirrors
 /// `preview_from_raw`'s text-over-html preference, but returns the whole body
@@ -360,11 +436,16 @@ impl Cache {
                 account_id TEXT NOT NULL,
                 data TEXT NOT NULL
             );
+            -- `partial` marks a row the background prefetch indexed from a
+            -- never-opened folder's newest-N window (`store_partial_messages`)
+            -- rather than a full `sync_mailbox` snapshot: searchable, but
+            -- never served as the folder's contents (see `has_messages`).
             CREATE TABLE IF NOT EXISTS messages (
                 mailbox_id TEXT NOT NULL,
                 uid INTEGER NOT NULL,
                 uidvalidity INTEGER NOT NULL,
                 data TEXT NOT NULL,
+                partial INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (mailbox_id, uid)
             );
             CREATE INDEX IF NOT EXISTS messages_by_mailbox ON messages (mailbox_id);
@@ -412,6 +493,19 @@ impl Cache {
             );
             ",
         )?;
+        // Caches created before the `partial` column existed. Every existing
+        // row came from a full sync, so the default (0, complete) is right.
+        // The UI's read handle and the session open this file concurrently,
+        // so a lost race on the ALTER ("duplicate column") is re-checked
+        // rather than treated as a failure.
+        let has_partial_column = |conn: &Connection| -> rusqlite::Result<bool> { conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'partial'")?.exists([]) };
+        if !has_partial_column(&conn)? {
+            if let Err(e) = conn.execute("ALTER TABLE messages ADD COLUMN partial INTEGER NOT NULL DEFAULT 0", []) {
+                if !has_partial_column(&conn)? {
+                    return Err(e.into());
+                }
+            }
+        }
         // One-time envelope-cache migration. Pre-full-sync builds kept only a
         // folder's newest ~200 messages, so their `messages` rows hold a
         // *subset* of the mailbox - and the session's cache-hit path would
@@ -586,32 +680,19 @@ impl Cache {
         // messages that actually changed - and, crucially, a message's full-body
         // index text (the `store_body` upgrade) survives a re-sync of an
         // unchanged envelope instead of being downgraded back to the preview.
+        // This is a full snapshot, so every row it writes is complete: the
+        // `partial` arm of the guard promotes a prefetch-indexed row even when
+        // its envelope is byte-identical.
         let mut upsert = tx.prepare_cached(
-            "INSERT INTO messages (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(mailbox_id, uid) DO UPDATE SET uidvalidity = excluded.uidvalidity, data = excluded.data \
-             WHERE messages.data IS NOT excluded.data",
+            "INSERT INTO messages (mailbox_id, uid, uidvalidity, data, partial) VALUES (?1, ?2, ?3, ?4, 0) \
+             ON CONFLICT(mailbox_id, uid) DO UPDATE SET uidvalidity = excluded.uidvalidity, data = excluded.data, partial = 0 \
+             WHERE messages.data IS NOT excluded.data OR messages.partial != 0",
         )?;
         for msg in messages {
             let data = serde_json::to_string(msg)?;
             let modified = upsert.execute(rusqlite::params![mailbox_id.0, msg.uid.0, uidvalidity.0, data])?;
             if modified > 0 {
-                // A new row, or a genuinely changed envelope (flags, preview, ...).
-                // The envelope change never carries the body text `store_body`
-                // indexed, so keep the existing index row's text - a flag-only
-                // rewrite must not downgrade a full-body index back to the
-                // preview. New messages index their preview.
-                let existing_body: Option<String> = tx
-                    .query_row(
-                        "SELECT body FROM search_fts WHERE mailbox_id = ?1 AND uid = ?2",
-                        rusqlite::params![mailbox_id.0, msg.uid.0],
-                        |row| row.get(0),
-                    )
-                    .ok();
-                let body = match existing_body.as_deref() {
-                    Some(existing) if !existing.is_empty() => existing.to_string(),
-                    _ => msg.preview.as_deref().unwrap_or("").to_string(),
-                };
-                index_upsert_message(&tx, msg, &body)?;
+                index_preserving_body(&tx, msg, !stored.contains_key(&msg.uid.0))?;
             }
         }
         // Delete the UIDs absent from the new set - expunged server-side, or
@@ -635,12 +716,113 @@ impl Cache {
         self.purge_message_files(mailbox_id, &purged);
         drop(upsert);
         tx.commit()?;
+        tracing::debug!(mailbox = %mailbox_id.0, rows = messages.len(), "replace_messages committed");
         Ok(())
     }
 
+    /// Indexes a never-opened folder's newest-N envelope window, as fetched
+    /// by the background prefetch, so the folder's recent mail is searchable
+    /// before the user ever opens it. The rows are stored `partial`: `search`
+    /// and the per-uid lookups see them, but `has_messages`/`load_messages`
+    /// don't, so the folder is never shown (or cache-hit-skipped) as if this
+    /// window were its whole contents. The first real `sync_mailbox` reuses
+    /// them as already-fetched envelopes and `replace_messages` promotes
+    /// them to complete.
+    ///
+    /// A no-op once the folder holds any complete row - a full snapshot is
+    /// fuller than this window, and the folder's own syncs keep it current.
+    /// Otherwise the stored partial set is replaced by `messages`: rows that
+    /// fell out of the window (or were expunged) go, with their index rows,
+    /// bodies and files, so a re-run keeps the window bounded and fresh. A
+    /// snoozed row is kept - it left the window, not the server. A row whose
+    /// new envelope lacks a preview keeps the one an earlier pass derived.
+    pub fn store_partial_messages(&self, mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let complete: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE mailbox_id = ?1 AND partial = 0)", [&mailbox_id.0], |row| {
+            row.get(0)
+        })?;
+        if complete {
+            return Ok(());
+        }
+        let mut stored: HashMap<u32, (u32, Option<String>)> = HashMap::new();
+        {
+            let mut stmt = tx.prepare("SELECT uid, uidvalidity, data FROM messages WHERE mailbox_id = ?1")?;
+            let rows = stmt.query_map([&mailbox_id.0], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?, row.get::<_, String>(2)?)))?;
+            for row in rows {
+                let (uid, validity, data) = row?;
+                let preview = serde_json::from_str::<EmailSummary>(&data).ok().and_then(|m| m.preview);
+                stored.insert(uid, (validity, preview));
+            }
+        }
+        {
+            let mut upsert = tx.prepare_cached(
+                "INSERT INTO messages (mailbox_id, uid, uidvalidity, data, partial) VALUES (?1, ?2, ?3, ?4, 1) \
+                 ON CONFLICT(mailbox_id, uid) DO UPDATE SET uidvalidity = excluded.uidvalidity, data = excluded.data \
+                 WHERE messages.data IS NOT excluded.data",
+            )?;
+            for msg in messages {
+                let mut msg = msg.clone();
+                if msg.preview.is_none() {
+                    if let Some((validity, Some(preview))) = stored.get(&msg.uid.0) {
+                        if *validity == uidvalidity.0 {
+                            msg.preview = Some(preview.clone());
+                        }
+                    }
+                }
+                let data = serde_json::to_string(&msg)?;
+                if upsert.execute(rusqlite::params![mailbox_id.0, msg.uid.0, uidvalidity.0, data])? == 0 {
+                    continue;
+                }
+                // A row new to the index whose body an earlier prefetch pass
+                // already cached: that `store_bodies` found no envelope to
+                // index against, and the body won't be fetched again, so it
+                // seeds the full-text row (and the snippet) now.
+                let is_new = stored.get(&msg.uid.0).is_none_or(|(validity, _)| *validity != uidvalidity.0);
+                let cached_body: Option<EmailBody> = if is_new {
+                    tx.query_row(
+                        "SELECT data FROM bodies WHERE mailbox_id = ?1 AND uid = ?2 AND uidvalidity = ?3",
+                        rusqlite::params![mailbox_id.0, msg.uid.0, uidvalidity.0],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()?
+                    .and_then(|data| serde_json::from_slice(&data).ok())
+                } else {
+                    None
+                };
+                match cached_body {
+                    Some(body) => index_stored_body(&tx, mailbox_id, msg.uid, &body)?,
+                    None => index_preserving_body(&tx, &msg, is_new)?,
+                }
+            }
+        }
+        let present: HashSet<u32> = messages.iter().map(|m| m.uid.0).collect();
+        let snoozed: HashSet<u32> = {
+            let mut stmt = tx.prepare("SELECT uid FROM snoozed WHERE mailbox_id = ?1")?;
+            let rows = stmt.query_map([&mailbox_id.0], |row| row.get::<_, u32>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut purged: HashSet<(u32, u32)> = HashSet::new();
+        for (&uid, &(stored_validity, _)) in &stored {
+            if !present.contains(&uid) && !snoozed.contains(&uid) {
+                delete_index_row(&tx, mailbox_id, Uid(uid))?;
+                tx.execute("DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid])?;
+                tx.execute("DELETE FROM bodies WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![mailbox_id.0, uid])?;
+                purged.insert((uid, stored_validity));
+            }
+        }
+        self.purge_message_files(mailbox_id, &purged);
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The folder's cached envelope snapshot, as written by `sync_mailbox` -
+    /// what the list paints before (or instead of) a live sync. Excludes the
+    /// prefetch's `partial` search-index rows: those are only the newest-N
+    /// window of a folder never synced in full (see `store_partial_messages`).
     pub fn load_messages(&self, mailbox_id: &MailboxId) -> Result<Vec<EmailSummary>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND partial = 0")?;
         let rows = stmt.query_map([&mailbox_id.0], |row| row.get::<_, String>(0))?;
         let mut messages = Vec::new();
         for row in rows {
@@ -658,6 +840,8 @@ impl Cache {
     /// `sync_mailbox`'s incremental refresh to tell which UIDs already have
     /// an ENVELOPE/BODYSTRUCTURE worth keeping - those never change once a
     /// message exists, so only a UID missing here needs a full re-fetch.
+    /// Includes the prefetch's `partial` rows, so a folder's first full sync
+    /// doesn't re-download the window the prefetch already indexed.
     pub fn load_messages_by_uid(&self, mailbox_id: &MailboxId, uidvalidity: UidValidity) -> Result<std::collections::HashMap<Uid, EmailSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uidvalidity = ?2")?;
@@ -671,12 +855,15 @@ impl Cache {
         Ok(messages)
     }
 
-    /// Returns `true` if the cache holds any message summaries for `mailbox_id`,
-    /// without deserializing them. Used by the session actor to skip a
-    /// redundant IMAP sync when the data is already cached.
+    /// Returns `true` if the cache holds a full-sync snapshot for `mailbox_id`,
+    /// without deserializing it. Used by the session actor to skip a
+    /// redundant IMAP sync when the data is already cached, and by the
+    /// prefetch to tell an opened folder from one whose envelopes it should
+    /// index. The prefetch's `partial` rows don't count - serving them would
+    /// show the newest-N window as the whole folder.
     pub fn has_messages(&self, mailbox_id: &MailboxId) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT 1 FROM messages WHERE mailbox_id = ?1 LIMIT 1")?;
+        let mut stmt = conn.prepare("SELECT 1 FROM messages WHERE mailbox_id = ?1 AND partial = 0 LIMIT 1")?;
         let mut rows = stmt.query_map([&mailbox_id.0], |_| Ok(()))?;
         Ok(rows.next().is_some())
     }
@@ -743,20 +930,7 @@ impl Cache {
             "INSERT OR REPLACE INTO bodies (mailbox_id, uid, uidvalidity, data) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![mailbox_id.0, uid.0, uidvalidity.0, data],
         )?;
-        // Re-index the message with its full text, but only if the envelope is
-        // cached (a stray body for a wiped envelope has no subject/sender to
-        // index against). The preview text rides along so previously-indexed
-        // phrasing stays findable.
-        if let Some(summary) = load_summary_row(&tx, mailbox_id, uid)? {
-            let mut indexed = body_index_text(body).unwrap_or_default();
-            if let Some(preview) = &summary.preview {
-                if !indexed.is_empty() {
-                    indexed.push(' ');
-                }
-                indexed.push_str(preview);
-            }
-            index_upsert_message(&tx, &summary, &indexed)?;
-        }
+        index_stored_body(&tx, mailbox_id, uid, body)?;
         tx.commit()?;
         Ok(())
     }
@@ -780,19 +954,7 @@ impl Cache {
             }
         }
         for (uid, body) in bodies {
-            // Re-index the message with its full text, but only if the
-            // envelope is cached (a stray body for a wiped envelope has no
-            // subject/sender to index against), mirroring `store_body`.
-            if let Some(summary) = load_summary_row(&tx, mailbox_id, *uid)? {
-                let mut indexed = body_index_text(body).unwrap_or_default();
-                if let Some(preview) = &summary.preview {
-                    if !indexed.is_empty() {
-                        indexed.push(' ');
-                    }
-                    indexed.push_str(preview);
-                }
-                index_upsert_message(&tx, &summary, &indexed)?;
-            }
+            index_stored_body(&tx, mailbox_id, *uid, body)?;
         }
         tx.commit()?;
         Ok(())
@@ -1191,17 +1353,19 @@ impl Cache {
     /// stay accurate across DST changes; SQL only extracts the stored
     /// RFC 3339 strings and filters them lexicographically, which is valid
     /// because every cached date serializes in UTC with a trailing `Z`.
-    /// Rows whose date can't be parsed are skipped.
+    /// Rows whose date can't be parsed are skipped, as are the prefetch's
+    /// `partial` search-index rows, so the chart reflects the synced folders
+    /// it always has rather than shifting with how far the prefetch got.
     pub fn hour_histogram(&self, since: Option<DateTime<Utc>>) -> Result<[i64; 24]> {
         let conn = self.conn.lock().unwrap();
         // The cut is passed as the stored format (RFC 3339 UTC), which sorts
         // lexicographically like the serialized dates themselves.
         let (sql, since_string) = match since {
             Some(since) => (
-                "SELECT json_extract(data, '$.date') FROM messages WHERE json_extract(data, '$.date') >= ?1",
+                "SELECT json_extract(data, '$.date') FROM messages WHERE partial = 0 AND json_extract(data, '$.date') >= ?1",
                 Some(since.to_rfc3339()),
             ),
-            None => ("SELECT json_extract(data, '$.date') FROM messages", None),
+            None => ("SELECT json_extract(data, '$.date') FROM messages WHERE partial = 0", None),
         };
         let mut stmt = conn.prepare(sql)?;
         let params: Vec<String> = since_string.into_iter().collect();
@@ -1222,9 +1386,11 @@ impl Cache {
     /// Coverage is bounded by what's been synced: a folder's envelope fields
     /// (subject/sender/recipients) plus the preview are indexed the moment it
     /// syncs, and the body text joins in once a full body is fetched or
-    /// prefetched. Mail that has never been synced (an unopened folder) and
-    /// body text for never-fetched messages need the IMAP `SEARCH` fallback -
-    /// see `AccountCommand::SearchMailbox`.
+    /// prefetched. A folder never opened is covered by the background
+    /// prefetch's `partial` rows - its newest-N window (see
+    /// `store_partial_messages`) - once the prefetch pass reaches it. Older
+    /// mail in such a folder, and body text for never-fetched messages, need
+    /// the IMAP `SEARCH` fallback - see `AccountCommand::SearchMailbox`.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<EmailSummary>> {
         let Some(match_query) = sanitize_fts_query(query) else {
             return Ok(Vec::new());
@@ -1282,11 +1448,13 @@ impl Cache {
     /// lexicographic; rows whose date can't be parsed are skipped. Snoozed
     /// messages stay hidden, matching what the message list and `search`
     /// show, so the result can fall short of `limit` when the newest rows
-    /// are snoozed.
+    /// are snoozed. The prefetch's `partial` search-index rows are left out
+    /// too: their flags are only as fresh as the last prefetch pass, and the
+    /// feed covers the folders the user actually syncs.
     pub fn recent_messages(&self, limit: usize) -> Result<Vec<EmailSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT data FROM messages \
+            "SELECT data FROM messages WHERE partial = 0 \
              ORDER BY json_extract(data, '$.date') DESC \
              LIMIT ?1",
         )?;
@@ -2171,6 +2339,108 @@ mod tests {
             preview: preview.map(|p| p.to_string()),
             structure: None,
         }
+    }
+
+    fn titled(mailbox_id: &MailboxId, uid: u32, subject: &str) -> EmailSummary {
+        EmailSummary {
+            subject: Some(subject.to_string()),
+            ..sample_summary(mailbox_id, uid, None)
+        }
+    }
+
+    fn search_uids(cache: &Cache, query: &str) -> Vec<u32> {
+        let mut uids: Vec<u32> = cache.search(query, 50).unwrap().iter().map(|m| m.uid.0).collect();
+        uids.sort();
+        uids
+    }
+
+    #[test]
+    fn a_partial_window_is_searchable_but_never_served_as_the_folder() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "Projects");
+        let window = [titled(&mailbox_id, 1, "quarterly zeppelin"), titled(&mailbox_id, 2, "zeppelin hangar")];
+
+        cache.store_partial_messages(&mailbox_id, UidValidity(1), &window).unwrap();
+        assert_eq!(search_uids(&cache, "zeppelin"), vec![1, 2]);
+        assert!(!cache.has_messages(&mailbox_id).unwrap(), "a partial window must not cache-hit the folder's sync");
+        assert!(cache.load_messages(&mailbox_id).unwrap().is_empty(), "a partial window must not paint as the folder");
+        assert_eq!(
+            cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap().len(),
+            2,
+            "the first full sync reuses the window"
+        );
+
+        // The first full sync promotes even byte-identical rows to complete.
+        let full = [window[0].clone(), window[1].clone(), titled(&mailbox_id, 3, "older zeppelin")];
+        cache.replace_messages(&mailbox_id, UidValidity(1), &full).unwrap();
+        assert!(cache.has_messages(&mailbox_id).unwrap());
+        assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 3);
+        assert_eq!(search_uids(&cache, "zeppelin"), vec![1, 2, 3]);
+
+        // Once the folder has a full snapshot, a later prefetch pass leaves it alone.
+        cache.store_partial_messages(&mailbox_id, UidValidity(1), &[titled(&mailbox_id, 4, "zeppelin")]).unwrap();
+        assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 3);
+        assert_eq!(search_uids(&cache, "zeppelin"), vec![1, 2, 3]);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_partial_window_rerun_drops_rows_that_left_it_but_keeps_snoozed_ones() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "Projects");
+        let first = [1, 2, 3].map(|uid| titled(&mailbox_id, uid, "zeppelin"));
+        cache.store_partial_messages(&mailbox_id, UidValidity(1), &first).unwrap();
+        cache.snooze_message(&mailbox_id, Uid(1), Utc::now() + chrono::Duration::hours(1)).unwrap();
+        cache.store_body(&mailbox_id, Uid(2), UidValidity(1), &sample_body("hangar")).unwrap();
+
+        let second = [3, 4].map(|uid| titled(&mailbox_id, uid, "zeppelin"));
+        cache.store_partial_messages(&mailbox_id, UidValidity(1), &second).unwrap();
+
+        let mut kept: Vec<u32> = cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap().keys().map(|u| u.0).collect();
+        kept.sort();
+        assert_eq!(kept, vec![1, 3, 4], "uid 2 left the window; the snoozed uid 1 stays");
+        assert!(!cache.has_body(&mailbox_id, Uid(2), UidValidity(1)).unwrap());
+        assert_eq!(search_uids(&cache, "zeppelin"), vec![3, 4], "the snoozed row stays hidden from search");
+        assert!(search_uids(&cache, "hangar").is_empty(), "a dropped row's index text goes with it");
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_partial_window_indexes_bodies_cached_before_and_after_it() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "Projects");
+        // An earlier prefetch pass cached this body with no envelope to index against.
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("the quokka enclosure")).unwrap();
+
+        cache
+            .store_partial_messages(&mailbox_id, UidValidity(1), &[titled(&mailbox_id, 1, "zoo"), titled(&mailbox_id, 2, "zoo")])
+            .unwrap();
+        assert_eq!(search_uids(&cache, "quokka"), vec![1]);
+        // A body fetched after the window was indexed joins it the usual way.
+        cache.store_bodies(&mailbox_id, UidValidity(1), &[(Uid(2), sample_body("wombat burrow"))]).unwrap();
+        assert_eq!(search_uids(&cache, "wombat"), vec![2]);
+
+        let rows = cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap();
+        assert_eq!(rows[&Uid(1)].preview.as_deref(), Some("the quokka enclosure"), "a search hit shows a snippet");
+        assert_eq!(rows[&Uid(2)].preview.as_deref(), Some("wombat burrow"));
+
+        // A re-run's fresh envelope (no preview) keeps the derived snippet.
+        cache
+            .store_partial_messages(&mailbox_id, UidValidity(1), &[titled(&mailbox_id, 1, "zoo"), titled(&mailbox_id, 2, "zoo")])
+            .unwrap();
+        let rows = cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap();
+        assert_eq!(rows[&Uid(1)].preview.as_deref(), Some("the quokka enclosure"));
+        assert_eq!(search_uids(&cache, "quokka"), vec![1], "the full-text row survives the re-run");
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

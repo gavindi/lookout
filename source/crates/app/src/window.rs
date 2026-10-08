@@ -668,6 +668,14 @@ pub(crate) struct UiState {
     /// `UnifiedInbox`. The visible list is the union of these, deduplicated
     /// by `(mailbox, uid)` and sorted newest-first.
     unified_snapshots: HashMap<MailboxId, Vec<EmailSummary>>,
+    /// Bumped for a mailbox every time an authoritative `MessagesUpdated`
+    /// lands for it. `select_mailbox`/the startup restore capture a mailbox's
+    /// value before spawning their off-thread disk-cache read and re-check it
+    /// when the reply arrives, so a read that started before the live sync
+    /// (and therefore returns a stale, possibly empty set - a never-opened
+    /// folder has only `partial` search-index rows, which `load_messages`
+    /// excludes) can never overwrite the fresh list the sync just painted.
+    mailbox_sync_epoch: HashMap<MailboxId, u64>,
     /// Rows hidden from the message list on an optimistic delete/archive/
     /// report-as-junk, keyed by source mailbox, kept around so a matching
     /// `AccountEvent::MoveFailed` can restore exactly these rows. Cleared for
@@ -2134,6 +2142,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         pending_message_selection: None,
         mail_view: MailView::Single,
         unified_snapshots: HashMap::new(),
+        mailbox_sync_epoch: HashMap::new(),
         pending_optimistic_removals: HashMap::new(),
         pending_optimistic_flag_changes: HashMap::new(),
         pending_optimistic_pinned_changes: HashMap::new(),
@@ -9799,6 +9808,15 @@ fn spawn_account_event_loop(
                         }
                     }
                     AccountEvent::MessagesUpdated { mailbox, mut messages } => {
+                        // This is the authoritative live-sync landing. Bump the
+                        // mailbox's epoch first so any off-thread cache read
+                        // still in flight for it (dispatched before this sync
+                        // returned, so it holds a stale window) is discarded
+                        // rather than repainting the list over these messages.
+                        {
+                            let mut st = state.borrow_mut();
+                            *st.mailbox_sync_epoch.entry(mailbox.clone()).or_insert(0) += 1;
+                        }
                         // A sync can land for reasons unrelated to a pending
                         // optimistic removal/flag-toggle (see the IDLE-vs-
                         // command race in session.rs) and carry stale state
@@ -14061,6 +14079,10 @@ fn select_mailbox(
     refresh_message_loading_state(state, message_list, message_list_stack);
 
     if let Some(cache) = state.borrow().accounts.get(&account_id).and_then(|h| h.address_cache.clone()) {
+        // Captured just before the read is dispatched so the reply can tell
+        // whether a live sync landed while it was in flight (see
+        // `UiState::mailbox_sync_epoch`).
+        let epoch = state.borrow().mailbox_sync_epoch.get(&mailbox_id).copied().unwrap_or(0);
         let reply_rx = spawn_cache_read(worker, cache, {
             let mailbox_id = mailbox_id.clone();
             move |cache| {
@@ -14081,6 +14103,15 @@ fn select_mailbox(
             // whatever navigation triggered *that* switch, and leaving it
             // stashed could misfire on some later, unrelated load.
             if state.borrow().current_mailbox.as_ref() != Some(&mailbox_id) {
+                state.borrow_mut().pending_message_selection = None;
+                return;
+            }
+            // If a live sync for this mailbox landed since this read was
+            // dispatched, its `MessagesUpdated` already painted the freshest
+            // set. A window read from disk *before* that sync - empty for a
+            // folder the background prefetch has only indexed as `partial`
+            // search rows - must not repaint over it.
+            if state.borrow().mailbox_sync_epoch.get(&mailbox_id).copied().unwrap_or(0) != epoch {
                 state.borrow_mut().pending_message_selection = None;
                 return;
             }
@@ -14333,18 +14364,74 @@ fn search_cached_results(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, quer
 }
 
 /// Repopulates the message list from the accumulated search results, under the
-/// current sort.
+/// current sort, with copies of one message across folders collapsed (see
+/// `collapse_search_copies`).
 fn repopulate_search_results(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel) {
     let (key, descending) = current_sort(state);
-    let results = state.borrow().search_results.clone();
+    let results = {
+        let st = state.borrow();
+        collapse_search_copies(&st.search_results, |mailbox| {
+            let account_id = mailbox_account_id(mailbox)?;
+            st.accounts.get(&account_id)?.folders.iter().find(|f| &f.id == mailbox).map(|f| f.role)
+        })
+    };
     message_list.repopulate(results, key, descending);
+}
+
+/// Collapses the copies of one message a search found in several folders of
+/// the same account - matched by Message-ID - to a single row. The index
+/// covers every folder (the prefetch indexes the ones never opened), and
+/// Gmail exposes each message once per label plus again in All Mail, so
+/// without this every Gmail hit would list at least twice. The copy kept is
+/// the one in the most specific folder: Inbox, then any other folder, then
+/// Archive/All Mail, then Junk/Trash; ties keep the first-found copy. Hits
+/// without a Message-ID are never merged. `role_of` resolves a hit's folder.
+fn collapse_search_copies(results: &[EmailSummary], role_of: impl Fn(&MailboxId) -> Option<MailboxRole>) -> Vec<EmailSummary> {
+    fn rank(role: Option<MailboxRole>) -> u8 {
+        match role {
+            Some(MailboxRole::Inbox) => 0,
+            Some(MailboxRole::Archive) => 2,
+            Some(MailboxRole::Junk | MailboxRole::Trash) => 3,
+            _ => 1,
+        }
+    }
+    let mut out: Vec<EmailSummary> = Vec::with_capacity(results.len());
+    let mut kept: HashMap<(Option<AccountId>, String), (usize, u8)> = HashMap::new();
+    for summary in results {
+        let message_id = summary
+            .message_id
+            .as_deref()
+            .map(|id| id.trim().trim_start_matches('<').trim_end_matches('>'))
+            .filter(|id| !id.is_empty());
+        let Some(message_id) = message_id else {
+            out.push(summary.clone());
+            continue;
+        };
+        let this_rank = rank(role_of(&summary.mailbox));
+        match kept.entry((mailbox_account_id(&summary.mailbox), message_id.to_string())) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (index, kept_rank) = *entry.get();
+                if this_rank < kept_rank {
+                    out[index] = summary.clone();
+                    entry.insert((index, this_rank));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((out.len(), this_rank));
+                out.push(summary.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Asks the live IMAP pass to cover the mailbox the user was viewing - or
 /// every account's Inbox when the pre-search view was the unified one (the
 /// same folders `account_inboxes` names). Searches arrive in these folders, so
 /// this is where the local index's gaps are: mail that has never been synced,
-/// and body text for messages never fetched. One `SearchMailbox` per folder
+/// and body text for messages never fetched. (Folders never opened are covered
+/// locally up to the background prefetch's newest-N window - see
+/// `Cache::store_partial_messages`.) One `SearchMailbox` per folder
 /// (a SELECT + `UID SEARCH` + fetch each), which is why the fan-out stops at
 /// the open view instead of covering every folder of every account - a search
 /// over an unopened folder would otherwise pay a round trip for nothing the
@@ -14476,6 +14563,7 @@ fn exit_search(
         if let Some((account_id, mailbox_id)) = account_id.zip(mailbox_id) {
             request_mailbox_sync(state, &account_id, &mailbox_id);
             if let Some(cache) = state.borrow().accounts.get(&account_id).and_then(|h| h.address_cache.clone()) {
+                let epoch = state.borrow().mailbox_sync_epoch.get(&mailbox_id).copied().unwrap_or(0);
                 let reply_rx = spawn_cache_read(worker, cache, {
                     let mailbox_id = mailbox_id.clone();
                     move |cache| cache.load_messages(&mailbox_id).ok()
@@ -14488,6 +14576,11 @@ fn exit_search(
                     // Discard a reply for a mailbox the user has since
                     // navigated away from.
                     if state.borrow().current_mailbox.as_ref() != Some(&mailbox_id) {
+                        return;
+                    }
+                    // Skip a stale window if the live sync landed first - see
+                    // `select_mailbox`'s identical guard.
+                    if state.borrow().mailbox_sync_epoch.get(&mailbox_id).copied().unwrap_or(0) != epoch {
                         return;
                     }
                     let (key, descending) = current_sort(&state);
@@ -18371,6 +18464,37 @@ mod tests {
     }
 
     #[test]
+    fn search_copies_collapse_to_the_most_specific_folder_per_account() {
+        let hit = |uid: u32, mailbox: &str, message_id: Option<&str>| EmailSummary {
+            message_id: message_id.map(str::to_string),
+            ..summary(Uid(uid), mailbox, 2026, 10, 9, 9)
+        };
+        let results = vec![
+            hit(1, "gmail:[Gmail]/All Mail", Some("<a@x>")),
+            hit(2, "gmail:Work", Some("<a@x>")),
+            hit(3, "gmail:INBOX", Some("a@x")),
+            hit(4, "gmail:[Gmail]/All Mail", Some("<b@x>")),
+            hit(5, "gmail:[Gmail]/Bin", Some("<b@x>")),
+            hit(6, "other:INBOX", Some("<a@x>")),
+            hit(7, "gmail:Work", None),
+            hit(8, "gmail:INBOX", None),
+        ];
+        let role_of = |mailbox: &MailboxId| {
+            Some(match mailbox.0.split_once(':').map(|(_, path)| path) {
+                Some("INBOX") => MailboxRole::Inbox,
+                Some("[Gmail]/All Mail") => MailboxRole::Archive,
+                Some("[Gmail]/Bin") => MailboxRole::Trash,
+                _ => MailboxRole::Custom,
+            })
+        };
+        let kept: Vec<u32> = collapse_search_copies(&results, role_of).iter().map(|m| m.uid.0).collect();
+        // `<a@x>` keeps its Inbox copy (angle brackets don't matter), `<b@x>`
+        // prefers All Mail over the Bin, another account's copy is its own
+        // message, and Message-ID-less hits are never merged.
+        assert_eq!(kept, vec![3, 4, 6, 7, 8]);
+    }
+
+    #[test]
     fn csp_blocks_remote_content_unless_the_level_allows_it() {
         // Nothing allowed: no `*` source anywhere, so remote images, styles,
         // fonts and media are all vetoed; the message's own data:/cid: images
@@ -18581,6 +18705,7 @@ mod tests {
             pending_message_selection: None,
             mail_view: MailView::Single,
             unified_snapshots: HashMap::new(),
+            mailbox_sync_epoch: HashMap::new(),
             pending_optimistic_removals: HashMap::new(),
             pending_optimistic_flag_changes: HashMap::new(),
             pending_optimistic_pinned_changes: HashMap::new(),

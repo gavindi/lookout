@@ -10,6 +10,7 @@ use nom::{
     IResult,
 };
 
+use std::borrow::Cow;
 use std::str::{from_utf8, FromStr};
 
 // ----- number -----
@@ -66,6 +67,26 @@ pub fn string(i: &[u8]) -> IResult<&[u8], &[u8]> {
 // string bytes as utf8
 pub fn string_utf8(i: &[u8]) -> IResult<&[u8], &str> {
     map_res(string, from_utf8)(i)
+}
+
+/// `string` decoded as text without ever failing on an encoding the server
+/// actually sent. Borrows when the bytes are valid UTF-8 and falls back to a
+/// lossy owned string otherwise.
+///
+/// This is the string decoder the *body-structure* parser uses. MIME part
+/// parameters - `filename`/`name` above all - are frequently carried in a
+/// legacy encoding (Latin-1, Windows-1252, Shift-JIS) inside the quoted
+/// string, and a strict `from_utf8` rejects those bytes. Because a FETCH
+/// response is parsed as one unit, a single unparsable part aborts the whole
+/// response, tears the connection down, and - since the reconnect re-fetches
+/// the same message - loops the session forever (the same failure `is_char`
+/// fixed for ENVELOPE subjects). Lossy decoding keeps the message and the
+/// session alive; callers already handle non-ASCII text as `Cow<str>`.
+pub fn string_lossy(i: &[u8]) -> IResult<&[u8], Cow<'_, str>> {
+    map(string, |bytes| match from_utf8(bytes) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(String::from_utf8_lossy(bytes).into_owned()),
+    })(i)
 }
 
 // quoted = DQUOTE *QUOTED-CHAR DQUOTE
@@ -157,6 +178,13 @@ pub fn nstring(i: &[u8]) -> IResult<&[u8], Option<&[u8]>> {
 // nstring bytes as utf8
 pub fn nstring_utf8(i: &[u8]) -> IResult<&[u8], Option<&str>> {
     alt((map(nil, |_| None), map(string_utf8, Some)))(i)
+}
+
+/// [`nstring`] decoded through [`string_lossy`] - the lossy counterpart used
+/// by the body-structure parser so a nil-or-legacy-encoded field never aborts
+/// the response. See `string_lossy`.
+pub fn nstring_lossy(i: &[u8]) -> IResult<&[u8], Option<Cow<'_, str>>> {
+    alt((map(nil, |_| None), map(string_lossy, Some)))(i)
 }
 
 // nil = "NIL"
