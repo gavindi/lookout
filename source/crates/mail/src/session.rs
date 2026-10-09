@@ -782,6 +782,54 @@ fn idle_push_outcome(pushed: &MailboxId, current: &MailboxId) -> PushOutcome {
     }
 }
 
+/// How many syncs in a row the main loop will run purely because the
+/// session's unsolicited-response channel reported a change (see
+/// `take_mailbox_change`) before it enters IDLE regardless. A server that
+/// re-announces `EXISTS` after every command would otherwise keep the session
+/// resyncing forever instead of ever reaching the IDLE wait.
+const MAX_CHANGE_RESYNCS: u8 = 3;
+
+/// Whether an unsolicited response says the *selected* mailbox's membership
+/// moved: a new message (`EXISTS`/`RECENT`) or an expunge (`EXPUNGE`, or a
+/// QRESYNC `VANISHED`, which async-imap files under `Other`). A `STATUS` is
+/// about a named mailbox, not the selected one, and is ignored.
+fn is_mailbox_change(resp: &async_imap::types::UnsolicitedResponse) -> bool {
+    use async_imap::types::UnsolicitedResponse as U;
+    match resp {
+        U::Exists(_) | U::Expunge(_) | U::Recent(_) => true,
+        U::Other(data) => is_change_response(data.parsed()),
+        U::Status { .. } => false,
+    }
+}
+
+/// The `Other` half of [`is_mailbox_change`], split out so it can be tested
+/// against a hand-built `Response` (async-imap's `ResponseData` wrapper isn't
+/// constructible outside that crate).
+fn is_change_response(resp: &Response) -> bool {
+    matches!(resp, Response::Vanished { .. })
+}
+
+/// Drains everything queued on a session's unsolicited-response channel and
+/// returns whether any of it reported a change to the selected mailbox (see
+/// [`is_mailbox_change`]).
+///
+/// async-imap routes every untagged response that isn't part of the reply
+/// being parsed - an `EXISTS` the server sends at the end of a `FETCH`, or
+/// while `IDLE` is starting up or being torn down with `DONE` - into this
+/// channel rather than surfacing it. The server considers such a change
+/// *delivered*, so it is never reported again: the next IDLE stays silent
+/// and the new message stays invisible until something unrelated triggers a
+/// sync. Checking the channel at the points a change can slip through is what
+/// closes that gap. Always drains the whole channel - it's bounded and
+/// silently drops on overflow, so leaving it full would lose later signals.
+fn take_mailbox_change(rx: &async_channel::Receiver<async_imap::types::UnsolicitedResponse>) -> bool {
+    let mut changed = false;
+    while let Ok(resp) = rx.try_recv() {
+        changed |= is_mailbox_change(&resp);
+    }
+    changed
+}
+
 /// Runs one account's IMAP connection lifecycle on the calling task (spawn
 /// this onto the shared tokio worker thread - see the crate docs). Reconnects
 /// with backoff on any connection error; re-fetches credentials from
@@ -1138,8 +1186,18 @@ async fn connect_and_run(
         /// re-derives everything itself via its own SELECT/FETCH rather than
         /// trying to hand over parsed IMAP data from the other connection.
         IdlePush(MailboxId),
+        /// This connection's own unsolicited-response channel reported a
+        /// change to the open mailbox that no IDLE wait will ever report
+        /// (see `take_mailbox_change`), or the pre-IDLE re-SELECT found the
+        /// open mailbox's `UIDNEXT` had moved. Resynced exactly like an
+        /// IDLE wake.
+        ServerChanged,
         ChannelClosed,
     }
+
+    // Consecutive `Wake::ServerChanged` syncs since the session last reached
+    // an IDLE wait - see `MAX_CHANGE_RESYNCS`.
+    let mut change_resyncs: u8 = 0;
 
     loop {
         // Take a command - or a push from the dedicated IDLE connection -
@@ -1187,7 +1245,13 @@ async fn connect_and_run(
                             // skipped whenever the session already matches. Only reached on
                             // the way *into* IDLE, so a queued command never pays for it -
                             // its own handler selects whatever folder it needs.
+                            let mut server_changed = false;
                             if session_selected != current_mailbox_id {
+                                // Anything the unsolicited channel holds was reported while the
+                                // session sat on some other folder, so it says nothing about this
+                                // one - discard it. This folder's own changes are judged from the
+                                // SELECT's `UIDNEXT` below instead.
+                                take_mailbox_change(&session.unsolicited_responses);
                                 let meta = session.select(&current_mailbox_name).await?;
                                 session_selected = current_mailbox_id.clone();
                                 // Keep the folder list's `uidvalidity`/`uidnext` fresh so a
@@ -1198,85 +1262,124 @@ async fn connect_and_run(
                                     if let Some(v) = meta.uid_validity {
                                         f.uidvalidity = UidValidity(v);
                                     }
+                                    // Mail that landed while the session was elsewhere predates
+                                    // the IDLE about to start, so IDLE will never report it.
+                                    // A moved `UIDNEXT` catches it: resync instead of idling,
+                                    // and keep the old `highest_modseq` so that sync's
+                                    // `CHANGEDSINCE` delta still covers the arrival (advancing
+                                    // it here would put the new message below the baseline).
+                                    // A `uidnext` that was merely stale (delta syncs don't
+                                    // refresh it) costs one cheap extra sync, after which the
+                                    // write-back below keeps the comparison stable.
+                                    let arrived = meta.uid_next.is_some_and(|next| next != f.uidnext);
                                     if let Some(next) = meta.uid_next {
                                         f.uidnext = next;
                                     }
-                                    if let Some(modseq) = meta.highest_modseq {
+                                    if arrived {
+                                        server_changed = true;
+                                    } else if let Some(modseq) = meta.highest_modseq {
                                         f.highest_modseq = Some(modseq);
                                     }
                                 }
+                            } else {
+                                // Already on the open folder: an `EXISTS`/`EXPUNGE` that rode
+                                // in on some earlier command's response (typically the push
+                                // sync's own `FETCH`, sent before the server had shown this
+                                // connection the new message) is a change IDLE won't repeat.
+                                server_changed = take_mailbox_change(&session.unsolicited_responses);
                             }
 
-                            let mut handle = session.idle();
-                            handle.init().await?;
-                            // Aggressive prefetch paces the session with a short IDLE
-                            // slice so batches keep flowing on a quiet session (a
-                            // timeout wake runs the next prefetch batch), and the
-                            // short slice also keeps the periodic re-scan tick alive
-                            // once a pass is done. Otherwise the wait is the usual
-                            // keepalive slice.
-                            let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
-                            let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
+                            if server_changed && change_resyncs < MAX_CHANGE_RESYNCS {
+                                change_resyncs += 1;
+                                tracing::debug!(mailbox = %current_mailbox_id, "server reported a change outside IDLE; resyncing before idling");
+                                Wake::ServerChanged
+                            } else {
+                                // `Session::idle` consumes the session, so keep a handle on its
+                                // unsolicited channel (clones share one queue) to see what
+                                // `init()` routes there.
+                                let unsolicited = session.unsolicited_responses.clone();
+                                let mut handle = session.idle();
+                                handle.init().await?;
+                                // An `EXISTS` the server sends before its `+ idling` reply is
+                                // routed to the unsolicited channel by `init()`, not reported by
+                                // the wait below - which would then sit out a whole slice.
+                                if take_mailbox_change(&unsolicited) && change_resyncs < MAX_CHANGE_RESYNCS {
+                                    change_resyncs += 1;
+                                    tracing::debug!(mailbox = %current_mailbox_id, "server reported a change while IDLE was starting; resyncing");
+                                    session = handle.done().await?;
+                                    Wake::ServerChanged
+                                } else {
+                                    change_resyncs = 0;
+                                    // Aggressive prefetch paces the session with a short IDLE
+                                    // slice so batches keep flowing on a quiet session (a
+                                    // timeout wake runs the next prefetch batch), and the
+                                    // short slice also keeps the periodic re-scan tick alive
+                                    // once a pass is done. Otherwise the wait is the usual
+                                    // keepalive slice.
+                                    let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
+                                    let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
 
-                            // Race the IDLE wait against the next command so an on-demand
-                            // request (open a message, switch folders, ...) doesn't wait for
-                            // IDLE_SLICE to elapse. Both channels race the wait: the
-                            // interactive one exists so a user-facing fetch isn't queued
-                            // behind background commands (and vice versa). If a command
-                            // branch wins, `wait_fut` is dropped along with `stop_source`;
-                            // dropping a `StopSource` cancels its associated wait
-                            // immediately (see `stop_token::StopSource`'s docs) - but since
-                            // we're also dropping `wait_fut` itself here, we don't even need
-                            // to observe that cancellation, we just move straight on to
-                            // `handle.done()` below to send IMAP's `DONE` and reclaim the
-                            // session.
-                            let wake = tokio::select! {
-                                r = wait_fut => Wake::Idle(r),
-                                c = interactive_commands.recv() => match c {
-                                    Ok(cmd) => Wake::Command(cmd),
-                                    Err(_) => Wake::ChannelClosed,
-                                },
-                                m = idle_notify.recv() => match m {
-                                    Ok(mailbox_id) => Wake::IdlePush(mailbox_id),
-                                    // `idle_notify` closing mid-race (the spare
-                                    // sender `run_account_session` holds is only
-                                    // ever dropped on account shutdown, alongside
-                                    // `commands`/`interactive_commands`, which
-                                    // will themselves produce `ChannelClosed` on
-                                    // the very next iteration) is treated as a
-                                    // no-op rather than tearing the session down
-                                    // over an unrelated channel - `continue`
-                                    // isn't safe here, since it would skip the
-                                    // `handle.done()` teardown below and leave
-                                    // the connection still mid-IDLE.
-                                    Err(_) => Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)),
-                                },
-                                c = commands.recv() => match c {
-                                    Ok(cmd) => Wake::Command(cmd),
-                                    Err(_) => Wake::ChannelClosed,
-                                },
-                            };
+                                    // Race the IDLE wait against the next command so an on-demand
+                                    // request (open a message, switch folders, ...) doesn't wait for
+                                    // IDLE_SLICE to elapse. Both channels race the wait: the
+                                    // interactive one exists so a user-facing fetch isn't queued
+                                    // behind background commands (and vice versa). If a command
+                                    // branch wins, `wait_fut` is dropped along with `stop_source`;
+                                    // dropping a `StopSource` cancels its associated wait
+                                    // immediately (see `stop_token::StopSource`'s docs) - but since
+                                    // we're also dropping `wait_fut` itself here, we don't even need
+                                    // to observe that cancellation, we just move straight on to
+                                    // `handle.done()` below to send IMAP's `DONE` and reclaim the
+                                    // session.
+                                    let wake = tokio::select! {
+                                        r = wait_fut => Wake::Idle(r),
+                                        c = interactive_commands.recv() => match c {
+                                            Ok(cmd) => Wake::Command(cmd),
+                                            Err(_) => Wake::ChannelClosed,
+                                        },
+                                        m = idle_notify.recv() => match m {
+                                            Ok(mailbox_id) => Wake::IdlePush(mailbox_id),
+                                            // `idle_notify` closing mid-race (the spare
+                                            // sender `run_account_session` holds is only
+                                            // ever dropped on account shutdown, alongside
+                                            // `commands`/`interactive_commands`, which
+                                            // will themselves produce `ChannelClosed` on
+                                            // the very next iteration) is treated as a
+                                            // no-op rather than tearing the session down
+                                            // over an unrelated channel - `continue`
+                                            // isn't safe here, since it would skip the
+                                            // `handle.done()` teardown below and leave
+                                            // the connection still mid-IDLE.
+                                            Err(_) => Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)),
+                                        },
+                                        c = commands.recv() => match c {
+                                            Ok(cmd) => Wake::Command(cmd),
+                                            Err(_) => Wake::ChannelClosed,
+                                        },
+                                    };
 
-                            // How long a command that arrived while we were entering
-                            // IDLE (the SELECT-if-needed above, plus `handle.init()`'s
-                            // own round trip) had to wait before it was even noticed -
-                            // independent of any background prefetch batch, which has
-                            // its own elapsed logging. Not logged for an `Idle`/
-                            // `ChannelClosed` wake since nothing was waiting on those.
-                            if let Wake::Command(_) = &wake {
-                                tracing::debug!(elapsed_ms = idle_entry_started.elapsed().as_millis(), "idle-entry: command noticed after SELECT+IDLE-init");
+                                    // How long a command that arrived while we were entering
+                                    // IDLE (the SELECT-if-needed above, plus `handle.init()`'s
+                                    // own round trip) had to wait before it was even noticed -
+                                    // independent of any background prefetch batch, which has
+                                    // its own elapsed logging. Not logged for an `Idle`/
+                                    // `ChannelClosed` wake since nothing was waiting on those.
+                                    if let Wake::Command(_) = &wake {
+                                        tracing::debug!(elapsed_ms = idle_entry_started.elapsed().as_millis(), "idle-entry: command noticed after SELECT+IDLE-init");
+                                    }
+
+                                    // Emit cached messages for instant display the instant a folder
+                                    // switch arrives, *before* the IDLE teardown (handle.done().await)
+                                    // so the UI paints from disk while we wait for the network round-trip.
+                                    if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
+                                        emit_cached_messages(cache, mailbox_id, events).await;
+                                    }
+
+                                    drop(stop_source);
+                                    session = handle.done().await?;
+                                    wake
+                                }
                             }
-
-                            // Emit cached messages for instant display the instant a folder
-                            // switch arrives, *before* the IDLE teardown (handle.done().await)
-                            // so the UI paints from disk while we wait for the network round-trip.
-                            if let Wake::Command(AccountCommand::SyncMailbox(mailbox_id)) = &wake {
-                                emit_cached_messages(cache, mailbox_id, events).await;
-                            }
-
-                            drop(stop_source);
-                            session = handle.done().await?;
-                            wake
                         }
                     },
                 },
@@ -1292,7 +1395,7 @@ async fn connect_and_run(
             // CONDSTORE is enabled this is a `CHANGEDSINCE` delta, not a
             // full flag re-fetch - see `sync_mailbox`.
             Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
-            Wake::Idle(Ok(_)) => {
+            Wake::Idle(Ok(_)) | Wake::ServerChanged => {
                 // `sync_mailbox` derives the open folder's count fields from what
                 // this sync already fetched (the flag list for `unread`, SELECT
                 // meta for `total`/`uidnext`) and re-publishes the sidebar only
@@ -1318,6 +1421,17 @@ async fn connect_and_run(
             Wake::IdlePush(mailbox_id) => match idle_push_outcome(&mailbox_id, &current_mailbox_id) {
                 PushOutcome::ResyncNow => {
                     tracing::debug!(mailbox = %mailbox_id, "idle-push: resyncing currently-open mailbox");
+                    // The push comes from the *other* connection, and a
+                    // server updates each connection's view of a mailbox
+                    // separately - this one may not have been shown the new
+                    // message yet, in which case the sync's `FETCH 1:*`
+                    // would stop short of it. NOOP is IMAP's way of asking
+                    // the server to catch this connection's view up first.
+                    // Only needed when the sync will skip its own SELECT
+                    // (which refreshes the view anyway).
+                    if session_selected == current_mailbox_id {
+                        session.noop().await?;
+                    }
                     sync_mailbox(
                         &mut session,
                         &account_id,
@@ -3153,10 +3267,27 @@ async fn run_idle_connection(
         if selected.as_ref() != Some(&watched) {
             session.select(path).await?;
             selected = Some(watched.clone());
+            // Whatever the unsolicited channel held was about the previously
+            // watched folder.
+            take_mailbox_change(&session.unsolicited_responses);
         }
 
+        // `Session::idle` consumes the session; keep a handle on its
+        // unsolicited channel (clones share one queue). async-imap routes an
+        // `EXISTS` that arrives while IDLE is starting (before `+ idling`) or
+        // being torn down (during `DONE`) there instead of reporting it, and
+        // the server never repeats it - see `take_mailbox_change`.
+        let unsolicited = session.unsolicited_responses.clone();
         let mut handle = session.idle();
         handle.init().await?;
+        if take_mailbox_change(&unsolicited) {
+            let _ = idle_notify.send(watched.clone()).await;
+            session = handle.done().await?;
+            // Anything `DONE` itself brought in is covered by the push just
+            // sent: the primary connection resyncs after it.
+            take_mailbox_change(&unsolicited);
+            continue;
+        }
         let (wait_fut, stop_source) = handle.wait_with_timeout(IDLE_SLICE);
         // A mailbox switch mid-wait re-selects the new target on the next
         // loop iteration; dropping `wait_fut`/`stop_source` (via `select!`'s
@@ -3173,10 +3304,18 @@ async fn run_idle_connection(
         };
         drop(stop_source);
         session = handle.done().await?;
+        // Drained on every path so it can't go stale; only a timeout wake
+        // acts on it, since a change wake pushes regardless and a mailbox
+        // switch makes it about a folder no longer being watched.
+        let changed_during_done = take_mailbox_change(&unsolicited);
 
         match idle_result {
             None => {}
-            Some(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
+            Some(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {
+                if changed_during_done {
+                    let _ = idle_notify.send(watched.clone()).await;
+                }
+            }
             Some(Ok(_)) => {
                 let _ = idle_notify.send(watched.clone()).await;
             }
@@ -4305,6 +4444,13 @@ async fn sync_mailbox(
     qresync: bool,
 ) -> Result<()> {
     let _ = events.send(AccountEvent::MailboxSyncStarted { mailbox: mailbox_id.clone() }).await;
+    // Any change already reported to this connection is covered by the fetch
+    // below (the server only reports what it has added to this connection's
+    // view), and anything reported while on another folder isn't about this
+    // one - so neither should make the IDLE-entry check (`take_mailbox_change`
+    // in `connect_and_run`) run a second, redundant sync. Only what arrives
+    // *during* this sync is left for that check.
+    take_mailbox_change(&session.unsolicited_responses);
     let is_sent = folders.iter().find(|f| f.id == *mailbox_id).is_some_and(|f| matches!(f.role, MailboxRole::Sent));
     // `None` = a fresh session with nothing SELECTed yet (the connect-time
     // INBOX sync). Otherwise, when the session is already on this folder -
@@ -5878,6 +6024,51 @@ mod tests {
         let work = MailboxId::new(&account, "Work");
         assert_eq!(idle_push_outcome(&inbox, &inbox), PushOutcome::ResyncNow);
         assert_eq!(idle_push_outcome(&work, &inbox), PushOutcome::MarkDirty);
+    }
+
+    #[test]
+    fn mailbox_membership_responses_count_as_a_change() {
+        use async_imap::types::UnsolicitedResponse as U;
+        assert!(is_mailbox_change(&U::Exists(12)));
+        assert!(is_mailbox_change(&U::Expunge(3)));
+        assert!(is_mailbox_change(&U::Recent(1)));
+        // A STATUS names some mailbox, not necessarily the selected one.
+        assert!(!is_mailbox_change(&U::Status {
+            mailbox: "INBOX".into(),
+            attributes: vec![StatusAttribute::Messages(12)],
+        }));
+        assert!(is_change_response(&Response::Vanished {
+            earlier: false,
+            uids: vec![4..=6],
+        }));
+        assert!(!is_change_response(&Response::Fetch(1, Vec::new())));
+        assert!(!is_change_response(&Response::Expunge(1)), "a bare EXPUNGE arrives as its own variant, never via Other");
+    }
+
+    #[test]
+    fn take_mailbox_change_drains_the_channel_and_reports_any_change() {
+        use async_imap::types::UnsolicitedResponse as U;
+        let (tx, rx) = async_channel::bounded(10);
+        assert!(!take_mailbox_change(&rx), "nothing queued, nothing changed");
+
+        tx.try_send(U::Status {
+            mailbox: "Work".into(),
+            attributes: vec![StatusAttribute::Unseen(2)],
+        })
+        .unwrap();
+        assert!(!take_mailbox_change(&rx), "a STATUS alone isn't a change to the selected mailbox");
+        assert!(rx.is_empty(), "drained even when nothing counted");
+
+        tx.try_send(U::Status {
+            mailbox: "Work".into(),
+            attributes: vec![StatusAttribute::Unseen(2)],
+        })
+        .unwrap();
+        tx.try_send(U::Exists(7)).unwrap();
+        tx.try_send(U::Recent(1)).unwrap();
+        assert!(take_mailbox_change(&rx));
+        assert!(rx.is_empty(), "the whole channel is drained, not just up to the first change");
+        assert!(!take_mailbox_change(&rx), "a change is reported once, then consumed");
     }
 
     #[test]

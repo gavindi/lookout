@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.156" date="2026-10-09">
+      <description>
+        <p>New mail now appears in the open folder as soon as the server announces it. Previously a new message could stay hidden until something else happened - another message arriving, a flag changing, or switching folders - because Lookout sometimes checked the folder a moment before the server had made the new message visible to it.</p>
+      </description>
+    </release>
     <release version="0.9.155" date="2026-10-09">
       <description>
         <p>Fixed a Gmail "All Mail" folder - or any large folder - staying empty when the account contained an older message that Gmail describes in a way Lookout couldn't read; one such message no longer stops the whole folder from loading. Large folders also open much faster, since the first sync of a big folder (such as All Mail) no longer stalls for over a minute while it is saved to disk.</p>
