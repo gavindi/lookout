@@ -72,7 +72,10 @@ fn main() -> glib::ExitCode {
 
     tracing_subscriber::fmt::init();
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
     let worker = Rc::new(worker::Worker::new());
     // The dock badge's D-Bus work needs the worker's tokio reactor (the UI
     // thread's GLib context has none - see `launcher_entry`); hand the
@@ -96,14 +99,26 @@ fn main() -> glib::ExitCode {
             "Start without showing the main window",
             None,
         );
-        app.connect_handle_local_options(move |_app, options| {
-            // A `G_OPTION_ARG_NONE` option shows up in the parsed options
-            // dictionary as a true boolean; the env-args check covers any
-            // dispatch quirk, since the process argv is never rewritten.
-            if options.lookup_value("hidden", None).is_some() || std::env::args().any(|arg| arg == "--hidden") {
-                hidden.set(true);
+        for (name, description) in [
+            ("compose", "Compose a new message"),
+            ("contacts", "Open Contacts"),
+            ("calendar", "Open Calendar"),
+            ("tasks", "Open Tasks"),
+        ] {
+            app.add_main_option(name, 0.into(), glib::OptionFlags::NONE, glib::OptionArg::None, description, None);
+        }
+        // GApplication forwards the parsed options to the primary instance.
+        // Activate first so the window and its actions exist on a cold start.
+        app.connect_command_line(move |app, command_line| {
+            let options = command_line.options_dict();
+            hidden.set(options.lookup_value("hidden", None).is_some());
+            app.activate();
+            for action in ["compose", "contacts", "calendar", "tasks"] {
+                if options.lookup_value(action, None).is_some() {
+                    app.activate_action(action, None);
+                }
             }
-            std::ops::ControlFlow::<glib::ExitCode>::Continue(())
+            glib::ExitCode::SUCCESS
         });
     }
 
