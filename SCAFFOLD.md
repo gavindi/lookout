@@ -26,6 +26,7 @@ source/crates/
 ├── goa/          lookout-goa    — GNOME Online Accounts discovery (zbus/D-Bus)
 ├── mail/         lookout-mail   — IMAP/SMTP account-session actor + SQLite cache
 ├── dav/          lookout-dav    — CalDAV/CardDAV client + iCalendar/RRULE + SQLite caches
+├── graph/        lookout-graph  — Microsoft Graph client (paging, delta, throttling; Phase 5 backend)
 ├── imap-proto/   vendored fork of `imap-proto` (one upstream fix, patched via [patch.crates-io])
 ├── async-imap/   vendored fork of `async-imap` (in-place compress upgrade, buffer perf fix)
 └── app/          lookout-app    — the `lookout` binary: GTK4/libadwaita UI
@@ -38,11 +39,11 @@ lookout-core  (no I/O deps at all — tokio-free, zbus-free, gtk-free)
    ↑     ↑
    |     └── lookout-dav   (reqwest, quick-xml, icalendar, rrule, rusqlite)
    └── lookout-mail        (async-imap[patched], lettre, mail-parser, rusqlite)
-                 ↑              ↑            ↑
-                 |              |            |
-             lookout-goa    lookout-dav   lookout-mail
-                 \              |            /
-                  \             |           /
+                 ↑              ↑            ↑            ↑
+                 |              |            |            |
+             lookout-goa    lookout-dav   lookout-mail  lookout-graph
+                 \              |            /            /
+                  \             |           /            /
                         lookout-app (gtk4, libadwaita, webkit6, zbus, ksni, secret-service)
 ```
 
@@ -50,8 +51,10 @@ Both `lookout-mail` and `lookout-dav` are explicitly documented as having **no d
 `lookout-goa`/`zbus`** — each takes credentials through a small trait (`CredentialProvider` /
 `CalendarCredentialProvider`) instead, so both crates are unit-testable (and, for `lookout-mail`,
 integration-testable against a real IMAP server via `tests/imap_integration.rs`) without any
-GNOME/D-Bus session present. `lookout-app` is the only crate that touches GOA, GTK, or D-Bus tray
-integration — it is the composition root.
+GNOME/D-Bus session present. `lookout-graph` follows the same seam: its `TokenProvider` trait is
+implemented in `lookout-app` against `microsoft_oauth.rs` (`TokenAudience::Graph`), keeping the
+Graph transport free of OAuth/keyring/browser code. `lookout-app` is the only crate that touches
+GOA, GTK, or D-Bus tray integration — it is the composition root.
 
 **The mail and calendar engines mirror each other by design.** `lookout-dav`'s own crate doc
 comment calls itself a client "mirroring `lookout-mail`'s IMAP session actor," and this mirroring

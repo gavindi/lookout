@@ -594,8 +594,8 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 0.4 | ✅ ~~Undo stack~~ | `UndoEntry { description, inverse: Vec<AccountCommand> }` in `UiState`; toast with Undo; Ctrl+Z | `window.rs` | S |
 | 0.5 | ✅ ~~Context-menu framework~~ | Generalise the `folder_menu.rs` pattern into a reusable builder (action groups plus `gio::Menu` models) for messages, events, contacts, tasks | `app/src/context_menu.rs` (new) | S |
 | 0.6 | ✅ ~~Calendar preferences~~ | GSettings keys `calendar-week-start`, `calendar-work-days`, `calendar-work-start`, `calendar-work-end`, `calendar-primary-tz`, `calendar-secondary-tz`, `calendar-default-reminder`; replace `BUSINESS_HOURS_START/END`, `WORK_WEEK_DAYS`, `WEEK_DAYS`/`first_grid_day` constants | gschema, `settings.rs`, `calendar_view.rs`, `config_view.rs` | M |
-| 0.7 | `lookout-graph` crate skeleton | `reqwest` client, token supplier from `microsoft_oauth.rs` (`TokenAudience::Graph`), paging (`@odata.nextLink`), delta queries (`/delta`), throttling (`Retry-After`), error model; per-feature scope negotiation | `source/crates/graph` (new), `microsoft_oauth.rs` | M |
-| 0.8 | Fixture corpus | Capture real Outlook artefacts: invite, update, cancel, counter, TNEF, `.msg`, importance/sensitivity mail, Teams invite | `source/test-fixtures/outlook/` | S |
+| 0.7 | ✅ ~~`lookout-graph` crate skeleton~~ | `reqwest` client, token supplier from `microsoft_oauth.rs` (`TokenAudience::Graph`), paging (`@odata.nextLink`), delta queries (`/delta`), throttling (`Retry-After`), error model; per-feature scope negotiation | `source/crates/graph` (new), `microsoft_oauth.rs` | M |
+| 0.8 | ✅ ~~Fixture corpus~~ | Capture real Outlook artefacts: invite, update, cancel, counter, TNEF, `.msg`, importance/sensitivity mail, Teams invite | `source/test-fixtures/outlook/` | S |
 
 ### Phase 1: Mail daily-driver parity (mostly S/M; highest value per hour)
 

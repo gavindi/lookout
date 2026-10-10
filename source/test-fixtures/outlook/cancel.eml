@@ -1,0 +1,40 @@
+From: Ada Lovelace <ada@contoso.com>
+To: Bob Example <bob@example.com>
+Subject: Canceled: Project kickoff
+Date: Wed, 05 Aug 2026 11:00:00 +0000
+Message-ID: <outlook-invite-cancel-20260810@contoso.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="ol-invite-3"
+
+--ol-invite-3
+Content-Type: text/plain; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+This event has been canceled.
+
+Project kickoff
+Monday, August 10, 2026 2:00 PM - 3:00 PM
+
+--ol-invite-3
+Content-Type: text/calendar; method=CANCEL; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+BEGIN:VCALENDAR
+METHOD:CANCEL
+PRODID:Microsoft Exchange Server 2019
+VERSION:2.0
+BEGIN:VEVENT
+ORGANIZER;CN=Ada Lovelace:mailto:ada@contoso.com
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;CN=Bob Example:mailto:bob@example.com
+UID:040000008200E00074C5B7101A82E00800000000A1B2C3D4E5F6A7B8
+SUMMARY;LANGUAGE=en-US:Project kickoff
+DTSTART;TZID=W. Europe Standard Time:20260810T140000
+DTEND;TZID=W. Europe Standard Time:20260810T150000
+SEQUENCE:2
+STATUS:CANCELLED
+X-MICROSOFT-CDO-APPT-SEQUENCE:2
+DTSTAMP:20260805T110000Z
+END:VEVENT
+END:VCALENDAR
+
+--ol-invite-3--

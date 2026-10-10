@@ -13,6 +13,12 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.159] - 2026-10-11
+**Reference**: Microsoft 365 — `lookout-graph` client skeleton (Phase 0.7)
+**Summary**: Adds `source/crates/graph/` and registers it in the workspace, and touches `crates/app/src/microsoft_oauth.rs` and the app manifest; no data-format change. A transport every Graph-backed feature builds on: a `reqwest` `GraphClient` that attaches a bearer token from a `TokenProvider` (the OAuth seam the app implements against `microsoft_oauth.rs`, mirroring `CredentialProvider`), follows `@odata.nextLink` paging (`get_all`), reads `/delta` cursors, honours the `Retry-After` throttling header with backoff, and normalises Graph errors into `GraphError`. Per-feature scopes are declared in `scopes.rs` (`GraphFeature::consent_scopes`) and negotiated incrementally; `MicrosoftOAuth` gains `ensure_graph_consent_for` and the `TokenProvider` impl. Covered by 11 unit/wiremock tests (paging, delta, throttling retry, status mapping, PATCH).
+**Reference**: Tests — Outlook fixture corpus (Phase 0.8)
+**Summary**: Adds `source/test-fixtures/outlook/` and `crates/mail/tests/outlook_fixtures.rs`; no data-format change. Checked-in Outlook wire artefacts — invite, invite update, cancel, iTIP counter, Teams invite, and importance/sensitivity mail — authored to the documented formats with a README on capturing the binary TNEF/`.msg` fixtures. The new test parses every fixture through the app's own readers and asserts each iTIP method, the `X-MICROSOFT-*` extensions and the importance/sensitivity/List-Id markers.
+
 ## [v0.9.158] - 2026-10-11
 **Reference**: Mail — Undo stack (Phase 0.4)
 **Summary**: Touches `crates/app/src/{window,shortcuts}.rs`; no data-format change. Adds an `UndoEntry { id, description, inverse: Vec<AccountCommand> }` stack to `UiState`, a bottom-left "… / Undo" toast whose button reverses exactly the action it names, and Ctrl+Z (`undo_last`) to undo the most recent one. Wired to the toolbar and row delete/archive/report, pin/unpin, mark read/unread, move-to-folder drag and categorize; entries expire with their toast and are bounded by `MAX_UNDO_ENTRIES`. The broader set (undo send, "after moving or deleting") lands in 1.13.

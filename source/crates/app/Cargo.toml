@@ -16,6 +16,7 @@ lookout-core.workspace = true
 lookout-goa.workspace = true
 lookout-mail.workspace = true
 lookout-dav.workspace = true
+lookout-graph.workspace = true
 async-channel.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

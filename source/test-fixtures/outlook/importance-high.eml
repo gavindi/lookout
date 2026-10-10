@@ -1,0 +1,15 @@
+From: "Contoso Alerts" <alerts@contoso.com>
+To: Bob Example <bob@example.com>
+Subject: Action required: quarterly access review
+Date: Fri, 07 Aug 2026 07:45:00 +0000
+Message-ID: <outlook-importance-high-20260807@contoso.com>
+Importance: High
+X-Priority: 1 (Highest)
+X-MSMail-Priority: High
+Sensitivity: Private
+List-Id: Contoso Notifications <notifications.contoso.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+Your quarterly access review is due. Please complete it before the end of the week.

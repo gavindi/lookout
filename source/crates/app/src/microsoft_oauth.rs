@@ -325,8 +325,17 @@ impl MicrosoftOAuth {
     /// actually redeems a working Graph token on this tenant before
     /// reporting success.
     pub async fn ensure_graph_consent(&self) -> Result<(), String> {
+        self.ensure_graph_consent_for(COMBINED_SCOPES).await
+    }
+
+    /// The per-feature variant of [`Self::ensure_graph_consent`]: requests
+    /// exactly `scopes` (a space-separated OAuth2 scope string) rather than the
+    /// fixed combined set, so consent widens incrementally as each Graph
+    /// feature is first used (OUTLOOK_PARITY.md §4.4). Only ever called from a
+    /// user-initiated action.
+    pub async fn ensure_graph_consent_for(&self, scopes: &str) -> Result<(), String> {
         let store = TokenStore::for_account(&self.account_id);
-        let resp = self.authorize_interactive(COMBINED_SCOPES).await?;
+        let resp = self.authorize_interactive(scopes).await?;
         let refresh_token = resp.refresh_token.ok_or("Microsoft token response didn't include a refresh token")?;
         let stored = StoredToken {
             refresh_token,
@@ -435,6 +444,32 @@ impl MicrosoftOAuth {
     fn cache(&self, audience: TokenAudience, token: String, expires_in: u64) {
         let expires_at = Instant::now() + Duration::from_secs(expires_in.saturating_sub(60));
         *self.cache_slot(audience).lock().unwrap() = Some((token, expires_at));
+    }
+}
+
+/// Bridges the OAuth2 token store to `lookout-graph`'s transport: the
+/// [`lookout_graph::TokenProvider`] implementation the Graph client uses.
+/// `graph_token` reuses the non-interactive [`MicrosoftOAuth::graph_access_token`]
+/// (it never opens a browser); `ensure_scopes` is the only method that runs the
+/// interactive flow, so it must only be reached from a user-initiated action.
+#[async_trait::async_trait]
+impl lookout_graph::TokenProvider for MicrosoftOAuth {
+    async fn graph_token(&self) -> Result<String, lookout_graph::GraphError> {
+        self.graph_access_token().await.map_err(|error| match error {
+            GraphAuthError::ConsentRequired => lookout_graph::GraphError::ConsentRequired(GRAPH_SCOPES.to_string()),
+            GraphAuthError::Transient(message) => lookout_graph::GraphError::Token(message),
+        })
+    }
+
+    async fn ensure_scopes(&self, scopes: &[&str]) -> Result<(), lookout_graph::GraphError> {
+        // Build the OAuth2 `scope` string: `offline_access` plus the Graph
+        // resource-qualified names, matching `GRAPH_SCOPES`/`COMBINED_SCOPES`.
+        let mut requested = String::from("offline_access");
+        for scope in scopes {
+            requested.push_str(" https://graph.microsoft.com/");
+            requested.push_str(scope);
+        }
+        self.ensure_graph_consent_for(&requested).await.map_err(lookout_graph::GraphError::Token)
     }
 }
 

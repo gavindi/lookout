@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.159" date="2026-10-11">
+      <description>
+        <p>Internal groundwork for the Microsoft 365 features to come: Lookout now has a Microsoft Graph client (for the calendar, contacts and To Do integration planned for a future release) and a corpus of real Outlook message fixtures that the calendar and mail code is tested against. No user-visible changes in this release.</p>
+      </description>
+    </release>
     <release version="0.9.158" date="2026-10-11">
       <description>
         <p>Undo now covers the actions that change your mail: after deleting, archiving, moving, flagging or categorizing messages, a toast in the bottom-left corner offers Undo, and Ctrl+Z reverses the most recent action. The Calendar gains preferences under Settings → Calendar for the first day of the week, working days and hours, a time zone and a default reminder for new events.</p>

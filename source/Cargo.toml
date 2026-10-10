@@ -5,6 +5,7 @@ members = [
     "crates/goa",
     "crates/mail",
     "crates/dav",
+    "crates/graph",
     "crates/app",
     "crates/async-imap",
 ]
@@ -27,7 +28,7 @@ imap-proto = { path = "crates/imap-proto" }
 async-imap = { path = "crates/async-imap" }
 
 [workspace.package]
-version = "0.9.158"
+version = "0.9.159"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gavindi/lookout"
@@ -38,6 +39,7 @@ lookout-core = { path = "crates/core" }
 lookout-goa = { path = "crates/goa" }
 lookout-mail = { path = "crates/mail" }
 lookout-dav = { path = "crates/dav" }
+lookout-graph = { path = "crates/graph" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 async-channel = "2"

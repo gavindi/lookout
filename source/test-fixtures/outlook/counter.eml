@@ -1,0 +1,40 @@
+From: Bob Example <bob@example.com>
+To: Ada Lovelace <ada@contoso.com>
+Subject: New time proposed: Project kickoff
+Date: Thu, 06 Aug 2026 08:15:00 +0000
+Message-ID: <outlook-invite-counter-20260810@contoso.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="ol-invite-4"
+
+--ol-invite-4
+Content-Type: text/plain; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+Bob Example proposed a new time for this meeting.
+
+Project kickoff
+Monday, August 10, 2026 4:00 PM - 5:00 PM
+
+--ol-invite-4
+Content-Type: text/calendar; method=COUNTER; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+BEGIN:VCALENDAR
+METHOD:COUNTER
+PRODID:Microsoft Exchange Server 2019
+VERSION:2.0
+BEGIN:VEVENT
+ORGANIZER;CN=Ada Lovelace:mailto:ada@contoso.com
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;CN=Bob Example:mailto:bob@example.com
+UID:040000008200E00074C5B7101A82E00800000000A1B2C3D4E5F6A7B8
+SUMMARY;LANGUAGE=en-US:Project kickoff
+DTSTART;TZID=W. Europe Standard Time:20260810T160000
+DTEND;TZID=W. Europe Standard Time:20260810T170000
+COMMENT;LANGUAGE=en-US:Bob Example proposed a new time.
+SEQUENCE:0
+X-MICROSOFT-CDO-APPT-SEQUENCE:0
+DTSTAMP:20260806T081500Z
+END:VEVENT
+END:VCALENDAR
+
+--ol-invite-4--

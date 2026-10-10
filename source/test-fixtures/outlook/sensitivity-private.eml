@@ -1,0 +1,11 @@
+From: "HR Team" <hr@contoso.com>
+To: Bob Example <bob@example.com>
+Subject: Your performance review
+Date: Fri, 07 Aug 2026 08:30:00 +0000
+Message-ID: <outlook-sensitivity-private-20260807@contoso.com>
+Sensitivity: Company-Confidential
+MIME-Version: 1.0
+Content-Type: text/plain; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+This message is confidential. Please do not forward it.

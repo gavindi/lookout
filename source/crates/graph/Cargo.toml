@@ -1,0 +1,18 @@
+[package]
+name = "lookout-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Microsoft Graph client skeleton for Lookout"
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+
+[dev-dependencies]
+wiremock = "0.6"
