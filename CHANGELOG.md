@@ -10,8 +10,16 @@ New entries follow this style:
 ```
 ## [vX.Y.Z] - yyyy-mm-dd
 **Reference**: Category — short title
-**Summary**: scope/files touched; a plain, human-readable description of the change.
+**Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
+
+## [v0.9.158] - 2026-10-11
+**Reference**: Mail — Undo stack (Phase 0.4)
+**Summary**: Touches `crates/app/src/{window,shortcuts}.rs`; no data-format change. Adds an `UndoEntry { id, description, inverse: Vec<AccountCommand> }` stack to `UiState`, a bottom-left "… / Undo" toast whose button reverses exactly the action it names, and Ctrl+Z (`undo_last`) to undo the most recent one. Wired to the toolbar and row delete/archive/report, pin/unpin, mark read/unread, move-to-folder drag and categorize; entries expire with their toast and are bounded by `MAX_UNDO_ENTRIES`. The broader set (undo send, "after moving or deleting") lands in 1.13.
+**Reference**: App — reusable context-menu builder (Phase 0.5)
+**Summary**: Touches `crates/app/src/main.rs` and `crates/app/src/folder_menu.rs`, and adds `crates/app/src/context_menu.rs`; no data-format change. Generalises the folder menu's pattern into one builder — a declarative `MenuDescription` (sections, submenus, custom-widget slots) compiled to a `gio::Menu`, backed by a `gio::SimpleActionGroup` whose every action routes through one dispatch closure, presented via a `gtk::PopoverMenu`/`MenuButton` with per-item `set_enabled`/`set_state` refresh — for the message, event and contact/task menus still to come (1.17, 2.7, 3.12). The folder "⋯" menu is rebuilt on it with identical structure and behaviour.
+**Reference**: Calendar — preferences (Phase 0.6)
+**Summary**: Touches `data/gschema/...gschema.xml`, `crates/app/src/{settings,calendar_view,config_view,window,event_editor}.rs`; no data-format change. Adds seven GSettings keys (`calendar-week-start`, `calendar-work-days`, `calendar-work-start`, `calendar-work-end`, `calendar-primary-tz`, `calendar-secondary-tz`, `calendar-default-reminder`) with a validated `CalendarPreferences` assembled in `settings.rs`, and a Calendar page in Settings with rows for each. Replaces the hard-coded `WEEK_DAYS`/`WORK_WEEK_DAYS`/`BUSINESS_HOURS_START`/`BUSINESS_HOURS_END` constants and `first_grid_day`'s Sunday assumption: the month/mini grids, Work-week columns and business-hours band now come from the preferences. Live application across every surface and the time-zone rendering land in item 3.1.
 
 ## [v0.9.157] - 2026-10-11
 **Reference**: Outlook interop — added `lookout-core`'s Phase 0.1 interop module

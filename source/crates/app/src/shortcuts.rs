@@ -64,6 +64,7 @@ pub const ACTION_SNOOZE: &str = "snooze";
 /// customization on upgrade. Only the human-visible `title` below changed.
 pub const ACTION_PIN: &str = "flag";
 pub const ACTION_MARK_READ: &str = "mark-read";
+pub const ACTION_UNDO: &str = "undo";
 pub const ACTION_PRINT: &str = "print";
 pub const ACTION_SEARCH: &str = "search";
 pub const ACTION_CLOSE_PANE: &str = "close-pane";
@@ -146,6 +147,12 @@ pub const DEFAULT_SHORTCUTS: &[DefaultShortcut] = &[
         action: ACTION_MARK_READ,
         title: "Mark read / unread",
         keyval: gdk::Key::q,
+        modifiers: CONTROL,
+    },
+    DefaultShortcut {
+        action: ACTION_UNDO,
+        title: "Undo",
+        keyval: gdk::Key::z,
         modifiers: CONTROL,
     },
     DefaultShortcut {
@@ -494,7 +501,7 @@ mod tests {
             let key = d.keyval.to_lower();
             assert!(chords.insert((d.modifiers & MODIFIER_MASK, key)), "duplicate chord for {}", d.action);
         }
-        assert_eq!(actions.len(), 19);
+        assert_eq!(actions.len(), 20);
     }
 
     #[test]

@@ -189,6 +189,45 @@
       <summary>Event alerts</summary>
       <description>Show a notification when an event reminder comes due.</description>
     </key>
+    <key name="calendar-week-start" type="i">
+      <range min="0" max="6"/>
+      <default>0</default>
+      <summary>Week starts on</summary>
+      <description>First day of the week for the calendar grids and mini-calendar, as 0=Sunday .. 6=Saturday.</description>
+    </key>
+    <key name="calendar-work-days" type="as">
+      <default>['1', '2', '3', '4', '5']</default>
+      <summary>Working days</summary>
+      <description>Weekdays shown in the Work week view, as day numbers 0=Sunday .. 6=Saturday.</description>
+    </key>
+    <key name="calendar-work-start" type="i">
+      <range min="0" max="23"/>
+      <default>8</default>
+      <summary>Working hours start</summary>
+      <description>Local hour the business-hours band begins in the day/week grids.</description>
+    </key>
+    <key name="calendar-work-end" type="i">
+      <range min="1" max="24"/>
+      <default>18</default>
+      <summary>Working hours end</summary>
+      <description>Local hour the business-hours band ends (exclusive) in the day/week grids.</description>
+    </key>
+    <key name="calendar-primary-tz" type="s">
+      <default>''</default>
+      <summary>Primary time zone</summary>
+      <description>IANA name of the calendar's primary time zone; empty means the system local zone.</description>
+    </key>
+    <key name="calendar-secondary-tz" type="s">
+      <default>''</default>
+      <summary>Second time zone</summary>
+      <description>IANA name of an optional second time zone shown in the grid's gutter; empty means none.</description>
+    </key>
+    <key name="calendar-default-reminder" type="i">
+      <range min="-1" max="10080"/>
+      <default>-1</default>
+      <summary>Default reminder</summary>
+      <description>Minutes before a new event its reminder defaults to; -1 means no default reminder.</description>
+    </key>
 
     <!-- Assistant -->
     <key name="assistant-api-url" type="s">

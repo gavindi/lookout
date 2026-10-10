@@ -362,7 +362,7 @@ pub fn show_event_editor(
     // --- Right-hand preview: a mini month calendar above a single-day
     // schedule strip, reusing the widgets the main Calendar tab already
     // builds for itself (`calendar_view::build_mini`/`build_time_grid`).
-    let preview_mini = crate::calendar_view::build_mini();
+    let preview_mini = crate::calendar_view::build_mini(chrono::Weekday::Sun);
     let preview_day_strip = Rc::new(crate::calendar_view::build_time_grid(&[chrono::Weekday::Mon], true));
     let preview_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

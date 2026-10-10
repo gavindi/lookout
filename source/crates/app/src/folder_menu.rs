@@ -20,11 +20,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::glib;
 use lookout_core::{display_name, AccountId, Mailbox, MailboxId, MailboxRole};
 use lookout_mail::mailbox_name::{is_same_or_descendant, parent_mailbox_id, rekey_mailbox_id};
 
 use crate::calendar_colors::CALENDAR_PALETTE;
+use crate::context_menu::{ActionSpec, ContextMenu, Dispatch, MenuDescription};
 use crate::ui_state_db::FolderCountMode;
 
 /// One thing the menu can ask for. Carried to the [`FolderMenuHandler`]
@@ -155,19 +156,44 @@ pub fn palette_css() -> String {
         .collect()
 }
 
-/// One row's menu: the button, its action group (inserted on the row as
-/// `folder`), the heading label and the colour swatches - everything `bind`
+/// One row's menu: the button, its built context menu (action group + gio
+/// model), the heading label and the colour swatches - everything `bind`
 /// refreshes for whichever folder the row shows now.
 #[derive(Clone)]
 pub struct RowMenu {
     pub button: gtk::MenuButton,
-    pub actions: gio::SimpleActionGroup,
+    menu: ContextMenu,
     info: gtk::Label,
     swatches: Vec<(String, gtk::Button)>,
 }
 
-/// Builds a row's menu. `target` is read at activation time (the row slot
-/// `bind` writes), and every action goes through `handler`.
+/// Maps a menu action's bare name and parameter (from the shared
+/// [`ContextMenu`]) to the folder action it stands for - the piece
+/// `build_row_menu`'s dispatch closure runs on activation.
+fn folder_action_for(name: &str, param: Option<&glib::Variant>) -> Option<FolderMenuAction> {
+    Some(match name {
+        "create" => FolderMenuAction::CreateSubfolder,
+        "rename" => FolderMenuAction::Rename,
+        "move" => FolderMenuAction::Move,
+        "delete" => FolderMenuAction::Delete,
+        "empty" => FolderMenuAction::Empty,
+        "mark-read" => FolderMenuAction::MarkAllRead,
+        "favorite-add" => FolderMenuAction::AddFavorite,
+        "favorite-remove" => FolderMenuAction::RemoveFavorite,
+        "favorite-up" => FolderMenuAction::MoveFavoriteUp,
+        "favorite-down" => FolderMenuAction::MoveFavoriteDown,
+        "color" => FolderMenuAction::SetColor(param.and_then(|p| p.get::<String>()).filter(|hex| !hex.is_empty())),
+        "count" => FolderMenuAction::SetCountMode(match param.and_then(|p| p.get::<String>()).as_deref() {
+            Some("total") => FolderCountMode::Total,
+            _ => FolderCountMode::Unread,
+        }),
+        _ => return None,
+    })
+}
+
+/// Builds a row's menu through the shared [`ContextMenu`] builder. `target` is
+/// read at activation time (the row slot `bind` writes), and every action goes
+/// through `handler`.
 pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuHandler) -> RowMenu {
     let button = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
@@ -175,8 +201,7 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
         .css_classes(["hover-quick-action"])
         .valign(gtk::Align::Center)
         .build();
-    let actions = gio::SimpleActionGroup::new();
-    let dispatch: Rc<dyn Fn(FolderMenuAction)> = {
+    let dispatch_folder: Rc<dyn Fn(FolderMenuAction)> = {
         let button = button.clone();
         Rc::new(move |action| {
             let mailbox = target.borrow().clone();
@@ -186,97 +211,64 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
             }
         })
     };
-    let simple = [
-        ("create", FolderMenuAction::CreateSubfolder),
-        ("rename", FolderMenuAction::Rename),
-        ("move", FolderMenuAction::Move),
-        ("delete", FolderMenuAction::Delete),
-        ("empty", FolderMenuAction::Empty),
-        ("mark-read", FolderMenuAction::MarkAllRead),
-        ("favorite-add", FolderMenuAction::AddFavorite),
-        ("favorite-remove", FolderMenuAction::RemoveFavorite),
-        ("favorite-up", FolderMenuAction::MoveFavoriteUp),
-        ("favorite-down", FolderMenuAction::MoveFavoriteDown),
-    ];
-    for (name, action) in simple {
-        let simple_action = gio::SimpleAction::new(name, None);
-        let dispatch = dispatch.clone();
-        simple_action.connect_activate(move |_, _| dispatch(action.clone()));
-        actions.add_action(&simple_action);
-    }
-    let color = gio::SimpleAction::new("color", Some(glib::VariantTy::STRING));
-    {
-        let dispatch = dispatch.clone();
-        color.connect_activate(move |_, param| {
-            let hex = param.and_then(|p| p.get::<String>()).filter(|hex| !hex.is_empty());
-            dispatch(FolderMenuAction::SetColor(hex));
-        });
-    }
-    actions.add_action(&color);
-    // Stateful so the two count items render as radio buttons; `bind` sets
-    // the state to the row's current mode, and activation only reports the
-    // choice - the rebuild that follows sets the state from the stored prefs.
-    let count = gio::SimpleAction::new_stateful("count", Some(glib::VariantTy::STRING), &"unread".to_variant());
-    {
-        let dispatch = dispatch.clone();
-        count.connect_activate(move |_, param| {
-            let mode = match param.and_then(|p| p.get::<String>()).as_deref() {
-                Some("total") => FolderCountMode::Total,
-                _ => FolderCountMode::Unread,
-            };
-            dispatch(FolderMenuAction::SetCountMode(mode));
-        });
-    }
-    actions.add_action(&count);
-
-    let menu = gio::Menu::new();
-    let custom_item = |id: &str| {
-        let item = gio::MenuItem::new(None, None);
-        item.set_attribute_value("custom", Some(&id.to_variant()));
-        item
+    let dispatch: Dispatch = {
+        let dispatch_folder = dispatch_folder.clone();
+        Rc::new(move |name, param| {
+            if let Some(action) = folder_action_for(name, param.as_ref()) {
+                dispatch_folder(action);
+            }
+        })
     };
-    let heading = gio::Menu::new();
-    heading.append_item(&custom_item("info"));
-    menu.append_section(None, &heading);
 
-    let create = gio::Menu::new();
-    create.append(Some("Create new subfolder"), Some("folder.create"));
-    menu.append_section(None, &create);
+    let description = MenuDescription::new()
+        .section()
+        .custom("info")
+        .section()
+        .action("Create new subfolder", "folder.create")
+        .section()
+        .action("Rename", "folder.rename")
+        .submenu(
+            "Change color",
+            MenuDescription::new()
+                .section()
+                .custom("colors")
+                .action_with_target("No color", "folder.color", "".to_variant()),
+        )
+        .submenu(
+            "Change folder count",
+            MenuDescription::new()
+                .section()
+                .action_with_target("Show unread count", "folder.count", "unread".to_variant())
+                .action_with_target("Show total count", "folder.count", "total".to_variant()),
+        )
+        .section()
+        .action("Move…", "folder.move")
+        .action("Delete", "folder.delete")
+        .action("Empty", "folder.empty")
+        .action("Mark all as read", "folder.mark-read")
+        .section()
+        .hidden_action("Add to Favorites", "folder.favorite-add")
+        .hidden_action("Remove from Favorites", "folder.favorite-remove")
+        .action("Move up", "folder.favorite-up")
+        .action("Move down", "folder.favorite-down");
 
-    let appearance = gio::Menu::new();
-    appearance.append(Some("Rename"), Some("folder.rename"));
-    let colors = gio::Menu::new();
-    colors.append_item(&custom_item("colors"));
-    let no_color = gio::MenuItem::new(Some("No color"), None);
-    no_color.set_action_and_target_value(Some("folder.color"), Some(&"".to_variant()));
-    colors.append_item(&no_color);
-    appearance.append_submenu(Some("Change color"), &colors);
-    let counts = gio::Menu::new();
-    counts.append(Some("Show unread count"), Some("folder.count::unread"));
-    counts.append(Some("Show total count"), Some("folder.count::total"));
-    appearance.append_submenu(Some("Change folder count"), &counts);
-    menu.append_section(None, &appearance);
+    let specs = [
+        ActionSpec::simple("create"),
+        ActionSpec::simple("rename"),
+        ActionSpec::simple("move"),
+        ActionSpec::simple("delete"),
+        ActionSpec::simple("empty"),
+        ActionSpec::simple("mark-read"),
+        ActionSpec::simple("favorite-add"),
+        ActionSpec::simple("favorite-remove"),
+        ActionSpec::simple("favorite-up"),
+        ActionSpec::simple("favorite-down"),
+        ActionSpec::parameterised("color", glib::VariantTy::STRING),
+        ActionSpec::stateful("count", glib::VariantTy::STRING, &"unread".to_variant()),
+    ];
+    let menu = ContextMenu::new(&description, &specs, dispatch);
+    menu.attach_button(&button, "folder");
 
-    let manage = gio::Menu::new();
-    manage.append(Some("Move…"), Some("folder.move"));
-    manage.append(Some("Delete"), Some("folder.delete"));
-    manage.append(Some("Empty"), Some("folder.empty"));
-    manage.append(Some("Mark all as read"), Some("folder.mark-read"));
-    menu.append_section(None, &manage);
-
-    let favorites = gio::Menu::new();
-    for (label, action) in [("Add to Favorites", "folder.favorite-add"), ("Remove from Favorites", "folder.favorite-remove")] {
-        // Only one of the pair is ever enabled, and the other is hidden
-        // rather than greyed out - the item reads as a single toggle.
-        let item = gio::MenuItem::new(Some(label), Some(action));
-        item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
-        favorites.append_item(&item);
-    }
-    favorites.append(Some("Move up"), Some("folder.favorite-up"));
-    favorites.append(Some("Move down"), Some("folder.favorite-down"));
-    menu.append_section(None, &favorites);
-
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
     let info = gtk::Label::builder()
         .xalign(0.0)
         .margin_start(12)
@@ -285,7 +277,7 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
         .margin_bottom(6)
         .css_classes(["dim-label", "caption"])
         .build();
-    popover.add_child(&info, "info");
+    menu.add_child(&info, "info");
     let swatch_grid = gtk::Grid::builder()
         .column_spacing(6)
         .row_spacing(6)
@@ -301,22 +293,20 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
             .tooltip_text(*hex)
             .build();
         {
-            let dispatch = dispatch.clone();
-            let popover = popover.clone();
+            let dispatch_folder = dispatch_folder.clone();
+            let menu = menu.clone();
             let hex = hex.to_string();
             swatch.connect_clicked(move |_| {
-                popover.popdown();
-                dispatch(FolderMenuAction::SetColor(Some(hex.clone())));
+                menu.popdown();
+                dispatch_folder(FolderMenuAction::SetColor(Some(hex.clone())));
             });
         }
         swatch_grid.attach(&swatch, (index % 5) as i32, (index / 5) as i32, 1, 1);
         swatches.push((hex.to_string(), swatch));
     }
-    popover.add_child(&swatch_grid, "colors");
-    button.set_popover(Some(&popover));
-    button.insert_action_group("folder", Some(&actions));
+    menu.add_child(&swatch_grid, "colors");
 
-    RowMenu { button, actions, info, swatches }
+    RowMenu { button, menu, info, swatches }
 }
 
 impl RowMenu {
@@ -324,28 +314,21 @@ impl RowMenu {
     /// and the checked colour and count mode.
     pub fn refresh(&self, mailbox: &Mailbox, state: FolderMenuState, color: Option<&str>, count_mode: FolderCountMode) {
         self.info.set_label(&folder_info_text(mailbox));
-        let enable = |name: &str, enabled: bool| {
-            if let Some(action) = self.actions.lookup_action(name).and_downcast::<gio::SimpleAction>() {
-                action.set_enabled(enabled);
-            }
+        self.menu.set_enabled("create", state.create);
+        self.menu.set_enabled("rename", state.rename);
+        self.menu.set_enabled("move", state.move_folder);
+        self.menu.set_enabled("delete", state.delete);
+        self.menu.set_enabled("empty", state.empty);
+        self.menu.set_enabled("mark-read", state.mark_read);
+        self.menu.set_enabled("favorite-add", !state.is_favorite);
+        self.menu.set_enabled("favorite-remove", state.is_favorite);
+        self.menu.set_enabled("favorite-up", state.move_up);
+        self.menu.set_enabled("favorite-down", state.move_down);
+        let mode = match count_mode {
+            FolderCountMode::Unread => "unread",
+            FolderCountMode::Total => "total",
         };
-        enable("create", state.create);
-        enable("rename", state.rename);
-        enable("move", state.move_folder);
-        enable("delete", state.delete);
-        enable("empty", state.empty);
-        enable("mark-read", state.mark_read);
-        enable("favorite-add", !state.is_favorite);
-        enable("favorite-remove", state.is_favorite);
-        enable("favorite-up", state.move_up);
-        enable("favorite-down", state.move_down);
-        if let Some(action) = self.actions.lookup_action("count").and_downcast::<gio::SimpleAction>() {
-            let mode = match count_mode {
-                FolderCountMode::Unread => "unread",
-                FolderCountMode::Total => "total",
-            };
-            action.set_state(&mode.to_variant());
-        }
+        self.menu.set_state("count", &mode.to_variant());
         for (hex, swatch) in &self.swatches {
             if Some(hex.as_str()) == color {
                 swatch.add_css_class("selected");
@@ -624,5 +607,43 @@ mod tests {
         for hex in CALENDAR_PALETTE {
             assert!(css.contains(&format!(".{} {{ color: {hex}; }}", color_class(hex))));
         }
+    }
+
+    #[test]
+    fn action_names_and_parameters_map_to_folder_actions() {
+        assert_eq!(folder_action_for("create", None), Some(FolderMenuAction::CreateSubfolder));
+        assert_eq!(folder_action_for("mark-read", None), Some(FolderMenuAction::MarkAllRead));
+        assert_eq!(folder_action_for("favorite-down", None), Some(FolderMenuAction::MoveFavoriteDown));
+        assert_eq!(
+            folder_action_for("color", Some(&"#ff0000".to_variant())),
+            Some(FolderMenuAction::SetColor(Some("#ff0000".into())))
+        );
+        assert_eq!(folder_action_for("color", Some(&"".to_variant())), Some(FolderMenuAction::SetColor(None)));
+        assert_eq!(
+            folder_action_for("count", Some(&"total".to_variant())),
+            Some(FolderMenuAction::SetCountMode(FolderCountMode::Total))
+        );
+        assert_eq!(
+            folder_action_for("count", Some(&"unread".to_variant())),
+            Some(FolderMenuAction::SetCountMode(FolderCountMode::Unread))
+        );
+        assert_eq!(folder_action_for("bogus", None), None);
+    }
+
+    /// The menu builds through the shared `ContextMenu` builder and `refresh`
+    /// drives its actions without panicking. Needs GTK, so it self-skips where
+    /// GTK can't be initialised.
+    #[test]
+    fn row_menu_builds_and_refreshes_through_the_shared_builder() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let handler: FolderMenuHandler = Rc::new(RefCell::new(None));
+        let target: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+        let menu = build_row_menu(target, handler);
+
+        let folder = folder("Work", MailboxRole::Custom, 4, &[]);
+        menu.refresh(&folder, folder_menu_state(&folder, None), Some("#3584e4"), FolderCountMode::Total);
+        menu.refresh(&folder, folder_menu_state(&folder, None), None, FolderCountMode::Unread);
     }
 }

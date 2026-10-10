@@ -699,7 +699,9 @@ there's no standalone "agenda" stack entry), and `month` (default). Time-grid vi
 stacked `gtk::DrawingArea`s (all-day band + scrollable timed canvas) with custom cairo
 `set_draw_func` painting; overlapping same-day events are laid out via a greedy interval-
 partitioning `assign_lanes` algorithm. Data-in/widget-out: `set_anchor`/`set_occurrences` are the
-two inputs, both triggering a full `refresh`.
+two inputs, both triggering a full `refresh`. Week start, the Work-week columns and the
+business-hours band come from `settings::CalendarPreferences` (item 0.6, passed to `build_main`);
+the time grids' default band is 8..18 when built outside the calendar panel.
 
 **`compose.rs`** — plain (`gtk::TextView`) and rich (contenteditable `webkit::WebView`,
 `hardware_acceleration_policy(Never)`) editors coexist, one live at a time; HTML mode sends
@@ -775,7 +777,13 @@ IMAP keywords; `trusted_senders.rs` — remote-content trust dialog; `task_edito
 `tasks_view.rs` — VTODO editor and grouped list; `other_accounts.rs` — manual IMAP/SMTP account
 management, keyring-backed; `theme.rs` — bundled named-color CSS theming; `background_image.rs`
 — window-background image persistence; `shortcuts.rs` — keyboard shortcuts matched by physical
-keycode (layout-independent).
+keycode (layout-independent); `context_menu.rs` — the shared context-menu builder (item 0.5): a
+declarative `MenuDescription` compiled to a `gio::Menu` plus a `SimpleActionGroup` routed through
+one dispatch closure, used by `folder_menu.rs` and the message/event/contact menus to come.
+`window.rs`'s `UiState.undo_stack` holds the reversible-action
+history (item 0.4): each destructive action records an `UndoEntry { id, description, inverse }`,
+shows a bottom-left toast whose Undo button reverses exactly that entry, and is also undoable with
+Ctrl+Z (`ACTION_UNDO`); entries expire with their toast and are capped by `MAX_UNDO_ENTRIES`.
 
 ### 8.6 Four persistence layers, deliberately kept separate
 

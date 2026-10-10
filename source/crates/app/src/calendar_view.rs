@@ -12,27 +12,34 @@ use lookout_dav::session::ConnectionState as CalendarConnectionState;
 
 use crate::calendar_colors;
 
-/// Sunday-first week (matches Outlook's/the US default convention, per the
-/// reference screenshot this view is matched against) rather than
-/// locale-detected - an explicit simplification for this pass.
+/// The short label for each weekday, indexed by `num_days_from_sunday`. The
+/// displayed week order is driven by the `calendar-week-start` preference (see
+/// [`week_days`]/[`ordered_weekday_labels`]), not this array's own order.
 const WEEKDAY_LABELS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const WEEK_DAYS: [chrono::Weekday; 7] = [
-    chrono::Weekday::Sun,
-    chrono::Weekday::Mon,
-    chrono::Weekday::Tue,
-    chrono::Weekday::Wed,
-    chrono::Weekday::Thu,
-    chrono::Weekday::Fri,
-    chrono::Weekday::Sat,
-];
-const WORK_WEEK_DAYS: [chrono::Weekday; 5] = [chrono::Weekday::Mon, chrono::Weekday::Tue, chrono::Weekday::Wed, chrono::Weekday::Thu, chrono::Weekday::Fri];
 const MAX_VISIBLE_EVENTS_PER_DAY: usize = 3;
 const HOURS_PER_DAY: usize = 24;
-/// The local-hour range rendered with a lighter "business hours" background
-/// in the Day/Week/Work week grids (8am-6pm, half-open so hour 18 starts the
-/// off-hours tone again); everything else is the darker off-hours background.
-const BUSINESS_HOURS_START: usize = 8;
-const BUSINESS_HOURS_END: usize = 18;
+
+/// The short label for `day` ("Sun".."Sat").
+fn weekday_short(day: chrono::Weekday) -> &'static str {
+    WEEKDAY_LABELS[day.num_days_from_sunday() as usize]
+}
+
+/// The seven weekdays beginning at `week_start`, in week order.
+fn week_days(week_start: chrono::Weekday) -> Vec<chrono::Weekday> {
+    let start = crate::settings::weekday_sun_index(week_start);
+    (0..7)
+        .map(|i| crate::settings::weekday_from_sun_index((start + i) % 7).expect("0..=6 is a weekday"))
+        .collect()
+}
+
+/// The seven weekday labels in week order, `week_start` first.
+fn ordered_weekday_labels(week_start: chrono::Weekday) -> [&'static str; 7] {
+    let mut labels = [""; 7];
+    for (slot, day) in labels.iter_mut().zip(week_days(week_start)) {
+        *slot = weekday_short(day);
+    }
+    labels
+}
 /// Width of the hour-gutter column in the Day/Week grids, wide enough for
 /// "5pm"-style labels without pushing the event columns off-balance.
 const HOUR_GUTTER_WIDTH: f64 = 52.0;
@@ -294,12 +301,15 @@ pub struct MonthGrid {
     /// [`connect_main_day_activated`]).
     selected_day: Rc<RefCell<Option<NaiveDate>>>,
     on_day_activate: PendingDayActivate,
+    /// First day of the week for this grid (the `calendar-week-start`
+    /// preference), used by [`first_grid_day`] to place the 6-week window.
+    week_start: chrono::Weekday,
 }
 
-fn build_month_grid() -> MonthGrid {
+fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
     let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).homogeneous(true).build();
-    for label in WEEKDAY_LABELS.iter() {
-        let weekday_label = gtk::Label::builder().label(*label).css_classes(["dim-label", "caption-heading"]).build();
+    for label in ordered_weekday_labels(week_start) {
+        let weekday_label = gtk::Label::builder().label(label).css_classes(["dim-label", "caption-heading"]).build();
         let cell = gtk::Box::builder().css_classes(["calendar-day-cell"]).hexpand(true).build();
         cell.append(&weekday_label);
         header_row.append(&cell);
@@ -349,7 +359,7 @@ fn build_month_grid() -> MonthGrid {
                     }
                     widget = current.parent();
                 }
-                let date = first_grid_day(*anchor_month.borrow()) + chrono::Duration::days(index as i64);
+                let date = first_grid_day(*anchor_month.borrow(), week_start) + chrono::Duration::days(index as i64);
                 if *selected_day.borrow() == Some(date) {
                     *selected_day.borrow_mut() = None;
                     click_target.remove_css_class("calendar-selected-cell");
@@ -380,7 +390,7 @@ fn build_month_grid() -> MonthGrid {
     let month_drag: Rc<RefCell<Option<MonthDrag>>> = Rc::new(RefCell::new(None));
     let chip_events: Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>> = Rc::new(RefCell::new(HashMap::new()));
     let on_drag: PendingEventDrag = Rc::new(RefCell::new(None));
-    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag);
+    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag, week_start);
 
     MonthGrid {
         root: root_box.upcast(),
@@ -393,6 +403,7 @@ fn build_month_grid() -> MonthGrid {
         on_day_selected,
         selected_day,
         on_day_activate,
+        week_start,
     }
 }
 
@@ -405,7 +416,7 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
 
     let today = chrono::Utc::now().date_naive();
     let selected_day = *mg.selected_day.borrow();
-    let grid_start = first_grid_day(month);
+    let grid_start = first_grid_day(month, mg.week_start);
 
     for (i, cell) in mg.day_cells.iter().enumerate() {
         let date = grid_start + chrono::Duration::days(i as i64);
@@ -456,7 +467,7 @@ pub fn set_month_occurrences(
     for cell in &mg.day_cells {
         cell.container.remove_css_class("calendar-drag-target");
     }
-    let grid_start = first_grid_day(*mg.anchor_month.borrow());
+    let grid_start = first_grid_day(*mg.anchor_month.borrow(), mg.week_start);
 
     for cell in &mg.day_cells {
         clear_children(&cell.events_box);
@@ -579,6 +590,7 @@ fn attach_month_drag(
     chip_events: &Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>>,
     on_activate: &PendingActivate,
     on_drag: &PendingEventDrag,
+    week_start: chrono::Weekday,
 ) {
     let gesture = gtk::GestureClick::new();
     let events_boxes: Vec<gtk::Box> = day_cells.iter().map(|c| c.events_box.clone()).collect();
@@ -605,7 +617,7 @@ fn attach_month_drag(
             let Some(cell) = cell_index_at_point(grid.width() as f64, grid.height() as f64, x, y) else {
                 return;
             };
-            let date = first_grid_day(*anchor_month.borrow()) + chrono::Duration::days(cell as i64);
+            let date = first_grid_day(*anchor_month.borrow(), week_start) + chrono::Duration::days(cell as i64);
             *month_drag.borrow_mut() = Some(MonthDrag {
                 occ,
                 button,
@@ -638,7 +650,7 @@ fn attach_month_drag(
             let Some(cell) = cell_index_at_point(grid.width() as f64, grid.height() as f64, x, y) else {
                 return;
             };
-            let date = first_grid_day(*anchor_month.borrow()) + chrono::Duration::days(cell as i64);
+            let date = first_grid_day(*anchor_month.borrow(), week_start) + chrono::Duration::days(cell as i64);
             if d.to_date != date {
                 d.to_date = date;
                 // Live feedback: reparent the chip into the target cell and
@@ -845,6 +857,11 @@ struct TimeGridData {
     /// The chip drag currently in flight, if any - set once a chip press
     /// crosses the drag threshold, cleared on release or re-render.
     drag: Rc<RefCell<Option<TimeGridDrag>>>,
+    /// The business-hours band painted by [`paint_time_grid`], as local hours,
+    /// half-open `start..end`. Defaults to 8..18; [`TimeGrid::set_work_hours`]
+    /// sets it from the `CalendarPreferences` when the calendar is built.
+    work_start: Cell<usize>,
+    work_end: Cell<usize>,
 }
 
 pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
@@ -869,6 +886,8 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         drag_anchor: Rc::new(RefCell::new(None)),
         chip_press: Rc::new(RefCell::new(None)),
         drag: Rc::new(RefCell::new(None)),
+        work_start: Cell::new(8),
+        work_end: Cell::new(18),
     };
     let hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let on_activate: PendingActivate = Rc::new(RefCell::new(None));
@@ -932,6 +951,18 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         on_activate,
         on_slot_activate,
         on_drag,
+    }
+}
+
+impl TimeGrid {
+    /// Sets the business-hours band (local hours, half-open `start..end`)
+    /// painted on the timeline and repaints it. Called by [`build_main`] from
+    /// the `CalendarPreferences`; the event editor's preview grid keeps the
+    /// default 8..18.
+    pub(crate) fn set_work_hours(&self, start: usize, end: usize) {
+        self.data.work_start.set(start.min(23));
+        self.data.work_end.set(end.clamp(1, 24));
+        self.canvas.queue_draw();
     }
 }
 
@@ -1727,9 +1758,12 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
 
     // No background fill (see `GRID_BUSINESS_ALPHA`): off-hours are the main
     // panel's own translucent background, with a foreground tint marking the
-    // business-hours stripe.
-    let business_top = BUSINESS_HOURS_START as f64 * TIME_SLOT_HEIGHT;
-    let business_height = (BUSINESS_HOURS_END as f64 - BUSINESS_HOURS_START as f64) * TIME_SLOT_HEIGHT;
+    // business-hours stripe. The band comes from the `calendar-work-start`/
+    // `-end` preferences.
+    let work_start = data.work_start.get();
+    let work_end = data.work_end.get();
+    let business_top = work_start as f64 * TIME_SLOT_HEIGHT;
+    let business_height = (work_end.saturating_sub(work_start)) as f64 * TIME_SLOT_HEIGHT;
     cr.rectangle(HOUR_GUTTER_WIDTH, business_top, columns_width, business_height);
     cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_BUSINESS_ALPHA);
     let _ = cr.fill();
@@ -2043,8 +2077,8 @@ pub struct SplitView {
     pub agenda: AgendaView,
 }
 
-fn build_split_view() -> SplitView {
-    let month = build_month_grid();
+fn build_split_view(week_start: chrono::Weekday) -> SplitView {
+    let month = build_month_grid(week_start);
     month.root.set_width_request(300);
     let agenda = build_agenda_view();
 
@@ -2118,7 +2152,8 @@ pub struct CalendarMain {
     on_drag: PendingEventDrag,
 }
 
-pub fn build_main() -> CalendarMain {
+pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain {
+    let week_start = prefs.week_start;
     install_calendar_css();
 
     let header_label = gtk::Label::builder().css_classes(["title-2"]).hexpand(true).xalign(0.0).build();
@@ -2131,7 +2166,7 @@ pub fn build_main() -> CalendarMain {
     // can browse months with its prev/next buttons and click a day to jump the
     // whole panel there. The caller (`window.rs`) registers that navigation via
     // `connect_day_selected`; the popover closes itself on a day pick here.
-    let month_mini = build_mini();
+    let month_mini = build_mini(week_start);
     let month_popover = gtk::Popover::builder().child(&month_mini.root).build();
     {
         let month_popover = month_popover.clone();
@@ -2156,12 +2191,16 @@ pub fn build_main() -> CalendarMain {
     header_row.append(&next_button);
     header_row.append(&month_button);
 
-    let month = build_month_grid();
-    let workweek = build_time_grid(&WORK_WEEK_DAYS, false);
-    let week = build_time_grid(&WEEK_DAYS, false);
-    let day = build_time_grid(&[chrono::Weekday::Mon], true);
+    let month = build_month_grid(week_start);
+    let workweek = build_time_grid(&prefs.work_days, false);
+    let week = build_time_grid(&week_days(week_start), false);
+    let day = build_time_grid(&[week_start], true);
+    // The Day/Week/Work-week grids share the configured business-hours band.
+    for grid in [&workweek, &week, &day] {
+        grid.set_work_hours(prefs.work_start as usize, prefs.work_end as usize);
+    }
     let agenda = build_agenda_view();
-    let split = build_split_view();
+    let split = build_split_view(week_start);
 
     let stack = gtk::Stack::new();
     stack.add_named(&workweek.root, Some("workweek"));
@@ -2373,7 +2412,7 @@ fn header_text(c: &CalendarMain) -> String {
     match active_view(c) {
         "day" => anchor.format("%A %d %B %Y").to_string(),
         "workweek" | "week" => {
-            let weekdays = if active_view(c) == "workweek" { &WORK_WEEK_DAYS[..] } else { &WEEK_DAYS[..] };
+            let weekdays: &[chrono::Weekday] = if active_view(c) == "workweek" { &c.workweek.weekdays } else { &c.week.weekdays };
             let start = week_start(anchor, weekdays[0]);
             let end = start + chrono::Duration::days(weekdays.len() as i64 - 1);
             if start.year() == end.year() {
@@ -2485,9 +2524,12 @@ pub struct MiniCalendar {
     /// updated by [`set_mini_month`]/[`set_mini_event_days`].
     event_days: Rc<RefCell<HashSet<NaiveDate>>>,
     on_day_selected: DaySelectedCallbacks,
+    /// First day of the week (the `calendar-week-start` preference) for the
+    /// grid's column order and its 6-week window.
+    week_start: chrono::Weekday,
 }
 
-pub fn build_mini() -> MiniCalendar {
+pub fn build_mini(week_start: chrono::Weekday) -> MiniCalendar {
     let anchor_month = Rc::new(RefCell::new(first_of_month(chrono::Utc::now().date_naive())));
     let event_days = Rc::new(RefCell::new(HashSet::new()));
     let on_day_selected: DaySelectedCallbacks = Rc::new(RefCell::new(Vec::new()));
@@ -2502,8 +2544,8 @@ pub fn build_mini() -> MiniCalendar {
     header_row.append(&next_button);
 
     let grid = gtk::Grid::builder().row_homogeneous(true).column_homogeneous(true).build();
-    for (col, label) in WEEKDAY_LABELS.iter().enumerate() {
-        let weekday_label = gtk::Label::builder().label(*label).css_classes(["dim-label", "caption"]).build();
+    for (col, label) in ordered_weekday_labels(week_start).into_iter().enumerate() {
+        let weekday_label = gtk::Label::builder().label(label).css_classes(["dim-label", "caption"]).build();
         grid.attach(&weekday_label, col as i32, 0, 1, 1);
     }
 
@@ -2517,7 +2559,7 @@ pub fn build_mini() -> MiniCalendar {
                 let on_day_selected = on_day_selected.clone();
                 button.connect_clicked(move |_| {
                     let month = *anchor_month.borrow();
-                    let date = first_grid_day(month) + chrono::Duration::days(index);
+                    let date = first_grid_day(month, week_start) + chrono::Duration::days(index);
                     for callback in on_day_selected.borrow().iter() {
                         callback(date);
                     }
@@ -2539,6 +2581,7 @@ pub fn build_mini() -> MiniCalendar {
         anchor_month,
         event_days,
         on_day_selected,
+        week_start,
     };
 
     {
@@ -2550,7 +2593,7 @@ pub fn build_mini() -> MiniCalendar {
             let current = *mini_month.borrow();
             let event_days = mini_days.borrow();
             let new_month = current.checked_sub_months(chrono::Months::new(1)).unwrap_or(current);
-            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days);
+            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days, week_start);
         });
     }
     {
@@ -2562,13 +2605,13 @@ pub fn build_mini() -> MiniCalendar {
             let current = *mini_month.borrow();
             let event_days = mini_days.borrow();
             let new_month = current.checked_add_months(chrono::Months::new(1)).unwrap_or(current);
-            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days);
+            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days, week_start);
         });
     }
 
     let initial_month = *mini.anchor_month.borrow();
     let initial_days = mini.event_days.borrow().clone();
-    relabel_mini(&mini.anchor_month, &mini.header_label, &mini.day_buttons, initial_month, &initial_days);
+    relabel_mini(&mini.anchor_month, &mini.header_label, &mini.day_buttons, initial_month, &initial_days, week_start);
     mini
 }
 
@@ -2576,7 +2619,7 @@ pub fn build_mini() -> MiniCalendar {
 /// within it have events (`event_days`) so their day buttons render bold.
 pub fn set_mini_month(mc: &MiniCalendar, month: NaiveDate, event_days: &HashSet<NaiveDate>) {
     *mc.event_days.borrow_mut() = event_days.clone();
-    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days);
+    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days, mc.week_start);
 }
 
 /// Updates which dates in the currently-displayed month have events, without
@@ -2585,7 +2628,7 @@ pub fn set_mini_month(mc: &MiniCalendar, month: NaiveDate, event_days: &HashSet<
 pub fn set_mini_event_days(mc: &MiniCalendar, event_days: &HashSet<NaiveDate>) {
     *mc.event_days.borrow_mut() = event_days.clone();
     let month = *mc.anchor_month.borrow();
-    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days);
+    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days, mc.week_start);
 }
 
 /// The first-of-month date the mini grid is currently showing (see
@@ -2594,13 +2637,20 @@ pub fn mini_month(mc: &MiniCalendar) -> NaiveDate {
     *mc.anchor_month.borrow()
 }
 
-fn relabel_mini(anchor_month: &Rc<RefCell<NaiveDate>>, header_label: &gtk::Label, day_buttons: &[gtk::Button], month: NaiveDate, event_days: &HashSet<NaiveDate>) {
+fn relabel_mini(
+    anchor_month: &Rc<RefCell<NaiveDate>>,
+    header_label: &gtk::Label,
+    day_buttons: &[gtk::Button],
+    month: NaiveDate,
+    event_days: &HashSet<NaiveDate>,
+    week_start: chrono::Weekday,
+) {
     let month = first_of_month(month);
     *anchor_month.borrow_mut() = month;
     header_label.set_label(&month.format("%B %Y").to_string());
 
     let today = chrono::Utc::now().date_naive();
-    let grid_start = first_grid_day(month);
+    let grid_start = first_grid_day(month, week_start);
     for (i, button) in day_buttons.iter().enumerate() {
         let date = grid_start + chrono::Duration::days(i as i64);
         button.set_label(&date.day().to_string());
@@ -2810,8 +2860,8 @@ pub struct CalendarSidebar {
     pub add_calendar_button: gtk::Button,
 }
 
-pub fn build_sidebar() -> CalendarSidebar {
-    let mini_calendar = build_mini();
+pub fn build_sidebar(week_start: chrono::Weekday) -> CalendarSidebar {
+    let mini_calendar = build_mini(week_start);
     mini_calendar.root.add_css_class("mini-calendar-sidebar");
 
     let add_calendar_button = gtk::Button::builder().label("Add calendar").css_classes(["flat"]).halign(gtk::Align::Start).build();
@@ -2864,10 +2914,11 @@ fn last_of_month(date: NaiveDate) -> NaiveDate {
     next - chrono::Duration::days(1)
 }
 
-/// The Sunday that starts the grid's first row - on or before the 1st of `month`.
-fn first_grid_day(month: NaiveDate) -> NaiveDate {
-    let days_since_sunday = month.weekday().num_days_from_sunday() as i64;
-    month - chrono::Duration::days(days_since_sunday)
+/// The first day of the grid's 6-week window: on or before the 1st of `month`,
+/// on the configured `week_start` weekday.
+fn first_grid_day(month: NaiveDate, week_start: chrono::Weekday) -> NaiveDate {
+    let offset = (crate::settings::weekday_sun_index(month.weekday()) - crate::settings::weekday_sun_index(week_start)).rem_euclid(7);
+    month - chrono::Duration::days(offset)
 }
 
 #[cfg(test)]
@@ -2878,18 +2929,41 @@ mod tests {
 
     #[test]
     fn first_grid_day_lands_on_sunday_on_or_before_the_1st() {
-        // 2026-07-01 is a Wednesday; the grid should start on Sunday 2026-06-28.
+        // 2026-07-01 is a Wednesday; a Sunday-first grid starts 2026-06-28.
         let month = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
-        let grid_start = first_grid_day(month);
+        let grid_start = first_grid_day(month, chrono::Weekday::Sun);
         assert_eq!(grid_start, NaiveDate::from_ymd_opt(2026, 6, 28).unwrap());
         assert_eq!(grid_start.weekday(), chrono::Weekday::Sun);
+        // The same month on a Monday-first grid starts 2026-06-29.
+        assert_eq!(first_grid_day(month, chrono::Weekday::Mon), NaiveDate::from_ymd_opt(2026, 6, 29).unwrap());
     }
 
     #[test]
-    fn first_grid_day_is_unchanged_when_month_already_starts_on_sunday() {
+    fn first_grid_day_is_unchanged_when_month_already_starts_on_the_week_start() {
         // 2026-11-01 is itself a Sunday.
         let month = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
-        assert_eq!(first_grid_day(month), month);
+        assert_eq!(first_grid_day(month, chrono::Weekday::Sun), month);
+    }
+
+    #[test]
+    fn week_days_and_labels_start_at_the_configured_day() {
+        assert_eq!(week_days(chrono::Weekday::Sun).first().copied(), Some(chrono::Weekday::Sun));
+        assert_eq!(week_days(chrono::Weekday::Mon).first().copied(), Some(chrono::Weekday::Mon));
+        // Starting at Saturday wraps through Sunday back to Friday.
+        assert_eq!(
+            week_days(chrono::Weekday::Sat),
+            vec![
+                chrono::Weekday::Sat,
+                chrono::Weekday::Sun,
+                chrono::Weekday::Mon,
+                chrono::Weekday::Tue,
+                chrono::Weekday::Wed,
+                chrono::Weekday::Thu,
+                chrono::Weekday::Fri
+            ]
+        );
+        assert_eq!(ordered_weekday_labels(chrono::Weekday::Mon)[0], "Mon");
+        assert_eq!(ordered_weekday_labels(chrono::Weekday::Sat), ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]);
     }
 
     #[test]

@@ -758,6 +758,13 @@ pub(crate) struct UiState {
     /// outstanding send for that account - popping the front on either event
     /// and dismissing it is enough to retract the right toast.
     sending_toasts: HashMap<AccountId, VecDeque<adw::Toast>>,
+    /// The reversible-action history behind the Undo toast and Ctrl+Z
+    /// (item 0.4). Most-recent last; entries time out with their toast (see
+    /// `show_undo_toast`) and are bounded by `MAX_UNDO_ENTRIES`.
+    undo_stack: Vec<UndoEntry>,
+    /// Monotonic id for the next `UndoEntry`, so a toast's Undo button undoes
+    /// exactly the action it names even after later actions push more.
+    next_undo_id: u64,
     /// A body is currently loading into the reading pane's WebView and
     /// should be revealed when its load finishes. Cleared on every selection
     /// change so a load started for a message the user has already navigated
@@ -2164,6 +2171,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         temp_attachment_files: HashSet::new(),
         toast_overlay: Some(toast_overlay.clone()),
         sending_toasts: HashMap::new(),
+        undo_stack: Vec::new(),
+        next_undo_id: 0,
         pending_html_reveal: false,
         pending_header: None,
         body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),
@@ -2647,6 +2656,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 } else {
                     (Vec::new(), vec![SystemFlagBit::Seen])
                 };
+                // Undo: the opposite `\Seen` change.
+                record_undo(
+                    &state,
+                    if mark_read { "Marked as read" } else { "Marked as unread" },
+                    vec![AccountCommand::StoreFlagsMany {
+                        mailbox: mailbox.clone(),
+                        uids: vec![uid],
+                        add: remove.clone(),
+                        remove: add.clone(),
+                    }],
+                );
                 let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
                     mailbox,
                     uids: vec![uid],
@@ -2700,6 +2720,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 } else {
                     (Vec::new(), vec![SystemFlagBit::Flagged])
                 };
+                // Undo: the opposite `\Flagged` change.
+                record_undo(
+                    &state,
+                    if pinning { "Pinned" } else { "Unpinned" },
+                    vec![AccountCommand::StoreFlagsMany {
+                        mailbox: mailbox.clone(),
+                        uids: vec![uid],
+                        add: remove.clone(),
+                        remove: add.clone(),
+                    }],
+                );
                 let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
                     mailbox,
                     uids: vec![uid],
@@ -2720,6 +2751,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
                 if let Some(cmd_tx) = cmd_tx {
                     optimistic_remove_messages(&state, &message_list, &mailbox, &[uid]);
+                    // Undo: move the message back out of Trash.
+                    if let Some(trash) = role_mailbox_id(&state, &account_id, MailboxRole::Trash) {
+                        record_undo(
+                            &state,
+                            &undo_move_description(MailboxRole::Trash, 1),
+                            vec![AccountCommand::MoveMessagesTo {
+                                mailbox: trash,
+                                uids: vec![uid],
+                                target: mailbox.clone(),
+                            }],
+                        );
+                    }
                     let _ = cmd_tx.send_blocking(AccountCommand::MoveMessage {
                         mailbox,
                         uid,
@@ -4072,8 +4115,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .title("No Calendar Accounts")
         .description("Add an account with Calendar enabled in GNOME Online Accounts to see events here.")
         .build();
-    let calendar_main = Rc::new(calendar_view::build_main());
-    let calendar_sidebar = calendar_view::build_sidebar();
+    let calendar_prefs = state.borrow().settings.calendar_preferences();
+    let calendar_main = Rc::new(calendar_view::build_main(&calendar_prefs));
+    let calendar_sidebar = calendar_view::build_sidebar(calendar_prefs.week_start);
     let calendar_sidebar_card = card_section(&calendar_sidebar.root);
     calendar_sidebar_card.add_css_class("folder-pane");
     let calendar_paned = gtk::Paned::builder()
@@ -4570,7 +4614,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // (it's a sibling in `window_body`, not nested inside `root_stack`).
     // Mail-only - the Calendar view already has its own full sidebar with a
     // mini-calendar.
-    let mail_calendar_overview = calendar_view::build_mini();
+    let mail_calendar_overview = calendar_view::build_mini(calendar_prefs.week_start);
     // Half-width day cells (see `.mini-calendar-compact` in
     // `install_calendar_css`). The day buttons' own natural size is what set
     // the pane's real width - the `width_request` below is only a floor - so
@@ -6408,6 +6452,56 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Calendar → the calendar preferences (item 0.6). Each row writes
+    // its GSettings key; the calendar panel reads them when it is built, so a
+    // change takes effect on the next launch (item 3.1 applies them live).
+    {
+        let state = state.clone();
+        config_view.calendar_week_start_row.connect_selected_notify(move |row| {
+            state.borrow().settings.set_int(crate::settings::CALENDAR_WEEK_START, row.selected() as i32);
+        });
+    }
+    {
+        let state = state.clone();
+        config_view.calendar_work_days_row.connect_selected_notify(move |row| {
+            let days = crate::settings::work_day_preset_at(row.selected());
+            state.borrow().settings.set_strv(crate::settings::CALENDAR_WORK_DAYS, days);
+        });
+    }
+    {
+        let state = state.clone();
+        config_view.calendar_work_start_row.connect_value_notify(move |row| {
+            state.borrow().settings.set_int(crate::settings::CALENDAR_WORK_START, row.value() as i32);
+        });
+    }
+    {
+        let state = state.clone();
+        config_view.calendar_work_end_row.connect_value_notify(move |row| {
+            state.borrow().settings.set_int(crate::settings::CALENDAR_WORK_END, row.value() as i32);
+        });
+    }
+    {
+        let state = state.clone();
+        config_view.calendar_primary_tz_row.connect_changed(move |row| {
+            state.borrow().settings.set_string(crate::settings::CALENDAR_PRIMARY_TZ, row.text().as_str());
+        });
+    }
+    {
+        let state = state.clone();
+        config_view.calendar_secondary_tz_row.connect_changed(move |row| {
+            state.borrow().settings.set_string(crate::settings::CALENDAR_SECONDARY_TZ, row.text().as_str());
+        });
+    }
+    {
+        let state = state.clone();
+        config_view.calendar_default_reminder_row.connect_selected_notify(move |row| {
+            state
+                .borrow()
+                .settings
+                .set_int(crate::settings::CALENDAR_DEFAULT_REMINDER, crate::settings::default_reminder_at(row.selected()));
+        });
+    }
+
     // Config → General → "Start Lookout at login": registers login
     // autostart with the session's Background portal when available (the
     // shell decides, first time via a dialog, and manages the registration
@@ -6578,6 +6672,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.dock_badge_row.set_active(persisted.get_bool(crate::settings::DOCK_BADGE_ENABLED));
         config_view.tray_icon_row.set_active(persisted.get_bool(crate::settings::TRAY_ICON_ENABLED));
         config_view.calendar_alerts_row.set_active(persisted.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED));
+        config_view
+            .calendar_week_start_row
+            .set_selected(persisted.get_int(crate::settings::CALENDAR_WEEK_START).clamp(0, 6) as u32);
+        config_view
+            .calendar_work_days_row
+            .set_selected(crate::settings::work_day_preset_index(&persisted.get_strv(crate::settings::CALENDAR_WORK_DAYS)));
+        config_view
+            .calendar_work_start_row
+            .set_value(persisted.get_int(crate::settings::CALENDAR_WORK_START).clamp(0, 23) as f64);
+        config_view
+            .calendar_work_end_row
+            .set_value(persisted.get_int(crate::settings::CALENDAR_WORK_END).clamp(1, 24) as f64);
+        config_view.calendar_primary_tz_row.set_text(&persisted.get_string(crate::settings::CALENDAR_PRIMARY_TZ));
+        config_view
+            .calendar_secondary_tz_row
+            .set_text(&persisted.get_string(crate::settings::CALENDAR_SECONDARY_TZ));
+        config_view
+            .calendar_default_reminder_row
+            .set_selected(crate::settings::default_reminder_index(persisted.get_int(crate::settings::CALENDAR_DEFAULT_REMINDER)));
         // "Start Lookout at login": the setting is the source of truth for
         // the portal path; the managed XDG file is the fallback, so an
         // entry left over (or written while the portal was absent) counts
@@ -6804,6 +6917,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let button = button.clone();
         dispatch.insert(action, Rc::new(move || button.emit_clicked()));
     }
+    // Undo (Ctrl+Z): pop and replay the most recent reversible action
+    // (item 0.4). A no-op when the stack is empty.
+    dispatch.insert(
+        crate::shortcuts::ACTION_UNDO,
+        Rc::new({
+            let state = state.clone();
+            move || {
+                undo_last(&state);
+            }
+        }),
+    );
     // Print: the reading-pane print path (the calendar toolbar's Print
     // button prints the month instead), gated the same way the More menu's
     // Print item is: only while a message is actually rendered.
@@ -8666,10 +8790,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list = message_list.clone();
         let state = state.clone();
         button.connect_clicked(move |_| {
+            // One undo entry for the whole action, even across accounts: its
+            // inverse moves each group back from the role folder it landed in
+            // (item 0.4).
+            let mut inverse = Vec::new();
+            let mut count = 0usize;
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
                 optimistic_remove_messages(&state, &message_list, &mailbox, &uids);
+                if let Some(destination) = mailbox_account_id(&mailbox).and_then(|account_id| role_mailbox_id(&state, &account_id, role)) {
+                    inverse.push(AccountCommand::MoveMessagesTo {
+                        mailbox: destination,
+                        uids: uids.clone(),
+                        target: mailbox.clone(),
+                    });
+                }
+                count += uids.len();
                 let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages { mailbox, uids, role });
             }
+            record_undo(&state, &undo_move_description(role, count), inverse);
         });
     }
     // --- Pin/Unpin -> AccountCommand::StoreFlagsMany toggling `\Flagged`
@@ -8694,8 +8832,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             } else {
                 (Vec::new(), vec![SystemFlagBit::Flagged])
             };
+            // One undo entry for the whole action: the opposite `\Flagged`
+            // change on every affected message (item 0.4).
+            let mut inverse = Vec::new();
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
                 optimistic_toggle_pinned(&state, &message_list, &mailbox, &uids, pinning);
+                inverse.push(AccountCommand::StoreFlagsMany {
+                    mailbox: mailbox.clone(),
+                    uids: uids.clone(),
+                    add: remove.clone(),
+                    remove: add.clone(),
+                });
                 let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
                     mailbox,
                     uids,
@@ -8703,6 +8850,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     remove: remove.clone(),
                 });
             }
+            record_undo(&state, if pinning { "Pinned" } else { "Unpinned" }, inverse);
             // The optimistic patch above already moved every affected
             // message into/out of the Pinned group and restored the
             // selection, so the aggregate state `refresh_pin_button` reads
@@ -8746,8 +8894,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             } else {
                 (Vec::new(), vec![SystemFlagBit::Seen])
             };
+            // One undo entry for the whole action: the opposite `\Seen` change
+            // on every affected message (item 0.4).
+            let mut inverse = Vec::new();
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
                 optimistic_toggle_read(&state, &message_list, &mailbox, &uids, mark_read);
+                inverse.push(AccountCommand::StoreFlagsMany {
+                    mailbox: mailbox.clone(),
+                    uids: uids.clone(),
+                    add: remove.clone(),
+                    remove: add.clone(),
+                });
                 let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
                     mailbox,
                     uids,
@@ -8755,6 +8912,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     remove: remove.clone(),
                 });
             }
+            record_undo(&state, if mark_read { "Marked as read" } else { "Marked as unread" }, inverse);
             refresh_mark_read_button(&mark_read_button_for_click, &message_list);
         });
     }
@@ -13305,10 +13463,20 @@ fn handle_message_drag_drop(state: &Rc<RefCell<UiState>>, target: &Mailbox, valu
     if groups.is_empty() {
         return false;
     }
-    let state = state.borrow();
     for (account_id, (source, uids)) in groups {
-        let Some(handle) = state.accounts.get(&account_id) else { continue };
-        let _ = handle.cmd_tx.send_blocking(AccountCommand::MoveMessagesTo {
+        let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
+        let Some(cmd_tx) = cmd_tx else { continue };
+        // Undo: move them back from the target folder to their source.
+        record_undo(
+            state,
+            &undo_move_description(MailboxRole::Custom, uids.len()),
+            vec![AccountCommand::MoveMessagesTo {
+                mailbox: target.id.clone(),
+                uids: uids.clone(),
+                target: source.clone(),
+            }],
+        );
+        let _ = cmd_tx.send_blocking(AccountCommand::MoveMessagesTo {
             mailbox: source,
             uids,
             target: target.id.clone(),
@@ -13523,9 +13691,20 @@ fn apply_tag_colors(tags: &Rc<RefCell<crate::tags::TagSet>>, provider: &gtk::Css
 /// which repaints the row's tag dots.
 fn send_keyword_store(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, add: Vec<String>, remove: Vec<String>) {
     let Some(account_id) = mailbox_account_id(&summary.mailbox) else { return };
-    let st = state.borrow();
-    let Some(handle) = st.accounts.get(&account_id) else { return };
-    let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreKeywords {
+    let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
+    let Some(cmd_tx) = cmd_tx else { return };
+    // Undo: the reverse keyword STORE (item 0.4).
+    record_undo(
+        state,
+        if add.is_empty() { "Category removed" } else { "Categorised" },
+        vec![AccountCommand::StoreKeywords {
+            mailbox: summary.mailbox.clone(),
+            uid: summary.uid,
+            add: remove.clone(),
+            remove: add.clone(),
+        }],
+    );
+    let _ = cmd_tx.send_blocking(AccountCommand::StoreKeywords {
         mailbox: summary.mailbox.clone(),
         uid: summary.uid,
         add,
@@ -13553,7 +13732,6 @@ fn handle_keyword_drag_drop(state: &Rc<RefCell<UiState>>, key: &str, value: &gli
         return false;
     }
     let keyword = lookout_core::tag_keyword(key);
-    let state = state.borrow();
     let mut groups: HashMap<AccountId, (MailboxId, Vec<Uid>)> = HashMap::new();
     for (mailbox, uid) in payload {
         let Some(account_id) = mailbox_account_id(&MailboxId(mailbox.clone())) else { continue };
@@ -13562,8 +13740,20 @@ fn handle_keyword_drag_drop(state: &Rc<RefCell<UiState>>, key: &str, value: &gli
     }
     let mut sent = false;
     for (account_id, (source, uids)) in groups {
-        let Some(handle) = state.accounts.get(&account_id) else { continue };
-        let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreKeywordsMany {
+        let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
+        let Some(cmd_tx) = cmd_tx else { continue };
+        // Undo: remove the same keyword again (item 0.4).
+        record_undo(
+            state,
+            "Categorised",
+            vec![AccountCommand::StoreKeywordsMany {
+                mailbox: source.clone(),
+                uids: uids.clone(),
+                add: Vec::new(),
+                remove: vec![keyword.clone()],
+            }],
+        );
+        let _ = cmd_tx.send_blocking(AccountCommand::StoreKeywordsMany {
             mailbox: source,
             uids,
             add: vec![keyword.clone()],
@@ -14664,6 +14854,147 @@ fn resort_message_list(state: &Rc<RefCell<UiState>>, message_list: &MessageListM
     }
     let (key, descending) = current_sort(state);
     message_list.repopulate(messages, key, descending);
+}
+
+/// How long an Undo toast - and its stack entry - stays live. Matches the
+/// short window Outlook gives to reverse a mistaken action; once it elapses
+/// the entry is pruned and Ctrl+Z moves on to the previous one.
+const UNDO_TOAST_TIMEOUT_SECS: u32 = 8;
+
+/// Upper bound on the retained undo history. Each toast times out on its own,
+/// but a burst of actions shouldn't grow the stack without limit before those
+/// timeouts fire.
+const MAX_UNDO_ENTRIES: usize = 16;
+
+/// One reversible user action (OUTLOOK_PARITY.md item 0.4). `description` is
+/// the toast wording ("1 item deleted"); `inverse` are the commands that
+/// reverse it, replayed in order by `apply_undo`.
+pub(crate) struct UndoEntry {
+    pub(crate) id: u64,
+    pub(crate) description: String,
+    pub(crate) inverse: Vec<AccountCommand>,
+}
+
+/// The mailbox a command acts on, used to route its inverse back to the right
+/// account. `None` for commands with no mailbox (`SendMessage` today, whose
+/// undo is the outbox `not_before` delay rather than this stack).
+fn command_mailbox(command: &AccountCommand) -> Option<&MailboxId> {
+    match command {
+        AccountCommand::MoveMessage { mailbox, .. }
+        | AccountCommand::MoveMessages { mailbox, .. }
+        | AccountCommand::MoveMessagesTo { mailbox, .. }
+        | AccountCommand::SnoozeMessage { mailbox, .. }
+        | AccountCommand::SnoozeMessages { mailbox, .. }
+        | AccountCommand::StoreFlags { mailbox, .. }
+        | AccountCommand::StoreFlagsMany { mailbox, .. }
+        | AccountCommand::StoreKeywords { mailbox, .. }
+        | AccountCommand::StoreKeywordsMany { mailbox, .. } => Some(mailbox),
+        _ => None,
+    }
+}
+
+/// The id of `account_id`'s folder carrying `role`, if the account has one.
+fn role_mailbox_id(state: &Rc<RefCell<UiState>>, account_id: &AccountId, role: MailboxRole) -> Option<MailboxId> {
+    state.borrow().accounts.get(account_id)?.folders.iter().find(|m| m.role == role).map(|m| m.id.clone())
+}
+
+/// The Undo-toast wording for a role move (§6.2 / UX-17: "1 item deleted",
+/// "2 items archived", …).
+fn undo_move_description(role: MailboxRole, count: usize) -> String {
+    let noun = if count == 1 { "item" } else { "items" };
+    match role {
+        MailboxRole::Trash => format!("{count} {noun} deleted"),
+        MailboxRole::Archive => format!("{count} {noun} archived"),
+        MailboxRole::Junk => format!("{count} {noun} reported as junk"),
+        _ => format!("{count} {noun} moved"),
+    }
+}
+
+/// Records a reversible action and shows its "… / Undo" toast. A no-op when
+/// `inverse` is empty (nothing to reverse).
+fn record_undo(state: &Rc<RefCell<UiState>>, description: &str, inverse: Vec<AccountCommand>) {
+    if inverse.is_empty() {
+        return;
+    }
+    let id = {
+        let mut st = state.borrow_mut();
+        let id = st.next_undo_id;
+        st.next_undo_id += 1;
+        st.undo_stack.push(UndoEntry {
+            id,
+            description: description.to_string(),
+            inverse,
+        });
+        while st.undo_stack.len() > MAX_UNDO_ENTRIES {
+            st.undo_stack.remove(0);
+        }
+        id
+    };
+    show_undo_toast(state, id, description);
+}
+
+/// Pops and applies the most recent undo entry (Ctrl+Z). Returns whether
+/// anything was undone.
+fn undo_last(state: &Rc<RefCell<UiState>>) -> bool {
+    let entry = state.borrow_mut().undo_stack.pop();
+    match entry {
+        Some(entry) => {
+            apply_undo(state, entry);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Removes and returns the entry with `id`, if it's still on the stack. Shared
+/// by a toast's Undo button and its `dismissed` signal.
+fn take_undo(state: &Rc<RefCell<UiState>>, id: u64) -> Option<UndoEntry> {
+    let mut st = state.borrow_mut();
+    let position = st.undo_stack.iter().position(|entry| entry.id == id)?;
+    Some(st.undo_stack.remove(position))
+}
+
+/// Replays an entry's inverse commands, each routed to the account owning its
+/// mailbox, then shows a brief confirmation.
+fn apply_undo(state: &Rc<RefCell<UiState>>, entry: UndoEntry) {
+    let UndoEntry { description, inverse, .. } = entry;
+    for command in inverse {
+        let Some(account_id) = command_mailbox(&command).and_then(mailbox_account_id) else {
+            continue;
+        };
+        let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
+        if let Some(cmd_tx) = cmd_tx {
+            let _ = cmd_tx.send_blocking(command);
+        }
+    }
+    if let Some(overlay) = &state.borrow().toast_overlay {
+        overlay.add_toast(adw::Toast::new(&format!("Undone: {description}")));
+    }
+}
+
+/// Builds an Undo toast whose button applies exactly this entry (not whatever
+/// happens to be newest by the time it's clicked). A no-op when there's no
+/// overlay (tests / headless), where no widget may be constructed.
+fn show_undo_toast(state: &Rc<RefCell<UiState>>, id: u64, description: &str) {
+    let Some(overlay) = state.borrow().toast_overlay.clone() else { return };
+    let toast = adw::Toast::new(description);
+    toast.set_button_label(Some("Undo"));
+    toast.set_timeout(UNDO_TOAST_TIMEOUT_SECS);
+    {
+        let state = state.clone();
+        toast.connect_button_clicked(move |_| {
+            if let Some(entry) = take_undo(&state, id) {
+                apply_undo(&state, entry);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        toast.connect_dismissed(move |_| {
+            take_undo(&state, id);
+        });
+    }
+    overlay.add_toast(toast);
 }
 
 /// Removes `uids` from `mailbox` in the message list immediately, ahead of
@@ -18733,6 +19064,8 @@ mod tests {
             temp_attachment_files: HashSet::new(),
             toast_overlay: None,
             sending_toasts: HashMap::new(),
+            undo_stack: Vec::new(),
+            next_undo_id: 0,
             pending_html_reveal: false,
             pending_header: None,
             body_cache: BodyCache::new(BODY_CACHE_IN_MEMORY),
@@ -19809,6 +20142,70 @@ mod tests {
             other => panic!("expected StoreKeywordsMany, got {other:?}"),
         }
         assert!(cmd_rx.try_recv().is_err(), "only one command goes out");
+    }
+
+    /// `record_undo` + Ctrl+Z (`undo_last`) replay the inverse command to the
+    /// account that owns its mailbox, then consume the entry.
+    #[test]
+    fn undo_last_replays_the_inverse_to_the_owning_account() {
+        let acc = AccountId("acc".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+
+        record_undo(
+            &state,
+            "1 item deleted",
+            vec![AccountCommand::MoveMessagesTo {
+                mailbox: MailboxId("acc:Trash".into()),
+                uids: vec![Uid(7)],
+                target: MailboxId("acc:INBOX".into()),
+            }],
+        );
+        assert_eq!(state.borrow().undo_stack.len(), 1);
+
+        assert!(undo_last(&state));
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::MoveMessagesTo { mailbox, uids, target }) => {
+                assert_eq!(mailbox, MailboxId("acc:Trash".into()));
+                assert_eq!(uids, vec![Uid(7)]);
+                assert_eq!(target, MailboxId("acc:INBOX".into()));
+            }
+            other => panic!("expected MoveMessagesTo, got {other:?}"),
+        }
+        assert!(state.borrow().undo_stack.is_empty(), "Ctrl+Z consumes the entry");
+        assert!(!undo_last(&state), "nothing left to undo");
+    }
+
+    /// A toast's own Undo button removes exactly its entry, leaving later
+    /// actions for Ctrl+Z.
+    #[test]
+    fn take_undo_removes_only_the_named_entry() {
+        let acc = AccountId("acc".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+        let flag = |uid: u32| AccountCommand::StoreFlagsMany {
+            mailbox: MailboxId("acc:INBOX".into()),
+            uids: vec![Uid(uid)],
+            add: Vec::new(),
+            remove: Vec::new(),
+        };
+        record_undo(&state, "first", vec![flag(1)]);
+        let first = state.borrow().undo_stack.last().unwrap().id;
+        record_undo(&state, "second", vec![flag(2)]);
+
+        let taken = take_undo(&state, first).expect("first is still on the stack");
+        assert_eq!(taken.description, "first");
+        assert_eq!(state.borrow().undo_stack.len(), 1);
+        assert_eq!(state.borrow().undo_stack[0].description, "second");
+        assert!(take_undo(&state, first).is_none(), "taking it again is a no-op");
+    }
+
+    #[test]
+    fn undo_move_descriptions_match_outlook_wording() {
+        assert_eq!(undo_move_description(MailboxRole::Trash, 1), "1 item deleted");
+        assert_eq!(undo_move_description(MailboxRole::Trash, 2), "2 items deleted");
+        assert_eq!(undo_move_description(MailboxRole::Archive, 1), "1 item archived");
+        assert_eq!(undo_move_description(MailboxRole::Junk, 3), "3 items reported as junk");
     }
 
     /// Coalescing is the point of the bounded event channels: the startup

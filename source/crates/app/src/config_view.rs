@@ -261,6 +261,20 @@ pub struct ConfigView {
     /// wire its `active` state into the `Gio::Notification` reminder
     /// scheduling.
     pub calendar_alerts_row: adw::SwitchRow,
+    /// "Week starts on" combo (Config → Calendar).
+    pub calendar_week_start_row: adw::ComboRow,
+    /// "Working days" preset combo (Config → Calendar).
+    pub calendar_work_days_row: adw::ComboRow,
+    /// "Working hours start" spin (Config → Calendar), local hour 0-23.
+    pub calendar_work_start_row: adw::SpinRow,
+    /// "Working hours end" spin (Config → Calendar), local hour 1-24.
+    pub calendar_work_end_row: adw::SpinRow,
+    /// "Time zone" entry (Config → Calendar): an IANA name, empty = system.
+    pub calendar_primary_tz_row: adw::EntryRow,
+    /// "Second time zone" entry (Config → Calendar): an IANA name, empty = none.
+    pub calendar_secondary_tz_row: adw::EntryRow,
+    /// "Default reminder" preset combo (Config → Calendar).
+    pub calendar_default_reminder_row: adw::ComboRow,
     /// "OAuth client id" row (Config → Google Tasks), exposed so the caller
     /// can wire its `activated` signal to the client-id dialog (and update
     /// the subtitle after a save).
@@ -559,6 +573,39 @@ pub fn build() -> ConfigView {
         .build();
     calendar_settings_group.add(&calendar_alerts_row);
 
+    let calendar_week_start_row = adw::ComboRow::builder()
+        .title("Week starts on")
+        .subtitle("First day of the week in the calendar")
+        .model(&gtk::StringList::new(&crate::settings::WEEK_START_LABELS))
+        .build();
+    calendar_settings_group.add(&calendar_week_start_row);
+    let work_day_labels: Vec<&str> = crate::settings::WORK_DAY_PRESETS.iter().map(|(label, _)| *label).collect();
+    let calendar_work_days_row = adw::ComboRow::builder()
+        .title("Working days")
+        .subtitle("Days shown in the Work week view")
+        .model(&gtk::StringList::new(&work_day_labels))
+        .build();
+    calendar_settings_group.add(&calendar_work_days_row);
+    let calendar_work_start_row = adw::SpinRow::with_range(0.0, 23.0, 1.0);
+    calendar_work_start_row.set_title("Working hours start");
+    calendar_work_start_row.set_subtitle("Hour the working-hours band begins");
+    calendar_settings_group.add(&calendar_work_start_row);
+    let calendar_work_end_row = adw::SpinRow::with_range(1.0, 24.0, 1.0);
+    calendar_work_end_row.set_title("Working hours end");
+    calendar_work_end_row.set_subtitle("Hour the working-hours band ends");
+    calendar_settings_group.add(&calendar_work_end_row);
+    let calendar_primary_tz_row = adw::EntryRow::builder().title("Time zone").build();
+    calendar_settings_group.add(&calendar_primary_tz_row);
+    let calendar_secondary_tz_row = adw::EntryRow::builder().title("Second time zone").build();
+    calendar_settings_group.add(&calendar_secondary_tz_row);
+    let reminder_labels: Vec<&str> = crate::settings::DEFAULT_REMINDER_PRESETS.iter().map(|(label, _)| *label).collect();
+    let calendar_default_reminder_row = adw::ComboRow::builder()
+        .title("Default reminder")
+        .subtitle("Reminder applied to a new event")
+        .model(&gtk::StringList::new(&reminder_labels))
+        .build();
+    calendar_settings_group.add(&calendar_default_reminder_row);
+
     // The real "Google Tasks" group (in the "Apps" section's place): the
     // OAuth client id the Tasks integration needs - Google has no public
     // client id, so the user's own registered id is configured here.
@@ -842,6 +889,13 @@ pub fn build() -> ConfigView {
         mail_notifications_row,
         dock_badge_row,
         calendar_alerts_row,
+        calendar_week_start_row,
+        calendar_work_days_row,
+        calendar_work_start_row,
+        calendar_work_end_row,
+        calendar_primary_tz_row,
+        calendar_secondary_tz_row,
+        calendar_default_reminder_row,
         google_tasks_client_row,
         assistant_url_entry,
         assistant_token_row,

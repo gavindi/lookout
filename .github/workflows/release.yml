@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag to build and release (e.g. 0.9.99)"
+        description: "Git tag to build and release (e.g. 0.9.158)"
         required: true
 
 defaults:
@@ -114,7 +114,7 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           awk -v ver="$TAG" '
-            $0 ~ "^## " ver " " { found=1; print; next }
+            $0 ~ "^## \\[v?" ver "\\] " || $0 ~ "^## " ver " " { found=1; print; next }
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md
