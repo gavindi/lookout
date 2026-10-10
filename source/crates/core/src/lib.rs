@@ -9,6 +9,7 @@ pub mod calendar;
 pub mod email;
 pub mod identity;
 pub mod ids;
+pub mod interop;
 pub mod mailbox;
 pub mod signature;
 pub mod thread;
@@ -26,6 +27,11 @@ pub use email::{
 };
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
+pub use interop::{
+    flag_due_from_keyword, flag_due_keyword, follow_up_from_headers, follow_up_headers, graph_preset, importance_from_headers, importance_headers, nearest_preset_for_rgb,
+    preset_by_graph, sensitivity_from_headers, sensitivity_header, BusyStatus, CategoryPreset, FlagStatus, FollowUpFlag, Importance, MessageSensitivity, FLAG_DONE_KEYWORD,
+    FLAG_DUE_KEYWORD_PREFIX, OUTLOOK_CATEGORY_PRESETS,
+};
 pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use signature::Signature;
 pub use thread::{ThreadGroup, ThreadKey};

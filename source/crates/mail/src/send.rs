@@ -130,6 +130,54 @@ pub struct ComposedMessage {
     pub message_id: Option<String>,
 }
 
+/// A queued outgoing message persisted in the account's local outbox
+/// (OUTLOOK_PARITY.md §2.4 decision 2, item 0.3). This is the "single
+/// mechanism" behind undo send, schedule send and the offline outbox: a
+/// `ComposedMessage` is turned into this payload at enqueue time, sent when
+/// its `not_before` time arrives, and retried with backoff on failure.
+///
+/// The raw RFC 5322 bytes are built once, at enqueue, so a later send is a
+/// pure SMTP delivery with no re-rendering; they are stored base64-encoded in
+/// the cache's `outbox.payload` BLOB. The SMTP envelope (`from` plus the flat
+/// `recipients` list) travels alongside because it can't be recovered from
+/// the headers - bcc especially must be in the envelope but never in a
+/// header. `draft_message_id` records the Drafts copy to delete *after* a
+/// successful send, so a queued message that fails or is scheduled leaves the
+/// draft in place ("drafts stay in Drafts until sent").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutboxMessage {
+    pub from: String,
+    pub recipients: Vec<String>,
+    /// Base64 (standard alphabet) of the raw RFC 5322 message bytes.
+    pub raw_base64: String,
+    pub draft_message_id: Option<String>,
+    /// The subject, kept for the outbox's own UI (a scheduled-send banner,
+    /// item 1.14) without having to parse the raw message.
+    pub subject: String,
+}
+
+impl OutboxMessage {
+    /// Builds the outbox payload for `msg`. A pre-set `message_id` (a saved
+    /// draft's stable id) is reused, so the sent copy and the draft it
+    /// replaces share a `Message-ID`.
+    pub fn from_composed(msg: &ComposedMessage) -> Self {
+        let (raw, _message_id, recipients) = build_raw_message(msg);
+        OutboxMessage {
+            from: msg.from.clone(),
+            recipients,
+            raw_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw),
+            draft_message_id: msg.message_id.clone(),
+            subject: msg.subject.clone(),
+        }
+    }
+
+    /// The raw RFC 5322 message bytes, or `None` if the stored base64 is
+    /// corrupt - a row to drop rather than retry.
+    pub fn raw(&self) -> Option<Vec<u8>> {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &self.raw_base64).ok()
+    }
+}
+
 /// Generates a fresh globally-unique bare `Message-ID` (no angle brackets -
 /// `mail_builder`'s header writer adds them).
 pub fn new_message_id() -> String {
@@ -414,6 +462,42 @@ mod tests {
             references: vec![],
             message_id: None,
         }
+    }
+
+    #[test]
+    fn outbox_message_round_trips_raw_and_envelope() {
+        let mut msg = sample_message(None);
+        msg.bcc = vec!["hidden@example.com".to_string()];
+        msg.message_id = Some("draft-1@lookout.local".to_string());
+        let outbox = OutboxMessage::from_composed(&msg);
+
+        // The stored bytes are exactly what a direct build produces, and the
+        // envelope carries the bcc that never appears in a header.
+        let (raw, message_id, recipients) = build_raw_message(&msg);
+        assert_eq!(outbox.raw().as_deref(), Some(raw.as_slice()));
+        assert_eq!(message_id, "draft-1@lookout.local");
+        assert_eq!(outbox.recipients, recipients);
+        assert!(outbox.recipients.contains(&"hidden@example.com".to_string()));
+        assert_eq!(outbox.draft_message_id.as_deref(), Some("draft-1@lookout.local"));
+        assert_eq!(outbox.subject, "test");
+
+        // The cache stores this as JSON in a BLOB; it must round-trip intact.
+        let encoded = serde_json::to_vec(&outbox).unwrap();
+        let decoded: OutboxMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, outbox);
+        assert_eq!(decoded.raw(), outbox.raw());
+    }
+
+    #[test]
+    fn outbox_message_raw_is_none_when_base64_is_corrupt() {
+        let outbox = OutboxMessage {
+            from: "a@example.com".into(),
+            recipients: vec!["b@example.com".into()],
+            raw_base64: "not base64!!".into(),
+            draft_message_id: None,
+            subject: String::new(),
+        };
+        assert_eq!(outbox.raw(), None);
     }
 
     fn sample_receipt() -> ReadReceipt {

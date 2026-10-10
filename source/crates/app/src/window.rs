@@ -751,12 +751,12 @@ pub(crate) struct UiState {
     /// is back to 0 - see `mail_notifications::withdraw_new_mail_notification`.
     /// `None` only in tests, where no real `Application` exists.
     app: Option<adw::Application>,
-    /// Persistent "Sending: <subject>" toasts shown while a `SendMessage`
-    /// command is outstanding, queued per account in the order their sends
-    /// were dispatched. The per-account session loop processes commands
-    /// strictly in order, so `SendCompleted`/`SendFailed` always answers the
-    /// oldest outstanding send for that account - popping the front on
-    /// either event and dismissing it is enough to retract the right toast.
+    /// Persistent "Sending: <subject>" toasts shown while a queued send is
+    /// outstanding, queued per account in the order their sends were
+    /// dispatched. The per-account session delivers outbox rows one at a time
+    /// and in order, so `OutboxSent`/`OutboxFailed` always answers the oldest
+    /// outstanding send for that account - popping the front on either event
+    /// and dismissing it is enough to retract the right toast.
     sending_toasts: HashMap<AccountId, VecDeque<adw::Toast>>,
     /// A body is currently loading into the reading pane's WebView and
     /// should be revealed when its load finishes. Cleared on every selection
@@ -10193,13 +10193,19 @@ fn spawn_account_event_loop(
                             toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                         }
                     }
-                    AccountEvent::SendCompleted => {
+                    // The message was persisted to the local outbox (item 0.3).
+                    // The "Sending: …" toast was already shown when Send was
+                    // clicked, so there's nothing to do here until it actually
+                    // goes out (`OutboxSent`/`OutboxFailed`) - a scheduled send
+                    // (item 1.14) will use this to show a "Scheduled for …" bar.
+                    AccountEvent::OutboxQueued { .. } => {}
+                    AccountEvent::OutboxSent { .. } => {
                         if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
                             toast.dismiss();
                         }
                         toast_overlay.add_toast(adw::Toast::new("Message sent"));
                     }
-                    AccountEvent::SendFailed(message) => {
+                    AccountEvent::OutboxFailed { message, .. } => {
                         if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
                             toast.dismiss();
                         }
@@ -18003,7 +18009,7 @@ fn show_composer_in_reading_pane(
     // Shows the persistent "Sending: <subject>" toast the instant Send is
     // clicked, and registers it in `sending_toasts` so the account event
     // loop can retract it once the send actually completes or fails - see
-    // `AccountEvent::SendCompleted`/`SendFailed` in `connect_account`.
+    // `AccountEvent::OutboxSent`/`OutboxFailed` in `connect_account`.
     let on_send_started: Rc<dyn Fn(String)> = {
         let state = state.clone();
         let account_id = account_id.clone();
@@ -19584,6 +19590,9 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
             structure: None,
         }
     }

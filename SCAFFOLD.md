@@ -207,8 +207,8 @@ flight.
 **`AccountEvent`** — every variant: `ConnectionStateChanged`, `FoldersUpdated`, `MessagesUpdated`,
 `MailboxSyncStarted`, `PrefetchStarted`/`PrefetchFinished`, `NewMessages`, `PreviewsFetched`,
 `BodyFetched`, `PartFetched`/`PartFetchFailed`, `RawMessageFetched`/`RawMessageFetchFailed`,
-`SendCompleted`/`SendFailed`, `MoveFailed`, `StoreFlagsFailed`, `DraftSaved`, `MessageMoved`,
-`MessageSnoozed`, `MailboxExpunged`, `SearchResults`, `Error`.
+`OutboxQueued`/`OutboxSent`/`OutboxFailed` (§4.6), `MoveFailed`, `StoreFlagsFailed`, `DraftSaved`,
+`MessageMoved`, `MessageSnoozed`, `MailboxExpunged`, `SearchResults`, `Error`.
 
 ### 4.2 The actor loop
 
@@ -340,6 +340,12 @@ CREATE TABLE addresses (
 );
 CREATE INDEX addresses_by_count ON addresses (seen_count DESC);
 
+CREATE TABLE outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, not_before INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, payload BLOB NOT NULL, state TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX outbox_due ON outbox (state, not_before);
+
 CREATE VIRTUAL TABLE search_fts USING fts5(
     mailbox_id UNINDEXED, uid UNINDEXED, subject, sender, recipients, body,
     tokenize = 'unicode61 remove_diacritics 2'
@@ -357,6 +363,9 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
   word becomes a quoted phrase, ANDed — neutralizing FTS5 query-syntax injection.
 - Schema versioning via `PRAGMA user_version` triggers a one-time full wipe of `messages` or
   `bodies` on a format change (e.g. `EmailBody`'s JSON shape changing).
+- `outbox` is the local outgoing-mail queue (§4.6, item 0.3): `payload` is an opaque JSON BLOB the
+  session owns (`send::OutboxMessage`), `not_before` schedules it, and `state`/`attempts` drive the
+  retry backoff. Append-only, so it needs no `user_version` wipe.
 - Periodic maintenance (`run_maintenance`, called once per session start on the blocking pool):
   sweeps orphaned flat files with no matching `messages` row, migrates to
   `auto_vacuum=INCREMENTAL` on first run (a one-time full `VACUUM`), and runs `PRAGMA
@@ -378,6 +387,18 @@ anything else → STARTTLS (chosen by port, since GOA's TLS/SSL flags are ambigu
 providers). Drafts are handled in `session.rs`, not `send.rs`: `SaveDraft`/`DeleteDraft` append to
 (and, on replace, first delete) the Drafts mailbox, keyed by a stable per-compose-session
 Message-ID.
+
+**Outbox and scheduler (item 0.3).** `SendMessage` no longer sends inline: it serializes a
+`send::OutboxMessage` (the pre-built raw bytes, base64-encoded, plus the `from`/recipients envelope
+and the draft's Message-ID) into the per-account `outbox` table and emits `OutboxQueued`. The
+session drains due rows (`state = 'pending'` and `not_before` passed) at the top of every
+`connect_and_run` loop iteration — so it runs on connect and on each IDLE wake — sending over SMTP,
+best-effort APPENDing to Sent, deleting the draft only after a successful send, then emitting
+`OutboxSent`. Failures back off exponentially (`outbox_retry_delay`) and increment `attempts`; once
+`MAX_OUTBOX_ATTEMPTS` is reached the row is marked `failed` and `OutboxFailed` is emitted, while a
+retry that could still succeed stays silent. The main loop caps its IDLE slice to the next
+`not_before` (`cap_slice_for_outbox`), so a scheduled or undo-send timer wakes the session on time
+rather than waiting out the 25-minute keepalive.
 
 ### 4.7 Auth and connection (`auth.rs`, `connection.rs`)
 

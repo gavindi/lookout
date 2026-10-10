@@ -1758,15 +1758,12 @@ pub fn build_compose_view(
                     let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
                     (text, None, vec![])
                 };
-                // If this message was draft-autosaved, delete the stored draft
-                // first so the sent mail doesn't linger in Drafts. Queued ahead
-                // of the send on the same command channel, so the session
-                // processes them in order.
-                if autosave.draft_queued.get() {
-                    let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft {
-                        message_id: (*draft_message_id).clone(),
-                    });
-                }
+                // If this message was draft-autosaved, reuse the draft's
+                // stable `Message-ID` on the sent copy and let the account
+                // session's outbox delete the Drafts copy *after* the message
+                // actually goes out (item 0.3) - so a queued send that fails or
+                // is scheduled leaves the draft in Drafts until it's sent.
+                let draft_message_id_used = autosave.draft_queued.get().then(|| (*draft_message_id).clone());
                 let identity = selected_identity(&identities, &from_dropdown);
                 let mut bcc = bcc.clone();
                 bcc.extend(identity.bcc.iter().map(|a| a.address.clone()));
@@ -1787,7 +1784,7 @@ pub fn build_compose_view(
                     request_read_receipt: read_receipt_toggle.is_active(),
                     in_reply_to,
                     references,
-                    message_id: None,
+                    message_id: draft_message_id_used,
                 };
                 on_send_started(msg.subject.clone());
                 let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(Box::new(msg)));
@@ -1922,6 +1919,9 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
             structure: None,
         }
     }

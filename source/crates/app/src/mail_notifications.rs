@@ -127,6 +127,9 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
             structure: None,
         }
     }

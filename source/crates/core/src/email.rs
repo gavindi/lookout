@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, Utc};
 
 use crate::ids::{MailboxId, Uid};
+use crate::interop::{Importance, MessageSensitivity};
 use crate::thread::ThreadKey;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -144,6 +145,20 @@ pub struct EmailSummary {
     #[serde(default)]
     pub has_calendar: bool,
     pub preview: Option<String>,
+    /// The message's importance, read from the selected importance headers
+    /// (`Importance` / `X-Priority` / `X-MSMail-Priority` / RFC 2156
+    /// `Priority`, see [`crate::interop::headers`]). `Normal` is the default,
+    /// so a message with no marker and an un-fetched envelope both read as
+    /// normal.
+    #[serde(default)]
+    pub importance: Importance,
+    /// The message's RFC 2156 `Sensitivity`. `Normal` is the default.
+    #[serde(default)]
+    pub sensitivity: MessageSensitivity,
+    /// The message's RFC 2919 `List-Id`, when present - the list a mailing
+    /// message came through, which the rules engine matches on (M-14).
+    #[serde(default)]
+    pub list_id: Option<String>,
     /// The message's MIME part tree, flattened into its leaf parts (with
     /// `BODYSTRUCTURE`-derived part numbers), or `None` if the server didn't
     /// report a body structure for this message (or its envelope was cached

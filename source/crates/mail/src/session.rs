@@ -16,7 +16,7 @@ use crate::config::{AccountConfig, Credential};
 use crate::connection::{connect_tls, SessionStream};
 use crate::envelope::{flags_from_fetch, summary_from_fetch};
 use crate::error::{Error, Result};
-use crate::send::{build_raw_message, send_smtp, ComposedMessage};
+use crate::send::{build_raw_message, send_smtp, ComposedMessage, OutboxMessage};
 
 /// How many of the most recent messages the background body prefetch queues
 /// for download on a folder it hasn't warmed yet. Bounds the *body* warm-up
@@ -116,6 +116,28 @@ const INLINE_BODY_FETCH_LIMIT: usize = 25;
 /// itself - the sync is what makes the new email *visible* - so oversized
 /// messages are left to the on-demand path and the (size-capped) prefetch.
 const INLINE_BODY_FETCH_SIZE_CAP: u32 = 2 * 1024 * 1024;
+
+/// The `FETCH` items that build an `EmailSummary`: the envelope pass plus the
+/// small selected-header block `summary_from_fetch` reads importance,
+/// sensitivity and `List-Id` from (see OUTLOOK_PARITY.md §4.1). Kept in one
+/// place so every summary-building fetch - first sync, new-arrival chunk,
+/// server-search fallback and the prefetch's indexing branch - requests the
+/// same fields. `BODY.PEEK` leaves `\Seen` alone; the response comes back as
+/// `BODY[HEADER.FIELDS (...)]`, which async-imap's `Fetch::header()` surfaces
+/// like a plain `BODY[HEADER]` (the vendored parser folds both to the same
+/// `SectionPath`).
+const ENVELOPE_FETCH_ITEMS: &str =
+    "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY X-MSMAIL-PRIORITY PRIORITY SENSITIVITY LIST-ID AUTHENTICATION-RESULTS)])";
+
+/// The `FETCH` items for the prefetch's non-indexing branch, which only needs
+/// sizes and part structures to warm bodies - no summary is built, so neither
+/// the envelope nor the header block is requested.
+const STRUCTURE_ONLY_FETCH_ITEMS: &str = "(UID RFC822.SIZE BODYSTRUCTURE)";
+
+/// How many times the outbox retries a message the SMTP server rejects before
+/// giving up and leaving the row `failed` for the user to act on (item 1.14),
+/// rather than retrying forever. Retries back off via `outbox_retry_delay`.
+const MAX_OUTBOX_ATTEMPTS: u32 = 5;
 
 /// How many bytes of sequence-set syntax one `UID`-prefixed command line may
 /// carry before it is split into further commands. Servers cap command-line
@@ -331,13 +353,12 @@ pub enum AccountCommand {
     },
     /// Force a folder-list + current-mailbox resync outside of IDLE's own cadence.
     Refresh,
-    /// Send a composed message over SMTP, then `APPEND` it to the account's
-    /// Sent mailbox (two explicit steps - IMAP has no JMAP-style implicit
-    /// filing on submit). If no Sent mailbox can be identified, the message
-    /// is still sent; only the archival copy is skipped (logged as a warning).
-    /// When the APPEND does land, the handler also resyncs the Sent mailbox
-    /// so the new message shows up immediately instead of waiting behind the
-    /// cache-hit shortcut in `SyncMailbox` below.
+    /// Queue a composed message in the account's local outbox (item 0.3)
+    /// rather than sending inline. The session's loop drains due outbox rows,
+    /// sends them over SMTP and best-effort `APPEND`s them to the Sent
+    /// mailbox, emitting `OutboxQueued`/`OutboxSent`/`OutboxFailed`. A normal
+    /// send is due immediately; a future `not_before` gives schedule send and
+    /// undo send for free.
     /// Boxed: the message can be large (an iMIP reply carries a whole
     /// iCalendar document), and commands are passed one at a time through an
     /// mpsc channel - the heap indirection keeps the command enum compact.
@@ -636,12 +657,29 @@ pub enum AccountEvent {
         uid: Uid,
         message: String,
     },
-    SendCompleted,
-    /// A `SendMessage` request failed. Kept distinct from the generic
-    /// `Error` below so the UI can retract the "Sending…" toast it showed
-    /// for this specific send without also swallowing unrelated errors
-    /// (sync, connection, etc.) that might land while a send is outstanding.
-    SendFailed(String),
+    /// A composed message was persisted to the account's local outbox (item
+    /// 0.3). It goes out when its `not_before` time arrives - immediately for
+    /// an ordinary send, later for schedule send/undo send. `id` is the outbox
+    /// row, quoted again by the matching `OutboxSent`/`OutboxFailed`.
+    OutboxQueued {
+        id: i64,
+    },
+    /// An outbox row was delivered: SMTP accepted it and it was archived to
+    /// Sent. Replaces the old synchronous-send `SendCompleted`, so the UI can
+    /// retract the "Sending…" toast exactly as before.
+    OutboxSent {
+        id: i64,
+    },
+    /// An outbox row couldn't be delivered and its retries are exhausted (or
+    /// the failure couldn't be recorded), so it's left for the user to act on
+    /// (item 1.14). Intermediate retries stay silent - the "Sending…" toast
+    /// stays up - so a blip that recovers doesn't cry wolf. Kept distinct from
+    /// the generic `Error` below so the UI can retract that toast for this
+    /// specific message.
+    OutboxFailed {
+        id: i64,
+        message: String,
+    },
     /// A `MoveMessage`/`MoveMessages`/`MoveMessagesTo` request failed. Kept
     /// distinct from `Error` below, mirroring `SendFailed`, so the UI can
     /// restore exactly the rows it optimistically removed from the message
@@ -1199,7 +1237,155 @@ async fn connect_and_run(
     // an IDLE wait - see `MAX_CHANGE_RESYNCS`.
     let mut change_resyncs: u8 = 0;
 
+    // When the earliest pending outbox message is due, or `None` when the
+    // outbox is empty. Updated whenever a message is queued or a drain runs,
+    // and used to cap the IDLE slice below so a scheduled send (or an
+    // undo-send timer) wakes the session on time instead of waiting out the
+    // keepalive.
+    let mut next_outbox_due: Option<chrono::DateTime<chrono::Utc>> = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
+
     loop {
+        // Deliver any queued outbox message whose time has arrived (item 0.3).
+        // This runs before the IDLE wait on every iteration, so a message the
+        // command drain just queued goes out on the next pass and a scheduled
+        // send goes out as soon as the (outbox-capped) IDLE slice wakes. Gated
+        // on a due time and `no_work_pending`, so an empty outbox costs one
+        // comparison and a queued command always wins over delivery.
+        if next_outbox_due.is_some_and(|due| due <= chrono::Utc::now()) && no_work_pending(commands, interactive_commands, idle_notify) {
+            let due = cache_op(cache, {
+                let now = chrono::Utc::now();
+                move |c| c.due_outbox(now)
+            })
+            .await
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+            for entry in due {
+                let id = entry.id;
+                let attempts = entry.attempts;
+                // A payload we can't decode can never be sent - drop it rather
+                // than retrying forever.
+                let decoded = serde_json::from_slice::<OutboxMessage>(&entry.payload).ok().and_then(|m| m.raw().map(|raw| (m, raw)));
+                let Some((message, raw)) = decoded else {
+                    tracing::warn!(id, "dropping an undecodable outbox row");
+                    cache_op(cache, move |c| c.delete_outbox(id)).await;
+                    continue;
+                };
+                let sent = match credentials.smtp_credential().await {
+                    Ok(cred) => send_smtp(&config.smtp, cred, &message.from, &message.recipients, &raw).await,
+                    Err(e) => Err(Error::LoginFailed(e)),
+                };
+                match sent {
+                    Ok(()) => {
+                        // Archive the sent copy (best-effort: the message *was*
+                        // sent), then delete the draft it replaces so a queued
+                        // send leaves drafts in place until it actually lands.
+                        let sent_mailbox = archive_sent_message(&mut session, &folders, &account_id, &raw).await;
+                        if let Some(draft_id) = message.draft_message_id.as_deref() {
+                            if let Err(e) = delete_draft(&mut session, &folders, &account_id, draft_id, has_uidplus).await {
+                                tracing::warn!("message sent but deleting its draft failed: {e}");
+                            }
+                        }
+                        cache_op(cache, move |c| c.delete_outbox(id)).await;
+                        let _ = events.send(AccountEvent::OutboxSent { id }).await;
+
+                        // Resync Sent so the archived copy isn't hidden behind
+                        // the cache-hit shortcut in `SyncMailbox`, then restore
+                        // the open folder. (Moved here from the old synchronous
+                        // `SendMessage` handler.)
+                        if let Some(sent_id) = sent_mailbox {
+                            if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
+                                let mut ids = vec![sent_id.clone()];
+                                if sent_id != current_mailbox_id {
+                                    ids.push(current_mailbox_id.clone());
+                                }
+                                let open_changed = refresh_folders_targeted(
+                                    &mut session,
+                                    &mut folders,
+                                    &account_id,
+                                    &ids,
+                                    &current_mailbox_id,
+                                    condstore,
+                                    cache,
+                                    events,
+                                    &mut dirty_mailboxes,
+                                )
+                                .await;
+                                sync_mailbox(
+                                    &mut session,
+                                    &account_id,
+                                    &path,
+                                    &sent_id,
+                                    events,
+                                    cache,
+                                    &mut folders,
+                                    interactive_commands,
+                                    Some(&session_selected),
+                                    condstore,
+                                    qresync,
+                                )
+                                .await?;
+                                dirty_mailboxes.remove(&sent_id);
+                                session_selected = sent_id.clone();
+                                if session_selected != current_mailbox_id {
+                                    session.select(&current_mailbox_name).await?;
+                                    session_selected = current_mailbox_id.clone();
+                                }
+                                // The re-list's LIST-STATUS counts said the
+                                // open folder changed and the Sent sync above
+                                // didn't cover it - resync so the sidebar and
+                                // the list on screen agree.
+                                if open_changed && sent_id != current_mailbox_id {
+                                    sync_mailbox(
+                                        &mut session,
+                                        &account_id,
+                                        &current_mailbox_name,
+                                        &current_mailbox_id,
+                                        events,
+                                        cache,
+                                        &mut folders,
+                                        interactive_commands,
+                                        Some(&session_selected),
+                                        condstore,
+                                        qresync,
+                                    )
+                                    .await?;
+                                    dirty_mailboxes.remove(&current_mailbox_id);
+                                    session_selected = current_mailbox_id.clone();
+                                }
+                            }
+                        } else if message.draft_message_id.is_some() {
+                            // `delete_draft` left the session SELECTed on
+                            // Drafts and there's no Sent resync to restore the
+                            // user's folder, so do it here.
+                            session.select(&current_mailbox_name).await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                    }
+                    Err(e) => {
+                        let retry_at = chrono::Utc::now() + outbox_retry_delay(attempts + 1);
+                        let state = cache_op(cache, move |c| c.outbox_attempt_failed(id, retry_at, MAX_OUTBOX_ATTEMPTS)).await;
+                        match state {
+                            // Still within the retry budget: keep the
+                            // "Sending…" toast up and stay quiet, so a blip
+                            // that recovers doesn't cry wolf.
+                            Some(Ok(crate::cache::OutboxState::Pending)) => tracing::warn!(id, "send failed, will retry: {e}"),
+                            // Exhausted (or the attempt couldn't be recorded):
+                            // surface it and let the user act (item 1.14).
+                            _ => {
+                                tracing::warn!(id, "send failed permanently: {e}");
+                                let _ = events
+                                    .send(AccountEvent::OutboxFailed {
+                                        id,
+                                        message: format!("Couldn't send message: {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+            next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
+        }
         // Take a command - or a push from the dedicated IDLE connection -
         // that's *already* queued without entering IDLE first. Establishing
         // an IDLE and tearing it down again costs two round trips, and the
@@ -1317,6 +1503,9 @@ async fn connect_and_run(
                                     // once a pass is done. Otherwise the wait is the usual
                                     // keepalive slice.
                                     let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
+                                    // Wake early if a scheduled outbox send is
+                                    // due sooner than the keepalive slice.
+                                    let slice = cap_slice_for_outbox(slice, next_outbox_due, chrono::Utc::now());
                                     let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
 
                                     // Race the IDLE wait against the next command so an on-demand
@@ -1841,83 +2030,56 @@ async fn connect_and_run(
                     };
                     let _ = events.send(AccountEvent::SearchResults { mailbox, query, messages }).await;
                 }
-                AccountCommand::SendMessage(msg) => match send_message(config, credentials, &mut session, &folders, *msg).await {
-                    Ok(sent_mailbox) => {
-                        let _ = events.send(AccountEvent::SendCompleted).await;
-                        // The APPEND landed in Sent - resync it now rather than
-                        // leaving the newly archived copy stuck behind the
-                        // cache-hit shortcut in `SyncMailbox` above, which would
-                        // otherwise hide it indefinitely (even across restarts)
-                        // until an explicit Refresh. Mirrors the resync-after-
-                        // mutation pattern `MoveMessage` uses below.
-                        if let Some(sent_id) = sent_mailbox {
-                            if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
-                                let mut ids = vec![sent_id.clone()];
-                                if sent_id != current_mailbox_id {
-                                    ids.push(current_mailbox_id.clone());
-                                }
-                                let open_changed = refresh_folders_targeted(
-                                    &mut session,
-                                    &mut folders,
-                                    &account_id,
-                                    &ids,
-                                    &current_mailbox_id,
-                                    condstore,
-                                    cache,
-                                    events,
-                                    &mut dirty_mailboxes,
-                                )
+                AccountCommand::SendMessage(msg) => {
+                    // Persist to the local outbox instead of sending inline:
+                    // the drain at the top of the loop delivers it when due,
+                    // so a slow SMTP server can't stall the session and the
+                    // same path backs undo send, schedule send and the offline
+                    // outbox (items 1.13/1.14). The raw message is built once,
+                    // here.
+                    let payload = match serde_json::to_vec(&OutboxMessage::from_composed(&msg)) {
+                        Ok(payload) => payload,
+                        Err(e) => {
+                            tracing::warn!("couldn't serialize outgoing message: {e}");
+                            let _ = events
+                                .send(AccountEvent::OutboxFailed {
+                                    id: 0,
+                                    message: format!("Couldn't queue message: {e}"),
+                                })
                                 .await;
-                                sync_mailbox(
-                                    &mut session,
-                                    &account_id,
-                                    &path,
-                                    &sent_id,
-                                    events,
-                                    cache,
-                                    &mut folders,
-                                    interactive_commands,
-                                    Some(&session_selected),
-                                    condstore,
-                                    qresync,
-                                )
-                                .await?;
-                                dirty_mailboxes.remove(&sent_id);
-                                session_selected = sent_id.clone();
-                                if session_selected != current_mailbox_id {
-                                    session.select(&current_mailbox_name).await?;
-                                    session_selected = current_mailbox_id.clone();
-                                }
-                                // The re-list's LIST-STATUS counts said the
-                                // open folder changed and the Sent sync above
-                                // didn't cover it - resync so the sidebar and
-                                // the list on screen agree (the STATUS drain's
-                                // immediate-resync counterpart).
-                                if open_changed && sent_id != current_mailbox_id {
-                                    sync_mailbox(
-                                        &mut session,
-                                        &account_id,
-                                        &current_mailbox_name,
-                                        &current_mailbox_id,
-                                        events,
-                                        cache,
-                                        &mut folders,
-                                        interactive_commands,
-                                        Some(&session_selected),
-                                        condstore,
-                                        qresync,
-                                    )
-                                    .await?;
-                                    dirty_mailboxes.remove(&current_mailbox_id);
-                                    session_selected = current_mailbox_id.clone();
-                                }
-                            }
+                            continue;
+                        }
+                    };
+                    let queued = cache_op(cache, {
+                        let account_id = account_id.clone();
+                        move |c| c.enqueue_outbox(&account_id, chrono::Utc::now(), &payload)
+                    })
+                    .await;
+                    match queued {
+                        Some(Ok(id)) => {
+                            next_outbox_due = Some(chrono::Utc::now());
+                            let _ = events.send(AccountEvent::OutboxQueued { id }).await;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("couldn't queue outgoing message: {e}");
+                            let _ = events
+                                .send(AccountEvent::OutboxFailed {
+                                    id: 0,
+                                    message: format!("Couldn't queue message: {e}"),
+                                })
+                                .await;
+                        }
+                        None => {
+                            tracing::warn!("no cache open; dropping outgoing message");
+                            let _ = events
+                                .send(AccountEvent::OutboxFailed {
+                                    id: 0,
+                                    message: "Couldn't queue message: no local cache".to_string(),
+                                })
+                                .await;
                         }
                     }
-                    Err(e) => {
-                        let _ = events.send(AccountEvent::SendFailed(format!("Couldn't send message: {e}"))).await;
-                    }
-                },
+                }
                 AccountCommand::SaveDraft { msg, replace } => {
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
                     match save_draft(&mut session, &folders, &account_id, *msg, replace, has_uidplus).await {
@@ -3003,11 +3165,7 @@ async fn connect_and_run(
                     // `RFC822.SIZE` rides along so the oversized-message
                     // filter below has a size to compare against; indexing
                     // adds the items `summary_from_fetch` builds a summary from.
-                    let items = if index_envelopes {
-                        "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)"
-                    } else {
-                        "(UID RFC822.SIZE BODYSTRUCTURE)"
-                    };
+                    let items = if index_envelopes { ENVELOPE_FETCH_ITEMS } else { STRUCTURE_ONLY_FETCH_ITEMS };
                     let fetches: Vec<_> = match session.fetch(&seq_range, items).await {
                         Ok(stream) => match stream.try_collect().await {
                             Ok(fetches) => {
@@ -3461,37 +3619,41 @@ async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], p
     Ok(())
 }
 
-/// Sends `msg` over SMTP, then best-effort `APPEND`s the raw message to the
-/// account's Sent mailbox (if one was identified in `folders`) so it shows
-/// up in the Sent view - IMAP has no server-side "file to Sent on submit"
-/// the way JMAP's EmailSubmission does. Returns the Sent mailbox's id when
-/// the APPEND actually landed, so the caller can resync it - archiving is
-/// best-effort, but the resync must not run against a mailbox nothing was
-/// appended to.
-async fn send_message(
-    config: &AccountConfig,
-    credentials: &dyn CredentialProvider,
-    session: &mut Session<SessionStream>,
-    folders: &[Mailbox],
-    msg: ComposedMessage,
-) -> Result<Option<MailboxId>> {
-    let (raw, _message_id, recipients) = build_raw_message(&msg);
-
-    let smtp_credential = credentials.smtp_credential().await.map_err(Error::LoginFailed)?;
-    send_smtp(&config.smtp, smtp_credential, &msg.from, &recipients, &raw).await?;
-
-    let Some(sent) = folders.iter().find(|m| matches!(m.role, lookout_core::MailboxRole::Sent)) else {
-        tracing::warn!("no Sent mailbox found; message was sent but not archived");
-        return Ok(None);
+/// Best-effort `APPEND` of a just-sent raw message to the account's Sent
+/// mailbox (if one was identified in `folders`) so it shows up in the Sent
+/// view - IMAP has no server-side "file to Sent on submit" the way JMAP's
+/// EmailSubmission does. Returns the Sent mailbox's id when the APPEND
+/// actually landed, so the caller can resync it; archiving is best-effort, but
+/// the resync must not run against a mailbox nothing was appended to.
+async fn archive_sent_message(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, raw: &[u8]) -> Option<MailboxId> {
+    let sent = folders.iter().find(|m| matches!(m.role, lookout_core::MailboxRole::Sent))?;
+    let Some(path) = sent.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
+        tracing::warn!("Sent mailbox id has an unexpected prefix; sent message not archived");
+        return None;
     };
-    let Some(path) = sent.id.0.strip_prefix(&format!("{}:", config.account_id.0)) else {
-        return Ok(None);
-    };
-    if let Err(e) = session.append(path, Some("(\\Seen)"), None, raw.as_slice()).await {
+    if let Err(e) = session.append(path, Some("(\\Seen)"), None, raw).await {
         tracing::warn!("message was sent but APPEND to Sent failed: {e}");
-        return Ok(None);
+        return None;
     }
-    Ok(Some(sent.id.clone()))
+    Some(sent.id.clone())
+}
+
+/// The delay before retrying a failed outbox send, after `attempts` failed
+/// tries: a minute, doubling per attempt, capped at an hour.
+fn outbox_retry_delay(attempts: u32) -> chrono::Duration {
+    let shift = attempts.saturating_sub(1).min(6);
+    chrono::Duration::seconds(60i64.saturating_mul(1i64 << shift).min(60 * 60))
+}
+
+/// Caps an IDLE slice so a due (or soon-due) outbox send wakes the session
+/// instead of waiting out the keepalive. A time already due collapses to a
+/// short floor so the next iteration drains promptly without busy-looping.
+fn cap_slice_for_outbox(requested: Duration, next_due: Option<chrono::DateTime<chrono::Utc>>, now: chrono::DateTime<chrono::Utc>) -> Duration {
+    let Some(due) = next_due else {
+        return requested;
+    };
+    let until = (due - now).num_seconds().max(0) as u64;
+    requested.min(Duration::from_secs(until.max(1))).max(Duration::from_millis(250))
 }
 
 /// The account's Drafts folder path from the latest folder list, or `None`
@@ -4353,11 +4515,7 @@ async fn search_mailbox(
             tracing::debug!(account = %account_id, mailbox = %mailbox, "mailbox search interrupted by interactive command");
             break;
         }
-        let chunk: Vec<_> = session
-            .uid_fetch(uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
-            .await?
-            .try_collect()
-            .await?;
+        let chunk: Vec<_> = session.uid_fetch(uid_set, ENVELOPE_FETCH_ITEMS).await?.try_collect().await?;
         fetches.extend(chunk);
     }
     let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox, f)).collect();
@@ -4603,19 +4761,11 @@ async fn sync_mailbox(
         // (the same `1:*` the flag fetch above already uses). Otherwise the
         // new arrivals are chunked into server-safe sequence-set lines.
         let fetches: Vec<_> = if cached.is_empty() {
-            session
-                .uid_fetch("1:*", "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
-                .await?
-                .try_collect()
-                .await?
+            session.uid_fetch("1:*", ENVELOPE_FETCH_ITEMS).await?.try_collect().await?
         } else {
             let mut fetches = Vec::new();
             for uid_set in &uid_set_chunks(&new_uids) {
-                let chunk: Vec<_> = session
-                    .uid_fetch(uid_set, "(UID FLAGS ENVELOPE RFC822.SIZE INTERNALDATE BODYSTRUCTURE)")
-                    .await?
-                    .try_collect()
-                    .await?;
+                let chunk: Vec<_> = session.uid_fetch(uid_set, ENVELOPE_FETCH_ITEMS).await?.try_collect().await?;
                 fetches.extend(chunk);
             }
             fetches
@@ -5644,6 +5794,9 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
             structure: None,
         }
     }
@@ -6100,5 +6253,30 @@ mod tests {
         idle_rx.try_recv().unwrap();
 
         assert!(no_work_pending(&commands_rx, &interactive_rx, &idle_rx));
+    }
+
+    #[test]
+    fn outbox_retry_delay_backs_off_and_caps_at_an_hour() {
+        assert_eq!(outbox_retry_delay(1).num_seconds(), 60);
+        assert_eq!(outbox_retry_delay(2).num_seconds(), 120);
+        assert_eq!(outbox_retry_delay(3).num_seconds(), 240);
+        // 2^6 * 60 = 3840s, clamped to an hour.
+        assert_eq!(outbox_retry_delay(7).num_seconds(), 3600);
+        assert_eq!(outbox_retry_delay(100).num_seconds(), 3600);
+    }
+
+    #[test]
+    fn cap_slice_for_outbox_only_shortens_for_a_soon_due_send() {
+        let now = chrono::Utc::now();
+        let base = Duration::from_secs(300);
+        assert_eq!(cap_slice_for_outbox(base, None, now), base);
+        assert_eq!(cap_slice_for_outbox(base, Some(now + chrono::Duration::seconds(5)), now), Duration::from_secs(5));
+        // A due-in-the-past time floors to a second rather than busy-looping.
+        assert_eq!(cap_slice_for_outbox(base, Some(now - chrono::Duration::seconds(5)), now), Duration::from_secs(1));
+        // A far-future due never widens the slice.
+        assert_eq!(
+            cap_slice_for_outbox(Duration::from_secs(2), Some(now + chrono::Duration::hours(1)), now),
+            Duration::from_secs(2)
+        );
     }
 }

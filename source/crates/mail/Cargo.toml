@@ -26,6 +26,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 uuid.workspace = true
 
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde.workspace = true
 serde_json.workspace = true
 socket2 = "0.6.5"
 

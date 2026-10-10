@@ -1,6 +1,6 @@
 //! Manual end-to-end verification of the SMTP send path: sends a real,
 //! self-addressed test email (account -> itself) through the live
-//! `run_account_session` actor, confirms `SendCompleted`, then re-syncs the
+//! `run_account_session` actor, confirms `OutboxSent`, then re-syncs the
 //! Sent mailbox and checks the message landed there via `APPEND`. Run with:
 //!   cargo run -p lookout-mail --example send_test
 
@@ -124,8 +124,9 @@ async fn main() -> anyhow::Result<()> {
                             .find(|m| matches!(m.role, lookout_core::MailboxRole::Sent))
                             .map(|m| m.id.clone());
                     }
-                    AccountEvent::SendCompleted => {
-                        println!("SendCompleted received");
+                    AccountEvent::OutboxQueued { id } => println!("OutboxQueued ({id})"),
+                    AccountEvent::OutboxSent { .. } => {
+                        println!("OutboxSent received");
                         send_completed = true;
                         if let Some(sent) = sent_mailbox_id.clone() {
                             println!("re-syncing Sent mailbox to verify APPEND: {sent}");
@@ -140,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
                         if found {
                             println!("CONFIRMED: test message found in Sent via APPEND");
                         } else {
-                            println!("WARNING: SendCompleted fired but test message not found in Sent (yet) - {} messages in view", messages.len());
+                            println!("WARNING: OutboxSent fired but test message not found in Sent (yet) - {} messages in view", messages.len());
                         }
                         break;
                     }
@@ -160,8 +161,8 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::RawMessageFetchFailed { .. } => {}
                     AccountEvent::MoveFailed { .. } => {}
                     AccountEvent::StoreFlagsFailed { .. } => {}
-                    AccountEvent::SendFailed(e) => {
-                        println!("SEND FAILED: {e}");
+                    AccountEvent::OutboxFailed { message, .. } => {
+                        println!("SEND FAILED: {message}");
                         break;
                     }
                     AccountEvent::Error(e) => {

@@ -198,7 +198,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         message_id: None,
     };
     let _ = cmd_tx.send(AccountCommand::SendMessage(Box::new(msg))).await;
-    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::SendCompleted)).await;
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxSent { .. })).await;
 
     // --- On-demand attachment fetch. The session API can't APPEND an
     // arbitrary message, so seed one through a raw plain-TCP IMAP session:
@@ -469,7 +469,7 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
     // New mail on the currently-open mailbox (INBOX), while 200 seeded
     // messages' worth of prefetch body fetches are being drained one round
     // trip at a time in the background.
-    let raw = b"From: sender@example.com\r\nTo: testuser@localhost\r\nSubject: new mail during prefetch\r\n\r\nhi\r\n";
+    let raw = b"From: sender@example.com\r\nTo: testuser@localhost\r\nSubject: new mail during prefetch\r\nImportance: High\r\nX-Priority: 1 (Highest)\r\nSensitivity: Private\r\nList-Id: Announcements <announce.example.com>\r\n\r\nhi\r\n";
     let started = std::time::Instant::now();
     append_raw(&host, imap_plain_port, raw).await;
 
@@ -489,6 +489,28 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
     assert!(
         messages.iter().any(|m| m.subject.as_deref() == Some("new mail during prefetch")),
         "new message missing from resync: {messages:?}"
+    );
+    // The selected-header block must ride the envelope fetch: importance,
+    // sensitivity and List-Id are read from `BODY.PEEK[HEADER.FIELDS (...)]`,
+    // not a separate body fetch.
+    let arrived = messages
+        .iter()
+        .find(|m| m.subject.as_deref() == Some("new mail during prefetch"))
+        .expect("new message present");
+    assert_eq!(
+        arrived.importance,
+        lookout_core::Importance::High,
+        "importance must come from the header block: {arrived:?}"
+    );
+    assert_eq!(
+        arrived.sensitivity,
+        lookout_core::MessageSensitivity::Private,
+        "sensitivity must come from the header block"
+    );
+    assert_eq!(
+        arrived.list_id.as_deref(),
+        Some("Announcements <announce.example.com>"),
+        "List-Id must come from the header block"
     );
     tracing::info!(elapsed_ms = started.elapsed().as_millis(), "new mail noticed while prefetch was in flight");
 

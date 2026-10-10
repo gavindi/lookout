@@ -2257,6 +2257,7 @@ dependencies = [
  "mail-parser",
  "rusqlite",
  "rustls-native-certs",
+ "serde",
  "serde_json",
  "socket2",
  "testcontainers",

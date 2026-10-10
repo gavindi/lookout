@@ -52,6 +52,48 @@ pub struct Cache {
     messages_dir: std::path::PathBuf,
 }
 
+/// State of a row in the local outbox (see [`OutboxEntry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxState {
+    /// Waiting to send: its `not_before` time hasn't arrived, or a previous
+    /// attempt failed and it's waiting out the retry backoff.
+    Pending,
+    /// Every retry attempt failed. The row is left for the user to act on
+    /// (item 1.14) rather than retried forever.
+    Failed,
+}
+
+impl OutboxState {
+    fn as_str(self) -> &'static str {
+        match self {
+            OutboxState::Pending => "pending",
+            OutboxState::Failed => "failed",
+        }
+    }
+
+    /// Unknown values (a future schema's state this build doesn't know) read
+    /// as `Pending`, so a row is retried rather than silently lost.
+    fn from_db(value: &str) -> Self {
+        match value {
+            "failed" => OutboxState::Failed,
+            _ => OutboxState::Pending,
+        }
+    }
+}
+
+/// One queued outgoing message in the account's local outbox. `payload` is
+/// opaque to the cache: the session serializes a
+/// [`crate::send::OutboxMessage`] into it (item 0.3).
+#[derive(Debug, Clone)]
+pub struct OutboxEntry {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub not_before: DateTime<Utc>,
+    pub attempts: u32,
+    pub payload: Vec<u8>,
+    pub state: OutboxState,
+}
+
 /// Cap on the accumulated address book. The `addresses` table is deliberately
 /// cumulative - addresses must survive after the envelopes that introduced
 /// them leave the cache, or the composer's autocomplete would forget people -
@@ -470,6 +512,23 @@ impl Cache {
                 last_seen INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS addresses_by_count ON addresses (seen_count DESC);
+            -- The local outgoing-mail queue (OUTLOOK_PARITY.md §2.4 decision 2,
+            -- item 0.3): the persistent `not_before`-stamped queue behind undo
+            -- send, schedule send and the offline outbox. `payload` is opaque to
+            -- the cache - the session serializes a `send::OutboxMessage` into it
+            -- - and `state` is `pending` or `failed`; `attempts` drives the
+            -- retry backoff. AUTOINCREMENT so an id quoted in an
+            -- `OutboxQueued`/`OutboxSent` event is never reused after the row is
+            -- deleted. Append-only, so it needs no `user_version` wipe.
+            CREATE TABLE IF NOT EXISTS outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                not_before INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                payload BLOB NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending'
+            );
+            CREATE INDEX IF NOT EXISTS outbox_due ON outbox (state, not_before);
             -- The full-text search index over cached envelopes + bodies. The
             -- bundled SQLite is built with FTS5 (see libsqlite3-sys's
             -- `-DSQLITE_ENABLE_FTS5`), so this is always available. Columns
@@ -506,16 +565,22 @@ impl Cache {
                 }
             }
         }
-        // One-time envelope-cache migration. Pre-full-sync builds kept only a
-        // folder's newest ~200 messages, so their `messages` rows hold a
-        // *subset* of the mailbox - and the session's cache-hit path would
-        // serve that subset forever without a live sync, hiding the older
-        // mail a full sync would fetch. Every sync now writes the whole
-        // folder, so once this version is recorded the cache is trustworthy;
-        // wiping the envelope table now forces each folder to re-sync in full
-        // on its next open. Snoozes, addresses, and the mailbox list are all
-        // untouched.
-        const ENVELOPE_CACHE_VERSION: i64 = 1;
+        // Messages/envelope cache version. The shared `user_version` PRAGMA is
+        // a single monotonic high-water mark (see `BODY_CACHE_VERSION` below),
+        // so a new messages-format change must raise this *above* every other
+        // constant to trigger its wipe - a value below the stored maximum would
+        // silently never fire.
+        //
+        // Version 1: pre-full-sync builds kept only a folder's newest ~200
+        // messages, so their `messages` rows held a *subset* of the mailbox and
+        // the cache-hit path would serve that subset forever; wiping forces a
+        // full re-sync. Version 5: `EmailSummary` gained importance,
+        // sensitivity and `List-Id`, read from a selected-header block only
+        // newer builds request - cached rows can't be back-filled, so they are
+        // wiped once and re-fetched with the header block. Version 5 subsumes
+        // version 1 (any older cache is also below 5). Snoozes, addresses and
+        // the mailbox list are untouched.
+        const ENVELOPE_CACHE_VERSION: i64 = 5;
         // One-time body-cache migration: `bodies` rows changed format from
         // raw RFC 5322 bytes to serialized `EmailBody` JSON (the partial-fetch
         // path never assembles a whole raw message), so pre-partial-fetch
@@ -1774,6 +1839,99 @@ impl Cache {
         Ok(())
     }
 
+    /// Adds an outgoing message to the local outbox, due at `not_before`
+    /// (`Utc::now()` for a normal send, a future time for schedule send).
+    /// Returns the new row's id, which the session quotes in its
+    /// `OutboxQueued`/`OutboxSent`/`OutboxFailed` events.
+    pub fn enqueue_outbox(&self, account_id: &AccountId, not_before: DateTime<Utc>, payload: &[u8]) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO outbox (account_id, not_before, attempts, payload, state) VALUES (?1, ?2, 0, ?3, ?4)",
+            rusqlite::params![account_id.0, not_before.timestamp(), payload, OutboxState::Pending.as_str()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// The outbox rows due to send as of `now`: `pending` rows whose time has
+    /// arrived, oldest first. `failed` rows are excluded - they only move
+    /// again when the user retries them (item 1.14).
+    pub fn due_outbox(&self, now: DateTime<Utc>) -> Result<Vec<OutboxEntry>> {
+        self.outbox_rows("WHERE state = 'pending' AND not_before <= ?1 ORDER BY not_before, id", rusqlite::params![now.timestamp()])
+    }
+
+    /// Every outbox row, newest first - the outbox view's list (item 1.14).
+    pub fn all_outbox(&self) -> Result<Vec<OutboxEntry>> {
+        self.outbox_rows("ORDER BY id DESC", [])
+    }
+
+    /// The `not_before` of the earliest pending row, if any - what the session
+    /// caps its IDLE slice against so a scheduled send wakes on time.
+    pub fn next_outbox_not_before(&self) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        let ts: Option<i64> = conn.query_row("SELECT MIN(not_before) FROM outbox WHERE state = 'pending'", [], |row| row.get(0))?;
+        Ok(ts.and_then(|t| DateTime::from_timestamp(t, 0)))
+    }
+
+    /// Records a failed send attempt: increments `attempts` and, once it
+    /// reaches `max_attempts`, marks the row `failed`; otherwise leaves it
+    /// `pending` with `not_before` pushed out to `retry_at`. Returns the
+    /// row's resulting state.
+    pub fn outbox_attempt_failed(&self, id: i64, retry_at: DateTime<Utc>, max_attempts: u32) -> Result<OutboxState> {
+        let conn = self.conn.lock().unwrap();
+        let attempts: i64 = conn
+            .query_row("SELECT attempts FROM outbox WHERE id = ?1", rusqlite::params![id], |row| row.get(0))
+            .optional()?
+            .unwrap_or(0);
+        let attempts = attempts + 1;
+        let state = if attempts >= i64::from(max_attempts) {
+            OutboxState::Failed
+        } else {
+            OutboxState::Pending
+        };
+        conn.execute(
+            "UPDATE outbox SET attempts = ?1, not_before = ?2, state = ?3 WHERE id = ?4",
+            rusqlite::params![attempts, retry_at.timestamp(), state.as_str(), id],
+        )?;
+        Ok(state)
+    }
+
+    /// Removes an outbox row - after a successful send, or to drop a payload
+    /// that can't be decoded.
+    pub fn delete_outbox(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
+        Ok(())
+    }
+
+    /// Shared row reader for the outbox queries.
+    fn outbox_rows<P: rusqlite::Params>(&self, clause: &str, params: P) -> Result<Vec<OutboxEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("SELECT id, account_id, not_before, attempts, payload, state FROM outbox {clause}"))?;
+        let rows = stmt.query_map(params, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (id, account_id, not_before, attempts, payload, state) = row?;
+            entries.push(OutboxEntry {
+                id,
+                account_id: AccountId(account_id),
+                not_before: DateTime::from_timestamp(not_before, 0).unwrap_or_else(Utc::now),
+                attempts: u32::try_from(attempts).unwrap_or(0),
+                payload,
+                state: OutboxState::from_db(&state),
+            });
+        }
+        Ok(entries)
+    }
+
     /// Every distinct mailbox id with a cached row (messages, bodies, the
     /// folder list or snoozes) that is `root` itself or lies beneath it.
     /// Filtered in Rust with `is_same_or_descendant` rather than a SQL `LIKE`,
@@ -2266,11 +2424,13 @@ mod tests {
 
     /// The one-time upgrades that make the cache-hit path safe again: a cache
     /// written by a pre-full-sync build holds only a windowed subset, so
-    /// opening it must wipe the envelope table (forcing full re-syncs), and a
+    /// opening it must wipe the envelope table (forcing full re-syncs); a
     /// pre-partial-fetch build stored raw RFC 5322 bytes in `bodies`, so a
-    /// format change must wipe those too. Each wipe happens exactly once,
-    /// since every sync after the migration writes the whole folder (and
-    /// every body fetch writes the new format).
+    /// format change must wipe those too; and a pre-header build's envelopes
+    /// lack importance/sensitivity/List-Id, so they are wiped to re-fetch with
+    /// the selected-header block. Each wipe happens exactly once, since every
+    /// sync after the migration writes the whole folder (and every body fetch
+    /// writes the new format).
     #[test]
     fn wiping_stale_caches_once_on_format_version_change() {
         let account_id = temp_account_id();
@@ -2302,19 +2462,115 @@ mod tests {
         assert!(cache.load_messages(&mailbox_id).unwrap().is_empty(), "a pre-migration cache must be wiped");
         assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), "a pre-migration body must be wiped");
 
-        // Simulate a version-1 database (envelope migration done, body format
-        // not): envelope rows survive, bodies are wiped.
+        // Simulate a version-4 database (body format current, but envelopes
+        // fetched before the selected-header block): the messages are wiped so
+        // they re-fetch with importance/sensitivity/List-Id, while the
+        // current-format bodies survive.
         cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 3, None)]).unwrap();
-        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("new-format body")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("current-format body")).unwrap();
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
         }
-        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("old-format body")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("kept body")).unwrap();
         let cache = Cache::open(&account_id).unwrap();
-        assert_eq!(cache.load_messages(&mailbox_id).unwrap().len(), 1, "a version-1 cache's envelope rows must survive");
-        assert!(!cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(), "a version-1 cache's bodies must be wiped");
+        assert!(
+            cache.load_messages(&mailbox_id).unwrap().is_empty(),
+            "a version-4 cache's envelopes must be wiped for the header re-fetch"
+        );
+        assert!(
+            cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(),
+            "a version-4 cache's current-format bodies must survive"
+        );
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The selected-header markers survive the JSON envelope round trip, so a
+    /// message synced with importance/sensitivity/List-Id keeps them when the
+    /// list is reloaded from the cache.
+    #[test]
+    fn summary_markers_round_trip_through_the_cache() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let mut msg = sample_summary(&mailbox_id, 7, None);
+        msg.importance = lookout_core::Importance::High;
+        msg.sensitivity = lookout_core::MessageSensitivity::Private;
+        msg.list_id = Some("announce.example.com".to_string());
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[msg]).unwrap();
+
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].importance, lookout_core::Importance::High);
+        assert_eq!(loaded[0].sensitivity, lookout_core::MessageSensitivity::Private);
+        assert_eq!(loaded[0].list_id.as_deref(), Some("announce.example.com"));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The outbox lifecycle: due rows are delivered, future rows wait, a
+    /// failure backs off and increments `attempts`, exceeding `max_attempts`
+    /// marks the row `failed` (which `due_outbox` then ignores), and deletes
+    /// take a row out of `next_outbox_not_before`.
+    #[test]
+    fn outbox_enqueue_due_retry_and_delete_lifecycle() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let now = Utc::now();
+        let now_secs = DateTime::from_timestamp(now.timestamp(), 0).unwrap();
+
+        let due_id = cache.enqueue_outbox(&account_id, now, b"due payload").unwrap();
+        let later_id = cache.enqueue_outbox(&account_id, now + chrono::Duration::hours(1), b"later payload").unwrap();
+
+        // Only the due row is delivered.
+        let due = cache.due_outbox(now).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, due_id);
+        assert_eq!(due[0].payload, b"due payload");
+        assert_eq!(due[0].attempts, 0);
+        assert_eq!(due[0].state, OutboxState::Pending);
+        assert_eq!(due[0].account_id, account_id);
+        assert_eq!(cache.next_outbox_not_before().unwrap(), Some(now_secs));
+
+        // `all_outbox` is newest first.
+        let all = cache.all_outbox().unwrap();
+        assert_eq!(all.iter().map(|e| e.id).collect::<Vec<_>>(), vec![later_id, due_id]);
+
+        // A first failure below the cap leaves it pending, but pushed out of
+        // the due window.
+        assert_eq!(cache.outbox_attempt_failed(due_id, now + chrono::Duration::minutes(1), 2).unwrap(), OutboxState::Pending);
+        assert!(cache.due_outbox(now).unwrap().is_empty());
+        // The next due time is now the retry, not the later row.
+        assert_eq!(
+            cache.next_outbox_not_before().unwrap(),
+            Some(DateTime::from_timestamp((now + chrono::Duration::minutes(1)).timestamp(), 0).unwrap())
+        );
+
+        // The second failure reaches the cap and marks it failed.
+        assert_eq!(cache.outbox_attempt_failed(due_id, now + chrono::Duration::minutes(2), 2).unwrap(), OutboxState::Failed);
+        let failed = cache.all_outbox().unwrap();
+        let failed_row = failed.iter().find(|e| e.id == due_id).unwrap();
+        assert_eq!(failed_row.attempts, 2);
+        assert_eq!(failed_row.state, OutboxState::Failed);
+        // A failed row never becomes due again, and doesn't hold the next-due
+        // time.
+        assert!(cache.due_outbox(now + chrono::Duration::hours(2)).unwrap().iter().all(|e| e.id != due_id));
+        assert_eq!(
+            cache.next_outbox_not_before().unwrap(),
+            Some(DateTime::from_timestamp((now + chrono::Duration::hours(1)).timestamp(), 0).unwrap())
+        );
+
+        // Deleting the pending row leaves no next-due time; deleting the failed
+        // row removes it entirely.
+        cache.delete_outbox(later_id).unwrap();
+        assert_eq!(cache.next_outbox_not_before().unwrap(), None);
+        cache.delete_outbox(due_id).unwrap();
+        assert!(cache.all_outbox().unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
     }
 
@@ -2337,6 +2593,9 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: preview.map(|p| p.to_string()),
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
             structure: None,
         }
     }
@@ -3403,14 +3662,15 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         // Create a database with envelopes + a body but no search index at all,
-        // exactly what a pre-search build left on disk (user_version 4: the
-        // envelope/body-format migrations done, the FTS index absent).
+        // exactly what a pre-search build left on disk (user_version 5: the
+        // envelope/body-format and header migrations done, the FTS index
+        // absent).
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 "
-                PRAGMA user_version = 4;
+                PRAGMA user_version = 5;
                 CREATE TABLE messages (
                     mailbox_id TEXT NOT NULL,
                     uid INTEGER NOT NULL,

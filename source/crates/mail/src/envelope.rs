@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use async_imap::types::Fetch;
 use chrono::{DateTime, Utc};
-use lookout_core::{EmailAddress, EmailSummary, MailboxId, SystemFlagBit, ThreadKey, Uid};
+use lookout_core::{header_value, importance_from_headers, sensitivity_from_headers, EmailAddress, EmailSummary, MailboxId, SystemFlagBit, ThreadKey, Uid};
 
 /// Decodes RFC 2047 MIME encoded-words (`=?charset?Q|B?...?=`) found in a
 /// raw header value. IMAP's `ENVELOPE` response returns header fields
@@ -132,6 +132,15 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
 
     let (flags, keywords) = flags_from_fetch(fetch);
 
+    // The selected-header block rides on the envelope fetch
+    // (`BODY.PEEK[HEADER.FIELDS (...)]`, see `ENVELOPE_FETCH_ITEMS`): a server
+    // that didn't return it (or an older cached fetch) leaves every marker at
+    // its default.
+    let headers = selected_headers(fetch.header());
+    let importance = importance_from_headers(&headers).unwrap_or_default();
+    let sensitivity = sensitivity_from_headers(&headers).unwrap_or_default();
+    let list_id = header_value(&headers, "List-Id").map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+
     let structure = fetch.bodystructure().map(crate::structure::parts_from_bodystructure);
     let has_attachment = structure.as_ref().map(|p| crate::structure::has_attachments(p)).unwrap_or(false);
     let has_calendar = structure.as_ref().map(|p| crate::structure::has_calendar_parts(p)).unwrap_or(false);
@@ -154,8 +163,20 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
         has_attachment,
         has_calendar,
         preview: None, // Requires a body fetch; filled in by `sync_mailbox`'s second phase.
+        importance,
+        sensitivity,
+        list_id,
         structure,
     })
+}
+
+/// Parses the raw `BODY.PEEK[HEADER.FIELDS (...)]` section the envelope fetch
+/// requests alongside the envelope into the `(name, value)` pairs the interop
+/// readers expect. Delegates to [`crate::body::parse_headers_section`] (same
+/// mail_parser unfolding/trimming), so a section the server didn't return
+/// yields an empty list and every marker stays at its default.
+fn selected_headers(raw: Option<&[u8]>) -> Vec<(String, String)> {
+    raw.map(crate::body::parse_headers_section).unwrap_or_default()
 }
 
 /// Parses a fetch response item's `FLAGS` into system flag bits and custom
@@ -264,5 +285,31 @@ mod tests {
             _ => None,
         });
         assert_eq!(subject.as_deref(), Some("Weekend hike photos 🏔\u{fe0f}"));
+    }
+
+    #[test]
+    fn selected_headers_parse_importance_sensitivity_and_list_id() {
+        let raw = b"Importance: High\r\nX-Priority: 1 (Highest)\r\nSensitivity: Private\r\nList-Id: Announcements <announce.example.com>\r\nSubject: ignored\r\n\r\n";
+        let headers = selected_headers(Some(raw));
+        assert_eq!(importance_from_headers(&headers), Some(lookout_core::Importance::High));
+        assert_eq!(sensitivity_from_headers(&headers), Some(lookout_core::MessageSensitivity::Private));
+        assert_eq!(header_value(&headers, "List-Id").map(str::trim), Some("Announcements <announce.example.com>"));
+    }
+
+    #[test]
+    fn selected_headers_unfolds_a_wrapped_field() {
+        let raw = b"Authentication-Results: mx.example.com;\r\n spf=pass smtp.mailfrom=a@b\r\nSensitivity: personal\r\n\r\n";
+        let headers = selected_headers(Some(raw));
+        let auth = header_value(&headers, "Authentication-Results").unwrap();
+        assert!(auth.contains("spf=pass"), "unfolded value was {auth:?}");
+        assert_eq!(sensitivity_from_headers(&headers), Some(lookout_core::MessageSensitivity::Personal));
+    }
+
+    #[test]
+    fn selected_headers_absent_defaults_to_normal() {
+        let headers = selected_headers(None);
+        assert!(headers.is_empty());
+        assert_eq!(importance_from_headers(&headers).unwrap_or_default(), lookout_core::Importance::Normal);
+        assert_eq!(sensitivity_from_headers(&headers).unwrap_or_default(), lookout_core::MessageSensitivity::Normal);
     }
 }

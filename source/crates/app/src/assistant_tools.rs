@@ -787,6 +787,9 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: Some("Your scan finished, nothing found".to_string()),
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
             structure: None,
         };
         let mut newer = older.clone();
@@ -872,6 +875,9 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
             structure: None,
         };
         second.replace_messages(&second_mailbox, UidValidity(1), std::slice::from_ref(&message)).unwrap();
