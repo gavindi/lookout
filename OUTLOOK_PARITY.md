@@ -244,7 +244,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-09 | Categories (named, coloured, multiple) | `app/src/tags.rs` (`$Lookout-tag-*` keywords), Categorize menu, drop-on-tag | 🟡 | No master-list editor with Outlook's 25 colour presets; no Microsoft 365 sync |
 | M-10 | Flag for follow-up with dates | Pin = `\Flagged`; "Follow up" creates a linked task with `due: None` (`window.rs` `build_task_seed_for_email`) | 🟡 | No Today/Tomorrow/This week/Next week/No date/Custom/Mark complete; no flag state on the message itself; no due-date list column |
 | M-11 | Snooze | Fixed "tomorrow 9 AM"; local-only `snoozed` table (`mail/src/cache.rs`) | 🟡 | Presets (later today, tomorrow, this weekend, next week, custom); syncing across installs (§4.2) |
-| M-12 | Importance display | — | ❌ | Not parsed or shown (§4.1) |
+| M-12 | Importance display | `!`/`↓` list glyph from parsed headers | ✅ | — |
 | M-13 | Pin | Pinned section, Graph mirror (`graph_pin.rs`) | ✅ | — |
 | M-14 | Rules | — | ❌ | Client engine plus Sieve plus Graph `messageRules` |
 | M-15 | Quick Steps | — | ❌ | User-defined action chains |
@@ -285,10 +285,10 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | ID | Outlook feature | Lookout today | Status | Gap |
 |---|---|---|---|---|
 | C-01 | Rich formatting | `app/src/compose.rs`: B/I/U/S, lists, 4 fonts, 4 sizes, colour, align, indent, HR, link, image, table | 🟡 | Styles/headings, highlight, any installed font, point sizes, format painter, superscript/subscript, paste options |
-| C-02 | Spell check | WebKit spellchecking not enabled | ❌ | `WebContext::set_spell_checking_enabled` plus language picker; F7 |
+| C-02 | Spell check | WebKit spellchecking on the composer's own `WebContext`; language picker; F7 | ✅ | — |
 | C-03 | Plain text vs HTML | Rich-text toggle; `multipart/alternative` | ✅ | — |
 | C-04 | From / Bcc / identities | `app/src/identities.rs`, From dropdown | ✅ | "Send as" for Microsoft 365 shared mailboxes (Phase 5) |
-| C-05 | Importance (High/Low) | `ComposedMessage` has no field | ❌ | §4.1 |
+| C-05 | Importance (High/Low) | `ComposedMessage.importance`; High/Low toggles; three headers written | ✅ | — |
 | C-06 | Sensitivity | — | ❌ | §4.1 |
 | C-07 | Request read / delivery receipt | Read only | 🟡 | DSN (M-27) |
 | C-08 | Schedule send / delay delivery | — | ❌ | Outbox `not_before` (Phase 0); server-side via Graph on Microsoft 365 |
@@ -334,7 +334,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | CAL-20 | Teams / online meeting | Video-call switch writes `CONFERENCE`/`URL` | 🟡 | Teams via Graph `isOnlineMeeting`; "Join" button on detected links |
 | CAL-21 | Event attachments | — | ❌ | RFC 8607 / Graph |
 | CAL-22 | Event search | Calendar "Filter" button disabled | ❌ | Search over `dav` cache |
-| CAL-23 | Print calendar | `print_calendar_month` exists, but the Calendar toolbar print button is created insensitive (`window.rs:4400`) and never re-enabled | 🟡 | **Bug:** enable the button. Add Day/Week/Month/Agenda print styles |
+| CAL-23 | Print calendar | `print_calendar_month`; toolbar button live | ✅ | Day/Week/Month/Agenda print styles still pending (3.20) |
 | CAL-24 | Share / publish calendar | Share button disabled | ❌ | Graph `calendarPermissions`; CalDAV sharing where supported |
 | CAL-25 | Open someone else's calendar | Only calendars already in the account | 🟡 | Graph `/users/{id}/calendars`; CalDAV principal browse |
 | CAL-26 | Internet calendar subscriptions | `dav/src/subscription.rs` | ✅ | — |
@@ -601,9 +601,9 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
-| 1.1 | Spell check | C-02 | Enable WebKit spellcheck on the compose view; language from locale plus a setting; F7 shortcut | S |
-| 1.2 | Importance in list and compose | M-12, C-05 | Uses 0.1/0.2; `!`/`↓` list glyph; compose toolbar toggle; write the three headers in `send.rs` | S |
-| 1.3 | Fix Calendar print button | CAL-23 | Make it sensitive (`window.rs:4400`) | S |
+| 1.1 | ✅ ~~Spell check~~ | C-02 | Enable WebKit spellcheck on the compose view; language from locale plus a setting; F7 shortcut | S |
+| 1.2 | ✅ ~~Importance in list and compose~~ | M-12, C-05 | Uses 0.1/0.2; `!`/`↓` list glyph; compose toolbar toggle; write the three headers in `send.rs` | S |
+| 1.3 | ✅ ~~Fix Calendar print button~~ | CAL-23 | Make it sensitive (`window.rs:4400`) | S |
 | 1.4 | Reading pane bottom | M-05 | `layout-reading-pane` → enum `right\|bottom\|off`; swap `gtk::Paned` orientation | M |
 | 1.5 | Preview lines and sender images | M-06 | Setting 0–3 lines; avatar (initials, or vCard photo) column | S |
 | 1.6 | More sort keys and filters | M-07, M-08 | Extend `SortKey` (Size, Importance, Flag, Category, To, Attachments) and the filter enum; group headers per key | M |

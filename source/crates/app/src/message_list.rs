@@ -313,6 +313,10 @@ pub struct ThreadRow {
     /// Any message in the thread carries an iCalendar part (a meeting invite
     /// or related message) - the header shows the calendar icon.
     pub has_calendar: bool,
+    /// The thread's aggregate importance: `High` if any message is high,
+    /// else `Low` if any is low, else `Normal` - the header shows the
+    /// matching importance glyph, mirroring a lone message row's own.
+    pub importance: lookout_core::Importance,
 }
 
 /// One row a date section's child store holds in threaded mode: a
@@ -511,17 +515,42 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
             has_pinned: latest.is_pinned() || emails.iter().any(|m| m.is_pinned()),
             has_attachment: latest.has_attachment || emails.iter().any(|m| m.has_attachment),
             has_calendar: latest.has_calendar || emails.iter().any(|m| m.has_calendar),
+            importance: thread_importance(&emails),
         };
         entries.push(ThreadEntry::Thread(ThreadLayout { row, messages: emails }));
     }
     entries
 }
 
+/// A thread's aggregate importance, for its header glyph: `High` if any
+/// message is high, else `Low` if any is low, else `Normal`.
+fn thread_importance(messages: &[EmailSummary]) -> lookout_core::Importance {
+    if messages.iter().any(|m| m.importance == lookout_core::Importance::High) {
+        lookout_core::Importance::High
+    } else if messages.iter().any(|m| m.importance == lookout_core::Importance::Low) {
+        lookout_core::Importance::Low
+    } else {
+        lookout_core::Importance::Normal
+    }
+}
+
 /// Message identity, the two flag-derived styles (unread, flagged), the four
 /// text fields a row renders, the color-tag keywords it carries, and its
 /// thread key. Named rather than written inline so the tuple stays under
 /// clippy's type-complexity threshold.
-type MessageRowKey = (MailboxId, Uid, bool, bool, DateTime<Utc>, Option<String>, String, Option<String>, Vec<String>, ThreadKey);
+type MessageRowKey = (
+    MailboxId,
+    Uid,
+    bool,
+    bool,
+    DateTime<Utc>,
+    Option<String>,
+    String,
+    Option<String>,
+    Vec<String>,
+    ThreadKey,
+    lookout_core::Importance,
+);
 
 /// A compact fingerprint of the fields one message-list row displays, keyed
 /// to keep the row distinct from any other. Used to detect "nothing changed"
@@ -558,6 +587,7 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
         m.preview.clone(),
         tags,
         m.thread_key.clone(),
+        m.importance,
     )
 }
 
@@ -621,7 +651,19 @@ fn section_row_key(bucket: DateBucket, label: &str) -> SectionRowKey {
 /// separate diff against the thread's child store. Named rather than written
 /// inline for the same clippy type-complexity reason as `MessageRowKey`, and
 /// must be kept in sync by hand with `ThreadRow`'s fields the same way.
-type ThreadRowKey = (ThreadId, String, Vec<String>, Option<String>, usize, DateTime<Utc>, bool, bool, bool, bool);
+type ThreadRowKey = (
+    ThreadId,
+    String,
+    Vec<String>,
+    Option<String>,
+    usize,
+    DateTime<Utc>,
+    bool,
+    bool,
+    bool,
+    bool,
+    lookout_core::Importance,
+);
 
 fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
     (
@@ -635,6 +677,7 @@ fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
         row.has_pinned,
         row.has_attachment,
         row.has_calendar,
+        row.importance,
     )
 }
 
@@ -2794,6 +2837,7 @@ mod tests {
             has_pinned: false,
             has_attachment: false,
             has_calendar: false,
+            importance: lookout_core::Importance::Normal,
         }
     }
 
@@ -2846,6 +2890,10 @@ mod tests {
         let mut other_calendar = base.clone();
         other_calendar.has_calendar = true;
         assert_ne!(thread_row_key(&other_calendar), base_key);
+
+        let mut other_importance = base.clone();
+        other_importance.importance = lookout_core::Importance::High;
+        assert_ne!(thread_row_key(&other_importance), base_key);
     }
 
     #[test]

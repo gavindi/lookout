@@ -7,7 +7,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use base64::Engine;
 use gtk::{gio, glib};
-use lookout_core::{header_value, AccountId, EmailAddress, EmailBody, EmailSummary, Identity, Signature};
+use lookout_core::{header_value, AccountId, EmailAddress, EmailBody, EmailSummary, Identity, Importance, Signature};
 use lookout_mail::session::AccountCommand;
 use lookout_mail::{new_message_id, Attachment, ComposedMessage, InlineImage};
 use webkit::prelude::*;
@@ -464,6 +464,10 @@ struct DraftSnapshot {
     /// draft so the stored copy carries (or stops carrying) the
     /// `Disposition-Notification-To` header, like any other edit.
     read_receipt: bool,
+    /// The composed message's Outlook importance (High/Normal/Low), from the
+    /// toolbar's High/Low toggles - a flip re-saves the draft so it carries
+    /// the matching `Importance`/`X-Priority` headers.
+    importance: Importance,
     body: String,
     body_text: String,
     attachments: Vec<PendingAttachment>,
@@ -516,6 +520,16 @@ fn selected_identity(identities: &Rc<RefCell<Vec<Identity>>>, from_dropdown: &gt
         .unwrap_or_else(|| list.first().cloned().unwrap_or_else(|| Identity::new(AccountId(String::new()), "", "")))
 }
 
+fn selected_importance(high: &gtk::ToggleButton, low: &gtk::ToggleButton) -> Importance {
+    if high.is_active() {
+        Importance::High
+    } else if low.is_active() {
+        Importance::Low
+    } else {
+        Importance::Normal
+    }
+}
+
 /// Everything the draft autosave touches, in one clonable bundle. This exists
 /// because reading the rich editor is `async` (see `read_content`) and an
 /// `Rc<dyn Fn()>` closure can't hold an `async` body - each caller clones a
@@ -527,6 +541,8 @@ struct AutosaveCtx {
     bcc_row: RecipientEntry,
     subject_row: adw::EntryRow,
     read_receipt_toggle: gtk::ToggleButton,
+    high_importance_toggle: gtk::ToggleButton,
+    low_importance_toggle: gtk::ToggleButton,
     rich_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
     rich_web_view: Rc<webkit::WebView>,
@@ -583,6 +599,7 @@ impl AutosaveCtx {
             subject: self.subject_row.text().to_string(),
             rich,
             read_receipt: self.read_receipt_toggle.is_active(),
+            importance: selected_importance(&self.high_importance_toggle, &self.low_importance_toggle),
             body,
             body_text,
             attachments: self.attachments.borrow().clone(),
@@ -635,6 +652,7 @@ impl AutosaveCtx {
             calendar_part: None,
             read_receipt: None,
             request_read_receipt: snap.read_receipt,
+            importance: snap.importance,
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             message_id: Some((*self.draft_message_id).clone()),
@@ -659,6 +677,46 @@ fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
         && snap.inline_images.is_empty()
 }
 
+thread_local! {
+    /// The composer's own WebKit context, kept separate from the process-wide
+    /// default so enabling spellchecking here never affects the reading pane,
+    /// the assistant or the print pipeline. Created once and shared by every
+    /// composer and the signature editor.
+    static COMPOSE_WEB_CONTEXT: RefCell<Option<webkit::WebContext>> = const { RefCell::new(None) };
+}
+
+/// The shared composer `WebContext`, created on first use.
+pub(crate) fn compose_web_context() -> webkit::WebContext {
+    COMPOSE_WEB_CONTEXT.with(|slot| slot.borrow_mut().get_or_insert_with(webkit::WebContext::new).clone())
+}
+
+/// Turns spellchecking on or off on the composer's shared context and sets the
+/// languages to check. `configured_languages` are `en_US`-style tags; empty
+/// means the system locale's language.
+pub(crate) fn apply_spell_check(enabled: bool, configured_languages: &[String]) {
+    let context = compose_web_context();
+    context.set_spell_checking_enabled(enabled);
+    let languages = resolved_spell_languages(configured_languages);
+    if !languages.is_empty() {
+        let refs: Vec<&str> = languages.iter().map(String::as_str).collect();
+        context.set_spell_checking_languages(&refs);
+    }
+}
+
+/// The language tags to spellcheck in: the configured ones, or, when none are
+/// configured, the system locale's first non-`C`/`POSIX` language.
+fn resolved_spell_languages(configured: &[String]) -> Vec<String> {
+    if !configured.is_empty() {
+        return configured.iter().filter(|tag| !tag.is_empty()).cloned().collect();
+    }
+    glib::language_names()
+        .into_iter()
+        .map(|tag| tag.to_string())
+        .find(|tag| !tag.eq_ignore_ascii_case("c") && !tag.eq_ignore_ascii_case("posix"))
+        .into_iter()
+        .collect()
+}
+
 /// Builds the rich-text editor's pieces: the contenteditable WebKit `WebView`
 /// plus its formatting toolbar (bold, italic, lists, font size, color,
 /// link). The caller composes the toolbar row (adding the plain/rich toggle
@@ -676,7 +734,7 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
         .enable_javascript(true)
         .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
         .build();
-    let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).build());
+    let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).web_context(&compose_web_context()).build());
 
     {
         let web_view = web_view.clone();
@@ -1053,6 +1111,11 @@ pub fn build_compose_view(
     prefill: ComposePrefill,
     on_done: Rc<dyn Fn()>,
     rich_text_default: bool,
+    // Whether to spellcheck as the user types, and the `en_US`-style language
+    // tags to check (empty = the system locale's language). Applied to the
+    // composer's shared WebKit context (see `apply_spell_check`).
+    spell_check: bool,
+    spell_languages: Vec<String>,
     suggestions: SuggestionSource,
     open_contact_picker: crate::contact_picker::ContactPickerOpener,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
@@ -1084,7 +1147,11 @@ pub fn build_compose_view(
     // clicked. A row that already has prefilled content (e.g. Reply All's
     // Cc list) starts shown, with its button skipped so there's nothing to
     // click for a field the user can already see.
-    let to_button = gtk::Button::builder().label("To").css_classes(["flat"]).tooltip_text("Add recipients from address book").build();
+    let to_button = gtk::Button::builder()
+        .label("To")
+        .css_classes(["flat"])
+        .tooltip_text("Add recipients from address book")
+        .build();
     let cc_button = gtk::Button::builder().label("Cc").css_classes(["flat", "caption"]).tooltip_text("Show Cc").build();
     let bcc_button = gtk::Button::builder().label("Bcc").css_classes(["flat", "caption"]).tooltip_text("Show Bcc").build();
     to_row.widget().prepend(&to_button);
@@ -1207,6 +1274,31 @@ pub fn build_compose_view(
         .tooltip_text("Request read receipt")
         .build();
 
+    // --- Importance: Outlook's High/Low buttons (RFC 2156 `Importance`,
+    // `X-Priority`, `X-MSMail-Priority` - written by `build_raw_message`).
+    // Two independent toggles kept mutually exclusive; neither active is
+    // Normal. Both live in the editor toolbar, which the window layer moves
+    // as a whole between the reading pane and a pop-out window, so they need
+    // no special reparenting of their own.
+    let high_importance_toggle = gtk::ToggleButton::builder().icon_name("emblem-important-symbolic").tooltip_text("High importance").build();
+    let low_importance_toggle = gtk::ToggleButton::builder().icon_name("go-down-symbolic").tooltip_text("Low importance").build();
+    {
+        let other = low_importance_toggle.clone();
+        high_importance_toggle.connect_toggled(move |toggle| {
+            if toggle.is_active() {
+                other.set_active(false);
+            }
+        });
+    }
+    {
+        let other = high_importance_toggle.clone();
+        low_importance_toggle.connect_toggled(move |toggle| {
+            if toggle.is_active() {
+                other.set_active(false);
+            }
+        });
+    }
+
     let body_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .left_margin(8)
@@ -1225,6 +1317,7 @@ pub fn build_compose_view(
     }
     let text_scroller = gtk::ScrolledWindow::builder().child(&body_view).hexpand(true).vexpand(true).build();
 
+    apply_spell_check(spell_check, &spell_languages);
     let (rich_web_view, format_toolbar) = build_rich_editor(prefill.body.as_deref().map(text_to_html).unwrap_or_default());
 
     let body_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
@@ -1527,6 +1620,10 @@ pub fn build_compose_view(
     editor_toolbar.append(&format_toolbar);
     // The signature menu is the toolbar's last control.
     editor_toolbar.append(&signature_button);
+    // Importance buttons trail the signature, after a separator.
+    editor_toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
+    editor_toolbar.append(&high_importance_toggle);
+    editor_toolbar.append(&low_importance_toggle);
 
     {
         let web_view = rich_web_view.clone();
@@ -1561,6 +1658,8 @@ pub fn build_compose_view(
         bcc_row: bcc_row.clone(),
         subject_row: subject_row.clone(),
         read_receipt_toggle: read_receipt_toggle.clone(),
+        high_importance_toggle: high_importance_toggle.clone(),
+        low_importance_toggle: low_importance_toggle.clone(),
         rich_toggle: rich_toggle.clone(),
         body_view: body_view.clone(),
         rich_web_view: rich_web_view.clone(),
@@ -1695,6 +1794,8 @@ pub fn build_compose_view(
         let closed = closed.clone();
         let from_dropdown = from_dropdown.clone();
         let read_receipt_toggle = read_receipt_toggle.clone();
+        let high_importance_toggle = high_importance_toggle.clone();
+        let low_importance_toggle = low_importance_toggle.clone();
         let on_send_started = on_send_started.clone();
         send_button.connect_clicked(move |_| {
             // Commit anything typed but not yet turned into a chip, so the
@@ -1724,6 +1825,8 @@ pub fn build_compose_view(
             let identities = identities.clone();
             let from_dropdown = from_dropdown.clone();
             let read_receipt_toggle = read_receipt_toggle.clone();
+            let high_importance_toggle = high_importance_toggle.clone();
+            let low_importance_toggle = low_importance_toggle.clone();
             let attachments = attachments.clone();
             let in_reply_to = in_reply_to.clone();
             let references = references.clone();
@@ -1782,6 +1885,7 @@ pub fn build_compose_view(
                     calendar_part: None,
                     read_receipt: None,
                     request_read_receipt: read_receipt_toggle.is_active(),
+                    importance: selected_importance(&high_importance_toggle, &low_importance_toggle),
                     in_reply_to,
                     references,
                     message_id: draft_message_id_used,
@@ -2065,6 +2169,7 @@ mod tests {
             subject: subject.to_string(),
             rich: false,
             read_receipt: false,
+            importance: Importance::Normal,
             body: body_text.to_string(),
             body_text: body_text.to_string(),
             attachments: vec![],
@@ -2121,6 +2226,7 @@ mod tests {
             subject: String::new(),
             rich: true,
             read_receipt: false,
+            importance: Importance::Normal,
             body: "<p><br></p>".to_string(),
             body_text: "\n".to_string(),
             attachments: vec![],

@@ -112,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
                                 calendar_part: None,
                                 read_receipt: None,
                                 request_read_receipt: false,
+                                importance: lookout_core::Importance::Normal,
                                 in_reply_to: None,
                                 references: vec![],
                                 message_id: None,

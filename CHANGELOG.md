@@ -13,6 +13,16 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.160] - 2026-10-11
+**Reference**: Mail — spell check (Phase 1.1 / C-02)
+**Summary**: Touches `data/gschema/...gschema.xml` and `crates/app/src/{settings,compose,config_view,window,shortcuts}.rs`; adds two GSettings keys (`mail-spell-check`, `mail-spell-check-languages`), both additive with no data-format change. Turns on WebKit's spellchecking in the composer: the editor now builds on its own dedicated `WebContext` (kept apart from the process-wide default, so the reading pane, assistant and printer are untouched), with `WebContext::set_spell_checking_enabled`/`set_spell_checking_languages` fed from the new Settings → Mail rows "Check spelling as you type" and "Spelling language" (the system locale by default). F7 (a new `spell-check` shortcut action, configurable like the rest) toggles spelling checks on/off and confirms with a toast — WebKitGTK has no spelling dialog, so it's a toggle rather than Outlook's modal.
+
+**Reference**: Mail — importance in the list and compose (Phase 1.2 / M-12, C-05)
+**Summary**: Touches `crates/mail/src/send.rs`, its examples/tests, and `crates/app/src/{compose,message_list,window}.rs`; no data-format change. `ComposedMessage` gains an `importance` field and `build_raw_message` now writes Outlook's three headers (`Importance`, `X-Priority`, `X-MSMail-Priority`) via the Phase 0.1 interop layer; `Normal` is left off the wire, matching Outlook. The composer's toolbar gains mutually-exclusive High (`!`) and Low (`↓`) buttons (persisted through draft autosave), and the message list shows the matching glyph after the sender, next to the attachment/meeting icons — for lone messages and (aggregated) conversation headers alike, driven through the row-diff keys so a flag change repaints. A new `send.rs` test asserts the high/normal/low header behaviour.
+
+**Reference**: Calendar — enable the Print button (Phase 1.3 / CAL-23)
+**Summary**: Touches `crates/app/src/window.rs`; no data-format change. The Calendar toolbar's Print button was created insensitive and never re-enabled, so `print_calendar_month` was unreachable; it is now a normal, always-live button in the Calendar view, printing the displayed range through the existing WebKit print pipeline.
+
 ## [v0.9.159] - 2026-10-11
 **Reference**: Microsoft 365 — `lookout-graph` client skeleton (Phase 0.7)
 **Summary**: Adds `source/crates/graph/` and registers it in the workspace, and touches `crates/app/src/microsoft_oauth.rs` and the app manifest; no data-format change. A transport every Graph-backed feature builds on: a `reqwest` `GraphClient` that attaches a bearer token from a `TokenProvider` (the OAuth seam the app implements against `microsoft_oauth.rs`, mirroring `CredentialProvider`), follows `@odata.nextLink` paging (`get_all`), reads `/delta` cursors, honours the `Retry-After` throttling header with backoff, and normalises Graph errors into `GraphError`. Per-feature scopes are declared in `scopes.rs` (`GraphFeature::consent_scopes`) and negotiated incrementally; `MicrosoftOAuth` gains `ensure_graph_consent_for` and the `TokenProvider` impl. Covered by 11 unit/wiremock tests (paging, delta, throttling retry, status mapping, PATCH).

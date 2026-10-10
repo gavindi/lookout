@@ -149,6 +149,9 @@ struct MessageRowWidgets {
     /// own pair.
     thread_attachment_icon: gtk::Image,
     thread_calendar_icon: gtk::Image,
+    /// Importance glyph on the conversation-header row (`!` high, `↓` low);
+    /// hidden on normal-importance threads.
+    thread_importance_icon: gtk::Image,
     thread_subject: gtk::Label,
     thread_count: gtk::Label,
     thread_pin_icon: gtk::Image,
@@ -173,6 +176,10 @@ struct MessageRowWidgets {
     /// their position aligned across rows.
     attachment_icon: gtk::Image,
     calendar_icon: gtk::Image,
+    /// Importance glyph (`!` high, `↓` low), right after the sender column
+    /// next to the attachment/calendar pair; hidden on normal-importance
+    /// messages.
+    importance_icon: gtk::Image,
     subject_label: gtk::Label,
     pin_icon: gtk::Image,
     /// The color-tag dots: one small circle per configured tag the message
@@ -2314,6 +2321,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .tooltip_text("Meeting invite")
             .visible(false)
             .build();
+        let importance_icon = gtk::Image::builder()
+            .icon_name("emblem-important-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("High importance")
+            .visible(false)
+            .build();
         let subject_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let date_label = gtk::Label::builder().xalign(1.0).build();
         // Sits between the expanding subject and the date, so a pinned row
@@ -2334,6 +2349,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         top_row.append(&sender_label);
         top_row.append(&attachment_icon);
         top_row.append(&calendar_icon);
+        top_row.append(&importance_icon);
         top_row.append(&subject_label);
         top_row.append(&pin_icon);
         top_row.append(&tag_dots);
@@ -2420,6 +2436,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .tooltip_text("Meeting invite")
             .visible(false)
             .build();
+        let thread_importance_icon = gtk::Image::builder()
+            .icon_name("emblem-important-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("High importance")
+            .visible(false)
+            .build();
         let thread_subject = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let thread_count = gtk::Label::builder().xalign(0.0).css_classes(["message-thread-count"]).build();
         let thread_pin_icon = gtk::Image::builder()
@@ -2434,6 +2458,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         thread_top.append(&thread_sender);
         thread_top.append(&thread_attachment_icon);
         thread_top.append(&thread_calendar_icon);
+        thread_top.append(&thread_importance_icon);
         thread_top.append(&thread_subject);
         thread_top.append(&thread_count);
         thread_top.append(&thread_pin_icon);
@@ -2828,6 +2853,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     thread_sender,
                     thread_attachment_icon,
                     thread_calendar_icon,
+                    thread_importance_icon,
                     thread_subject,
                     thread_count,
                     thread_pin_icon,
@@ -2839,6 +2865,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     sender_label,
                     attachment_icon,
                     calendar_icon,
+                    importance_icon,
                     subject_label,
                     pin_icon,
                     tag_dots,
@@ -2946,6 +2973,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // attachment is both.
                 widgets.attachment_icon.set_visible(summary.has_attachment);
                 widgets.calendar_icon.set_visible(summary.has_calendar);
+                let (imp_icon, imp_tip) = importance_icon_and_tooltip(summary.importance);
+                widgets.importance_icon.set_icon_name(Some(imp_icon));
+                widgets.importance_icon.set_tooltip_text(Some(imp_tip));
+                widgets.importance_icon.set_visible(summary.importance != lookout_core::Importance::Normal);
                 widgets.date_label.set_label(&format_row_date(summary.date, chrono::Utc::now()));
                 widgets.preview_label.set_label(summary.preview.as_deref().unwrap_or(""));
 
@@ -3016,6 +3047,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.thread_sender.set_label(&thread.sender);
                 widgets.thread_attachment_icon.set_visible(thread.has_attachment);
                 widgets.thread_calendar_icon.set_visible(thread.has_calendar);
+                let (imp_icon, imp_tip) = importance_icon_and_tooltip(thread.importance);
+                widgets.thread_importance_icon.set_icon_name(Some(imp_icon));
+                widgets.thread_importance_icon.set_tooltip_text(Some(imp_tip));
+                widgets.thread_importance_icon.set_visible(thread.importance != lookout_core::Importance::Normal);
                 widgets.thread_subject.set_label(thread.subject.as_deref().unwrap_or("(no subject)"));
                 widgets.thread_count.set_label(&thread.count.to_string());
                 // Who's in the conversation, a hover away - on the row itself
@@ -4396,8 +4431,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
     // active. New Event opens the event editor (wired later, once
     // `calendar_state` exists); all five segmented options (Day/Work
-    // week/Week/Month/Split) switch the main panel's stack; Filter/Share/Print
-    // remain disabled placeholders.
+    // week/Week/Month/Split) switch the main panel's stack; Filter/Share
+    // remain disabled placeholders. Print is live (prints the displayed
+    // range through WebKit's print pipeline).
     let new_event_button = gtk::Button::from_icon_name("appointment-new-symbolic");
     new_event_button.set_tooltip_text(Some("New Event"));
 
@@ -4441,8 +4477,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     share_button.set_sensitive(false);
     let print_button = gtk::Button::from_icon_name("printer-symbolic");
     print_button.set_tooltip_text(Some("Print"));
-    print_button.set_sensitive(false);
-
     let calendar_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     calendar_command_toolbar.append(&new_event_button);
     calendar_command_toolbar.append(&view_switch_box);
@@ -5359,7 +5393,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     } else {
                         paned_position_for_percent(pct, window_width, paned_width, start_min, end_min, cap)
                     };
-                    tracing::debug!(pane = key, pct, window_width, paned_width, start_min, end_min, stable, trusted, give_up, ?position, "pane width restore");
+                    tracing::debug!(
+                        pane = key,
+                        pct,
+                        window_width,
+                        paned_width,
+                        start_min,
+                        end_min,
+                        stable,
+                        trusted,
+                        give_up,
+                        ?position,
+                        "pane width restore"
+                    );
                     // The position is applied on every attempt, trusted or not:
                     // a pane that looks approximately right for one frame beats
                     // one sitting at its built-in default. What waits for trust
@@ -6407,6 +6453,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Check spelling as you type": persists the setting and
+    // applies it to the composer's shared WebKit context immediately, so a
+    // change (or the F7 toggle) affects an already-open composer.
+    {
+        let state = state.clone();
+        config_view.spell_check_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::MAIL_SPELL_CHECK, row.is_active());
+            let languages = state.borrow().settings.get_strv(crate::settings::MAIL_SPELL_CHECK_LANGUAGES);
+            crate::compose::apply_spell_check(row.is_active(), &languages);
+        });
+    }
+
+    // Config → Mail → "Spelling language": maps the combo's index to a WebKit
+    // tag (the first entry, empty, means the system locale) and applies it
+    // live.
+    {
+        let state = state.clone();
+        config_view.spell_languages_row.connect_selected_notify(move |row| {
+            let tag = crate::config_view::SPELL_LANGUAGE_TAGS.get(row.selected() as usize).copied().unwrap_or("");
+            let languages = if tag.is_empty() { Vec::new() } else { vec![tag.to_string()] };
+            state.borrow().settings.set_strv(crate::settings::MAIL_SPELL_CHECK_LANGUAGES, languages.clone());
+            let enabled = state.borrow().settings.get_bool(crate::settings::MAIL_SPELL_CHECK);
+            crate::compose::apply_spell_check(enabled, &languages);
+        });
+    }
+
     // Config → Mail → "Send read receipts automatically": the reading pane's
     // read-receipt policy. Read per message at display time, so a flip
     // affects the next message opened - no re-render needed.
@@ -6665,6 +6737,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.message_theme_dark_row.set_active(persisted.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK));
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
+        config_view.spell_check_row.set_active(persisted.get_bool(crate::settings::MAIL_SPELL_CHECK));
+        {
+            let spell_langs = persisted.get_strv(crate::settings::MAIL_SPELL_CHECK_LANGUAGES);
+            let index = spell_langs
+                .first()
+                .and_then(|tag| crate::config_view::SPELL_LANGUAGE_TAGS.iter().position(|t| t.eq_ignore_ascii_case(tag)))
+                .unwrap_or(0);
+            config_view.spell_languages_row.set_selected(index as u32);
+        }
         config_view.read_receipts_row.set_active(persisted.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS));
         config_view
             .mail_notifications_row
@@ -6940,6 +7021,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 if reading_stack.visible_child_name().as_deref() == Some("message") {
                     let parent: &gtk::Window = window.upcast_ref();
                     print_visible_message(&reading_stack, parent);
+                }
+            }
+        }),
+    );
+    // Check spelling (F7): flips the composer's spellcheck setting and applies
+    // it to the live composer context, confirming with a toast. WebKitGTK has
+    // no spelling dialog, so this is a toggle rather than Outlook's modal.
+    dispatch.insert(
+        crate::shortcuts::ACTION_SPELL,
+        Rc::new({
+            let state = state.clone();
+            move || {
+                let settings = state.borrow().settings.clone();
+                let enabled = !settings.get_bool(crate::settings::MAIL_SPELL_CHECK);
+                settings.set_bool(crate::settings::MAIL_SPELL_CHECK, enabled);
+                let languages = settings.get_strv(crate::settings::MAIL_SPELL_CHECK_LANGUAGES);
+                crate::compose::apply_spell_check(enabled, &languages);
+                if let Some(overlay) = state.borrow().toast_overlay.clone() {
+                    overlay.add_toast(adw::Toast::new(if enabled { "Spelling checks on" } else { "Spelling checks off" }));
                 }
             }
         }),
@@ -12929,6 +13029,7 @@ fn respond_to_imip_invitation(
         calendar_part: Some(reply_ics),
         read_receipt: None,
         request_read_receipt: false,
+        importance: lookout_core::Importance::Normal,
         in_reply_to: invitation.in_reply_to.clone(),
         references: vec![],
         message_id: None,
@@ -13610,6 +13711,17 @@ fn pin_icon_name(pinned: bool) -> &'static str {
 /// handlers, and `refresh_pin_button` below).
 fn set_pin_button_state(button: &gtk::Button, pinned: bool) {
     button.set_icon_name(pin_icon_name(pinned));
+}
+
+/// The message-list importance glyph + tooltip for a message's Outlook
+/// importance (`!` for high, `↓` for low). `Normal` has no glyph and is
+/// never shown; the caller gates on that.
+fn importance_icon_and_tooltip(importance: lookout_core::Importance) -> (&'static str, &'static str) {
+    match importance {
+        lookout_core::Importance::High => ("emblem-important-symbolic", "High importance"),
+        lookout_core::Importance::Low => ("go-down-symbolic", "Low importance"),
+        lookout_core::Importance::Normal => ("emblem-important-symbolic", "Normal importance"),
+    }
 }
 
 /// Sets `pin_button`'s active state to reflect whether the selected
@@ -17581,6 +17693,7 @@ fn send_read_receipt(state: &Rc<RefCell<UiState>>, automatic: bool) -> bool {
             original_headers: context.headers,
         }),
         request_read_receipt: false,
+        importance: lookout_core::Importance::Normal,
         in_reply_to: Some(bare_id.clone()),
         references: vec![bare_id],
         message_id: None,
@@ -18415,6 +18528,8 @@ fn show_composer_in_reading_pane(
         prefill,
         on_done,
         rich_text_default,
+        state.borrow().settings.get_bool(crate::settings::MAIL_SPELL_CHECK),
+        state.borrow().settings.get_strv(crate::settings::MAIL_SPELL_CHECK_LANGUAGES),
         suggestions,
         open_contact_picker,
         on_pop_out,
@@ -18453,8 +18568,16 @@ mod tests {
         // maximized to 2560px, not at whatever default it happened to hold.
         let pct = pane_width_percent(400, 1600).expect("a real window has a width");
         assert_eq!(pct, 25.0);
-        assert_eq!(paned_position_for_percent(pct, 1600, 1500, 100, 300, None), Some(400), "same width: the drag round-trips exactly");
-        assert_eq!(paned_position_for_percent(pct, 2560, 2400, 100, 300, None), Some(640), "maximized: the same share of a wider window");
+        assert_eq!(
+            paned_position_for_percent(pct, 1600, 1500, 100, 300, None),
+            Some(400),
+            "same width: the drag round-trips exactly"
+        );
+        assert_eq!(
+            paned_position_for_percent(pct, 2560, 2400, 100, 300, None),
+            Some(640),
+            "maximized: the same share of a wider window"
+        );
     }
 
     #[test]
@@ -18475,8 +18598,16 @@ mod tests {
 
     #[test]
     fn a_restored_width_stays_within_the_panes_own_bounds() {
-        assert_eq!(paned_position_for_percent(1.0, 1600, 1500, 240, 300, None), Some(240), "clamped up to the start child's minimum");
-        assert_eq!(paned_position_for_percent(90.0, 1600, 1500, 100, 300, None), Some(1200), "clamped down to leave the end child its minimum");
+        assert_eq!(
+            paned_position_for_percent(1.0, 1600, 1500, 240, 300, None),
+            Some(240),
+            "clamped up to the start child's minimum"
+        );
+        assert_eq!(
+            paned_position_for_percent(90.0, 1600, 1500, 100, 300, None),
+            Some(1200),
+            "clamped down to leave the end child its minimum"
+        );
         assert_eq!(
             paned_position_for_percent(50.0, 1600, 1500, 100, 300, Some(FOLDER_PANE_MAX_WIDTH)),
             Some(FOLDER_PANE_MAX_WIDTH),
@@ -18523,7 +18654,10 @@ mod tests {
     #[test]
     fn only_a_drag_within_an_unchanged_allocation_is_saved() {
         let restored = Some(PaneRestoreState { paned_width: 1500, position: 400 });
-        assert!(pane_change_is_a_drag(restored, 1500, 520), "the separator moved while the paned stayed the same size: a drag");
+        assert!(
+            pane_change_is_a_drag(restored, 1500, 520),
+            "the separator moved while the paned stayed the same size: a drag"
+        );
         assert!(!pane_change_is_a_drag(restored, 1500, 400), "the position didn't actually change");
     }
 

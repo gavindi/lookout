@@ -25,6 +25,31 @@ use lookout_core::AccountId;
 /// anchoring widget and the account id (opaque string).
 pub type ManageIdentities = Rc<dyn Fn(&gtk::Widget, &str)>;
 
+/// The spellcheck language picker's choices (Config → Mail): WebKit language
+/// tags in parallel with their display labels. The empty first entry means
+/// "follow the system locale" and is stored as an empty `mail-spell-check-
+/// languages` list.
+pub const SPELL_LANGUAGE_TAGS: &[&str] = &[
+    "", "en_US", "en_GB", "fr_FR", "de_DE", "es_ES", "it_IT", "pt_BR", "nl_NL", "ru_RU", "pl_PL", "tr_TR", "cs_CZ", "ja_JP", "zh_CN",
+];
+pub const SPELL_LANGUAGE_LABELS: &[&str] = &[
+    "System language",
+    "English (United States)",
+    "English (United Kingdom)",
+    "French",
+    "German",
+    "Spanish",
+    "Italian",
+    "Portuguese (Brazil)",
+    "Dutch",
+    "Russian",
+    "Polish",
+    "Turkish",
+    "Czech",
+    "Japanese",
+    "Chinese (Simplified)",
+];
+
 /// The caller's hook for one signature row's actions: takes the anchoring
 /// widget and the signature's id. Used for both editing (opens the signature
 /// editor prefilled) and removing - the caller distinguishes the two by
@@ -245,6 +270,12 @@ pub struct ConfigView {
     /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
     /// `active` state into the composer's default body mode.
     pub rich_text_row: adw::SwitchRow,
+    /// "Check spelling as you type" switch (Config → Mail), exposed so the
+    /// caller can persist it and apply it to the composer's spellchecking.
+    pub spell_check_row: adw::SwitchRow,
+    /// "Spelling language" combo (Config → Mail); its selected index maps to
+    /// `SPELL_LANGUAGE_TAGS`.
+    pub spell_languages_row: adw::ComboRow,
     /// "Send read receipts automatically" switch (Config → Mail), exposed so
     /// the caller can wire its `active` state into the reading pane's
     /// read-receipt policy (read per message at display time).
@@ -544,6 +575,18 @@ pub fn build() -> ConfigView {
         .active(true)
         .build();
     mail_settings_group.add(&rich_text_row);
+    let spell_check_row = adw::SwitchRow::builder()
+        .title("Check spelling as you type")
+        .subtitle("Underline misspelled words in the composer")
+        .active(true)
+        .build();
+    mail_settings_group.add(&spell_check_row);
+    let spell_languages_row = adw::ComboRow::builder()
+        .title("Spelling language")
+        .subtitle("Language to check spelling in")
+        .model(&gtk::StringList::new(SPELL_LANGUAGE_LABELS))
+        .build();
+    mail_settings_group.add(&spell_languages_row);
     let read_receipts_row = adw::SwitchRow::builder()
         .title("Send read receipts automatically")
         .subtitle("Reply with a read receipt when a message asks for one; when off, the reading pane asks first")
@@ -885,6 +928,8 @@ pub fn build() -> ConfigView {
         remote_images_row,
         trusted_senders_row,
         rich_text_row,
+        spell_check_row,
+        spell_languages_row,
         read_receipts_row,
         mail_notifications_row,
         dock_badge_row,

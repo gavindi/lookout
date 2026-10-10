@@ -157,6 +157,16 @@
       <default>true</default>
       <summary>Start new messages in the formatted editor</summary>
     </key>
+    <key name="mail-spell-check" type="b">
+      <default>true</default>
+      <summary>Check spelling as you type</summary>
+      <description>Turn on WebKit's spellchecking in the composer, underlining misspelled words.</description>
+    </key>
+    <key name="mail-spell-check-languages" type="as">
+      <default>[]</default>
+      <summary>Spelling languages</summary>
+      <description>WebKit language tags (e.g. "en_US") to check spelling in. Empty means the system locale's language.</description>
+    </key>
     <key name="mail-message-theme-dark" type="b">
       <default>false</default>
       <summary>Open HTML messages in dark mode</summary>

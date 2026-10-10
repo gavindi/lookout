@@ -79,6 +79,12 @@ pub const MAIL_THREADED: &str = "mail-threaded";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
+/// Config → Mail → "Check spelling as you type": whether the composer's
+/// WebKit view spellchecks as the user types.
+pub const MAIL_SPELL_CHECK: &str = "mail-spell-check";
+/// Config → Mail → "Spelling languages": WebKit language tags (`en_US`) to
+/// spellcheck in; empty means the system locale's language.
+pub const MAIL_SPELL_CHECK_LANGUAGES: &str = "mail-spell-check-languages";
 /// Config → Appearance → "Dark message theme": whether newly-opened HTML
 /// messages start with the reading pane's "Switch message theme" override
 /// already on - background stripped, colours inverted - instead of in their
@@ -230,6 +236,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
+    map.insert(MAIL_SPELL_CHECK, Value::Bool(true));
+    map.insert(MAIL_SPELL_CHECK_LANGUAGES, Value::Strv(Vec::new()));
     map.insert(MAIL_MESSAGE_THEME_DARK, Value::Bool(false));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(CALENDAR_WEEK_START, Value::Int(0));

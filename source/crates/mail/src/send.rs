@@ -93,6 +93,11 @@ pub struct ComposedMessage {
     /// RFC 5322 `Reply-To` addresses, from the sending identity.
     pub reply_to: Vec<String>,
     pub subject: String,
+    /// Message importance (Outlook's High/Normal/Low). `Normal` is the
+    /// default and emits no header; `High`/`Low` are written by
+    /// `build_raw_message` as the three Outlook headers (`Importance`,
+    /// `X-Priority`, `X-MSMail-Priority`) via the Phase 0.1 interop layer.
+    pub importance: lookout_core::Importance,
     pub text_body: String,
     /// Optional HTML rendering of the same body. Both parts are sent when
     /// set; recipients that only handle plain text fall back to `text_body`.
@@ -203,6 +208,13 @@ pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>
         // identity's own address, so a recipient's client knows whom to
         // answer. Sent bare (no display name), as the RFC's examples do.
         builder = builder.header("Disposition-Notification-To", raw_header(msg.from.clone()));
+    }
+    // Outlook's importance headers (RFC 2156 `Importance`, `X-Priority`,
+    // `X-MSMail-Priority`). Normal is left off the wire, matching Outlook.
+    if msg.importance != lookout_core::Importance::Normal {
+        for (name, value) in lookout_core::importance_headers(msg.importance) {
+            builder = builder.header(name, raw_header(value));
+        }
     }
     if let Some(receipt) = &msg.read_receipt {
         // RFC 8098 §3: a `multipart/report; report-type=disposition-notification`
@@ -458,6 +470,7 @@ mod tests {
             calendar_part: None,
             read_receipt: None,
             request_read_receipt: false,
+            importance: lookout_core::Importance::Normal,
             in_reply_to: None,
             references: vec![],
             message_id: None,
@@ -697,6 +710,28 @@ mod tests {
 
         let raw = raw_to_string(&sample_message(None));
         assert!(!raw.to_lowercase().contains("reply-to"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn importance_headers_are_emitted_for_high_and_low_but_not_normal() {
+        // Normal is left off the wire, matching Outlook.
+        let raw = raw_to_string(&sample_message(None));
+        assert!(!raw.contains("Importance:"), "raw:\n{raw}");
+        assert!(!raw.contains("X-Priority:"), "raw:\n{raw}");
+        assert!(!raw.contains("X-MSMail-Priority:"), "raw:\n{raw}");
+
+        let mut msg = sample_message(None);
+        msg.importance = lookout_core::Importance::High;
+        let raw = raw_to_string(&msg);
+        assert!(raw.contains("Importance: High"), "raw:\n{raw}");
+        assert!(raw.contains("X-Priority: 1 (Highest)"), "raw:\n{raw}");
+        assert!(raw.contains("X-MSMail-Priority: High"), "raw:\n{raw}");
+
+        msg.importance = lookout_core::Importance::Low;
+        let raw = raw_to_string(&msg);
+        assert!(raw.contains("Importance: Low"), "raw:\n{raw}");
+        assert!(raw.contains("X-Priority: 5 (Lowest)"), "raw:\n{raw}");
+        assert!(raw.contains("X-MSMail-Priority: Low"), "raw:\n{raw}");
     }
 
     #[test]

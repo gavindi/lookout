@@ -66,6 +66,10 @@ pub const ACTION_PIN: &str = "flag";
 pub const ACTION_MARK_READ: &str = "mark-read";
 pub const ACTION_UNDO: &str = "undo";
 pub const ACTION_PRINT: &str = "print";
+/// Toggles the composer's spellchecking (item 1.1 / C-02). Unlike Outlook's
+/// classic spelling dialog, WebKitGTK exposes no such dialog - F7 here flips
+/// spelling checks on/off and confirms with a toast.
+pub const ACTION_SPELL: &str = "spell-check";
 pub const ACTION_SEARCH: &str = "search";
 pub const ACTION_CLOSE_PANE: &str = "close-pane";
 pub const ACTION_MAIL: &str = "mail";
@@ -160,6 +164,12 @@ pub const DEFAULT_SHORTCUTS: &[DefaultShortcut] = &[
         title: "Print",
         keyval: gdk::Key::p,
         modifiers: CONTROL,
+    },
+    DefaultShortcut {
+        action: ACTION_SPELL,
+        title: "Check spelling",
+        keyval: gdk::Key::F7,
+        modifiers: gdk::ModifierType::empty(),
     },
     DefaultShortcut {
         action: ACTION_SEARCH,
@@ -501,7 +511,7 @@ mod tests {
             let key = d.keyval.to_lower();
             assert!(chords.insert((d.modifiers & MODIFIER_MASK, key)), "duplicate chord for {}", d.action);
         }
-        assert_eq!(actions.len(), 20);
+        assert_eq!(actions.len(), 21);
     }
 
     #[test]
