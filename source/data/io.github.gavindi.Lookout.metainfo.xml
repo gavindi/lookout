@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.163" date="2026-10-11">
+      <description>
+        <p>Messages can now be opened in their own read-only window - double-click a message in the list (or press Enter) and it opens separately from the main window, with Esc closing it. The reading pane's "More" menu also gains "View message details…", which shows a message's key fields, its full internet headers and its raw source.</p>
+      </description>
+    </release>
     <release version="0.9.162" date="2026-10-11">
       <description>
         <p>The message list can now be arranged by Size, Importance, Flag, Category, To or Attachments as well as Date, Sender and Subject, each grouped under its own headers. The filter menu offers independent, combinable filters - Unread, Flagged, Has files, High importance, Categorized and To me. Opening a message no longer always marks it read straight away: Settings → Mail adds a "Mark as read" choice of When selection changes (the new default), When opened, After a delay or Never.</p>

@@ -1309,6 +1309,14 @@ impl MessageListModel {
         }
     }
 
+    /// The `EmailSummary` at flat list position `position`, or `None` for a
+    /// section/thread header row. Used by the message list view's `activate`
+    /// handler (Enter / double-click), whose position is relative to the
+    /// same model (`selection`) `summary_at` walks.
+    pub fn summary_at_position(&self, position: u32) -> Option<EmailSummary> {
+        self.summary_at(position)
+    }
+
     /// The full `EmailSummary` at flat position `i`, or `None` if that row is
     /// a section or thread header. Like `message_at`, but cloning the whole
     /// summary rather than just its `(mailbox, uid)` identity - `message_at`

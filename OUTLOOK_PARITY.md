@@ -42,7 +42,7 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 12 | 15 | 17 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps, undo. No winmail.dat or `.msg`. |
+| Mail (5.1) | 14 | 15 | 15 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps, undo. No winmail.dat or `.msg`. |
 | Compose (5.2) | 4 | 5 | 13 | 1 | Good rich editor and identities. No spell check, schedule send, importance, emoji, draft reopen, or forwarding with attachments. |
 | Calendar (5.3) | 7 | 14 | 14 | 0 | Views and drag-to-edit are good. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No week-start, working-hours or time-zone settings. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
@@ -50,7 +50,7 @@ Counts are tallied from the §5 tables.
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **37** | **49** | **66** | **5** | ~24% at parity, ~33% partial |
+| **Total** | **39** | **49** | **64** | **5** | ~26% at parity, ~32% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -262,8 +262,8 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-27 | Delivery receipts (DSN) | — | ❌ | §4.1 |
 | M-28 | Print | `print_visible_message` | ✅ | — |
 | M-29 | Save as `.eml` / `.msg` / PDF | `.eml` via More menu and drag-out | 🟡 | `.msg`, "Save as PDF" via print-to-file |
-| M-30 | View source / message headers | Debug `.eml` viewer only | ❌ | "View message details" dialog (headers, raw source) |
-| M-31 | Open message in new window | Pop-out only for compose and People | ❌ | |
+| M-30 | View source / message headers | "View message details…" dialog (`window.rs`): parsed key fields, full header block, raw source via `FetchRawMessage`; debug `.eml` viewer retained | ✅ | — |
+| M-31 | Open message in new window | Double-click/Enter or ⋯ "Open in new window": standalone read-only `adw::Window` (`message_window.rs`), raw-based render, theme toggle, attachment strip, remote-content banner | ✅ | — |
 | M-32 | Attachment preview | Inline `cid:` images; Open / Open with / Save | 🟡 | In-app preview for PDF, images, text (Office via LibreOffice conversion, optional) |
 | M-33 | Download / save all attachments, zip | Per-attachment save | 🟡 | "Save all", "Download as zip" (the retired `TODO.md` noted the zip variant was missing) |
 | M-34 | Remote content / trusted senders | `core/src/trust.rs`, `app/src/trusted_senders.rs` | ✅ | — |
@@ -494,7 +494,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 | UX-34 | Attachments in reading pane | Tiles (file-type icon, name, size) under the header; each tile ▾: Preview, Download, Save to…; "Download all" / "Save all" link | Attachment rows with a ☰ menu (Open / Open with / Save) ✅ | Tile layout, Preview as the default click (M-32, 7.3), "Download all" (M-33) | S |
 | UX-35 | Conversation in reading pane | Stacked message cards, newest on top (option): older collapsed to sender + one-line preview, click to expand; inline "Reply" at the top | One message at a time | Implement with 1.7 (M-04) | L |
 | UX-36 | Message context menu | Reply, Reply all, Forward · Delete, Archive, Move ▸, Copy ▸ · Mark as unread, Flag ▸, Pin, Snooze ▸, Categorize ▸ · Ignore, Report ▸, Block ▸ · Rules ▸ Create rule · View ▸ · Open in new window, Print | Category toggles only | Exactly this list and order (M-38, 1.17) | M |
-| UX-37 | Default open / navigation | Single-click selects (marks read per setting); **double-click or Enter opens a separate window**; after delete/move: "open next item" (setting: next / previous / return to list); Esc closes a popped-out item | Single-click opens in the pane; double-click/Enter do nothing extra; Esc **closes the reading pane** | Double-click/Enter → new window (M-31). "After moving or deleting" setting. Esc should close popped windows, not hide the reading pane (remap Lookout's close-pane action, or keep it only in the Lookout keymap) | S |
+| UX-37 | Default open / navigation | Single-click selects (marks read per setting); **double-click or Enter opens a separate window**; after delete/move: "open next item" (setting: next / previous / return to list); Esc closes a popped-out item | Single-click opens in the pane; double-click/Enter open a standalone window (1.9); Esc closes that window, and **hides** the reading pane in the main window | "After moving or deleting" setting. Esc should close popped-out items in the main window too, not hide the reading pane (remap Lookout's close-pane action, or keep it only in the Lookout keymap) | S |
 | UX-38 | Drag and drop | Drag to a folder = move; **Ctrl+drag = copy**; drag onto the Calendar app icon / My Day calendar = new event; onto To Do = task; onto a category is not supported | Rows → folders/tags; out as `.eml` ✅ | Add Ctrl=copy, drop on nav-rail Calendar/Tasks icons and My Day (UX-18). Keep drop-on-category (a Lookout extra) | S |
 | UX-39 | Sender avatars | Contact photo if known, else coloured initials; setting "Show sender images" | Coloured initials ✅ | Photos from vCard / Graph (P-03); on/off setting | S |
 
@@ -609,8 +609,8 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.6 | ✅ ~~More sort keys and filters~~ | M-07, M-08 | Extend `SortKey` (Size, Importance, Flag, Category, To, Attachments) and the filter set; group headers per key | M |
 | 1.7 | Conversation options | M-04 | Newest-on-top/bottom setting; stacked conversation rendering in the reading pane (one WebKit view with collapsible messages) | L |
 | 1.8 | ✅ ~~Mark-as-read options~~ | M-22 | Setting: on open, after N seconds, on selection change, never | S |
-| 1.9 | Message in new window | M-31 | Reuse the reading-pane builder in an `adw::Window`; double-click and Enter open it | M |
-| 1.10 | View message details / source | M-30 | Dialog with parsed headers plus raw source (via `FetchRawMessage`) | S |
+| 1.9 | ✅ ~~Message in new window~~ | M-31 | Reuse the reading-pane builder in an `adw::Window`; double-click and Enter open it | M |
+| 1.10 | ✅ ~~View message details / source~~ | M-30 | Dialog with parsed headers plus raw source (via `FetchRawMessage`) | S |
 | 1.11 | Forward with attachments; forward as attachment | C-13 | Fetch original parts (`FetchAttachment`) into the composer; `message/rfc822` part | M |
 | 1.12 | Reopen drafts | C-12 | Open a Drafts message → parse MIME → composer prefill (identity, recipients, HTML, attachments); replace on save | M |
 | 1.13 | Undo send / undo actions | M-21, C-09 | 0.3 delay (setting 0/5/10 s) plus 0.4 for move/delete/flag/archive | M |

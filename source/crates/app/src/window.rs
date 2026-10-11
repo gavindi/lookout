@@ -564,7 +564,7 @@ const MAX_TAG_DOTS: usize = 3;
 /// backstop that guarantees the button can never be stuck on "Fetching…"
 /// forever. Generous: the fetch is a single IMAP literal, and multi-megabyte
 /// attachments over slow connections legitimately take a while.
-const ATTACHMENT_FETCH_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const ATTACHMENT_FETCH_TIMEOUT_MS: u64 = 60_000;
 
 /// How many session events may queue before the session stalls on send. The
 /// UI drains each loop's channel in batches and collapses whole-snapshot
@@ -602,7 +602,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// are gone above, only the text and any remaining accent colours invert -
 /// against the app theme's background, which is untouched by the page's
 /// filter.
-const MESSAGE_THEME_OVERRIDE_CSS: &str = "\
+pub(crate) const MESSAGE_THEME_OVERRIDE_CSS: &str = "\
 html, body {
     background-color: transparent !important;
     background-image: none !important;
@@ -662,6 +662,33 @@ struct PendingRawMessage {
     mailbox: MailboxId,
     uid: Uid,
     initial_name: String,
+}
+
+/// The single "Message details" dialog (item 1.10 / M-30) while one is open,
+/// tracked in `UiState::message_details`: its window plus the widgets the
+/// async raw-message reply fills, and the `(mailbox, uid)` it belongs to so
+/// `AccountEvent::RawMessageFetched` can route the bytes to it. One at a
+/// time, like `compose_popout_window`; opening it for the same message
+/// re-presents the existing dialog. Unlike the .eml export, this request is
+/// not tied to the list selection - navigating the reading pane while the
+/// dialog is open must not cancel it.
+struct MessageDetailsDialog {
+    window: adw::Window,
+    mailbox: MailboxId,
+    uid: Uid,
+    /// Whether the raw bytes have been applied; a second arrival (a Retry)
+    /// simply overwrites.
+    fetched: bool,
+    /// The pages below the header: "loading" (spinner), "content" (the two
+    /// text views), "error".
+    status_stack: gtk::Stack,
+    /// The "Internet headers" text view, filled from the parsed header block.
+    headers_view: gtk::TextView,
+    /// The raw RFC 5322 source text view.
+    source_view: gtk::TextView,
+    /// The failure page's message label, set when the fetch errors or times
+    /// out.
+    error_label: gtk::Label,
 }
 
 /// Marks a value as `Send` so it can cross from WebKit's scheme-handler
@@ -878,6 +905,20 @@ pub(crate) struct UiState {
     /// away first, in which case the late response is dropped as stale). See
     /// `PendingRawMessage`.
     pending_raw_message: Option<PendingRawMessage>,
+    /// Open "message in new window" pop-outs (item 1.9 / M-31), keyed by
+    /// `(mailbox, uid)` - one window per message; `open_message_window`
+    /// re-presents an existing window instead of opening a second. The stored
+    /// `Rc` keeps the window alive (GTK only keeps a presented window alive
+    /// while a strong reference exists), and the window's close handler
+    /// removes its entry. `message_is_visible` treats a match here as "on
+    /// screen" for the attachment flows, so opening an
+    /// attachment from a pop-out completes even when the reading pane has
+    /// since moved to a different message.
+    pub(crate) message_windows: HashMap<(MailboxId, Uid), Rc<RefCell<crate::message_window::MessageWindowState>>>,
+    /// The "Message details" dialog (item 1.10 / M-30), while one is open.
+    /// One at a time; `RawMessageFetched` routes the dialog's raw bytes here.
+    /// See `MessageDetailsDialog`.
+    message_details: Option<MessageDetailsDialog>,
     /// Inline `cid:` image fetches in flight for the message on the reading
     /// pane, keyed by `BodyPart::part_number`. A message can embed several
     /// images, so - unlike `pending_attachment` - this is a map. Each entry
@@ -1260,6 +1301,28 @@ impl UiState {
             disabled.push(id.0.clone());
         }
         self.settings.set_strv(crate::settings::ACCOUNTS_DISABLED, disabled);
+    }
+
+    /// A recently-viewed message body from the in-memory LRU, if any - the
+    /// pop-out message window (item 1.9) and its reply buttons read this
+    /// instead of the reading pane's single-message fetch state. `&mut`
+    /// because `BodyCache::get` promotes the hit (LRU).
+    pub(crate) fn cached_body(&mut self, mailbox: &MailboxId, uid: Uid) -> Option<EmailBody> {
+        self.body_cache.get(mailbox, &uid)
+    }
+
+    /// Config → Mail → "Rich text": the body-mode default new composers open
+    /// with. Read by the pop-out window's reply/forward actions, which open
+    /// the composer from outside `build_window`'s scope.
+    pub(crate) fn rich_text_default(&self) -> bool {
+        self.rich_text_default
+    }
+
+    /// Config → Appearance → "Dark message theme": the state the per-message
+    /// theme override opens in. Read by the pop-out message window (item
+    /// 1.9), which has no reading-pane navigation to reset it from.
+    pub(crate) fn message_theme_dark_default(&self) -> bool {
+        self.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK)
     }
 }
 
@@ -2327,6 +2390,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         body_fetch_generation: 0,
         pending_attachment: None,
         pending_raw_message: None,
+        message_windows: HashMap::new(),
+        message_details: None,
         unsubscribe_info: None,
         unsubscribe_dismissed: None,
         imip: None,
@@ -3313,6 +3378,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // whether the user is at the top of the list when a rebuild lands, and the
     // view to put them back there if they were (see `pin_to_top`).
     message_list.attach_scroller(&message_scroller, &message_list_view);
+    // Double-click / Enter on a message opens it in its own window (item
+    // 1.9, Outlook's UX-37): `GtkListView::activate` fires for both, and the
+    // row factory's `bind` has already made message rows activatable and
+    // header rows not, so a header can't get here. The window itself is
+    // built on demand; the main window (the replies' composer destination)
+    // is resolved from the view's root at activation time, since it doesn't
+    // exist yet in `build_window`'s scope here.
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let reading_stack = reading_stack.clone();
+        message_list_view.connect_activate(move |view, position| {
+            let Some(summary) = message_list.summary_at_position(position) else { return };
+            let Some(parent) = view.root().and_downcast::<adw::ApplicationWindow>() else { return };
+            crate::message_window::open_message_window(&parent, &state, &worker, &reading_stack, &summary);
+        });
+    }
     // Shown instead of the list while the folder on screen is empty and its
     // sync is still outstanding - see `refresh_message_loading_state`.
     // Without this, the empty list a folder switch eagerly paints (see
@@ -4657,11 +4740,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let message_list = message_list.clone();
         let state = state.clone();
+        let worker_for_menu = worker.clone();
         let reading_stack_for_menu = reading_stack.clone();
         let more_popover_for_menu = more_popover.clone();
         more_popover.connect_show(move |popover| {
             let has_selection = message_list.selected_summary().is_some();
-            let menu = build_more_menu(has_selection, &message_list, &state, &reading_stack_for_menu, &more_popover_for_menu);
+            let menu = build_more_menu(has_selection, &message_list, &state, &worker_for_menu, &reading_stack_for_menu, &more_popover_for_menu);
             popover.set_child(Some(&menu));
         });
     }
@@ -10834,7 +10918,7 @@ fn spawn_account_event_loop(
                         // bookkeeping.
                         let pending = {
                             let mut st = state.borrow_mut();
-                            let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
+                            let on_screen = message_is_visible(&st, &mailbox, uid);
                             if !on_screen {
                                 st.pending_attachment = None;
                                 None
@@ -10888,7 +10972,7 @@ fn spawn_account_event_loop(
                         // it stuck.
                         let pending = {
                             let mut st = state.borrow_mut();
-                            let on_screen = st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid));
+                            let on_screen = message_is_visible(&st, &mailbox, uid);
                             if !on_screen {
                                 st.pending_attachment = None;
                                 None
@@ -10920,6 +11004,14 @@ fn spawn_account_event_loop(
                         }
                     }
                     AccountEvent::RawMessageFetched { mailbox, uid, bytes } => {
+                        // A "message in new window" pop-out (item 1.9) waiting
+                        // on these bytes renders them; independent of the
+                        // export below, since both can be in flight for the
+                        // same message at once.
+                        crate::message_window::deliver_raw(&state, &mailbox, uid, &bytes);
+                        // The "Message details" dialog (item 1.10), if one is
+                        // waiting for this exact message's source.
+                        deliver_raw_to_details_dialog(&state, &mailbox, uid, &bytes);
                         // The .eml export's whole raw message arrived. Only act if
                         // it belongs to the outstanding export request; a response
                         // that lands after the user selected a different message
@@ -10944,6 +11036,11 @@ fn spawn_account_event_loop(
                         }
                     }
                     AccountEvent::RawMessageFetchFailed { mailbox, uid, message } => {
+                        // Tell a pop-out window (item 1.9) or the "Message
+                        // details" dialog (item 1.10) waiting on this fetch
+                        // what went wrong, so neither is left on its spinner.
+                        crate::message_window::deliver_error(&state, &mailbox, uid, &message);
+                        deliver_raw_error_to_details_dialog(&state, &mailbox, uid, &message);
                         // The session couldn't produce the raw message. Clear the
                         // pending export (so a later click can retry) and tell the
                         // user what went wrong - never leave it stuck.
@@ -13991,7 +14088,7 @@ fn show_calendar_dialog(
     dialog.present();
 }
 
-fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
+pub(crate) fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
     mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
 }
 
@@ -14387,12 +14484,14 @@ fn handle_keyword_drag_drop(state: &Rc<RefCell<UiState>>, key: &str, value: &gli
     sent
 }
 
-/// Builds the "More" menu popover's contents: "Save as .eml…" exports the
+/// Builds the "More" menu popover's contents: "Open in new window" opens the
+/// selected message in its own window (item 1.9), "View message details…"
+/// shows the details/source dialog (item 1.10), "Save as .eml…" exports the
 /// selected message's whole raw RFC 5322 bytes to a file, and "Print…" sends
 /// the visible body through WebKit's print pipeline. Rebuilt on every popover
 /// `show` (like the categorize menu) so each item's sensitivity tracks
 /// whether a message is selected when the menu opens.
-fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, popover: &gtk::Popover) -> gtk::Box {
+fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, popover: &gtk::Popover) -> gtk::Box {
     let boxed = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -14401,6 +14500,36 @@ fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: 
         .margin_start(6)
         .margin_end(6)
         .build();
+    let open_window = gtk::Button::builder().label("Open in new window").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    open_window.set_sensitive(has_selection);
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let reading_stack = reading_stack.clone();
+        let popover = popover.clone();
+        open_window.connect_clicked(move |_| {
+            popover.popdown();
+            let Some(parent) = popover.root().and_downcast::<adw::ApplicationWindow>() else { return };
+            let Some(summary) = message_list.selected_summary() else { return };
+            crate::message_window::open_message_window(&parent, &state, &worker, &reading_stack, &summary);
+        });
+    }
+    boxed.append(&open_window);
+    let details_button = gtk::Button::builder().label("View message details…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    details_button.set_sensitive(has_selection);
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        details_button.connect_clicked(move |_| {
+            popover.popdown();
+            let Some(parent) = popover.root().and_downcast::<adw::ApplicationWindow>() else { return };
+            let Some(summary) = message_list.selected_summary() else { return };
+            show_message_details_dialog(&state, &parent, &summary);
+        });
+    }
+    boxed.append(&details_button);
     let save_eml = gtk::Button::builder().label("Save as .eml…").css_classes(["flat"]).halign(gtk::Align::Start).build();
     save_eml.set_sensitive(has_selection);
     {
@@ -16159,6 +16288,19 @@ fn selected_message_reply_context(
     Some((summary, body, handle.email.clone(), handle.cmd_tx.clone()))
 }
 
+/// The account context a reply/forward from a pop-out message window (item
+/// 1.9) needs: the sending identity's address and the account's command
+/// channel. The body is resolved separately by the caller (the window's own
+/// parsed body, falling back to the body cache) so this stays independent of
+/// the LRU. `None` when the message's account isn't connected - the caller
+/// is then a silent no-op, same convention as `selected_message_reply_context`.
+pub(crate) fn reply_send_context(state: &Rc<RefCell<UiState>>, summary: &EmailSummary) -> Option<(String, async_channel::Sender<AccountCommand>)> {
+    let account_id = mailbox_account_id(&summary.mailbox)?;
+    let st = state.borrow();
+    let handle = st.accounts.get(&account_id)?;
+    Some((handle.email.clone(), handle.cmd_tx.clone()))
+}
+
 /// Opens a new-message composer in the reading pane for the best-guess
 /// account: the selected message's account, else the open mailbox's, else
 /// any connected account - exactly the toolbar compose button's logic,
@@ -17624,7 +17766,7 @@ fn attachment_display_name(part: &BodyPart) -> String {
 /// account session for that part's bytes on demand (`FetchAttachment`). The
 /// strip is hidden when the message has no attachments. One action is in
 /// flight at a time, tracked as the single `UiState::pending_attachment`.
-fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, mailbox: &MailboxId, uid: Uid, parts: &[BodyPart]) {
+pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, mailbox: &MailboxId, uid: Uid, parts: &[BodyPart]) {
     let Some(strip) = find_attachment_strip(reading_stack) else { return };
     // A previous render's in-flight action belongs to the message being
     // replaced; any late `PartFetched` for it is discarded as stale.
@@ -17898,6 +18040,342 @@ fn eml_suggested_name(summary: &EmailSummary) -> String {
     }
 }
 
+/// The most of a raw message the details dialog's Source page will display.
+/// A message with a multi-megabyte base64 attachment would otherwise hand
+/// `GtkTextView` an enormous document and stall the UI; truncation is
+/// announced inline, and the full bytes remain available through
+/// "Save as .eml…".
+const MESSAGE_SOURCE_DISPLAY_CAP: usize = 4 * 1024 * 1024;
+
+/// Opens Outlook's "View message details" dialog (item 1.10 / M-30): the
+/// message's key fields, its full parsed internet-header block, and the raw
+/// RFC 5322 source on a Source tab. The key fields come from the summary so
+/// they render immediately; the header block renders from the body cache
+/// when the message has already been read this session, and both the header
+/// block and the source fill in when `FetchRawMessage` answers
+/// (`deliver_raw_to_details_dialog`). One dialog at a time - opening it for
+/// the same message re-presents the existing one, and for a different
+/// message replaces it.
+fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: &adw::ApplicationWindow, summary: &EmailSummary) {
+    // Re-present an existing dialog opened for the same message.
+    {
+        let st = state.borrow();
+        if let Some(existing) = st.message_details.as_ref() {
+            if existing.mailbox == summary.mailbox && existing.uid == summary.uid {
+                existing.window.present();
+                return;
+            }
+        }
+    }
+    // A dialog open for a different message is replaced: take it out of the
+    // slot first (so its close handler sees nothing to clear), then close it.
+    let previous = state.borrow_mut().message_details.take();
+    if let Some(previous) = previous {
+        previous.window.close();
+    }
+
+    let window = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Message details")
+        .default_width(780)
+        .default_height(640)
+        .build();
+    let header = adw::HeaderBar::new();
+    let close_button = gtk::Button::from_icon_name("window-close-symbolic");
+    close_button.set_css_classes(&["flat"]);
+    close_button.set_tooltip_text(Some("Close"));
+    header.pack_end(&close_button);
+
+    let switcher = adw::ViewSwitcher::builder().policy(adw::ViewSwitcherPolicy::Wide).build();
+    header.set_title_widget(Some(&switcher));
+
+    let stack = adw::ViewStack::new();
+
+    // --- Details page: key fields, then the full parsed header block. ---
+    let details_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    let fields = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    for (caption, value) in message_detail_fields(summary) {
+        fields.append(&message_detail_row(&caption, &value));
+    }
+    details_content.append(&fields);
+    details_content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    details_content.append(&gtk::Label::builder().label("Internet headers").xalign(0.0).css_classes(["heading"]).build());
+    let headers_view = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    // Seed the header block from the body cache when the message has already
+    // been read this session; the raw fetch overwrites it with the
+    // authoritative block when it lands.
+    let cached_headers = state.borrow_mut().cached_body(&summary.mailbox, summary.uid).map(|body| body.headers);
+    headers_view.buffer().set_text(&match &cached_headers {
+        Some(headers) => format_header_block(headers),
+        None => "Loading…".to_string(),
+    });
+    let headers_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .min_content_height(200)
+        .child(&headers_view)
+        .build();
+    details_content.append(&headers_scroller);
+    let details_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&details_content)
+        .build();
+    stack.add_titled(&details_scroller, Some("details"), "Details");
+
+    // --- Source page: the raw message, with loading / error states. ---
+    let source_view = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::None)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    let source_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&source_view)
+        .build();
+    let loading = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .vexpand(true)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .build();
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    loading.append(&spinner);
+    loading.append(&gtk::Label::builder().label("Loading message source…").css_classes(["dim-label"]).build());
+    let error_label = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).css_classes(["dim-label"]).build();
+    let retry_button = gtk::Button::with_label("Retry");
+    retry_button.add_css_class("suggested-action");
+    let error_page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .vexpand(true)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .build();
+    error_page.append(&error_label);
+    error_page.append(&retry_button);
+    let status_stack = gtk::Stack::new();
+    status_stack.set_transition_type(gtk::StackTransitionType::None);
+    status_stack.add_named(&loading, Some("loading"));
+    status_stack.add_named(&source_scroller, Some("content"));
+    status_stack.add_named(&error_page, Some("error"));
+    status_stack.set_visible_child_name("loading");
+    stack.add_titled(&status_stack, Some("source"), "Source");
+    switcher.set_stack(Some(&stack));
+    stack.set_vexpand(true);
+
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    content.append(&header);
+    content.append(&stack);
+    window.set_content(Some(&content));
+
+    {
+        let window = window.clone();
+        close_button.connect_clicked(move |_| window.close());
+    }
+    {
+        // Esc closes the dialog, like every other dialog in the app.
+        let keys = gtk::EventControllerKey::new();
+        {
+            let window = window.clone();
+            keys.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    window.close();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+        }
+        window.add_controller(keys);
+    }
+    {
+        let state = state.clone();
+        let mailbox = summary.mailbox.clone();
+        let uid = summary.uid;
+        let status_stack = status_stack.clone();
+        let error_label = error_label.clone();
+        retry_button.connect_clicked(move |_| {
+            if send_fetch_raw_message(&state, &mailbox, uid) {
+                status_stack.set_visible_child_name("loading");
+            } else {
+                error_label.set_text("The message source can't be loaded while the account is offline.");
+                status_stack.set_visible_child_name("error");
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let window_for_clear = window.clone();
+        window.connect_close_request(move |_| {
+            let mut st = state.borrow_mut();
+            if st.message_details.as_ref().is_some_and(|d| d.window == window_for_clear) {
+                st.message_details = None;
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    state.borrow_mut().message_details = Some(MessageDetailsDialog {
+        window: window.clone(),
+        mailbox: summary.mailbox.clone(),
+        uid: summary.uid,
+        fetched: false,
+        status_stack: status_stack.clone(),
+        headers_view: headers_view.clone(),
+        source_view: source_view.clone(),
+        error_label: error_label.clone(),
+    });
+    if !send_fetch_raw_message(state, &summary.mailbox, summary.uid) {
+        error_label.set_text("The message source can't be loaded while the account is offline.");
+        status_stack.set_visible_child_name("error");
+        if cached_headers.is_none() {
+            headers_view.buffer().set_text("The message headers can't be loaded while the account is offline.");
+        }
+    } else {
+        // Backstop: a fetch lost to a reconnect must not leave the dialog on
+        // its spinner forever. Only fires while this exact dialog still owns
+        // the request and nothing has filled it.
+        let state = state.clone();
+        let mailbox = summary.mailbox.clone();
+        let uid = summary.uid;
+        let headers_view = headers_view.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+            let mut st = state.borrow_mut();
+            let stale = st.message_details.as_ref().is_some_and(|d| d.mailbox == mailbox && d.uid == uid && !d.fetched);
+            if stale {
+                if let Some(d) = st.message_details.as_mut() {
+                    d.error_label.set_text("Loading the message source timed out.");
+                    d.status_stack.set_visible_child_name("error");
+                }
+                headers_view.buffer().set_text("Loading the message headers timed out.");
+            }
+        });
+    }
+    window.present();
+}
+
+/// Routes a fetched raw message to the "Message details" dialog (item 1.10)
+/// when one is open for exactly this message. Arrivals for anything else are
+/// ignored, so a dialog closed (or replaced) mid-fetch never shows stale
+/// bytes.
+fn deliver_raw_to_details_dialog(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, bytes: &[u8]) {
+    let matching = {
+        let st = state.borrow();
+        st.message_details.as_ref().is_some_and(|d| d.mailbox == *mailbox && d.uid == uid)
+    };
+    if !matching {
+        return;
+    }
+    let headers = lookout_mail::body::parse_headers_section(bytes);
+    let source = message_source_text(bytes);
+    let mut st = state.borrow_mut();
+    let Some(d) = st.message_details.as_mut() else { return };
+    d.headers_view.buffer().set_text(&format_header_block(&headers));
+    d.source_view.buffer().set_text(&source);
+    d.status_stack.set_visible_child_name("content");
+    d.fetched = true;
+}
+
+/// Shows the failure page of the "Message details" dialog for a failed (or
+/// timed-out) raw fetch, when the dialog still belongs to this message.
+fn deliver_raw_error_to_details_dialog(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, message: &str) {
+    let mut st = state.borrow_mut();
+    let Some(d) = st.message_details.as_mut() else { return };
+    if d.mailbox != *mailbox || d.uid != uid {
+        return;
+    }
+    d.error_label.set_text(&format!("The message source couldn't be loaded: {message}"));
+    d.status_stack.set_visible_child_name("error");
+    d.fetched = true;
+}
+
+/// The key fields shown at the top of the details dialog. Built from the
+/// summary so the dialog has content the instant it opens - the raw source
+/// may still be in flight.
+fn message_detail_fields(summary: &EmailSummary) -> Vec<(String, String)> {
+    let addresses = |list: &[EmailAddress]| list.iter().map(|a| a.display_label()).collect::<Vec<_>>().join(", ");
+    let mut fields = vec![
+        ("From".to_string(), addresses(&summary.from)),
+        ("To".to_string(), addresses(&summary.to)),
+    ];
+    if !summary.cc.is_empty() {
+        fields.push(("Cc".to_string(), addresses(&summary.cc)));
+    }
+    fields.push(("Subject".to_string(), summary.subject.clone().unwrap_or_else(|| "(no subject)".to_string())));
+    fields.push((
+        "Date".to_string(),
+        summary.date.with_timezone(&chrono::Local).format("%a %d/%m/%Y %I:%M %p").to_string(),
+    ));
+    if let Some(message_id) = &summary.message_id {
+        fields.push(("Message ID".to_string(), message_id.clone()));
+    }
+    fields
+}
+
+/// One caption/value row of the details dialog's key-fields block. The value
+/// is selectable so an address or Message-ID can be copied out.
+fn message_detail_row(caption: &str, value: &str) -> gtk::Box {
+    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
+    let caption_label = gtk::Label::builder()
+        .label(caption)
+        .xalign(0.0)
+        .width_request(96)
+        .css_classes(["dim-label"])
+        .valign(gtk::Align::Start)
+        .build();
+    let value_label = gtk::Label::builder().label(value).xalign(0.0).wrap(true).selectable(true).hexpand(true).build();
+    row.append(&caption_label);
+    row.append(&value_label);
+    row
+}
+
+/// The details dialog's header texts, one `Name: value` line each.
+fn format_header_block(headers: &[(String, String)]) -> String {
+    headers.iter().map(|(name, value)| format!("{name}: {value}")).collect::<Vec<_>>().join("\n")
+}
+
+/// The Source page's text for a raw message: the bytes decoded lossily, or a
+/// truncated view with a trailing notice past `MESSAGE_SOURCE_DISPLAY_CAP`.
+fn message_source_text(bytes: &[u8]) -> String {
+    if bytes.len() <= MESSAGE_SOURCE_DISPLAY_CAP {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut text = String::from_utf8_lossy(&bytes[..MESSAGE_SOURCE_DISPLAY_CAP]).into_owned();
+    if let Some(last_newline) = text.rfind('\n') {
+        text.truncate(last_newline);
+    }
+    text.push_str(&format!(
+        "\n\n… truncated: showing the first {MESSAGE_SOURCE_DISPLAY_CAP} of {} bytes. Use \"Save as .eml…\" for the full message.",
+        bytes.len()
+    ));
+    text
+}
+
 /// RFC 8058 one-click unsubscribe: POST `List-Unsubscribe=One-Click` to the
 /// list's URL. Success is a 2xx (reqwest follows the redirects some lists
 /// answer with); a non-2xx response or a transport failure is an error the
@@ -18166,7 +18644,7 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
 /// (`UiState::message_theme_override`) changes, so the two never drift - the
 /// toggle handler, every navigation reset, and the close-pane reset all
 /// route through this.
-fn set_message_theme_armed(enabled: bool, web_view: &webkit::WebView, user_content_manager: &webkit::UserContentManager, theme_override_sheet: &webkit::UserStyleSheet) {
+pub(crate) fn set_message_theme_armed(enabled: bool, web_view: &webkit::WebView, user_content_manager: &webkit::UserContentManager, theme_override_sheet: &webkit::UserStyleSheet) {
     if enabled {
         user_content_manager.add_style_sheet(theme_override_sheet);
         web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
@@ -18367,6 +18845,51 @@ pub(crate) fn wrap_message_with_csp(html: &str, images_allowed: bool, all_allowe
     out
 }
 
+/// Resolves the external-content load policy for a message: whether remote
+/// `image/*` subresources may load (`images_allowed`) and whether every
+/// remote subresource may (`all_allowed`). The inputs are the per-account
+/// "Load images from the web" preference, the transient load-once overrides
+/// (`state`'s for the reading pane, `load_images_once`'s for a pop-out
+/// message window), and the sender's trust entry for the receiving account.
+/// `trust_sender` is the `(account, normalized sender address)` pair to
+/// resolve against `trusted_senders` - `None` when there's no sender to key
+/// trust on (the debug `.eml` viewer). Shared between `render_body` and the
+/// pop-out message window (item 1.9) so both apply the identical policy.
+pub(crate) fn remote_content_policy(state: &Rc<RefCell<UiState>>, trust_sender: Option<&(AccountId, String)>, load_images_once: bool) -> (bool, bool) {
+    let st = state.borrow();
+    let level = trust_sender.and_then(|(account, sender)| st.trusted_senders.get(&(account.clone(), sender.clone())).copied());
+    let images_allowed = st.load_remote_images || st.load_once_images || load_images_once || level.is_some_and(|l| l >= lookout_core::TrustLevel::Images);
+    let all_allowed = level.is_some_and(|l| l >= lookout_core::TrustLevel::AllContent);
+    (images_allowed, all_allowed)
+}
+
+/// Whether `(mailbox, uid)` is on screen in any surface: the reading pane
+/// (`rendered_message`) or an open "message in new window" pop-out (item
+/// 1.9). The attachment Open/Save flows use this instead of a bare
+/// `rendered_message` check so a fetch started from a pop-out completes even
+/// after the reading pane has moved to a different message.
+pub(crate) fn message_is_visible(st: &UiState, mailbox: &MailboxId, uid: Uid) -> bool {
+    st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid)) || st.message_windows.contains_key(&(mailbox.clone(), uid))
+}
+
+/// Dispatches `FetchRawMessage` for `(mailbox, uid)` on its account's
+/// interactive channel - the shared first step of the .eml export, the
+/// "Message details" dialog (item 1.10) and the message window (item 1.9).
+/// Silent no-op returning `false` when the mailbox's account isn't connected.
+pub(crate) fn send_fetch_raw_message(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid) -> bool {
+    let Some(account_id) = mailbox_account_id(mailbox) else { return false };
+    let cmd_tx = state.borrow().accounts.get(&account_id).map(|h| h.interactive_cmd_tx.clone());
+    match cmd_tx {
+        Some(cmd_tx) => cmd_tx
+            .send_blocking(AccountCommand::FetchRawMessage {
+                mailbox: mailbox.clone(),
+                uid,
+            })
+            .is_ok(),
+        None => false,
+    }
+}
+
 fn render_body(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
@@ -18513,16 +19036,8 @@ fn render_body(
     // subresources - verified empirically against 2.52), the CSP is what
     // actually enforces the block on every remote image, style, font and
     // media load.
-    let (images_allowed, all_allowed) = {
-        let st = state.borrow();
-        let level = st
-            .rendered_trust_sender
-            .as_ref()
-            .and_then(|(account, sender)| st.trusted_senders.get(&(account.clone(), sender.clone())).copied());
-        let images_allowed = st.load_remote_images || st.load_once_images || level.is_some_and(|l| l >= lookout_core::TrustLevel::Images);
-        let all_allowed = level.is_some_and(|l| l >= lookout_core::TrustLevel::AllContent);
-        (images_allowed, all_allowed)
-    };
+    let trust_sender = state.borrow().rendered_trust_sender.clone();
+    let (images_allowed, all_allowed) = remote_content_policy(state, trust_sender.as_ref(), false);
     // Trust banner: reveal it when the message on screen references remote
     // content the policy above is *currently blocking* - its sender isn't
     // trusted (at a high enough level) and the global "Load images from the
@@ -18763,7 +19278,7 @@ impl ComposeActionBar {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn show_composer_in_reading_pane(
+pub(crate) fn show_composer_in_reading_pane(
     state: &Rc<RefCell<UiState>>,
     worker: &Rc<Worker>,
     reading_stack: &gtk::Stack,
@@ -19392,6 +19907,58 @@ mod tests {
         assert_eq!(eml_suggested_name(&with_subject(Some("a\\b"))), "message.eml");
     }
 
+    /// The details dialog's key fields come from the summary: From/To always,
+    /// Cc only when present, and Message ID only when the envelope has one.
+    #[test]
+    fn message_detail_fields_include_cc_and_message_id_only_when_present() {
+        let sender = EmailAddress {
+            name: Some("Ada Lovelace".to_string()),
+            address: "ada@example.com".to_string(),
+        };
+        let base = EmailSummary {
+            from: vec![sender.clone()],
+            ..summary(Uid(1), "INBOX", 2026, 7, 30, 12)
+        };
+        let fields = message_detail_fields(&base);
+        let captions: Vec<&str> = fields.iter().map(|(caption, _)| caption.as_str()).collect();
+        assert_eq!(captions, vec!["From", "To", "Subject", "Date"]);
+        assert!(fields.iter().any(|(_, value)| value == "Ada Lovelace"), "From should render the sender");
+
+        let full = EmailSummary {
+            cc: base.from.clone(),
+            message_id: Some("<id@example.com>".to_string()),
+            ..base
+        };
+        let captions: Vec<String> = message_detail_fields(&full).into_iter().map(|(caption, _)| caption).collect();
+        assert_eq!(captions, vec!["From", "To", "Cc", "Subject", "Date", "Message ID"]);
+    }
+
+    /// The header block renders one `Name: value` line per parsed header.
+    #[test]
+    fn format_header_block_renders_name_value_lines() {
+        let headers = vec![
+            ("From".to_string(), "Ada <ada@example.com>".to_string()),
+            ("Subject".to_string(), "Hi".to_string()),
+        ];
+        assert_eq!(format_header_block(&headers), "From: Ada <ada@example.com>\nSubject: Hi");
+    }
+
+    /// The source view's text passes small messages through lossily, and
+    /// truncates large ones with an announced byte count.
+    #[test]
+    fn message_source_text_truncates_past_the_display_cap() {
+        assert_eq!(message_source_text(b"Subject: Hi\r\n\r\nBody"), "Subject: Hi\r\n\r\nBody");
+
+        let mut large = vec![b'a'; MESSAGE_SOURCE_DISPLAY_CAP];
+        large.extend_from_slice(b"\nmore bytes past the cap");
+        let text = message_source_text(&large);
+        assert!(text.starts_with(&"a".repeat(16)));
+        assert!(text.ends_with(&format!(
+            "… truncated: showing the first {MESSAGE_SOURCE_DISPLAY_CAP} of {} bytes. Use \"Save as .eml…\" for the full message.",
+            large.len()
+        )));
+    }
+
     fn attachment_with_type(part_number: &str, filename: Option<&str>, content_type: &str) -> BodyPart {
         BodyPart {
             part_number: part_number.to_string(),
@@ -19786,6 +20353,8 @@ mod tests {
             body_fetch_generation: 0,
             pending_attachment: None,
             pending_raw_message: None,
+            message_windows: HashMap::new(),
+            message_details: None,
             unsubscribe_info: None,
             unsubscribe_dismissed: None,
             imip: None,
