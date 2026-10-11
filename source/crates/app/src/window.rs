@@ -34,7 +34,7 @@ use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::google_tasks::{self, GoogleTasksCommand, GoogleTasksEvent, TaskList};
 use crate::last_view::{self, LastSelection};
-use crate::message_list::{format_row_date, unified_merge_order, ListFilter, MessageItem, MessageListModel, SelectionKind, SortKey};
+use crate::message_list::{format_row_date, unified_merge_order, Filter, FilterSet, MessageItem, MessageListModel, SelectionKind, SortKey};
 use crate::microsoft_oauth::MicrosoftCredentialProvider;
 use crate::ui_state_db::UiStateDb;
 use crate::worker::Worker;
@@ -966,6 +966,15 @@ pub(crate) struct UiState {
     /// doesn't route the pane through "empty" and crossfade the same email
     /// again. `None` while the pane shows nothing.
     rendered_message: Option<(MailboxId, Uid)>,
+    /// A pending "mark as read after a delay" timer (item 1.8): the timer's
+    /// source, plus the message it will mark if it's still selected when it
+    /// fires. `None` when nothing is pending. Cancelled on every navigation.
+    pending_mark_read: Option<(glib::SourceId, MailboxId, Uid)>,
+    /// The message currently on the reading pane that should be marked read
+    /// when the selection moves away from it (item 1.8,
+    /// "on-selection-change" mode). Only set when the message was unread when
+    /// displayed; `None` otherwise, or after it's been flushed.
+    mark_read_on_leave: Option<(MailboxId, Uid)>,
     /// The parsed List-Unsubscribe actions of the message currently on the
     /// reading pane, re-derived by `render_body` from the rendered body's
     /// headers and read by the banner's button handler when it fires. `None`
@@ -2340,6 +2349,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         last_selection: last_selection.clone(),
         restore_pending: last_selection.is_some(),
         rendered_message: None,
+        pending_mark_read: None,
+        mark_read_on_leave: None,
         syncing: HashSet::new(),
         prefetching: HashSet::new(),
         folder_row_spinners: HashMap::new(),
@@ -3387,18 +3398,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .css_classes(["flat", "list-header-action"])
         .valign(gtk::Align::Center)
         .build();
-    // The filter menu, mirroring the sort-key one: a stateful action renders
-    // the items as radio checks. `MessageListModel` owns the active filter -
-    // it's applied inside `repopulate`, the single choke point every rebuild
-    // passes through, against the model's unfiltered source of truth (see
-    // `MessageListModel::set_filter`) - so the action just tells the model
-    // which one to use.
+    // The filter menu: one checkable item per Filter, each bound to its own
+    // stateful boolean action (win.filter-unread, …). Filters combine, so the
+    // menu is a set of independent checks, not a radio group - matching
+    // Outlook's Filter menu. `MessageListModel` owns the active set - it's
+    // applied inside `repopulate`, the single choke point every rebuild passes
+    // through, against the model's unfiltered source of truth.
+    let initial_filters = FilterSet::from_states(&state.borrow().settings.get_strv(crate::settings::MAIL_FILTERS));
+    message_list.set_filter(initial_filters);
     let list_filter_menu = gio::Menu::new();
-    list_filter_menu.append(Some("All"), Some("win.list-filter('all')"));
-    list_filter_menu.append(Some("Unread"), Some("win.list-filter('unread')"));
-    list_filter_menu.append(Some("Flagged"), Some("win.list-filter('flagged')"));
+    for filter in Filter::ALL {
+        let action = format!("win.filter-{}", filter.action_state());
+        list_filter_menu.append(Some(filter.label()), Some(action.as_str()));
+    }
     let list_filter_button = gtk::MenuButton::builder()
-        .label(ListFilter::All.label())
+        .label(filter_button_label(initial_filters))
         .tooltip_text("Filter")
         .css_classes(["flat"])
         .valign(gtk::Align::Center)
@@ -3406,7 +3420,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .build();
     let sort_direction_button = gtk::ToggleButton::builder()
         .icon_name(sort_direction_icon(true))
-        .tooltip_text("Newest first")
+        .tooltip_text(sort_direction_tooltip(state.borrow().sort_key, true))
         .css_classes(["flat", "list-header-action"])
         .valign(gtk::Align::Center)
         .active(true)
@@ -3415,6 +3429,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     sort_key_menu.append(Some("By Date"), Some("win.sort-key('date')"));
     sort_key_menu.append(Some("By Sender"), Some("win.sort-key('sender')"));
     sort_key_menu.append(Some("By Subject"), Some("win.sort-key('subject')"));
+    sort_key_menu.append(Some("By Size"), Some("win.sort-key('size')"));
+    sort_key_menu.append(Some("By Importance"), Some("win.sort-key('importance')"));
+    sort_key_menu.append(Some("By Flag"), Some("win.sort-key('flag')"));
+    sort_key_menu.append(Some("By Category"), Some("win.sort-key('category')"));
+    sort_key_menu.append(Some("By To"), Some("win.sort-key('to')"));
+    sort_key_menu.append(Some("By Attachments"), Some("win.sort-key('attachments')"));
     let sort_key_button = gtk::MenuButton::builder()
         .label(state.borrow().sort_key.label())
         .css_classes(["flat"])
@@ -3548,7 +3568,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let descending = state.borrow().sort_descending;
         sort_direction_button.set_active(descending);
         sort_direction_button.set_icon_name(sort_direction_icon(descending));
-        sort_direction_button.set_tooltip_text(Some(if descending { "Newest first" } else { "Oldest first" }));
+        sort_direction_button.set_tooltip_text(Some(sort_direction_tooltip(state.borrow().sort_key, descending)));
     }
     {
         let state = state.clone();
@@ -3556,7 +3576,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         sort_direction_button.connect_toggled(move |button| {
             let descending = button.is_active();
             button.set_icon_name(sort_direction_icon(descending));
-            button.set_tooltip_text(Some(if descending { "Newest first" } else { "Oldest first" }));
+            button.set_tooltip_text(Some(sort_direction_tooltip(state.borrow().sort_key, descending)));
             state.borrow_mut().sort_descending = descending;
             state.borrow().settings.set_bool(crate::settings::SORT_DESCENDING, descending);
             resort_message_list(&state, &message_list);
@@ -3572,35 +3592,44 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let message_list = message_list.clone();
         let sort_key_button = sort_key_button.clone();
+        let sort_direction_button = sort_direction_button.clone();
         sort_key_action.connect_activate(move |action, parameter| {
             let Some(key) = parameter.and_then(|p| p.str()).and_then(SortKey::from_action_state) else {
                 return;
             };
             action.set_state(&key.action_state().to_variant());
             sort_key_button.set_label(key.label());
+            sort_direction_button.set_tooltip_text(Some(sort_direction_tooltip(key, sort_direction_button.is_active())));
             state.borrow_mut().sort_key = key;
             state.borrow().settings.set_string(crate::settings::SORT_KEY, key.action_state());
             resort_message_list(&state, &message_list);
         });
     }
 
-    // --- Filter -> a stateful action so the menu renders radio checks,
-    // mirroring the sort-key action above. The active filter lives in the
-    // model, so changing it just re-renders the list from the model's
-    // unfiltered source of truth (see `MessageListModel::set_filter`). ---
-    let list_filter_action = gio::SimpleAction::new_stateful("list-filter", Some(glib::VariantTy::STRING), &ListFilter::All.action_state().to_variant());
-    {
-        let message_list = message_list.clone();
-        let list_filter_button = list_filter_button.clone();
-        list_filter_action.connect_activate(move |action, parameter| {
-            let Some(filter) = parameter.and_then(|p| p.str()).and_then(ListFilter::from_action_state) else {
-                return;
-            };
-            action.set_state(&filter.action_state().to_variant());
-            list_filter_button.set_label(filter.label());
-            message_list.set_filter(filter);
-        });
-    }
+    // --- Filters -> one stateful boolean action per `Filter` (win.filter-*),
+    // so the menu renders independent check marks. Toggling one updates the
+    // model's set, relabels the button with the active count, and persists the
+    // set in the `mail-filters` setting. ---
+    let filter_actions: Vec<gio::SimpleAction> = Filter::ALL
+        .into_iter()
+        .map(|filter| {
+            let action = gio::SimpleAction::new_stateful(&format!("filter-{}", filter.action_state()), None, &initial_filters.contains(filter).to_variant());
+            let state = state.clone();
+            let message_list = message_list.clone();
+            let list_filter_button = list_filter_button.clone();
+            // A boolean stateful action renders as a check item, and GTK's
+            // menu toggles it through `change-state` (not `activate`).
+            action.connect_change_state(move |action, requested| {
+                let on = requested.and_then(|value| value.get::<bool>()).unwrap_or(false);
+                action.set_state(&on.to_variant());
+                let set = message_list.filter().with(filter, on);
+                message_list.set_filter(set);
+                list_filter_button.set_label(&filter_button_label(set));
+                state.borrow().settings.set_strv(crate::settings::MAIL_FILTERS, set.to_states());
+            });
+            action
+        })
+        .collect();
 
     // --- Favorite star -> add/remove the open folder from the tree's
     // Favorites section. Session-only (see `UiState::favorites`). ---
@@ -5434,7 +5463,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `win.`-scoped actions resolve through the widget hierarchy when the menu
     // item is activated, so registering it here is in time.
     window.add_action(&sort_key_action);
-    window.add_action(&list_filter_action);
+    for action in &filter_actions {
+        window.add_action(action);
+    }
     window.add_action(&reading_pane_action);
 
     // --- Close-to-background: the window's close button hides the window
@@ -6910,6 +6941,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Mark as read": which mode decides when opening a
+    // message marks it read (item 1.8). Read fresh in the selection handler on
+    // every navigation, so a change takes effect on the next message; any mark
+    // queued under the old mode is dropped here.
+    {
+        let state = state.clone();
+        let delay_row = config_view.mark_as_read_delay_row.clone();
+        config_view.mark_as_read_row.connect_selected_notify(move |row| {
+            let mode = crate::settings::mark_as_read_at(row.selected());
+            state.borrow().settings.set_string(crate::settings::MARK_AS_READ_MODE, mode);
+            delay_row.set_sensitive(mode == "after-delay");
+            cancel_pending_mark_read(&state);
+            state.borrow_mut().mark_read_on_leave = None;
+        });
+    }
+
+    // Config → Mail → "Mark as read" → "After": seconds a message stays open
+    // before it is marked read in "after-delay" mode.
+    {
+        let state = state.clone();
+        config_view.mark_as_read_delay_row.connect_value_notify(move |row| {
+            state.borrow().settings.set_int(crate::settings::MARK_AS_READ_DELAY, row.value().round() as i32);
+        });
+    }
+
     // Config → Mail → "Mail notifications": gates the new-mail/send-failure
     // desktop notifications. Read straight off the setting at the point each
     // event fires (see `connect_account`), so nothing needs re-arming here.
@@ -7168,6 +7224,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             config_view.spell_languages_row.set_selected(index as u32);
         }
         config_view.read_receipts_row.set_active(persisted.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS));
+        {
+            let mark_mode = persisted.get_string(crate::settings::MARK_AS_READ_MODE);
+            config_view.mark_as_read_row.set_selected(crate::settings::mark_as_read_index(&mark_mode));
+            config_view.mark_as_read_delay_row.set_sensitive(mark_mode == "after-delay");
+            config_view
+                .mark_as_read_delay_row
+                .set_value(persisted.get_int(crate::settings::MARK_AS_READ_DELAY).clamp(1, 60) as f64);
+        }
         config_view
             .mail_notifications_row
             .set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
@@ -9108,6 +9172,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     // message-theme override resets to the configured default
                     // (Config → Appearance → "Dark message theme") and its
                     // physical sheet/canvas are re-armed to match.
+                    // Leaving the single message that was showing marks it
+                    // read in "on-selection-change" mode (item 1.8).
+                    flush_mark_read_on_leave(&state);
+                    cancel_pending_mark_read(&state);
                     let default_dark = {
                         let mut st = state.borrow_mut();
                         st.pending_body_request = None;
@@ -9164,6 +9232,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         if !matches!(message_list_for_selection.selection_kind(), SelectionKind::Empty) {
                             return;
                         }
+                        // The pane is genuinely empty now: mark the message we
+                        // just left read in "on-selection-change" mode (item
+                        // 1.8) and drop any delayed mark queued for it.
+                        flush_mark_read_on_leave(&state);
+                        cancel_pending_mark_read(&state);
                         let default_dark = {
                             let mut st = state.borrow_mut();
                             st.pending_body_request = None;
@@ -9211,6 +9284,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if already_shown {
                 return;
             }
+            // The selection has moved off whatever was showing: in
+            // "on-selection-change" mode this is when the previous message
+            // becomes read (item 1.8), and any delayed mark queued for it is
+            // dropped.
+            flush_mark_read_on_leave(&state);
+            cancel_pending_mark_read(&state);
+            let mark_read_mode = crate::settings::mark_as_read_mode(&state.borrow().settings.get_string(crate::settings::MARK_AS_READ_MODE));
             let request = (mailbox.clone(), uid);
             // Opening a message is what marks it read - bodies are fetched
             // with `BODY.PEEK`, so the server never sets `\Seen` itself (see
@@ -9218,8 +9298,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // guard above, so the rebuild this triggers can't loop: the
             // message comes back with `\Seen` set, and a re-selection of the
             // row already on the reading pane returns before reaching here.
-            // Bulwark's configurable mark-as-read delay is a later refinement;
-            // this marks on open, as Outlook's default reading pane does.
+            // The mark-as-read setting decides *when* it happens (item 1.8).
             let mark_read = summary.is_unread();
             // Deferred to the reveal: updating the header here would swap it
             // to the next email while the previous message is still fading
@@ -9227,14 +9306,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // shown (the pane is on "empty" by then, so it can't flash).
             state.borrow_mut().pending_header = Some(summary);
             if mark_read {
-                let st = state.borrow();
-                if let Some(handle) = mailbox_account_id(&mailbox).and_then(|id| st.accounts.get(&id)) {
-                    let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreFlags {
-                        mailbox: mailbox.clone(),
-                        uid,
-                        add: vec![SystemFlagBit::Seen],
-                        remove: Vec::new(),
-                    });
+                match mark_read_mode {
+                    crate::settings::MarkAsReadMode::WhenOpened => mark_message_read(&state, &mailbox, uid),
+                    crate::settings::MarkAsReadMode::AfterDelay => {
+                        let delay = crate::settings::mark_as_read_delay(state.borrow().settings.get_int(crate::settings::MARK_AS_READ_DELAY));
+                        arm_pending_mark_read(&state, &message_list_for_selection, &mailbox, uid, delay as u32);
+                    }
+                    crate::settings::MarkAsReadMode::OnSelectionChange => {
+                        state.borrow_mut().mark_read_on_leave = Some((mailbox.clone(), uid));
+                    }
+                    crate::settings::MarkAsReadMode::Never => {}
                 }
             }
 
@@ -10275,6 +10356,7 @@ fn connect_account(
             graph_pin: is_microsoft_365.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
         },
     );
+    message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
         let state = state.clone();
@@ -11127,6 +11209,7 @@ fn connect_other_account(
             graph_pin: None,
         },
     );
+    message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
         let state = state.clone();
@@ -14729,6 +14812,27 @@ fn sort_direction_icon(descending: bool) -> &'static str {
     }
 }
 
+/// The sort-direction toggle's tooltip: key-specific wording (A-Z, largest
+/// first, …) rather than the old date-only "Newest first".
+fn sort_direction_tooltip(key: SortKey, descending: bool) -> &'static str {
+    if descending {
+        key.descending_label()
+    } else {
+        key.ascending_label()
+    }
+}
+
+/// The filter button's label: "Filter" when no filters are active, otherwise
+/// the active count, so the narrowed list is obvious at a glance.
+fn filter_button_label(set: FilterSet) -> String {
+    let count = set.count();
+    if count == 0 {
+        "Filter".to_string()
+    } else {
+        format!("Filter ({count})")
+    }
+}
+
 /// Runs `query` against `cache` on the `Worker`'s blocking thread pool and
 /// returns a receiver for the result, instead of running it inline on the
 /// GTK thread. Mirrors the mail session's own `cache_op` helper for the
@@ -15396,6 +15500,12 @@ fn resort_message_list(state: &Rc<RefCell<UiState>>, message_list: &MessageListM
     message_list.repopulate(messages, key, descending);
 }
 
+/// The viewer's own lowercased email addresses across every connected mail
+/// account - used to evaluate the "To me" message filter.
+fn viewer_addresses(state: &UiState) -> HashSet<String> {
+    state.accounts.values().map(|handle| handle.email.to_lowercase()).collect()
+}
+
 /// How long an Undo toast - and its stack entry - stays live. Matches the
 /// short window Outlook gives to reverse a mistaken action; once it elapses
 /// the entry is pruned and Ctrl+Z moves on to the previous one.
@@ -15615,6 +15725,62 @@ fn reconcile_optimistic_removals(state: &Rc<RefCell<UiState>>, mailbox: &Mailbox
     let still_pending: HashSet<Uid> = st.pending_optimistic_removals[mailbox].iter().map(|m| m.uid).collect();
     drop(st);
     messages.retain(|m| !still_pending.contains(&m.uid));
+}
+
+/// Sends the `\Seen` store that marks `uid` read on its account, best-effort
+/// (a mailbox with no live account handle is silently skipped). Shared by
+/// every mark-as-read mode (item 1.8).
+fn mark_message_read(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid) {
+    let st = state.borrow();
+    if let Some(handle) = mailbox_account_id(mailbox).and_then(|id| st.accounts.get(&id)) {
+        let _ = handle.cmd_tx.send_blocking(AccountCommand::StoreFlags {
+            mailbox: mailbox.clone(),
+            uid,
+            add: vec![SystemFlagBit::Seen],
+            remove: Vec::new(),
+        });
+    }
+}
+
+/// Cancels any pending "mark as read after a delay" timer (item 1.8). Called
+/// on every navigation, so a message left before its delay elapsed isn't
+/// marked read later.
+fn cancel_pending_mark_read(state: &Rc<RefCell<UiState>>) {
+    if let Some((source, _, _)) = state.borrow_mut().pending_mark_read.take() {
+        source.remove();
+    }
+}
+
+/// Marks the message recorded by the "on-selection-change" mode read, now that
+/// the selection has moved off it (item 1.8). A no-op when nothing is
+/// recorded.
+fn flush_mark_read_on_leave(state: &Rc<RefCell<UiState>>) {
+    let candidate = state.borrow_mut().mark_read_on_leave.take();
+    if let Some((mailbox, uid)) = candidate {
+        mark_message_read(state, &mailbox, uid);
+    }
+}
+
+/// Arms the "mark as read after a delay" timer (item 1.8): `uid` is marked
+/// read `delay_secs` later, but only if it's still the selected message then.
+/// Replaces any already-pending timer.
+fn arm_pending_mark_read(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uid: Uid, delay_secs: u32) {
+    cancel_pending_mark_read(state);
+    let state_for_timer = state.clone();
+    let message_list = message_list.clone();
+    let mailbox_for_timer = mailbox.clone();
+    let source = glib::timeout_add_local_once(std::time::Duration::from_secs(u64::from(delay_secs.max(1))), move || {
+        let state = state_for_timer;
+        state.borrow_mut().pending_mark_read = None;
+        let still_selected = matches!(
+            message_list.selection_kind(),
+            SelectionKind::Message(m) if m.mailbox == mailbox_for_timer && m.uid == uid
+        );
+        if still_selected {
+            mark_message_read(&state, &mailbox_for_timer, uid);
+        }
+    });
+    state.borrow_mut().pending_mark_read = Some((source, mailbox.clone(), uid));
 }
 
 /// Optimistically flips `SystemFlagBit::Seen` for `uids` in `mailbox` -
@@ -19641,7 +19807,9 @@ mod tests {
             reveal_generation: 0,
             last_selection: None,
             restore_pending: false,
-            rendered_message: None,
+        rendered_message: None,
+        pending_mark_read: None,
+        mark_read_on_leave: None,
             syncing: HashSet::new(),
             prefetching: HashSet::new(),
             folder_row_spinners: HashMap::new(),

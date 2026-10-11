@@ -4,6 +4,19 @@
     <value nick="date" value="0"/>
     <value nick="sender" value="1"/>
     <value nick="subject" value="2"/>
+    <value nick="size" value="3"/>
+    <value nick="importance" value="4"/>
+    <value nick="flag" value="5"/>
+    <value nick="category" value="6"/>
+    <value nick="to" value="7"/>
+    <value nick="attachments" value="8"/>
+  </enum>
+
+  <enum id="io.github.gavindi.Lookout.MarkAsReadMode">
+    <value nick="on-selection-change" value="0"/>
+    <value nick="when-opened" value="1"/>
+    <value nick="after-delay" value="2"/>
+    <value nick="never" value="3"/>
   </enum>
 
   <schema id="io.github.gavindi.Lookout" path="/io/github/gavindi/Lookout/">
@@ -161,6 +174,11 @@
       <summary>Group replies into conversations</summary>
       <description>Show replies as collapsible conversation threads in the message list instead of bare messages.</description>
     </key>
+    <key name="mail-filters" type="as">
+      <default>[]</default>
+      <summary>Active message-list filters</summary>
+      <description>The independent filters narrowing the message list (unread, flagged, has-attachments, high-importance, categorized, to-me). Empty shows every message.</description>
+    </key>
 
     <!-- Mail settings -->
     <key name="mail-load-remote-images" type="b">
@@ -196,6 +214,17 @@
       <default>false</default>
       <summary>Send read receipts automatically</summary>
       <description>When a message asks for a read receipt (a Disposition-Notification-To header), reply with one automatically on display. When off, the reading pane asks first.</description>
+    </key>
+    <key name="mark-as-read-mode" enum="io.github.gavindi.Lookout.MarkAsReadMode">
+      <default>'on-selection-change'</default>
+      <summary>When to mark a message as read</summary>
+      <description>When opening a message marks it read: 'when-opened' marks it as soon as the reading pane shows it, 'on-selection-change' when the selection moves away from it (the default, matching Outlook), 'after-delay' after the configured number of seconds, and 'never' leaves it unread until marked by hand.</description>
+    </key>
+    <key name="mark-as-read-delay" type="i">
+      <range min="1" max="60"/>
+      <default>5</default>
+      <summary>Mark-as-read delay in seconds</summary>
+      <description>Seconds a message must stay on screen before it is marked read when the mark-as-read mode is 'after-delay'.</description>
     </key>
     <key name="mail-notifications-enabled" type="b">
       <default>true</default>

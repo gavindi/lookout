@@ -239,8 +239,8 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-04 | Conversation view | `app/src/message_list.rs` `group_threads` (list grouping only) | 🟡 | No newest-on-top/bottom setting; no stacked conversation in the reading pane; no "show messages from other folders" |
 | M-05 | Reading pane right / bottom / off | `layout-reading-pane` boolean plus `layout-reading-pane-position`; View ribbon dropdown and Settings row | ✅ | — |
 | M-06 | Density and message preview lines | `layout-vertical-spacing` tight/medium/loose; `layout-message-preview-lines` 0–3; `mail-show-sender-images` (vCard photo, else initials) | ✅ | Density still uses Lookout's names (UX-83) |
-| M-07 | Sort / arrange by | `message_list.rs` `SortKey { Date, Sender, Subject }`; filter All/Unread/Flagged | 🟡 | Missing size, importance, flag/due, category, to, attachments; group headers only for Date |
-| M-08 | Filter menu | All/Unread/Flagged | 🟡 | Add: has attachments, @mentions me, to me, categorised, high importance |
+| M-07 | Sort / arrange by | `message_list.rs` `SortKey { Date, Sender, Subject, Size, Importance, Flag, Category, To, Attachments }`; group headers derived from every sort key (`GroupKey`) | 🟡 | Flag sort groups by pin state only until follow-up flags land (M-10/1.16); no per-column sortable headers yet (U.4) |
+| M-08 | Filter menu | `FilterSet`: Unread, Flagged, Has files, High importance, Categorized, To me (combinable check items) | 🟡 | @mentions me pending (M-25/2.13) |
 | M-09 | Categories (named, coloured, multiple) | `app/src/tags.rs` (`$Lookout-tag-*` keywords), Categorize menu, drop-on-tag | 🟡 | No master-list editor with Outlook's 25 colour presets; no Microsoft 365 sync |
 | M-10 | Flag for follow-up with dates | Pin = `\Flagged`; "Follow up" creates a linked task with `due: None` (`window.rs` `build_task_seed_for_email`) | 🟡 | No Today/Tomorrow/This week/Next week/No date/Custom/Mark complete; no flag state on the message itself; no due-date list column |
 | M-11 | Snooze | Fixed "tomorrow 9 AM"; local-only `snoozed` table (`mail/src/cache.rs`) | 🟡 | Presets (later today, tomorrow, this weekend, next week, custom); syncing across installs (§4.2) |
@@ -254,7 +254,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-19 | Search Folders (saved searches) | — | ❌ | |
 | M-20 | Ignore conversation / Clean up conversation | — | ❌ | |
 | M-21 | Undo (move, delete, flag, archive) | Optimistic rollback only on server failure | ❌ | Toast "Undo" plus inverse command |
-| M-22 | Mark-as-read options | Marks read on open | 🟡 | "After N seconds", "when selection changes", "never" |
+| M-22 | Mark-as-read options | Setting: when selection changes (default), when opened, after N seconds, never | ✅ | — |
 | M-23 | Read receipts | Request toggle, banner, RFC 8098 MDN (`mail/src/send.rs`) | ✅ | Add "always / never / ask" policy |
 | M-24 | Automatic replies (OOF) | — | ❌ | Graph or Sieve vacation |
 | M-25 | @mentions | — | ❌ | Highlight "@Me" in the list; filter |
@@ -606,9 +606,9 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.3 | ✅ ~~Fix Calendar print button~~ | CAL-23 | Make it sensitive (`window.rs:4400`) | S |
 | 1.4 | ✅ ~~Reading pane bottom~~ | M-05 | `layout-reading-pane` → enum `right\|bottom\|off`; swap `gtk::Paned` orientation | M |
 | 1.5 | ✅ ~~Preview lines and sender images~~ | M-06 | Setting 0–3 lines; avatar (initials, or vCard photo) column | S |
-| 1.6 | More sort keys and filters | M-07, M-08 | Extend `SortKey` (Size, Importance, Flag, Category, To, Attachments) and the filter enum; group headers per key | M |
+| 1.6 | ✅ ~~More sort keys and filters~~ | M-07, M-08 | Extend `SortKey` (Size, Importance, Flag, Category, To, Attachments) and the filter set; group headers per key | M |
 | 1.7 | Conversation options | M-04 | Newest-on-top/bottom setting; stacked conversation rendering in the reading pane (one WebKit view with collapsible messages) | L |
-| 1.8 | Mark-as-read options | M-22 | Setting: on open, after N seconds, on selection change, never | S |
+| 1.8 | ✅ ~~Mark-as-read options~~ | M-22 | Setting: on open, after N seconds, on selection change, never | S |
 | 1.9 | Message in new window | M-31 | Reuse the reading-pane builder in an `adw::Window`; double-click and Enter open it | M |
 | 1.10 | View message details / source | M-30 | Dialog with parsed headers plus raw source (via `FetchRawMessage`) | S |
 | 1.11 | Forward with attachments; forward as attachment | C-13 | Fetch original parts (`FetchAttachment`) into the composer; `message/rfc822` part | M |

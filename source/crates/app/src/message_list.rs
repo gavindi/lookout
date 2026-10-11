@@ -24,13 +24,20 @@ use crate::worker::Worker;
 
 /// Which field the message list is ordered by. Paired with
 /// `UiState::sort_descending`, this is the whole of the list's ordering
-/// policy - see `sort_messages`. Also decides whether the list is grouped:
-/// only `Date` produces section headers (see `build_layout`).
+/// policy - see `sort_messages`. The key also decides how the list is
+/// grouped: every key groups its rows under headers derived from the same
+/// field (see `group_of`), matching Outlook's "Arrange by".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortKey {
     Date,
     Sender,
     Subject,
+    Size,
+    Importance,
+    Flag,
+    Category,
+    To,
+    Attachments,
 }
 
 impl SortKey {
@@ -40,6 +47,12 @@ impl SortKey {
             SortKey::Date => "By Date",
             SortKey::Sender => "By Sender",
             SortKey::Subject => "By Subject",
+            SortKey::Size => "By Size",
+            SortKey::Importance => "By Importance",
+            SortKey::Flag => "By Flag",
+            SortKey::Category => "By Category",
+            SortKey::To => "By To",
+            SortKey::Attachments => "By Attachments",
         }
     }
 
@@ -50,6 +63,12 @@ impl SortKey {
             SortKey::Date => "date",
             SortKey::Sender => "sender",
             SortKey::Subject => "subject",
+            SortKey::Size => "size",
+            SortKey::Importance => "importance",
+            SortKey::Flag => "flag",
+            SortKey::Category => "category",
+            SortKey::To => "to",
+            SortKey::Attachments => "attachments",
         }
     }
 
@@ -58,61 +77,175 @@ impl SortKey {
             "date" => Some(SortKey::Date),
             "sender" => Some(SortKey::Sender),
             "subject" => Some(SortKey::Subject),
+            "size" => Some(SortKey::Size),
+            "importance" => Some(SortKey::Importance),
+            "flag" => Some(SortKey::Flag),
+            "category" => Some(SortKey::Category),
+            "to" => Some(SortKey::To),
+            "attachments" => Some(SortKey::Attachments),
             _ => None,
         }
     }
-}
 
-/// Which messages the list shows, applied as a pre-sort subset of the
-/// incoming message set. The model keeps the *unfiltered* set as its source
-/// of truth (see `MessageListModel::all_messages`), so switching the filter
-/// re-renders from the full set rather than from an already-filtered subset.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ListFilter {
-    All,
-    Unread,
-    Flagged,
-}
-
-impl ListFilter {
-    /// The filter menu's item label - also the `MenuButton`'s text, mirroring
-    /// `SortKey::label`.
-    pub fn label(self) -> &'static str {
+    /// The sort-direction toggle's tooltip when it is "descending" - the
+    /// natural "most first" order for this key.
+    pub fn descending_label(self) -> &'static str {
         match self {
-            ListFilter::All => "All",
-            ListFilter::Unread => "Unread",
-            ListFilter::Flagged => "Flagged",
+            SortKey::Date => "Newest first",
+            SortKey::Size => "Largest first",
+            SortKey::Importance => "High to low",
+            SortKey::Flag => "Flagged first",
+            SortKey::Attachments => "With attachments first",
+            SortKey::Sender | SortKey::Subject | SortKey::Category | SortKey::To => "Z to A",
         }
     }
 
-    /// The filter's name in the `list-filter` `gio::SimpleAction`'s state,
-    /// which is what the filter menu's radio items are bound to.
+    /// The sort-direction toggle's tooltip when it is "ascending" - the
+    /// mirror of [`SortKey::descending_label`].
+    pub fn ascending_label(self) -> &'static str {
+        match self {
+            SortKey::Date => "Oldest first",
+            SortKey::Size => "Smallest first",
+            SortKey::Importance => "Low to high",
+            SortKey::Flag => "Unflagged first",
+            SortKey::Attachments => "No attachments first",
+            SortKey::Sender | SortKey::Subject | SortKey::Category | SortKey::To => "A to Z",
+        }
+    }
+}
+
+/// One independent message filter, mirroring Outlook's Filter menu (item 1.6).
+/// Several can be active at once - see [`FilterSet`] - and a message must pass
+/// every active one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Filter {
+    Unread,
+    Flagged,
+    HasAttachments,
+    HighImportance,
+    Categorized,
+    ToMe,
+}
+
+impl Filter {
+    /// Every filter, in menu order.
+    pub const ALL: [Filter; 6] = [Filter::Unread, Filter::Flagged, Filter::HasAttachments, Filter::HighImportance, Filter::Categorized, Filter::ToMe];
+
+    /// The filter menu's item label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Filter::Unread => "Unread",
+            Filter::Flagged => "Flagged",
+            Filter::HasAttachments => "Has files",
+            Filter::HighImportance => "High importance",
+            Filter::Categorized => "Categorized",
+            Filter::ToMe => "To me",
+        }
+    }
+
+    /// The filter's name in its `gio::SimpleAction`'s state, and the string
+    /// persisted in the `mail-filters` setting.
     pub fn action_state(self) -> &'static str {
         match self {
-            ListFilter::All => "all",
-            ListFilter::Unread => "unread",
-            ListFilter::Flagged => "flagged",
+            Filter::Unread => "unread",
+            Filter::Flagged => "flagged",
+            Filter::HasAttachments => "has-attachments",
+            Filter::HighImportance => "high-importance",
+            Filter::Categorized => "categorized",
+            Filter::ToMe => "to-me",
         }
     }
 
     pub fn from_action_state(name: &str) -> Option<Self> {
-        match name {
-            "all" => Some(ListFilter::All),
-            "unread" => Some(ListFilter::Unread),
-            "flagged" => Some(ListFilter::Flagged),
-            _ => None,
+        Self::ALL.into_iter().find(|filter| filter.action_state() == name)
+    }
+
+    /// This filter's bit in a [`FilterSet`].
+    const fn bit(self) -> u8 {
+        match self {
+            Filter::Unread => 1 << 0,
+            Filter::Flagged => 1 << 1,
+            Filter::HasAttachments => 1 << 2,
+            Filter::HighImportance => 1 << 3,
+            Filter::Categorized => 1 << 4,
+            Filter::ToMe => 1 << 5,
         }
     }
 
-    /// Whether `message` passes this filter. Unread and Flagged are drawn
-    /// from the system flags the row itself renders, so the two can overlap -
-    /// a flagged-but-unread message belongs to both.
-    fn matches(self, message: &EmailSummary) -> bool {
+    /// Whether `message` passes this filter. `viewer` is the set of the
+    /// viewer's own lowercased addresses, used only by [`Filter::ToMe`].
+    fn matches(self, message: &EmailSummary, viewer: &HashSet<String>) -> bool {
         match self {
-            ListFilter::All => true,
-            ListFilter::Unread => message.is_unread(),
-            ListFilter::Flagged => message.is_pinned(),
+            Filter::Unread => message.is_unread(),
+            Filter::Flagged => message.is_pinned(),
+            Filter::HasAttachments => message.has_attachment,
+            Filter::HighImportance => message.importance == lookout_core::Importance::High,
+            Filter::Categorized => message.keywords.iter().any(|k| lookout_core::tag_key_from_keyword(k).is_some()),
+            Filter::ToMe => message.to.iter().chain(message.cc.iter()).any(|address| viewer.contains(&address.address.to_lowercase())),
         }
+    }
+}
+
+/// A set of active [`Filter`]s, applied as a pre-sort subset of the incoming
+/// message set. The model keeps the *unfiltered* set as its source of truth
+/// (see `MessageListModel::all_messages`), so changing the filters re-renders
+/// from the full set rather than from an already-filtered subset. An empty set
+/// shows everything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct FilterSet(u8);
+
+impl FilterSet {
+    /// No filters: everything passes.
+    pub fn none() -> Self {
+        FilterSet(0)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn contains(self, filter: Filter) -> bool {
+        self.0 & filter.bit() != 0
+    }
+
+    /// How many filters are active.
+    pub fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// Turns one filter on or off, returning the updated set.
+    pub fn with(mut self, filter: Filter, on: bool) -> Self {
+        if on {
+            self.0 |= filter.bit();
+        } else {
+            self.0 &= !filter.bit();
+        }
+        self
+    }
+
+    /// The active filters' action states, for persisting in `mail-filters`.
+    pub fn to_states(self) -> Vec<String> {
+        Filter::ALL.into_iter().filter(|filter| self.contains(*filter)).map(|filter| filter.action_state().to_string()).collect()
+    }
+
+    /// Rebuilds a set from persisted action states; unknown entries are
+    /// ignored.
+    pub fn from_states<S: AsRef<str>>(states: &[S]) -> Self {
+        let mut set = FilterSet::none();
+        for state in states {
+            if let Some(filter) = Filter::from_action_state(state.as_ref()) {
+                set = set.with(filter, true);
+            }
+        }
+        set
+    }
+
+    /// Whether `message` passes every active filter.
+    fn matches(self, message: &EmailSummary, viewer: &HashSet<String>) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        Filter::ALL.into_iter().all(|filter| !self.contains(filter) || filter.matches(message, viewer))
     }
 }
 
@@ -146,13 +279,6 @@ pub enum DateBucket {
     /// year ("2024"). `LastMonth` and `Older` shade into this as time passes,
     /// but a message already in one `Year` never moves to another.
     Year(i32),
-    /// The pinned "Pinned" section header, always the first root row when
-    /// any pinned message is visible. Unlike every other variant, never
-    /// produced by `bucket_for` - `compute_layout` assigns it directly,
-    /// pulling pinned messages out of the date-bucketed/flat body entirely
-    /// (see `splice_pinned_section`), so it coexists with every sort key
-    /// instead of only `SortKey::Date`.
-    Pinned,
 }
 
 /// The Monday on or before `date`.
@@ -234,7 +360,6 @@ pub fn bucket_label(bucket: DateBucket, now: DateTime<Local>) -> String {
         }
         DateBucket::Older => "Older".to_string(),
         DateBucket::Year(year) => format!("{year}"),
-        DateBucket::Pinned => "Pinned".to_string(),
     }
 }
 
@@ -251,6 +376,126 @@ pub fn format_row_date(date: DateTime<Utc>, now: DateTime<Utc>) -> String {
         local.format("%a %-I:%M %p").to_string()
     } else {
         local.format("%-d/%m/%Y").to_string()
+    }
+}
+
+/// The size ranges the "Arrange by: Size" grouping buckets messages into.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SizeBucket {
+    Under10K,
+    Under100K,
+    Under1M,
+    Under5M,
+    Over5M,
+}
+
+/// Which section header a row sits under. One variant per `SortKey` (plus the
+/// special `Pinned`), so grouping can follow whichever field the list is
+/// arranged by - Outlook's "Arrange by" behaviour - rather than date only.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum GroupKey {
+    Date(DateBucket),
+    /// A single initial letter (A-Z) or "#" for anything else.
+    Sender(String),
+    Subject(String),
+    To(String),
+    /// The alphabetically-first `$Lookout-tag-*` key, or `""` for none.
+    Category(String),
+    Size(SizeBucket),
+    /// Importance rank: 0 = High, 1 = Normal, 2 = Low.
+    Importance(u8),
+    Flag(bool),
+    Attachment(bool),
+    Pinned,
+}
+
+/// Importance rank used for both the sort and grouping: High first, Low last.
+fn importance_rank(importance: lookout_core::Importance) -> u8 {
+    match importance {
+        lookout_core::Importance::High => 0,
+        lookout_core::Importance::Normal => 1,
+        lookout_core::Importance::Low => 2,
+    }
+}
+
+fn size_bucket(size: u32) -> SizeBucket {
+    const KB: u32 = 1024;
+    const MB: u32 = 1024 * 1024;
+    if size < 10 * KB {
+        SizeBucket::Under10K
+    } else if size < 100 * KB {
+        SizeBucket::Under100K
+    } else if size < MB {
+        SizeBucket::Under1M
+    } else if size < 5 * MB {
+        SizeBucket::Under5M
+    } else {
+        SizeBucket::Over5M
+    }
+}
+
+fn size_bucket_label(bucket: SizeBucket) -> &'static str {
+    match bucket {
+        SizeBucket::Under10K => "Under 10 KB",
+        SizeBucket::Under100K => "10-100 KB",
+        SizeBucket::Under1M => "100 KB - 1 MB",
+        SizeBucket::Under5M => "1-5 MB",
+        SizeBucket::Over5M => "Over 5 MB",
+    }
+}
+
+/// The initial-letter bucket for a text field: the first character uppercased
+/// when it is alphabetic, otherwise "#" (covering blank and non-Latin values).
+fn initial_letter(value: Option<&str>) -> String {
+    match value.and_then(|value| value.trim_start().chars().next()) {
+        Some(c) if c.is_alphabetic() => c.to_uppercase().to_string(),
+        _ => "#".to_string(),
+    }
+}
+
+/// The alphabetically-first `$Lookout-tag-*` key on a message, lowercased, or
+/// `None` when it carries no category. `keywords` is a `BTreeSet`, so the
+/// first match is deterministic.
+fn tag_sort_key(message: &EmailSummary) -> Option<String> {
+    message.keywords.iter().find_map(|keyword| lookout_core::tag_key_from_keyword(keyword)).map(str::to_lowercase)
+}
+
+/// The grouping key and header label for `message` under `key`. Because the
+/// list is already sorted by `key`, equal keys come out contiguous - which is
+/// what lets `build_layout` cut sections from runs without sorting.
+fn group_of(key: SortKey, message: &EmailSummary, now: DateTime<Local>) -> (GroupKey, String) {
+    let group = match key {
+        SortKey::Date => GroupKey::Date(bucket_for(message.date, now)),
+        SortKey::Sender => GroupKey::Sender(initial_letter(message.from.first().map(|a| a.display_label()))),
+        SortKey::Subject => GroupKey::Subject(initial_letter(message.subject.as_deref())),
+        SortKey::To => GroupKey::To(initial_letter(message.to.first().map(|a| a.display_label()))),
+        SortKey::Category => GroupKey::Category(tag_sort_key(message).unwrap_or_default()),
+        SortKey::Size => GroupKey::Size(size_bucket(message.size)),
+        SortKey::Importance => GroupKey::Importance(importance_rank(message.importance)),
+        SortKey::Flag => GroupKey::Flag(message.is_pinned()),
+        SortKey::Attachments => GroupKey::Attachment(message.has_attachment),
+    };
+    let label = group_label(&group, now);
+    (group, label)
+}
+
+/// The header text for `group`. Only `LastMonth`'s date label depends on
+/// `now`.
+fn group_label(group: &GroupKey, now: DateTime<Local>) -> String {
+    match group {
+        GroupKey::Date(bucket) => bucket_label(*bucket, now),
+        GroupKey::Sender(letter) | GroupKey::Subject(letter) | GroupKey::To(letter) => letter.clone(),
+        GroupKey::Category(key) if key.is_empty() => "No category".to_string(),
+        GroupKey::Category(key) => key.clone(),
+        GroupKey::Size(bucket) => size_bucket_label(*bucket).to_string(),
+        GroupKey::Importance(0) => "High importance".to_string(),
+        GroupKey::Importance(2) => "Low importance".to_string(),
+        GroupKey::Importance(_) => "Normal importance".to_string(),
+        GroupKey::Flag(true) => "Flagged".to_string(),
+        GroupKey::Flag(false) => "Not flagged".to_string(),
+        GroupKey::Attachment(true) => "With attachments".to_string(),
+        GroupKey::Attachment(false) => "No attachments".to_string(),
+        GroupKey::Pinned => "Pinned".to_string(),
     }
 }
 
@@ -271,7 +516,7 @@ pub enum MessageItem {
 }
 
 pub struct SectionRow {
-    pub bucket: DateBucket,
+    pub group: GroupKey,
     pub label: String,
 }
 
@@ -341,13 +586,12 @@ struct ThreadLayout {
     messages: Vec<EmailSummary>,
 }
 
-/// How the list is arranged for a given sort: grouped under date headers, a
-/// flat run of messages, or date headers over collapsible conversations.
+/// How the list is arranged for a given sort: grouped under headers, or
+/// headers over collapsible conversations.
 #[derive(Debug)]
 enum ListLayout {
-    Flat(Vec<EmailSummary>),
-    Grouped(Vec<(DateBucket, String, Vec<EmailSummary>)>),
-    Threaded(Vec<(DateBucket, String, Vec<ThreadEntry>)>),
+    Grouped(Vec<(GroupKey, String, Vec<EmailSummary>)>),
+    Threaded(Vec<(GroupKey, String, Vec<ThreadEntry>)>),
 }
 
 /// `compute_layout`'s full result, bundled into one value rather than three
@@ -362,28 +606,26 @@ struct ComputedLayout {
 
 /// Splits an already-sorted message list into the sections the list renders.
 ///
-/// Grouping only makes sense under `SortKey::Date` - sections are date
-/// ranges, and under a sender/subject sort their contents would interleave
-/// arbitrarily - so the other keys render flat.
+/// Sections follow the sort key: each key has its own `group_of` (date
+/// ranges, sender initial, size range, and so on), matching Outlook's
+/// "Arrange by" grouping.
 ///
 /// Sections are cut from *consecutive runs* of the sorted slice rather than
-/// collected into a map and sorted afterwards. `bucket_for` is monotone in
-/// date, so runs come out contiguous and already in the right order - and,
-/// for free, an ascending sort yields oldest-section-first, the exact mirror
-/// of the descending layout. That's why `DateBucket` needs no `Ord`.
+/// collected into a map and sorted afterwards. Because the messages are
+/// sorted by the same field the group is derived from, equal groups come out
+/// contiguous and already in order - and, for free, an ascending sort yields
+/// the sections in mirrored order, exactly as the descending layout. That's
+/// why `GroupKey` needs no `Ord`.
 ///
 /// With `threaded` set, conversations (`group_threads`) are cut instead of
 /// bare messages, and each conversation sits in the section of its *newest*
-/// message's date - a two-day-old root whose reply landed today belongs to
-/// Today, not to the root's bucket. The section run-cut stays valid because
-/// each thread's newest message is the first of its members in the
-/// newest-first scan, so the per-thread latest dates the cuts follow are
-/// monotone in the same way single messages' dates were.
+/// message - a two-day-old root whose reply landed today belongs to Today,
+/// not to the root's group. The section run-cut stays valid because each
+/// thread's newest message is the first of its members in the newest-first
+/// scan, so the per-thread latest values the cuts follow are monotone in the
+/// same way single messages' values were.
 fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>, threaded: bool, descending: bool) -> ListLayout {
-    if key != SortKey::Date {
-        return ListLayout::Flat(sorted);
-    }
-    let sections: Vec<(DateBucket, String, Vec<ThreadEntry>)> = if threaded {
+    let sections: Vec<(GroupKey, String, Vec<ThreadEntry>)> = if threaded {
         // `group_threads` scans newest-first (it needs each thread's newest
         // member to place it), so an ascending sort is mirrored by reversing
         // the scan order first and then the finished sections, exactly as the
@@ -392,16 +634,16 @@ fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>, t
         if !descending {
             messages.reverse();
         }
-        let mut sections: Vec<(DateBucket, String, Vec<ThreadEntry>)> = Vec::new();
+        let mut sections: Vec<(GroupKey, String, Vec<ThreadEntry>)> = Vec::new();
         for entry in group_threads(&messages) {
-            let latest = match &entry {
-                ThreadEntry::Thread(thread) => thread.row.latest,
-                ThreadEntry::Single(message) => message.date,
+            let representative = match &entry {
+                ThreadEntry::Thread(thread) => thread.messages.last().expect("a thread keeps at least its newest message"),
+                ThreadEntry::Single(message) => message,
             };
-            let bucket = bucket_for(latest, now);
+            let (group, label) = group_of(key, representative, now);
             match sections.last_mut() {
-                Some((last, _, entries)) if *last == bucket => entries.push(entry),
-                _ => sections.push((bucket, bucket_label(bucket, now), vec![entry])),
+                Some((last, _, entries)) if *last == group => entries.push(entry),
+                _ => sections.push((group, label, vec![entry])),
             }
         }
         if !descending {
@@ -416,33 +658,26 @@ fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>, t
         }
         sections
     } else {
-        let mut sections: Vec<(DateBucket, String, Vec<ThreadEntry>)> = Vec::new();
+        let mut sections: Vec<(GroupKey, String, Vec<ThreadEntry>)> = Vec::new();
         for message in sorted {
-            let bucket = bucket_for(message.date, now);
+            let (group, label) = group_of(key, &message, now);
             match sections.last_mut() {
-                Some((last, _, entries)) if *last == bucket => entries.push(ThreadEntry::Single(message)),
-                _ => {
-                    debug_assert!(
-                        !sections.iter().any(|(b, _, _)| *b == bucket),
-                        "bucket_for is not monotone in date: {bucket:?} emitted twice"
-                    );
-                    sections.push((bucket, bucket_label(bucket, now), vec![ThreadEntry::Single(message)]));
-                }
+                Some((last, _, entries)) if *last == group => entries.push(ThreadEntry::Single(message)),
+                _ => sections.push((group, label, vec![ThreadEntry::Single(message)])),
             }
         }
         sections
     };
     if !threaded {
-        // The unthreaded layout keeps its old shape: sections of bare
-        // messages.
+        // The unthreaded layout holds bare messages inside each section.
         let grouped = sections
             .into_iter()
-            .map(|(bucket, label, entries)| {
+            .map(|(group, label, entries)| {
                 let messages = entries.into_iter().map(|e| match e {
                     ThreadEntry::Single(message) => message,
                     ThreadEntry::Thread(_) => unreachable!("unthreaded layout never holds thread entries"),
                 });
-                (bucket, label, messages.collect())
+                (group, label, messages.collect())
             })
             .collect();
         return ListLayout::Grouped(grouped);
@@ -614,16 +849,14 @@ fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
 /// whenever the blocking pool happened to get around to it.
 ///
 /// Pinned messages are pulled out of `messages` before `build_layout` ever
-/// sees them (unless `filter` is already `Flagged`, in which case every
-/// visible message is pinned and a pinned copy would just duplicate the
-/// list) - `apply_layout`'s `splice_pinned_section` renders them as their
-/// own leading section, independent of `sort_key`/`threaded`, which is what
-/// lets the pinned section appear under every sort mode while
-/// `build_layout` itself stays exactly as date-grouping-only as before.
-fn compute_layout(truth: Vec<EmailSummary>, filter: ListFilter, sort_key: SortKey, sort_descending: bool, threaded: bool, now: DateTime<Local>) -> ComputedLayout {
-    let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m)).collect();
+/// sees them (unless `flag` is active, in which case every visible message is
+/// pinned and a pinned copy would just duplicate the list) - `apply_layout`'s
+/// `splice_pinned_section` renders them as their own leading section,
+/// independent of `sort_key`/`threaded`.
+fn compute_layout(truth: Vec<EmailSummary>, filter: FilterSet, viewer: &HashSet<String>, sort_key: SortKey, sort_descending: bool, threaded: bool, now: DateTime<Local>) -> ComputedLayout {
+    let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m, viewer)).collect();
     sort_messages(&mut messages, sort_key, sort_descending);
-    let pinned = if filter == ListFilter::Flagged {
+    let pinned = if filter.contains(Filter::Flagged) {
         Vec::new()
     } else {
         // `partition` preserves each output's relative order, so both halves
@@ -637,13 +870,13 @@ fn compute_layout(truth: Vec<EmailSummary>, filter: ListFilter, sort_key: SortKe
     ComputedLayout { pinned, layout, keys }
 }
 
-/// A `SectionRow` fingerprint: bucket identity plus its label, so a relabel
+/// A `SectionRow` fingerprint: group identity plus its label, so a relabel
 /// (e.g. `LastMonth`'s label crossing a month boundary between rebuilds)
-/// still counts as a change even though the bucket itself didn't move.
-type SectionRowKey = (DateBucket, String);
+/// still counts as a change even though the group itself didn't move.
+type SectionRowKey = (GroupKey, String);
 
-fn section_row_key(bucket: DateBucket, label: &str) -> SectionRowKey {
-    (bucket, label.to_string())
+fn section_row_key(group: GroupKey, label: &str) -> SectionRowKey {
+    (group, label.to_string())
 }
 
 /// A `ThreadRow` header fingerprint - every field the header renders, plus
@@ -748,7 +981,7 @@ fn splice_diff(store: &gio::ListStore, old_keys: &[RowKey], new_keys: &[RowKey],
 /// themselves: the fingerprint is the only thing the comparison needs, and
 /// key vectors make it a plain `Vec` equality (allocation-free) instead of a
 /// per-message key rebuild on both sides of every event.
-type DisplayedMessages = Option<(SortKey, bool, ListFilter, bool, Vec<MessageRowKey>)>;
+type DisplayedMessages = Option<(SortKey, bool, FilterSet, bool, Vec<MessageRowKey>)>;
 
 /// What the message list's selection currently points at. The cases are
 /// genuinely distinct to the reading pane: nothing selected clears it, a
@@ -824,16 +1057,16 @@ pub struct MessageListModel {
     /// `splice` still holds the child model it was given, so swapping in a
     /// fresh store would leave that row pointing at a discarded one.
     /// Rebuilds splice *into* these instead.
-    sections: Rc<RefCell<HashMap<DateBucket, TrackedStore>>>,
+    sections: Rc<RefCell<HashMap<GroupKey, TrackedStore>>>,
     /// One child store per conversation, for the thread rows' own children -
     /// the third tree level, only populated while threading is on. Same
     /// outlive-the-rebuild discipline and diff-target pairing as `sections`.
     threads: Rc<RefCell<HashMap<ThreadId, TrackedStore>>>,
     /// Sections the user has collapsed. Collapse is the exception, so an
-    /// absent bucket means expanded and a newly-appearing section defaults
+    /// absent group means expanded and a newly-appearing section defaults
     /// open. Lives outside the model so it survives the constant rebuilds
     /// (cache replay, live sync, on-demand sync) that recreate every row.
-    collapsed: Rc<RefCell<HashSet<DateBucket>>>,
+    collapsed: Rc<RefCell<HashSet<GroupKey>>>,
     /// Conversations the user has collapsed, keyed by the thread's stable
     /// `(mailbox, thread key)` identity - the same discipline as `collapsed`,
     /// and the reason `ThreadRow` keeps its id rather than deriving anything
@@ -842,7 +1075,7 @@ pub struct MessageListModel {
     /// off-and-on doesn't forget the user's collapses.
     collapsed_threads: Rc<RefCell<HashSet<ThreadId>>>,
     /// Whether the Pinned section is collapsed. Kept separate from
-    /// `collapsed` rather than folded in as one more `DateBucket` member -
+    /// `collapsed` rather than folded in as one more `GroupKey` member -
     /// see `capture_collapsed`/`apply_expansion`'s matching special cases.
     collapsed_pinned: Rc<Cell<bool>>,
     /// Whether conversations render collapsed under their headers (on) or as
@@ -862,11 +1095,15 @@ pub struct MessageListModel {
     /// this (filtered, then sorted), so toggling the filter off can bring
     /// back messages the filtered subset no longer contains.
     truth: Rc<RefCell<Vec<EmailSummary>>>,
-    /// The active filter, applied inside `repopulate` to every incoming
+    /// The active filters, applied inside `repopulate` to every incoming
     /// message set. Owned by the model rather than `UiState` (unlike the
     /// sort), so every caller that rebuilds the list gets the same subset
-    /// without threading the filter through each call site.
-    filter: Rc<RefCell<ListFilter>>,
+    /// without threading the filters through each call site.
+    filter: Rc<RefCell<FilterSet>>,
+    /// The viewer's own lowercased email addresses (every connected account's
+    /// address), used to evaluate [`Filter::ToMe`]. Empty until the window
+    /// seeds it, which makes `ToMe` match nothing - a safe default.
+    viewer: Rc<RefCell<HashSet<String>>>,
     /// Bumped on every `repopulate` call (both the inline and background
     /// paths), and captured at the start of a background dispatch. When that
     /// dispatch's reply lands, it's discarded unless this still reads the
@@ -927,7 +1164,7 @@ impl MessageListModel {
 
     fn build_internal(worker: Option<Rc<Worker>>) -> Self {
         let root = gio::ListStore::new::<glib::BoxedAnyObject>();
-        let sections: Rc<RefCell<HashMap<DateBucket, TrackedStore>>> = Rc::new(RefCell::new(HashMap::new()));
+        let sections: Rc<RefCell<HashMap<GroupKey, TrackedStore>>> = Rc::new(RefCell::new(HashMap::new()));
         let threads: Rc<RefCell<HashMap<ThreadId, TrackedStore>>> = Rc::new(RefCell::new(HashMap::new()));
         let tree = gtk::TreeListModel::new(root.clone(), false, false, {
             let sections = sections.clone();
@@ -938,7 +1175,7 @@ impl MessageListModel {
                 let store = match &*item {
                     // A section's children are its conversation headers and
                     // lone messages.
-                    MessageItem::Section(section) => sections.borrow_mut().entry(section.bucket).or_insert_with(TrackedStore::new).store.clone(),
+                    MessageItem::Section(section) => sections.borrow_mut().entry(section.group.clone()).or_insert_with(TrackedStore::new).store.clone(),
                     // A conversation's children are its messages.
                     MessageItem::Thread(thread) => threads.borrow_mut().entry(thread.id.clone()).or_insert_with(TrackedStore::new).store.clone(),
                     // A message is a leaf: no child model, no expander.
@@ -965,7 +1202,8 @@ impl MessageListModel {
             threaded: Rc::new(RefCell::new(true)),
             displayed: Rc::new(RefCell::new(None)),
             truth: Rc::new(RefCell::new(Vec::new())),
-            filter: Rc::new(RefCell::new(ListFilter::All)),
+            filter: Rc::new(RefCell::new(FilterSet::none())),
+            viewer: Rc::new(RefCell::new(HashSet::new())),
             generation: Rc::new(Cell::new(0)),
             worker,
             scroller: Rc::new(RefCell::new(None)),
@@ -1028,6 +1266,11 @@ impl MessageListModel {
         self.truth.borrow().clone()
     }
 
+    /// The active filter set, for the window's filter-menu actions to toggle.
+    pub fn filter(&self) -> FilterSet {
+        *self.filter.borrow()
+    }
+
     /// The selected row's message, or `None` when nothing is selected, the
     /// selection has landed on a section header, or more than one message is
     /// selected.
@@ -1082,8 +1325,8 @@ impl MessageListModel {
     }
 
     /// Replaces the list's contents with `messages` in the given sort order,
-    /// filtered by the active `ListFilter`, grouped into date sections when
-    /// sorting by date, preserving the current highlight and the user's
+    /// filtered by the active [`FilterSet`], grouped under headers derived
+    /// from the sort key, preserving the current highlight and the user's
     /// collapsed sections where possible.
     ///
     /// The *unfiltered* `messages` are kept as the model's source of truth
@@ -1160,6 +1403,7 @@ impl MessageListModel {
     /// generation-guard rationale.
     fn recompute_and_apply(&self, sort_key: SortKey, sort_descending: bool) {
         let filter = *self.filter.borrow();
+        let viewer = self.viewer.borrow().clone();
         let threaded = *self.threaded.borrow();
         let now = Local::now();
         let generation = self.generation.get().wrapping_add(1);
@@ -1179,14 +1423,14 @@ impl MessageListModel {
             // Small enough to be imperceptible inline (or no worker - every
             // test-built model), or under the threshold: compute and apply
             // in the same call, exactly as before this split existed.
-            let computed = compute_layout(truth_snapshot, filter, sort_key, sort_descending, threaded, now);
+            let computed = compute_layout(truth_snapshot, filter, &viewer, sort_key, sort_descending, threaded, now);
             self.apply_layout(sort_key, sort_descending, filter, threaded, now, computed);
             return;
         };
 
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         worker.spawn(async move {
-            if let Ok(result) = tokio::task::spawn_blocking(move || compute_layout(truth_snapshot, filter, sort_key, sort_descending, threaded, now)).await {
+            if let Ok(result) = tokio::task::spawn_blocking(move || compute_layout(truth_snapshot, filter, &viewer, sort_key, sort_descending, threaded, now)).await {
                 let _ = reply_tx.send(result).await;
             }
         });
@@ -1205,7 +1449,7 @@ impl MessageListModel {
     /// `compute_layout` dispatch), does the no-op check, snapshots collapse
     /// and selection state, and splices the result into the tree. See
     /// `repopulate`'s doc comment for the two ways this gets called.
-    fn apply_layout(&self, sort_key: SortKey, sort_descending: bool, filter: ListFilter, threaded: bool, now: DateTime<Local>, computed: ComputedLayout) {
+    fn apply_layout(&self, sort_key: SortKey, sort_descending: bool, filter: FilterSet, threaded: bool, now: DateTime<Local>, computed: ComputedLayout) {
         let ComputedLayout { pinned, layout, keys } = computed;
         // The sort is part of the comparison, not just the contents: a list
         // can be element-identical under ascending and descending order yet
@@ -1258,31 +1502,13 @@ impl MessageListModel {
         let (pinned_live, pinned_root_keys, pinned_root_rows) = self.splice_pinned_section(&pinned, now);
 
         match layout {
-            ListLayout::Flat(messages) => {
-                // No date sections, no threads: every *other* child store
-                // drains, so a later threaded rebuild can't resurrect rows
-                // from a layout that has been gone since the last capture -
-                // the Pinned store is deliberately spared via `pinned_live`.
-                self.clear_sections(&pinned_live);
-                self.clear_threads(&HashSet::new());
-                let mut new_keys: Vec<RowKey> = pinned_root_keys;
-                new_keys.extend(messages.iter().map(|m| RowKey::Message(message_row_key(m))));
-                let mut rows: Vec<glib::Object> = pinned_root_rows;
-                rows.extend(messages.into_iter().map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m))).upcast()));
-                let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
-                splice_diff(&self.root, &old_keys, &new_keys, &rows);
-                // A flat sort has no date sections of its own, but the
-                // Pinned row above might be one - apply its collapse state
-                // (a no-op walk when `pinned` was empty).
-                self.apply_expansion();
-            }
             ListLayout::Grouped(sections) => {
                 // Children before roots: a root row whose child store is
                 // already correct spends no time reporting a stale child
                 // count to the tree model.
-                let mut live: HashSet<DateBucket> = pinned_live;
-                live.extend(sections.iter().map(|(b, _, _)| *b));
-                for (bucket, _, messages) in &sections {
+                let mut live: HashSet<GroupKey> = pinned_live;
+                live.extend(sections.iter().map(|(group, _, _)| group.clone()));
+                for (group, _, messages) in &sections {
                     let new_keys: Vec<RowKey> = messages.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
                     let rows: Vec<glib::Object> = messages
                         .iter()
@@ -1295,7 +1521,7 @@ impl MessageListModel {
                     // follows below).
                     let (store, old_keys) = {
                         let mut sections = self.sections.borrow_mut();
-                        let tracked = sections.entry(*bucket).or_insert_with(TrackedStore::new);
+                        let tracked = sections.entry(group.clone()).or_insert_with(TrackedStore::new);
                         let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
                         (tracked.store.clone(), old_keys)
                     };
@@ -1308,12 +1534,12 @@ impl MessageListModel {
                 self.clear_threads(&HashSet::new());
 
                 let mut new_keys: Vec<RowKey> = pinned_root_keys;
-                new_keys.extend(sections.iter().map(|(bucket, label, _)| RowKey::Section(section_row_key(*bucket, label))));
+                new_keys.extend(sections.iter().map(|(group, label, _)| RowKey::Section(section_row_key(group.clone(), label))));
                 let mut rows: Vec<glib::Object> = pinned_root_rows;
                 rows.extend(
                     sections
                         .into_iter()
-                        .map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast()),
+                        .map(|(group, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { group, label })).upcast()),
                 );
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
@@ -1323,10 +1549,10 @@ impl MessageListModel {
                 // Two child levels to splice before the roots: each section's
                 // store holds its conversation headers and lone messages, and
                 // each conversation's store holds its messages.
-                let mut live_buckets: HashSet<DateBucket> = pinned_live;
-                live_buckets.extend(sections.iter().map(|(b, _, _)| *b));
+                let mut live_groups: HashSet<GroupKey> = pinned_live;
+                live_groups.extend(sections.iter().map(|(group, _, _)| group.clone()));
                 let mut live_threads: HashSet<ThreadId> = HashSet::new();
-                for (bucket, _, entries) in &sections {
+                for (group, _, entries) in &sections {
                     let new_keys: Vec<RowKey> = entries
                         .iter()
                         .map(|entry| match entry {
@@ -1345,7 +1571,7 @@ impl MessageListModel {
                     // and the borrow dropped before splicing.
                     let (store, old_keys) = {
                         let mut sections = self.sections.borrow_mut();
-                        let tracked = sections.entry(*bucket).or_insert_with(TrackedStore::new);
+                        let tracked = sections.entry(group.clone()).or_insert_with(TrackedStore::new);
                         let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
                         (tracked.store.clone(), old_keys)
                     };
@@ -1372,16 +1598,16 @@ impl MessageListModel {
                         splice_diff(&thread_store, &old_message_keys, &new_message_keys, &message_rows);
                     }
                 }
-                self.clear_sections(&live_buckets);
+                self.clear_sections(&live_groups);
                 self.clear_threads(&live_threads);
 
                 let mut new_keys: Vec<RowKey> = pinned_root_keys;
-                new_keys.extend(sections.iter().map(|(bucket, label, _)| RowKey::Section(section_row_key(*bucket, label))));
+                new_keys.extend(sections.iter().map(|(group, label, _)| RowKey::Section(section_row_key(group.clone(), label))));
                 let mut rows: Vec<glib::Object> = pinned_root_rows;
                 rows.extend(
                     sections
                         .into_iter()
-                        .map(|(bucket, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { bucket, label })).upcast()),
+                        .map(|(group, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { group, label })).upcast()),
                 );
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
@@ -1399,9 +1625,9 @@ impl MessageListModel {
     }
 
     /// Switches which messages the list shows and re-renders from the stored
-    /// unfiltered set under the current sort, so `Unread` ↔ `All` round-trips
+    /// unfiltered set under the current sort, so toggling filters round-trips
     /// without losing a message. A no-op when the filter is already in effect.
-    pub fn set_filter(&self, filter: ListFilter) {
+    pub fn set_filter(&self, filter: FilterSet) {
         if *self.filter.borrow() == filter {
             return;
         }
@@ -1416,11 +1642,27 @@ impl MessageListModel {
         self.repopulate(truth, sort_key, sort_descending);
     }
 
+    /// Replaces the viewer's own addresses used to evaluate [`Filter::ToMe`],
+    /// and re-renders when the set actually changed (so a message list built
+    /// before the accounts connected picks the filter up).
+    pub fn set_viewer_addresses(&self, viewer: HashSet<String>) {
+        if *self.viewer.borrow() == viewer {
+            return;
+        }
+        *self.viewer.borrow_mut() = viewer;
+        if self.contains_to_me_filter() {
+            self.refresh();
+        }
+    }
+
+    fn contains_to_me_filter(&self) -> bool {
+        self.filter.borrow().contains(Filter::ToMe)
+    }
+
     /// Turns conversation grouping on or off and re-renders from the stored
-    /// unfiltered set. Only a `SortKey::Date` list is affected - sender and
-    /// subject sorts render flat either way (`build_layout`), so toggling
-    /// while one is active just records the mode for when the list is next
-    /// sorted by date. A no-op when the mode is already in effect.
+    /// unfiltered set. Every sort key groups, so this only decides whether the
+    /// list's rows are collapsible conversations. A no-op when the mode is
+    /// already in effect.
     pub fn set_threaded(&self, threaded: bool) {
         if *self.threaded.borrow() == threaded {
             return;
@@ -1452,28 +1694,28 @@ impl MessageListModel {
         self.repopulate(self.all_messages(), sort_key, sort_descending);
     }
 
-    /// Empties every section store whose bucket isn't in `live`, so a bucket
+    /// Empties every section store whose group isn't in `live`, so a group
     /// that has gone away stops contributing rows. The stores themselves are
     /// kept (see the `sections` field's note).
-    fn clear_sections(&self, live: &HashSet<DateBucket>) {
-        let stale: Vec<(DateBucket, gio::ListStore)> = self
+    fn clear_sections(&self, live: &HashSet<GroupKey>) {
+        let stale: Vec<(GroupKey, gio::ListStore)> = self
             .sections
             .borrow()
             .iter()
-            .filter(|(bucket, _)| !live.contains(*bucket))
-            .map(|(bucket, tracked)| (*bucket, tracked.store.clone()))
+            .filter(|(group, _)| !live.contains(*group))
+            .map(|(group, tracked)| (group.clone(), tracked.store.clone()))
             .collect();
         // Borrow dropped before splicing: `items-changed` re-enters.
         for (_, store) in &stale {
             store.splice(0, store.n_items(), &[] as &[glib::Object]);
         }
         // Second pass, after every splice has settled: zero the stale
-        // entries' cached keys too, or a bucket that's kept around (see the
+        // entries' cached keys too, or a group that's kept around (see the
         // `sections` field's note) but now empty would diff its next
         // reappearance against a stale non-empty baseline.
         let mut sections = self.sections.borrow_mut();
-        for (bucket, _) in &stale {
-            if let Some(tracked) = sections.get_mut(bucket) {
+        for (group, _) in &stale {
+            if let Some(tracked) = sections.get_mut(group) {
                 tracked.keys.clear();
             }
         }
@@ -1481,10 +1723,9 @@ impl MessageListModel {
 
     /// Empties every conversation store whose thread id isn't in `live` - the
     /// `sections`-level counterpart for the threads map. Called whenever the
-    /// new layout holds no thread rows at all (flat and grouped layouts pass
-    /// an empty set), so a stale thread store can never resurface its old
-    /// messages under a row the next threaded rebuild re-creates for the same
-    /// id.
+    /// new layout holds no thread rows at all (grouped layouts pass an empty
+    /// set), so a stale thread store can never resurface its old messages
+    /// under a row the next threaded rebuild re-creates for the same id.
     fn clear_threads(&self, live: &HashSet<ThreadId>) {
         let stale: Vec<(ThreadId, gio::ListStore)> = self
             .threads
@@ -1505,15 +1746,15 @@ impl MessageListModel {
     }
 
     /// Splices the Pinned section's message rows into its own
-    /// tracked store (reusing `self.sections`'s per-bucket-store machinery,
-    /// keyed by the new `DateBucket::Pinned`) and returns what
-    /// `apply_layout` needs to give it priority: the bucket to keep out of
+    /// tracked store (reusing `self.sections`'s per-group-store machinery,
+    /// keyed by the special `GroupKey::Pinned`) and returns what
+    /// `apply_layout` needs to give it priority: the group to keep out of
     /// `clear_sections`, and the 0-or-1 `SectionRow` to place ahead of
     /// whatever the active sort/grouping renders below it. Called first,
     /// unconditionally, in every `apply_layout` arm - the pinned section
-    /// exists independent of date grouping (`compute_layout` already pulled
-    /// pinned messages out of `build_layout`'s input).
-    fn splice_pinned_section(&self, pinned: &[EmailSummary], now: DateTime<Local>) -> (HashSet<DateBucket>, Vec<RowKey>, Vec<glib::Object>) {
+    /// exists independent of the active grouping (`compute_layout` already
+    /// pulled pinned messages out of `build_layout`'s input).
+    fn splice_pinned_section(&self, pinned: &[EmailSummary], now: DateTime<Local>) -> (HashSet<GroupKey>, Vec<RowKey>, Vec<glib::Object>) {
         if pinned.is_empty() {
             return (HashSet::new(), Vec::new(), Vec::new());
         }
@@ -1524,19 +1765,19 @@ impl MessageListModel {
             .collect();
         let (store, old_keys) = {
             let mut sections = self.sections.borrow_mut();
-            let tracked = sections.entry(DateBucket::Pinned).or_insert_with(TrackedStore::new);
+            let tracked = sections.entry(GroupKey::Pinned).or_insert_with(TrackedStore::new);
             let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
             (tracked.store.clone(), old_keys)
         };
         splice_diff(&store, &old_keys, &new_keys, &rows);
-        let label = bucket_label(DateBucket::Pinned, now);
-        let root_keys = vec![RowKey::Section(section_row_key(DateBucket::Pinned, &label))];
+        let label = group_label(&GroupKey::Pinned, now);
+        let root_keys = vec![RowKey::Section(section_row_key(GroupKey::Pinned, &label))];
         let root_rows: Vec<glib::Object> = vec![glib::BoxedAnyObject::new(MessageItem::Section(SectionRow {
-            bucket: DateBucket::Pinned,
+            group: GroupKey::Pinned,
             label,
         }))
         .upcast()];
-        (HashSet::from([DateBucket::Pinned]), root_keys, root_rows)
+        (HashSet::from([GroupKey::Pinned]), root_keys, root_rows)
     }
 
     /// Re-projects the user's collapsed-section set onto the freshly-created
@@ -1555,19 +1796,19 @@ impl MessageListModel {
             // the flat row count changing underneath it as each expansion
             // splices children in. Iterating `tree.n_items()` would not be.
             let Some(row) = self.tree.child_row(i) else { continue };
-            let Some(bucket) = section_bucket(&row) else { continue };
-            if bucket == DateBucket::Pinned {
-                // Kept out of `collapsed`: the Pinned section can appear
-                // under a flat (Sender/Subject) sort where no date section
-                // does, and folding its state into the same set `capture_
-                // collapsed` wholesale-overwrites would start forgetting
-                // remembered date-bucket collapses on every trip through a
-                // flat sort. It also never threads (see `compute_layout`),
-                // so there's no child walk to do here either.
+            let Some(group) = section_group(&row) else { continue };
+            if group == GroupKey::Pinned {
+                // Kept out of `collapsed`: the Pinned section can coexist
+                // with any active grouping, and folding its state into the
+                // same set `capture_collapsed` wholesale-overwrites would
+                // start forgetting remembered section collapses on every
+                // rebuild that groups differently. It also never threads (see
+                // `compute_layout`), so there's no child walk to do here
+                // either.
                 row.set_expanded(!self.collapsed_pinned.get());
                 continue;
             }
-            row.set_expanded(!collapsed.contains(&bucket));
+            row.set_expanded(!collapsed.contains(&group));
             // One level deeper: each section's children include conversation
             // headers, which get their own expansion state. `row.child_row`
             // is the tree's own child accessor (the section must be expanded
@@ -1605,23 +1846,31 @@ impl MessageListModel {
     /// whatever the model materialized - capturing that as "not collapsed" is
     /// exactly right.
     fn capture_collapsed(&self) {
-        let mut collapsed = HashSet::new();
-        let mut collapsed_threads = HashSet::new();
+        // Start from the remembered sets and update only the groups/threads
+        // that are actually on screen now: a group that isn't visible under
+        // the current sort key (e.g. a date group while sorting by sender)
+        // must keep its remembered collapse, since `collapsed` is keyed by
+        // `GroupKey` across every sort. Visible groups are set to their
+        // current state either way, so expanding one still forgets it.
+        let mut collapsed = self.collapsed.borrow().clone();
+        let mut collapsed_threads = self.collapsed_threads.borrow().clone();
         let mut saw_section = false;
         let mut saw_thread = false;
         for i in 0..self.root.n_items() {
             let Some(row) = self.tree.child_row(i) else { continue };
-            let Some(bucket) = section_bucket(&row) else { continue };
-            if bucket == DateBucket::Pinned {
+            let Some(group) = section_group(&row) else { continue };
+            if group == GroupKey::Pinned {
                 // See `apply_expansion`'s matching special case: tracked
-                // separately so its presence under a flat sort can't wipe
-                // remembered date-bucket collapses.
+                // separately so its presence alongside any grouping can't wipe
+                // remembered section collapses.
                 self.collapsed_pinned.set(!row.is_expanded());
                 continue;
             }
             saw_section = true;
-            if !row.is_expanded() {
-                collapsed.insert(bucket);
+            if row.is_expanded() {
+                collapsed.remove(&group);
+            } else {
+                collapsed.insert(group.clone());
             }
             // Only an expanded section's thread rows can carry a user's
             // collapse - a collapsed one hides its threads from interaction.
@@ -1631,19 +1880,18 @@ impl MessageListModel {
                     c += 1;
                     if let Some(id) = thread_id(&child) {
                         saw_thread = true;
-                        if !child.is_expanded() {
+                        if child.is_expanded() {
+                            collapsed_threads.remove(&id);
+                        } else {
                             collapsed_threads.insert(id);
                         }
                     }
                 }
             }
         }
-        // Only a grouped list can speak for the collapsed sets. A flat one
-        // (a sender/subject sort) has no section or thread rows at all, and
-        // letting it write empty sets would forget the user's collapses
-        // across a there-and-back sort change. Each set is only rewritten
-        // when rows of its own kind were on screen, so an unthreaded capture
-        // never wipes the thread collapses (or vice versa).
+        // Only a list with rows of a kind can speak for that kind's set, so a
+        // there-and-back sort/threading change never writes an empty set over
+        // remembered collapses it had no rows to observe.
         if saw_section {
             *self.collapsed.borrow_mut() = collapsed;
         }
@@ -1733,12 +1981,12 @@ impl MessageListModel {
     /// message can be located without expanding anything first; only
     /// *selecting* it afterward needs the row to actually be flat.
     ///
-    /// A message hidden by the active `ListFilter` (e.g. "Unread only")
+    /// A message hidden by an active filter (e.g. "Unread only")
     /// isn't in these stores at all - an accepted v1 limitation, not a bug:
     /// this returns `false` rather than silently resetting the user's
     /// filter as a side effect of a chat link click.
     pub fn select_uid(&self, mailbox: &MailboxId, uid: Uid) -> bool {
-        let mut target_section: Option<DateBucket> = None;
+        let mut target_section: Option<GroupKey> = None;
         let mut target_thread: Option<ThreadId> = None;
         let mut located = false;
 
@@ -1748,14 +1996,15 @@ impl MessageListModel {
             };
             let item = boxed.borrow::<MessageItem>();
             match &*item {
-                // Flat (ungrouped) mode: messages sit directly at root.
+                // Messages sit at root only in a degenerate (empty) layout;
+                // normally every message is under a section.
                 MessageItem::Message(summary) if summary.mailbox == *mailbox && summary.uid == uid => {
                     located = true;
                     break 'search;
                 }
                 MessageItem::Section(section) => {
                     let sections = self.sections.borrow();
-                    let Some(tracked) = sections.get(&section.bucket) else { continue };
+                    let Some(tracked) = sections.get(&section.group) else { continue };
                     for j in 0..tracked.store.n_items() {
                         let Some(sboxed) = tracked.store.item(j).and_downcast::<glib::BoxedAnyObject>() else {
                             continue;
@@ -1763,7 +2012,7 @@ impl MessageListModel {
                         let sitem = sboxed.borrow::<MessageItem>();
                         match &*sitem {
                             MessageItem::Message(summary) if summary.mailbox == *mailbox && summary.uid == uid => {
-                                target_section = Some(section.bucket);
+                                target_section = Some(section.group.clone());
                                 located = true;
                             }
                             MessageItem::Thread(thread) => {
@@ -1776,7 +2025,7 @@ impl MessageListModel {
                                         let mitem = mboxed.borrow::<MessageItem>();
                                         if let MessageItem::Message(summary) = &*mitem {
                                             if summary.mailbox == *mailbox && summary.uid == uid {
-                                                target_section = Some(section.bucket);
+                                                target_section = Some(section.group.clone());
                                                 target_thread = Some(thread.id.clone());
                                                 located = true;
                                             }
@@ -1803,8 +2052,8 @@ impl MessageListModel {
         }
 
         let mut changed = false;
-        if let Some(bucket) = target_section {
-            if self.collapsed.borrow_mut().remove(&bucket) {
+        if let Some(group) = target_section {
+            if self.collapsed.borrow_mut().remove(&group) {
                 changed = true;
             }
         }
@@ -1827,13 +2076,13 @@ impl MessageListModel {
     }
 }
 
-/// The date bucket a root-level `TreeListRow` heads, or `None` if the row is
-/// a message rather than a section.
-fn section_bucket(row: &gtk::TreeListRow) -> Option<DateBucket> {
+/// The group a root-level `TreeListRow` heads, or `None` if the row is a
+/// message rather than a section.
+fn section_group(row: &gtk::TreeListRow) -> Option<GroupKey> {
     let boxed = row.item().and_downcast::<glib::BoxedAnyObject>()?;
     let item = boxed.borrow::<MessageItem>();
     match &*item {
-        MessageItem::Section(section) => Some(section.bucket),
+        MessageItem::Section(section) => Some(section.group.clone()),
         MessageItem::Message(_) | MessageItem::Thread(_) => None,
     }
 }
@@ -1851,19 +2100,31 @@ fn thread_id(row: &gtk::TreeListRow) -> Option<ThreadId> {
 
 /// Orders the message list by the header's chosen key. Every key tie-breaks on
 /// date, newest first, so the order is total - two messages with the same
-/// sender or subject can't shuffle between otherwise-identical rebuilds and
-/// defeat `repopulate`'s identity check.
+/// sender, subject or size can't shuffle between otherwise-identical rebuilds
+/// and defeat `repopulate`'s identity check.
+///
+/// Comparators are written in the "descending" direction (newest/largest/
+/// High/Z-A first); an ascending request is the exact mirror, produced by
+/// reversing - which also flips the date tie-break, as intended.
 pub fn sort_messages(messages: &mut [EmailSummary], key: SortKey, descending: bool) {
-    fn sender_of(m: &EmailSummary) -> String {
-        m.from.first().map(|a| a.display_label().to_lowercase()).unwrap_or_default()
-    }
+    // A missing text value sorts after every real value in the descending
+    // order (so blanks land last, as Outlook's "None" groups do).
+    const NO_KEY: &str = "\u{10FFFF}";
+    let sender_of = |m: &EmailSummary| m.from.first().map(|a| a.display_label().to_lowercase()).unwrap_or_else(|| NO_KEY.to_string());
+    let subject_of = |m: &EmailSummary| m.subject.as_ref().map(|s| s.to_lowercase()).unwrap_or_else(|| NO_KEY.to_string());
+    let to_of = |m: &EmailSummary| m.to.first().map(|a| a.display_label().to_lowercase()).unwrap_or_else(|| NO_KEY.to_string());
+    let category_of = |m: &EmailSummary| tag_sort_key(m).unwrap_or_else(|| NO_KEY.to_string());
+    let date_tie = |a: &EmailSummary, b: &EmailSummary| b.date.cmp(&a.date);
     match key {
         SortKey::Date => messages.sort_by_key(|m| std::cmp::Reverse(m.date)),
-        SortKey::Sender => messages.sort_by(|a, b| sender_of(a).cmp(&sender_of(b)).then_with(|| b.date.cmp(&a.date))),
-        SortKey::Subject => {
-            let subject_of = |m: &EmailSummary| m.subject.clone().unwrap_or_default().to_lowercase();
-            messages.sort_by(|a, b| subject_of(a).cmp(&subject_of(b)).then_with(|| b.date.cmp(&a.date)));
-        }
+        SortKey::Sender => messages.sort_by(|a, b| sender_of(a).cmp(&sender_of(b)).then_with(|| date_tie(a, b))),
+        SortKey::Subject => messages.sort_by(|a, b| subject_of(a).cmp(&subject_of(b)).then_with(|| date_tie(a, b))),
+        SortKey::To => messages.sort_by(|a, b| to_of(a).cmp(&to_of(b)).then_with(|| date_tie(a, b))),
+        SortKey::Category => messages.sort_by(|a, b| category_of(a).cmp(&category_of(b)).then_with(|| date_tie(a, b))),
+        SortKey::Size => messages.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| date_tie(a, b))),
+        SortKey::Importance => messages.sort_by(|a, b| importance_rank(a.importance).cmp(&importance_rank(b.importance)).then_with(|| date_tie(a, b))),
+        SortKey::Flag => messages.sort_by(|a, b| b.is_pinned().cmp(&a.is_pinned()).then_with(|| date_tie(a, b))),
+        SortKey::Attachments => messages.sort_by(|a, b| b.has_attachment.cmp(&a.has_attachment).then_with(|| date_tie(a, b))),
     }
     // Ascending is the descending order reversed rather than a second set of
     // comparators - which also flips the date tie-break, so "oldest first"
@@ -2002,14 +2263,17 @@ mod tests {
         model.tree.child_row(0).expect("root row 0").set_expanded(true);
         assert_eq!(model.selection.n_items(), 7, "re-expanding did not restore the messages");
 
-        // --- A non-date sort renders flat, with no headers at all ---
-        let flat = MessageListModel::build();
-        flat.repopulate(vec![summary(1, today), summary(2, older)], SortKey::Sender, true);
-        assert_eq!(flat.selection.n_items(), 2);
-        assert!((0..2).all(|i| flat.message_at(i).is_some()), "a sender sort produced a header row");
-        // Switching back to date regroups, expanded.
-        flat.repopulate(vec![summary(1, today), summary(2, older)], SortKey::Date, true);
-        assert_eq!(flat.selection.n_items(), 4);
+        // --- A non-date sort groups by that field instead of date ---
+        let grouped = MessageListModel::build();
+        grouped.repopulate(vec![summary(1, today), summary(2, older)], SortKey::Sender, true);
+        // The fixtures carry no sender, so both land in the "#" group: one
+        // header + two messages.
+        assert_eq!(grouped.selection.n_items(), 3);
+        let kinds: Vec<bool> = (0..grouped.selection.n_items()).map(|i| grouped.message_at(i).is_some()).collect();
+        assert_eq!(kinds, vec![false, true, true], "a sender sort grouped both messages under one header");
+        // Switching back to date regroups.
+        grouped.repopulate(vec![summary(1, today), summary(2, older)], SortKey::Date, true);
+        assert_eq!(grouped.selection.n_items(), 4);
 
         // --- A filter renders a subset and re-renders from the unfiltered
         // truth when it changes ---
@@ -2038,12 +2302,12 @@ mod tests {
         assert_eq!(filtered.selection.n_items(), 7, "unfiltered: Pinned section + two date sections + four messages");
         assert_eq!(filtered.all_messages().len(), 4, "the unfiltered truth is kept");
 
-        filtered.set_filter(ListFilter::Unread);
+        filtered.set_filter(FilterSet::none().with(Filter::Unread, true));
         // `seen` and `flagged_read` are read; the two unread survive.
         assert_eq!(filtered.selection.n_items(), 4, "Unread: two sections + two messages");
         assert_eq!(filtered.all_messages().len(), 4, "filtering never discards the truth");
 
-        filtered.set_filter(ListFilter::Flagged);
+        filtered.set_filter(FilterSet::none().with(Filter::Flagged, true));
         // Both flagged messages, read or not, in the single Today section.
         assert_eq!(filtered.selection.n_items(), 3, "Flagged: one section + two messages");
 
@@ -2053,14 +2317,14 @@ mod tests {
         filtered.repopulate(full.clone(), SortKey::Date, true);
         assert_eq!(filtered.selection.n_items(), 3);
 
-        // Switching back to All restores everything from the truth.
-        filtered.set_filter(ListFilter::All);
-        assert_eq!(filtered.selection.n_items(), 7, "switching back to All restored the hidden rows");
+        // Clearing the filters restores everything from the truth.
+        filtered.set_filter(FilterSet::none());
+        assert_eq!(filtered.selection.n_items(), 7, "clearing the filters restored the hidden rows");
 
-        // --- The pinned section stays root row 0 under a flat sort too, and
-        // collapsing it is tracked independently of any date bucket's own
-        // collapse - so a round trip through Sender sort (which has no date
-        // sections at all) can't forget a collapsed date bucket, and vice
+        // --- The pinned section stays root row 0 under another sort key too,
+        // and collapsing it is tracked independently of any group's own
+        // collapse - so a round trip through Sender sort (which groups by a
+        // different field) can't forget a collapsed date group, and vice
         // versa. ---
         let pinned = MessageListModel::build();
         let pinned_msg = {
@@ -2073,8 +2337,8 @@ mod tests {
         assert_eq!(pinned.selection.n_items(), 6);
         assert_eq!(pinned.message_at(0), None, "row 0 must be a header");
         assert_eq!(
-            pinned.selection.item(0).and_downcast::<gtk::TreeListRow>().and_then(|r| section_bucket(&r)),
-            Some(DateBucket::Pinned)
+            pinned.selection.item(0).and_downcast::<gtk::TreeListRow>().and_then(|r| section_group(&r)),
+            Some(GroupKey::Pinned)
         );
 
         // Collapse Pinned and Older - `tree.child_row` indexes *root* rows
@@ -2084,12 +2348,12 @@ mod tests {
         pinned.tree.child_row(2).expect("Older row").set_expanded(false);
         assert_eq!(pinned.selection.n_items(), 4, "both collapses hid their one message each");
 
-        // A Sender-sort round trip has no date sections at all - it must not
-        // forget Older's remembered collapse - and Pinned still appears
-        // (still collapsed) even though nothing else groups under this sort.
+        // A Sender-sort round trip groups by sender instead (all the fixtures
+        // are senderless, so one "#" section) - it must not forget Older's
+        // remembered collapse - and Pinned still appears (still collapsed).
         pinned.repopulate(vec![pinned_msg.clone(), summary(1, today), summary(2, older)], SortKey::Sender, true);
-        assert_eq!(pinned.selection.n_items(), 3, "Pinned (collapsed) + two flat messages");
-        assert!(pinned.collapsed_pinned.get(), "the Pinned collapse must survive a flat-sort round trip");
+        assert_eq!(pinned.selection.n_items(), 4, "Pinned (collapsed) + one # section + two messages");
+        assert!(pinned.collapsed_pinned.get(), "the Pinned collapse must survive a sort-key round trip");
 
         pinned.repopulate(vec![pinned_msg, summary(1, today), summary(2, older)], SortKey::Date, true);
         assert!(
@@ -2146,9 +2410,10 @@ mod tests {
         threaded.set_threaded(true);
         assert_eq!(threaded.selection.n_items(), 3, "flipping the mode did not rebuild");
 
-        // --- A sender sort ignores threading and renders flat ---
+        // --- A sender sort still groups (here into one "#" section, since the
+        // fixtures carry no sender) ---
         threaded.repopulate(vec![summary(1, today), summary(2, today)], SortKey::Sender, true);
-        assert_eq!(threaded.selection.n_items(), 2, "a sender sort should render flat under threading");
+        assert_eq!(threaded.selection.n_items(), 3, "a sender sort groups under one # header + two messages");
 
         // --- A rebuild whose diff only touches one section must not perturb
         // an untouched section's collapsed state or the selection. This pins
@@ -2456,7 +2721,6 @@ mod tests {
             let sections = match &layout {
                 ListLayout::Grouped(s) => s.len(),
                 ListLayout::Threaded(s) => s.len(),
-                ListLayout::Flat(_) => 0,
             };
             let total = sort_time + keys_time + layout_time;
             println!("n={n:>7}: sort={sort_time:>9?}  keys={keys_time:>9?}  build_layout={layout_time:>9?}  total={total:>9?}  sections={sections}");
@@ -2465,17 +2729,16 @@ mod tests {
     }
 
     #[test]
-    fn non_date_sorts_render_flat() {
+    fn non_date_sorts_group_by_their_key() {
         let now = local(2026, 8, 4, 8);
         let messages = vec![summary(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 2, 1))];
-        assert!(matches!(
-            build_layout(messages.clone(), SortKey::Sender, now, true, true),
-            ListLayout::Flat(m) if m.len() == 2
-        ));
-        assert!(matches!(
-            build_layout(messages, SortKey::Subject, now, true, true),
-            ListLayout::Flat(m) if m.len() == 2
-        ));
+        // The fixtures have no sender, so a Sender sort groups both under "#".
+        let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Sender, now, false, true) else {
+            panic!("expected a grouped layout");
+        };
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].0, GroupKey::Sender("#".into()));
+        assert_eq!(sections[0].2.len(), 2);
     }
 
     fn pinned(uid: u32, date: DateTime<Utc>) -> EmailSummary {
@@ -2485,37 +2748,32 @@ mod tests {
     }
 
     /// `compute_layout` pulls pinned messages out ahead of `build_layout`
-    /// entirely, so the pinned section applies under every sort key - unlike
-    /// date grouping, which `non_date_sorts_render_flat` above confirms stays
-    /// off under Sender/Subject.
+    /// entirely, so the pinned section applies under every sort key.
     #[test]
-    fn pinned_messages_render_ahead_of_a_flat_sort_and_are_excluded_from_it() {
+    fn pinned_messages_render_ahead_of_the_grouped_body_and_are_excluded_from_it() {
         let now = local(2026, 8, 4, 8);
         let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 2, 1)), pinned(3, utc_on(now, 2026, 1, 1))];
-        let computed = compute_layout(messages, ListFilter::All, SortKey::Sender, true, false, now);
+        let computed = compute_layout(messages, FilterSet::none(), &HashSet::new(), SortKey::Sender, true, false, now);
         assert_eq!(
             computed.pinned.iter().map(|m| m.uid.0).collect::<Vec<_>>(),
             vec![1, 3],
             "both pinned messages appear, in sort order"
         );
-        let ListLayout::Flat(rest) = computed.layout else {
-            panic!("Sender sort must still render its own body flat")
+        let ListLayout::Grouped(sections) = computed.layout else {
+            panic!("expected a grouped body")
         };
-        assert_eq!(
-            rest.iter().map(|m| m.uid.0).collect::<Vec<_>>(),
-            vec![2],
-            "the pinned messages must not also appear in the flat body"
-        );
+        let body: Vec<u32> = sections.iter().flat_map(|(_, _, m)| m.iter().map(|m| m.uid.0)).collect();
+        assert_eq!(body, vec![2], "the pinned messages must not also appear in the grouped body");
     }
 
     /// The pinned section would just duplicate the entire visible list under
-    /// `ListFilter::Flagged` (everything shown is already pinned), so
+    /// the Flagged filter (everything shown is already pinned), so
     /// `compute_layout` skips pulling anything out in that case.
     #[test]
     fn pinned_section_is_empty_under_the_flagged_filter() {
         let now = local(2026, 8, 4, 8);
         let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 8, 4))];
-        let computed = compute_layout(messages, ListFilter::Flagged, SortKey::Date, true, false, now);
+        let computed = compute_layout(messages, FilterSet::none().with(Filter::Flagged, true), &HashSet::new(), SortKey::Date, true, false, now);
         assert!(computed.pinned.is_empty(), "Flagged already shows nothing but pinned messages - no separate pin needed");
         let ListLayout::Grouped(sections) = computed.layout else {
             panic!("expected a grouped layout under Date sort")
@@ -2537,10 +2795,14 @@ mod tests {
         let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now, false, true) else {
             panic!("expected a grouped layout");
         };
-        let shape: Vec<(DateBucket, &str, usize)> = sections.iter().map(|(b, l, m)| (*b, l.as_str(), m.len())).collect();
+        let shape: Vec<(GroupKey, &str, usize)> = sections.iter().map(|(b, l, m)| (b.clone(), l.as_str(), m.len())).collect();
         assert_eq!(
             shape,
-            vec![(DateBucket::Today, "Today", 2), (DateBucket::LastMonth, "July", 1), (DateBucket::Older, "Older", 1)]
+            vec![
+                (GroupKey::Date(DateBucket::Today), "Today", 2),
+                (GroupKey::Date(DateBucket::LastMonth), "July", 1),
+                (GroupKey::Date(DateBucket::Older), "Older", 1),
+            ]
         );
     }
 
@@ -2558,13 +2820,13 @@ mod tests {
         let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now, false, true) else {
             panic!("expected a grouped layout");
         };
-        let shape: Vec<(DateBucket, &str, usize)> = sections.iter().map(|(b, l, m)| (*b, l.as_str(), m.len())).collect();
+        let shape: Vec<(GroupKey, &str, usize)> = sections.iter().map(|(b, l, m)| (b.clone(), l.as_str(), m.len())).collect();
         assert_eq!(
             shape,
             vec![
-                (DateBucket::Year(2025), "2025", 2),
-                (DateBucket::Year(2024), "2024", 1),
-                (DateBucket::Year(2023), "2023", 1),
+                (GroupKey::Date(DateBucket::Year(2025)), "2025", 2),
+                (GroupKey::Date(DateBucket::Year(2024)), "2024", 1),
+                (GroupKey::Date(DateBucket::Year(2023)), "2023", 1),
             ]
         );
     }
@@ -2581,20 +2843,24 @@ mod tests {
         let n = BACKGROUND_REPOPULATE_THRESHOLD + 1;
         let messages: Vec<EmailSummary> = (0..n as u32).map(|uid| summary(uid, dates[uid as usize % 3])).collect();
 
-        let computed = compute_layout(messages, ListFilter::All, SortKey::Date, true, false, now);
+        let computed = compute_layout(messages, FilterSet::none(), &HashSet::new(), SortKey::Date, true, false, now);
         assert!(computed.pinned.is_empty(), "none of the fixture messages are pinned");
         assert_eq!(computed.keys.len(), n, "every message produced one row-key fingerprint");
 
         let ListLayout::Grouped(sections) = computed.layout else {
             panic!("expected a grouped layout");
         };
-        let shape: Vec<(DateBucket, usize)> = sections.iter().map(|(b, _, m)| (*b, m.len())).collect();
+        let shape: Vec<(GroupKey, usize)> = sections.iter().map(|(b, _, m)| (b.clone(), m.len())).collect();
         // n is a multiple of 3 (BACKGROUND_REPOPULATE_THRESHOLD + 1 = 5001),
         // so the three buckets split evenly.
         assert_eq!(n % 3, 0);
         assert_eq!(
             shape,
-            vec![(DateBucket::Today, n / 3), (DateBucket::LastMonth, n / 3), (DateBucket::Older, n / 3)],
+            vec![
+                (GroupKey::Date(DateBucket::Today), n / 3),
+                (GroupKey::Date(DateBucket::LastMonth), n / 3),
+                (GroupKey::Date(DateBucket::Older), n / 3),
+            ],
             "the same three buckets `build_layout` produces for this exact date mix at small scale (see date_sort_cuts_one_section_per_run), just at scale"
         );
     }
@@ -2612,8 +2878,15 @@ mod tests {
         let ListLayout::Grouped(sections) = build_layout(messages, SortKey::Date, now, false, false) else {
             panic!("expected a grouped layout");
         };
-        let buckets: Vec<DateBucket> = sections.iter().map(|(b, _, _)| *b).collect();
-        assert_eq!(buckets, vec![DateBucket::Older, DateBucket::LastMonth, DateBucket::Today]);
+        let groups: Vec<GroupKey> = sections.iter().map(|(b, _, _)| b.clone()).collect();
+        assert_eq!(
+            groups,
+            vec![
+                GroupKey::Date(DateBucket::Older),
+                GroupKey::Date(DateBucket::LastMonth),
+                GroupKey::Date(DateBucket::Today),
+            ]
+        );
     }
 
     fn in_thread(mut summary: EmailSummary, key: &str) -> EmailSummary {
@@ -2638,7 +2911,7 @@ mod tests {
         }
     }
 
-    fn shape(sections: &[(DateBucket, String, Vec<ThreadEntry>)]) -> Vec<(DateBucket, &str, Vec<&str>)> {
+    fn shape(sections: &[(GroupKey, String, Vec<ThreadEntry>)]) -> Vec<(GroupKey, &str, Vec<&str>)> {
         sections
             .iter()
             .map(|(b, l, entries)| {
@@ -2646,7 +2919,7 @@ mod tests {
                     ThreadEntry::Thread(t) => t.row.subject.as_deref().unwrap_or("(no subject)"),
                     ThreadEntry::Single(m) => m.subject.as_deref().unwrap_or("(no subject)"),
                 });
-                (*b, l.as_str(), kinds.collect())
+                (b.clone(), l.as_str(), kinds.collect())
             })
             .collect()
     }
@@ -2670,8 +2943,8 @@ mod tests {
         assert_eq!(
             shape(&sections),
             vec![
-                (DateBucket::Today, "Today", vec!["Re: Project kickoff"]),
-                (DateBucket::LastMonth, "July", vec!["Standalone"])
+                (GroupKey::Date(DateBucket::Today), "Today", vec!["Re: Project kickoff"]),
+                (GroupKey::Date(DateBucket::LastMonth), "July", vec!["Standalone"])
             ]
         );
         let (_, _, today) = &sections[0];
@@ -2819,10 +3092,12 @@ mod tests {
     }
 
     #[test]
-    fn section_row_key_differs_on_label_or_bucket_change() {
-        assert_eq!(section_row_key(DateBucket::Today, "Today"), section_row_key(DateBucket::Today, "Today"));
-        assert_ne!(section_row_key(DateBucket::Today, "Today"), section_row_key(DateBucket::Today, "Relabeled"));
-        assert_ne!(section_row_key(DateBucket::Today, "x"), section_row_key(DateBucket::Yesterday, "x"));
+    fn section_row_key_differs_on_label_or_group_change() {
+        let today = GroupKey::Date(DateBucket::Today);
+        let yesterday = GroupKey::Date(DateBucket::Yesterday);
+        assert_eq!(section_row_key(today.clone(), "Today"), section_row_key(today.clone(), "Today"));
+        assert_ne!(section_row_key(today.clone(), "Today"), section_row_key(today.clone(), "Relabeled"));
+        assert_ne!(section_row_key(today, "x"), section_row_key(yesterday, "x"));
     }
 
     fn base_thread_row() -> ThreadRow {
@@ -2979,6 +3254,64 @@ mod tests {
     }
 
     #[test]
+    fn group_of_derives_a_header_per_sort_key() {
+        let now = local(2026, 8, 4, 8);
+        let mut alice = with_sender_and_subject(summary(1, utc_on(now, 2026, 8, 4)), "alice", "Zebra");
+        alice.size = 2_000_000;
+        alice.importance = lookout_core::Importance::High;
+        alice.keywords = std::collections::BTreeSet::from([lookout_core::tag_keyword("work")]);
+        alice.to = vec![lookout_core::EmailAddress {
+            name: Some("Bob".to_string()),
+            address: "bob@example.com".to_string(),
+        }];
+        alice.has_attachment = true;
+
+        assert_eq!(group_of(SortKey::Sender, &alice, now).0, GroupKey::Sender("A".to_string()));
+        assert_eq!(group_of(SortKey::Subject, &alice, now).0, GroupKey::Subject("Z".to_string()));
+        assert_eq!(group_of(SortKey::To, &alice, now).0, GroupKey::To("B".to_string()));
+        assert_eq!(group_of(SortKey::Category, &alice, now).0, GroupKey::Category("work".to_string()));
+        assert_eq!(group_of(SortKey::Size, &alice, now).0, GroupKey::Size(SizeBucket::Under5M));
+        assert_eq!(group_of(SortKey::Importance, &alice, now).0, GroupKey::Importance(0));
+        assert_eq!(group_of(SortKey::Flag, &alice, now).0, GroupKey::Flag(false));
+        assert_eq!(group_of(SortKey::Attachments, &alice, now).0, GroupKey::Attachment(true));
+
+        // A senderless, categoryless fixture groups under "#" / "".
+        let bare = summary(9, utc_on(now, 2026, 8, 4));
+        assert_eq!(group_of(SortKey::Sender, &bare, now).0, GroupKey::Sender("#".to_string()));
+        assert_eq!(group_of(SortKey::Category, &bare, now).0, GroupKey::Category(String::new()));
+    }
+
+    #[test]
+    fn sort_messages_orders_the_size_importance_flag_and_attachment_keys() {
+        let same = Utc.with_ymd_and_hms(2024, 1, 1, 9, 0, 0).unwrap();
+        let mk = |uid: u32, size: u32, importance: lookout_core::Importance, flagged: bool, attachment: bool| {
+            let mut m = summary(uid, same);
+            m.size = size;
+            m.importance = importance;
+            m.has_attachment = attachment;
+            if flagged {
+                m.flags.insert(lookout_core::SystemFlagBit::Flagged);
+            }
+            m
+        };
+        let plain = mk(1, 100, lookout_core::Importance::Low, false, false);
+        let rich = mk(2, 5_000_000, lookout_core::Importance::High, true, true);
+
+        let mut messages = vec![plain.clone(), rich.clone()];
+        sort_messages(&mut messages, SortKey::Size, true);
+        assert_eq!(uids(&messages), vec![2, 1], "largest first");
+        sort_messages(&mut messages, SortKey::Size, false);
+        assert_eq!(uids(&messages), vec![1, 2], "ascending mirrors to smallest first");
+
+        sort_messages(&mut messages, SortKey::Importance, true);
+        assert_eq!(uids(&messages), vec![2, 1], "High before Low");
+        sort_messages(&mut messages, SortKey::Flag, true);
+        assert_eq!(uids(&messages), vec![2, 1], "flagged first");
+        sort_messages(&mut messages, SortKey::Attachments, true);
+        assert_eq!(uids(&messages), vec![2, 1], "with attachments first");
+    }
+
+    #[test]
     fn sort_messages_orders_by_the_chosen_key_and_mirrors_exactly_when_ascending() {
         // Same date on the two "b"/"c" rows so the sender/subject keys are what
         // actually decides their order, not the date tie-break.
@@ -3033,31 +3366,64 @@ mod tests {
     }
 
     #[test]
-    fn list_filter_matches_read_and_flagged_state() {
+    fn filter_set_matches_read_and_flagged_state() {
+        let viewer = HashSet::new();
         let mut read = summary(1, Utc::now());
         read.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen]);
-        assert!(ListFilter::All.matches(&read));
-        assert!(!ListFilter::Unread.matches(&read));
-        assert!(!ListFilter::Flagged.matches(&read));
+        assert!(FilterSet::none().matches(&read, &viewer), "no filters shows everything");
+        assert!(!FilterSet::none().with(Filter::Unread, true).matches(&read, &viewer));
+        assert!(!FilterSet::none().with(Filter::Flagged, true).matches(&read, &viewer));
 
         let unread = summary(2, Utc::now());
-        assert!(ListFilter::Unread.matches(&unread));
-        assert!(!ListFilter::Flagged.matches(&unread));
+        assert!(FilterSet::none().with(Filter::Unread, true).matches(&unread, &viewer));
+        assert!(!FilterSet::none().with(Filter::Flagged, true).matches(&unread, &viewer));
 
         let mut flagged = summary(3, Utc::now());
         flagged.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Flagged]);
-        assert!(ListFilter::Unread.matches(&flagged), "a flagged-but-unread message belongs to both filters");
-        assert!(ListFilter::Flagged.matches(&flagged));
+        assert!(FilterSet::none().with(Filter::Unread, true).matches(&flagged, &viewer), "a flagged-but-unread message belongs to both filters");
+        assert!(FilterSet::none().with(Filter::Flagged, true).matches(&flagged, &viewer));
 
         let mut flagged_read = summary(4, Utc::now());
         flagged_read.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen, lookout_core::SystemFlagBit::Flagged]);
-        assert!(ListFilter::Flagged.matches(&flagged_read));
-        assert!(!ListFilter::Unread.matches(&flagged_read));
+        assert!(FilterSet::none().with(Filter::Flagged, true).matches(&flagged_read, &viewer));
+        assert!(!FilterSet::none().with(Filter::Unread, true).matches(&flagged_read, &viewer));
 
-        // The menu wiring's label/state round-trips.
-        assert_eq!(ListFilter::All.label(), "All");
-        assert_eq!(ListFilter::from_action_state(ListFilter::Flagged.action_state()), Some(ListFilter::Flagged));
-        assert_eq!(ListFilter::from_action_state("bogus"), None);
+        // Combined filters are ANDed: a read, unflagged message fails both.
+        let both = FilterSet::none().with(Filter::Unread, true).with(Filter::Flagged, true);
+        assert!(both.matches(&flagged, &viewer), "the flagged-unread message passes both");
+        assert!(!both.matches(&unread, &viewer), "an unflagged unread message fails Flagged");
+    }
+
+    #[test]
+    fn filter_set_matches_message_intrinsic_predicates() {
+        let mut m = summary(1, Utc::now());
+        m.has_attachment = true;
+        m.importance = lookout_core::Importance::High;
+        m.keywords = std::collections::BTreeSet::from([lookout_core::tag_keyword("work")]);
+        m.to = vec![lookout_core::EmailAddress {
+            name: None,
+            address: "me@example.com".to_string(),
+        }];
+        let viewer: HashSet<String> = ["me@example.com".to_string()].into_iter().collect();
+
+        assert!(FilterSet::none().with(Filter::HasAttachments, true).matches(&m, &viewer));
+        assert!(FilterSet::none().with(Filter::HighImportance, true).matches(&m, &viewer));
+        assert!(FilterSet::none().with(Filter::Categorized, true).matches(&m, &viewer));
+        assert!(FilterSet::none().with(Filter::ToMe, true).matches(&m, &viewer));
+        assert!(!FilterSet::none().with(Filter::ToMe, true).matches(&m, &HashSet::new()), "an empty viewer matches nothing");
+    }
+
+    #[test]
+    fn filter_set_round_trips_action_states() {
+        assert!(FilterSet::none().to_states().is_empty());
+        let set = FilterSet::none().with(Filter::Unread, true).with(Filter::ToMe, true).with(Filter::HasAttachments, true);
+        assert_eq!(set.count(), 3);
+        let states = set.to_states();
+        assert_eq!(FilterSet::from_states(&states), set);
+        assert_eq!(FilterSet::from_states(&["bogus".to_string()]), FilterSet::none());
+        // The menu wiring's action-state round-trip.
+        assert_eq!(Filter::from_action_state(Filter::Flagged.action_state()), Some(Filter::Flagged));
+        assert_eq!(Filter::from_action_state("bogus"), None);
     }
 
     fn summary_in(uid: u32, mailbox: &str, date: DateTime<Utc>) -> EmailSummary {

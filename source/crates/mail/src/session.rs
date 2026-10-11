@@ -5192,8 +5192,8 @@ async fn fetch_previews(
 /// message's summary carries no `BODYSTRUCTURE`-derived part structure (see
 /// `fetch_body_partial` for the normal path). Uses `BODY.PEEK[]` rather than
 /// `BODY[]`/`RFC822` so reading a message doesn't implicitly set `\Seen`
-/// server-side - the UI layer decides if/when to mark as read, matching
-/// Bulwark's configurable mark-as-read-delay behavior.
+/// server-side - the UI layer decides if/when to mark as read, per the
+/// mark-as-read setting (item 1.8).
 async fn fetch_body(session: &mut Session<SessionStream>, uid: Uid) -> Result<Option<Vec<u8>>> {
     let fetches: Vec<_> = session.uid_fetch(uid.0.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
     let Some(fetch) = fetches.into_iter().find(|f| f.uid == Some(uid.0)) else {

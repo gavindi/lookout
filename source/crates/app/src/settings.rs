@@ -87,6 +87,10 @@ pub const MAIL_FAVORITES_CUSTOM_ORDER: &str = "mail-favorites-custom-order";
 /// Accounts; everything else is enabled by default.
 pub const ACCOUNTS_DISABLED: &str = "accounts-disabled";
 pub const MAIL_THREADED: &str = "mail-threaded";
+/// The independent filters narrowing the message list (see
+/// `message_list::FilterSet`): any subset of unread, flagged, has-attachments,
+/// high-importance, categorised, to-me. Empty shows every message.
+pub const MAIL_FILTERS: &str = "mail-filters";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
@@ -106,6 +110,14 @@ pub const MAIL_MESSAGE_THEME_DARK: &str = "mail-message-theme-dark";
 /// reading-pane header show a sender avatar (contact photo when available,
 /// else coloured initials).
 pub const MAIL_SHOW_SENDER_IMAGES: &str = "mail-show-sender-images";
+/// Config → Mail → "Mark as read": when opening a message marks it `\Seen`.
+/// One of [`MARK_AS_READ_MODES`]; "on-selection-change" is the default,
+/// matching Outlook's reading pane.
+pub const MARK_AS_READ_MODE: &str = "mark-as-read-mode";
+/// Config → Mail → "Mark as read" → "After": seconds a message stays on
+/// screen before it is marked read when [`MARK_AS_READ_MODE`] is
+/// "after-delay".
+pub const MARK_AS_READ_DELAY: &str = "mark-as-read-delay";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
 /// Calendar → "Week starts on": first day of the week, as 0=Sunday .. 6=Saturday.
 pub const CALENDAR_WEEK_START: &str = "calendar-week-start";
@@ -251,6 +263,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_FAVORITES_CUSTOM_ORDER, Value::Bool(false));
     map.insert(ACCOUNTS_DISABLED, Value::Strv(Vec::new()));
     map.insert(MAIL_THREADED, Value::Bool(true));
+    map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
@@ -258,6 +271,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_SPELL_CHECK_LANGUAGES, Value::Strv(Vec::new()));
     map.insert(MAIL_MESSAGE_THEME_DARK, Value::Bool(false));
     map.insert(MAIL_SHOW_SENDER_IMAGES, Value::Bool(true));
+    map.insert(MARK_AS_READ_MODE, Value::String("on-selection-change".into()));
+    map.insert(MARK_AS_READ_DELAY, Value::Int(5));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(CALENDAR_WEEK_START, Value::Int(0));
     map.insert(CALENDAR_WORK_DAYS, Value::Strv(vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()]));
@@ -578,6 +593,63 @@ pub fn preview_lines(value: i32) -> i32 {
     value.clamp(0, MAX_PREVIEW_LINES)
 }
 
+/// Config → Mail → "Mark as read": the stored `mark-as-read-mode` values, in
+/// UI (a `ComboRow`) order. "on-selection-change" is the default (and what an
+/// unset GSettings value resolves to), matching Outlook.
+pub const MARK_AS_READ_MODES: [&str; 4] = ["on-selection-change", "when-opened", "after-delay", "never"];
+
+/// The `ComboRow` labels matching [`MARK_AS_READ_MODES`] by index.
+pub const MARK_AS_READ_LABELS: [&str; 4] = ["When selection changes", "When opened", "After a delay", "Never"];
+
+/// Upper bound on the configurable mark-as-read delay.
+pub const MAX_MARK_AS_READ_DELAY: i32 = 60;
+
+/// Resolved mark-as-read behaviour, derived from the stored
+/// [`MARK_AS_READ_MODE`] string. The app marks an opened message read by
+/// sending a `\Seen` store; this decides *when* (see the selection handler in
+/// `window.rs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MarkAsReadMode {
+    /// Read once the selection moves off the message (the default).
+    OnSelectionChange,
+    /// Read as soon as the reading pane shows it.
+    WhenOpened,
+    /// Read after [`MARK_AS_READ_DELAY`] seconds on screen.
+    AfterDelay,
+    /// Never mark automatically.
+    Never,
+}
+
+/// Resolves a stored mode string; anything unknown falls back to the default
+/// ("on-selection-change").
+pub fn mark_as_read_mode(name: &str) -> MarkAsReadMode {
+    match name {
+        "when-opened" => MarkAsReadMode::WhenOpened,
+        "after-delay" => MarkAsReadMode::AfterDelay,
+        "never" => MarkAsReadMode::Never,
+        _ => MarkAsReadMode::OnSelectionChange,
+    }
+}
+
+/// Index of a stored mark-as-read value (for the config `ComboRow`); unknown
+/// values fall back to the default ("on-selection-change")'s index.
+pub fn mark_as_read_index(name: &str) -> u32 {
+    MARK_AS_READ_MODES.iter().position(|value| *value == name).unwrap_or(0) as u32
+}
+
+/// The mark-as-read value at a [`MARK_AS_READ_MODES`] index (from the config
+/// `ComboRow`); out-of-range indexes fall back to the default.
+pub fn mark_as_read_at(index: u32) -> &'static str {
+    MARK_AS_READ_MODES.get(index as usize).copied().unwrap_or(MARK_AS_READ_MODES[0])
+}
+
+/// Clamps a stored [`MARK_AS_READ_DELAY`] value to the supported 1-60 range,
+/// so a hand-edited dconf value can never ask for a longer delay than the
+/// config offers.
+pub fn mark_as_read_delay(value: i32) -> i32 {
+    value.clamp(1, MAX_MARK_AS_READ_DELAY)
+}
+
 /// Config → Calendar → "Week starts on" labels, indexed 0=Sunday .. 6=Saturday
 /// (the stored `calendar-week-start` scheme).
 pub const WEEK_START_LABELS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -788,6 +860,24 @@ mod tests {
     }
 
     #[test]
+    fn mark_as_read_helpers_map_values_and_clamp_the_delay() {
+        assert_eq!(mark_as_read_mode("on-selection-change"), MarkAsReadMode::OnSelectionChange);
+        assert_eq!(mark_as_read_mode("when-opened"), MarkAsReadMode::WhenOpened);
+        assert_eq!(mark_as_read_mode("after-delay"), MarkAsReadMode::AfterDelay);
+        assert_eq!(mark_as_read_mode("never"), MarkAsReadMode::Never);
+        assert_eq!(mark_as_read_mode("bogus"), MarkAsReadMode::OnSelectionChange, "unknown values land on the default");
+        assert_eq!(mark_as_read_index("on-selection-change"), 0);
+        assert_eq!(mark_as_read_index("never"), 3);
+        assert_eq!(mark_as_read_index("bogus"), 0);
+        assert_eq!(mark_as_read_at(0), "on-selection-change");
+        assert_eq!(mark_as_read_at(3), "never");
+        assert_eq!(mark_as_read_at(99), "on-selection-change");
+        assert_eq!(mark_as_read_delay(0), 1);
+        assert_eq!(mark_as_read_delay(5), 5);
+        assert_eq!(mark_as_read_delay(999), MAX_MARK_AS_READ_DELAY);
+    }
+
+    #[test]
     fn untouched_keys_report_the_schema_defaults() {
         let store = resolve();
         assert!(!store.get_bool(MAIL_LOAD_REMOTE_IMAGES));
@@ -802,6 +892,8 @@ mod tests {
         assert_eq!(store.get_string(THEME_ID), "flat-dark");
         assert_eq!(store.get_string(ACCENT_COLOR), "");
         assert_eq!(store.get_string(LAYOUT_SPACING), "medium");
+        assert_eq!(store.get_string(MARK_AS_READ_MODE), "on-selection-change");
+        assert_eq!(store.get_int(MARK_AS_READ_DELAY), 5);
         assert_eq!(store.get_int(PREFETCH_BATCH_INTERVAL_SECONDS), 30);
         assert_eq!(store.get_int(PREFETCH_FOLDER_LIMIT), 200);
         assert_eq!(store.get_int(PREFETCH_BATCH_SIZE), 1);
