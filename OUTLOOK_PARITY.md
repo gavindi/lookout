@@ -43,14 +43,14 @@ Counts are tallied from the §5 tables.
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
 | Mail (5.1) | 14 | 15 | 15 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps, undo. No winmail.dat or `.msg`. |
-| Compose (5.2) | 4 | 5 | 13 | 1 | Good rich editor and identities. No spell check, schedule send, importance, emoji, draft reopen, or forwarding with attachments. |
+| Compose (5.2) | 5 | 5 | 12 | 1 | Good rich editor and identities. No schedule send, emoji, or forwarding with attachments. |
 | Calendar (5.3) | 7 | 14 | 14 | 0 | Views and drag-to-edit are good. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No week-start, working-hours or time-zone settings. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 3 | 3 | 5 | 1 | VTODO and Google Tasks CRUD. No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **39** | **49** | **64** | **5** | ~26% at parity, ~32% partial |
+| **Total** | **40** | **49** | **63** | **5** | ~26% at parity, ~32% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -295,7 +295,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | C-09 | Undo send | — | ❌ | Outbox delay 5/10 s |
 | C-10 | Signatures | Rich, per-account defaults for new and reply (`app_config.rs` `signature_defaults`) | ✅ | — |
 | C-11 | Drafts autosave | 5 s autosave to IMAP Drafts | ✅ | — |
-| C-12 | Reopen a draft | No way to edit a saved draft | ❌ | Open from Drafts into the composer (parse MIME back) |
+| C-12 | Reopen a draft | "Edit" banner on a Drafts preview (or Enter/double-click) opens the composer prefilled from the parsed MIME: identity, To/Cc/Bcc, subject, HTML/text, inline images, attachments, importance, receipt, threading; saving replaces the stored draft (UID on first, Message-ID after) | ✅ | — |
 | C-13 | Forward with attachments / as attachment | Forward quotes text and drops attachments | 🟡 | Re-attach original parts; "Forward as attachment" (`message/rfc822`) |
 | C-14 | Emoji picker | — | ❌ | `gtk::EmojiChooser` |
 | C-15 | Paste / drop images and files | Paste images works; file drop blocked (`compose.rs:722`) | 🟡 | Drop files → attachments |
@@ -612,7 +612,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.9 | ✅ ~~Message in new window~~ | M-31 | Reuse the reading-pane builder in an `adw::Window`; double-click and Enter open it | M |
 | 1.10 | ✅ ~~View message details / source~~ | M-30 | Dialog with parsed headers plus raw source (via `FetchRawMessage`) | S |
 | 1.11 | Forward with attachments; forward as attachment | C-13 | Fetch original parts (`FetchAttachment`) into the composer; `message/rfc822` part | M |
-| 1.12 | Reopen drafts | C-12 | Open a Drafts message → parse MIME → composer prefill (identity, recipients, HTML, attachments); replace on save | M |
+| 1.12 | ✅ ~~Reopen drafts~~ | C-12 | Open a Drafts message → parse MIME → composer prefill (identity, recipients, HTML, attachments); replace on save | M |
 | 1.13 | Undo send / undo actions | M-21, C-09 | 0.3 delay (setting 0/5/10 s) plus 0.4 for move/delete/flag/archive | M |
 | 1.14 | Schedule send | C-08 | Send menu → "Schedule send" date-time; 0.3 `not_before`; banner listing scheduled items; Graph deferred send on Microsoft 365 later (5.x) | M |
 | 1.15 | Snooze presets and sync | M-11 | Preset menu plus custom; Scheduled folder plus keyword (§4.2) | M |

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lookout_core::{AccountId, MailboxId};
-use lookout_mail::session::{AccountCommand, AccountEvent, CredentialProvider};
+use lookout_mail::session::{AccountCommand, AccountEvent, CredentialProvider, DraftReplace};
 use lookout_mail::{AccountConfig, ComposedMessage, Credential, EndpointConfig};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -140,7 +140,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let _ = cmd_tx
         .send(AccountCommand::SaveDraft {
             msg: Box::new(draft("draft v1")),
-            replace: false,
+            replace: DraftReplace::None,
         })
         .await;
     let saved = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::DraftSaved { .. })).await;
@@ -160,7 +160,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let _ = cmd_tx
         .send(AccountCommand::SaveDraft {
             msg: Box::new(draft("draft v2")),
-            replace: true,
+            replace: DraftReplace::ByMessageId,
         })
         .await;
     wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::DraftSaved { .. })).await;
@@ -169,6 +169,27 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let AccountEvent::MessagesUpdated { messages, .. } = listed else { unreachable!() };
     assert_eq!(messages.len(), 1, "replace left duplicates behind: {messages:?}");
     assert_eq!(messages[0].subject.as_deref(), Some("draft v2"));
+
+    // Reopen-style replace (item 1.12): purge the source UID exactly, then
+    // append the new copy - the path the composer uses for a reopened
+    // draft's first save, which must work even for a foreign draft with no
+    // Message-ID to search by.
+    let source_uid = messages[0].uid;
+    let _ = cmd_tx
+        .send(AccountCommand::SaveDraft {
+            msg: Box::new(draft("draft v3")),
+            replace: DraftReplace::ByUid {
+                mailbox: drafts_id.clone(),
+                uid: source_uid,
+            },
+        })
+        .await;
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::DraftSaved { .. })).await;
+    let _ = cmd_tx.send(AccountCommand::Refresh).await;
+    let listed = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::MessagesUpdated { mailbox, .. } if *mailbox == drafts_id)).await;
+    let AccountEvent::MessagesUpdated { messages, .. } = listed else { unreachable!() };
+    assert_eq!(messages.len(), 1, "ByUid replace left duplicates behind: {messages:?}");
+    assert_eq!(messages[0].subject.as_deref(), Some("draft v3"));
 
     // Delete (what Send does to a draft that was autosaved), then verify
     // the folder is empty.

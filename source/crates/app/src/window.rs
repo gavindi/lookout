@@ -691,6 +691,18 @@ struct MessageDetailsDialog {
     error_label: gtk::Label,
 }
 
+/// A saved draft whose "Edit" action is waiting on its raw bytes (item 1.12),
+/// tracked in `UiState::pending_draft_open`. The bytes are parsed by
+/// `lookout_mail::body::parse_draft_prefill` and swapped into the composer
+/// once `AccountEvent::RawMessageFetched` lands. The summary rides along so
+/// the composer prefill can be built without re-reading the list selection
+/// (which may have moved on by then).
+struct PendingDraftOpen {
+    mailbox: MailboxId,
+    uid: Uid,
+    summary: EmailSummary,
+}
+
 /// Marks a value as `Send` so it can cross from WebKit's scheme-handler
 /// thread to the main loop. `webkit::URISchemeRequest` is a ref-counted
 /// GObject whose `finish`/`finish_error` are documented thread-safe; the
@@ -919,6 +931,17 @@ pub(crate) struct UiState {
     /// One at a time; `RawMessageFetched` routes the dialog's raw bytes here.
     /// See `MessageDetailsDialog`.
     message_details: Option<MessageDetailsDialog>,
+    /// The `(mailbox, uid)` of the saved draft currently on the reading pane,
+    /// stashed by `render_body` from the rendered summary's `\Draft` flag or
+    /// Drafts-folder role so the "Edit" banner's handler knows what to open
+    /// (item 1.12). Cleared on every navigation.
+    rendered_draft: Option<(MailboxId, Uid)>,
+    /// A reopened draft's raw fetch in flight (item 1.12), waiting on
+    /// `AccountEvent::RawMessageFetched` to build the composer prefill.
+    /// Cleared on navigation and by whichever response lands, so a late
+    /// response can't open a composer over a message the user has since
+    /// selected. See `open_draft_composer`.
+    pending_draft_open: Option<PendingDraftOpen>,
     /// Inline `cid:` image fetches in flight for the message on the reading
     /// pane, keyed by `BodyPart::part_number`. A message can embed several
     /// images, so - unlike `pending_attachment` - this is a map. Each entry
@@ -2392,6 +2415,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         pending_raw_message: None,
         message_windows: HashMap::new(),
         message_details: None,
+        rendered_draft: None,
+        pending_draft_open: None,
         unsubscribe_info: None,
         unsubscribe_dismissed: None,
         imip: None,
@@ -3079,7 +3104,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         prefill,
                         rich_text_default,
                         mailbox_account_id(&summary.mailbox),
-                        crate::config_view::SignatureDefault::Reply,
+                        Some(crate::config_view::SignatureDefault::Reply),
                     );
                 }
             });
@@ -3392,6 +3417,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_stack = reading_stack.clone();
         message_list_view.connect_activate(move |view, position| {
             let Some(summary) = message_list.summary_at_position(position) else { return };
+            // A draft opens in the composer, not the read-only window (item
+            // 1.12): editing is the only useful thing to do with one.
+            if summary_is_draft(&state.borrow(), &summary) {
+                open_draft_composer(&state, &reading_stack, &summary);
+                return;
+            }
             let Some(parent) = view.root().and_downcast::<adw::ApplicationWindow>() else { return };
             crate::message_window::open_message_window(&parent, &state, &worker, &reading_stack, &summary);
         });
@@ -4118,6 +4149,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     read_receipt_banner.set_button_label(Some("Send read receipt"));
     read_receipt_banner.set_revealed(false);
     message_page.append(&read_receipt_banner);
+    // The draft banner (item 1.12): revealed by `render_body` for a message
+    // that is a saved draft - its `\Draft` flag, or its home in the account's
+    // Drafts mailbox - so the preview offers an explicit way back into the
+    // composer. Its button opens the draft for editing; see the handler
+    // registered below.
+    let draft_banner = adw::Banner::new("This is a draft");
+    draft_banner.set_widget_name("draft-banner");
+    draft_banner.set_button_label(Some("Edit"));
+    draft_banner.set_revealed(false);
+    message_page.append(&draft_banner);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
@@ -4339,6 +4380,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if sent {
                 banner.set_revealed(false);
             }
+        });
+    }
+    // --- Draft banner action (item 1.12): "Edit" opens the rendered draft in
+    // the composer. The source is whatever `render_body` stashed for the
+    // message currently on screen; the envelope comes from the selected row
+    // (matching `(mailbox, uid)`, in case the selection has already moved on
+    // under the banner's feet).
+    {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        let message_list = message_list.clone();
+        draft_banner.connect_button_clicked(move |_| {
+            let source = state.borrow().rendered_draft.clone();
+            let Some((mailbox, uid)) = source else { return };
+            let Some(summary) = message_list.selected_summary().filter(|s| s.mailbox == mailbox && s.uid == uid) else { return };
+            // The banner stays revealed: the message page (and with it the
+            // banner) is simply hidden while the loading page or composer
+            // takes over, and shows again if the composer is cancelled.
+            open_draft_composer(&state, &reading_stack, &summary);
         });
     }
     // WebKit paints asynchronously - revealing the HTML page while a fresh
@@ -7671,6 +7731,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.message_theme_override = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
                     st.trust_banner_dismissed = None;
                     st.rendered_message = None;
+                    st.rendered_draft = None;
+                    st.pending_draft_open = None;
                     st.message_theme_override
                 };
                 drop_pending_cid(&state);
@@ -8967,7 +9029,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     prefill,
                     rich_text_default,
                     mailbox_account_id(&summary.mailbox),
-                    crate::config_view::SignatureDefault::Reply,
+                    Some(crate::config_view::SignatureDefault::Reply),
                 );
             }
         });
@@ -8990,7 +9052,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     prefill,
                     rich_text_default,
                     mailbox_account_id(&summary.mailbox),
-                    crate::config_view::SignatureDefault::Reply,
+                    Some(crate::config_view::SignatureDefault::Reply),
                 );
             }
         });
@@ -9282,6 +9344,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         st.message_theme_override = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
                         st.trust_banner_dismissed = None;
                         st.rendered_message = None;
+                        st.rendered_draft = None;
+                        st.pending_draft_open = None;
                         st.message_theme_override
                     };
                     drop_pending_cid(&state);
@@ -9343,6 +9407,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             st.message_theme_override = st.settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
                             st.trust_banner_dismissed = None;
                             st.rendered_message = None;
+                            st.rendered_draft = None;
+                            st.pending_draft_open = None;
                             st.message_theme_override
                         };
                         drop_pending_cid(&state);
@@ -9355,6 +9421,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             };
             let uid = summary.uid;
             let mailbox = summary.mailbox.clone();
+            // A draft-open request (item 1.12) interacts with selection in two
+            // ways: re-selecting the message whose raw bytes are still in
+            // flight must leave the loading page alone (a repaint re-firing
+            // this handler must not restart the body fetch over it), and
+            // moving to a different message abandons the request - its late
+            // response is then dropped by `RawMessageFetched`.
+            {
+                let mut st = state.borrow_mut();
+                match st.pending_draft_open.as_ref() {
+                    Some(pending) if pending.mailbox == mailbox && pending.uid == uid => return,
+                    Some(_) => st.pending_draft_open = None,
+                    None => {}
+                }
+            }
             // Re-selecting the message that's already on the reading pane -
             // which `restore_selection` can do across a rebuild that
             // preserves the same selected row - must be a no-op, not a fresh
@@ -11012,6 +11092,22 @@ fn spawn_account_event_loop(
                         // The "Message details" dialog (item 1.10), if one is
                         // waiting for this exact message's source.
                         deliver_raw_to_details_dialog(&state, &mailbox, uid, &bytes);
+                        // A draft "Edit" action waiting on these bytes (item
+                        // 1.12) opens the composer prefilled from the parsed
+                        // draft.
+                        let pending_draft = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_draft_open.take() {
+                                Some(pending) if pending.mailbox == mailbox && pending.uid == uid => Some(pending),
+                                other => {
+                                    st.pending_draft_open = other;
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(pending) = pending_draft {
+                            open_draft_composer_with_raw(&state, &worker, &reading_stack, &pending.summary, &bytes);
+                        }
                         // The .eml export's whole raw message arrived. Only act if
                         // it belongs to the outstanding export request; a response
                         // that lands after the user selected a different message
@@ -11041,6 +11137,22 @@ fn spawn_account_event_loop(
                         // what went wrong, so neither is left on its spinner.
                         crate::message_window::deliver_error(&state, &mailbox, uid, &message);
                         deliver_raw_error_to_details_dialog(&state, &mailbox, uid, &message);
+                        // A draft "Edit" action (item 1.12) waiting on the
+                        // same fetch: drop back to the empty pane and say why.
+                        let draft_pending = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_draft_open.take() {
+                                Some(pending) if pending.mailbox == mailbox && pending.uid == uid => true,
+                                other => {
+                                    st.pending_draft_open = other;
+                                    false
+                                }
+                            }
+                        };
+                        if draft_pending {
+                            reading_stack.set_visible_child_name("empty");
+                            toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't open the draft: {message}"))));
+                        }
                         // The session couldn't produce the raw message. Clear the
                         // pending export (so a later click can retry) and tell the
                         // user what went wrong - never leave it stuck.
@@ -14092,6 +14204,24 @@ pub(crate) fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
     mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
 }
 
+/// The role of `mailbox` as last reported by its account's folder list, or
+/// `None` when the account isn't connected (or the mailbox isn't in its
+/// list). The app's first role lookup helper - the folder tree and search
+/// paths inline this same `folders.iter().find(...)` walk.
+fn mailbox_role(state: &UiState, mailbox: &MailboxId) -> Option<MailboxRole> {
+    let account_id = mailbox_account_id(mailbox)?;
+    state.accounts.get(&account_id)?.folders.iter().find(|folder| &folder.id == mailbox).map(|folder| folder.role)
+}
+
+/// Whether a message-list summary is a saved draft (item 1.12): an explicit
+/// `\Draft` flag - which catches drafts surfaced outside the Drafts folder,
+/// such as search copies - or a message living in the account's Drafts
+/// mailbox. Used to offer the "Edit" affordance and to route Enter/double
+/// click into the composer instead of the read-only message window.
+fn summary_is_draft(state: &UiState, summary: &EmailSummary) -> bool {
+    summary.flags.contains(&SystemFlagBit::Draft) || mailbox_role(state, &summary.mailbox) == Some(MailboxRole::Drafts)
+}
+
 /// Which summaries a message-row drag carries: the whole current selection
 /// when the dragged row is part of one, otherwise just that row's message.
 fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefCell<Option<EmailSummary>>>) -> Vec<EmailSummary> {
@@ -16327,7 +16457,7 @@ fn compose_new_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, readin
         crate::compose::ComposePrefill::default(),
         rich_text_default,
         account_id,
-        crate::config_view::SignatureDefault::New,
+        Some(crate::config_view::SignatureDefault::New),
     );
 }
 
@@ -18423,7 +18553,7 @@ fn open_mailto_unsubscribe(
         prefill,
         rich_text_default,
         account_id,
-        crate::config_view::SignatureDefault::Reply,
+        Some(crate::config_view::SignatureDefault::Reply),
     );
 }
 
@@ -18958,8 +19088,24 @@ fn render_body(
             message_header.update(&summary);
             let sender = summary.from.first().map(|a| a.address.trim().to_lowercase());
             st.rendered_trust_sender = mailbox_account_id(&mailbox).zip(sender);
+            // Draft status (item 1.12): the message-list summary's `\Draft`
+            // flag (which also catches drafts surfaced outside the Drafts
+            // folder, e.g. search copies) or the mailbox's role. The draft
+            // banner below is revealed from this.
+            st.rendered_draft = summary_is_draft(&st, &summary).then(|| (mailbox.clone(), uid));
         } else {
             st.rendered_trust_sender = None;
+            st.rendered_draft = None;
+        }
+    }
+    // Draft banner (item 1.12): offer "Edit" only for the message actually
+    // being rendered, so a stale stash can never act on a different row.
+    {
+        let st = state.borrow();
+        let is_rendered_draft = st.rendered_draft.as_ref() == Some(&(mailbox.clone(), uid));
+        drop(st);
+        if let Some(banner) = find_named_child(reading_stack, "draft-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+            banner.set_revealed(is_rendered_draft);
         }
     }
     // Sync the "Switch message theme" toggle with its per-email state: the
@@ -19277,6 +19423,133 @@ impl ComposeActionBar {
     }
 }
 
+/// Opens a saved draft in the composer (item 1.12): fetch its raw bytes
+/// (`FetchRawMessage`), parse them back into a prefill, and swap the composer
+/// into the reading pane. The raw round trip is what restores the draft's
+/// attachments and inline images - the body cache's partial fetch never
+/// downloads either - so opening always fetches (`RawMessageFetched` then
+/// completes it via `open_draft_composer_with_raw`); the session's flat-file
+/// raw cache makes re-opening the same draft instant. While it's in flight
+/// the pane shows the loading page; a failure or timeout drops back to
+/// "empty" with a toast. No-op when the message's account isn't connected.
+fn open_draft_composer(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, summary: &EmailSummary) {
+    if mailbox_account_id(&summary.mailbox).is_none() {
+        return;
+    }
+    {
+        let mut st = state.borrow_mut();
+        // Refire guard: the banner and Enter/double-click can both route
+        // here, and a request already in flight must not queue a second.
+        if st
+            .pending_draft_open
+            .as_ref()
+            .is_some_and(|pending| pending.mailbox == summary.mailbox && pending.uid == summary.uid)
+        {
+            return;
+        }
+        // A newer request supersedes any older one still in flight.
+        st.pending_draft_open = Some(PendingDraftOpen {
+            mailbox: summary.mailbox.clone(),
+            uid: summary.uid,
+            summary: summary.clone(),
+        });
+        // A body fetch the selection may have just started for this same
+        // message must not render its preview over the loading page when it
+        // lands - the raw fetch supersedes it (`BodyFetched` still caches
+        // the body either way).
+        st.pending_body_request = None;
+        st.pending_html_reveal = false;
+        st.reveal_generation += 1;
+    }
+    if !send_fetch_raw_message(state, &summary.mailbox, summary.uid) {
+        state.borrow_mut().pending_draft_open = None;
+        if let Some(toast_overlay) = &state.borrow().toast_overlay {
+            toast_overlay.add_toast(adw::Toast::new("The draft can't be opened while the account is offline."));
+        }
+        return;
+    }
+    show_body_fetch_loading(reading_stack);
+    // Backstop: a fetch lost to a reconnect must not strand the pane on its
+    // spinner. Only fires while this exact request is still the outstanding
+    // one.
+    let state_for_timeout = state.clone();
+    let reading_stack_for_timeout = reading_stack.clone();
+    let mailbox_for_timeout = summary.mailbox.clone();
+    let uid_for_timeout = summary.uid;
+    glib::timeout_add_local_once(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+        let stale = {
+            let mut st = state_for_timeout.borrow_mut();
+            let matches = st
+                .pending_draft_open
+                .as_ref()
+                .is_some_and(|pending| pending.mailbox == mailbox_for_timeout && pending.uid == uid_for_timeout);
+            if matches {
+                st.pending_draft_open = None;
+            }
+            matches
+        };
+        if stale {
+            reading_stack_for_timeout.set_visible_child_name("empty");
+            if let Some(toast_overlay) = &state_for_timeout.borrow().toast_overlay {
+                toast_overlay.add_toast(adw::Toast::new("Opening the draft timed out"));
+            }
+        }
+    });
+}
+
+/// Completes a draft open once its raw bytes arrive: parse them back into
+/// the composer prefill and swap the composer into the reading pane. The
+/// signature is deliberately skipped (`signature_kind: None`) - the saved
+/// body already contains whatever signature it was written with.
+fn open_draft_composer_with_raw(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, summary: &EmailSummary, raw: &[u8]) {
+    let Some(content) = lookout_mail::body::parse_draft_prefill(raw) else {
+        reading_stack.set_visible_child_name("empty");
+        if let Some(toast_overlay) = &state.borrow().toast_overlay {
+            toast_overlay.add_toast(adw::Toast::new("This draft couldn't be displayed."));
+        }
+        return;
+    };
+    let cmd_tx = {
+        let account_id = mailbox_account_id(&summary.mailbox);
+        let st = state.borrow();
+        account_id.and_then(|id| st.accounts.get(&id)).map(|handle| handle.cmd_tx.clone())
+    };
+    let Some(cmd_tx) = cmd_tx else {
+        reading_stack.set_visible_child_name("empty");
+        return;
+    };
+    let prefill = crate::compose::build_draft_prefill(summary, &content);
+    // Open in rich mode exactly when the saved draft had an HTML part; a
+    // plain-text draft opens plain, with its text intact.
+    let rich_text_default = prefill.html_body.is_some();
+    let title = summary.subject.clone().filter(|subject| !subject.trim().is_empty()).unwrap_or_else(|| "Draft".to_string());
+    // The pane currently shows the fetch's loading page (swapped in over the
+    // draft's preview, which the message page still holds). Point the stack
+    // back at the preview before opening the composer so its Cancel/Send
+    // returns there instead of a dead spinner; when nothing was rendered yet
+    // (Edit via Enter on a never-previewed row), fall back to "empty".
+    {
+        let st = state.borrow();
+        let restored = if st.rendered_message.as_ref() == Some(&(summary.mailbox.clone(), summary.uid)) {
+            "message"
+        } else {
+            "empty"
+        };
+        reading_stack.set_visible_child_name(restored);
+    }
+    show_composer_in_reading_pane(
+        state,
+        worker,
+        reading_stack,
+        &title,
+        cmd_tx,
+        prefill,
+        rich_text_default,
+        mailbox_account_id(&summary.mailbox),
+        None,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show_composer_in_reading_pane(
     state: &Rc<RefCell<UiState>>,
@@ -19290,7 +19563,9 @@ pub(crate) fn show_composer_in_reading_pane(
     // Whether this is a new message (uses the account's "Default for new
     // messages") or a reply/forward (uses "Default for replies &
     // forwards"). The resolved signature is appended to the body on open.
-    signature_kind: crate::config_view::SignatureDefault,
+    // `None` skips signature appending entirely - a reopened draft already
+    // contains whatever signature it was written with.
+    signature_kind: Option<crate::config_view::SignatureDefault>,
 ) {
     if let Some(existing) = reading_stack.child_by_name("compose") {
         reading_stack.remove(&existing);
@@ -19627,11 +19902,12 @@ pub(crate) fn show_composer_in_reading_pane(
             let st = state.borrow();
             let resolved = account_id.clone().or_else(|| st.accounts.keys().next().cloned());
             let config = st.app_config.borrow();
-            let selected = resolved.and_then(|id| config.signature_defaults.get(&id)).and_then(|defaults| match signature_kind {
-                crate::config_view::SignatureDefault::New => defaults.new,
-                crate::config_view::SignatureDefault::Reply => defaults.reply,
+            let id = resolved.and_then(|id| config.signature_defaults.get(&id)).and_then(|defaults| match signature_kind {
+                Some(crate::config_view::SignatureDefault::New) => defaults.new,
+                Some(crate::config_view::SignatureDefault::Reply) => defaults.reply,
+                None => None,
             });
-            selected.and_then(|id| config.signatures.iter().find(|s| s.id == id).cloned())
+            id.and_then(|id| config.signatures.iter().find(|s| s.id == id).cloned())
         },
         cmd_tx,
         prefill,
@@ -20355,6 +20631,8 @@ mod tests {
             pending_raw_message: None,
             message_windows: HashMap::new(),
             message_details: None,
+            rendered_draft: None,
+            pending_draft_open: None,
             unsubscribe_info: None,
             unsubscribe_dismissed: None,
             imip: None,

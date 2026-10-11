@@ -16,7 +16,7 @@ use crate::config::{AccountConfig, Credential};
 use crate::connection::{connect_tls, SessionStream};
 use crate::envelope::{flags_from_fetch, summary_from_fetch};
 use crate::error::{Error, Result};
-use crate::send::{build_raw_message, send_smtp, ComposedMessage, OutboxMessage};
+use crate::send::{build_draft_raw_message, send_smtp, ComposedMessage, OutboxMessage};
 
 /// How many of the most recent messages the background body prefetch queues
 /// for download on a folder it hasn't warmed yet. Bounds the *body* warm-up
@@ -312,6 +312,23 @@ pub enum ConnectionState {
     Error { message: String, retryable: bool },
 }
 
+/// How `AccountCommand::SaveDraft` should remove the copy its new draft
+/// replaces.
+#[derive(Debug, Clone)]
+pub enum DraftReplace {
+    /// A brand-new draft: nothing to purge first.
+    None,
+    /// A resave of a draft this compose session created (or has already
+    /// replaced once): purge any draft in the Drafts mailbox whose
+    /// `Message-ID` header matches the saved message's.
+    ByMessageId,
+    /// The first save of a *reopened* draft: purge this exact mailbox and
+    /// UID instead of searching by `Message-ID`, so a foreign draft without
+    /// a `Message-ID` header is still replaced rather than duplicated. The
+    /// composer switches to `ByMessageId` for subsequent saves.
+    ByUid { mailbox: MailboxId, uid: Uid },
+}
+
 #[derive(Debug)]
 pub enum AccountCommand {
     /// Select a mailbox and (re)fetch its envelopes.
@@ -519,15 +536,16 @@ pub enum AccountCommand {
     PrefetchBodies,
     /// Best-effort draft autosave: build `msg` into a raw RFC 5322 message
     /// and `APPEND` it to the account's Drafts mailbox with `\Draft \Seen`
-    /// flags. `msg.message_id` carries a stable per-compose-session id; with
-    /// `replace` set, any draft already stored under that `Message-ID` is
-    /// deleted first, so repeated autosaves never accumulate duplicates. If
+    /// flags. `msg.message_id` carries a stable per-compose-session id;
+    /// `replace` says which previous copy to delete first (by `Message-ID`,
+    /// or by an exact UID when a reopened draft is being saved for the first
+    /// time), so repeated autosaves never accumulate duplicates. If
     /// the account has no Drafts mailbox yet, one is `CREATE`d. Failures are
     /// warning-level and silent in the UI (a draft is housekeeping, not a
     /// user action - same convention as the Sent `APPEND` after sending).
     SaveDraft {
         msg: Box<ComposedMessage>,
-        replace: bool,
+        replace: DraftReplace,
     },
     /// The IMAP `SEARCH` fallback for full-text search: run `UID SEARCH TEXT
     /// "<query>"` against `mailbox` (SELECTing it on demand, like
@@ -3896,16 +3914,35 @@ async fn purge_by_message_id(session: &mut Session<SessionStream>, message_id: &
     Ok(())
 }
 
+/// Permanently removes the single message `uid` from the *currently selected*
+/// mailbox (`\Deleted` + expunge) - the exact-target counterpart of
+/// `purge_by_message_id`, used for the first save of a reopened draft (whose
+/// UID is known, and whose `Message-ID` may be missing on foreign drafts).
+/// Same UIDPLUS caveat as `purge_by_message_id`'s non-UIDPLUS fallback.
+async fn purge_uid(session: &mut Session<SessionStream>, uid: Uid, has_uidplus: bool) -> Result<()> {
+    let uid_set = uid.0.to_string();
+    let _: Vec<_> = session.uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    if has_uidplus {
+        let _: Vec<_> = session.uid_expunge(&uid_set).await?.try_collect().await?;
+    } else {
+        let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    }
+    Ok(())
+}
+
 /// Saves `msg` as a draft: `APPEND`s the raw message to the account's
 /// Drafts mailbox with `\Draft \Seen` flags (drafts must not show as
-/// unread). With `replace`, any draft already stored under the same
-/// `Message-ID` is purged first so autosaves update in place instead of
-/// accumulating. Accounts without a Drafts mailbox get one `CREATE`d -
+/// unread). `replace` names the previous copy to purge first so autosaves
+/// update in place instead of accumulating - by `Message-ID` for a resave,
+/// or by exact `(mailbox, uid)` for the first save of a reopened draft.
+/// The saved raw message includes a `Bcc` header (see
+/// `build_draft_raw_message`) so reopening the draft can restore its
+/// blind-copy list. Accounts without a Drafts mailbox get one `CREATE`d -
 /// servers aren't required to pre-create it, and refusing to autosave on
 /// such an account would be a worse surprise than a new folder. Leaves the
 /// session SELECTed on the Drafts mailbox; the caller re-selects the
 /// user's folder. Returns the draft's `Message-ID`.
-async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, msg: ComposedMessage, replace: bool, has_uidplus: bool) -> Result<String> {
+async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, msg: ComposedMessage, replace: DraftReplace, has_uidplus: bool) -> Result<String> {
     let path = match drafts_path(folders, account_id) {
         Some(path) => path.to_string(),
         None => {
@@ -3919,9 +3956,17 @@ async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], a
             "Drafts".to_string()
         }
     };
-    let (raw, message_id, _) = build_raw_message(&msg);
+    // ByUid purges the source copy in its own mailbox before the append
+    // below; the mailbox id carries the account prefix, which the wire path
+    // doesn't take.
+    if let DraftReplace::ByUid { mailbox, uid } = &replace {
+        let source_path = mailbox.0.split_once(':').map(|(_, p)| p).unwrap_or(mailbox.0.as_str());
+        session.select(source_path).await?;
+        purge_uid(session, *uid, has_uidplus).await?;
+    }
+    let (raw, message_id, _) = build_draft_raw_message(&msg);
     session.select(&path).await?;
-    if replace {
+    if matches!(replace, DraftReplace::ByMessageId) {
         purge_by_message_id(session, &message_id, has_uidplus).await?;
     }
     session.append(&path, Some("(\\Draft \\Seen)"), None, raw.as_slice()).await?;

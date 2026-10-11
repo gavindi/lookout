@@ -189,14 +189,31 @@ pub fn new_message_id() -> String {
     format!("{}@lookout.local", uuid::Uuid::new_v4())
 }
 
+/// Builds the raw RFC 5322 message a *draft* save should store. Identical to
+/// [`build_raw_message`] except the `Bcc` header is written: it is the only
+/// place a saved draft records its blind-copy list, so reopening the draft
+/// can restore it. Send must keep using `build_raw_message` - a `Bcc` header
+/// on the wire would leak every blind recipient's address.
+pub fn build_draft_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>) {
+    build_raw_message_inner(msg, true)
+}
+
 /// Builds the raw RFC 5322 message bytes for `msg`, generating a fresh
 /// `Message-ID` unless the message carries a pre-generated one (drafts, see
-/// `ComposedMessage::message_id`). Returns the bytes plus the Message-ID in
-/// use (the caller may want it for thread-tracking) and the flat recipient
-/// list (to/cc/bcc combined) needed for the SMTP envelope, since MIME
-/// headers alone aren't necessarily what the envelope's `RCPT TO` list
-/// should be (bcc must be in the envelope but never in a header).
+/// `ComposedMessage::message_id`). Bcc is never written as a header - it only
+/// reaches the SMTP envelope (RFC 5322 §3.6.3: the destination addresses are
+/// the envelope's `RCPT TO` list, not a header); drafts that must round-trip
+/// their Bcc through a save use `build_draft_raw_message`. Returns the bytes
+/// plus the Message-ID in use (the caller may want it for thread-tracking)
+/// and the flat recipient list (to/cc/bcc combined) needed for the SMTP
+/// envelope, since MIME headers alone aren't necessarily what the envelope's
+/// `RCPT TO` list should be (bcc must be in the envelope but never in a
+/// header).
 pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>) {
+    build_raw_message_inner(msg, false)
+}
+
+fn build_raw_message_inner(msg: &ComposedMessage, include_bcc: bool) -> (Vec<u8>, String, Vec<String>) {
     let message_id = msg.message_id.clone().unwrap_or_else(new_message_id);
 
     let mut builder = MessageBuilder::new()
@@ -284,6 +301,21 @@ pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>
     if !msg.cc.is_empty() {
         builder = builder.cc(BuilderAddress::new_list(
             msg.cc
+                .iter()
+                .map(|a| {
+                    let (name, address) = split_mailbox(a);
+                    BuilderAddress::new_address(name, address)
+                })
+                .collect(),
+        ));
+    }
+    if include_bcc && !msg.bcc.is_empty() {
+        // Drafts only (see `build_draft_raw_message`): a `Bcc` header is how
+        // a saved draft remembers its blind-copy list. Send never writes it -
+        // the header would leak every bcc recipient's address to the To/Cc
+        // recipients and to servers along the path.
+        builder = builder.bcc(BuilderAddress::new_list(
+            msg.bcc
                 .iter()
                 .map(|a| {
                     let (name, address) = split_mailbox(a);
@@ -511,6 +543,29 @@ mod tests {
             subject: String::new(),
         };
         assert_eq!(outbox.raw(), None);
+    }
+
+    /// Draft saves write the Bcc header - it is the only place a draft
+    /// records its blind-copy list, so reopening can restore it - while a
+    /// send must never put it on the wire, where the header would leak every
+    /// blind recipient's address to the To/Cc recipients and servers.
+    #[test]
+    fn draft_raw_includes_bcc_but_send_raw_does_not() {
+        let mut msg = sample_message(None);
+        msg.bcc = vec!["Ada <hidden@example.com>".to_string()];
+
+        let (draft_raw, _, draft_recipients) = build_draft_raw_message(&msg);
+        let draft = String::from_utf8(draft_raw).expect("raw message is valid UTF-8");
+        assert!(
+            draft.to_lowercase().contains("bcc:") && draft.contains("hidden@example.com"),
+            "draft raw missing Bcc: {draft}"
+        );
+        assert!(draft_recipients.contains(&"Ada <hidden@example.com>".to_string()), "bcc stays in the envelope");
+
+        let (send_raw, _, send_recipients) = build_raw_message(&msg);
+        let sent = String::from_utf8(send_raw).expect("raw message is valid UTF-8");
+        assert!(!sent.to_lowercase().contains("bcc:"), "send raw must not carry a Bcc header: {sent}");
+        assert!(send_recipients.contains(&"Ada <hidden@example.com>".to_string()), "bcc still reaches the envelope");
     }
 
     fn sample_receipt() -> ReadReceipt {

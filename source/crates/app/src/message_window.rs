@@ -640,7 +640,7 @@ fn wire_reply_button(
             prefill,
             rich_text_default,
             crate::window::mailbox_account_id(&summary.mailbox),
-            crate::config_view::SignatureDefault::Reply,
+            Some(crate::config_view::SignatureDefault::Reply),
         );
         parent.present();
     });
@@ -676,7 +676,7 @@ fn wire_forward_button(
             prefill,
             rich_text_default,
             crate::window::mailbox_account_id(&summary.mailbox),
-            crate::config_view::SignatureDefault::Reply,
+            Some(crate::config_view::SignatureDefault::Reply),
         );
         parent.present();
     });

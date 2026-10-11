@@ -2,8 +2,10 @@
 /// Software released under the GPL3 license
 use base64::Engine;
 use lookout_core::{BodyPart, EmailBody, Uid};
-use mail_parser::{Message, MessageParser, MimeHeaders, PartType};
+use mail_parser::{Addr, Address as MailAddress, HeaderValue, Message, MessageParser, MimeHeaders, PartType};
 use std::collections::HashMap;
+
+use crate::send::Attachment;
 
 /// Parses a raw RFC 5322 message (as returned by `UID FETCH ... BODY.PEEK[]`)
 /// into an [`EmailBody`]. This is the *fallback* body path, used when a
@@ -165,6 +167,131 @@ pub fn rewrite_cid_refs_to_data_uris(html: &str, raw: &[u8]) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The pieces of a saved draft needed to reopen it in the composer: the
+/// parsed bodies, the decoded attachments, and the blind-copy list. The HTML
+/// has its `cid:` image references rewritten to `data:` URIs, because the
+/// composer's WebView has no `cid:` scheme (and `read_content` extracts
+/// `data:` images back into inline attachments on the next save, so the
+/// round trip is lossless). `bcc` is only ever present in drafts - regular
+/// messages never carry a `Bcc` header (see `send::build_draft_raw_message`).
+#[derive(Debug, Default)]
+pub struct DraftPrefillContent {
+    pub text_body: Option<String>,
+    pub html_body: Option<String>,
+    pub attachments: Vec<Attachment>,
+    pub bcc: Vec<String>,
+    /// The draft's own `In-Reply-To` (bare, no `<>`) - restored verbatim, so
+    /// a draft composed as a reply still threads when reopened.
+    pub in_reply_to: Option<String>,
+    /// The draft's own `References` chain (bare ids, as parsed).
+    pub references: Vec<String>,
+    /// Whether the draft asked for a read receipt
+    /// (`Disposition-Notification-To` present).
+    pub request_read_receipt: bool,
+}
+
+/// Parses a saved draft's raw bytes into the contents the composer prefills
+/// from. `None` only when the bytes don't parse as a message at all. The
+/// attachment classification (disposition `attachment`, or a filename
+/// without an explicit `inline` disposition) and the exclusion of inline
+/// `cid:` images from the attachment list mirror `parse_body`, so a draft
+/// round-trips its attachments through the same rules the reading pane uses.
+pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
+    let message = MessageParser::default().parse(raw)?;
+
+    let text_body = message.body_text(0).map(|c| c.into_owned());
+    // A genuine `text/html` part is taken verbatim (linkified, like
+    // `parse_body`) with its `cid:` images inlined as `data:` URIs; a
+    // plain-text-only draft yields no HTML - the composer derives its rich
+    // rendering from the text, and opening it in plain mode shows the text
+    // as saved.
+    let html_body = match message.html_part(0).map(|p| &p.body) {
+        Some(PartType::Html(html)) => Some(rewrite_cid_refs_to_data_uris(&linkify_html_text_nodes(html.as_ref()), raw)),
+        _ => None,
+    };
+
+    let attachments = message
+        .attachments()
+        .filter_map(|part| {
+            let content_type = part
+                .content_type()
+                .map(|ct| match ct.subtype() {
+                    Some(sub) => format!("{}/{}", ct.ctype(), sub),
+                    None => ct.ctype().to_string(),
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string())
+                .to_ascii_lowercase();
+            // Calendar payloads are body content, never composer attachments
+            // (same exclusion as `parse_body`'s part list).
+            if content_type.eq_ignore_ascii_case("text/calendar") {
+                return None;
+            }
+            let disposition = part.content_disposition();
+            let is_attachment = disposition.as_ref().is_some_and(|d| d.is_attachment())
+                || part.attachment_name().is_some() && disposition.as_ref().is_none_or(|d| !d.is_inline());
+            if !is_attachment {
+                return None;
+            }
+            Some(Attachment {
+                filename: part.attachment_name().map(str::to_string).unwrap_or_else(|| "attachment".to_string()),
+                content_type,
+                bytes: part.contents().to_vec(),
+            })
+        })
+        .collect();
+
+    let bcc = message.header("bcc").map(address_header_to_strings).unwrap_or_default();
+
+    // Threading and receipt state come from the raw headers rather than
+    // mail_parser's typed accessors, matching the app's `reply_threading`
+    // and `parse_disposition_notification_to` readers exactly.
+    let headers: Vec<(String, String)> = message.headers_raw().map(|(name, value)| (name.to_string(), value.trim().to_string())).collect();
+    let in_reply_to = lookout_core::header_value(&headers, "in-reply-to")
+        .map(|value| value.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+        .filter(|value| !value.is_empty());
+    let references = lookout_core::header_value(&headers, "references")
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(|id| id.trim_start_matches('<').trim_end_matches('>').to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let request_read_receipt = !lookout_core::parse_disposition_notification_to(&headers).is_empty();
+
+    Some(DraftPrefillContent {
+        text_body,
+        html_body,
+        attachments,
+        bcc,
+        in_reply_to,
+        references,
+        request_read_receipt,
+    })
+}
+
+/// Formats a parsed address header as the composer's recipient tokens:
+/// `Name <address>` when the address carries a display name, else the bare
+/// address - the same shape `split_mailbox` parses back when the draft is
+/// rebuilt.
+fn address_header_to_strings(value: &HeaderValue<'_>) -> Vec<String> {
+    let list: Vec<&Addr<'_>> = match value {
+        HeaderValue::Address(MailAddress::List(list)) => list.iter().collect(),
+        HeaderValue::Address(MailAddress::Group(groups)) => groups.iter().flat_map(|g| g.addresses.iter()).collect(),
+        _ => Vec::new(),
+    };
+    list.into_iter()
+        .filter_map(|addr| {
+            let address = addr.address.as_deref()?;
+            let name = addr.name.as_deref().filter(|n| !n.trim().is_empty());
+            Some(match name {
+                Some(name) => format!("{name} <{address}>"),
+                None => address.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Computes every MIME part's RFC 3501 section path - the `BODY[<n>]` number
@@ -1024,6 +1151,56 @@ mod tests {
         let html = "<img src=\"cid:missing123\">";
         let rewritten = rewrite_cid_refs_to_data_uris(html, &raw);
         assert_eq!(rewritten, html);
+    }
+
+    /// A draft saved through its own raw builder round-trips through
+    /// `parse_draft_prefill`: both bodies, the attachment bytes, the Bcc
+    /// tokens, and the inline image rewritten to a `data:` URI for the
+    /// composer's scheme-less WebView. This is exactly what reopening a
+    /// draft does.
+    #[test]
+    fn draft_prefill_round_trips_attachments_bcc_and_inline_images() {
+        use crate::send::{build_draft_raw_message, Attachment, ComposedMessage, InlineImage};
+        let msg = ComposedMessage {
+            from: "me@example.com".to_string(),
+            display_name: None,
+            to: vec!["you@example.com".to_string()],
+            cc: vec![],
+            bcc: vec!["Ada <hidden@example.com>".to_string()],
+            reply_to: vec![],
+            subject: "Draft".to_string(),
+            importance: lookout_core::Importance::Normal,
+            text_body: "draft body".to_string(),
+            html_body: Some("<p>draft body</p><img src=\"cid:img-1@lookout.local\">".to_string()),
+            attachments: vec![Attachment {
+                filename: "notes.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                bytes: b"attached notes".to_vec(),
+            }],
+            inline_images: vec![InlineImage {
+                cid: "img-1@lookout.local".to_string(),
+                content_type: "image/png".to_string(),
+                bytes: b"\x89PNG fake".to_vec(),
+            }],
+            calendar_part: None,
+            read_receipt: None,
+            request_read_receipt: false,
+            in_reply_to: None,
+            references: vec![],
+            message_id: Some("draft-rt@lookout.local".to_string()),
+        };
+        let (raw, message_id, _) = build_draft_raw_message(&msg);
+        assert_eq!(message_id, "draft-rt@lookout.local");
+
+        let prefill = parse_draft_prefill(&raw).expect("draft parses");
+        assert_eq!(prefill.text_body.as_deref(), Some("draft body"));
+        let html = prefill.html_body.expect("html part survives");
+        assert!(!html.contains("cid:img-1@lookout.local"), "inline image not rewritten: {html}");
+        assert!(html.contains("data:image/png;base64,"));
+        assert_eq!(prefill.attachments.len(), 1, "only the regular attachment is listed");
+        assert_eq!(prefill.attachments[0].filename, "notes.txt");
+        assert_eq!(prefill.attachments[0].bytes, b"attached notes");
+        assert_eq!(prefill.bcc, vec!["Ada <hidden@example.com>".to_string()]);
     }
 
     /// The iMIP invitation fixture: `parse_body` must surface the

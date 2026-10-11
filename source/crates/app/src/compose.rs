@@ -7,8 +7,9 @@ use std::time::Duration;
 use adw::prelude::*;
 use base64::Engine;
 use gtk::{gio, glib};
-use lookout_core::{header_value, AccountId, EmailAddress, EmailBody, EmailSummary, Identity, Importance, Signature};
-use lookout_mail::session::AccountCommand;
+use lookout_core::{header_value, AccountId, EmailAddress, EmailBody, EmailSummary, Identity, Importance, MailboxId, Signature, Uid};
+use lookout_mail::body::DraftPrefillContent;
+use lookout_mail::session::{AccountCommand, DraftReplace};
 use lookout_mail::{new_message_id, Attachment, ComposedMessage, InlineImage};
 use webkit::prelude::*;
 
@@ -81,13 +82,55 @@ pub struct PopOutHandle {
 /// Everything the compose window can be pre-filled with, beyond a blank "New
 /// Message" (`ComposePrefill::default()`). Grouped into one struct rather
 /// than more loose parameters since Reply/Reply-All/Forward all need to set
-/// several of these fields together.
+/// several of these fields together. Reopening a saved draft (item 1.12)
+/// uses the same channel for everything a draft restores: the HTML body,
+/// Bcc/attachment/importance/read-receipt fields Reply/Forward can't know,
+/// the identity it was written as, and the draft identity the autosave
+/// replaces on save.
 #[derive(Default)]
 pub struct ComposePrefill {
     pub to: Option<String>,
     pub cc: Option<String>,
+    /// Blind-copy recipients. Only ever set when reopening a draft - a draft
+    /// stores its Bcc as a header (see `build_draft_raw_message`); Reply and
+    /// Forward, by definition, cannot know a blind-copy list.
+    pub bcc: Option<String>,
     pub subject: Option<String>,
+    /// The body as plain text. For a draft this is the saved text part; for
+    /// Reply/Forward it is the quoted/forwarded plain text.
     pub body: Option<String>,
+    /// The exact HTML body for the rich editor. Set when reopening a draft
+    /// whose saved form was HTML (with `cid:` images already rewritten to
+    /// `data:` URIs - see `lookout_mail::body::parse_draft_prefill`). `None`
+    /// for every other prefill, where the rich editor derives its markup
+    /// from `body` via `text_to_html`.
+    pub html_body: Option<String>,
+    /// The sending identity's address to preselect in the From dropdown,
+    /// matched case-insensitively against the account's identities - a draft
+    /// reopened after being written as an alternate identity must not
+    /// silently switch to the default one. An address that no longer matches
+    /// any identity leaves the default selected.
+    pub from: Option<String>,
+    /// The saved importance. `Normal` (the default) for non-draft prefills.
+    pub importance: Importance,
+    /// Whether the saved draft asked for a read receipt
+    /// (`Disposition-Notification-To`).
+    pub request_read_receipt: bool,
+    /// Files to seed the composer's attachment list with, bytes included
+    /// (decoded from the saved draft's MIME parts by
+    /// `parse_draft_prefill`).
+    pub attachments: Vec<Attachment>,
+    /// A reopened draft's bare `Message-ID` (no `<>`), which becomes the
+    /// autosave's stable id so every resave replaces the stored copy instead
+    /// of appending a second one. `None` for a fresh composer (a new id is
+    /// generated) and for foreign drafts whose saved form carried no
+    /// `Message-ID`.
+    pub draft_message_id: Option<String>,
+    /// A reopened draft's source `(mailbox, uid)`: the first autosave purges
+    /// exactly this copy before appending the new one, so a foreign draft
+    /// without a `Message-ID` still replaces rather than duplicates.
+    /// Consumed by that first save; later saves purge by `Message-ID`.
+    pub draft_source: Option<(MailboxId, Uid)>,
     /// RFC 5322 `In-Reply-To` - the bare Message-Id (no `<>`) of the message
     /// being replied to. `mail_builder`'s `MessageId` header writer adds the
     /// angle brackets itself, so this must NOT include them.
@@ -180,6 +223,7 @@ pub fn build_reply_prefill(summary: &EmailSummary, body: &EmailBody, own_email: 
         body: Some(reply_body),
         in_reply_to,
         references,
+        ..Default::default()
     }
 }
 
@@ -203,12 +247,57 @@ pub fn build_forward_prefill(summary: &EmailSummary, body: &EmailBody) -> Compos
     );
 
     ComposePrefill {
-        to: None,
-        cc: None,
         subject: Some(subject),
         body: Some(forward_body),
-        in_reply_to: None,
-        references: Vec::new(),
+        ..Default::default()
+    }
+}
+
+/// Builds the prefill for reopening a saved draft (item 1.12), from the
+/// envelope fields the reading pane already has (`summary`) plus the parsed
+/// MIME content (`lookout_mail::body::parse_draft_prefill`). Unlike Reply,
+/// nothing is filtered or rewritten: the draft is exactly what the user
+/// saved, so its recipients, subject, bodies, threading, importance, receipt
+/// request, attachments and identity are restored verbatim, and its
+/// `(mailbox, uid)`/`Message-ID` ride along so the autosave replaces the
+/// stored copy on save (see `ComposePrefill::draft_source`/`draft_message_id`).
+pub fn build_draft_prefill(summary: &EmailSummary, content: &DraftPrefillContent) -> ComposePrefill {
+    let recipients = |list: &[EmailAddress]| -> Option<String> {
+        if list.is_empty() {
+            return None;
+        }
+        Some(
+            list.iter()
+                .map(|a| match a.name.as_deref().filter(|name| !name.trim().is_empty()) {
+                    Some(name) => format!("{name} <{}>", a.address),
+                    None => a.address.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    };
+    ComposePrefill {
+        to: recipients(&summary.to),
+        cc: recipients(&summary.cc),
+        bcc: (!content.bcc.is_empty()).then(|| content.bcc.join(", ")),
+        subject: summary.subject.clone(),
+        body: content.text_body.clone(),
+        html_body: content.html_body.clone(),
+        from: summary.from.first().map(|a| a.address.clone()),
+        importance: summary.importance,
+        request_read_receipt: content.request_read_receipt,
+        attachments: content.attachments.clone(),
+        // Defensive bracket strip: envelope-parsed ids are usually bare, but
+        // a pre-parse fallback could carry the brackets.
+        draft_message_id: summary
+            .message_id
+            .as_deref()
+            .map(strip_angle_brackets)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        draft_source: Some((summary.mailbox.clone(), summary.uid)),
+        in_reply_to: content.in_reply_to.clone(),
+        references: content.references.clone(),
     }
 }
 
@@ -475,13 +564,14 @@ struct DraftSnapshot {
 }
 
 /// One file attached to the message being composed, held in memory for the
-/// compose session - Cancel or a crash simply drops the bytes, like any
-/// other unsaved edit (there is no attachment persistence for drafts: see
-/// the note on `ComposePrefill` near where drafts get reopened - they don't,
-/// today, at all). `bytes` is `Rc`-wrapped so add/remove/rebuild never
-/// reclones potentially multi-MB payloads; it's cloned into an owned
-/// `lookout_mail::Attachment` only at the two points that actually build a
-/// `ComposedMessage` (Send, and a changed autosave tick).
+/// compose session. Drafts do persist attachments - they are MIME parts of
+/// the saved message, and reopening a draft seeds this list from
+/// `ComposePrefill::attachments` (item 1.12) - though a crash before the
+/// next autosave still drops whatever was added since. `bytes` is
+/// `Rc`-wrapped so add/remove/rebuild never reclones potentially multi-MB
+/// payloads; it's cloned into an owned `lookout_mail::Attachment` only at
+/// the two points that actually build a `ComposedMessage` (Send, and a
+/// changed autosave tick).
 #[derive(Clone)]
 struct PendingAttachment {
     filename: String,
@@ -565,8 +655,15 @@ struct AutosaveCtx {
     in_flight: Rc<Cell<bool>>,
     /// One stable Message-ID per compose session: every autosave carries it,
     /// and `replace` purges whatever the previous save stored under it, so
-    /// the Drafts folder only ever holds one copy of this draft.
+    /// the Drafts folder only ever holds one copy of this draft. A reopened
+    /// draft seeds it with the saved message's own id.
     draft_message_id: Rc<String>,
+    /// Set only when this composer reopened a saved draft (item 1.12): the
+    /// source copy's exact `(mailbox, uid)`, taken by the *first* autosave
+    /// so it can purge that copy directly (a foreign draft may carry no
+    /// `Message-ID` to search by). Every later save purges by
+    /// `draft_message_id` instead.
+    replace_uid: Rc<RefCell<Option<(MailboxId, Uid)>>>,
     cmd_tx: async_channel::Sender<AccountCommand>,
     /// The account's selectable identities (default first) and the From
     /// dropdown that selects among them. Shared with the send handler, so
@@ -631,7 +728,17 @@ impl AutosaveCtx {
         if unchanged {
             return;
         }
-        let replace = self.draft_queued.get();
+        // First save of a reopened draft takes its exact source UID (then
+        // clears it); every other replace works by Message-ID, which by now
+        // names either this session's earlier save or the reopened draft's
+        // own id.
+        let replace = if !self.draft_queued.get() {
+            DraftReplace::None
+        } else if let Some((mailbox, uid)) = self.replace_uid.borrow_mut().take() {
+            DraftReplace::ByUid { mailbox, uid }
+        } else {
+            DraftReplace::ByMessageId
+        };
         *self.last_saved.borrow_mut() = Some(snap.clone());
         self.draft_queued.set(true);
         let identity = selected_identity(&self.identities, &self.from_dropdown);
@@ -1133,9 +1240,13 @@ pub fn build_compose_view(
     if let Some(cc) = &prefill.cc {
         cc_row.set_from_text(cc);
     }
-    // Bcc has no prefill: neither Reply nor Forward can know a blind copy
-    // list, by definition.
+    // Bcc is only ever prefilled when reopening a saved draft; Reply and
+    // Forward can't know a blind-copy list by definition.
     let bcc_row = RecipientEntry::new_plain("Bcc");
+    let bcc_prefilled = prefill.bcc.as_ref().is_some_and(|bcc| !bcc.trim().is_empty());
+    if let Some(bcc) = &prefill.bcc {
+        bcc_row.set_from_text(bcc);
+    }
     for row in [&to_row, &cc_row, &bcc_row] {
         row.set_suggestion_source(suggestions.clone());
     }
@@ -1169,7 +1280,8 @@ pub fn build_compose_view(
     }
     cc_row.widget().set_visible(cc_prefilled);
     cc_button.set_visible(!cc_prefilled);
-    bcc_row.widget().set_visible(false);
+    bcc_row.widget().set_visible(bcc_prefilled);
+    bcc_button.set_visible(!bcc_prefilled);
     {
         let cc_row = cc_row.clone();
         let cc_button_self = cc_button.clone();
@@ -1240,6 +1352,16 @@ pub fn build_compose_view(
         })
     };
     refresh_from_dropdown();
+    // A reopened draft remembers which identity it was written as: select
+    // that address when it's still among the account's identities. An
+    // unmatched address (the identity was deleted since) silently keeps the
+    // default - the saved From header's display name isn't carried over.
+    if let Some(email) = prefill.from.as_deref().map(str::trim).filter(|email| !email.is_empty()) {
+        let index = identities.borrow().iter().position(|identity| identity.email.eq_ignore_ascii_case(email));
+        if let Some(index) = index {
+            from_dropdown.set_selected(index as u32);
+        }
+    }
 
     let fields_group = adw::PreferencesGroup::new();
     fields_group.add(to_row.widget());
@@ -1247,11 +1369,11 @@ pub fn build_compose_view(
     fields_group.add(bcc_row.widget());
     fields_group.add(&subject_row);
 
-    // --- Attachments: a canonical in-session list (gone on Cancel/crash
-    // like any other unsaved edit - there's no draft-attachment
-    // persistence, matching Bcc/read-receipt's existing gap on reopening a
-    // draft), rendered as removable chips below the fields, same
-    // repopulate-from-truth shape `RecipientEntry` uses for To/Cc/Bcc.
+    // --- Attachments: a canonical in-session list, rendered as removable
+    // chips below the fields, same repopulate-from-truth shape
+    // `RecipientEntry` uses for To/Cc/Bcc. A reopened draft seeds the list
+    // with the saved message's decoded parts (item 1.12); everything else
+    // starts empty. ---
     let attachments: Rc<RefCell<Vec<PendingAttachment>>> = Rc::new(RefCell::new(Vec::new()));
     let attachment_flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -1262,6 +1384,14 @@ pub fn build_compose_view(
         .homogeneous(false)
         .visible(false)
         .build();
+    for attachment in &prefill.attachments {
+        attachments.borrow_mut().push(PendingAttachment {
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone(),
+            bytes: Rc::new(attachment.bytes.clone()),
+        });
+    }
+    rebuild_attachment_chips(&attachments, &attachment_flow);
 
     // --- Read-receipt request: RFC 8098's `Disposition-Notification-To`
     // header, asking recipients to notify us when they read the message.
@@ -1298,6 +1428,15 @@ pub fn build_compose_view(
             }
         });
     }
+    // A reopened draft restores its saved Importance and read-receipt
+    // request; every other prefill leaves both at Normal/off. The toggles'
+    // handlers are already connected, so High/Low stay mutually exclusive.
+    match prefill.importance {
+        Importance::High => high_importance_toggle.set_active(true),
+        Importance::Low => low_importance_toggle.set_active(true),
+        Importance::Normal => {}
+    }
+    read_receipt_toggle.set_active(prefill.request_read_receipt);
 
     let body_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
@@ -1318,7 +1457,14 @@ pub fn build_compose_view(
     let text_scroller = gtk::ScrolledWindow::builder().child(&body_view).hexpand(true).vexpand(true).build();
 
     apply_spell_check(spell_check, &spell_languages);
-    let (rich_web_view, format_toolbar) = build_rich_editor(prefill.body.as_deref().map(text_to_html).unwrap_or_default());
+    // A reopened HTML draft seeds the rich editor verbatim (its `cid:`
+    // images already rewritten to `data:` URIs, which `read_content` turns
+    // back into inline images on the next save); every other prefill - and a
+    // plain-text draft - derives the markup from the plain body, since the
+    // rich content must not round-trip through `text_to_html`, which would
+    // flatten its formatting.
+    let rich_initial = prefill.html_body.clone().unwrap_or_else(|| prefill.body.as_deref().map(text_to_html).unwrap_or_default());
+    let (rich_web_view, format_toolbar) = build_rich_editor(rich_initial);
 
     let body_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     body_stack.add_named(&text_scroller, Some("text"));
@@ -1650,7 +1796,13 @@ pub fn build_compose_view(
     // autosave timer can't fire against a torn-down page.
     let closed = Rc::new(Cell::new(false));
     let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
-    let draft_message_id = Rc::new(new_message_id());
+    // A reopened draft keeps the saved message's own Message-ID (bare, no
+    // `<>` - `build_raw_message` re-adds the brackets), so resaves replace
+    // the stored copy; a fresh composer mints a new stable id.
+    let draft_message_id = Rc::new(prefill.draft_message_id.clone().unwrap_or_else(new_message_id));
+    // The exact source copy for the first save of a reopened draft; taken -
+    // and cleared - by `save_if_changed`'s first successful queue.
+    let replace_uid: Rc<RefCell<Option<(MailboxId, Uid)>>> = Rc::new(RefCell::new(prefill.draft_source.clone()));
 
     let autosave = AutosaveCtx {
         to_row: to_row.clone(),
@@ -1665,9 +1817,12 @@ pub fn build_compose_view(
         rich_web_view: rich_web_view.clone(),
         attachments: attachments.clone(),
         last_saved: Rc::new(RefCell::new(None)),
-        draft_queued: Rc::new(Cell::new(false)),
+        // A reopened draft is already stored: its first save must replace,
+        // not append (and its Send must delete the stored copy).
+        draft_queued: Rc::new(Cell::new(prefill.draft_source.is_some())),
         in_flight: Rc::new(Cell::new(false)),
         draft_message_id: draft_message_id.clone(),
+        replace_uid,
         cmd_tx: cmd_tx.clone(),
         identities: identities.clone(),
         from_dropdown: from_dropdown.clone(),
@@ -2048,6 +2203,48 @@ mod tests {
         assert_eq!(header_value(&headers, "message-id"), Some("<abc@example.com>"));
         assert_eq!(header_value(&headers, "Message-Id"), Some("<abc@example.com>"));
         assert_eq!(header_value(&headers, "subject"), None);
+    }
+
+    /// Reopening a draft restores everything the saved copy carried: named
+    /// recipients, both bodies, Bcc, the identity it was written as,
+    /// importance/receipt/threading, attachment bytes, and the
+    /// `(mailbox, uid)`/`Message-ID` the autosave replaces on save. Nothing
+    /// is filtered or rewritten, unlike Reply/Forward.
+    #[test]
+    fn draft_prefill_restores_the_saved_copy_verbatim() {
+        let mut summary = sample_summary();
+        summary.message_id = Some("<draft-1@lookout.local>".to_string());
+        summary.importance = Importance::High;
+        let content = DraftPrefillContent {
+            text_body: Some("draft text".to_string()),
+            html_body: Some("<p>draft text</p>".to_string()),
+            attachments: vec![Attachment {
+                filename: "notes.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                bytes: b"notes".to_vec(),
+            }],
+            bcc: vec!["Ada <hidden@example.com>".to_string()],
+            in_reply_to: Some("older@example.com".to_string()),
+            references: vec!["older@example.com".to_string()],
+            request_read_receipt: true,
+        };
+
+        let prefill = build_draft_prefill(&summary, &content);
+        assert_eq!(prefill.to.as_deref(), Some("me@example.com, other@example.com"));
+        assert_eq!(prefill.cc.as_deref(), Some("cc-person@example.com"));
+        assert_eq!(prefill.bcc.as_deref(), Some("Ada <hidden@example.com>"));
+        assert_eq!(prefill.subject.as_deref(), Some("Hello there"));
+        assert_eq!(prefill.body.as_deref(), Some("draft text"));
+        assert_eq!(prefill.html_body.as_deref(), Some("<p>draft text</p>"));
+        assert_eq!(prefill.from.as_deref(), Some("ada@example.com"));
+        assert_eq!(prefill.importance, Importance::High);
+        assert!(prefill.request_read_receipt);
+        assert_eq!(prefill.attachments.len(), 1);
+        assert_eq!(prefill.attachments[0].bytes, b"notes");
+        assert_eq!(prefill.draft_message_id.as_deref(), Some("draft-1@lookout.local"));
+        assert_eq!(prefill.draft_source.as_ref().map(|(m, u)| (m.clone(), *u)), Some((summary.mailbox.clone(), summary.uid)));
+        assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
+        assert_eq!(prefill.references, vec!["older@example.com".to_string()]);
     }
 
     #[test]

@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.165" date="2026-10-12">
+      <description>
+        <p>Drafts can now be reopened for editing: a message in the Drafts folder shows a "This is a draft" bar above its preview with an Edit button, and double-clicking it (or pressing Enter) opens the composer. Recipients, subject, the formatted body with its inline images, attachments, importance and the sending identity all come back as they were saved, and saving updates the original draft in place instead of leaving a second copy behind.</p>
+      </description>
+    </release>
     <release version="0.9.164" date="2026-10-12">
       <description>
         <p>Fixes a compilation error in the release build that could stop packaged builds of 0.9.163 from being produced. No functional changes - this release is otherwise identical to 0.9.163.</p>
