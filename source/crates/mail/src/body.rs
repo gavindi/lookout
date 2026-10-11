@@ -124,15 +124,13 @@ pub fn find_part_in_raw(raw: &[u8], requested: &BodyPart) -> Option<Vec<u8>> {
     Some(found.contents().to_vec())
 }
 
-/// Dev-only helper for the debug ".eml viewer": rewrites every `cid:` image
-/// reference in `html` to a `data:` URI carrying the referenced part's
-/// already-transfer-decoded bytes from `raw`. The debug viewer has no
-/// account session behind it, so the reading pane's scheme handler (which
-/// fetches cid parts over IMAP) can't serve these - this lets a fixture be
-/// verified in-app without a server. Compiled out of release builds.
-#[cfg(debug_assertions)]
+/// Rewrites every `cid:` image reference in `html` to a `data:` URI carrying
+/// the referenced part's already-transfer-decoded bytes from `raw`. Used by
+/// self-contained render paths that have no account session behind them - the
+/// debug ".eml viewer" and the popped-out message window - where the reading
+/// pane's scheme handler (which fetches cid parts over IMAP) can't serve
+/// these.
 pub fn rewrite_cid_refs_to_data_uris(html: &str, raw: &[u8]) -> String {
-    use mail_parser::MimeHeaders;
     let Some(message) = MessageParser::default().parse(raw) else { return html.to_string() };
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
@@ -1010,7 +1008,6 @@ mod tests {
         assert!(!image.is_attachment);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     fn cid_refs_rewrite_to_data_uris_from_the_raw_message() {
         let raw = fixture("html-cid-image.eml");
@@ -1021,7 +1018,6 @@ mod tests {
         assert!(rewritten.contains("data:image/png;base64,iVBORw0KGgo"), "rewritten: {rewritten}");
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     fn cid_refs_that_resolve_nowhere_survive_verbatim() {
         let raw = fixture("html-cid-image.eml");

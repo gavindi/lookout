@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.164" date="2026-10-12">
+      <description>
+        <p>Fixes a compilation error in the release build that could stop packaged builds of 0.9.163 from being produced. No functional changes - this release is otherwise identical to 0.9.163.</p>
+      </description>
+    </release>
     <release version="0.9.163" date="2026-10-11">
       <description>
         <p>Messages can now be opened in their own read-only window - double-click a message in the list (or press Enter) and it opens separately from the main window, with Esc closing it. The reading pane's "More" menu also gains "View message details…", which shows a message's key fields, its full internet headers and its raw source.</p>
