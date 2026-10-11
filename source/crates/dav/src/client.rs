@@ -970,6 +970,7 @@ mod tests {
             name: None,
             organization: None,
             title: None,
+            photo: None,
             emails: vec![lookout_core::EmailField {
                 types: vec!["work".to_string()],
                 address: "jane@example.com".to_string(),

@@ -228,6 +228,17 @@ pub struct ConfigView {
     /// its selection to the `spacing-*` CSS class on the folder and message
     /// list panes.
     pub spacing_row: adw::ComboRow,
+    /// "Reading pane" dropdown (Config → Appearance): Right / Bottom / Off.
+    /// Exposed so the caller can seed it from the `layout-reading-pane`
+    /// boolean and `layout-reading-pane-position` key, and apply a change
+    /// through the same path as the View ribbon's dropdown.
+    pub reading_pane_row: adw::ComboRow,
+    /// "Message preview" dropdown (Config → Appearance): Off / 1 / 2 / 3
+    /// lines of body preview per message-list row.
+    pub preview_lines_row: adw::ComboRow,
+    /// "Show sender images" switch (Config → Appearance): whether message-list
+    /// rows and the reading-pane header show a sender avatar.
+    pub show_sender_images_row: adw::SwitchRow,
     /// "Custom accent color" switch (Config → Appearance), exposed so the
     /// caller can arm the accent picker row and map its state to the
     /// `accent-color` GSettings key (off = follow the system accent).
@@ -767,6 +778,30 @@ pub fn build() -> ConfigView {
         .model(&spacing_model)
         .build();
     appearance_group.add(&spacing_row);
+    // Position of the reading pane: Right (beside the list), Bottom (below it)
+    // or Off. Mirrors the View ribbon's "Reading pane" dropdown.
+    let reading_pane_model = gtk::StringList::new(&["Right", "Bottom", "Off"]);
+    let reading_pane_row = adw::ComboRow::builder()
+        .title("Reading pane")
+        .subtitle("Where the reading pane sits, or Off to hide it")
+        .model(&reading_pane_model)
+        .build();
+    appearance_group.add(&reading_pane_row);
+    // How many body-preview lines each message-list row shows.
+    let preview_lines_model = gtk::StringList::new(&["Off", "1 line", "2 lines", "3 lines"]);
+    let preview_lines_row = adw::ComboRow::builder()
+        .title("Message preview")
+        .subtitle("Lines of message body to show on each row of the message list")
+        .model(&preview_lines_model)
+        .build();
+    appearance_group.add(&preview_lines_row);
+    // Whether sender avatars (contact photo, else coloured initials) appear on
+    // message-list rows and in the reading-pane header.
+    let show_sender_images_row = adw::SwitchRow::builder()
+        .title("Show sender images")
+        .subtitle("Show a contact photo, or coloured initials, for the sender of each message")
+        .build();
+    appearance_group.add(&show_sender_images_row);
     let privacy_group = placeholder_group("Privacy");
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
@@ -917,6 +952,9 @@ pub fn build() -> ConfigView {
         theme_row,
         message_theme_dark_row,
         spacing_row,
+        reading_pane_row,
+        preview_lines_row,
+        show_sender_images_row,
         accent_switch_row,
         accent_color_row,
         accent_color_button,

@@ -62,6 +62,11 @@
       <default>true</default>
       <summary>Show the reading pane</summary>
     </key>
+    <key name="layout-reading-pane-position" type="s">
+      <default>'right'</default>
+      <summary>Reading pane position</summary>
+      <description>Where the reading pane sits: right (beside the message list) or bottom (below it). The layout-reading-pane boolean stays the on/off switch, so "off" is that boolean being false regardless of this value.</description>
+    </key>
     <key name="layout-calendar-overview" type="b">
       <default>true</default>
       <summary>Show the calendar overview</summary>
@@ -70,6 +75,11 @@
       <default>'medium'</default>
       <summary>Vertical spacing in the folder and message list panes</summary>
       <description>Vertical spacing between items in the folder and message list panes: tight (the least padding), medium (5% more padding) or loose (10% more padding). Medium is the default.</description>
+    </key>
+    <key name="layout-message-preview-lines" type="i">
+      <default>1</default>
+      <summary>Message preview lines in the message list</summary>
+      <description>How many lines of the message body preview to show on each list row: 0 hides the preview entirely. 1 is the default, matching Outlook.</description>
     </key>
     <key name="pane-folder-width-percent" type="d">
       <default>-1</default>
@@ -80,6 +90,11 @@
       <default>-1</default>
       <summary>Message list pane width as a percentage of the window width</summary>
       <description>Last width the message list pane was dragged to, as a percentage of the application window width; -1 means never set. Reapplied when the window is resized.</description>
+    </key>
+    <key name="pane-message-list-height-percent" type="d">
+      <default>-1</default>
+      <summary>Message list pane height as a percentage of the window height</summary>
+      <description>Last height the message list pane was dragged to while the reading pane is at the bottom, as a percentage of the application window height; -1 means never set. Reapplied when the window is resized.</description>
     </key>
     <key name="pane-calendar-sidebar-width-percent" type="d">
       <default>-1</default>
@@ -166,6 +181,11 @@
       <default>[]</default>
       <summary>Spelling languages</summary>
       <description>WebKit language tags (e.g. "en_US") to check spelling in. Empty means the system locale's language.</description>
+    </key>
+    <key name="mail-show-sender-images" type="b">
+      <default>true</default>
+      <summary>Show sender images</summary>
+      <description>Show a sender avatar on each message-list row and in the reading-pane header: the contact's photo when their address book card has one, otherwise coloured initials.</description>
     </key>
     <key name="mail-message-theme-dark" type="b">
       <default>false</default>

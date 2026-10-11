@@ -168,7 +168,12 @@ struct MessageRowWidgets {
     /// the selection model - the same pattern as `ListHeader::favorite_suppress`.
     checkbox_suppress: Rc<Cell<bool>>,
     accent: gtk::Box,
-    avatar: gtk::Label,
+    /// The sender avatar: a fixed 32x32 overlay showing the contact's photo
+    /// when one is known and "Show sender images" is on, else coloured
+    /// initials. Replaced in place by `checkbox` while Select mode is on.
+    avatar: gtk::Overlay,
+    avatar_label: gtk::Label,
+    avatar_photo: gtk::Picture,
     sender_label: gtk::Label,
     /// Attachment/calendar indicator icons, right after the sender column.
     /// Hidden on rows that have neither, so they take no width at all there -
@@ -200,6 +205,63 @@ struct MessageRowWidgets {
     /// The message this row currently shows. Set by `bind`, read by the
     /// quick-action handlers when they fire.
     bound: Rc<RefCell<Option<EmailSummary>>>,
+}
+
+/// Weak handles to a row's display-dependent widgets - the avatar/checkbox
+/// pair and the preview label - whose appearance follows app-wide settings
+/// (Select mode, "Show sender images", the preview line count) rather than the
+/// row's own message. The list view creates a bounded pool of row widgets and
+/// recycles them, so the registry in `build_window` holds weak references and
+/// prunes the dead ones whenever a setting changes (see `update_row_display`).
+struct RowDisplayRefs {
+    avatar: glib::WeakRef<gtk::Overlay>,
+    checkbox: glib::WeakRef<gtk::CheckButton>,
+    preview_label: glib::WeakRef<gtk::Label>,
+}
+
+/// Configures a row's preview label for `lines` body-preview lines: 0 hides
+/// it (dropping the reserved line so the row shrinks), 1 keeps the label on a
+/// single ellipsized line, and 2-3 wrap and cap the label at that many lines.
+fn apply_preview_lines(label: &gtk::Label, lines: i32) {
+    let lines = crate::settings::preview_lines(lines);
+    if lines <= 0 {
+        label.set_visible(false);
+        return;
+    }
+    label.set_visible(true);
+    label.set_wrap(true);
+    label.set_single_line_mode(false);
+    label.set_lines(lines);
+}
+
+/// Applies the app-wide display settings to every live row in `registry`:
+/// avatar/checkbox visibility for Select mode and "Show sender images", and
+/// the preview line count. Dead weak references are dropped on the way.
+fn update_row_display(registry: &Rc<RefCell<Vec<RowDisplayRefs>>>, select_mode: bool, show_sender_images: bool, preview_lines: i32) {
+    registry.borrow_mut().retain(|refs| {
+        let (Some(avatar), Some(checkbox), Some(preview)) = (refs.avatar.upgrade(), refs.checkbox.upgrade(), refs.preview_label.upgrade()) else {
+            return false;
+        };
+        avatar.set_visible(!select_mode && show_sender_images);
+        checkbox.set_visible(select_mode);
+        apply_preview_lines(&preview, preview_lines);
+        true
+    });
+}
+
+/// The sender's contact photo as a decoded texture, memoized per address in
+/// `cache`. `None` when there is no contact for the address, no photo on the
+/// card, or the photo can't be decoded - all of which fall back to initials.
+fn sender_photo_texture(state: &Rc<RefCell<UiState>>, address: &str, cache: &Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>>) -> Option<gtk::gdk::Texture> {
+    if let Some(cached) = cache.borrow().get(address) {
+        return cached.clone();
+    }
+    let texture = find_contact_by_address(state, address, None)
+        .and_then(|(_, entry)| entry.card.photo)
+        .and_then(|photo| photo.data)
+        .and_then(|data| gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(data)).ok());
+    cache.borrow_mut().insert(address.to_string(), texture.clone());
+    texture
 }
 
 /// Per-row widgets for the folder tree rows, stored under a `set_data` key on
@@ -293,8 +355,10 @@ const PANE_RESTORE_ATTEMPTS: u8 = 20;
 /// [`pane_change_is_a_drag`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PaneRestoreState {
-    /// `paned.width()` when the position below was applied.
-    paned_width: i32,
+    /// The paned's own allocated extent along its split axis (`width()` for a
+    /// horizontal paned, `height()` for a vertical one) when the position
+    /// below was applied.
+    paned_extent: i32,
     /// The position the restore set, or the clamp last observed.
     position: i32,
 }
@@ -314,9 +378,9 @@ struct PaneRestoreState {
 /// wide HTML message loads does this, as does every window resize and stack
 /// page switch. An unchanged `paned_width` with a moved position can only be
 /// the user dragging the separator.
-fn pane_change_is_a_drag(recorded: Option<PaneRestoreState>, paned_width: i32, position: i32) -> bool {
+fn pane_change_is_a_drag(recorded: Option<PaneRestoreState>, paned_extent: i32, position: i32) -> bool {
     match recorded {
-        Some(recorded) => recorded.paned_width == paned_width && recorded.position != position,
+        Some(recorded) => recorded.paned_extent == paned_extent && recorded.position != position,
         None => false,
     }
 }
@@ -391,6 +455,89 @@ fn pane_width_percent(child_width: i32, window_width: i32) -> Option<f64> {
         return None;
     }
     Some(child_width as f64 * 100.0 / window_width as f64)
+}
+
+/// A paned's own allocated length along its split axis: the width for a
+/// horizontal paned (children side by side), the height for a vertical one
+/// (children stacked). The message list's paned flips to vertical when the
+/// reading pane sits at the bottom, so every restore/save computation is
+/// expressed against this rather than `width()` directly.
+fn paned_axis_extent(paned: &gtk::Paned) -> i32 {
+    match paned.orientation() {
+        gtk::Orientation::Vertical => paned.height(),
+        _ => paned.width(),
+    }
+}
+
+/// The window's length along a paned's split axis - what a pane's percentage
+/// is taken against (see `pane_width_percent`).
+fn window_axis_extent(window: &gtk::Window, orientation: gtk::Orientation) -> i32 {
+    match orientation {
+        gtk::Orientation::Vertical => window.height(),
+        _ => window.width(),
+    }
+}
+
+/// The GSettings percentages a pane persists its extent under, one per split
+/// axis. Every pane but the message list has a fixed orientation and passes
+/// the same key twice; the message list is vertical when the reading pane is
+/// at the bottom, so its width and its height are remembered separately.
+#[derive(Clone, Copy)]
+struct PaneExtentKeys {
+    horizontal: &'static str,
+    vertical: &'static str,
+}
+
+impl PaneExtentKeys {
+    /// The keys for a pane that never changes orientation (every pane but the
+    /// message list): the same percentage regardless of axis.
+    fn fixed(key: &'static str) -> Self {
+        Self { horizontal: key, vertical: key }
+    }
+
+    /// The key for the orientation the paned is in *right now*.
+    fn for_paned(self, paned: &gtk::Paned) -> &'static str {
+        match paned.orientation() {
+            gtk::Orientation::Vertical => self.vertical,
+            _ => self.horizontal,
+        }
+    }
+}
+
+/// The reading-pane dropdown's three choices, in View-ribbon and Settings
+/// order. "right"/"bottom" are the two positions; "off" hides the pane.
+const READING_PANE_CHOICES: [&str; 3] = ["right", "bottom", "off"];
+
+/// The index of a reading-pane choice in [`READING_PANE_CHOICES`], for the
+/// Settings `ComboRow`.
+fn reading_pane_choice_index(choice: &str) -> u32 {
+    READING_PANE_CHOICES.iter().position(|c| *c == choice).unwrap_or(0) as u32
+}
+
+/// Applies a reading-pane choice ("right"/"bottom"/"off") and, when the second
+/// argument is true, writes it through to GSettings. Shared by the View
+/// ribbon's dropdown and the Settings `ComboRow`.
+type ApplyReadingPane = Rc<dyn Fn(&str, bool)>;
+
+/// The initial state of the View ribbon's reading-pane dropdown action
+/// (`win.reading-pane-position`): "off" when the reading pane is hidden,
+/// otherwise the stored position ("right" or "bottom").
+fn reading_pane_action_state(settings: &crate::settings::SettingsStore) -> String {
+    if !settings.get_bool(crate::settings::LAYOUT_READING_PANE) {
+        return "off".to_string();
+    }
+    settings.get_string(crate::settings::LAYOUT_READING_PANE_POSITION)
+}
+
+/// The reading-pane dropdown's tooltip, naming its current position.
+fn reading_pane_tooltip(settings: &crate::settings::SettingsStore) -> String {
+    if !settings.get_bool(crate::settings::LAYOUT_READING_PANE) {
+        return "Reading pane: Off".to_string();
+    }
+    match crate::settings::reading_pane_position(&settings.get_string(crate::settings::LAYOUT_READING_PANE_POSITION)) {
+        crate::settings::ReadingPanePosition::Bottom => "Reading pane: Bottom".to_string(),
+        crate::settings::ReadingPanePosition::Right => "Reading pane: Right".to_string(),
+    }
 }
 
 /// How long after the last keystroke before a search query is committed. Long
@@ -1444,6 +1591,12 @@ fn install_paned_css() {
             color: white;
             font-weight: bold;
         }
+        /* The contact photo layered over the initials. Clipped to the same
+           circle as the initials background so an avatar reads as one shape
+           whether it shows a photo or coloured initials. */
+        .avatar-photo {
+            border-radius: 9999px;
+        }
         .avatar-color-0 { background-color: @lookout-avatar-0; }
         .avatar-color-1 { background-color: @lookout-avatar-1; }
         .avatar-color-2 { background-color: @lookout-avatar-2; }
@@ -2266,7 +2419,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .css_classes(["flat", "list-header-action"])
         .valign(gtk::Align::Center)
         .build();
-    let select_mode_button_for_rows = select_mode_button.clone();
+    // Whether Select mode is on, shared with the row factory so `bind` can
+    // decide each row's avatar/checkbox visibility (see `RowDisplayRefs`).
+    let select_mode_flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Weak handles to every created row's display-dependent widgets, so a
+    // change to Select mode, "Show sender images" or the preview line count
+    // updates the rows already on screen in place (the list view recycles row
+    // widgets and won't rebind them for an unrelated setting change).
+    let row_display_registry: Rc<RefCell<Vec<RowDisplayRefs>>> = Rc::new(RefCell::new(Vec::new()));
+    let row_display_registry_for_setup = row_display_registry.clone();
+    // Decoded contact-photo textures, keyed by sender address. A miss (or a
+    // contact with no photo) is cached too, so the address-book lookup and
+    // the base64 decode run at most once per sender per session.
+    let sender_photo_cache: Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>> = Rc::new(RefCell::new(HashMap::new()));
     let worker_for_rows = worker.clone();
     let message_factory = gtk::SignalListItemFactory::new();
     message_factory.connect_setup(move |_, list_item| {
@@ -2287,15 +2452,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // padding), colored only when the message is unread.
         let accent = gtk::Box::builder().width_request(3).vexpand(true).build();
         accent.add_css_class("message-accent-bar");
-        let avatar = gtk::Label::builder()
-            .css_classes(["avatar-circle"])
+        // The avatar overlay: a coloured circle with the sender's initials,
+        // and on top of it (when there is one) the contact's photo. A photo
+        // with no paintable leaves the initials visible underneath, so the
+        // same two children serve both cases. Fixed 32x32, centred, like the
+        // checkbox that replaces it in Select mode.
+        let avatar_label = gtk::Label::builder().css_classes(["avatar-circle"]).build();
+        let avatar_photo = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).css_classes(["avatar-photo"]).build();
+        let avatar = gtk::Overlay::builder()
             .width_request(32)
             .height_request(32)
             .halign(gtk::Align::Center)
             .valign(gtk::Align::Center)
             .margin_start(8)
             .margin_end(8)
+            .child(&avatar_label)
             .build();
+        avatar.add_overlay(&avatar_photo);
 
         // Fixed-width sender, expanding subject: that's what lines every
         // row's subject up in one column, rather than letting it start
@@ -2383,9 +2556,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
         // Same footprint as the avatar it replaces (32x32, centered) so
         // toggling Select mode swaps one for the other in place rather than
-        // adding a separate column - `bind_property` below (not bind()/CSS)
-        // is what makes the swap live across every row, including ones
-        // already on screen, the moment the header's Select toggle flips.
+        // adding a separate column.
         let checkbox = gtk::CheckButton::builder()
             .width_request(32)
             .height_request(32)
@@ -2393,18 +2564,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
-        // `sync_create` seeds each binding with the button's current state
-        // immediately (rows created while already in Select mode - e.g. one
-        // scrolled into view - must not default to showing the avatar), and
-        // both bindings keep matching it live without any rebind: a plain
-        // signal (message_factory has no per-toggle rebind hook) would only
-        // reach rows bound *after* the flip.
-        select_mode_button_for_rows
-            .bind_property("active", &avatar, "visible")
-            .invert_boolean()
-            .sync_create()
-            .build();
-        select_mode_button_for_rows.bind_property("active", &checkbox, "visible").sync_create().build();
+        // The avatar/checkbox swap and the preview line count depend on
+        // app-wide display settings (Select mode, "Show sender images",
+        // preview lines), not on this row's message. Register weak handles so
+        // a settings change can update every live row in place; `bind` also
+        // applies them, so a freshly recycled row comes out correct.
+        row_display_registry_for_setup.borrow_mut().push(RowDisplayRefs {
+            avatar: avatar.downgrade(),
+            checkbox: checkbox.downgrade(),
+            preview_label: preview_label.downgrade(),
+        });
 
         let message_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
         message_box.add_css_class("message-row");
@@ -2862,6 +3031,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     checkbox_suppress,
                     accent,
                     avatar,
+                    avatar_label,
+                    avatar_photo,
                     sender_label,
                     attachment_icon,
                     calendar_icon,
@@ -2882,6 +3053,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
         list_item.set_child(Some(&overlay));
     });
+    let select_mode_flag_for_bind = select_mode_flag.clone();
+    let sender_photo_cache_for_bind = sender_photo_cache.clone();
     message_factory.connect_bind(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(row) = list_item.item().and_downcast::<gtk::TreeListRow>() else { return };
@@ -2936,13 +3109,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let sender = summary.from.first();
                 match sender {
                     Some(address) => {
-                        widgets.avatar.set_label(&crate::message_header::initials(address.name.as_deref(), &address.address));
+                        widgets.avatar_label.set_label(&crate::message_header::initials(address.name.as_deref(), &address.address));
                         for class in crate::message_header::AVATAR_COLOR_CLASSES {
-                            widgets.avatar.remove_css_class(class);
+                            widgets.avatar_label.remove_css_class(class);
                         }
-                        widgets.avatar.add_css_class(crate::message_header::avatar_color_class(&address.address));
+                        widgets.avatar_label.add_css_class(crate::message_header::avatar_color_class(&address.address));
+                        match sender_photo_texture(&state_clone2, &address.address, &sender_photo_cache_for_bind) {
+                            Some(texture) => widgets.avatar_photo.set_paintable(Some(&texture)),
+                            None => widgets.avatar_photo.set_paintable(None::<&gtk::gdk::Texture>),
+                        }
                     }
-                    None => widgets.avatar.set_label("?"),
+                    None => {
+                        widgets.avatar_label.set_label("?");
+                        widgets.avatar_photo.set_paintable(None::<&gtk::gdk::Texture>);
+                    }
                 }
 
                 let from = sender.map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
@@ -2979,6 +3159,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.importance_icon.set_visible(summary.importance != lookout_core::Importance::Normal);
                 widgets.date_label.set_label(&format_row_date(summary.date, chrono::Utc::now()));
                 widgets.preview_label.set_label(summary.preview.as_deref().unwrap_or(""));
+                // Display settings that don't change per message: the preview
+                // line count, and whether the avatar is shown at all. Select
+                // mode hides the avatar in favour of the checkbox.
+                let (show_sender_images, preview_lines) = {
+                    let st = state_clone2.borrow();
+                    (
+                        st.settings.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES),
+                        st.settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES),
+                    )
+                };
+                apply_preview_lines(&widgets.preview_label, preview_lines);
+                widgets.avatar.set_visible(!select_mode_flag_for_bind.get() && show_sender_images);
+                widgets.checkbox.set_visible(select_mode_flag_for_bind.get());
 
                 let unread = summary.is_unread();
                 widgets
@@ -3228,13 +3421,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .valign(gtk::Align::Center)
         .menu_model(&sort_key_menu)
         .build();
-    // The button itself (and the property bindings each row's avatar/
-    // checkbox make to its `active` state) were built earlier, alongside
-    // the row factory - see the comment there. All that's left here is the
-    // one side effect that isn't per-row: clearing the selection on exit.
+    // The button's `active` state drives each row's avatar/checkbox swap; the
+    // shared `select_mode_flag` and the row registry make the swap reach rows
+    // already on screen (see `update_row_display`). The one side effect that
+    // isn't per-row is clearing the selection on exit.
     {
         let message_list = message_list.clone();
+        let state = state.clone();
+        let select_mode_flag = select_mode_flag.clone();
+        let row_display_registry = row_display_registry.clone();
         select_mode_button.connect_toggled(move |button| {
+            select_mode_flag.set(button.is_active());
+            let (show_sender_images, preview_lines) = {
+                let st = state.borrow();
+                (
+                    st.settings.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES),
+                    st.settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES),
+                )
+            };
+            update_row_display(&row_display_registry, button.is_active(), show_sender_images, preview_lines);
             if !button.is_active() {
                 // Leaving Select mode clears the selection - matches Gmail's
                 // "cancel selection" behavior and avoids stranding the
@@ -4108,8 +4313,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // rounded card. `resize_start_child(false)` keeps the sidebar-like
     // panes from silently growing when the window resizes; the reading
     // pane absorbs the extra space.
+    // The reading pane sits to the right of the message list by default, but
+    // the user can dock it below (Outlook's "Reading pane: Bottom"); then this
+    // paned is vertical - messages on top, reading pane below - so its split
+    // position and percentage are measured by height instead of width (see
+    // `paned_axis_extent`).
+    let reading_pane_position = crate::settings::reading_pane_position(&settings.get_string(crate::settings::LAYOUT_READING_PANE_POSITION));
+    let reading_pane_orientation = match reading_pane_position {
+        crate::settings::ReadingPanePosition::Bottom => gtk::Orientation::Vertical,
+        crate::settings::ReadingPanePosition::Right => gtk::Orientation::Horizontal,
+    };
     let messages_reading_paned = gtk::Paned::builder()
-        .orientation(gtk::Orientation::Horizontal)
+        .orientation(reading_pane_orientation)
         .start_child(&message_card)
         .end_child(&reading_card)
         .resize_start_child(false)
@@ -4118,6 +4333,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .shrink_end_child(false)
         .position(368)
         .build();
+    // Apply the persisted visibility here; the View ribbon's "Reading pane"
+    // dropdown only re-applies it when the user picks a new position.
+    reading_card.set_visible(settings.get_bool(crate::settings::LAYOUT_READING_PANE));
+    // A bottom reading pane closes the half-gap to the message list on the
+    // vertical edge (the cards' facing top/bottom margins), the way the side
+    // layout already does on the horizontal edge.
+    if reading_pane_orientation == gtk::Orientation::Vertical {
+        reading_card.set_margin_top(0);
+        message_card.set_margin_bottom(0);
+    }
     let main_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .start_child(&folder_card)
@@ -4506,9 +4731,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let folder_pane_toggle = gtk::ToggleButton::builder().icon_name("folder-symbolic").build();
     folder_pane_toggle.set_tooltip_text(Some("Folder pane"));
     folder_pane_toggle.set_active(true);
-    let reading_pane_toggle = gtk::ToggleButton::builder().icon_name("document-preview-symbolic").build();
-    reading_pane_toggle.set_tooltip_text(Some("Reading pane"));
-    reading_pane_toggle.set_active(true);
+    // Reading pane is a dropdown, not a plain toggle, because it has two
+    // "on" positions (Outlook's "Reading pane: Right / Bottom") plus Off. It
+    // drives the `win.reading-pane-position` stateful action; the activation
+    // handler (which needs the paned and the pane-width scheduler) is wired
+    // later, once those exist.
+    let reading_pane_menu = gio::Menu::new();
+    reading_pane_menu.append(Some("Right"), Some("win.reading-pane-position('right')"));
+    reading_pane_menu.append(Some("Bottom"), Some("win.reading-pane-position('bottom')"));
+    reading_pane_menu.append(Some("Off"), Some("win.reading-pane-position('off')"));
+    let reading_pane_button = gtk::MenuButton::builder()
+        .icon_name("document-preview-symbolic")
+        .tooltip_text("Reading pane")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .menu_model(&reading_pane_menu)
+        .build();
+    let reading_pane_action = gio::SimpleAction::new_stateful("reading-pane-position", Some(glib::VariantTy::STRING), &reading_pane_action_state(&settings).to_variant());
     let overview_pane_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").build();
     overview_pane_toggle.set_tooltip_text(Some("Calendar overview"));
     overview_pane_toggle.set_active(true);
@@ -4520,7 +4759,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let view_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     view_toolbar.append(&layout_label);
     view_toolbar.append(&folder_pane_toggle);
-    view_toolbar.append(&reading_pane_toggle);
+    view_toolbar.append(&reading_pane_button);
     view_toolbar.append(&overview_pane_toggle);
     view_toolbar.append(&conversations_toggle);
 
@@ -4717,14 +4956,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     {
-        let reading_card = reading_card.clone();
-        let state = state.clone();
-        reading_pane_toggle.connect_toggled(move |btn| {
-            state.borrow().settings.set_bool(crate::settings::LAYOUT_READING_PANE, btn.is_active());
-            reading_card.set_visible(btn.is_active());
-        });
-    }
-    {
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         let overview_forced_hidden = overview_forced_hidden.clone();
         let state = state.clone();
@@ -4768,7 +4999,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let persisted = state.borrow().settings.clone();
         folder_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_FOLDER_PANE));
-        reading_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_READING_PANE));
         overview_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_CALENDAR_OVERVIEW));
         conversations_toggle.set_active(persisted.get_bool(crate::settings::MAIL_THREADED));
     }
@@ -5205,6 +5435,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // item is activated, so registering it here is in time.
     window.add_action(&sort_key_action);
     window.add_action(&list_filter_action);
+    window.add_action(&reading_pane_action);
 
     // --- Close-to-background: the window's close button hides the window
     // instead of exiting (Config → General → "Keep running when the window
@@ -5308,8 +5539,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let pane_alloc_seen: Rc<RefCell<HashMap<&'static str, i32>>> = Rc::new(RefCell::new(HashMap::new()));
     let mark_pane_restored = {
         let panes_restored = panes_restored.clone();
-        move |key: &'static str, paned_width: i32, position: i32| {
-            panes_restored.borrow_mut().insert(key, PaneRestoreState { paned_width, position });
+        move |key: &'static str, paned_extent: i32, position: i32| {
+            panes_restored.borrow_mut().insert(key, PaneRestoreState { paned_extent, position });
         }
     };
     let clear_pane_restored = {
@@ -5353,7 +5584,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // allocation by then is counted as restored anyway, so its saves
         // reopen. Suppressing a real drag forever would be a worse failure
         // than restoring one pane late.
-        move |window_width: i32, stable: bool, give_up: bool| -> bool {
+        move |window_width: i32, window_height: i32, stable: bool, give_up: bool| -> bool {
             if window_width <= 0 {
                 return false;
             }
@@ -5368,14 +5599,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             {
                 // `end_child` marks the one pane (the mail tab's overview) that
                 // is its paned's end child, so its stored percentage is its own
-                // width rather than the separator's position.
-                let mut restore = |paned: &gtk::Paned, key: &'static str, cap: Option<i32>, end_child: bool| {
+                // width rather than the separator's position. `keys` carries a
+                // separate percentage per axis, because the message list's paned
+                // flips to vertical when the reading pane is at the bottom.
+                let mut restore = |paned: &gtk::Paned, keys: PaneExtentKeys, cap: Option<i32>, end_child: bool| {
+                    let key = keys.for_paned(paned);
                     if !paned.is_mapped() {
                         tracing::debug!(pane = key, "pane width restore skipped: not mapped");
                         return;
                     }
+                    let axis = paned.orientation();
+                    let window_extent = match axis {
+                        gtk::Orientation::Vertical => window_height,
+                        _ => window_width,
+                    };
                     let pct = settings.get_double(key);
-                    let paned_width = paned.width();
+                    let paned_extent = paned_axis_extent(paned);
                     // A paned's own allocation lags the window's, and by a lot:
                     // a window already reporting its full maximized width can
                     // still hold paneds sized for the pre-maximize one, several
@@ -5384,20 +5623,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     // layout, so - exactly like the window width - an
                     // allocation is only trusted once two attempts agree on it.
                     let previous_alloc = pane_alloc_seen.borrow().get(key).copied();
-                    pane_alloc_seen.borrow_mut().insert(key, paned_width);
-                    let trusted = stable && paned_width > 0 && previous_alloc == Some(paned_width);
-                    let start_min = paned.start_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
-                    let end_min = paned.end_child().map(|w| w.measure(gtk::Orientation::Horizontal, -1).0).unwrap_or(0);
+                    pane_alloc_seen.borrow_mut().insert(key, paned_extent);
+                    let trusted = stable && paned_extent > 0 && previous_alloc == Some(paned_extent);
+                    let start_min = paned.start_child().map(|w| w.measure(axis, -1).0).unwrap_or(0);
+                    let end_min = paned.end_child().map(|w| w.measure(axis, -1).0).unwrap_or(0);
                     let position = if end_child {
-                        paned_position_for_end_percent(pct, window_width, paned_width, start_min, end_min)
+                        paned_position_for_end_percent(pct, window_extent, paned_extent, start_min, end_min)
                     } else {
-                        paned_position_for_percent(pct, window_width, paned_width, start_min, end_min, cap)
+                        paned_position_for_percent(pct, window_extent, paned_extent, start_min, end_min, cap)
                     };
                     tracing::debug!(
                         pane = key,
                         pct,
-                        window_width,
-                        paned_width,
+                        window_extent,
+                        paned_extent,
                         start_min,
                         end_min,
                         stable,
@@ -5418,18 +5657,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         // `set_position` runs the save handler synchronously
                         // and that handler reads this map.
                         if trusted || give_up {
-                            mark_pane_restored(key, paned_width, position);
+                            mark_pane_restored(key, paned_extent, position);
                         }
                         paned.set_position(position);
                     } else if pct <= 0.0 && (trusted || give_up) {
                         // Never dragged: nothing stored, so nothing to protect,
                         // and the pane's first drag should save normally.
-                        mark_pane_restored(key, paned_width, paned.position());
+                        mark_pane_restored(key, paned_extent, paned.position());
                     } else if give_up {
                         // Something to restore but still no allocation to
                         // measure against, and out of attempts. Suppressing a
                         // real drag forever would be worse than giving up.
-                        mark_pane_restored(key, paned_width, paned.position());
+                        mark_pane_restored(key, paned_extent, paned.position());
                     }
                     if !trusted {
                         settled = false;
@@ -5439,12 +5678,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // the inner paneds are measured against, so restoring it last
                 // would leave every inner position computed against a stale
                 // allocation and guarantee a follow-up clamp.
-                restore(&content_and_overview_paned, crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT, None, true);
-                restore(&main_paned, crate::settings::PANE_FOLDER_WIDTH_PCT, Some(FOLDER_PANE_MAX_WIDTH), false);
-                restore(&messages_reading_paned, crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT, None, false);
-                restore(&calendar_paned, crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT, None, false);
-                restore(&contacts_paned, crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT, None, false);
-                restore(&config_paned, crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT, None, false);
+                restore(
+                    &content_and_overview_paned,
+                    PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT),
+                    None,
+                    true,
+                );
+                restore(
+                    &main_paned,
+                    PaneExtentKeys::fixed(crate::settings::PANE_FOLDER_WIDTH_PCT),
+                    Some(FOLDER_PANE_MAX_WIDTH),
+                    false,
+                );
+                restore(
+                    &messages_reading_paned,
+                    PaneExtentKeys {
+                        horizontal: crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT,
+                        vertical: crate::settings::PANE_MESSAGE_LIST_HEIGHT_PCT,
+                    },
+                    None,
+                    false,
+                );
+                restore(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT), None, false);
+                restore(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT), None, false);
+                restore(&config_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT), None, false);
             }
             // The flag is cleared from an idle, not here, so it also covers the
             // layout pass these `set_position` calls just queued. GtkPaned
@@ -5498,14 +5755,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let debounce_for_timeout = debounce.clone();
             let attempts = Cell::new(0u8);
             let previous_width: Cell<Option<i32>> = Cell::new(None);
+            let previous_height: Cell<Option<i32>> = Cell::new(None);
             debounce.set(Some(glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
                 let last_attempt = attempts.get() + 1 >= PANE_RESTORE_ATTEMPTS;
                 let width = window.width();
+                let height = window.height();
                 // On the final attempt the width is taken as-is: one pane
                 // restored against a slightly stale width is a far better
-                // failure than a pane left at its default forever.
-                let stable = window_width_is_stable(previous_width.replace(Some(width)), width) || last_attempt;
-                let settled = apply(width, stable, last_attempt);
+                // failure than a pane left at its default forever. Stability
+                // is tracked on both axes, since the message list's paned can
+                // be vertical and restored against the window height.
+                let stable =
+                    (window_width_is_stable(previous_width.replace(Some(width)), width) && window_width_is_stable(previous_height.replace(Some(height)), height)) || last_attempt;
+                let settled = apply(width, height, stable, last_attempt);
                 attempts.set(attempts.get() + 1);
                 if settled || last_attempt {
                     debounce_for_timeout.set(None);
@@ -5523,7 +5785,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // is its own width rather than the separator's position. `cap` marks the
     // folder pane, the one pane with a hard ceiling.
     {
-        let wire_pane_width_save = |paned: &gtk::Paned, key: &'static str, end_child: bool, cap: bool| {
+        let wire_pane_width_save = |paned: &gtk::Paned, keys: PaneExtentKeys, end_child: bool, cap: bool| {
             let window_for_save = window.clone();
             let state_for_save = state.clone();
             let applying = pane_widths_applying.clone();
@@ -5547,10 +5809,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 if applying.get() {
                     return;
                 }
-                let paned_width = paned.width();
+                // The key follows the paned's current orientation, so the
+                // message list's vertical drag saves under the height key.
+                let key = keys.for_paned(paned);
+                let axis = paned.orientation();
+                let paned_extent = paned_axis_extent(paned);
                 let position = paned.position();
                 let recorded = restore_state(key);
-                if !pane_change_is_a_drag(recorded, paned_width, position) {
+                if !pane_change_is_a_drag(recorded, paned_extent, position) {
                     // Either the pane has not been restored during this map
                     // cycle - it is still showing its built-in default, which
                     // the user never chose - or GTK has re-clamped the position
@@ -5558,36 +5824,49 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     // record, so the next genuine drag is measured against what
                     // is actually on screen now.
                     if recorded.is_some() {
-                        tracing::debug!(pane = key, paned_width, position, "pane position re-clamped by GTK, not saving");
-                        record_pane_state(key, paned_width, position);
+                        tracing::debug!(pane = key, paned_extent, position, "pane position re-clamped by GTK, not saving");
+                        record_pane_state(key, paned_extent, position);
                     }
                     // Bailing before `debounce.take()` leaves a genuine drag's
                     // pending save, and its value, alone.
                     return;
                 }
-                record_pane_state(key, paned_width, position);
+                record_pane_state(key, paned_extent, position);
                 if let Some(id) = debounce.take() {
                     id.remove();
                 }
-                let width = if end_child { paned_width.saturating_sub(position) } else { position };
-                let window_width = window_for_save.width();
+                let extent = if end_child { paned_extent.saturating_sub(position) } else { position };
+                let window_extent = window_axis_extent(window_for_save.upcast_ref::<gtk::Window>(), axis);
                 let state_for_timeout = state_for_save.clone();
                 let debounce_for_timeout = debounce.clone();
                 debounce.set(Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
                     debounce_for_timeout.set(None);
-                    if let Some(pct) = pane_width_percent(width, window_width) {
-                        tracing::debug!(pane = key, width, window_width, pct, "saving dragged pane width");
+                    if let Some(pct) = pane_width_percent(extent, window_extent) {
+                        tracing::debug!(pane = key, extent, window_extent, pct, "saving dragged pane extent");
                         state_for_timeout.borrow().settings.set_double(key, pct);
                     }
                 })));
             });
         };
-        wire_pane_width_save(&main_paned, crate::settings::PANE_FOLDER_WIDTH_PCT, false, true);
-        wire_pane_width_save(&messages_reading_paned, crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT, false, false);
-        wire_pane_width_save(&calendar_paned, crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT, false, false);
-        wire_pane_width_save(&contacts_paned, crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT, false, false);
-        wire_pane_width_save(&config_view.paned, crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT, false, false);
-        wire_pane_width_save(&content_and_overview_paned, crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT, true, false);
+        wire_pane_width_save(&main_paned, PaneExtentKeys::fixed(crate::settings::PANE_FOLDER_WIDTH_PCT), false, true);
+        wire_pane_width_save(
+            &messages_reading_paned,
+            PaneExtentKeys {
+                horizontal: crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT,
+                vertical: crate::settings::PANE_MESSAGE_LIST_HEIGHT_PCT,
+            },
+            false,
+            false,
+        );
+        wire_pane_width_save(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT), false, false);
+        wire_pane_width_save(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT), false, false);
+        wire_pane_width_save(&config_view.paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT), false, false);
+        wire_pane_width_save(
+            &content_and_overview_paned,
+            PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT),
+            true,
+            false,
+        );
     }
     // Each pane restores itself the moment it maps. This is what makes the
     // restore deterministic: every branch of `apply_stored_pane_widths` is
@@ -5602,20 +5881,135 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
         let clear_pane_restored = clear_pane_restored.clone();
-        let wire_pane_width_restore = move |paned: &gtk::Paned, key: &'static str| {
+        let wire_pane_width_restore = move |paned: &gtk::Paned, keys: PaneExtentKeys| {
             {
                 let schedule = schedule_apply_pane_widths.clone();
                 paned.connect_map(move |_| schedule());
             }
             let clear = clear_pane_restored.clone();
-            paned.connect_unmap(move |_| clear(key));
+            paned.connect_unmap(move |paned| clear(keys.for_paned(paned)));
         };
-        wire_pane_width_restore(&main_paned, crate::settings::PANE_FOLDER_WIDTH_PCT);
-        wire_pane_width_restore(&messages_reading_paned, crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT);
-        wire_pane_width_restore(&calendar_paned, crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT);
-        wire_pane_width_restore(&contacts_paned, crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT);
-        wire_pane_width_restore(&config_view.paned, crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT);
-        wire_pane_width_restore(&content_and_overview_paned, crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT);
+        wire_pane_width_restore(&main_paned, PaneExtentKeys::fixed(crate::settings::PANE_FOLDER_WIDTH_PCT));
+        wire_pane_width_restore(
+            &messages_reading_paned,
+            PaneExtentKeys {
+                horizontal: crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT,
+                vertical: crate::settings::PANE_MESSAGE_LIST_HEIGHT_PCT,
+            },
+        );
+        wire_pane_width_restore(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT));
+        wire_pane_width_restore(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT));
+        wire_pane_width_restore(&config_view.paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT));
+        wire_pane_width_restore(&content_and_overview_paned, PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT));
+    }
+    // --- Reading pane position: Right / Bottom / Off, shared by the View
+    // ribbon's dropdown (the stateful `win.reading-pane-position` action) and
+    // the Settings → Appearance ComboRow. Wired here rather than at the
+    // widgets' construction because switching position needs the message
+    // list's paned and the pane-extent scheduler, both of which only exist by
+    // this point. Bottom flips the paned vertical and puts the reading pane
+    // back on its remembered height (or a sensible default the first time);
+    // Right flips it back to horizontal.
+    {
+        let reading_pane_action = reading_pane_action.clone();
+        let reading_pane_button = reading_pane_button.clone();
+        let messages_reading_paned = messages_reading_paned.clone();
+        let message_card = message_card.clone();
+        let reading_card = reading_card.clone();
+        let reading_pane_row = config_view.reading_pane_row.clone();
+        let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
+        let state = state.clone();
+        // Guards the ComboRow's `selected` notify while `apply` writes it, so
+        // the row and the action can never drive each other in a loop.
+        let suppress_row: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // The margins a bottom reading pane zeroes to close the half-gap to
+        // the message list; captured so Right can restore them.
+        let reading_card_default_margin_top = reading_card.margin_top();
+        let message_card_default_margin_bottom = message_card.margin_bottom();
+        let apply: ApplyReadingPane = {
+            let reading_pane_action = reading_pane_action.clone();
+            let reading_pane_button = reading_pane_button.clone();
+            let messages_reading_paned = messages_reading_paned.clone();
+            let message_card = message_card.clone();
+            let reading_card = reading_card.clone();
+            let reading_pane_row = reading_pane_row.clone();
+            let schedule_apply_pane_widths = schedule_apply_pane_widths.clone();
+            let state = state.clone();
+            let suppress_row = suppress_row.clone();
+            Rc::new(move |choice: &str, persist: bool| {
+                reading_pane_action.set_state(&choice.to_variant());
+                let store = state.borrow().settings.clone();
+                let visible = choice != "off";
+                if persist {
+                    store.set_bool(crate::settings::LAYOUT_READING_PANE, visible);
+                }
+                reading_card.set_visible(visible);
+                reading_pane_button.set_tooltip_text(Some(&reading_pane_tooltip(&store)));
+                suppress_row.set(true);
+                reading_pane_row.set_selected(reading_pane_choice_index(choice));
+                suppress_row.set(false);
+                if !visible {
+                    return;
+                }
+                let position = crate::settings::reading_pane_position(choice);
+                if persist {
+                    store.set_string(crate::settings::LAYOUT_READING_PANE_POSITION, choice);
+                }
+                let orientation = match position {
+                    crate::settings::ReadingPanePosition::Bottom => gtk::Orientation::Vertical,
+                    crate::settings::ReadingPanePosition::Right => gtk::Orientation::Horizontal,
+                };
+                messages_reading_paned.set_orientation(orientation);
+                match position {
+                    crate::settings::ReadingPanePosition::Bottom => {
+                        reading_card.set_margin_top(0);
+                        message_card.set_margin_bottom(0);
+                    }
+                    crate::settings::ReadingPanePosition::Right => {
+                        reading_card.set_margin_top(reading_card_default_margin_top);
+                        message_card.set_margin_bottom(message_card_default_margin_bottom);
+                    }
+                }
+                // A first switch to an orientation with no remembered extent
+                // gets a sensible default; the scheduler below overrides it
+                // when a stored percentage exists (and re-measures the newly
+                // vertical paned).
+                if messages_reading_paned.is_mapped() && paned_axis_extent(&messages_reading_paned) > 0 {
+                    let stored = store.get_double(match orientation {
+                        gtk::Orientation::Vertical => crate::settings::PANE_MESSAGE_LIST_HEIGHT_PCT,
+                        _ => crate::settings::PANE_MESSAGE_LIST_WIDTH_PCT,
+                    });
+                    if stored <= 0.0 {
+                        let extent = paned_axis_extent(&messages_reading_paned);
+                        messages_reading_paned.set_position((extent as f64 * 0.55).round() as i32);
+                    }
+                }
+                schedule_apply_pane_widths();
+            })
+        };
+        {
+            let apply = apply.clone();
+            reading_pane_action.connect_activate(move |_action, parameter| {
+                let Some(choice) = parameter.and_then(|p| p.str()) else { return };
+                apply(choice, true);
+            });
+        }
+        {
+            let apply = apply.clone();
+            let suppress_row = suppress_row.clone();
+            config_view.reading_pane_row.connect_selected_notify(move |row| {
+                if suppress_row.get() {
+                    return;
+                }
+                if let Some(choice) = READING_PANE_CHOICES.get(row.selected() as usize) {
+                    apply(choice, true);
+                }
+            });
+        }
+        // Seed both controls from the stored state without writing anything
+        // back through.
+        let choice = reading_pane_action_state(&state.borrow().settings);
+        apply(&choice, false);
     }
     // GTK4 only updates `default-width` when the window is resized while
     // resizable and not maximized/tiled/fullscreen (see `should_remember_size`
@@ -6368,6 +6762,33 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
+    // Config → Appearance → "Message preview": how many body-preview lines
+    // each message-list row shows. Rewrites the live rows in place through the
+    // row registry, so the list reflows as the choice changes.
+    {
+        let state = state.clone();
+        let row_display_registry = row_display_registry.clone();
+        let select_mode_flag = select_mode_flag.clone();
+        config_view.preview_lines_row.connect_selected_notify(move |row| {
+            let lines = row.selected() as i32;
+            state.borrow().settings.set_int(crate::settings::LAYOUT_PREVIEW_LINES, lines);
+            let show_sender_images = state.borrow().settings.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES);
+            update_row_display(&row_display_registry, select_mode_flag.get(), show_sender_images, lines);
+        });
+    }
+    // Config → Appearance → "Show sender images": toggles the message-list
+    // avatars (and the reading-pane header's, on the next message).
+    {
+        let state = state.clone();
+        let row_display_registry = row_display_registry.clone();
+        let select_mode_flag = select_mode_flag.clone();
+        config_view.show_sender_images_row.connect_active_notify(move |row| {
+            let show_sender_images = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES, show_sender_images);
+            let lines = state.borrow().settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES);
+            update_row_display(&row_display_registry, select_mode_flag.get(), show_sender_images, lines);
+        });
+    }
     {
         let theme_manager = theme_manager.clone();
         let state = state.clone();
@@ -6800,6 +7221,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .spacing_row
             .set_selected(crate::settings::spacing_index(&persisted.get_string(crate::settings::LAYOUT_SPACING)));
+        // Appearance → "Message preview" and "Show sender images": seed from
+        // the stored values (their notify handlers are no-ops for a value that
+        // already matches, so nothing is written back on startup).
+        config_view
+            .preview_lines_row
+            .set_selected(crate::settings::preview_lines(persisted.get_int(crate::settings::LAYOUT_PREVIEW_LINES)) as u32);
+        config_view.show_sender_images_row.set_active(persisted.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES));
         // Advanced → "Aggressive prefetch": seeding fires the notify handlers
         // above - the switch's handler re-applies the rows' sensitivity and
         // every handler re-sends the assembled `PrefetchPolicy` to the
@@ -18653,7 +19081,10 @@ mod tests {
 
     #[test]
     fn only_a_drag_within_an_unchanged_allocation_is_saved() {
-        let restored = Some(PaneRestoreState { paned_width: 1500, position: 400 });
+        let restored = Some(PaneRestoreState {
+            paned_extent: 1500,
+            position: 400,
+        });
         assert!(
             pane_change_is_a_drag(restored, 1500, 520),
             "the separator moved while the paned stayed the same size: a drag"
@@ -18668,7 +19099,10 @@ mod tests {
         // emits `notify::position` from there - asynchronously, after the
         // restore's `pane_widths_applying` flag has already been cleared. The
         // changed `paned_width` is what gives it away.
-        let restored = Some(PaneRestoreState { paned_width: 1500, position: 400 });
+        let restored = Some(PaneRestoreState {
+            paned_extent: 1500,
+            position: 400,
+        });
         assert!(!pane_change_is_a_drag(restored, 2400, 400), "window widened: the paned grew, so this is a re-fit");
         assert!(!pane_change_is_a_drag(restored, 900, 300), "window narrowed: the position was clamped down to fit");
     }
@@ -19023,6 +19457,7 @@ mod tests {
             name: None,
             organization: None,
             title: None,
+            photo: None,
             emails: vec![lookout_core::EmailField {
                 types: vec!["work".into()],
                 address: address.to_string(),

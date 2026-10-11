@@ -47,13 +47,24 @@ pub const THEME_ID: &str = "theme-id";
 pub const ACCENT_COLOR: &str = "accent-color";
 pub const LAYOUT_FOLDER_PANE: &str = "layout-folder-pane";
 pub const LAYOUT_READING_PANE: &str = "layout-reading-pane";
+/// Where the reading pane sits: one of [`READING_PANE_POSITIONS`] ("right"
+/// default, "bottom"). Visibility stays the separate [`LAYOUT_READING_PANE`]
+/// boolean, so "off" is that boolean being false, never a value here.
+pub const LAYOUT_READING_PANE_POSITION: &str = "layout-reading-pane-position";
 pub const LAYOUT_CALENDAR_OVERVIEW: &str = "layout-calendar-overview";
+/// How many lines of body preview each message-list row shows, 0-3 (see
+/// [`preview_lines`]); 1 is the default, matching Outlook.
+pub const LAYOUT_PREVIEW_LINES: &str = "layout-message-preview-lines";
 /// Vertical spacing between items in the folder and message list panes: one
 /// of [`SPACINGS`] ("medium" default, "tight", "loose"). Drives the
 /// `spacing-*` CSS class on both panes via [`spacing_class`].
 pub const LAYOUT_SPACING: &str = "layout-vertical-spacing";
 pub const PANE_FOLDER_WIDTH_PCT: &str = "pane-folder-width-percent";
 pub const PANE_MESSAGE_LIST_WIDTH_PCT: &str = "pane-message-list-width-percent";
+/// The message list pane's height, as a percentage of the window height, when
+/// the reading pane is at the bottom (the pane is vertical then). Never set
+/// (-1) means the pane is left at its built-in default.
+pub const PANE_MESSAGE_LIST_HEIGHT_PCT: &str = "pane-message-list-height-percent";
 pub const PANE_CALENDAR_SIDEBAR_WIDTH_PCT: &str = "pane-calendar-sidebar-width-percent";
 pub const PANE_CONTACTS_SIDEBAR_WIDTH_PCT: &str = "pane-contacts-sidebar-width-percent";
 pub const PANE_CONFIG_SIDEBAR_WIDTH_PCT: &str = "pane-config-sidebar-width-percent";
@@ -91,6 +102,10 @@ pub const MAIL_SPELL_CHECK_LANGUAGES: &str = "mail-spell-check-languages";
 /// original light form. A default for new messages only; the per-email
 /// toggle in the header still overrides the current message either way.
 pub const MAIL_MESSAGE_THEME_DARK: &str = "mail-message-theme-dark";
+/// Config → Mail → "Show sender images": whether message-list rows and the
+/// reading-pane header show a sender avatar (contact photo when available,
+/// else coloured initials).
+pub const MAIL_SHOW_SENDER_IMAGES: &str = "mail-show-sender-images";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
 /// Calendar → "Week starts on": first day of the week, as 0=Sunday .. 6=Saturday.
 pub const CALENDAR_WEEK_START: &str = "calendar-week-start";
@@ -216,10 +231,13 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(ACCENT_COLOR, Value::String(String::new()));
     map.insert(LAYOUT_FOLDER_PANE, Value::Bool(true));
     map.insert(LAYOUT_READING_PANE, Value::Bool(true));
+    map.insert(LAYOUT_READING_PANE_POSITION, Value::String("right".into()));
     map.insert(LAYOUT_CALENDAR_OVERVIEW, Value::Bool(true));
     map.insert(LAYOUT_SPACING, Value::String("medium".into()));
+    map.insert(LAYOUT_PREVIEW_LINES, Value::Int(1));
     map.insert(PANE_FOLDER_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_MESSAGE_LIST_WIDTH_PCT, Value::Double(-1.0));
+    map.insert(PANE_MESSAGE_LIST_HEIGHT_PCT, Value::Double(-1.0));
     map.insert(PANE_CALENDAR_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_CONTACTS_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_CONFIG_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
@@ -239,6 +257,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_SPELL_CHECK, Value::Bool(true));
     map.insert(MAIL_SPELL_CHECK_LANGUAGES, Value::Strv(Vec::new()));
     map.insert(MAIL_MESSAGE_THEME_DARK, Value::Bool(false));
+    map.insert(MAIL_SHOW_SENDER_IMAGES, Value::Bool(true));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(CALENDAR_WEEK_START, Value::Int(0));
     map.insert(CALENDAR_WORK_DAYS, Value::Strv(vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()]));
@@ -532,6 +551,33 @@ pub fn spacing_at(index: u32) -> &'static str {
     SPACINGS.get(index as usize).copied().unwrap_or("medium")
 }
 
+/// Where the reading pane sits, resolved from the
+/// `layout-reading-pane-position` setting. There are only two positions:
+/// visibility is the separate boolean, so "off" never reaches here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadingPanePosition {
+    Right,
+    Bottom,
+}
+
+/// Resolves a stored position value; anything unknown falls back to "right".
+pub fn reading_pane_position(name: &str) -> ReadingPanePosition {
+    match name {
+        "bottom" => ReadingPanePosition::Bottom,
+        _ => ReadingPanePosition::Right,
+    }
+}
+
+/// Upper bound on the configurable message-preview line count.
+pub const MAX_PREVIEW_LINES: i32 = 3;
+
+/// Clamps a stored `layout-message-preview-lines` value to the supported
+/// 0-3 range, so a hand-edited dconf value can never ask for more lines than
+/// the config offers.
+pub fn preview_lines(value: i32) -> i32 {
+    value.clamp(0, MAX_PREVIEW_LINES)
+}
+
 /// Config → Calendar → "Week starts on" labels, indexed 0=Sunday .. 6=Saturday
 /// (the stored `calendar-week-start` scheme).
 pub const WEEK_START_LABELS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -722,6 +768,23 @@ mod tests {
         assert_eq!(spacing_class("medium"), "spacing-medium");
         assert_eq!(spacing_class("loose"), "spacing-loose");
         assert_eq!(spacing_class("no-such-spacing"), "spacing-medium");
+    }
+
+    #[test]
+    fn reading_pane_position_helpers_resolve_known_and_unknown_values() {
+        assert_eq!(reading_pane_position("right"), ReadingPanePosition::Right);
+        assert_eq!(reading_pane_position("bottom"), ReadingPanePosition::Bottom);
+        assert_eq!(reading_pane_position("no-such-position"), ReadingPanePosition::Right, "unknown values land on the default");
+        assert_eq!(reading_pane_position(""), ReadingPanePosition::Right);
+    }
+
+    #[test]
+    fn preview_lines_clamps_to_the_supported_zero_to_three_range() {
+        assert_eq!(preview_lines(-5), 0);
+        assert_eq!(preview_lines(0), 0);
+        assert_eq!(preview_lines(1), 1);
+        assert_eq!(preview_lines(3), 3);
+        assert_eq!(preview_lines(9), MAX_PREVIEW_LINES);
     }
 
     #[test]

@@ -365,6 +365,7 @@ pub fn show_contact_editor(
             name: None,
             organization: None,
             title: None,
+            photo: None,
             emails: Vec::new(),
             telephones: Vec::new(),
             addresses: Vec::new(),

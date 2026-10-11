@@ -42,7 +42,7 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 10 | 17 | 17 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps, undo. No winmail.dat or `.msg`. |
+| Mail (5.1) | 12 | 15 | 17 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps, undo. No winmail.dat or `.msg`. |
 | Compose (5.2) | 4 | 5 | 13 | 1 | Good rich editor and identities. No spell check, schedule send, importance, emoji, draft reopen, or forwarding with attachments. |
 | Calendar (5.3) | 7 | 14 | 14 | 0 | Views and drag-to-edit are good. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No week-start, working-hours or time-zone settings. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
@@ -50,7 +50,7 @@ Counts are tallied from the §5 tables.
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **35** | **51** | **66** | **5** | ~22% at parity, ~33% partial |
+| **Total** | **37** | **49** | **66** | **5** | ~24% at parity, ~33% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -237,8 +237,8 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-02 | Unified inbox | `TreeItem::Unified` / `MailView::UnifiedInbox` | ✅ | — |
 | M-03 | Focused / Other inbox | — | ❌ | Graph `inferenceClassification` on Microsoft 365; local heuristic elsewhere |
 | M-04 | Conversation view | `app/src/message_list.rs` `group_threads` (list grouping only) | 🟡 | No newest-on-top/bottom setting; no stacked conversation in the reading pane; no "show messages from other folders" |
-| M-05 | Reading pane right / bottom / off | `layout-reading-pane` boolean | 🟡 | No bottom position |
-| M-06 | Density and message preview lines | `layout-vertical-spacing` tight/medium/loose | 🟡 | No 0/1/2/3-line preview setting; no "show sender image" toggle |
+| M-05 | Reading pane right / bottom / off | `layout-reading-pane` boolean plus `layout-reading-pane-position`; View ribbon dropdown and Settings row | ✅ | — |
+| M-06 | Density and message preview lines | `layout-vertical-spacing` tight/medium/loose; `layout-message-preview-lines` 0–3; `mail-show-sender-images` (vCard photo, else initials) | ✅ | Density still uses Lookout's names (UX-83) |
 | M-07 | Sort / arrange by | `message_list.rs` `SortKey { Date, Sender, Subject }`; filter All/Unread/Flagged | 🟡 | Missing size, importance, flag/due, category, to, attachments; group headers only for Date |
 | M-08 | Filter menu | All/Unread/Flagged | 🟡 | Add: has attachments, @mentions me, to me, categorised, high importance |
 | M-09 | Categories (named, coloured, multiple) | `app/src/tags.rs` (`$Lookout-tag-*` keywords), Categorize menu, drop-on-tag | 🟡 | No master-list editor with Outlook's 25 colour presets; no Microsoft 365 sync |
@@ -604,8 +604,8 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.1 | ✅ ~~Spell check~~ | C-02 | Enable WebKit spellcheck on the compose view; language from locale plus a setting; F7 shortcut | S |
 | 1.2 | ✅ ~~Importance in list and compose~~ | M-12, C-05 | Uses 0.1/0.2; `!`/`↓` list glyph; compose toolbar toggle; write the three headers in `send.rs` | S |
 | 1.3 | ✅ ~~Fix Calendar print button~~ | CAL-23 | Make it sensitive (`window.rs:4400`) | S |
-| 1.4 | Reading pane bottom | M-05 | `layout-reading-pane` → enum `right\|bottom\|off`; swap `gtk::Paned` orientation | M |
-| 1.5 | Preview lines and sender images | M-06 | Setting 0–3 lines; avatar (initials, or vCard photo) column | S |
+| 1.4 | ✅ ~~Reading pane bottom~~ | M-05 | `layout-reading-pane` → enum `right\|bottom\|off`; swap `gtk::Paned` orientation | M |
+| 1.5 | ✅ ~~Preview lines and sender images~~ | M-06 | Setting 0–3 lines; avatar (initials, or vCard photo) column | S |
 | 1.6 | More sort keys and filters | M-07, M-08 | Extend `SortKey` (Size, Importance, Flag, Category, To, Attachments) and the filter enum; group headers per key | M |
 | 1.7 | Conversation options | M-04 | Newest-on-top/bottom setting; stacked conversation rendering in the reading pane (one WebKit view with collapsible messages) | L |
 | 1.8 | Mark-as-read options | M-22 | Setting: on open, after N seconds, on selection change, never | S |

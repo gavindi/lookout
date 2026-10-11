@@ -16,6 +16,9 @@ pub struct VCard {
     pub name: Option<Name>,
     pub organization: Option<Vec<String>>,
     pub title: Option<String>,
+    /// The contact's photo (`PHOTO`): inline image bytes when embedded, or a
+    /// URI to fetch otherwise. Used for sender avatars in the message list.
+    pub photo: Option<Photo>,
     pub emails: Vec<EmailField>,
     pub telephones: Vec<TelephoneField>,
     pub addresses: Vec<AddressField>,
@@ -47,6 +50,18 @@ pub struct Name {
     pub additional: String,
     pub prefix: String,
     pub suffix: String,
+}
+
+/// A contact's `PHOTO` value. Both forms RFC 6350 allows are covered: inline
+/// base64 image bytes (`data`), or a URI to fetch the image from (`uri`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Photo {
+    /// The `MEDIATYPE`/`TYPE` param (e.g. "image/jpeg"), when present.
+    pub media_type: Option<String>,
+    /// Decoded image bytes, when the photo is embedded as base64.
+    pub data: Option<Vec<u8>>,
+    /// A URI for the photo, when it is referenced rather than embedded.
+    pub uri: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +143,7 @@ impl VCard {
             name: None,
             organization: None,
             title: None,
+            photo: None,
             emails: Vec::new(),
             telephones: Vec::new(),
             addresses: Vec::new(),
@@ -167,6 +183,7 @@ impl VCard {
                 "N" => card.name = Some(parse_name(&value)),
                 "ORG" => card.organization = Some(value.split(';').map(|part| part.to_string()).collect()),
                 "TITLE" => card.title = Some(value),
+                "PHOTO" => card.photo = Some(parse_photo(&params, &value)),
                 "EMAIL" => card.emails.push(parse_email_field(&params, &value)),
                 "TEL" => card.telephones.push(parse_telephone_field(&params, &value)),
                 "ADR" => card.addresses.push(parse_address_field(&params, &value)?),
@@ -249,6 +266,9 @@ impl VCard {
         }
         if let Some(title) = &self.title {
             lines.push(format!("TITLE:{}", escape_value(title)));
+        }
+        if let Some(photo) = &self.photo {
+            lines.push(photo_property(photo));
         }
         for email in &self.emails {
             let params = param_string(&email.types, "TYPE");
@@ -491,6 +511,64 @@ fn param_values(params: &[Parameter], key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Parses a `PHOTO` value into a [`Photo`]. RFC 6350 allows either an embedded
+/// base64 image (`ENCODING=b`, the form Apple and Google emit) or a URI
+/// (`VALUE=uri`, or a bare `http(s):`/`data:` value). A value whose encoding
+/// says base64 but that fails to decode is kept as a URI verbatim, so a
+/// malformed photo degrades to "unusable" rather than dropping the property.
+fn parse_photo(params: &[Parameter], value: &str) -> Photo {
+    let media_type = param_values(params, "MEDIATYPE")
+        .into_iter()
+        .chain(param_values(params, "TYPE"))
+        .next()
+        .filter(|s| !s.is_empty());
+    let value_param = param_values(params, "VALUE").into_iter().next().map(|v| v.to_ascii_lowercase());
+    let encoding = param_values(params, "ENCODING").into_iter().next().map(|v| v.to_ascii_lowercase());
+    let looks_like_uri = value_param.as_deref() == Some("uri") || value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:");
+    let base64_encoded = matches!(encoding.as_deref(), Some("b") | Some("base64"));
+    if looks_like_uri && !base64_encoded {
+        return Photo {
+            media_type,
+            data: None,
+            uri: Some(value.to_string()),
+        };
+    }
+    // Embedded: strip a `data:image/...;base64,` prefix if one survived
+    // unescaping, then decode. Base64 never contains a comma, so the split is
+    // unambiguous.
+    let raw = value.rsplit_once(',').map(|(_, tail)| tail).unwrap_or(value).trim();
+    match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, raw) {
+        Ok(bytes) => Photo {
+            media_type,
+            data: Some(bytes),
+            uri: None,
+        },
+        Err(_) => Photo {
+            media_type,
+            data: None,
+            uri: Some(value.to_string()),
+        },
+    }
+}
+
+/// Renders a [`Photo`] back to a `PHOTO` line: embedded bytes as
+/// `PHOTO;ENCODING=b;MEDIATYPE=...:<base64>`, or a URI as `PHOTO;VALUE=uri:...`.
+fn photo_property(photo: &Photo) -> String {
+    let mut params = Vec::new();
+    if let Some(media_type) = &photo.media_type {
+        params.push(format!("MEDIATYPE={}", media_type));
+    }
+    if let Some(data) = &photo.data {
+        params.push("ENCODING=b".to_string());
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
+        let joined = if params.is_empty() { String::new() } else { format!(";{}", params.join(";")) };
+        return format!("PHOTO{}:{}", joined, encoded);
+    }
+    params.push("VALUE=uri".to_string());
+    let uri = photo.uri.clone().unwrap_or_default();
+    format!("PHOTO;{}:{}", params.join(";"), uri)
+}
+
 fn escape_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\n', "\\n").replace(';', "\\;").replace(',', "\\,")
 }
@@ -588,6 +666,7 @@ mod tests {
             }),
             organization: Some(vec!["Example Corp".to_string()]),
             title: Some("Engineer".to_string()),
+            photo: None,
             emails: vec![EmailField {
                 types: vec!["work".to_string()],
                 address: "ada@example.com".to_string(),
@@ -635,6 +714,45 @@ mod tests {
         let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:John \r\n Doe\r\nN:Doe;John;;;\r\nEND:VCARD\r\n";
         let card = VCard::parse(text).unwrap();
         assert_eq!(card.full_name.as_deref(), Some("John Doe"));
+    }
+
+    #[test]
+    fn parses_an_embedded_base64_photo() {
+        // "Hi" -> SGk= (bytes 0x48 0x69)
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nPHOTO;ENCODING=b;TYPE=JPEG:SGk=\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        let photo = card.photo.expect("photo parsed");
+        assert_eq!(photo.data.as_deref(), Some(&b"Hi"[..]));
+        assert_eq!(photo.media_type.as_deref(), Some("JPEG"));
+        assert!(photo.uri.is_none());
+    }
+
+    #[test]
+    fn parses_a_photo_uri() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nPHOTO;VALUE=uri:https://example.com/a.jpg\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        let photo = card.photo.expect("photo parsed");
+        assert_eq!(photo.uri.as_deref(), Some("https://example.com/a.jpg"));
+        assert!(photo.data.is_none());
+    }
+
+    #[test]
+    fn round_trips_an_embedded_photo() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nPHOTO;ENCODING=b;MEDIATYPE=image/png:SGk=\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        let serialized = card.serialize();
+        assert!(serialized.contains("PHOTO;MEDIATYPE=image/png;ENCODING=b:SGk="), "{serialized}");
+        let reparsed = VCard::parse(&serialized).unwrap();
+        assert_eq!(reparsed.photo.unwrap().data.as_deref(), Some(&b"Hi"[..]));
+    }
+
+    #[test]
+    fn a_malformed_base64_photo_is_kept_as_a_uri_rather_than_dropped() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nPHOTO;ENCODING=b:not-base64!!\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        let photo = card.photo.expect("photo kept");
+        assert!(photo.data.is_none());
+        assert_eq!(photo.uri.as_deref(), Some("not-base64!!"));
     }
 
     #[test]
@@ -743,6 +861,7 @@ mod tests {
             }),
             organization: None,
             title: None,
+            photo: None,
             emails: vec![EmailField {
                 types: vec!["work".to_string()],
                 address: "ada@example.com".to_string(),

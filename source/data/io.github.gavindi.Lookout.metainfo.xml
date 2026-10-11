@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.161" date="2026-10-11">
+      <description>
+        <p>The reading pane can now sit at the bottom of the window instead of only at the right - pick Right, Bottom or Off from the View ribbon's "Reading pane" menu or Settings → Appearance. The message list gains per-row body previews of Off, 1, 2 or 3 lines, and sender avatars now show the contact's photo when their address book card has one (coloured initials otherwise), with a "Show sender images" switch.</p>
+      </description>
+    </release>
     <release version="0.9.160" date="2026-10-11">
       <description>
         <p>Composing mail picks up three Outlook conveniences. Spell check now underlines misspelled words as you type, with a language picker under Settings → Mail and F7 to toggle it. High or low importance can be set from the compose toolbar and shows as a marker in the message list, and the headers are written so other clients see it. The Calendar's Print button works again.</p>

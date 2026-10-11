@@ -633,6 +633,7 @@ mod tests {
             name: None,
             organization: None,
             title: None,
+            photo: None,
             emails: vec![EmailField {
                 types: vec!["work".to_string()],
                 address: "ada@example.org".to_string(),

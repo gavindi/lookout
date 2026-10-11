@@ -600,6 +600,7 @@ pub fn show_create_contact_for(
         name: None,
         organization: None,
         title: None,
+        photo: None,
         emails: vec![EmailField {
             types: vec!["work".to_string()],
             address: sender.address.clone(),
