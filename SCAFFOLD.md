@@ -201,7 +201,8 @@ IMAP directly, only sends commands and reacts to events.
 `CancelOutbox`, `RescheduleOutbox`, `WakeSnoozed`, `Reconnect`,
 `SetPrefetchPolicy`, `MoveMessage`/`MoveMessages`/`MoveMessagesTo`, `EmptyMailbox`,
 `SnoozeMessage`/`SnoozeMessages`, `StoreFlags`/`StoreFlagsMany`, `StoreKeywords`/
-`StoreKeywordsMany`, `PrefetchBodies`, `SaveDraft`/`DeleteDraft`, `SearchMailbox`, `Shutdown`.
+`StoreKeywordsMany`, `SetFollowUp`, `ApplyRemoteFollowUps`, `PrefetchBodies`, `SaveDraft`/`DeleteDraft`,
+`SearchMailbox`, `Shutdown`.
 
 Two command channels feed one actor: a background one and an `interactive_commands` one — the
 latter carries user-facing fetches (`FetchBody`/`FetchAttachment`/`FetchRawMessage`) and is
@@ -213,7 +214,8 @@ flight.
 `BodyFetched`, `PartFetched`/`PartFetchFailed`, `RawMessageFetched`/`RawMessageFetchFailed`,
 `OutboxQueued`/`OutboxSent`/`OutboxFailed`, `OutboxCancelled`/`OutboxCancelFailed`,
 `OutboxContents` (§4.6), `MoveFailed`, `StoreFlagsFailed`, `DraftSaved`,
-`MessageMoved`, `MessageSnoozed`, `MailboxExpunged`, `SearchResults`, `Error`.
+`MessageMoved`, `MessageSnoozed`, `FollowUpFailed`, `FollowUpSet`, `FlaggedMessages`, `MailboxExpunged`,
+`SearchResults`, `Error`.
 
 ### 4.2 The actor loop
 
@@ -421,6 +423,21 @@ scanning Scheduled (`scan_scheduled`: `UID SEARCH ALL` plus a `FLAGS` fetch) and
 messages to INBOX with the keyword and `\Seen` removed. Scheduled is rescanned every 15 minutes
 (`SCHEDULED_RESCAN`) for snoozes made by other installs, and the IDLE slice is capped against the
 earliest wake. `WakeSnoozed` is the reading pane's "Unsnooze".
+
+**Follow-up flags (item 1.16).** `SetFollowUp { mailbox, uids, flag }` replaces the messages' flag
+state with `flag` (`FlagStatus::NotFlagged` clears it). Where the folder's `PERMANENTFLAGS` include
+`\*` (learnt per folder on first use, `keywords_ok`) it is stored as keywords -
+`$Lookout-flagged` plus `$Lookout-flag-due-<unix>`, or `$Lookout-flag-done` (`lookout_core::
+follow_up_keywords`) - after stripping whatever flag keywords the server shows. Otherwise (Exchange
+IMAP) it goes to the cache's `follow_up_flags` table, keyed by bare Message-ID so it follows a move,
+and every read path (`load_messages`, `load_summaries`, `search`, `recent_messages`, and
+`emit_messages` via `overlay_follow_ups`) rewrites the summaries' keywords from it, so the UI reads
+one representation. A `NotFlagged` row is a tombstone that masks a stale keyword. After a stored
+change the session emits `FollowUpSet` (the Message-IDs, for the app's Graph mirror) and re-emits the
+folder; `FollowUpFailed` reports a change stored nowhere. `FlaggedMessages` (`Cache::
+flagged_messages`, every cached flagged message, partial rows included) is emitted at start-up,
+after each sync and after each flag change, for the Tasks view. `ApplyRemoteFollowUps` replaces the
+table with a Graph snapshot (Microsoft 365), keeping rows written after the snapshot was taken.
 
 ### 4.7 Auth and connection (`auth.rs`, `connection.rs`)
 
@@ -797,6 +814,19 @@ approach Thunderbird uses), persisting a refresh token under `$XDG_DATA_HOME/loo
 **`graph_pin.rs`** — mirrors Lookout's IMAP-`\Flagged`-driven pin state to Outlook's own MAPI
 `PR_RENEW_TIME` property via Microsoft Graph (write-only; reading real-Outlook-made pins back is
 explicitly out of scope), since IMAP has no way to reach that property and EWS is being retired.
+
+**`graph_mail.rs`** — syncs follow-up flags (item 1.16) with Outlook's own message `flag` on
+Microsoft 365 through the `lookout-graph` `GraphClient`, once the account has granted Graph access
+(Config's "Sync pins and flags with Outlook"). Writes follow the session's `FollowUpSet` event (so an
+undo is mirrored too); reads are a snapshot of every flagged and recently completed message, taken on
+connect, every 15 minutes and on F5, and handed to the session as `ApplyRemoteFollowUps`. Due dates
+are written as local midnight in the calendar's display zone.
+
+**`follow_up.rs`** — the Flag menu's presets (Today, Tomorrow, This week, Next week, No date,
+following the calendar's week start and work days), `FlagBucket` (the list's flag groups and the
+Tasks view's order) and the due/banner/undo wording. The window wires it into the Flag ▾ split
+button, the row's flag icon and due label, the "Follow up. Due by …" bar and Insert; the Tasks view's
+"Flagged email" section (`tasks_view::set_flagged_mail`) lists open flags from `FlaggedMessages`.
 
 **Smaller modules** (one line each): `contact_picker.rs` — the compose "To" button's modal
 address-book picker (§8.5 above, `compose.rs`), modeled on `identities.rs::show_manage_dialog`'s

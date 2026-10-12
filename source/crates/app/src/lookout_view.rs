@@ -48,6 +48,9 @@ pub struct LookoutData {
     pub checked_calendar_ids: HashSet<CalendarId>,
     /// Per-calendar colours, for the event rows' dots.
     pub colors: CalendarColorMap,
+    /// Every account's flagged mail (item 1.16); the open flags are listed
+    /// under the outstanding tasks.
+    pub flagged_mail: Vec<lookout_core::EmailSummary>,
 }
 
 /// The outstanding subset of `tasks`, in section order (Overdue, Today,
@@ -295,12 +298,19 @@ pub fn set_data(view: &LookoutView, data: &LookoutData) {
     // --- Outstanding tasks.
     clear_box(&view.tasks_list);
     let outstanding = outstanding_tasks(&data.tasks, now_local.naive_local(), OUTSTANDING_TASKS_LIMIT);
-    if outstanding.is_empty() {
+    let today = crate::calendar_tz::display_zone().today();
+    let mut flagged = tasks_view::flagged_mail_rows(&data.flagged_mail, today, crate::message_list::current_week_start());
+    flagged.truncate(OUTSTANDING_TASKS_LIMIT.saturating_sub(outstanding.len()));
+    if outstanding.is_empty() && flagged.is_empty() {
         append_empty(&view.tasks_list, "No outstanding tasks.");
     } else {
         for task in outstanding {
             view.tasks_list
                 .append(&tasks_view::task_row(&task, &data.colors, toggle.clone(), activate.clone(), &[], true));
+        }
+        let open = tasks_view::open_message_through_app();
+        for message in &flagged {
+            view.tasks_list.append(&tasks_view::flagged_mail_row(message, today, None, open.clone(), &[]));
         }
     }
 

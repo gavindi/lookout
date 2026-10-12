@@ -154,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::OutboxCancelFailed { id } => println!("outbox cancel too late: {id}"),
                     AccountEvent::DraftSaved { message_id } => println!("draft saved: {message_id}"),
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
+                    AccountEvent::FollowUpFailed { .. } | AccountEvent::FollowUpSet { .. } => {}
+                    AccountEvent::FlaggedMessages { messages } => println!("flagged: {} message(s)", messages.len()),
                     AccountEvent::MailboxCreated { .. } | AccountEvent::MailboxRenamed { .. } | AccountEvent::MailboxDeleted { .. } => {}
                     AccountEvent::PreviewsFetched { .. } => {}
                     AccountEvent::MailboxSyncStarted { .. } => {}

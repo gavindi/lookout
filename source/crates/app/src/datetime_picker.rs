@@ -1,7 +1,7 @@
 //! Date-and-time picking shared across the app: the event editor's date
 //! button plus `hh:mm` spin pair, and the "pick a time" preset menus with a
 //! custom-time dialog behind them - schedule send (item 1.14) and snooze
-//! (item 1.15).
+//! (item 1.15) - plus the Flag menu's date-only dialog (item 1.16).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -212,6 +212,30 @@ pub(crate) fn present_time_dialog(parent: Option<&gtk::Widget>, spec: &TimeDialo
             if let Some(at) = chosen() {
                 on_pick(at);
             }
+        }
+    });
+    dialog.present(parent);
+}
+
+/// A date-only dialog (the Flag menu's "Custom date…", item 1.16): a
+/// calendar starting on `initial`. Any date is accepted - a follow-up flag
+/// may be due today, or even be back-dated.
+pub(crate) fn present_date_dialog(parent: Option<&gtk::Widget>, heading: &str, field_label: &str, accept: &str, initial: NaiveDate, on_pick: Rc<dyn Fn(NaiveDate)>) {
+    let date = Rc::new(Cell::new(initial));
+    let calendar = gtk::Calendar::new();
+    set_calendar_date(&calendar, &date, initial);
+    wire_calendar(&calendar, &date);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    content.append(&gtk::Label::builder().label(field_label).css_classes(["dim-label", "caption"]).xalign(0.0).build());
+    content.append(&calendar);
+    let dialog = adw::AlertDialog::builder().heading(heading).default_response("accept").close_response("cancel").build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("accept", accept);
+    dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
+    dialog.set_extra_child(Some(&content));
+    dialog.connect_response(None, move |_, response| {
+        if response == "accept" {
+            on_pick(date.get());
         }
     });
     dialog.present(parent);

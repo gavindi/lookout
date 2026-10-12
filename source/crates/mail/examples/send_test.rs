@@ -160,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::BodyFetched { .. } => {}
                     AccountEvent::DraftSaved { .. } => {}
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
+                    AccountEvent::FollowUpFailed { .. } | AccountEvent::FollowUpSet { .. } => {}
+                    AccountEvent::FlaggedMessages { .. } => {}
                     AccountEvent::MailboxCreated { .. } | AccountEvent::MailboxRenamed { .. } | AccountEvent::MailboxDeleted { .. } => {}
                     AccountEvent::SearchResults { .. } => {}
                     AccountEvent::PartFetched { .. } => {}

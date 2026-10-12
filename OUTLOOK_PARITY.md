@@ -42,7 +42,7 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 16 | 14 | 14 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps. No winmail.dat or `.msg`. |
+| Mail (5.1) | 17 | 13 | 14 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No winmail.dat or `.msg`. |
 | Compose (5.2) | 7 | 5 | 10 | 1 | Good rich editor and identities, with undo send and schedule send. No emoji, or forwarding with attachments. |
 | Calendar (5.3) | 10 | 14 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours and a second time zone apply live. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No per-event time zone yet. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
@@ -50,7 +50,7 @@ Counts are tallied from the §5 tables.
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **47** | **48** | **57** | **5** | ~30% at parity, ~31% partial |
+| **Total** | **48** | **47** | **57** | **5** | ~31% at parity, ~30% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -117,7 +117,7 @@ Wire-level facts that implementations must match. Anything marked **verify** sho
 | Sensitivity | `Sensitivity: Personal\|Private\|Company-Confidential` (RFC 2156) | Same | Compose option and reading-pane banner. |
 | Read receipt | `Disposition-Notification-To:` | Same | ✅ already (`send.rs`, RFC 8098). |
 | Delivery receipt | SMTP DSN `NOTIFY=SUCCESS,FAILURE` (RFC 3461) | DSN reports (`multipart/report; report-type=delivery-status`) | Needs DSN support in the SMTP layer (**verify** `lettre`); render DSNs as a status card. |
-| Follow-up flag (internet) | `X-Message-Flag: Follow up` (classic, to internet recipients); `Reply-By:` (RFC 2156) | Same | Display "Follow up / Reply by" banner. |
+| Follow-up flag (internet) | `X-Message-Flag: Follow up` (classic, to internet recipients); `Reply-By:` (RFC 2156) | Same | Display "Follow up / Reply by" banner. Parsing exists (`follow_up_from_headers`); showing it needs the two headers in the envelope fetch and a cache version bump (UX-33). |
 | TNEF | `application/ms-tnef` part named `winmail.dat` | — | Decode (§4.6). |
 | Auth results | n/a (server adds `Authentication-Results:`, RFC 8601) | Drives the "unverified sender" banner | Fill the existing but unused `EmailBody.auth_results` (`source/crates/core/src/email.rs:334`). |
 
@@ -127,7 +127,8 @@ Exchange does **not** expose Outlook categories or rich flags over IMAP. On Micr
 
 | Concept | Convention | Lookout today | Plan |
 |---|---|---|---|
-| Flagged | `\Flagged` | Used for **Pin** (`graph_pin.rs` mirrors it to Outlook's pin MAPI property on Microsoft 365) | Keep. Flags with due dates are separate (M-10). |
+| Flagged | `\Flagged` | Used for **Pin** (`graph_pin.rs` mirrors it to Outlook's pin MAPI property on Microsoft 365) | Keep. Follow-up flags are separate (next row). |
+| Follow-up flag | No standard (Thunderbird has none; Outlook's `followupFlag` is MAPI/Graph only) | `$Lookout-flagged`, plus `$Lookout-flag-due-<unix>` (UTC midnight of the due date) when dated; a completed flag is `$Lookout-flag-done` alone (`core/src/interop/flags.rs`). Where the folder's `PERMANENTFLAGS` lack `\*` (Exchange IMAP) the flag lives in the cache's `follow_up_flags` table, keyed by Message-ID; on Microsoft 365 that table is synced both ways with Graph `flag` (`app/src/graph_mail.rs`) ✅ | The fixed `$Lookout-flagged` atom allows a later `UID SEARCH KEYWORD` for flagged mail outside the cached window. |
 | Categories | No standard. Thunderbird uses `$label1…$label5`; Lookout uses `$Lookout-tag-<key>` (`tags.rs`) | 🟡 Lookout-only | Keep the keyword store. On Microsoft 365 also sync to Graph `categories` (§4.4). Optionally read Thunderbird `$label*`. |
 | Junk | `$Junk` / `$NotJunk` (RFC 5788 registry) | Not set | Set on Report Junk / Not Junk so server filters learn. |
 | Forwarded / answered | `$Forwarded`, `\Answered` | **verify** whether set on send | Set both; show the reply/forward indicator icons in the list. |
@@ -154,7 +155,7 @@ Exchange does **not** expose Outlook categories or rich flags over IMAP. On Micr
 |---|---|---|
 | Category master list | `GET/POST /me/outlook/masterCategories`; colour `preset0`…`preset24` | `MailboxSettings.ReadWrite` |
 | Message categories | `PATCH /me/messages/{id}` `{categories:[…]}` | `Mail.ReadWrite` (already granted) |
-| Follow-up flag | `followupFlag { flagStatus: notFlagged\|flagged\|complete, startDateTime, dueDateTime, completedDateTime }` | `Mail.ReadWrite` |
+| Follow-up flag | The message's `flag` property, a `followupFlag { flagStatus: notFlagged\|flagged\|complete, startDateTime, dueDateTime, completedDateTime }`; Outlook wants a start date with a due date. Lookout lists flagged mail with `$filter=flag/flagStatus eq 'flagged'` (and `'complete'`) (`graph_mail.rs`, 1.16; **verify** the filter on a live tenant) | `Mail.ReadWrite` |
 | Importance | `importance: low\|normal\|high` | `Mail.ReadWrite` |
 | Focused Inbox | `inferenceClassification: focused\|other`; overrides at `/me/inferenceClassification/overrides` | `Mail.ReadWrite` |
 | Automatic replies | `/me/mailboxSettings` → `automaticRepliesSetting { status, scheduledStartDateTime, scheduledEndDateTime, internalReplyMessage, externalReplyMessage, externalAudience }` | `MailboxSettings.ReadWrite` |
@@ -210,7 +211,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | Search | Ctrl+E, F3 | Ctrl+F | Conflict (Lookout Ctrl+E = Archive) |
 | Archive | Backspace | Ctrl+E | |
 | Mark read / unread | Ctrl+Q / Ctrl+U | Ctrl+Q (toggle) / — | Add separate unread |
-| Toggle flag / custom flag | Insert / Ctrl+Shift+G | Ctrl+Shift+G = Pin | Remap when flags exist (M-10) |
+| Toggle flag / custom flag | Insert / Ctrl+Shift+G | Insert = Flag / clear flag (1.16); Ctrl+Shift+G = Pin | The Outlook preset (1.18) moves Pin off Ctrl+Shift+G and opens the Flag menu there |
 | Move to folder / go to folder | Ctrl+Shift+V / Ctrl+Y | — | ❌ |
 | Delete | Delete, Ctrl+D | Delete | Add Ctrl+D |
 | Next / previous item | Ctrl+. / Ctrl+, | — | ❌ |
@@ -239,10 +240,10 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-04 | Conversation view | `app/src/message_list.rs` `group_threads` (list grouping only) | 🟡 | No newest-on-top/bottom setting; no stacked conversation in the reading pane; no "show messages from other folders" |
 | M-05 | Reading pane right / bottom / off | `layout-reading-pane` boolean plus `layout-reading-pane-position`; View ribbon dropdown and Settings row | ✅ | — |
 | M-06 | Density and message preview lines | `layout-vertical-spacing` tight/medium/loose; `layout-message-preview-lines` 0–3; `mail-show-sender-images` (vCard photo, else initials) | ✅ | Density still uses Lookout's names (UX-83) |
-| M-07 | Sort / arrange by | `message_list.rs` `SortKey { Date, Sender, Subject, Size, Importance, Flag, Category, To, Attachments }`; group headers derived from every sort key (`GroupKey`) | 🟡 | Flag sort groups by pin state only until follow-up flags land (M-10/1.16); no per-column sortable headers yet (U.4) |
-| M-08 | Filter menu | `FilterSet`: Unread, Flagged, Has files, High importance, Categorized, To me (combinable check items) | 🟡 | @mentions me pending (M-25/2.13) |
+| M-07 | Sort / arrange by | `message_list.rs` `SortKey { Date, Sender, Subject, Size, Importance, Flag, Category, To, Attachments }`; group headers derived from every sort key (`GroupKey`) | 🟡 | No per-column sortable headers yet (U.4) |
+| M-08 | Filter menu | `FilterSet`: Unread, Flagged (open follow-up flags), Pinned, Has files, High importance, Categorized, To me (combinable check items) | 🟡 | @mentions me pending (M-25/2.13) |
 | M-09 | Categories (named, coloured, multiple) | `app/src/tags.rs` (`$Lookout-tag-*` keywords), Categorize menu, drop-on-tag | 🟡 | No master-list editor with Outlook's 25 colour presets; no Microsoft 365 sync |
-| M-10 | Flag for follow-up with dates | Pin = `\Flagged`; "Follow up" creates a linked task with `due: None` (`window.rs` `build_task_seed_for_email`) | 🟡 | No Today/Tomorrow/This week/Next week/No date/Custom/Mark complete; no flag state on the message itself; no due-date list column |
+| M-10 | Flag for follow-up with dates | Message-level flag state (keywords, local fallback, Graph `flag` on Microsoft 365, §4.2); Flag ▾ (Today, Tomorrow, This week, Next week, No date, Custom date…, Mark complete, Clear flag) following the calendar's week start and work days; Insert toggles; row flag icon and due label (red once overdue); Flag sort and groups by due (Overdue … Later, No date, Completed); "Follow up. Due by …" bar; Undo; Pin stays separate | ✅ | Incoming `X-Message-Flag`/`Reply-By` not shown yet (UX-33) |
 | M-11 | Snooze | Snooze ▾ presets (Later today, Tomorrow, This weekend, Next week, Choose a date…); synced via the server "Scheduled" folder plus a wake-time keyword, local fallback where keywords aren't stored (§4.2); wakes on time back to the Inbox, unread; "Snoozed until …" bar with Unsnooze; Undo | ✅ | Outlook's own snooze isn't visible over IMAP (⛔) |
 | M-12 | Importance display | `!`/`↓` list glyph from parsed headers | ✅ | — |
 | M-13 | Pin | Pinned section, Graph mirror (`graph_pin.rs`) | ✅ | — |
@@ -253,7 +254,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-18 | Search syntax and refiners | Local FTS5 (`mail/src/cache.rs` `sanitize_fts_query`) plus server `UID SEARCH TEXT` | 🟡 | No `from:`/`to:`/`subject:`/`has:attachment`/`received:`/`is:`/`category:`; no refiners, scope picker or search history |
 | M-19 | Search Folders (saved searches) | — | ❌ | |
 | M-20 | Ignore conversation / Clean up conversation | — | ❌ | |
-| M-21 | Undo (move, delete, flag, archive) | "… / Undo" toast and Ctrl+Z for delete, archive, junk, drag-move, pin, read/unread, categorize and snooze; moves are reverted by `RevertMove` via the COPYUID map (or Message-ID) | ✅ | Follow-up flags (1.16) add their own inverse |
+| M-21 | Undo (move, delete, flag, archive) | "… / Undo" toast and Ctrl+Z for delete, archive, junk, drag-move, pin, read/unread, categorize and snooze; moves are reverted by `RevertMove` via the COPYUID map (or Message-ID) | ✅ | Follow-up flags are undone too (1.16) |
 | M-22 | Mark-as-read options | Setting: when selection changes (default), when opened, after N seconds, never | ✅ | — |
 | M-23 | Read receipts | Request toggle, banner, RFC 8098 MDN (`mail/src/send.rs`) | ✅ | Add "always / never / ask" policy |
 | M-24 | Automatic replies (OOF) | — | ❌ | Graph or Sieve vacation |
@@ -371,7 +372,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 |---|---|---|---|---|
 | T-01 | Task lists sidebar | Lists merged (`merged_tasks`); chosen only in editor | 🟡 | List navigation pane, create/rename lists |
 | T-02 | My Day | — | ❌ | Per-day pin set (local; Graph To Do has no My Day API; **verify**) |
-| T-03 | Flagged email as tasks | `task_for_email` linked via notes marker | ✅ | Unify with M-10 flags; Graph `linkedResources` |
+| T-03 | Flagged email as tasks | Tasks view "Flagged email" section listing open M-10 flags across accounts (check = mark complete, click = open), also on the dashboard and Mail overview; "Create task from message…" in More | ✅ | Lists cached messages only; Graph To Do `linkedResources` (5.3) |
 | T-04 | Due, importance, % complete, notes | `app/src/task_editor.rs` | ✅ | — |
 | T-05 | Reminders | — | ❌ | `VALARM` in VTODO; Graph `reminderDateTime` |
 | T-06 | Recurrence | — | ❌ | `RRULE` in VTODO; Graph `recurrence` |
@@ -449,7 +450,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 | ID | Outlook term | Lookout today | Action |
 |---|---|---|---|
 | UX-01 | **Categorize** / Categories | UI says "Categorize"; docs and code say "color tags" | Keep the UI label; rename "tags" to "categories" in user-facing docs, settings and tooltips |
-| UX-02 | **Flag** (follow-up) vs **Pin** | Both icons in the ribbon; flag today means "create a linked task" | Flag = follow-up flag (M-10); Pin = pin. Never use one word for the other |
+| UX-02 | **Flag** (follow-up) vs **Pin** | Both icons in the ribbon; Flag is the follow-up flag (1.16) | ✅ Flag = follow-up flag (M-10); Pin = pin. Never use one word for the other |
 | UX-03 | **Junk Email** | Server folder name shown verbatim (e.g. "Junk Mail") | Show the well-known display name for SPECIAL-USE roles (Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive), with an option to "Use server folder names" |
 | UX-04 | **New mail** / **New event** / **New contact** / **New task** | Tray says "Compose…"; ribbon icon has no label | "New mail" everywhere (tray, ribbon, menus) |
 | UX-05 | **Report** ▸ Report junk / Report phishing / Not junk | "Report" (junk only) | Split button with the three verbs (M-17, S-09) |
@@ -478,19 +479,19 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 
 | ID | Element | Outlook | Lookout today | Change | Effort |
 |---|---|---|---|---|---|
-| UX-21 | Mail Home ribbon order | **New mail ▾** · Delete ▾ · Archive · Report ▾ · Sweep · Move to ▾ · Reply · Reply all · Forward ▾ · Read/Unread · Categorize ▾ · Flag ▾ · Pin · Snooze ▾ · Quick steps ▾ · Print · … | New, Reply, Reply all, Forward, Delete, Archive, Report, Pin(★), Flag, Read/Unread, Categorize, Snooze ▾ (presets, 1.15), ⋮ (icon-only) | Reorder into Outlook's groups. Add **New mail ▾** (New event, New contact, New task), Sweep, Move to ▾ (recent folders, "Other folder…"), Forward ▾ (Forward as attachment), Snooze ▾ presets, Quick steps ▾. Labels per UX-16 | S |
+| UX-21 | Mail Home ribbon order | **New mail ▾** · Delete ▾ · Archive · Report ▾ · Sweep · Move to ▾ · Reply · Reply all · Forward ▾ · Read/Unread · Categorize ▾ · Flag ▾ · Pin · Snooze ▾ · Quick steps ▾ · Print · … | New, Reply, Reply all, Forward, Delete, Archive, Report, Pin(★), Flag ▾ (1.16), Read/Unread, Categorize, Snooze ▾ (presets, 1.15), ⋮ (icon-only) | Reorder into Outlook's groups. Add **New mail ▾** (New event, New contact, New task), Sweep, Move to ▾ (recent folders, "Other folder…"), Forward ▾ (Forward as attachment), Snooze ▾ presets, Quick steps ▾. Labels per UX-16 | S |
 | UX-22 | Mail View ribbon | View settings · Messages ▾ (Show as conversations / individual messages) · Layout: Folder pane ▾ (show / collapsed / hide), Reading pane ▾ (right / bottom / hidden), Density ▾ (Full / Medium / Compact), Message preview ▾ · Zoom · Sender image · Immersive reader · My Day | "Layout" group (`window.rs` ~4422) | Fill out to Outlook's set: M-04, M-05, M-06, M-37, X-04 | M |
 | UX-23 | Folder pane order | Favorites, then each account (by email address) with **Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive**, Notes, Conversation History, then user folders A–Z; "Create new folder" at the end of each account | All Inboxes, Favorites, accounts; each account sorts **Inbox first, then everything alphabetical** (`folder_tree.rs` `sort_paths`), so Deleted Items lands before Drafts | Sort SPECIAL-USE roles in Outlook's fixed order before user folders. Add a "Create new folder" row. Keep All Inboxes (Outlook for Mac has it; harmless) | S |
 | UX-24 | Folder counts | Unread count for most folders; **Drafts shows its total item count**; Junk shows unread; Deleted shows nothing by default | Unread count everywhere; folder ⋯ menu has a count option (`folder_menu.rs`) | Default Drafts to total count, matching Outlook | S |
 | UX-25 | Collapse folder pane | ☰ button collapses the pane to a narrow strip (Favorites icons) | Pane is resizable only | Collapse toggle (☰) and View ▸ Folder pane ▸ Collapsed | S |
 | UX-26 | List header | Folder name + ☆ (favorite) · **Focused \| Other** tabs · Select (checkbox) · **Filter** ▾ (one menu: Unread, Flagged, To me, Has files, Mentions me, then **Sort by** and order) | Folder name + account subtitle · ☆ · select checkbox · refresh · "All ▾" filter · sort-direction button · "By Date ▾" | Merge filter and sort into one Filter menu with Outlook's items (M-07, M-08). Focused/Other tabs when enabled (M-03). Keep refresh only if Outlook keymap F9 isn't enough (optional) | S |
 | UX-27 | Column header row | **Only in the single-line (wide / reading pane off or bottom) layout.** Sortable columns: Importance, Icon, Attachment, From, Subject, Received, Size, Categories, Flag status; right-click a header to add or remove columns | Fixed "Sender / Subject / Date" header shown **above the two-line rows** (screenshots) | Hide headers in the multi-line layout. Add the single-line columnar layout with clickable, configurable headers, used automatically when the reading pane is bottom/off or the list is wide (pairs with 1.4) | M |
-| UX-28 | Message row (multi-line) | Line 1: **sender** (bold if unread); hover actions on the right (Delete, Flag, Pin, Read/Unread). Line 2: **subject** (accent colour and bold if unread) + received time on the right. Line 3: preview. Status icons: attachment, importance (!), flag, meeting, replied/forwarded arrow, reminder bell, **category chips** under the preview. Unread = accent bar on the left edge | Line 1: sender + 📎 + **subject squeezed onto the same line** (often truncated to "Te…") + date. Line 2: preview. Avatar; unread accent bar ✅; hover quick menu (`window.rs` "hover-quickmenu") | Move subject to its own line (Outlook's three-line default), with "Message preview" lines from UX-22. Add the status-icon set (importance, flag, replied/forwarded, meeting) and category chips. Bold sender plus accent subject for unread | M |
+| UX-28 | Message row (multi-line) | Line 1: **sender** (bold if unread); hover actions on the right (Delete, Flag, Pin, Read/Unread). Line 2: **subject** (accent colour and bold if unread) + received time on the right. Line 3: preview. Status icons: attachment, importance (!), flag, meeting, replied/forwarded arrow, reminder bell, **category chips** under the preview. Unread = accent bar on the left edge | Line 1: sender + 📎 + **subject squeezed onto the same line** (often truncated to "Te…") + date. Line 2: preview. Avatar; unread accent bar ✅; hover quick menu (`window.rs` "hover-quickmenu"); flag icon and due label ✅ | Move subject to its own line (Outlook's three-line default), with "Message preview" lines from UX-22. Add the status-icon set (importance, flag, replied/forwarded, meeting) and category chips. Bold sender plus accent subject for unread | M |
 | UX-29 | Selection affordance | Avatar becomes a round checkbox on hover / in Select mode; Ctrl and Shift click; reading pane shows "N items selected" with bulk actions | Ctrl/Shift multi-select; "multi" reading-pane page ✅ | Avatar → checkbox on hover; bulk-action buttons on the multi page | S |
-| UX-30 | Group headers and dates | Today, Yesterday, Last week, Two weeks ago, Three weeks ago, Last month, Older; today shows time, this week "Mon 10:42", older a short date | Today, Yesterday, Last Week, This Month, month names, Older; similar date formats ✅ | Align bucket names to Outlook. Group headers for every sort key (by sender A–Z, by size range, by category, by flag due) | S |
+| UX-30 | Group headers and dates | Today, Yesterday, Last week, Two weeks ago, Three weeks ago, Last month, Older; today shows time, this week "Mon 10:42", older a short date | Today, Yesterday, Last Week, This Month, month names, Older; similar date formats ✅; groups for every sort key, flag due included ✅ | Align bucket names to Outlook. Group headers for every sort key (by sender A–Z, by size range, by category, by flag due) | S |
 | UX-31 | Draft marker | Conversation with an unsent reply shows a red **[Draft]** prefix in the list | — | Show [Draft] when Drafts holds a message whose `In-Reply-To` matches (pairs with C-12) | S |
 | UX-32 | Reading pane header | Subject on top; avatar; sender name (click → **profile card**); To/Cc expandable; date; action bar: (reaction), Reply, Reply all, Forward, **⋯** (Reply all by meeting, Forward as attachment, Print, Translate, Immersive reader, View ▸ message details / source, Report, Block, Create rule, Open in new window) | Subject, avatar, name, address, To, date, Reply / Reply all / Forward, contact button, ⋮ ✅ (screenshot) | Make the ⋯ menu Outlook's list (M-30, M-31, M-36, M-37). Clicking the name opens the profile card (P-10). Reactions ⛔ (Exchange-only) | S |
-| UX-33 | Info bars | Stacked bars above the body: "You replied to this message on …" / "You forwarded …", "Some content has been blocked — Show blocked content", "This sender is external", "This message was identified as junk — It's not junk", "Follow up. Due by …", "This item will be deleted in N days", importance/sensitivity notes | Remote-content banner ✅; read-receipt banner ✅; invitation banner ✅ | One info-bar stack component with Outlook's wording and order. Add replied/forwarded (`\Answered`/`$Forwarded`), external (S-06), junk ("It's not junk"), follow-up (M-10), importance/sensitivity (M-12, C-06) | M |
+| UX-33 | Info bars | Stacked bars above the body: "You replied to this message on …" / "You forwarded …", "Some content has been blocked — Show blocked content", "This sender is external", "This message was identified as junk — It's not junk", "Follow up. Due by …", "This item will be deleted in N days", importance/sensitivity notes | Remote-content banner ✅; read-receipt banner ✅; invitation banner ✅; "Follow up. Due by …" ✅ | One info-bar stack component with Outlook's wording and order. Add replied/forwarded (`\Answered`/`$Forwarded`), external (S-06), junk ("It's not junk"), follow-up (M-10), importance/sensitivity (M-12, C-06) | M |
 | UX-34 | Attachments in reading pane | Tiles (file-type icon, name, size) under the header; each tile ▾: Preview, Download, Save to…; "Download all" / "Save all" link | Attachment rows with a ☰ menu (Open / Open with / Save) ✅ | Tile layout, Preview as the default click (M-32, 7.3), "Download all" (M-33) | S |
 | UX-35 | Conversation in reading pane | Stacked message cards, newest on top (option): older collapsed to sender + one-line preview, click to expand; inline "Reply" at the top | One message at a time | Implement with 1.7 (M-04) | L |
 | UX-36 | Message context menu | Reply, Reply all, Forward · Delete, Archive, Move ▸, Copy ▸ · Mark as unread, Flag ▸, Pin, Snooze ▸, Categorize ▸ · Ignore, Report ▸, Block ▸ · Rules ▸ Create rule · View ▸ · Open in new window, Print | Category toggles only | Exactly this list and order (M-38, 1.17) | M |
@@ -616,7 +617,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.13 | ✅ ~~Undo send / undo actions~~ | M-21, C-09 | 0.3 delay (setting 0/5/10 s) plus 0.4 for move/delete/flag/archive | M |
 | 1.14 | ✅ ~~Schedule send~~ | C-08 | Send menu → "Schedule send" date-time; 0.3 `not_before`; banner listing scheduled items; Graph deferred send on Microsoft 365 later (5.x) | M |
 | 1.15 | ✅ ~~Snooze presets and sync~~ | M-11 | Preset menu plus custom; Scheduled folder plus keyword (§4.2) | M |
-| 1.16 | Follow-up flags | M-10, T-03 | Message-level flag state (keyword `$Lookout-flag-due-<date>` / `$Lookout-flag-done`; Graph `followupFlag` on Microsoft 365); presets; due column; tasks view shows flagged mail; Pin stays separate | L |
+| 1.16 | ✅ ~~Follow-up flags~~ | M-10, T-03 | Message-level flag state (keyword `$Lookout-flag-due-<date>` / `$Lookout-flag-done`; Graph `followupFlag` on Microsoft 365); presets; due column; tasks view shows flagged mail; Pin stays separate | L |
 | 1.17 | Message context menu | M-38 | 0.5; full Outlook item menu | M |
 | 1.18 | Outlook keyboard preset | UI-04 | §4.7 table as a second defaults set; picker in Settings; new actions (move to folder, next/previous, mark unread, new event/task/contact, F9) | M |
 | 1.19 | Attachment reminder | C-16 | Regex over body (localisable word list) on send → dialog | S |

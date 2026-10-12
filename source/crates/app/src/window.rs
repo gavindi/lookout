@@ -92,6 +92,10 @@ pub(crate) struct AccountHandle {
     /// touched from the GTK thread again); both safely share the same
     /// on-disk token file via its atomic tmp+rename save.
     pub(crate) graph_pin: Option<Rc<crate::graph_pin::GraphPinClient>>,
+    /// Present only for Microsoft 365 accounts: syncs follow-up flags with
+    /// Outlook's own `flag` property through Graph (item 1.16), both ways,
+    /// once the account has granted Graph access. See `graph_mail`.
+    pub(crate) graph_mail: Option<Rc<crate::graph_mail::GraphMailClient>>,
 }
 
 /// One GNOME Online Accounts account as discovered at startup, keeping the
@@ -155,6 +159,8 @@ struct MessageRowWidgets {
     thread_subject: gtk::Label,
     thread_count: gtk::Label,
     thread_pin_icon: gtk::Image,
+    /// The conversation's most urgent open follow-up flag (item 1.16).
+    thread_flag_icon: gtk::Image,
     thread_date: gtk::Label,
     /// Batch-select checkbox, kept in sync with the row's real selection
     /// state (see `checkbox_suppress`'s note) rather than driving it
@@ -187,6 +193,11 @@ struct MessageRowWidgets {
     importance_icon: gtk::Image,
     subject_label: gtk::Label,
     pin_icon: gtk::Image,
+    /// Follow-up flag indicator (item 1.16): the due label ("Due Tue",
+    /// "Overdue") and the flag (or completed check) icon. Hidden, like
+    /// `pin_icon`, on rows without a flag.
+    flag_label: gtk::Label,
+    flag_icon: gtk::Image,
     /// The color-tag dots: one small circle per configured tag the message
     /// carries, rebuilt on every bind.
     tag_dots: gtk::Box,
@@ -771,12 +782,8 @@ impl BodyCache {
     }
 }
 
-/// `UiState::follow_up_status`'s callback: does the given message-id already
-/// have a follow-up task?
-type FollowUpStatusFn = Rc<dyn Fn(&str) -> bool>;
-/// `UiState::follow_up_toggle`'s callback: creates or removes the follow-up
-/// task for a message, returning the new has-task state.
-type FollowUpToggleFn = Rc<dyn Fn(&EmailSummary, Option<AccountId>, Option<String>) -> bool>;
+/// A late-bound action on one message (`UiState::create_task_from_message`).
+type MessageActionFn = Rc<dyn Fn(&EmailSummary)>;
 
 /// Mutable UI-thread state the various signal handlers close over. Plain
 /// `Rc<RefCell<_>>` is fine here - GTK is single-threaded, so there's no
@@ -943,6 +950,13 @@ pub(crate) struct UiState {
     /// folder with a wake time (item 1.15): `(mailbox, uid, until)`, behind
     /// the "Snoozed until …" bar's Unsnooze. Cleared on every navigation.
     rendered_snooze: Option<(MailboxId, Uid, chrono::DateTime<chrono::Utc>)>,
+    /// The message on the reading pane when it carries a follow-up flag
+    /// (item 1.16): `(mailbox, uid, flag)`, behind the "Follow up. Due by …"
+    /// bar's button. Cleared on every navigation.
+    rendered_follow_up: Option<(MailboxId, Uid, lookout_core::FollowUpFlag)>,
+    /// Each account's flagged mail as last reported by `FlaggedMessages`
+    /// (item 1.16) - the Tasks view's "Flagged email" section.
+    flagged_mail: HashMap<AccountId, Vec<EmailSummary>>,
     /// Each account's local outbox as last reported by `OutboxContents`
     /// (item 1.14): scheduled sends, messages waiting to go out, and ones
     /// that failed.
@@ -1240,18 +1254,15 @@ pub(crate) struct UiState {
     /// `build_window` fills it in once the settings window's open logic
     /// exists (same pattern as `composer_identities_refresh`).
     manage_signatures: Option<Rc<dyn Fn()>>,
-    /// Whether a given message-id already has a follow-up task, per
-    /// `email_has_task`. Late-bound: the message row factory closures that
-    /// need this are built before `calendar_state` exists, so this hook is
-    /// filled in once it does (same ordering problem `task_button_refresh`
-    /// solves for the toolbar's own Follow-up button). `None` until then.
-    follow_up_status: Option<FollowUpStatusFn>,
-    /// The message row hover-quickmenu's Follow-up toggle: creates or
-    /// removes the follow-up task for a message (with an optional preferred
-    /// account/email to default the task's calendar into, same as
-    /// `show_create_task_for_email`), returning the new has-task state.
-    /// Late-bound for the same reason as `follow_up_status`.
-    follow_up_toggle: Option<FollowUpToggleFn>,
+    /// The More menu's "Create task from message…": opens the task editor
+    /// seeded from a message (`show_create_task_for_email`). Late-bound: the
+    /// menu is built before `calendar_state`/`tasks_view` exist, so this hook
+    /// is filled in once they do. `None` until then.
+    create_task_from_message: Option<MessageActionFn>,
+    /// Repaints every surface listing flagged mail (the Tasks view's
+    /// "Flagged email" section, the dashboard) from `flagged_mail` (item
+    /// 1.16). Late-bound like `create_task_from_message`; `None` until then.
+    flagged_mail_refresh: Option<Rc<dyn Fn()>>,
     /// Which compose session's relays (`draft_saved_tx` and
     /// `composer_identities_refresh`) are currently installed. Every composer
     /// bumps this when it opens and remembers its own value; a finishing
@@ -1583,12 +1594,10 @@ struct CalendarUiState {
     /// generation no longer matches belongs to a refresh a newer one already
     /// superseded and is discarded (the `suggestion_generation` idiom).
     dashboard_generation: u64,
-    /// The mail toolbar's "Add as Task" flag button's own repaint hook,
-    /// registered by the window once `calendar_state` exists - same pattern
-    /// as `dashboard_refresh`. `refresh_tasks_view` calls it so the button's
-    /// filled/outline icon stays in sync with whichever message is selected
-    /// as tasks are created, synced, or removed; `None` until then.
-    task_button_refresh: Option<Rc<dyn Fn()>>,
+    /// Every account's flagged mail (item 1.16), mirrored from
+    /// `UiState::flagged_mail` by its refresh hook so the dashboard and the
+    /// Mail overview pane, which only see this state, can list it.
+    flagged_mail: Vec<EmailSummary>,
     /// Occurrences with a drag-reschedule in flight, keyed by `(uid,
     /// recurrence_id)`, holding the occurrence with its new `start`/`end`
     /// already applied. Reapplied onto every `refresh_displayed_calendar_view`
@@ -2436,6 +2445,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rendered_draft: None,
         rendered_draft_message_id: None,
         rendered_snooze: None,
+        rendered_follow_up: None,
+        flagged_mail: HashMap::new(),
         outbox: HashMap::new(),
         outbox_banner: None,
         outbox_dialog: None,
@@ -2485,8 +2496,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         draft_saved_tx: None,
         composer_identities_refresh: None,
         manage_signatures: None,
-        follow_up_status: None,
-        follow_up_toggle: None,
+        create_task_from_message: None,
+        flagged_mail_refresh: None,
         composer_relay_generation: 0,
         compose_popout_window: None,
         compose_action_bar: None,
@@ -2639,6 +2650,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        // The follow-up flag's due label and icon (item 1.16), set in `bind`.
+        let flag_label = gtk::Label::builder().css_classes(["caption"]).valign(gtk::Align::Center).visible(false).build();
+        let flag_icon = gtk::Image::builder().pixel_size(12).valign(gtk::Align::Center).visible(false).build();
         // One dot per configured color tag the message carries, filled in on
         // `bind`. Hidden when there are none (the container takes no space
         // when empty), so an untagged row is identical to today's.
@@ -2650,6 +2664,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         top_row.append(&importance_icon);
         top_row.append(&subject_label);
         top_row.append(&pin_icon);
+        top_row.append(&flag_label);
+        top_row.append(&flag_icon);
         top_row.append(&tag_dots);
         top_row.append(&date_label);
 
@@ -2747,6 +2763,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        let thread_flag_icon = gtk::Image::builder().pixel_size(12).valign(gtk::Align::Center).visible(false).build();
         let thread_date = gtk::Label::builder().xalign(1.0).build();
         let thread_top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
         thread_top.append(&thread_sender);
@@ -2756,6 +2773,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         thread_top.append(&thread_subject);
         thread_top.append(&thread_count);
         thread_top.append(&thread_pin_icon);
+        thread_top.append(&thread_flag_icon);
         thread_top.append(&thread_date);
         let thread_expander = gtk::TreeExpander::new();
         thread_expander.set_child(Some(&thread_top));
@@ -2785,9 +2803,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // action, so there's nothing meaningful to set until bind time.
         let mark_read_btn = gtk::Button::from_icon_name("mail-mark-read-symbolic");
         mark_read_btn.add_css_class("hover-quick-action");
-        let follow_up_btn = gtk::Button::from_icon_name("flag-outline-thin-symbolic");
+        let follow_up_btn = gtk::Button::from_icon_name(follow_up_icon_name(false));
         follow_up_btn.add_css_class("hover-quick-action");
-        follow_up_btn.set_tooltip_text(Some("Follow-up"));
+        follow_up_btn.set_tooltip_text(Some("Flag"));
         let pin_btn = gtk::Button::from_icon_name(pin_icon_name(false));
         pin_btn.add_css_class("hover-quick-action");
         pin_btn.set_tooltip_text(Some("Pin/Unpin"));
@@ -3002,16 +3020,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             });
         }
         {
+            // Flag / Clear flag on this row's message (item 1.16). The
+            // optimistic repopulate rebinds the row, which repaints the
+            // button from the new state.
             let state = state_clone.clone();
             let bound = bound.clone();
-            follow_up_btn.connect_clicked(move |btn| {
+            let message_list = message_list_for_rows.clone();
+            follow_up_btn.connect_clicked(move |_| {
                 let Some(summary) = bound.borrow().clone() else { return };
-                let account_id = mailbox_account_id(&summary.mailbox);
-                let account_email = account_id.as_ref().and_then(|id| state.borrow().accounts.get(id).map(|handle| handle.email.clone()));
-                let toggle = state.borrow().follow_up_toggle.clone();
-                let Some(toggle) = toggle else { return };
-                let has_task = toggle(&summary, account_id, account_email);
-                btn.set_icon_name(follow_up_icon_name(has_task));
+                toggle_follow_up(&state, &message_list, vec![summary]);
             });
         }
         {
@@ -3151,6 +3168,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     thread_subject,
                     thread_count,
                     thread_pin_icon,
+                    thread_flag_icon,
                     thread_date,
                     checkbox,
                     checkbox_suppress,
@@ -3164,6 +3182,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     importance_icon,
                     subject_label,
                     pin_icon,
+                    flag_label,
+                    flag_icon,
                     tag_dots,
                     date_label,
                     preview_label,
@@ -3320,11 +3340,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let (mr_icon, mr_tooltip) = mark_read_button_icon(unread);
                 widgets.mark_read_btn.set_icon_name(mr_icon);
                 widgets.mark_read_btn.set_tooltip_text(Some(mr_tooltip));
-                let has_task = summary
-                    .message_id
-                    .as_deref()
-                    .is_some_and(|mid| state_clone2.borrow().follow_up_status.as_ref().is_some_and(|f| f(mid)));
-                widgets.follow_up_btn.set_icon_name(follow_up_icon_name(has_task));
+                let follow_up = summary.follow_up();
+                apply_flag_indicator(&widgets.flag_icon, Some(&widgets.flag_label), follow_up.as_ref());
+                set_flag_button_state(&widgets.follow_up_btn, follow_up.as_ref());
 
                 // Rebuild the color-tag dots for this message. Colored by the
                 // `.message-tag-dot.tag-<key>` rules `apply_tag_colors` keeps
@@ -3378,6 +3396,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     .set_tooltip_text(Some(&format!("{} messages: {}", thread.count, thread.participants.join(", "))));
                 widgets.thread_date.set_label(&format_row_date(thread.latest, chrono::Utc::now()));
                 widgets.thread_pin_icon.set_visible(thread.has_pinned);
+                apply_flag_indicator(&widgets.thread_flag_icon, None, thread.follow_up.as_ref());
                 // Unread bolds the whole header like it bolds a message row:
                 // an unread member makes the conversation's sender, subject,
                 // and date read as unread.
@@ -4212,6 +4231,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     message_page.append(&snooze_banner);
+    // "Follow up. Due by …" (item 1.16 / UX-33): the rendered message's
+    // follow-up flag, with Mark complete (or Clear flag once complete).
+    let follow_up_banner = adw::Banner::new("");
+    follow_up_banner.set_widget_name("follow-up-banner");
+    follow_up_banner.set_revealed(false);
+    {
+        let state = state.clone();
+        let message_list = message_list.clone();
+        follow_up_banner.connect_button_clicked(move |_| {
+            let Some((mailbox, uid, flag)) = state.borrow().rendered_follow_up.clone() else { return };
+            let Some(summary) = message_list.all_messages().into_iter().find(|m| m.mailbox == mailbox && m.uid == uid) else {
+                return;
+            };
+            let next = if flag.status == lookout_core::FlagStatus::Complete {
+                crate::follow_up::cleared()
+            } else {
+                crate::follow_up::completed()
+            };
+            set_follow_up(&state, &message_list, vec![summary], next);
+        });
+    }
+    message_page.append(&follow_up_banner);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
@@ -4820,14 +4861,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let pin_button = gtk::Button::from_icon_name(pin_icon_name(false));
     pin_button.set_tooltip_text(Some("Pin/Unpin"));
     refresh_pin_button(&pin_button, &message_list);
-    // Add as Task: opens the task editor prefilled from the selected
-    // message (subject as title, sender/date in Notes - `CalendarTask` has
-    // no url field). Distinct from Pin/Unpin above, which only toggles the
-    // IMAP `\Flagged` bit. Its icon starts outline and is kept in sync with
-    // whether the selected message already has an associated task by
-    // `refresh_task_button`, registered once `calendar_state` exists below.
-    let task_button = gtk::Button::from_icon_name(themed_icon_name(&["flag-outline-thin-symbolic", "flag-outline-symbolic", "mail-mark-important-symbolic"]));
-    task_button.set_tooltip_text(Some("Follow-up"));
+    // Flag ▾ (item 1.16 / M-10): the main part flags the selection (no due
+    // date) or clears its flag; the arrow opens Outlook's due-date menu.
+    // A follow-up flag, never Pin's `\Flagged` (UX-02). Its icon tracks the
+    // selection via `refresh_flag_button`.
+    let flag_button = adw::SplitButton::builder().icon_name(follow_up_icon_name(false)).dropdown_tooltip("Flag options").build();
+    flag_button.set_tooltip_text(Some("Flag"));
     // Mark read/unread: no explicit toolbar action for this existed before -
     // only the implicit mark-as-read that opening a message already does.
     // Same aggregate-direction policy as Pin/Unpin: any unread message in
@@ -4887,7 +4926,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&archive_button);
     command_toolbar.append(&report_button);
     command_toolbar.append(&pin_button);
-    command_toolbar.append(&task_button);
+    command_toolbar.append(&flag_button);
     command_toolbar.append(&mark_read_button);
     command_toolbar.append(&categorize_button);
     command_toolbar.append(&snooze_button);
@@ -6408,8 +6447,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         local_tasks,
         local_tasks_db,
         dashboard_refresh: None,
+        flagged_mail: Vec::new(),
         dashboard_generation: 0,
-        task_button_refresh: None,
         pending_calendar_moves: HashMap::new(),
         mail_overview_activate: None,
         mail_overview_refresh: None,
@@ -6456,53 +6495,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     };
     calendar_state.borrow_mut().dashboard_refresh = Some(dashboard_refresh.clone());
 
-    // --- "Add as Task" flag button's own repaint hook, same registration
-    // pattern as `dashboard_refresh` just above - `refresh_tasks_view` calls
-    // it so the button's icon tracks whether the *currently selected*
-    // message already has an associated task, even when that task was just
-    // created, synced in from the server, or removed.
-    let task_button_refresh: Rc<dyn Fn()> = {
-        let task_button = task_button.clone();
-        let message_list = message_list.clone();
-        let calendar_state = calendar_state.clone();
-        Rc::new(move || refresh_task_button(&task_button, &message_list, &calendar_state))
-    };
-    calendar_state.borrow_mut().task_button_refresh = Some(task_button_refresh.clone());
-    task_button_refresh();
-
-    // --- Message row hover-quickmenu's Follow-up toggle: `state.follow_up_status`
-    // and `state.follow_up_toggle` are the late-bound hooks the row factory
-    // closures (built earlier, before `calendar_state`/`tasks_view` existed)
-    // call through at bind/click time. `follow_up_toggle` also fires the
-    // toolbar's own `task_button_refresh` after mutating, so the two Follow-up
-    // controls (toolbar and per-row) never disagree.
+    // --- The More menu's "Create task from message…" (the old Follow-up
+    // button's job before item 1.16 made Flag a message-level flag): opens
+    // the task editor seeded from the message, defaulting into its own
+    // account's task list.
     {
-        let calendar_state = calendar_state.clone();
-        state.borrow_mut().follow_up_status = Some(Rc::new(move |message_id: &str| email_has_task(&calendar_state, message_id)));
-    }
-    {
+        let window = window.clone();
+        let state_for_hook = state.clone();
         let calendar_state = calendar_state.clone();
         let tasks_view = tasks_view.clone();
-        state.borrow_mut().follow_up_toggle = Some(Rc::new(
-            move |summary: &EmailSummary, preferred_account: Option<AccountId>, preferred_email: Option<String>| {
-                let Some(message_id) = summary.message_id.clone() else { return false };
-                let new_has_task = match task_for_email(&calendar_state, &message_id) {
-                    Some(task) => {
-                        route_task_delete(&calendar_state, &tasks_view, task.calendar_id, task.uid, task.href, task.etag);
-                        false
-                    }
-                    None => {
-                        let (calendar_id, task) = build_task_seed_for_email(&calendar_state, summary, preferred_account, preferred_email);
-                        route_task_save(&calendar_state, &tasks_view, calendar_id, task);
-                        true
-                    }
-                };
-                if let Some(refresh) = calendar_state.borrow().task_button_refresh.clone() {
-                    refresh();
-                }
-                new_has_task
-            },
-        ));
+        state.borrow_mut().create_task_from_message = Some(Rc::new(move |summary: &EmailSummary| {
+            let account_id = mailbox_account_id(&summary.mailbox);
+            let account_email = account_id.as_ref().and_then(|id| state_for_hook.borrow().accounts.get(id).map(|h| h.email.clone()));
+            show_create_task_for_email(&window, &calendar_state, &tasks_view, summary, account_id, account_email);
+        }));
     }
 
     // --- Calendar event reminders. The engine accumulates every occurrence
@@ -6565,7 +6571,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // once `select_mailbox`'s async cache-read reply actually repaints the
     // list - see there) and switch to that mailbox exactly like the
     // `open-mailbox` closure above.
-    crate::chat_links::spawn_open_message_action(app, {
+    let open_message_at: Rc<dyn Fn(MailboxId, Uid)> = {
         let window = window.clone();
         let state = state.clone();
         let folder_selection = folder_selection.clone();
@@ -6594,7 +6600,44 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
             }
         })
-    });
+    };
+    crate::chat_links::spawn_open_message_action(app, open_message_at.clone());
+    // --- The Tasks view's "Flagged email" section (item 1.16): its checkbox
+    // marks the flag complete, a click opens the message (the same path as a
+    // chat link), and `flagged_mail_refresh` repaints it whenever any
+    // account's `FlaggedMessages` lands.
+    {
+        let state_for_complete = state.clone();
+        let message_list = message_list.clone();
+        let open_message_at = open_message_at.clone();
+        crate::tasks_view::set_flag_handlers(
+            &tasks_view,
+            Rc::new(move |summary: EmailSummary| {
+                set_follow_up(&state_for_complete, &message_list, vec![summary], crate::follow_up::completed());
+            }),
+            Rc::new(move |summary: EmailSummary| open_message_at(summary.mailbox, summary.uid)),
+        );
+        let state_for_refresh = state.clone();
+        let tasks_view = tasks_view.clone();
+        let calendar_state = calendar_state.clone();
+        state.borrow_mut().flagged_mail_refresh = Some(Rc::new(move || {
+            let flagged = all_flagged_mail(&state_for_refresh);
+            crate::tasks_view::set_flagged_mail(&tasks_view, &flagged);
+            calendar_state.borrow_mut().flagged_mail = flagged;
+            refresh_dashboard_hook(&calendar_state);
+            refresh_mail_overview_hook(&calendar_state);
+        }));
+        // Outlook's flags on Microsoft 365 accounts, re-read on a timer as
+        // well as on connect and F5.
+        let state = state.clone();
+        glib::timeout_add_seconds_local(GRAPH_FLAG_RESYNC.as_secs() as u32, move || {
+            let account_ids: Vec<AccountId> = state.borrow().accounts.keys().cloned().collect();
+            for account_id in &account_ids {
+                sync_follow_ups_from_graph(&state, account_id);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     // --- iMIP banner actions. The banner's button acts on the invitation
     // stashed in `UiState::imip` by `render_body`; the calendar half of the
     // response (saving an accepted event, removing a cancelled one) needs
@@ -7756,6 +7799,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let button = button.clone();
         dispatch.insert(action, Rc::new(move || button.emit_clicked()));
     }
+    // Flag / clear flag (Insert, item 1.16): the Flag button's main action.
+    // Insert also toggles overwrite in text fields, so it's left to them
+    // while one has focus.
+    dispatch.insert(
+        crate::shortcuts::ACTION_FOLLOW_UP,
+        Rc::new({
+            let window = window.clone();
+            let flag_button = flag_button.clone();
+            move || {
+                let typing = gtk::prelude::GtkWindowExt::focus(&window).is_some_and(|focus| {
+                    focus.is::<gtk::Text>() || focus.is::<gtk::TextView>() || focus.downcast_ref::<webkit::WebView>().is_some_and(|view| view.is_editable())
+                });
+                if !typing {
+                    flag_button.emit_clicked();
+                }
+            }
+        }),
+    );
     // Undo (Ctrl+Z): pop and replay the most recent reversible action
     // (item 0.4). A no-op when the stack is empty.
     dispatch.insert(
@@ -7855,6 +7916,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.rendered_message = None;
                     st.rendered_draft = None;
                     st.rendered_snooze = None;
+                    st.rendered_follow_up = None;
                     st.pending_draft_open = None;
                     st.message_theme_override
                 };
@@ -8326,7 +8388,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     refresh();
                 })
             };
-            // Config's "Sync pins with Outlook" action for a Microsoft 365
+            // Config's "Sync pins and flags with Outlook" action for a Microsoft 365
             // account that hasn't opted in yet - runs the interactive Graph
             // consent flow and, on success, re-runs this closure so the row
             // redraws without the button. Declining is simply not clicking
@@ -8341,15 +8403,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     };
                     let toast_overlay = toast_overlay.clone();
                     let refresh_hook = refresh_hook.clone();
+                    let state = state.clone();
+                    let account_id = AccountId(account_id.to_string());
                     glib::spawn_future_local(async move {
                         match client.ensure_consent().await {
                             Ok(()) => {
-                                toast_overlay.add_toast(adw::Toast::new("Outlook pin sync enabled"));
+                                toast_overlay.add_toast(adw::Toast::new("Outlook sync enabled"));
+                                // The same grant covers follow-up flags (item
+                                // 1.16): read Outlook's now.
+                                sync_follow_ups_from_graph(&state, &account_id);
                                 let refresh = refresh_hook.borrow().clone();
                                 refresh();
                             }
                             Err(e) => {
-                                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't enable Outlook pin sync: {e}")));
+                                toast_overlay.add_toast(adw::Toast::new(&format!("Couldn't enable Outlook sync: {e}")));
                             }
                         }
                     });
@@ -8722,6 +8789,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
             for handle in state.borrow().accounts.values() {
                 let _ = handle.cmd_tx.send_blocking(AccountCommand::Refresh);
+            }
+            let account_ids: Vec<AccountId> = state.borrow().accounts.keys().cloned().collect();
+            for account_id in &account_ids {
+                sync_follow_ups_from_graph(&state, account_id);
             }
             for cmd_tx in state.borrow().contact_cmd_tx.values() {
                 let _ = cmd_tx.send_blocking(ContactCommand::Refresh);
@@ -9409,8 +9480,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list_for_selection = message_list.clone();
         let mark_read_button = mark_read_button.clone();
         let pin_button = pin_button.clone();
-        let task_button = task_button.clone();
-        let calendar_state = calendar_state.clone();
+        let flag_button = flag_button.clone();
         let web_view = web_view.clone();
         let user_content_manager = user_content_manager.clone();
         let theme_override_sheet = theme_override_sheet.clone();
@@ -9424,7 +9494,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             tracing::debug!(pos, n_items, kind, "selection-changed fired");
             refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
             refresh_pin_button(&pin_button, &message_list_for_selection);
-            refresh_task_button(&task_button, &message_list_for_selection, &calendar_state);
+            refresh_flag_button(&flag_button, &message_list_for_selection);
             let summary = match message_list_for_selection.selection_kind() {
                 SelectionKind::Message(summary) => *summary,
                 // A date section header - unreachable via the mouse (headers
@@ -9469,6 +9539,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         st.rendered_message = None;
                         st.rendered_draft = None;
                         st.rendered_snooze = None;
+                        st.rendered_follow_up = None;
                         st.pending_draft_open = None;
                         st.message_theme_override
                     };
@@ -9533,6 +9604,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             st.rendered_message = None;
                             st.rendered_draft = None;
                             st.rendered_snooze = None;
+                            st.rendered_follow_up = None;
                             st.pending_draft_open = None;
                             st.message_theme_override
                         };
@@ -9756,25 +9828,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             refresh_pin_button(&pin_button_for_click, &message_list);
         });
     }
-    // --- Add as Task: opens the task editor prefilled from the selected
-    // message's subject (title) and sender/date (Notes - `CalendarTask` has
-    // no url/link field, so this is the only way back to the source email),
-    // defaulting the calendar/list picker to the email's own account when it
-    // has a task-capable one. Silent no-op with nothing selected or a
-    // multi-selection - `selected_summary()` is `None` for both, same
-    // convention as the reading pane's "View contact" button.
+    // --- Flag ▾ (item 1.16): the main part toggles the selection's flag,
+    // the arrow opens the due-date menu.
     {
-        let window = window.clone();
-        let state = state.clone();
-        let calendar_state = calendar_state.clone();
-        let tasks_view = tasks_view.clone();
         let message_list = message_list.clone();
-        task_button.connect_clicked(move |_| {
-            let Some(summary) = message_list.selected_summary() else { return };
-            let account_id = mailbox_account_id(&summary.mailbox);
-            let account_email = account_id.as_ref().and_then(|id| state.borrow().accounts.get(id).map(|h| h.email.clone()));
-            show_create_task_for_email(&window, &calendar_state, &tasks_view, &summary, account_id, account_email);
+        let state = state.clone();
+        let flag_button_for_click = flag_button.clone();
+        flag_button.connect_clicked(move |_| {
+            toggle_follow_up(&state, &message_list, message_list.selected_summaries());
+            refresh_flag_button(&flag_button_for_click, &message_list);
         });
+    }
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let state_for_pick = state.clone();
+        let flag_button_for_pick = flag_button.clone();
+        flag_button.set_popover(Some(&build_flag_popover(
+            &state,
+            Rc::new(move |flag| {
+                set_follow_up(&state_for_pick, &message_list, message_list.selected_summaries(), flag);
+                refresh_flag_button(&flag_button_for_pick, &message_list);
+            }),
+        )));
     }
     {
         let message_list = message_list.clone();
@@ -10648,9 +10724,17 @@ fn connect_account(
             // Independent of the `credentials` provider constructed above -
             // see the field's own doc comment on `AccountHandle`.
             graph_pin: is_microsoft_365.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
+            graph_mail: is_microsoft_365.then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
+    if is_microsoft_365 {
+        // Read Outlook's flags once the session has had a moment to open its
+        // cache (item 1.16); `GRAPH_FLAG_RESYNC` and F5 keep them fresh.
+        let state = state.clone();
+        let account_id = account_id.clone();
+        glib::timeout_add_seconds_local_once(10, move || sync_follow_ups_from_graph(&state, &account_id));
+    }
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
         let state = state.clone();
@@ -10702,6 +10786,8 @@ enum SnapshotKey {
     Occurrences(chrono::NaiveDate),
     /// `TasksUpdated` from a calendar account or Google Tasks.
     Tasks,
+    /// `AccountEvent::FlaggedMessages` - the account's whole flagged-mail set.
+    FlaggedMail,
     /// `GoogleTasksEvent::ListsUpdated`.
     TaskLists,
     /// `SubscriptionSessionEvent::SubscriptionsUpdated` - one month's feeds.
@@ -10736,6 +10822,7 @@ fn collapse_account_events(events: Vec<AccountEvent>) -> Vec<AccountEvent> {
     collapse_last_wins(events, |event| match event {
         AccountEvent::FoldersUpdated(_) => Some(SnapshotKey::Folders),
         AccountEvent::MessagesUpdated { mailbox, .. } => Some(SnapshotKey::Mailbox(mailbox.clone())),
+        AccountEvent::FlaggedMessages { .. } => Some(SnapshotKey::FlaggedMail),
         _ => None,
     })
 }
@@ -11407,6 +11494,22 @@ fn spawn_account_event_loop(
                     }
                     // The snooze button's Undo toast already confirmed it.
                     AccountEvent::MessageSnoozed => {}
+                    // The session re-emits the folder from its cache after a
+                    // failed `SetFollowUp`, which undoes the optimistic flag.
+                    AccountEvent::FollowUpFailed { message, .. } => {
+                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
+                    }
+                    // A flag change was stored: carry it to Outlook on
+                    // Microsoft 365 (item 1.16), whether an action or its
+                    // undo sent it.
+                    AccountEvent::FollowUpSet { message_ids, flag } => {
+                        mirror_follow_up_to_graph(&state, &account_id, message_ids, flag);
+                    }
+                    AccountEvent::FlaggedMessages { messages } => {
+                        state.borrow_mut().flagged_mail.insert(account_id.clone(), messages);
+                        refresh_flagged_mail(&state);
+                        refresh_follow_up_banner(&state, &message_list, &reading_stack);
+                    }
                     AccountEvent::MailboxCreated { mailbox } => {
                         // Open the new folder's parent, so it's visible once the
                         // re-list that follows lands in `FoldersUpdated`.
@@ -11571,6 +11674,7 @@ fn connect_other_account(
             // mirroring only ever applies to GOA-discovered M365 accounts,
             // wired in `connect_account`.
             graph_pin: None,
+            graph_mail: None,
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
@@ -12622,6 +12726,23 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
             day_list_box.append(&crate::tasks_view::task_row(&task, &colors, Rc::new(|_t, _c| {}), activate.clone(), &["caption"], false));
         }
     }
+    // Open follow-up flags (item 1.16), as the Tasks view lists them.
+    let today = crate::calendar_tz::display_zone().today();
+    let flagged = crate::tasks_view::flagged_mail_rows(&calendar_state.borrow().flagged_mail, today, crate::message_list::current_week_start());
+    if !flagged.is_empty() {
+        day_list_box.append(
+            &gtk::Label::builder()
+                .label("Flagged email")
+                .css_classes(["caption-heading"])
+                .xalign(0.0)
+                .margin_top(8)
+                .build(),
+        );
+        let open = crate::tasks_view::open_message_through_app();
+        for message in &flagged {
+            day_list_box.append(&crate::tasks_view::flagged_mail_row(message, today, None, open.clone(), &["caption"]));
+        }
+    }
 }
 
 /// One event row in the mail overview panel's lists (the selected day's
@@ -13328,11 +13449,9 @@ fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view:
     crate::tasks_view::set_tasks(tasks_view, &tasks, &colors);
     // Every task change funnels through here (CalDAV and Google Tasks
     // `TasksUpdated` events, local saves, checkbox flips), so this is the
-    // single point that keeps the Lookout dashboard's task section, the
-    // mail toolbar's "Add as Task" flag button's icon, and the Mail-screen
-    // overview pane's task list live.
+    // single point that keeps the Lookout dashboard's task section and the
+    // Mail-screen overview pane's task list live.
     refresh_dashboard_hook(calendar_state);
-    refresh_task_button_hook(calendar_state);
     refresh_mail_overview_hook(calendar_state);
 }
 
@@ -13341,16 +13460,6 @@ fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view:
 /// error.
 fn refresh_dashboard_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
     let hook = calendar_state.borrow().dashboard_refresh.clone();
-    if let Some(hook) = hook {
-        hook();
-    }
-}
-
-/// Runs the mail toolbar's "Add as Task" flag button's repaint hook if the
-/// window has registered one - same no-op-until-wired convention as
-/// `refresh_dashboard_hook`.
-fn refresh_task_button_hook(calendar_state: &Rc<RefCell<CalendarUiState>>) {
-    let hook = calendar_state.borrow().task_button_refresh.clone();
     if let Some(hook) = hook {
         hook();
     }
@@ -13461,6 +13570,7 @@ fn set_lookout_data(calendar_state: &Rc<RefCell<CalendarUiState>>, lookout_view:
             events,
             checked_calendar_ids,
             colors,
+            flagged_mail: calendar_state.borrow().flagged_mail.clone(),
         },
     );
 }
@@ -13545,60 +13655,329 @@ fn show_new_task_editor(window: &adw::ApplicationWindow, calendar_state: &Rc<Ref
     );
 }
 
-/// The hidden marker line appended to an "Add as Task" task's Notes so
-/// `email_has_task` can later recognize which email spawned it - the only
-/// channel that reliably round-trips through every task backend (CalDAV's
-/// `DESCRIPTION` and Google Tasks' `notes` both preserve free text as-is,
-/// but Google Tasks drops `categories` entirely - see `task_to_write` - so a
-/// tag stored there wouldn't survive a Google Tasks round trip).
+/// The hidden marker line appended to a "Create task from message" task's
+/// Notes, recording which email spawned it - the only channel that reliably
+/// round-trips through every task backend (CalDAV's `DESCRIPTION` and Google
+/// Tasks' `notes` both preserve free text as-is, but Google Tasks drops
+/// `categories` entirely - see `task_to_write` - so a tag stored there
+/// wouldn't survive a Google Tasks round trip).
 fn task_email_marker(message_id: &str) -> String {
     format!("Lookout-Message-Id: {message_id}")
 }
 
-/// The known task (local, CalDAV, or Google Tasks) created from the email
-/// carrying `message_id`, if any - matched via the hidden marker
-/// `show_create_task_for_email`/`build_task_seed_for_email` stamp into a
-/// task's description. Used both to answer "does this email have a
-/// follow-up task" (`email_has_task`) and, by the hover-quickmenu Follow-up
-/// toggle, to find the task to delete when removing one.
-fn task_for_email(calendar_state: &Rc<RefCell<CalendarUiState>>, message_id: &str) -> Option<CalendarTask> {
-    let marker = task_email_marker(message_id);
-    merged_tasks(calendar_state)
-        .into_iter()
-        .find(|task| task.description.as_deref().is_some_and(|d| d.contains(&marker)))
-}
-
-/// Whether any known task (local, CalDAV, or Google Tasks) was created from
-/// the email carrying `message_id` - drives the "Add as Task"/Follow-up flag
-/// button's filled/outline icon.
-fn email_has_task(calendar_state: &Rc<RefCell<CalendarUiState>>, message_id: &str) -> bool {
-    task_for_email(calendar_state, message_id).is_some()
-}
-
-/// The "Add as Task"/Follow-up flag icon for a given has-task state - filled
-/// when `has_task`, outline otherwise. Shared by `refresh_task_button`
-/// (toolbar, selection-driven) and the message row's own hover-quickmenu
-/// button (single-message, bind- and click-driven).
-fn follow_up_icon_name(has_task: bool) -> &'static str {
-    if has_task {
+/// The flag icon: filled when `flagged`, outline otherwise. Shared by the
+/// toolbar's Flag button and the message row's hover button.
+fn follow_up_icon_name(flagged: bool) -> &'static str {
+    if flagged {
         themed_icon_name(&["mail-flag-symbolic", "flag-filled-symbolic", "mail-mark-important-symbolic"])
     } else {
         themed_icon_name(&["flag-outline-thin-symbolic", "flag-outline-symbolic", "mail-mark-important-symbolic"])
     }
 }
 
-/// Sets the mail toolbar's "Add as Task" flag button's icon to reflect
-/// whether the currently selected message already has an associated task -
-/// filled/solid when `email_has_task` finds one, outline otherwise
-/// (including when nothing, or more than one message, is selected, since
-/// `selected_summary()` is `None` for both). Mirrors
-/// `refresh_mark_read_button`'s icon-swap convention.
-fn refresh_task_button(button: &gtk::Button, message_list: &MessageListModel, calendar_state: &Rc<RefCell<CalendarUiState>>) {
-    let has_task = message_list
-        .selected_summary()
-        .and_then(|summary| summary.message_id)
-        .is_some_and(|message_id| email_has_task(calendar_state, &message_id));
-    button.set_icon_name(follow_up_icon_name(has_task));
+/// The toolbar Flag button's icon and tooltip for the selection: filled
+/// "Clear flag" when any selected message has an open follow-up flag (what a
+/// click then does), outline "Flag" otherwise.
+fn refresh_flag_button(button: &adw::SplitButton, message_list: &MessageListModel) {
+    let flagged = message_list.selected_summaries().iter().any(EmailSummary::is_flagged_for_follow_up);
+    button.set_icon_name(follow_up_icon_name(flagged));
+    button.set_tooltip_text(Some(if flagged { "Clear flag" } else { "Flag" }));
+}
+
+/// The row's hover Flag button for `flag`, mirroring `refresh_flag_button`.
+fn set_flag_button_state(button: &gtk::Button, flag: Option<&lookout_core::FollowUpFlag>) {
+    let flagged = flag.is_some_and(|flag| flag.status == lookout_core::FlagStatus::Flagged);
+    button.set_icon_name(follow_up_icon_name(flagged));
+    button.set_tooltip_text(Some(if flagged { "Clear flag" } else { "Flag" }));
+}
+
+/// Shows a follow-up flag on a list row (item 1.16): a filled flag icon and,
+/// when `label` is given and the flag has a due date, its due label - both in
+/// the error colour once overdue - or a check icon for a completed flag.
+/// Hidden when there's no flag, so an unflagged row looks as before.
+fn apply_flag_indicator(icon: &gtk::Image, label: Option<&gtk::Label>, flag: Option<&lookout_core::FollowUpFlag>) {
+    let today = crate::calendar_tz::display_zone().today();
+    let status = flag.map(|flag| flag.status).unwrap_or_default();
+    let due = flag.and_then(crate::follow_up::due_date);
+    let overdue = status == lookout_core::FlagStatus::Flagged && due.is_some_and(|due| due < today);
+    match status {
+        lookout_core::FlagStatus::NotFlagged => icon.set_visible(false),
+        lookout_core::FlagStatus::Flagged => {
+            icon.set_icon_name(Some(follow_up_icon_name(true)));
+            icon.set_visible(true);
+        }
+        lookout_core::FlagStatus::Complete => {
+            icon.set_icon_name(Some("object-select-symbolic"));
+            icon.set_visible(true);
+        }
+    }
+    icon.set_tooltip_text(flag.map(|flag| crate::follow_up::banner_text(flag, today)).as_deref());
+    if overdue {
+        icon.add_css_class("error");
+    } else {
+        icon.remove_css_class("error");
+    }
+    if let Some(label) = label {
+        let text = due.filter(|_| status == lookout_core::FlagStatus::Flagged).map(|due| crate::follow_up::due_label(due, today));
+        label.set_label(text.as_deref().unwrap_or(""));
+        label.set_visible(text.is_some());
+        if overdue {
+            label.add_css_class("error");
+        } else {
+            label.remove_css_class("error");
+        }
+    }
+}
+
+/// The Flag button's main action: clears the flag when any of `summaries`
+/// has an open one, else flags them all with no due date.
+fn toggle_follow_up(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: Vec<EmailSummary>) {
+    let flag = if summaries.iter().any(EmailSummary::is_flagged_for_follow_up) {
+        crate::follow_up::cleared()
+    } else {
+        crate::follow_up::flagged(None)
+    };
+    set_follow_up(state, message_list, summaries, flag);
+}
+
+/// Sets `flag` on `summaries` (item 1.16): shows it at once, sends one
+/// `SetFollowUp` per mailbox, and records an undo that restores each
+/// message's previous flag (grouped by that previous state).
+fn set_follow_up(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: Vec<EmailSummary>, flag: lookout_core::FollowUpFlag) {
+    if summaries.is_empty() {
+        return;
+    }
+    let mut by_mailbox: Vec<(MailboxId, Vec<Uid>)> = Vec::new();
+    let mut previous: Vec<(MailboxId, lookout_core::FollowUpFlag, Vec<Uid>)> = Vec::new();
+    for summary in &summaries {
+        match by_mailbox.iter_mut().find(|(mailbox, _)| *mailbox == summary.mailbox) {
+            Some((_, uids)) => uids.push(summary.uid),
+            None => by_mailbox.push((summary.mailbox.clone(), vec![summary.uid])),
+        }
+        let before = summary.follow_up().unwrap_or_default();
+        match previous.iter_mut().find(|(mailbox, flag, _)| *mailbox == summary.mailbox && *flag == before) {
+            Some((_, _, uids)) => uids.push(summary.uid),
+            None => previous.push((summary.mailbox.clone(), before, vec![summary.uid])),
+        }
+    }
+    for (mailbox, uids) in by_mailbox {
+        let Some(account_id) = mailbox_account_id(&mailbox) else { continue };
+        let Some(cmd_tx) = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone()) else {
+            continue;
+        };
+        optimistic_set_follow_up(state, message_list, &mailbox, &uids, &flag);
+        let _ = cmd_tx.send_blocking(AccountCommand::SetFollowUp { mailbox, uids, flag: flag.clone() });
+    }
+    let inverse = previous
+        .into_iter()
+        .map(|(mailbox, flag, uids)| AccountCommand::SetFollowUp { mailbox, uids, flag })
+        .collect();
+    let today = crate::calendar_tz::display_zone().today();
+    record_undo(state, &crate::follow_up::action_label(&flag, today), inverse);
+}
+
+/// Shows `flag` on `mailbox`/`uids` in the list (and the unified view's
+/// snapshot) before the session confirms it. Not stashed for rollback: the
+/// session re-emits the folder from its cache after every `SetFollowUp`,
+/// failed or not, which puts the true state back.
+fn optimistic_set_follow_up(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid], flag: &lookout_core::FollowUpFlag) {
+    let keywords = lookout_core::follow_up_keywords(flag);
+    let patch = |m: &mut EmailSummary| {
+        m.keywords.retain(|k| !lookout_core::is_flag_keyword(k));
+        m.keywords.extend(keywords.iter().cloned());
+    };
+    let mut changed = false;
+    let all: Vec<EmailSummary> = message_list
+        .all_messages()
+        .into_iter()
+        .map(|mut m| {
+            if m.mailbox == *mailbox && uids.contains(&m.uid) {
+                patch(&mut m);
+                changed = true;
+            }
+            m
+        })
+        .collect();
+    if changed {
+        let (key, descending) = current_sort(state);
+        message_list.repopulate(all, key, descending);
+    }
+    if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(mailbox) {
+        for m in snapshot.iter_mut().filter(|m| uids.contains(&m.uid)) {
+            patch(m);
+        }
+    }
+}
+
+/// How often Outlook's follow-up flags are re-read through Graph on
+/// Microsoft 365 accounts (item 1.16) - the snooze rescan's cadence.
+const GRAPH_FLAG_RESYNC: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Every account's flagged mail, merged - what the Tasks view lists.
+fn all_flagged_mail(state: &Rc<RefCell<UiState>>) -> Vec<EmailSummary> {
+    state.borrow().flagged_mail.values().flatten().cloned().collect()
+}
+
+/// Runs the flagged-mail repaint hook, if the window has registered one.
+fn refresh_flagged_mail(state: &Rc<RefCell<UiState>>) {
+    let hook = state.borrow().flagged_mail_refresh.clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Mirrors a stored flag change to Outlook through Graph (item 1.16) on a
+/// Microsoft 365 account that has granted Graph access. Best effort: a
+/// failure is logged, and the next Graph snapshot reconciles the two.
+fn mirror_follow_up_to_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId, message_ids: Vec<String>, flag: lookout_core::FollowUpFlag) {
+    let Some(client) = state.borrow().accounts.get(account_id).and_then(|h| h.graph_mail.clone()) else {
+        return;
+    };
+    if !client.consented() {
+        return;
+    }
+    let zone = crate::calendar_tz::display_zone();
+    glib::spawn_future_local(async move {
+        for message_id in message_ids {
+            if let Err(e) = client.set_follow_up(&message_id, &flag, zone).await {
+                tracing::warn!("Outlook flag mirror failed for {message_id}: {e}");
+            }
+        }
+    });
+}
+
+/// Fetches the Graph snapshot of every flagged message on a Microsoft 365
+/// account and hands it to the session (item 1.16), so flags set in Outlook
+/// show here. A no-op for other accounts and before Graph access is granted.
+fn sync_follow_ups_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    let target = state.borrow().accounts.get(account_id).and_then(|h| h.graph_mail.clone().map(|client| (client, h.cmd_tx.clone())));
+    let Some((client, cmd_tx)) = target else {
+        return;
+    };
+    if !client.consented() {
+        return;
+    }
+    let zone = crate::calendar_tz::display_zone();
+    glib::spawn_future_local(async move {
+        let taken_at = chrono::Utc::now();
+        match client.flagged_snapshot(zone).await {
+            Ok(snapshot) => {
+                let _ = cmd_tx.send(AccountCommand::ApplyRemoteFollowUps { snapshot, taken_at }).await;
+            }
+            Err(e) => tracing::warn!("couldn't read Outlook's flags: {e}"),
+        }
+    });
+}
+
+/// Shows or hides the reading pane's "Follow up. Due by …" bar for the
+/// message on it, from that message's current summary in the list.
+fn refresh_follow_up_banner(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, reading_stack: &gtk::Stack) {
+    let rendered = state.borrow().rendered_message.clone();
+    let flag = rendered.as_ref().and_then(|(mailbox, uid)| {
+        let summary = message_list.all_messages().into_iter().find(|m| m.mailbox == *mailbox && m.uid == *uid)?;
+        summary.follow_up().map(|flag| (mailbox.clone(), *uid, flag))
+    });
+    show_follow_up_banner(state, reading_stack, flag);
+}
+
+/// Reveals the follow-up bar for `flag` (or hides it for `None`), and keeps
+/// `rendered_follow_up` in step for its button.
+fn show_follow_up_banner(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, flag: Option<(MailboxId, Uid, lookout_core::FollowUpFlag)>) {
+    let Some(banner) = find_named_child(reading_stack, "follow-up-banner").and_downcast::<adw::Banner>() else {
+        return;
+    };
+    match &flag {
+        Some((_, _, follow_up)) => {
+            let today = crate::calendar_tz::display_zone().today();
+            banner.set_title(&glib::markup_escape_text(&crate::follow_up::banner_text(follow_up, today)));
+            banner.set_button_label(Some(if follow_up.status == lookout_core::FlagStatus::Complete {
+                "Clear flag"
+            } else {
+                "Mark complete"
+            }));
+            banner.set_revealed(true);
+        }
+        None => banner.set_revealed(false),
+    }
+    state.borrow_mut().rendered_follow_up = flag;
+}
+
+/// The Flag ▾ menu (item 1.16): Outlook's due-date presets for today (each
+/// with its date), "Custom date…", then Mark complete and Clear flag.
+/// Rebuilt every time it opens, so "Today" never goes stale and the presets
+/// follow the calendar's current week start and work days.
+fn build_flag_popover(state: &Rc<RefCell<UiState>>, on_pick: Rc<dyn Fn(lookout_core::FollowUpFlag)>) -> gtk::Popover {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let popover = gtk::Popover::builder().child(&list).build();
+    popover.add_css_class("menu");
+    let state = state.clone();
+    let fill = {
+        let list = list.clone();
+        let popover = popover.clone();
+        move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            list.append(
+                &gtk::Label::builder()
+                    .label("Flag")
+                    .css_classes(["heading"])
+                    .xalign(0.0)
+                    .margin_start(8)
+                    .margin_top(4)
+                    .margin_bottom(4)
+                    .build(),
+            );
+            let item = |label: &str, detail: Option<String>, flag: lookout_core::FollowUpFlag| {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                row.append(&gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build());
+                if let Some(detail) = detail {
+                    row.append(&gtk::Label::builder().label(detail).css_classes(["dim-label"]).build());
+                }
+                let button = gtk::Button::builder().child(&row).css_classes(["flat"]).build();
+                let on_pick = on_pick.clone();
+                let popover = popover.clone();
+                button.connect_clicked(move |_| {
+                    popover.popdown();
+                    on_pick(flag.clone());
+                });
+                button
+            };
+            let today = crate::calendar_tz::display_zone().today();
+            let prefs = state.borrow().settings.calendar_preferences();
+            for preset in crate::follow_up::flag_presets(today, prefs.week_start, &prefs.work_days) {
+                let detail = preset.due.map(|due| due.format("%a %-d %b").to_string());
+                list.append(&item(preset.name, detail, crate::follow_up::flagged(preset.due)));
+            }
+            let custom = gtk::Button::builder()
+                .child(&gtk::Label::builder().label("Custom date…").xalign(0.0).build())
+                .css_classes(["flat"])
+                .build();
+            {
+                let on_pick = on_pick.clone();
+                let popover = popover.clone();
+                custom.connect_clicked(move |_| {
+                    popover.popdown();
+                    let on_pick = on_pick.clone();
+                    crate::datetime_picker::present_date_dialog(
+                        popover.parent().as_ref(),
+                        "Flag for follow-up",
+                        "Due date",
+                        "Flag",
+                        today,
+                        Rc::new(move |due| on_pick(crate::follow_up::flagged(Some(due)))),
+                    );
+                });
+            }
+            list.append(&custom);
+            list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            list.append(&item("Mark complete", None, crate::follow_up::completed()));
+            list.append(&item("Clear flag", None, crate::follow_up::cleared()));
+        }
+    };
+    fill();
+    popover.connect_show(move |_| fill());
+    popover
 }
 
 /// Builds a follow-up `CalendarTask` seed for a mail message plus the
@@ -14820,6 +15199,24 @@ fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: 
         });
     }
     boxed.append(&details_button);
+    // "Create task from message…" (the Follow-up button's old job, before
+    // item 1.16 made Flag a message-level follow-up flag).
+    let create_task = gtk::Button::builder().label("Create task from message…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    create_task.set_sensitive(has_selection);
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        create_task.connect_clicked(move |_| {
+            popover.popdown();
+            let Some(summary) = message_list.selected_summary() else { return };
+            let hook = state.borrow().create_task_from_message.clone();
+            if let Some(hook) = hook {
+                hook(&summary);
+            }
+        });
+    }
+    boxed.append(&create_task);
     let save_eml = gtk::Button::builder().label("Save as .eml…").css_classes(["flat"]).halign(gtk::Align::Start).build();
     save_eml.set_sensitive(has_selection);
     {
@@ -15598,6 +15995,7 @@ fn request_account_refresh(state: &Rc<RefCell<UiState>>, account_id: &AccountId)
     if let Some(cmd_tx) = cmd_tx {
         let _ = cmd_tx.send_blocking(AccountCommand::Refresh);
     }
+    sync_follow_ups_from_graph(state, account_id);
 }
 
 /// The FTS cache pass of a search: query every connected account's read-side
@@ -15961,7 +16359,8 @@ fn command_mailbox(command: &AccountCommand) -> Option<&MailboxId> {
         | AccountCommand::StoreFlags { mailbox, .. }
         | AccountCommand::StoreFlagsMany { mailbox, .. }
         | AccountCommand::StoreKeywords { mailbox, .. }
-        | AccountCommand::StoreKeywordsMany { mailbox, .. } => Some(mailbox),
+        | AccountCommand::StoreKeywordsMany { mailbox, .. }
+        | AccountCommand::SetFollowUp { mailbox, .. } => Some(mailbox),
         _ => None,
     }
 }
@@ -19751,10 +20150,12 @@ fn render_body(
     // trust banner shows. The debug `.eml` viewer has no summary (and no
     // account to key trust on anyway), so the sender ends up `None` there
     // and all remote content stays blocked.
+    let mut rendered_follow_up = None;
     {
         let mut st = state.borrow_mut();
         if let Some(summary) = st.pending_header.take() {
             message_header.update(&summary);
+            rendered_follow_up = summary.follow_up().map(|flag| (mailbox.clone(), uid, flag));
             let sender = summary.from.first().map(|a| a.address.trim().to_lowercase());
             st.rendered_trust_sender = mailbox_account_id(&mailbox).zip(sender);
             // Draft status (item 1.12): the message-list summary's `\Draft`
@@ -19793,6 +20194,8 @@ fn render_body(
         }
         banner.set_revealed(snoozed_until.is_some());
     }
+    // Follow-up bar (item 1.16 / UX-33), for the rendered message only.
+    show_follow_up_banner(state, reading_stack, rendered_follow_up);
     // Sync the "Switch message theme" toggle with its per-email state: the
     // selection handler resets `message_theme_override` to the configured
     // default on every navigation (with the physical sheet/canvas already
@@ -21323,6 +21726,7 @@ mod tests {
                         folders,
                         address_cache: None,
                         graph_pin: None,
+                        graph_mail: None,
                     },
                 )
             })
@@ -21359,6 +21763,8 @@ mod tests {
             rendered_draft: None,
             rendered_draft_message_id: None,
             rendered_snooze: None,
+            rendered_follow_up: None,
+            flagged_mail: HashMap::new(),
             outbox: HashMap::new(),
             outbox_banner: None,
             outbox_dialog: None,
@@ -21408,8 +21814,8 @@ mod tests {
             draft_saved_tx: None,
             composer_identities_refresh: None,
             manage_signatures: None,
-            follow_up_status: None,
-            follow_up_toggle: None,
+            create_task_from_message: None,
+            flagged_mail_refresh: None,
             composer_relay_generation: 0,
             compose_popout_window: None,
             compose_action_bar: None,
@@ -22524,6 +22930,50 @@ mod tests {
         );
         assert!(undo_last(&state));
         assert!(matches!(cmd_rx.try_recv(), Ok(AccountCommand::UnsnoozeMessages { uids, .. }) if uids == vec![Uid(3)]));
+    }
+
+    /// Flagging (item 1.16) shows the flag at once, sends one `SetFollowUp`
+    /// for the mailbox, and its Undo restores each message's own earlier
+    /// state - one inverse per previous state, routed to the owning account.
+    #[test]
+    fn set_follow_up_shows_sends_and_undoes_per_previous_state() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let acc = AccountId("acc".into());
+        let mailbox = MailboxId("acc:INBOX".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+        let plain = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let mut done = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+        done.keywords.extend(lookout_core::follow_up_keywords(&crate::follow_up::completed()));
+        let message_list = MessageListModel::build();
+        message_list.repopulate(vec![plain.clone(), done.clone()], SortKey::Date, true);
+
+        let due = crate::follow_up::flagged(chrono::NaiveDate::from_ymd_opt(2026, 10, 16));
+        set_follow_up(&state, &message_list, vec![plain, done], due.clone());
+        assert!(message_list.all_messages().iter().all(|m| m.follow_up() == Some(due.clone())), "shown before the server answers");
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::SetFollowUp { mailbox: sent, mut uids, flag }) => {
+                uids.sort();
+                assert_eq!((sent, uids, flag), (mailbox.clone(), vec![Uid(1), Uid(2)], due));
+            }
+            other => panic!("expected SetFollowUp, got {other:?}"),
+        }
+
+        assert!(undo_last(&state));
+        let mut restored: Vec<(Vec<Uid>, lookout_core::FlagStatus)> = std::iter::from_fn(|| cmd_rx.try_recv().ok())
+            .map(|command| match command {
+                AccountCommand::SetFollowUp { uids, flag, .. } => (uids, flag.status),
+                other => panic!("expected SetFollowUp, got {other:?}"),
+            })
+            .collect();
+        restored.sort_by_key(|(uids, _)| uids[0]);
+        assert_eq!(
+            restored,
+            vec![(vec![Uid(1)], lookout_core::FlagStatus::NotFlagged), (vec![Uid(2)], lookout_core::FlagStatus::Complete)]
+        );
     }
 
     /// A toast's own Undo button removes exactly its entry, leaving later

@@ -125,11 +125,22 @@ pub enum Filter {
     HighImportance,
     Categorized,
     ToMe,
+    /// Pinned (`\Flagged`) messages. Kept apart from `Flagged`, which since
+    /// item 1.16 means an open follow-up flag (UX-02).
+    Pinned,
 }
 
 impl Filter {
     /// Every filter, in menu order.
-    pub const ALL: [Filter; 6] = [Filter::Unread, Filter::Flagged, Filter::HasAttachments, Filter::HighImportance, Filter::Categorized, Filter::ToMe];
+    pub const ALL: [Filter; 7] = [
+        Filter::Unread,
+        Filter::Flagged,
+        Filter::Pinned,
+        Filter::HasAttachments,
+        Filter::HighImportance,
+        Filter::Categorized,
+        Filter::ToMe,
+    ];
 
     /// The filter menu's item label.
     pub fn label(self) -> &'static str {
@@ -140,6 +151,7 @@ impl Filter {
             Filter::HighImportance => "High importance",
             Filter::Categorized => "Categorized",
             Filter::ToMe => "To me",
+            Filter::Pinned => "Pinned",
         }
     }
 
@@ -153,6 +165,7 @@ impl Filter {
             Filter::HighImportance => "high-importance",
             Filter::Categorized => "categorized",
             Filter::ToMe => "to-me",
+            Filter::Pinned => "pinned",
         }
     }
 
@@ -169,6 +182,7 @@ impl Filter {
             Filter::HighImportance => 1 << 3,
             Filter::Categorized => 1 << 4,
             Filter::ToMe => 1 << 5,
+            Filter::Pinned => 1 << 6,
         }
     }
 
@@ -177,7 +191,8 @@ impl Filter {
     fn matches(self, message: &EmailSummary, viewer: &HashSet<String>) -> bool {
         match self {
             Filter::Unread => message.is_unread(),
-            Filter::Flagged => message.is_pinned(),
+            Filter::Flagged => message.is_flagged_for_follow_up(),
+            Filter::Pinned => message.is_pinned(),
             Filter::HasAttachments => message.has_attachment,
             Filter::HighImportance => message.importance == lookout_core::Importance::High,
             Filter::Categorized => message.keywords.iter().any(|k| lookout_core::tag_key_from_keyword(k).is_some()),
@@ -293,7 +308,7 @@ pub fn set_week_start(day: chrono::Weekday) {
     WEEK_START.store(day.num_days_from_monday() as u8, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn current_week_start() -> chrono::Weekday {
+pub(crate) fn current_week_start() -> chrono::Weekday {
     chrono::Weekday::try_from(WEEK_START.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(chrono::Weekday::Mon)
 }
 
@@ -425,7 +440,9 @@ pub enum GroupKey {
     Size(SizeBucket),
     /// Importance rank: 0 = High, 1 = Normal, 2 = Low.
     Importance(u8),
-    Flag(bool),
+    /// The follow-up flag bucket (item 1.16): due date, then undated,
+    /// completed and unflagged.
+    Flag(crate::follow_up::FlagBucket),
     Attachment(bool),
     Pinned,
 }
@@ -493,7 +510,7 @@ fn group_of(key: SortKey, message: &EmailSummary, now: DateTime<Local>) -> (Grou
         SortKey::Category => GroupKey::Category(tag_sort_key(message).unwrap_or_default()),
         SortKey::Size => GroupKey::Size(size_bucket(message.size)),
         SortKey::Importance => GroupKey::Importance(importance_rank(message.importance)),
-        SortKey::Flag => GroupKey::Flag(message.is_pinned()),
+        SortKey::Flag => GroupKey::Flag(crate::follow_up::bucket(message.follow_up().as_ref(), now.date_naive(), current_week_start())),
         SortKey::Attachments => GroupKey::Attachment(message.has_attachment),
     };
     let label = group_label(&group, now);
@@ -512,8 +529,7 @@ fn group_label(group: &GroupKey, now: DateTime<Local>) -> String {
         GroupKey::Importance(0) => "High importance".to_string(),
         GroupKey::Importance(2) => "Low importance".to_string(),
         GroupKey::Importance(_) => "Normal importance".to_string(),
-        GroupKey::Flag(true) => "Flagged".to_string(),
-        GroupKey::Flag(false) => "Not flagged".to_string(),
+        GroupKey::Flag(bucket) => bucket.label().to_string(),
         GroupKey::Attachment(true) => "With attachments".to_string(),
         GroupKey::Attachment(false) => "No attachments".to_string(),
         GroupKey::Pinned => "Pinned".to_string(),
@@ -573,6 +589,9 @@ pub struct ThreadRow {
     pub has_unread: bool,
     /// Any message in the thread is pinned - the header shows the pin icon.
     pub has_pinned: bool,
+    /// The thread's most urgent open follow-up flag (earliest due, dated
+    /// before undated), if any message has one - the header's flag icon.
+    pub follow_up: Option<lookout_core::FollowUpFlag>,
     /// Any message in the thread has an attachment - the header shows the
     /// attachment icon, mirroring how a lone message row renders its own.
     pub has_attachment: bool,
@@ -769,6 +788,7 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
             latest: latest.date,
             has_unread: latest.is_unread() || emails.iter().any(|m| m.is_unread()),
             has_pinned: latest.is_pinned() || emails.iter().any(|m| m.is_pinned()),
+            follow_up: thread_follow_up(&emails),
             has_attachment: latest.has_attachment || emails.iter().any(|m| m.has_attachment),
             has_calendar: latest.has_calendar || emails.iter().any(|m| m.has_calendar),
             importance: thread_importance(&emails),
@@ -776,6 +796,15 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
         entries.push(ThreadEntry::Thread(ThreadLayout { row, messages: emails }));
     }
     entries
+}
+
+/// A thread's most urgent open follow-up flag, for its header icon.
+fn thread_follow_up(messages: &[EmailSummary]) -> Option<lookout_core::FollowUpFlag> {
+    messages
+        .iter()
+        .filter_map(EmailSummary::follow_up)
+        .filter(|flag| flag.status == lookout_core::FlagStatus::Flagged)
+        .min_by_key(|flag| (flag.due.is_none(), flag.due))
 }
 
 /// A thread's aggregate importance, for its header glyph: `High` if any
@@ -806,6 +835,7 @@ type MessageRowKey = (
     Vec<String>,
     ThreadKey,
     lookout_core::Importance,
+    Option<lookout_core::FollowUpFlag>,
 );
 
 /// A compact fingerprint of the fields one message-list row displays, keyed
@@ -844,6 +874,8 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
         tags,
         m.thread_key.clone(),
         m.importance,
+        // The follow-up flag drives the row's flag icon and due label.
+        m.follow_up(),
     )
 }
 
@@ -870,14 +902,14 @@ fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
 /// whenever the blocking pool happened to get around to it.
 ///
 /// Pinned messages are pulled out of `messages` before `build_layout` ever
-/// sees them (unless `flag` is active, in which case every visible message is
-/// pinned and a pinned copy would just duplicate the list) - `apply_layout`'s
+/// sees them (unless the Pinned filter is active, in which case every visible
+/// message is pinned and a pinned copy would just duplicate the list) - `apply_layout`'s
 /// `splice_pinned_section` renders them as their own leading section,
 /// independent of `sort_key`/`threaded`.
 fn compute_layout(truth: Vec<EmailSummary>, filter: FilterSet, viewer: &HashSet<String>, sort_key: SortKey, sort_descending: bool, threaded: bool, now: DateTime<Local>) -> ComputedLayout {
     let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m, viewer)).collect();
     sort_messages(&mut messages, sort_key, sort_descending);
-    let pinned = if filter.contains(Filter::Flagged) {
+    let pinned = if filter.contains(Filter::Pinned) {
         Vec::new()
     } else {
         // `partition` preserves each output's relative order, so both halves
@@ -917,6 +949,7 @@ type ThreadRowKey = (
     bool,
     bool,
     lookout_core::Importance,
+    Option<lookout_core::FollowUpFlag>,
 );
 
 fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
@@ -932,6 +965,7 @@ fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
         row.has_attachment,
         row.has_calendar,
         row.importance,
+        row.follow_up.clone(),
     )
 }
 
@@ -2152,7 +2186,7 @@ pub fn sort_messages(messages: &mut [EmailSummary], key: SortKey, descending: bo
         SortKey::Category => messages.sort_by(|a, b| category_of(a).cmp(&category_of(b)).then_with(|| date_tie(a, b))),
         SortKey::Size => messages.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| date_tie(a, b))),
         SortKey::Importance => messages.sort_by(|a, b| importance_rank(a.importance).cmp(&importance_rank(b.importance)).then_with(|| date_tie(a, b))),
-        SortKey::Flag => messages.sort_by(|a, b| b.is_pinned().cmp(&a.is_pinned()).then_with(|| date_tie(a, b))),
+        SortKey::Flag => messages.sort_by(|a, b| flag_rank(a).cmp(&flag_rank(b)).then_with(|| date_tie(a, b))),
         SortKey::Attachments => messages.sort_by(|a, b| b.has_attachment.cmp(&a.has_attachment).then_with(|| date_tie(a, b))),
     }
     // Ascending is the descending order reversed rather than a second set of
@@ -2160,6 +2194,20 @@ pub fn sort_messages(messages: &mut [EmailSummary], key: SortKey, descending: bo
     // really is the exact mirror of what was on screen.
     if !descending {
         messages.reverse();
+    }
+}
+
+/// A message's place under the Flag sort (item 1.16), "flagged first": open
+/// flags by due date, then undated ones, then completed, then unflagged -
+/// the same order `follow_up::FlagBucket` groups in.
+fn flag_rank(message: &EmailSummary) -> (u8, Option<DateTime<Utc>>) {
+    match message.follow_up() {
+        Some(flag) if flag.status == lookout_core::FlagStatus::Flagged => match flag.due {
+            Some(due) => (0, Some(due)),
+            None => (1, None),
+        },
+        Some(flag) if flag.status == lookout_core::FlagStatus::Complete => (2, None),
+        _ => (3, None),
     }
 }
 
@@ -2336,9 +2384,9 @@ mod tests {
         assert_eq!(filtered.selection.n_items(), 4, "Unread: two sections + two messages");
         assert_eq!(filtered.all_messages().len(), 4, "filtering never discards the truth");
 
-        filtered.set_filter(FilterSet::none().with(Filter::Flagged, true));
-        // Both flagged messages, read or not, in the single Today section.
-        assert_eq!(filtered.selection.n_items(), 3, "Flagged: one section + two messages");
+        filtered.set_filter(FilterSet::none().with(Filter::Pinned, true));
+        // Both pinned messages, read or not, in the single Today section.
+        assert_eq!(filtered.selection.n_items(), 3, "Pinned: one section + two messages");
 
         // A repopulate carrying the same full set under the same filter is
         // the identity case - the rebuild is skipped, so the row count (and
@@ -2811,14 +2859,14 @@ mod tests {
     }
 
     /// The pinned section would just duplicate the entire visible list under
-    /// the Flagged filter (everything shown is already pinned), so
+    /// the Pinned filter (everything shown is already pinned), so
     /// `compute_layout` skips pulling anything out in that case.
     #[test]
-    fn pinned_section_is_empty_under_the_flagged_filter() {
+    fn pinned_section_is_empty_under_the_pinned_filter() {
         let now = local(2026, 8, 4, 8);
         let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 8, 4))];
-        let computed = compute_layout(messages, FilterSet::none().with(Filter::Flagged, true), &HashSet::new(), SortKey::Date, true, false, now);
-        assert!(computed.pinned.is_empty(), "Flagged already shows nothing but pinned messages - no separate pin needed");
+        let computed = compute_layout(messages, FilterSet::none().with(Filter::Pinned, true), &HashSet::new(), SortKey::Date, true, false, now);
+        assert!(computed.pinned.is_empty(), "Pinned already shows nothing but pinned messages - no separate pin needed");
         let ListLayout::Grouped(sections) = computed.layout else {
             panic!("expected a grouped layout under Date sort")
         };
@@ -3154,6 +3202,7 @@ mod tests {
             latest: Utc.with_ymd_and_hms(2024, 1, 10, 10, 0, 0).unwrap(),
             has_unread: false,
             has_pinned: false,
+            follow_up: None,
             has_attachment: false,
             has_calendar: false,
             importance: lookout_core::Importance::Normal,
@@ -3201,6 +3250,10 @@ mod tests {
         let mut other_pinned = base.clone();
         other_pinned.has_pinned = true;
         assert_ne!(thread_row_key(&other_pinned), base_key);
+
+        let mut other_follow_up = base.clone();
+        other_follow_up.follow_up = Some(crate::follow_up::flagged(None));
+        assert_ne!(thread_row_key(&other_follow_up), base_key);
 
         let mut other_attachment = base.clone();
         other_attachment.has_attachment = true;
@@ -3316,7 +3369,10 @@ mod tests {
         assert_eq!(group_of(SortKey::Category, &alice, now).0, GroupKey::Category("work".to_string()));
         assert_eq!(group_of(SortKey::Size, &alice, now).0, GroupKey::Size(SizeBucket::Under5M));
         assert_eq!(group_of(SortKey::Importance, &alice, now).0, GroupKey::Importance(0));
-        assert_eq!(group_of(SortKey::Flag, &alice, now).0, GroupKey::Flag(false));
+        assert_eq!(group_of(SortKey::Flag, &alice, now).0, GroupKey::Flag(crate::follow_up::FlagBucket::Unflagged));
+        let mut flagged = alice.clone();
+        flagged.keywords.extend(lookout_core::follow_up_keywords(&crate::follow_up::flagged(Some(now.date_naive()))));
+        assert_eq!(group_of(SortKey::Flag, &flagged, now), (GroupKey::Flag(crate::follow_up::FlagBucket::Today), "Today".to_string()));
         assert_eq!(group_of(SortKey::Attachments, &alice, now).0, GroupKey::Attachment(true));
 
         // A senderless, categoryless fixture groups under "#" / "".
@@ -3334,7 +3390,7 @@ mod tests {
             m.importance = importance;
             m.has_attachment = attachment;
             if flagged {
-                m.flags.insert(lookout_core::SystemFlagBit::Flagged);
+                m.keywords.insert(lookout_core::FLAG_KEYWORD.to_string());
             }
             m
         };
@@ -3351,6 +3407,23 @@ mod tests {
         assert_eq!(uids(&messages), vec![2, 1], "High before Low");
         sort_messages(&mut messages, SortKey::Flag, true);
         assert_eq!(uids(&messages), vec![2, 1], "flagged first");
+
+        // Open flags by due date, then undated, then completed, then none.
+        let with_flag = |uid: u32, flag: lookout_core::FollowUpFlag| {
+            let mut m = summary(uid, same);
+            m.keywords.extend(lookout_core::follow_up_keywords(&flag));
+            m
+        };
+        let day = |d: u32| Some(chrono::NaiveDate::from_ymd_opt(2026, 10, d).unwrap());
+        let mut flags = vec![
+            summary(5, same),
+            with_flag(4, crate::follow_up::completed()),
+            with_flag(3, crate::follow_up::flagged(None)),
+            with_flag(2, crate::follow_up::flagged(day(20))),
+            with_flag(1, crate::follow_up::flagged(day(14))),
+        ];
+        sort_messages(&mut flags, SortKey::Flag, true);
+        assert_eq!(uids(&flags), vec![1, 2, 3, 4, 5]);
         sort_messages(&mut messages, SortKey::Attachments, true);
         assert_eq!(uids(&messages), vec![2, 1], "with attachments first");
     }
@@ -3410,32 +3483,46 @@ mod tests {
     }
 
     #[test]
-    fn filter_set_matches_read_and_flagged_state() {
+    fn filter_set_matches_read_and_pinned_state() {
         let viewer = HashSet::new();
         let mut read = summary(1, Utc::now());
         read.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen]);
         assert!(FilterSet::none().matches(&read, &viewer), "no filters shows everything");
         assert!(!FilterSet::none().with(Filter::Unread, true).matches(&read, &viewer));
-        assert!(!FilterSet::none().with(Filter::Flagged, true).matches(&read, &viewer));
+        assert!(!FilterSet::none().with(Filter::Pinned, true).matches(&read, &viewer));
 
         let unread = summary(2, Utc::now());
         assert!(FilterSet::none().with(Filter::Unread, true).matches(&unread, &viewer));
-        assert!(!FilterSet::none().with(Filter::Flagged, true).matches(&unread, &viewer));
+        assert!(!FilterSet::none().with(Filter::Pinned, true).matches(&unread, &viewer));
 
-        let mut flagged = summary(3, Utc::now());
-        flagged.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Flagged]);
-        assert!(FilterSet::none().with(Filter::Unread, true).matches(&flagged, &viewer), "a flagged-but-unread message belongs to both filters");
-        assert!(FilterSet::none().with(Filter::Flagged, true).matches(&flagged, &viewer));
+        let mut pinned = summary(3, Utc::now());
+        pinned.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Flagged]);
+        assert!(FilterSet::none().with(Filter::Unread, true).matches(&pinned, &viewer), "a pinned-but-unread message belongs to both filters");
+        assert!(FilterSet::none().with(Filter::Pinned, true).matches(&pinned, &viewer));
 
-        let mut flagged_read = summary(4, Utc::now());
-        flagged_read.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen, lookout_core::SystemFlagBit::Flagged]);
-        assert!(FilterSet::none().with(Filter::Flagged, true).matches(&flagged_read, &viewer));
-        assert!(!FilterSet::none().with(Filter::Unread, true).matches(&flagged_read, &viewer));
+        let mut pinned_read = summary(4, Utc::now());
+        pinned_read.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Seen, lookout_core::SystemFlagBit::Flagged]);
+        assert!(FilterSet::none().with(Filter::Pinned, true).matches(&pinned_read, &viewer));
+        assert!(!FilterSet::none().with(Filter::Unread, true).matches(&pinned_read, &viewer));
 
-        // Combined filters are ANDed: a read, unflagged message fails both.
-        let both = FilterSet::none().with(Filter::Unread, true).with(Filter::Flagged, true);
-        assert!(both.matches(&flagged, &viewer), "the flagged-unread message passes both");
-        assert!(!both.matches(&unread, &viewer), "an unflagged unread message fails Flagged");
+        // Combined filters are ANDed: a read, unpinned message fails both.
+        let both = FilterSet::none().with(Filter::Unread, true).with(Filter::Pinned, true);
+        assert!(both.matches(&pinned, &viewer), "the pinned-unread message passes both");
+        assert!(!both.matches(&unread, &viewer), "an unpinned unread message fails Pinned");
+    }
+
+    /// Flagged means an open follow-up flag (item 1.16), never Pin (UX-02).
+    #[test]
+    fn flagged_filter_matches_open_follow_up_flags_only() {
+        let viewer = HashSet::new();
+        let flagged = FilterSet::none().with(Filter::Flagged, true);
+        let mut open = summary(1, Utc::now());
+        open.keywords.extend(lookout_core::follow_up_keywords(&crate::follow_up::flagged(None)));
+        assert!(flagged.matches(&open, &viewer));
+        let mut done = summary(2, Utc::now());
+        done.keywords.extend(lookout_core::follow_up_keywords(&crate::follow_up::completed()));
+        assert!(!flagged.matches(&done, &viewer), "a completed flag isn't open");
+        assert!(!flagged.matches(&pinned(3, Utc::now()), &viewer), "Pin isn't a follow-up flag");
     }
 
     #[test]

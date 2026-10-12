@@ -9,8 +9,13 @@
 //! IMAP keywords, whose names are defined here so feature code never inlines
 //! them.
 //!
-//! Only the mapping lives in this module; the UI (today/tomorrow/… presets, a
-//! due-date list column, the linked task) is item 1.16.
+//! Only the mapping lives in this module; the presets, list column, reading
+//! pane bar and Tasks section live in the app (item 1.16).
+//!
+//! Keyword encoding (§4.2): a flagged message carries [`FLAG_KEYWORD`], plus
+//! `$Lookout-flag-due-<unix>` when it has a due date; a completed one carries
+//! only [`FLAG_DONE_KEYWORD`]. Due dates are date-only, stored as UTC midnight
+//! of the date, so a time-zone change never moves them.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -27,6 +32,9 @@ pub const REPLY_BY_HEADER: &str = "Reply-By";
 /// Unix seconds keep the atom legal (no spaces or reserved characters) and
 /// match the snooze keyword convention (§4.2).
 pub const FLAG_DUE_KEYWORD_PREFIX: &str = "$Lookout-flag-due-";
+/// IMAP keyword marking a message flagged for follow-up. A fixed atom (unlike
+/// the due keyword) so `UID SEARCH KEYWORD` can find every flagged message.
+pub const FLAG_KEYWORD: &str = "$Lookout-flagged";
 /// IMAP keyword marking a follow-up flag complete.
 pub const FLAG_DONE_KEYWORD: &str = "$Lookout-flag-done";
 
@@ -114,6 +122,68 @@ pub fn flag_due_from_keyword(keyword: &str) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(seconds, 0)
 }
 
+/// A message's follow-up flag from its IMAP keywords, or `None` when it isn't
+/// flagged. [`FLAG_DONE_KEYWORD`] wins over a stray [`FLAG_KEYWORD`] (a racing
+/// install may leave both), and the earliest due keyword wins when several
+/// survive. A due keyword without the flagged atom still reads as flagged.
+pub fn follow_up_from_keywords<'a>(keywords: impl IntoIterator<Item = &'a String>) -> Option<FollowUpFlag> {
+    let mut flagged = false;
+    let mut done = false;
+    let mut due: Option<DateTime<Utc>> = None;
+    for keyword in keywords {
+        if keyword == FLAG_KEYWORD {
+            flagged = true;
+        } else if keyword == FLAG_DONE_KEYWORD {
+            done = true;
+        } else if let Some(at) = flag_due_from_keyword(keyword) {
+            flagged = true;
+            due = Some(due.map_or(at, |current| current.min(at)));
+        }
+    }
+    if done {
+        return Some(FollowUpFlag {
+            status: FlagStatus::Complete,
+            ..Default::default()
+        });
+    }
+    flagged.then_some(FollowUpFlag {
+        status: FlagStatus::Flagged,
+        start: None,
+        due,
+        completed: None,
+    })
+}
+
+/// The IMAP keywords that encode `flag` (empty for [`FlagStatus::NotFlagged`]).
+pub fn follow_up_keywords(flag: &FollowUpFlag) -> Vec<String> {
+    match flag.status {
+        FlagStatus::NotFlagged => Vec::new(),
+        FlagStatus::Complete => vec![FLAG_DONE_KEYWORD.to_string()],
+        FlagStatus::Flagged => {
+            let mut keywords = vec![FLAG_KEYWORD.to_string()];
+            keywords.extend(flag.due.map(flag_due_keyword));
+            keywords
+        }
+    }
+}
+
+/// Every follow-up flag keyword among `keywords` - what changing or clearing a
+/// flag removes before adding the new state's keywords.
+pub fn flag_keywords<'a>(keywords: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    keywords.into_iter().filter(|keyword| is_flag_keyword(keyword)).cloned().collect()
+}
+
+/// Whether `keyword` is one of the follow-up flag keywords.
+pub fn is_flag_keyword(keyword: &str) -> bool {
+    keyword == FLAG_KEYWORD || keyword == FLAG_DONE_KEYWORD || keyword.starts_with(FLAG_DUE_KEYWORD_PREFIX)
+}
+
+/// The due instant for a due *date*: UTC midnight of that date, matching how
+/// all-day calendar boundaries are stored.
+pub fn flag_due_for_date(date: NaiveDate) -> DateTime<Utc> {
+    date.and_hms_opt(0, 0, 0).expect("midnight is valid").and_utc()
+}
+
 /// Parses an RFC 2156 `Reply-By` value: a full RFC 3339 date-time, a bare local
 /// date-time (assumed UTC), or a bare date. Outlook emits the first form.
 fn parse_reply_by(value: &str) -> Option<DateTime<Utc>> {
@@ -196,5 +266,61 @@ mod tests {
         assert_eq!(flag_due_from_keyword(&keyword), Some(due));
         assert_eq!(flag_due_from_keyword("$Lookout-tag-x"), None);
         assert_eq!(flag_due_from_keyword("$Lookout-flag-due-notanumber"), None);
+    }
+
+    fn set(keywords: &[&str]) -> Vec<String> {
+        keywords.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn keywords_round_trip_every_state() {
+        let due = flag_due_for_date(NaiveDate::from_ymd_opt(2026, 10, 16).unwrap());
+        for flag in [
+            FollowUpFlag {
+                status: FlagStatus::Flagged,
+                ..Default::default()
+            },
+            FollowUpFlag {
+                status: FlagStatus::Flagged,
+                due: Some(due),
+                ..Default::default()
+            },
+            FollowUpFlag {
+                status: FlagStatus::Complete,
+                ..Default::default()
+            },
+        ] {
+            let keywords = follow_up_keywords(&flag);
+            assert_eq!(follow_up_from_keywords(&keywords), Some(flag));
+        }
+        assert!(follow_up_keywords(&FollowUpFlag::default()).is_empty());
+        assert_eq!(follow_up_from_keywords(&set(&["$Lookout-tag-work", "\\Seen"])), None);
+    }
+
+    #[test]
+    fn done_wins_and_earliest_due_wins() {
+        let flag = follow_up_from_keywords(&set(&[FLAG_KEYWORD, FLAG_DONE_KEYWORD, "$Lookout-flag-due-100"])).unwrap();
+        assert_eq!(flag.status, FlagStatus::Complete);
+        assert_eq!(flag.due, None);
+
+        let flag = follow_up_from_keywords(&set(&[FLAG_KEYWORD, "$Lookout-flag-due-200", "$Lookout-flag-due-100"])).unwrap();
+        assert_eq!(flag.due, DateTime::from_timestamp(100, 0));
+        // A due keyword alone still reads as flagged; a malformed one is ignored.
+        assert_eq!(follow_up_from_keywords(&set(&["$Lookout-flag-due-100"])).unwrap().status, FlagStatus::Flagged);
+        assert_eq!(follow_up_from_keywords(&set(&["$Lookout-flag-due-x"])), None);
+    }
+
+    #[test]
+    fn flag_keywords_collects_only_flag_atoms() {
+        let keywords = set(&[FLAG_KEYWORD, "$Lookout-flag-due-5", FLAG_DONE_KEYWORD, "$Lookout-tag-x", "$Lookout-snooze-5"]);
+        assert_eq!(flag_keywords(&keywords), set(&[FLAG_KEYWORD, "$Lookout-flag-due-5", FLAG_DONE_KEYWORD]));
+    }
+
+    #[test]
+    fn due_dates_are_utc_midnight_so_the_date_survives_any_zone() {
+        let date = NaiveDate::from_ymd_opt(2026, 10, 16).unwrap();
+        let due = flag_due_for_date(date);
+        assert_eq!(due.date_naive(), date);
+        assert_eq!(flag_due_from_keyword(&flag_due_keyword(due)).unwrap().date_naive(), date);
     }
 }

@@ -178,6 +178,17 @@ impl EmailSummary {
     pub fn is_pinned(&self) -> bool {
         self.flags.contains(&SystemFlagBit::Flagged)
     }
+
+    /// The message's follow-up flag (M-10), read from its keywords - distinct
+    /// from Pin, which is `\Flagged`. `None` when it isn't flagged.
+    pub fn follow_up(&self) -> Option<crate::interop::FollowUpFlag> {
+        crate::interop::follow_up_from_keywords(&self.keywords)
+    }
+
+    /// Whether the message carries an open (not completed) follow-up flag.
+    pub fn is_flagged_for_follow_up(&self) -> bool {
+        self.follow_up().is_some_and(|flag| flag.status == crate::interop::FlagStatus::Flagged)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

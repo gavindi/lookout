@@ -428,6 +428,12 @@ fn serialize_emails(messages: &[EmailSummary]) -> serde_json::Value {
                 "to": message.to.iter().map(address_label).collect::<Vec<_>>(),
                 "date": message.date.to_rfc3339(),
                 "unread": message.is_unread(),
+                // The follow-up flag (item 1.16): "flagged" or "complete",
+                // with its due date.
+                "flag": message.follow_up().map(|flag| match flag.status {
+                    lookout_core::FlagStatus::Complete => serde_json::json!({"status": "complete"}),
+                    _ => serde_json::json!({"status": "flagged", "due": crate::follow_up::due_date(&flag).map(|d| d.to_string())}),
+                }),
                 "preview": message.preview.clone().unwrap_or_default(),
                 "mailbox": message.mailbox.0,
                 "uid": message.uid.0,

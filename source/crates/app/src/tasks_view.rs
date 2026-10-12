@@ -10,9 +10,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use chrono::{Duration, Local, NaiveDate, NaiveDateTime};
+use chrono::{Duration, Local, NaiveDate, NaiveDateTime, Weekday};
 use gtk::prelude::*;
-use lookout_core::{CalendarTask, TaskStatus};
+use lookout_core::{CalendarTask, EmailSummary, TaskStatus};
 
 use crate::calendar_colors::CalendarColorMap;
 
@@ -109,8 +109,13 @@ pub fn group_tasks(tasks: &[CalendarTask], now: NaiveDateTime) -> Vec<(TaskBucke
 pub struct TasksView {
     pub root: gtk::ScrolledWindow,
     list: gtk::Box,
+    /// The "Flagged email" section above the task buckets (item 1.16),
+    /// repainted on its own by [`set_flagged_mail`].
+    flagged: gtk::Box,
     toggle: RefCell<Option<ToggleHandler>>,
     activate: RefCell<Option<ActivateHandler>>,
+    flag_complete: RefCell<Option<FlagCompleteHandler>>,
+    flag_open: RefCell<Option<FlagOpenHandler>>,
     /// The message shown when the list is empty - the caller sets it to
     /// reflect what task sources exist (see `window::refresh_tasks_view`),
     /// defaulting to a plain "no tasks yet" hint.
@@ -122,6 +127,11 @@ pub struct TasksView {
 pub type ToggleHandler = Rc<dyn Fn(CalendarTask, bool) + 'static>;
 /// A clicked row: the caller should open the task editor for it.
 pub(crate) type ActivateHandler = Rc<dyn Fn(CalendarTask) + 'static>;
+/// A flagged-email row's checkbox: the caller marks the message's flag
+/// complete.
+pub(crate) type FlagCompleteHandler = Rc<dyn Fn(EmailSummary) + 'static>;
+/// A clicked flagged-email row: the caller opens the message.
+pub(crate) type FlagOpenHandler = Rc<dyn Fn(EmailSummary) + 'static>;
 
 /// Builds a fresh Tasks view: a scrolled list inside a card, with an empty
 /// placeholder for the no-tasks state.
@@ -135,12 +145,26 @@ pub fn build_tasks_view() -> TasksView {
         .margin_start(8)
         .margin_end(8)
         .build();
-    let root = gtk::ScrolledWindow::builder().child(&list).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build();
+    let flagged = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(8)
+        .margin_start(8)
+        .margin_end(8)
+        .visible(false)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&flagged);
+    content.append(&list);
+    let root = gtk::ScrolledWindow::builder().child(&content).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build();
     TasksView {
         root,
         list,
+        flagged,
         toggle: RefCell::new(None),
         activate: RefCell::new(None),
+        flag_complete: RefCell::new(None),
+        flag_open: RefCell::new(None),
         empty_message: RefCell::new("No tasks yet - use New task to create one.".to_string()),
     }
 }
@@ -150,6 +174,124 @@ pub fn build_tasks_view() -> TasksView {
 pub fn set_handlers(view: &TasksView, toggle: ToggleHandler, activate: ActivateHandler) {
     *view.toggle.borrow_mut() = Some(toggle);
     *view.activate.borrow_mut() = Some(activate);
+}
+
+/// Stores the flagged-email row callbacks (item 1.16). Called once at
+/// startup, like [`set_handlers`].
+pub(crate) fn set_flag_handlers(view: &TasksView, complete: FlagCompleteHandler, open: FlagOpenHandler) {
+    *view.flag_complete.borrow_mut() = Some(complete);
+    *view.flag_open.borrow_mut() = Some(open);
+}
+
+/// The messages the "Flagged email" section lists: open follow-up flags only
+/// (completing one drops it, as Outlook's To Do list does), most urgent
+/// first - by `FlagBucket`, then due date, then newest message.
+pub fn flagged_mail_rows(messages: &[EmailSummary], today: NaiveDate, week_start: Weekday) -> Vec<EmailSummary> {
+    let mut rows: Vec<(crate::follow_up::FlagBucket, EmailSummary)> = messages
+        .iter()
+        .filter(|message| message.is_flagged_for_follow_up())
+        .map(|message| (crate::follow_up::bucket(message.follow_up().as_ref(), today, week_start), message.clone()))
+        .collect();
+    rows.sort_by(|(a_bucket, a), (b_bucket, b)| {
+        let due = |m: &EmailSummary| m.follow_up().and_then(|flag| flag.due);
+        a_bucket.cmp(b_bucket).then_with(|| due(a).cmp(&due(b))).then_with(|| b.date.cmp(&a.date))
+    });
+    rows.into_iter().map(|(_, message)| message).collect()
+}
+
+/// Repaints the "Flagged email" section from `messages` (every account's
+/// flagged mail). Hidden when nothing is flagged.
+pub fn set_flagged_mail(view: &TasksView, messages: &[EmailSummary]) {
+    while let Some(child) = view.flagged.first_child() {
+        view.flagged.remove(&child);
+    }
+    let zone = crate::calendar_tz::display_zone();
+    let today = zone.today();
+    let rows = flagged_mail_rows(messages, today, crate::message_list::current_week_start());
+    view.flagged.set_visible(!rows.is_empty());
+    if rows.is_empty() {
+        return;
+    }
+    view.flagged.append(
+        &gtk::Label::builder()
+            .label("Flagged email")
+            .css_classes(["dim-label", "caption-heading"])
+            .xalign(0.0)
+            .margin_bottom(2)
+            .build(),
+    );
+    let complete = view.flag_complete.borrow().clone().unwrap_or_else(|| Rc::new(|_| {}));
+    let open = view.flag_open.borrow().clone().unwrap_or_else(|| Rc::new(|_| {}));
+    for message in rows {
+        view.flagged.append(&flagged_mail_row(&message, today, Some(complete.clone()), open.clone(), &[]));
+    }
+}
+
+/// Opens a message through the `app.open-message` action - the click
+/// handler for flagged-email rows outside the Tasks view (the dashboard and
+/// the Mail overview pane), which hold no window handles of their own.
+pub(crate) fn open_message_through_app() -> FlagOpenHandler {
+    Rc::new(|message: EmailSummary| {
+        if let Some(app) = gtk::gio::Application::default() {
+            let target = format!("{}:{}", message.uid.0, message.mailbox.0);
+            app.activate_action("open-message", Some(&target.to_variant()));
+        }
+    })
+}
+
+/// One flagged-email row: a completion checkbox (when `complete` is given),
+/// a mail icon, the subject over the sender, and the due label ("Due Tue",
+/// "Overdue"). `summary_classes` are extra classes for the subject, as in
+/// [`task_row`]. `pub(crate)` for the dashboard and the Mail overview pane.
+pub(crate) fn flagged_mail_row(message: &EmailSummary, today: NaiveDate, complete: Option<FlagCompleteHandler>, open: FlagOpenHandler, summary_classes: &[&str]) -> gtk::Button {
+    let check = complete.as_ref().map(|_| {
+        let check = gtk::CheckButton::new();
+        check.set_tooltip_text(Some("Mark complete"));
+        check
+    });
+    let icon = gtk::Image::builder().icon_name("mail-unread-symbolic").pixel_size(12).valign(gtk::Align::Center).build();
+    let subject = gtk::Label::builder()
+        .label(message.subject.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("(no subject)"))
+        .css_classes(summary_classes)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    let sender = gtk::Label::builder()
+        .label(message.from.first().map(|a| a.display_label().to_string()).unwrap_or_default())
+        .css_classes(["dim-label", "caption"])
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).build();
+    text.append(&subject);
+    text.append(&sender);
+    let due_date = message.follow_up().as_ref().and_then(crate::follow_up::due_date);
+    let due = gtk::Label::builder()
+        .label(due_date.map(|d| crate::follow_up::due_label(d, today)).unwrap_or_default())
+        .css_classes(["dim-label", "caption"])
+        .build();
+    if due_date.is_some_and(|d| d < today) {
+        due.add_css_class("task-due-overdue");
+    }
+    let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).margin_start(4).margin_end(4).build();
+    if let Some(check) = &check {
+        row_box.append(check);
+    }
+    row_box.append(&icon);
+    row_box.append(&text);
+    row_box.append(&due);
+    let button = gtk::Button::builder().child(&row_box).css_classes(["flat"]).hexpand(true).build();
+    if let (Some(check), Some(complete)) = (&check, complete) {
+        let message = message.clone();
+        check.connect_toggled(move |check| {
+            if check.is_active() {
+                complete(message.clone());
+            }
+        });
+    }
+    let message = message.clone();
+    button.connect_clicked(move |_| open(message.clone()));
+    button
 }
 
 /// Sets the message the empty state shows when there are no tasks at all -
@@ -429,5 +571,46 @@ mod tests {
         sort_bucket(&mut tasks);
         let order: Vec<&str> = tasks.iter().map(|t| t.summary.as_deref().unwrap()).collect();
         assert_eq!(order, vec!["c-prio1", "c-prio9", "c-prio0", "b-later", "a-undated"]);
+    }
+
+    fn flagged_message(uid: u32, flag: lookout_core::FollowUpFlag) -> EmailSummary {
+        EmailSummary {
+            uid: lookout_core::Uid(uid),
+            mailbox: lookout_core::MailboxId("a:INBOX".into()),
+            message_id: None,
+            in_reply_to: None,
+            references: Vec::new(),
+            thread_key: lookout_core::ThreadKey(String::new()),
+            subject: Some(format!("m{uid}")),
+            from: Vec::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: chrono::Utc.with_ymd_and_hms(2026, 10, 1, 9, 0, 0).unwrap(),
+            flags: Default::default(),
+            keywords: lookout_core::follow_up_keywords(&flag).into_iter().collect(),
+            size: 0,
+            has_attachment: false,
+            has_calendar: false,
+            preview: None,
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
+            structure: None,
+        }
+    }
+
+    #[test]
+    fn flagged_mail_lists_open_flags_most_urgent_first() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        let day = |d: u32| Some(NaiveDate::from_ymd_opt(2026, 10, d).unwrap());
+        let messages = vec![
+            flagged_message(1, crate::follow_up::flagged(None)),
+            flagged_message(2, crate::follow_up::completed()),
+            flagged_message(3, crate::follow_up::flagged(day(20))),
+            flagged_message(4, crate::follow_up::flagged(day(10))),
+            flagged_message(5, crate::follow_up::flagged(day(13))),
+        ];
+        let order: Vec<u32> = flagged_mail_rows(&messages, today, Weekday::Mon).iter().map(|m| m.uid.0).collect();
+        assert_eq!(order, vec![4, 5, 3, 1], "overdue, today, next week, undated; the completed one is left out");
     }
 }

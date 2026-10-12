@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Local, Timelike, Utc};
-use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailBody, EmailSummary, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
+use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailBody, EmailSummary, FlagStatus, FollowUpFlag, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
@@ -389,6 +389,77 @@ fn load_summary_row(conn: &rusqlite::Connection, mailbox_id: &MailboxId, uid: Ui
     }
 }
 
+/// The `follow_up_flags` key for a message: its bare Message-ID, or - for the
+/// rare message without one - its folder and UID.
+pub fn follow_up_key(summary: &EmailSummary) -> String {
+    match summary.message_id.as_deref().map(bare_message_id).filter(|id| !id.is_empty()) {
+        Some(id) => id,
+        None => format!("uid:{}:{}", summary.mailbox.0, summary.uid.0),
+    }
+}
+
+fn bare_message_id(id: &str) -> String {
+    id.trim().trim_start_matches('<').trim_end_matches('>').to_string()
+}
+
+fn flag_status_code(status: FlagStatus) -> i64 {
+    match status {
+        FlagStatus::NotFlagged => 0,
+        FlagStatus::Flagged => 1,
+        FlagStatus::Complete => 2,
+    }
+}
+
+fn load_local_follow_ups(conn: &Connection) -> Result<HashMap<String, FollowUpFlag>> {
+    let mut stmt = conn.prepare("SELECT message_key, status, due, completed FROM follow_up_flags")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<i64>>(3)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, status, due, completed) = row?;
+        let status = match status {
+            1 => FlagStatus::Flagged,
+            2 => FlagStatus::Complete,
+            _ => FlagStatus::NotFlagged,
+        };
+        out.insert(
+            key,
+            FollowUpFlag {
+                status,
+                start: None,
+                due: due.and_then(|t| DateTime::from_timestamp(t, 0)),
+                completed: completed.and_then(|t| DateTime::from_timestamp(t, 0)),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Rewrites `summary`'s follow-up keywords to the local row's state, if it
+/// has one, so the UI reads one representation however the flag is stored.
+fn apply_local_follow_up(local: &HashMap<String, FollowUpFlag>, summary: &mut EmailSummary) {
+    let Some(flag) = local.get(&follow_up_key(summary)) else {
+        return;
+    };
+    summary.keywords.retain(|k| !lookout_core::is_flag_keyword(k));
+    summary.keywords.extend(lookout_core::follow_up_keywords(flag));
+}
+
+fn overlay_local_follow_ups(conn: &Connection, messages: &mut [EmailSummary]) -> Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let local = load_local_follow_ups(conn)?;
+    if !local.is_empty() {
+        for summary in messages.iter_mut() {
+            apply_local_follow_up(&local, summary);
+        }
+    }
+    Ok(())
+}
+
+
 /// Converts a free-text user query into a valid FTS5 `MATCH` expression, or
 /// `None` when there's nothing to search for.
 ///
@@ -496,6 +567,13 @@ impl Cache {
                 uid INTEGER NOT NULL,
                 snoozed_until INTEGER NOT NULL,
                 PRIMARY KEY (mailbox_id, uid)
+            );
+            CREATE TABLE IF NOT EXISTS follow_up_flags (
+                message_key TEXT PRIMARY KEY,
+                status INTEGER NOT NULL,
+                due INTEGER,
+                completed INTEGER,
+                updated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS bodies (
                 mailbox_id TEXT NOT NULL,
@@ -895,6 +973,7 @@ impl Cache {
                 messages.push(msg);
             }
         }
+        overlay_local_follow_ups(&conn, &mut messages)?;
         Ok(messages)
     }
 
@@ -961,6 +1040,12 @@ impl Cache {
                 if let Ok(summary) = serde_json::from_str::<EmailSummary>(&data) {
                     out.insert(uid, summary);
                 }
+            }
+        }
+        let local = load_local_follow_ups(&conn)?;
+        if !local.is_empty() {
+            for summary in out.values_mut() {
+                apply_local_follow_up(&local, summary);
             }
         }
         Ok(out)
@@ -1502,6 +1587,7 @@ impl Cache {
             }
             out.push(serde_json::from_str(&data)?);
         }
+        overlay_local_follow_ups(&conn, &mut out)?;
         Ok(out)
     }
 
@@ -1552,6 +1638,7 @@ impl Cache {
             }
             out.push(serde_json::from_str(&data)?);
         }
+        overlay_local_follow_ups(&conn, &mut out)?;
         Ok(out)
     }
 
@@ -1868,6 +1955,108 @@ impl Cache {
         let ts: Option<i64> = conn.query_row("SELECT MIN(snoozed_until) FROM snoozed", [], |row| row.get(0))?;
         Ok(ts.and_then(|t| DateTime::from_timestamp(t, 0)))
     }
+
+    /// Records follow-up flags for messages whose folder can't store custom
+    /// keywords (item 1.16; Exchange IMAP lacks `\*` in `PERMANENTFLAGS`), or
+    /// that Graph reported. Keyed by [`follow_up_key`] - the Message-ID where
+    /// there is one - so the flag follows the message across moves and
+    /// matches Graph's `internetMessageId`. A `NotFlagged` row is kept as a
+    /// tombstone: it overrides a stale flag keyword and stops an older Graph
+    /// snapshot from resurrecting a flag cleared here.
+    pub fn set_local_follow_ups(&self, summaries: &[EmailSummary], flag: &FollowUpFlag, now: DateTime<Utc>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO follow_up_flags (message_key, status, due, completed, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+            for summary in summaries {
+                stmt.execute(rusqlite::params![
+                    follow_up_key(summary),
+                    flag_status_code(flag.status),
+                    flag.due.map(|d| d.timestamp()),
+                    flag.completed.map(|d| d.timestamp()),
+                    now.timestamp()
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drops the local follow-up rows for `summaries` - their keywords on the
+    /// server are authoritative again (a keyword STORE just succeeded).
+    pub fn clear_local_follow_ups(&self, summaries: &[EmailSummary]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM follow_up_flags WHERE message_key = ?1")?;
+            for summary in summaries {
+                stmt.execute([follow_up_key(summary)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces the local follow-up rows with a Graph snapshot of every
+    /// flagged message (item 1.16), keyed by bare Message-ID. Rows written
+    /// after `taken_at` - a change made here while the snapshot was in
+    /// flight - are kept as they are, so the snapshot can't undo it.
+    pub fn apply_remote_follow_ups(&self, snapshot: &[(String, FollowUpFlag)], taken_at: DateTime<Utc>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM follow_up_flags WHERE updated_at <= ?1", [taken_at.timestamp()])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO follow_up_flags (message_key, status, due, completed, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+            for (message_id, flag) in snapshot {
+                let key = bare_message_id(message_id);
+                if key.is_empty() {
+                    continue;
+                }
+                stmt.execute(rusqlite::params![
+                    key,
+                    flag_status_code(flag.status),
+                    flag.due.map(|d| d.timestamp()),
+                    flag.completed.map(|d| d.timestamp()),
+                    taken_at.timestamp()
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Applies the local follow-up rows to `messages` (see
+    /// `set_local_follow_ups`), for summaries that came from the server
+    /// rather than from a cache read, which overlays them already.
+    pub fn overlay_follow_ups(&self, messages: &mut [EmailSummary]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        overlay_local_follow_ups(&conn, messages)
+    }
+
+    /// Every cached message carrying a follow-up flag (open or complete),
+    /// across the account's folders - the Tasks view's "Flagged email"
+    /// section (item 1.16). Includes the prefetch's `partial` rows, so flagged
+    /// mail in a folder never opened still shows. A message cached in several
+    /// folders (a copy) is listed once.
+    pub fn flagged_messages(&self) -> Result<Vec<EmailSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT data FROM messages WHERE data LIKE '%$Lookout-flag%' \
+             OR trim(json_extract(data, '$.message_id'), '<> ') IN (SELECT message_key FROM follow_up_flags WHERE status != 0)",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut messages = Vec::new();
+        for row in rows {
+            if let Ok(msg) = serde_json::from_str::<EmailSummary>(&row?) {
+                messages.push(msg);
+            }
+        }
+        overlay_local_follow_ups(&conn, &mut messages)?;
+        let mut seen = HashSet::new();
+        messages.retain(|m| m.follow_up().is_some() && seen.insert(follow_up_key(m)));
+        Ok(messages)
+    }
+
 
     /// Adds an outgoing message to the local outbox, due at `not_before`
     /// (`Utc::now()` for a normal send, a future time for schedule send).
@@ -2717,6 +2906,92 @@ mod tests {
         assert_eq!(cache.next_outbox_not_before().unwrap(), None);
         cache.delete_outbox(due_id).unwrap();
         assert!(cache.all_outbox().unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn with_message_id(summary: EmailSummary, id: &str) -> EmailSummary {
+        EmailSummary {
+            message_id: Some(format!("<{id}>")),
+            ..summary
+        }
+    }
+
+    fn flagged(due: Option<DateTime<Utc>>) -> FollowUpFlag {
+        FollowUpFlag {
+            status: FlagStatus::Flagged,
+            due,
+            ..Default::default()
+        }
+    }
+
+    /// A local follow-up row (a folder without keyword support) shows on
+    /// every read path as the same keywords the server path would store, and
+    /// a tombstone masks a stale keyword.
+    #[test]
+    fn local_follow_ups_overlay_cache_reads_and_list_flagged_mail() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let mut keyworded = with_message_id(sample_summary(&mailbox_id, 2, None), "two@x");
+        keyworded.keywords.insert(lookout_core::FLAG_KEYWORD.to_string());
+        let plain = with_message_id(sample_summary(&mailbox_id, 1, None), "one@x");
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[plain.clone(), keyworded.clone()]).unwrap();
+
+        let due = lookout_core::flag_due_for_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap());
+        cache.set_local_follow_ups(std::slice::from_ref(&plain), &flagged(Some(due)), Utc::now()).unwrap();
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        let one = loaded.iter().find(|m| m.uid == Uid(1)).unwrap();
+        assert_eq!(one.follow_up(), Some(flagged(Some(due))));
+        assert_eq!(cache.load_summaries(&mailbox_id, &[Uid(1)]).unwrap()[&Uid(1)].follow_up(), Some(flagged(Some(due))));
+
+        let mut listed: Vec<u32> = cache.flagged_messages().unwrap().iter().map(|m| m.uid.0).collect();
+        listed.sort();
+        assert_eq!(listed, vec![1, 2], "both the keyword and the local flag are listed");
+
+        // A tombstone overrides the keyword the server still shows.
+        cache.set_local_follow_ups(std::slice::from_ref(&keyworded), &FollowUpFlag::default(), Utc::now()).unwrap();
+        assert_eq!(cache.load_summaries(&mailbox_id, &[Uid(2)]).unwrap()[&Uid(2)].follow_up(), None);
+        assert_eq!(cache.flagged_messages().unwrap().iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1]);
+
+        // Server summaries (not cache reads) get the same overlay.
+        let mut fresh = vec![plain.clone()];
+        cache.overlay_follow_ups(&mut fresh).unwrap();
+        assert!(fresh[0].is_flagged_for_follow_up());
+
+        cache.clear_local_follow_ups(&[plain, keyworded]).unwrap();
+        assert_eq!(cache.flagged_messages().unwrap().iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![2]);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A Graph snapshot replaces the local rows, but never one changed here
+    /// after the snapshot was taken.
+    #[test]
+    fn remote_follow_up_snapshot_replaces_older_rows_only() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let a = with_message_id(sample_summary(&mailbox_id, 1, None), "a@x");
+        let b = with_message_id(sample_summary(&mailbox_id, 2, None), "b@x");
+        let c = with_message_id(sample_summary(&mailbox_id, 3, None), "c@x");
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[a.clone(), b.clone(), c.clone()]).unwrap();
+
+        let taken_at = Utc::now();
+        // `a` was flagged before the snapshot (and cleared in Outlook since);
+        // `b` was cleared here after the snapshot was taken.
+        cache.set_local_follow_ups(std::slice::from_ref(&a), &flagged(None), taken_at - chrono::Duration::minutes(5)).unwrap();
+        cache.set_local_follow_ups(std::slice::from_ref(&b), &FollowUpFlag::default(), taken_at + chrono::Duration::seconds(5)).unwrap();
+        cache
+            .apply_remote_follow_ups(&[("<b@x>".to_string(), flagged(None)), ("c@x".to_string(), flagged(None))], taken_at)
+            .unwrap();
+
+        let loaded = cache.load_summaries(&mailbox_id, &[Uid(1), Uid(2), Uid(3)]).unwrap();
+        assert_eq!(loaded[&Uid(1)].follow_up(), None, "the snapshot no longer lists a");
+        assert_eq!(loaded[&Uid(2)].follow_up(), None, "the newer local clear wins over the snapshot");
+        assert!(loaded[&Uid(3)].is_flagged_for_follow_up());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

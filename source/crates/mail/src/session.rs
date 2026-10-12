@@ -585,6 +585,25 @@ pub enum AccountCommand {
         add: Vec<String>,
         remove: Vec<String>,
     },
+    /// Sets the follow-up flag (item 1.16 / M-10) on `uids`, replacing
+    /// whatever flag state they had; `FlagStatus::NotFlagged` clears it.
+    /// Stored as `$Lookout-flagged` / `$Lookout-flag-due-<unix>` /
+    /// `$Lookout-flag-done` keywords (§4.2) where the folder's
+    /// `PERMANENTFLAGS` allow custom keywords, and in the cache's local
+    /// `follow_up_flags` table otherwise (Exchange IMAP). Answered by
+    /// `MessagesUpdated` and `FlaggedMessages`, or `FollowUpFailed`.
+    SetFollowUp {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        flag: lookout_core::FollowUpFlag,
+    },
+    /// A Graph snapshot of every flagged message on a Microsoft 365 mailbox
+    /// (item 1.16), as `(internetMessageId, flag)` pairs taken at `taken_at`.
+    /// Replaces the local follow-up rows, except ones changed here since.
+    ApplyRemoteFollowUps {
+        snapshot: Vec<(String, lookout_core::FollowUpFlag)>,
+        taken_at: chrono::DateTime<chrono::Utc>,
+    },
     /// Kick off background body prefetch for all mailboxes. The prefetch
     /// runs cooperatively in batches between IDLE cycles, fetching full
     /// message bodies and caching them on disk so subsequent message views
@@ -811,6 +830,28 @@ pub enum AccountEvent {
         role: MailboxRole,
     },
     MessageSnoozed,
+    /// A `SetFollowUp` couldn't be stored anywhere; the UI restores the flag
+    /// state it optimistically showed for `uids`.
+    FollowUpFailed {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        message: String,
+    },
+    /// A `SetFollowUp` was stored (on the server or locally): `message_ids`
+    /// are the affected messages' `Message-ID`s, so the UI can mirror the
+    /// change to Outlook through Graph on Microsoft 365 (item 1.16) whatever
+    /// sent it - an action or its undo.
+    FollowUpSet {
+        message_ids: Vec<String>,
+        flag: lookout_core::FollowUpFlag,
+    },
+    /// Every cached message on the account carrying a follow-up flag, open
+    /// or complete (item 1.16) - the Tasks view's "Flagged email". Emitted
+    /// at session start (before connecting) and after each sync or flag
+    /// change.
+    FlaggedMessages {
+        messages: Vec<EmailSummary>,
+    },
     /// The answer to an `AccountCommand::EmptyMailbox`: every message is gone
     /// from the server. `role` is the emptied mailbox's role (Trash/Junk),
     /// so the UI can name the confirmation toast.
@@ -916,6 +957,14 @@ fn bare_address(token: &str) -> &str {
     match (token.rfind('<'), token.rfind('>')) {
         (Some(start), Some(end)) if start < end => token[start + 1..end].trim(),
         _ => token.trim(),
+    }
+}
+
+/// Emits every cached follow-up-flagged message as `FlaggedMessages` (item
+/// 1.16).
+async fn emit_flagged_messages(cache: &CacheHandle, events: &async_channel::Sender<AccountEvent>) {
+    if let Some(Ok(messages)) = cache_op(cache, |c| c.flagged_messages()).await {
+        let _ = events.send(AccountEvent::FlaggedMessages { messages }).await;
     }
 }
 
@@ -1084,6 +1133,7 @@ pub async fn run_account_session(
     // The outbox too, so scheduled and unsent messages are listed (item
     // 1.14) even while the account can't connect.
     emit_outbox_contents(&cache, &events).await;
+    emit_flagged_messages(&cache, &events).await;
 
     // One-time FTS backfill, fired off to the blocking pool *without*
     // awaiting. It used to run inline before the connection was even
@@ -1418,6 +1468,9 @@ async fn connect_and_run(
     // Scheduled for snoozes another Lookout install made. All of them cap the
     // IDLE slice like `next_outbox_due`, so a snooze wakes on time.
     let mut scheduled_keywords_ok: Option<bool> = None;
+    // Per folder: whether its `PERMANENTFLAGS` allow custom keywords, learnt
+    // on the first follow-up flag set there (item 1.16).
+    let mut keywords_ok: HashMap<MailboxId, bool> = HashMap::new();
     let mut server_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut local_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = cache_op(cache, |c| c.next_snooze_wake()).await.and_then(|r| r.ok()).flatten();
     let mut next_scheduled_scan = chrono::Utc::now();
@@ -1586,7 +1639,7 @@ async fn connect_and_run(
             }
             if let Some((path, scheduled_id)) = scheduled.filter(|_| server_due) {
                 next_scheduled_scan = now + SCHEDULED_RESCAN;
-                let accepts = select_scheduled(&mut session, &path).await?;
+                let accepts = select_accepting_keywords(&mut session, &path).await?;
                 session_selected = scheduled_id.clone();
                 scheduled_keywords_ok = Some(accepts);
                 let items = if accepts { scan_scheduled(&mut session).await? } else { Vec::new() };
@@ -3023,7 +3076,7 @@ async fn connect_and_run(
                         }
                         if let Some((scheduled_path, scheduled_id)) = scheduled_folder(&folders, &account_id) {
                             if scheduled_keywords_ok.is_none() {
-                                let accepts = select_scheduled(&mut session, &scheduled_path).await?;
+                                let accepts = select_accepting_keywords(&mut session, &scheduled_path).await?;
                                 session_selected = scheduled_id.clone();
                                 scheduled_keywords_ok = Some(accepts);
                                 if !accepts {
@@ -3558,6 +3611,118 @@ async fn connect_and_run(
                             let _ = events.send(AccountEvent::Error(format!("Couldn't update message tags: {e}"))).await;
                         }
                     }
+                }
+                AccountCommand::SetFollowUp { mailbox, uids, flag } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    // Same folder contract as `StoreKeywords`; the SELECT also
+                    // learns whether the folder keeps custom keywords.
+                    if session_selected != mailbox || !keywords_ok.contains_key(&mailbox) {
+                        let accepts = select_accepting_keywords(&mut session, &path).await?;
+                        session_selected = mailbox.clone();
+                        if !accepts {
+                            tracing::info!(%mailbox, "folder can't store keywords; follow-up flags stay local");
+                        }
+                        keywords_ok.insert(mailbox.clone(), accepts);
+                    }
+                    let summaries: Vec<EmailSummary> = cache_op(cache, {
+                        let mailbox = mailbox.clone();
+                        let uids = uids.clone();
+                        move |c| c.load_summaries(&mailbox, &uids)
+                    })
+                    .await
+                    .and_then(|r| r.ok())
+                    .map(|found| found.into_values().collect())
+                    .unwrap_or_default();
+                    let add = lookout_core::follow_up_keywords(&flag);
+                    let mut on_server = false;
+                    if keywords_ok.get(&mailbox) == Some(&true) {
+                        // Strip whatever flag keywords are on the server now
+                        // (an older due date, a stray done) and add the new
+                        // state's, in one STORE per side.
+                        let stored = match flag_keywords_by_uid(&mut session, &uids).await {
+                            Ok(found) => {
+                                let remove: Vec<String> = found
+                                    .into_iter()
+                                    .flat_map(|(_, keywords)| keywords)
+                                    .filter(|keyword| !add.contains(keyword) && valid_keyword_atom(keyword))
+                                    .collect::<std::collections::BTreeSet<_>>()
+                                    .into_iter()
+                                    .collect();
+                                store_raw_flags(&mut session, &uids, &add, &remove).await.map(|()| remove)
+                            }
+                            Err(e) => Err(e),
+                        };
+                        match stored {
+                            Ok(remove) => {
+                                on_server = true;
+                                // The cached rows may hold flag keywords the
+                                // server didn't (a local overlay), so those go too.
+                                let cached = summaries.iter().flat_map(|summary| lookout_core::flag_keywords(&summary.keywords));
+                                let flag_keywords: Vec<String> = remove.into_iter().chain(cached).filter(|keyword| !add.contains(keyword)).collect();
+                                if let Some(Err(e)) = cache_op(cache, {
+                                    let mailbox = mailbox.clone();
+                                    let uids = uids.clone();
+                                    let add = add.clone();
+                                    let summaries = summaries.clone();
+                                    move |c| {
+                                        c.update_keywords_many(&mailbox, &uids, &add, &flag_keywords)?;
+                                        // The keywords are authoritative now;
+                                        // drop any local row that would mask them.
+                                        c.clear_local_follow_ups(&summaries)
+                                    }
+                                })
+                                .await
+                                {
+                                    tracing::warn!("failed to cache follow-up flags: {e}");
+                                }
+                            }
+                            Err(e) => tracing::warn!("couldn't store follow-up keywords, keeping the flag locally: {e}"),
+                        }
+                    }
+                    let mut stored = on_server;
+                    if !on_server {
+                        let result = cache_op(cache, {
+                            let summaries = summaries.clone();
+                            let flag = flag.clone();
+                            move |c| c.set_local_follow_ups(&summaries, &flag, chrono::Utc::now())
+                        })
+                        .await;
+                        let failure = match &result {
+                            Some(Ok(())) if summaries.len() == uids.len() => None,
+                            Some(Ok(())) => Some("some messages aren't cached yet".to_string()),
+                            Some(Err(e)) => Some(e.to_string()),
+                            None => Some("no local cache".to_string()),
+                        };
+                        stored = !matches!(result, Some(Err(_)) | None);
+                        if let Some(message) = failure {
+                            let _ = events
+                                .send(AccountEvent::FollowUpFailed {
+                                    mailbox: mailbox.clone(),
+                                    uids: uids.clone(),
+                                    message: format!("Couldn't flag the message: {message}"),
+                                })
+                                .await;
+                        }
+                    }
+                    if stored {
+                        let message_ids: Vec<String> = summaries.iter().filter_map(|summary| summary.message_id.clone()).collect();
+                        let _ = events.send(AccountEvent::FollowUpSet { message_ids, flag }).await;
+                    }
+                    emit_cached_messages(cache, &mailbox, events).await;
+                    emit_flagged_messages(cache, events).await;
+                }
+                AccountCommand::ApplyRemoteFollowUps { snapshot, taken_at } => {
+                    if let Some(Err(e)) = cache_op(cache, move |c| c.apply_remote_follow_ups(&snapshot, taken_at)).await {
+                        tracing::warn!("failed to apply the Graph follow-up snapshot: {e}");
+                        continue;
+                    }
+                    emit_cached_messages(cache, &current_mailbox_id, events).await;
+                    emit_flagged_messages(cache, events).await;
                 }
                 AccountCommand::PrefetchBodies => {
                     tracing::debug!("PrefetchBodies command received");
@@ -4411,20 +4576,36 @@ fn earliest(times: impl IntoIterator<Item = Option<chrono::DateTime<chrono::Utc>
 /// SELECTs the Scheduled folder at `path` and reports whether it can store
 /// Lookout's wake-time keyword: its `PERMANENTFLAGS` must include `\*`.
 /// Servers without it (Exchange IMAP, typically) keep snoozes local.
-async fn select_scheduled(session: &mut Session<SessionStream>, path: &str) -> Result<bool> {
+/// SELECTs `path` and reports whether its `PERMANENTFLAGS` include `\*`, i.e.
+/// whether custom keywords stored there persist (Exchange IMAP's don't).
+async fn select_accepting_keywords(session: &mut Session<SessionStream>, path: &str) -> Result<bool> {
     let mailbox = session.select(path).await?;
     Ok(mailbox.permanent_flags.iter().any(|flag| matches!(flag, async_imap::types::Flag::MayCreate)))
 }
 
 /// The snooze keywords on `uids` in the SELECTed mailbox, per UID.
 async fn snooze_keywords_by_uid(session: &mut Session<SessionStream>, uids: &[Uid]) -> Result<Vec<(Uid, Vec<String>)>> {
+    keywords_by_uid(session, uids, |keywords| lookout_core::snooze_keywords(keywords)).await
+}
+
+/// The follow-up flag keywords on `uids` in the SELECTed mailbox, per UID.
+async fn flag_keywords_by_uid(session: &mut Session<SessionStream>, uids: &[Uid]) -> Result<Vec<(Uid, Vec<String>)>> {
+    keywords_by_uid(session, uids, |keywords| lookout_core::flag_keywords(keywords)).await
+}
+
+/// The keywords `pick` selects from each of `uids` in the SELECTed mailbox.
+async fn keywords_by_uid(
+    session: &mut Session<SessionStream>,
+    uids: &[Uid],
+    pick: impl Fn(&std::collections::BTreeSet<String>) -> Vec<String>,
+) -> Result<Vec<(Uid, Vec<String>)>> {
     let mut found = Vec::new();
     for uid_set in uid_set_chunks(uids) {
         let fetches: Vec<Fetch> = session.uid_fetch(uid_set, "FLAGS").await?.try_collect().await?;
         for fetch in &fetches {
             let Some(uid) = fetch.uid else { continue };
             let (_, keywords) = flags_from_fetch(fetch);
-            found.push((Uid(uid), lookout_core::snooze_keywords(&keywords)));
+            found.push((Uid(uid), pick(&keywords)));
         }
     }
     Ok(found)
@@ -5932,7 +6113,7 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
     // whole-folder diff), and this function runs at the end of every sync.
     let cached = cache_op(cache, {
         let mailbox_id = mailbox_id.clone();
-        let messages = messages.clone();
+        let mut messages = messages.clone();
         move |c| {
             let now = chrono::Utc::now();
             if let Err(e) = c.purge_expired_snoozed(now) {
@@ -5942,11 +6123,17 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
                 c.replace_messages(&mailbox_id, uidvalidity, &messages),
                 c.record_addresses(&messages),
                 c.active_snoozed_uids(&mailbox_id, now),
+                c.overlay_follow_ups(&mut messages).map(|()| messages),
             )
         }
     })
     .await;
-    if let Some((replace, addresses, snoozed)) = cached {
+    if let Some((replace, addresses, snoozed, overlaid)) = cached {
+        // Messages whose folder can't store keywords carry their follow-up
+        // flag in the cache's local table (item 1.16).
+        if let Ok(overlaid) = overlaid {
+            messages = overlaid;
+        }
         if let Err(e) = replace {
             tracing::warn!("failed to cache messages for {mailbox_id}: {e}");
         }
@@ -5967,6 +6154,9 @@ async fn emit_messages(mailbox_id: &MailboxId, uidvalidity: UidValidity, message
             messages,
         })
         .await;
+    // A sync can bring flags set by another client, so the Tasks view's
+    // flagged-mail list is re-read too.
+    emit_flagged_messages(cache, events).await;
 }
 
 /// Fetches list-row snippets for the newest `PREVIEW_FETCH_LIMIT` messages in

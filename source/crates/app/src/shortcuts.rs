@@ -63,6 +63,9 @@ pub const ACTION_SNOOZE: &str = "snooze";
 /// so changing the value would silently drop any existing user's
 /// customization on upgrade. Only the human-visible `title` below changed.
 pub const ACTION_PIN: &str = "flag";
+/// Flags the selection for follow-up, or clears its flag (item 1.16 /
+/// M-10) - Outlook's Insert. Distinct from Pin (`ACTION_PIN`, UX-02).
+pub const ACTION_FOLLOW_UP: &str = "follow-up";
 pub const ACTION_MARK_READ: &str = "mark-read";
 pub const ACTION_UNDO: &str = "undo";
 pub const ACTION_PRINT: &str = "print";
@@ -146,6 +149,12 @@ pub const DEFAULT_SHORTCUTS: &[DefaultShortcut] = &[
         title: "Pin / unpin",
         keyval: gdk::Key::g,
         modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_FOLLOW_UP,
+        title: "Flag / clear flag",
+        keyval: gdk::Key::Insert,
+        modifiers: gdk::ModifierType::empty(),
     },
     DefaultShortcut {
         action: ACTION_MARK_READ,
@@ -303,7 +312,13 @@ pub fn chord_from_key(display: &gdk::Display, keycode: u32, state: gdk::Modifier
 /// /navigation keys no entry field types. Everything else requires a
 /// modifier so shortcuts can't eat ordinary typing.
 fn allowed_without_modifier(key: gdk::Key) -> bool {
-    if key == gdk::Key::Delete || key == gdk::Key::Escape || key == gdk::Key::BackSpace || key == gdk::Key::Tab || key == gdk::Key::Return {
+    if key == gdk::Key::Delete
+        || key == gdk::Key::Insert
+        || key == gdk::Key::Escape
+        || key == gdk::Key::BackSpace
+        || key == gdk::Key::Tab
+        || key == gdk::Key::Return
+    {
         return true;
     }
     let name = key.name().unwrap_or_default().to_string();
@@ -511,7 +526,7 @@ mod tests {
             let key = d.keyval.to_lower();
             assert!(chords.insert((d.modifiers & MODIFIER_MASK, key)), "duplicate chord for {}", d.action);
         }
-        assert_eq!(actions.len(), 21);
+        assert_eq!(actions.len(), 22);
     }
 
     #[test]
@@ -544,6 +559,7 @@ mod tests {
         assert!(allowed_without_modifier(gdk::Key::F1));
         assert!(allowed_without_modifier(gdk::Key::F12));
         assert!(allowed_without_modifier(gdk::Key::Delete));
+        assert!(allowed_without_modifier(gdk::Key::Insert));
         assert!(allowed_without_modifier(gdk::Key::Escape));
         assert!(allowed_without_modifier(gdk::Key::Tab));
         assert!(!allowed_without_modifier(gdk::Key::n));

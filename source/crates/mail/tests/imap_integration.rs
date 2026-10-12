@@ -560,6 +560,70 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let awake = messages.iter().find(|m| m.subject.as_deref() == Some("undo move")).unwrap();
     assert!(lookout_core::snooze_until_from_keywords(&awake.keywords).is_none(), "waking drops the keyword");
 
+    // --- Follow-up flags (item 1.16): GreenMail keeps custom keywords, so a
+    // flag is stored as `$Lookout-flagged` plus `$Lookout-flag-due-<unix>`,
+    // survives a resync, turns into `$Lookout-flag-done` when completed, and
+    // the undo (a `SetFollowUp` back to the earlier state) restores it.
+    let uid = awake.uid;
+    let due = lookout_core::flag_due_for_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap());
+    let flagged = lookout_core::FollowUpFlag {
+        status: lookout_core::FlagStatus::Flagged,
+        due: Some(due),
+        ..Default::default()
+    };
+    let follow_up_of = |e: &AccountEvent| match e {
+        AccountEvent::MessagesUpdated { mailbox, messages, .. } if *mailbox == inbox_id => {
+            messages.iter().find(|m| m.uid == uid).map(|m| m.follow_up())
+        }
+        _ => None,
+    };
+    let _ = cmd_tx
+        .send(AccountCommand::SetFollowUp {
+            mailbox: inbox_id.clone(),
+            uids: vec![uid],
+            flag: flagged.clone(),
+        })
+        .await;
+    let listed = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::FlaggedMessages { messages } if messages.iter().any(|m| m.uid == uid))).await;
+    let AccountEvent::FlaggedMessages { messages } = listed else { unreachable!() };
+    assert_eq!(messages.iter().find(|m| m.uid == uid).unwrap().follow_up(), Some(flagged.clone()), "listed for the Tasks view");
+    let _ = cmd_tx.send(AccountCommand::Refresh).await;
+    wait_for_event(&evt_rx, |e| follow_up_of(e) == Some(Some(flagged.clone()))).await;
+
+    let _ = cmd_tx
+        .send(AccountCommand::SetFollowUp {
+            mailbox: inbox_id.clone(),
+            uids: vec![uid],
+            flag: lookout_core::FollowUpFlag {
+                status: lookout_core::FlagStatus::Complete,
+                ..Default::default()
+            },
+        })
+        .await;
+    let completed = wait_for_event(&evt_rx, |e| follow_up_of(e).flatten().is_some_and(|flag| flag.status == lookout_core::FlagStatus::Complete)).await;
+    let AccountEvent::MessagesUpdated { messages, .. } = completed else { unreachable!() };
+    let done = messages.iter().find(|m| m.uid == uid).unwrap();
+    assert!(done.keywords.contains(lookout_core::FLAG_DONE_KEYWORD));
+    assert!(!done.keywords.iter().any(|k| k.starts_with(lookout_core::FLAG_DUE_KEYWORD_PREFIX)), "completing drops the due keyword");
+
+    // Undo of the completion: back to the dated flag, then clear it.
+    let _ = cmd_tx
+        .send(AccountCommand::SetFollowUp {
+            mailbox: inbox_id.clone(),
+            uids: vec![uid],
+            flag: flagged.clone(),
+        })
+        .await;
+    wait_for_event(&evt_rx, |e| follow_up_of(e) == Some(Some(flagged.clone()))).await;
+    let _ = cmd_tx
+        .send(AccountCommand::SetFollowUp {
+            mailbox: inbox_id.clone(),
+            uids: vec![uid],
+            flag: lookout_core::FollowUpFlag::default(),
+        })
+        .await;
+    wait_for_event(&evt_rx, |e| follow_up_of(e) == Some(None)).await;
+
     let _ = cmd_tx.send(AccountCommand::Shutdown).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }

@@ -26,6 +26,9 @@ pub mod snooze;
 
 pub use categories::{graph_preset, nearest_preset_for_rgb, preset_by_graph, CategoryPreset, OUTLOOK_CATEGORY_PRESETS};
 pub use cdo::BusyStatus;
-pub use flags::{flag_due_from_keyword, flag_due_keyword, follow_up_from_headers, follow_up_headers, FlagStatus, FollowUpFlag, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX};
+pub use flags::{
+    flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers, follow_up_keywords, is_flag_keyword,
+    FlagStatus, FollowUpFlag, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD,
+};
 pub use headers::{importance_from_headers, importance_headers, sensitivity_from_headers, sensitivity_header, Importance, MessageSensitivity};
 pub use snooze::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};

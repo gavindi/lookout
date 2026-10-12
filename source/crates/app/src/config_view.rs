@@ -1153,7 +1153,7 @@ pub fn refresh(
                 row.add_suffix(&remove_button);
             }
             if info.graph_pin_status == GraphPinStatus::NeedsConsent {
-                let sync_button = gtk::Button::with_label("Sync pins with Outlook");
+                let sync_button = gtk::Button::with_label("Sync pins and flags with Outlook");
                 sync_button.add_css_class("flat");
                 let enable_graph_pin = enable_graph_pin.clone();
                 let row_widget = row.clone();
