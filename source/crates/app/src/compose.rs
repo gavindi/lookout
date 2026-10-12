@@ -416,164 +416,31 @@ pub fn schedule_presets<Tz: chrono::TimeZone>(now: &chrono::DateTime<Tz>) -> Vec
     presets
 }
 
-/// A custom schedule-send time picked as a local date and time: the instant
-/// it names, or `None` when it isn't in the future (or doesn't exist, in a
-/// DST gap) - the dialog keeps its Schedule button insensitive then.
-pub fn validate_schedule_time<Tz: chrono::TimeZone>(local: chrono::NaiveDateTime, now: &chrono::DateTime<Tz>) -> Option<chrono::DateTime<chrono::Utc>> {
-    let at = local.and_local_timezone(now.timezone()).earliest()?;
-    (at > *now).then(|| at.with_timezone(&chrono::Utc))
-}
-
-/// How a scheduled send's time reads in menus, toasts and banners: "Tue
-/// 08:00" within the coming week, "Tue 14 Oct 08:00" further out.
-pub fn format_schedule_time<Tz: chrono::TimeZone>(at: &chrono::DateTime<Tz>, now: &chrono::DateTime<Tz>) -> String
-where
-    Tz::Offset: std::fmt::Display,
-{
-    if at.date_naive() < now.date_naive() + chrono::Days::new(7) {
-        at.format("%a %H:%M").to_string()
-    } else {
-        at.format("%a %-d %b %H:%M").to_string()
-    }
-}
-
-/// The custom time's starting point: the next half hour after `now`.
-fn next_half_hour(now: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
-    use chrono::Timelike;
-    let base = now.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap_or(now);
-    let minutes_past = base.minute() % 30;
-    base + chrono::Duration::minutes(i64::from(30 - minutes_past))
-}
-
-/// The Send split button's menu (item 1.14): the presets, recomputed every
-/// time the menu opens so "Tomorrow" never goes stale in a long-open
-/// composer, then "Custom time…". `on_pick` receives the chosen instant.
+/// The Send split button's menu (item 1.14): the schedule-send presets,
+/// recomputed every time the menu opens so "Tomorrow" never goes stale in a
+/// long-open composer, then "Custom time…". `on_pick` receives the chosen
+/// instant.
 fn build_schedule_popover(on_pick: Rc<dyn Fn(chrono::DateTime<chrono::Utc>)>) -> gtk::Popover {
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let popover = gtk::Popover::builder().child(&list).build();
-    popover.add_css_class("menu");
-    let fill = {
-        let list = list.clone();
-        let popover = popover.clone();
-        move || {
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
-            }
-            list.append(
-                &gtk::Label::builder()
-                    .label("Schedule send")
-                    .css_classes(["heading"])
-                    .xalign(0.0)
-                    .margin_start(8)
-                    .margin_top(4)
-                    .margin_bottom(4)
-                    .build(),
-            );
-            let now = chrono::Local::now();
-            for preset in schedule_presets(&now) {
-                let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-                row.append(&gtk::Label::builder().label(preset.name).xalign(0.0).hexpand(true).build());
-                row.append(&gtk::Label::builder().label(format_schedule_time(&preset.at, &now)).css_classes(["dim-label"]).build());
-                let button = gtk::Button::builder().child(&row).css_classes(["flat"]).build();
-                let on_pick = on_pick.clone();
-                let popover = popover.clone();
-                let at = preset.at.with_timezone(&chrono::Utc);
-                button.connect_clicked(move |_| {
-                    popover.popdown();
-                    on_pick(at);
-                });
-                list.append(&button);
-            }
-            list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-            let custom = gtk::Button::builder()
-                .child(&gtk::Label::builder().label("Custom time…").xalign(0.0).build())
-                .css_classes(["flat"])
-                .build();
-            let on_pick = on_pick.clone();
-            let popover_for_custom = popover.clone();
-            custom.connect_clicked(move |_| {
-                popover_for_custom.popdown();
-                let parent = popover_for_custom.parent();
-                present_custom_schedule_dialog(parent.as_ref(), on_pick.clone());
-            });
-            list.append(&custom);
-        }
-    };
-    fill();
-    popover.connect_show(move |_| fill());
-    popover
-}
-
-/// The "Schedule send" dialog behind "Custom time…": a date and time,
-/// starting at the next half hour, that must be in the future before
-/// Schedule is enabled.
-fn present_custom_schedule_dialog(parent: Option<&gtk::Widget>, on_pick: Rc<dyn Fn(chrono::DateTime<chrono::Utc>)>) {
-    use chrono::Timelike;
-    let initial = next_half_hour(chrono::Local::now().naive_local());
-    let date = Rc::new(Cell::new(initial.date()));
-    let calendar = gtk::Calendar::new();
-    crate::datetime_picker::set_calendar_date(&calendar, &date, initial.date());
-    crate::datetime_picker::wire_calendar(&calendar, &date);
-    let hour = gtk::SpinButton::with_range(0.0, 23.0, 1.0);
-    let minute = gtk::SpinButton::with_range(0.0, 59.0, 1.0);
-    for spin in [&hour, &minute] {
-        spin.set_digits(0);
-        spin.set_width_chars(2);
-    }
-    hour.set_value(f64::from(initial.hour()));
-    minute.set_value(f64::from(initial.minute()));
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.append(&crate::datetime_picker::time_cluster("Send at", &calendar, &hour, &minute));
-    content.append(
-        &gtk::Label::builder()
-            .label("Lookout must be running for the message to be sent.")
-            .css_classes(["dim-label", "caption"])
-            .wrap(true)
-            .xalign(0.0)
-            .build(),
-    );
-    let dialog = adw::AlertDialog::builder()
-        .heading("Schedule send")
-        .default_response("schedule")
-        .close_response("cancel")
-        .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("schedule", "Schedule");
-    dialog.set_response_appearance("schedule", adw::ResponseAppearance::Suggested);
-    dialog.set_extra_child(Some(&content));
-
-    let chosen = {
-        let date = date.clone();
-        let hour = hour.clone();
-        let minute = minute.clone();
-        move || {
-            let time = chrono::NaiveTime::from_hms_opt(hour.value() as u32, minute.value() as u32, 0)?;
-            validate_schedule_time(date.get().and_time(time), &chrono::Local::now())
-        }
-    };
-    let refresh: Rc<dyn Fn()> = {
-        let dialog = dialog.clone();
-        let chosen = chosen.clone();
-        Rc::new(move || dialog.set_response_enabled("schedule", chosen().is_some()))
-    };
-    refresh();
-    {
-        let refresh = refresh.clone();
-        calendar.connect_day_selected(move |_| refresh());
-    }
-    for spin in [&hour, &minute] {
-        let refresh = refresh.clone();
-        spin.connect_value_changed(move |_| refresh());
-    }
-    dialog.connect_response(None, move |_, response| {
-        if response == "schedule" {
-            if let Some(at) = chosen() {
-                on_pick(at);
-            }
-        }
-    });
-    dialog.present(parent);
+    crate::datetime_picker::build_time_preset_popover(
+        "Schedule send",
+        Rc::new(|now| {
+            schedule_presets(&now)
+                .into_iter()
+                .map(|preset| crate::datetime_picker::TimeChoice {
+                    name: preset.name.to_string(),
+                    at: preset.at,
+                })
+                .collect()
+        }),
+        "Custom time…",
+        crate::datetime_picker::TimeDialog {
+            heading: "Schedule send",
+            field_label: "Send at",
+            accept: "Schedule",
+            note: Some("Lookout must be running for the message to be sent."),
+        },
+        on_pick,
+    )
 }
 
 /// `bcc` plus the identity's automatic Bcc addresses, skipping any already
@@ -2653,34 +2520,6 @@ mod tests {
         let presets = schedule_presets(&local(2026, 10, 18, 20, 0)); // Sunday
         assert_eq!(presets.iter().map(|p| p.name).collect::<Vec<_>>(), vec!["Tomorrow morning", "Tomorrow afternoon"]);
         assert_eq!(presets[0].at, local(2026, 10, 19, 8, 0));
-    }
-
-    /// A custom time must be in the future; a valid one comes back in UTC.
-    #[test]
-    fn validate_schedule_time_requires_a_future_time() {
-        let now = local(2026, 10, 12, 10, 0);
-        let at = |h, m| chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap().and_hms_opt(h, m, 0).unwrap();
-        assert_eq!(validate_schedule_time(at(9, 59), &now), None);
-        assert_eq!(validate_schedule_time(at(10, 0), &now), None, "now isn't the future");
-        assert_eq!(validate_schedule_time(at(10, 30), &now), Some(Utc.with_ymd_and_hms(2026, 10, 12, 8, 30, 0).unwrap()));
-    }
-
-    #[test]
-    fn schedule_times_read_short_within_the_week() {
-        let now = local(2026, 10, 12, 10, 0); // Monday
-        assert_eq!(format_schedule_time(&local(2026, 10, 13, 8, 0), &now), "Tue 08:00");
-        assert_eq!(format_schedule_time(&local(2026, 10, 20, 8, 0), &now), "Tue 20 Oct 08:00");
-    }
-
-    #[test]
-    fn custom_schedule_time_starts_at_the_next_half_hour() {
-        let at = |h, m, s| chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap().and_hms_opt(h, m, s).unwrap();
-        assert_eq!(next_half_hour(at(10, 7, 33)), at(10, 30, 0));
-        assert_eq!(next_half_hour(at(10, 30, 0)), at(11, 0, 0));
-        assert_eq!(
-            next_half_hour(at(23, 50, 0)),
-            chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap().and_hms_opt(0, 0, 0).unwrap()
-        );
     }
 
     /// Undo send (item 1.13) reopens exactly what was about to go out:

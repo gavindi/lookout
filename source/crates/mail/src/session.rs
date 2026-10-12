@@ -506,9 +506,12 @@ pub enum AccountCommand {
     DeleteMailbox {
         mailbox: MailboxId,
     },
-    /// Client-side only - IMAP has no native snooze. Records `until` in the
-    /// local cache and hides the message from `MessagesUpdated` until that
-    /// time passes.
+    /// Hides the message until `until` (IMAP has no native snooze). Where the
+    /// account allows it the message moves to the server "Scheduled" folder
+    /// carrying a `$Lookout-snooze-<unix>` keyword, so any Lookout install
+    /// wakes it (item 1.15 / §4.2); otherwise `until` is recorded in the
+    /// local cache and the message is filtered out of `MessagesUpdated`.
+    /// Either way it comes back on time (the session caps its IDLE slice).
     SnoozeMessage {
         mailbox: MailboxId,
         uid: Uid,
@@ -520,9 +523,18 @@ pub enum AccountCommand {
         uids: Vec<Uid>,
         until: chrono::DateTime<chrono::Utc>,
     },
-    /// Clears the local snooze on `uids` so they show again right away - the
-    /// undo of `SnoozeMessages` (item 1.13).
+    /// Undoes `SnoozeMessages` (item 1.13): `mailbox`/`uids` are where the
+    /// messages were snoozed from. A server-side snooze (item 1.15) moves
+    /// them back out of Scheduled without their wake keyword; a local one is
+    /// just forgotten, so they show again right away.
     UnsnoozeMessages {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+    },
+    /// Wakes `uids` waiting in the Scheduled folder `mailbox` right now
+    /// (item 1.15, the reading pane's "Unsnooze"): their wake keyword and
+    /// `\Seen` are removed and they move back to the Inbox.
+    WakeSnoozed {
         mailbox: MailboxId,
         uids: Vec<Uid>,
     },
@@ -1399,6 +1411,17 @@ async fn connect_and_run(
     // keepalive.
     let mut next_outbox_due: Option<chrono::DateTime<chrono::Utc>> = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
 
+    // Snooze (item 1.15). Whether this account's Scheduled folder can hold
+    // the wake-time keyword (`None` until first checked - a server without
+    // custom keywords keeps snoozes local), when the earliest server-side
+    // snooze wakes, when the earliest local-only one does, and when to rescan
+    // Scheduled for snoozes another Lookout install made. All of them cap the
+    // IDLE slice like `next_outbox_due`, so a snooze wakes on time.
+    let mut scheduled_keywords_ok: Option<bool> = None;
+    let mut server_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut local_snooze_wake: Option<chrono::DateTime<chrono::Utc>> = cache_op(cache, |c| c.next_snooze_wake()).await.and_then(|r| r.ok()).flatten();
+    let mut next_scheduled_scan = chrono::Utc::now();
+
     loop {
         // Deliver any queued outbox message whose time has arrived (item 0.3).
         // This runs before the IDLE wait on every iteration, so a message the
@@ -1543,6 +1566,82 @@ async fn connect_and_run(
             next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
             emit_outbox_contents(cache, events).await;
         }
+        // Wake snoozed messages whose time has come (item 1.15), behind the
+        // same "nothing queued" gate as the outbox drain. Local-only snoozes
+        // just stop hiding their messages; server-side ones (in Scheduled,
+        // carrying `$Lookout-snooze-<unix>`) move back to the Inbox, unread.
+        // Scheduled is also rescanned every `SCHEDULED_RESCAN` for snoozes
+        // another Lookout install made, so every install wakes them.
+        let now = chrono::Utc::now();
+        let scheduled = scheduled_folder(&folders, &account_id);
+        let local_due = local_snooze_wake.is_some_and(|due| due <= now);
+        let server_due = scheduled.is_some() && scheduled_keywords_ok != Some(false) && (server_snooze_wake.is_some_and(|due| due <= now) || next_scheduled_scan <= now);
+        if (local_due || server_due) && no_work_pending(commands, interactive_commands, idle_notify) {
+            if local_due {
+                let woken = cache_op(cache, move |c| c.purge_expired_snoozed(now)).await.and_then(|r| r.ok()).unwrap_or_default();
+                for mailbox in woken {
+                    emit_cached_messages(cache, &mailbox, events).await;
+                }
+                local_snooze_wake = cache_op(cache, |c| c.next_snooze_wake()).await.and_then(|r| r.ok()).flatten();
+            }
+            if let Some((path, scheduled_id)) = scheduled.filter(|_| server_due) {
+                next_scheduled_scan = now + SCHEDULED_RESCAN;
+                let accepts = select_scheduled(&mut session, &path).await?;
+                session_selected = scheduled_id.clone();
+                scheduled_keywords_ok = Some(accepts);
+                let items = if accepts { scan_scheduled(&mut session).await? } else { Vec::new() };
+                let (due, next) = due_wakes(&items, now);
+                server_snooze_wake = next;
+                if !due.is_empty() {
+                    let uids: Vec<Uid> = due.iter().map(|item| item.uid).collect();
+                    let keywords: Vec<String> = due.iter().flat_map(|item| item.keywords.clone()).collect();
+                    match wake_scheduled_uids(&mut session, &uids, &keywords, has_move, has_uidplus).await {
+                        Ok(()) => {
+                            tracing::info!(count = uids.len(), "woke snoozed messages");
+                            if let Some(Err(e)) = cache_op(cache, {
+                                let scheduled_id = scheduled_id.clone();
+                                move |c| c.delete_messages(&scheduled_id, &uids)
+                            })
+                            .await
+                            {
+                                tracing::warn!("failed to drop woken messages from cache: {e}");
+                            }
+                            emit_cached_messages_after_removal(cache, &scheduled_id, events).await;
+                            refresh_folders_targeted(
+                                &mut session,
+                                &mut folders,
+                                &account_id,
+                                &[scheduled_id.clone(), inbox_id.clone()],
+                                &current_mailbox_id,
+                                condstore,
+                                cache,
+                                events,
+                                &mut dirty_mailboxes,
+                            )
+                            .await;
+                            if current_mailbox_id == inbox_id || current_mailbox_id == scheduled_id {
+                                sync_mailbox(
+                                    &mut session,
+                                    &account_id,
+                                    &current_mailbox_name,
+                                    &current_mailbox_id,
+                                    events,
+                                    cache,
+                                    &mut folders,
+                                    interactive_commands,
+                                    Some(&session_selected),
+                                    condstore,
+                                    qresync,
+                                )
+                                .await?;
+                                session_selected = current_mailbox_id.clone();
+                            }
+                        }
+                        Err(e) => tracing::warn!("waking snoozed messages failed: {e}"),
+                    }
+                }
+            }
+        }
         // Take a command - or a push from the dedicated IDLE connection -
         // that's *already* queued without entering IDLE first. Establishing
         // an IDLE and tearing it down again costs two round trips, and the
@@ -1662,7 +1761,13 @@ async fn connect_and_run(
                                     let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
                                     // Wake early if a scheduled outbox send is
                                     // due sooner than the keepalive slice.
-                                    let slice = cap_slice_for_outbox(slice, next_outbox_due, chrono::Utc::now());
+                                    // So is a snooze wake (item 1.15), or the
+                                    // next rescan of the Scheduled folder.
+                                    let scan_due = scheduled_folder(&folders, &account_id)
+                                        .filter(|_| scheduled_keywords_ok != Some(false))
+                                        .map(|_| next_scheduled_scan);
+                                    let next_due = earliest([next_outbox_due, local_snooze_wake, server_snooze_wake, scan_due]);
+                                    let slice = cap_slice_for_outbox(slice, next_due, chrono::Utc::now());
                                     let (wait_fut, stop_source) = handle.wait_with_timeout(slice);
 
                                     // Race the IDLE wait against the next command so an on-demand
@@ -2878,41 +2983,132 @@ async fn connect_and_run(
                     .await?;
                     session_selected = current_mailbox_id.clone();
                 }
-                AccountCommand::SnoozeMessage { mailbox, uid, until } => {
-                    if let Some(Err(e)) = cache_op(cache, {
-                        let mailbox = mailbox.clone();
-                        move |c| c.snooze_message(&mailbox, uid, until)
-                    })
-                    .await
-                    {
-                        tracing::warn!("failed to record snooze: {e}");
+                command @ (AccountCommand::SnoozeMessage { .. } | AccountCommand::SnoozeMessages { .. }) => {
+                    let (mailbox, uids, until) = match command {
+                        AccountCommand::SnoozeMessage { mailbox, uid, until } => (mailbox, vec![uid], until),
+                        AccountCommand::SnoozeMessages { mailbox, uids, until } => (mailbox, uids, until),
+                        _ => unreachable!("matched just above"),
+                    };
+                    if uids.is_empty() {
+                        continue;
                     }
-                    let _ = events.send(AccountEvent::MessageSnoozed).await;
-                    sync_mailbox(
-                        &mut session,
-                        &account_id,
-                        &current_mailbox_name,
-                        &current_mailbox_id,
-                        events,
-                        cache,
-                        &mut folders,
-                        interactive_commands,
-                        Some(&session_selected),
-                        condstore,
-                        qresync,
-                    )
-                    .await?;
-                    session_selected = current_mailbox_id.clone();
-                }
-                AccountCommand::SnoozeMessages { mailbox, uids, until } => {
-                    if let Some(Err(e)) = cache_op(cache, {
-                        let mailbox = mailbox.clone();
-                        let uids = uids.clone();
-                        move |c| c.snooze_messages(&mailbox, &uids, until)
-                    })
-                    .await
-                    {
-                        tracing::warn!("failed to record snooze: {e}");
+                    // Server-side snooze (item 1.15 / §4.2): the messages move
+                    // to the Scheduled folder carrying `$Lookout-snooze-<unix>`,
+                    // so every Lookout install on the account sees and wakes
+                    // them. It needs that folder (created on demand) to accept
+                    // custom keywords; otherwise - or if any step fails - the
+                    // snooze stays local to this install, as before.
+                    let mut on_server = false;
+                    if scheduled_keywords_ok != Some(false) {
+                        if scheduled_folder(&folders, &account_id).is_none() {
+                            match session.create(lookout_core::SCHEDULED_FOLDER_NAME).await {
+                                Ok(()) => {
+                                    let _ = session.subscribe(lookout_core::SCHEDULED_FOLDER_NAME).await;
+                                    relist_folders(
+                                        &mut session,
+                                        &mut folders,
+                                        &mut counts_pending,
+                                        &account_id,
+                                        &current_mailbox_id,
+                                        cache,
+                                        events,
+                                        condstore,
+                                        has_list_status,
+                                        &mut dirty_mailboxes,
+                                    )
+                                    .await?;
+                                }
+                                Err(e) => tracing::warn!("couldn't create the Scheduled folder, snoozing locally: {e}"),
+                            }
+                        }
+                        if let Some((scheduled_path, scheduled_id)) = scheduled_folder(&folders, &account_id) {
+                            if scheduled_keywords_ok.is_none() {
+                                let accepts = select_scheduled(&mut session, &scheduled_path).await?;
+                                session_selected = scheduled_id.clone();
+                                scheduled_keywords_ok = Some(accepts);
+                                if !accepts {
+                                    tracing::info!("the Scheduled folder can't store keywords; snoozes stay local");
+                                }
+                            }
+                            if scheduled_keywords_ok == Some(true) {
+                                let keyword = lookout_core::snooze_keyword(until);
+                                if mailbox == scheduled_id {
+                                    // Re-snoozing a message that's already in
+                                    // Scheduled just replaces its wake time.
+                                    if session_selected != mailbox {
+                                        session.select(&scheduled_path).await?;
+                                        session_selected = mailbox.clone();
+                                    }
+                                    let old: Vec<String> = snooze_keywords_by_uid(&mut session, &uids)
+                                        .await?
+                                        .into_iter()
+                                        .flat_map(|(_, k)| k)
+                                        .filter(|k| *k != keyword)
+                                        .collect();
+                                    match store_raw_flags(&mut session, &uids, std::slice::from_ref(&keyword), &old).await {
+                                        Ok(()) => on_server = true,
+                                        Err(e) => tracing::warn!("re-snoozing in Scheduled failed: {e}"),
+                                    }
+                                } else if let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
+                                    if session_selected != mailbox {
+                                        session.select(&path).await?;
+                                        session_selected = mailbox.clone();
+                                    }
+                                    // The keyword goes on first, so it travels
+                                    // with the message into Scheduled.
+                                    match store_raw_flags(&mut session, &uids, std::slice::from_ref(&keyword), &[]).await {
+                                        Err(e) => tracing::warn!("couldn't tag messages for snooze, snoozing locally: {e}"),
+                                        Ok(()) => match move_uids_to_path(&mut session, &uids, &scheduled_path, has_move, has_uidplus).await {
+                                            Ok(moved) => {
+                                                let message_ids = cached_message_ids(cache, &mailbox, &uids).await;
+                                                move_ledger.record(&mailbox, &scheduled_id, &uids, &moved, &message_ids);
+                                                if let Some(Err(e)) = cache_op(cache, {
+                                                    let mailbox = mailbox.clone();
+                                                    let uids = uids.clone();
+                                                    move |c| c.delete_messages(&mailbox, &uids)
+                                                })
+                                                .await
+                                                {
+                                                    tracing::warn!("failed to drop snoozed messages from cache: {e}");
+                                                }
+                                                emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                                                refresh_folders_targeted(
+                                                    &mut session,
+                                                    &mut folders,
+                                                    &account_id,
+                                                    &[mailbox.clone(), scheduled_id.clone()],
+                                                    &current_mailbox_id,
+                                                    condstore,
+                                                    cache,
+                                                    events,
+                                                    &mut dirty_mailboxes,
+                                                )
+                                                .await;
+                                                on_server = true;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("moving messages to Scheduled failed, snoozing locally: {e}");
+                                                let _ = store_raw_flags(&mut session, &uids, &[], std::slice::from_ref(&keyword)).await;
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if on_server {
+                        server_snooze_wake = earliest([server_snooze_wake, Some(until)]);
+                    } else {
+                        if let Some(Err(e)) = cache_op(cache, {
+                            let mailbox = mailbox.clone();
+                            let uids = uids.clone();
+                            move |c| c.snooze_messages(&mailbox, &uids, until)
+                        })
+                        .await
+                        {
+                            tracing::warn!("failed to record snooze: {e}");
+                        }
+                        local_snooze_wake = earliest([local_snooze_wake, Some(until)]);
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
                     sync_mailbox(
@@ -2932,7 +3128,57 @@ async fn connect_and_run(
                     session_selected = current_mailbox_id.clone();
                 }
                 AccountCommand::UnsnoozeMessages { mailbox, uids } => {
-                    if let Some(Err(e)) = cache_op(cache, {
+                    // Undo of a server-side snooze (the move ledger says these
+                    // went to Scheduled): find them there - by `COPYUID` map
+                    // or Message-ID - drop the wake keyword and move them back.
+                    // Otherwise the snooze was local: just forget it.
+                    let server = scheduled_folder(&folders, &account_id).filter(|(_, id)| move_ledger.moved_any(&mailbox, &uids, id));
+                    if let Some((scheduled_path, scheduled_id)) = server {
+                        let Some(from_path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                            continue;
+                        };
+                        if session_selected != scheduled_id {
+                            session.select(&scheduled_path).await?;
+                            session_selected = scheduled_id.clone();
+                        }
+                        let found = resolve_moved_uids(&mut session, move_ledger, &mailbox, &scheduled_id, &uids).await?;
+                        if found.is_empty() {
+                            let _ = events.send(AccountEvent::Error("Couldn't undo: the messages are no longer snoozed".to_string())).await;
+                            continue;
+                        }
+                        let keywords: Vec<String> = snooze_keywords_by_uid(&mut session, &found).await?.into_iter().flat_map(|(_, k)| k).collect();
+                        store_raw_flags(&mut session, &found, &[], &keywords).await?;
+                        match move_uids_to_path(&mut session, &found, &from_path, has_move, has_uidplus).await {
+                            Ok(_) => {
+                                if let Some(Err(e)) = cache_op(cache, {
+                                    let scheduled_id = scheduled_id.clone();
+                                    move |c| c.delete_messages(&scheduled_id, &found)
+                                })
+                                .await
+                                {
+                                    tracing::warn!("failed to drop unsnoozed messages from cache: {e}");
+                                }
+                                emit_cached_messages_after_removal(cache, &scheduled_id, events).await;
+                                refresh_folders_targeted(
+                                    &mut session,
+                                    &mut folders,
+                                    &account_id,
+                                    &[mailbox.clone(), scheduled_id.clone()],
+                                    &current_mailbox_id,
+                                    condstore,
+                                    cache,
+                                    events,
+                                    &mut dirty_mailboxes,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!("undo snooze failed: {e}");
+                                let _ = events.send(AccountEvent::Error(format!("Couldn't undo: {e}"))).await;
+                                continue;
+                            }
+                        }
+                    } else if let Some(Err(e)) = cache_op(cache, {
                         let mailbox = mailbox.clone();
                         move |c| c.unsnooze_messages(&mailbox, &uids)
                     })
@@ -2955,6 +3201,63 @@ async fn connect_and_run(
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
+                }
+                AccountCommand::WakeSnoozed { mailbox, uids } => {
+                    // "Unsnooze" on a message waiting in Scheduled (item 1.15):
+                    // wake it now - back to the Inbox, unread.
+                    let Some((scheduled_path, scheduled_id)) = scheduled_folder(&folders, &account_id).filter(|(_, id)| *id == mailbox) else {
+                        continue;
+                    };
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    if session_selected != scheduled_id {
+                        session.select(&scheduled_path).await?;
+                        session_selected = scheduled_id.clone();
+                    }
+                    match wake_scheduled_uids(&mut session, &uids, &[], has_move, has_uidplus).await {
+                        Ok(()) => {
+                            if let Some(Err(e)) = cache_op(cache, {
+                                let scheduled_id = scheduled_id.clone();
+                                move |c| c.delete_messages(&scheduled_id, &uids)
+                            })
+                            .await
+                            {
+                                tracing::warn!("failed to drop woken messages from cache: {e}");
+                            }
+                            emit_cached_messages_after_removal(cache, &scheduled_id, events).await;
+                            refresh_folders_targeted(
+                                &mut session,
+                                &mut folders,
+                                &account_id,
+                                &[scheduled_id.clone(), inbox_id.clone()],
+                                &current_mailbox_id,
+                                condstore,
+                                cache,
+                                events,
+                                &mut dirty_mailboxes,
+                            )
+                            .await;
+                            sync_mailbox(
+                                &mut session,
+                                &account_id,
+                                &current_mailbox_name,
+                                &current_mailbox_id,
+                                events,
+                                cache,
+                                &mut folders,
+                                interactive_commands,
+                                Some(&session_selected),
+                                condstore,
+                                qresync,
+                            )
+                            .await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't unsnooze: {e}"))).await;
+                        }
+                    }
                 }
                 AccountCommand::StoreFlags { mailbox, uid, add, remove } => {
                     let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
@@ -3963,6 +4266,13 @@ impl MoveLedger {
         }
     }
 
+    /// Whether any of `uids` in `from` was last recorded moving to `to` -
+    /// how `UnsnoozeMessages` tells a server-side snooze (moved to Scheduled,
+    /// item 1.15) from a local-only one.
+    fn moved_any(&self, from: &MailboxId, uids: &[Uid], to: &MailboxId) -> bool {
+        uids.iter().any(|&uid| self.entries.get(&(from.clone(), uid)).is_some_and(|entry| entry.to == *to))
+    }
+
     /// What was recorded for the message that was `uid` in `from`, if its
     /// last recorded move went to `to`, forgetting the entry.
     fn take(&mut self, from: &MailboxId, uid: Uid, to: &MailboxId) -> Option<MovedMessage> {
@@ -4058,6 +4368,103 @@ fn cap_slice_for_outbox(requested: Duration, next_due: Option<chrono::DateTime<c
     };
     let until = (due - now).num_seconds().max(0) as u64;
     requested.min(Duration::from_secs(until.max(1))).max(Duration::from_millis(250))
+}
+
+/// How often the Scheduled folder is rescanned for snoozes made by another
+/// Lookout install (item 1.15), which this connection otherwise never hears
+/// about - IDLE only watches the open folder.
+const SCHEDULED_RESCAN: chrono::Duration = chrono::Duration::minutes(15);
+
+/// The account's top-level "Scheduled" folder (item 1.15 / §4.2: where
+/// snoozed mail waits, new Outlook's name for it) from the latest folder
+/// list, matched case-insensitively, as `(path, id)`.
+fn scheduled_folder(folders: &[Mailbox], account_id: &AccountId) -> Option<(String, MailboxId)> {
+    let prefix = format!("{}:", account_id.0);
+    folders.iter().find_map(|m| {
+        let path = m.id.0.strip_prefix(&prefix)?;
+        path.eq_ignore_ascii_case(lookout_core::SCHEDULED_FOLDER_NAME).then(|| (path.to_string(), m.id.clone()))
+    })
+}
+
+/// One message waiting in the Scheduled folder: its UID there, its wake time
+/// and the snooze keyword(s) carrying it.
+#[derive(Debug, Clone, PartialEq)]
+struct ScheduledItem {
+    uid: Uid,
+    until: chrono::DateTime<chrono::Utc>,
+    keywords: Vec<String>,
+}
+
+/// The items due to wake at `now`, and the earliest wake time left after
+/// them (`None` when nothing else is waiting). Pure, so the wake schedule is
+/// unit-testable.
+fn due_wakes(items: &[ScheduledItem], now: chrono::DateTime<chrono::Utc>) -> (Vec<ScheduledItem>, Option<chrono::DateTime<chrono::Utc>>) {
+    let (due, waiting): (Vec<_>, Vec<_>) = items.iter().cloned().partition(|item| item.until <= now);
+    (due, waiting.iter().map(|item| item.until).min())
+}
+
+/// The earliest of several optional due times.
+fn earliest(times: impl IntoIterator<Item = Option<chrono::DateTime<chrono::Utc>>>) -> Option<chrono::DateTime<chrono::Utc>> {
+    times.into_iter().flatten().min()
+}
+
+/// SELECTs the Scheduled folder at `path` and reports whether it can store
+/// Lookout's wake-time keyword: its `PERMANENTFLAGS` must include `\*`.
+/// Servers without it (Exchange IMAP, typically) keep snoozes local.
+async fn select_scheduled(session: &mut Session<SessionStream>, path: &str) -> Result<bool> {
+    let mailbox = session.select(path).await?;
+    Ok(mailbox.permanent_flags.iter().any(|flag| matches!(flag, async_imap::types::Flag::MayCreate)))
+}
+
+/// The snooze keywords on `uids` in the SELECTed mailbox, per UID.
+async fn snooze_keywords_by_uid(session: &mut Session<SessionStream>, uids: &[Uid]) -> Result<Vec<(Uid, Vec<String>)>> {
+    let mut found = Vec::new();
+    for uid_set in uid_set_chunks(uids) {
+        let fetches: Vec<Fetch> = session.uid_fetch(uid_set, "FLAGS").await?.try_collect().await?;
+        for fetch in &fetches {
+            let Some(uid) = fetch.uid else { continue };
+            let (_, keywords) = flags_from_fetch(fetch);
+            found.push((Uid(uid), lookout_core::snooze_keywords(&keywords)));
+        }
+    }
+    Ok(found)
+}
+
+/// Every snoozed message in the SELECTed Scheduled folder (one `UID SEARCH
+/// ALL` plus a `FLAGS` fetch). Messages there without a readable wake keyword
+/// (put there by Outlook, or by hand) are left alone.
+async fn scan_scheduled(session: &mut Session<SessionStream>) -> Result<Vec<ScheduledItem>> {
+    let mut uids: Vec<Uid> = session.uid_search("ALL").await?.into_iter().map(Uid).collect();
+    uids.sort_by_key(|uid| uid.0);
+    let found = snooze_keywords_by_uid(session, &uids).await?;
+    Ok(found
+        .into_iter()
+        .filter_map(|(uid, keywords)| {
+            let until = lookout_core::snooze_until_from_keywords(&keywords)?;
+            Some(ScheduledItem { uid, until, keywords })
+        })
+        .collect())
+}
+
+/// Wakes `uids` in the SELECTed Scheduled folder: drops their snooze
+/// keywords (`keywords`, plus whatever the server shows if empty) and
+/// `\Seen`, so they come back unread, then moves them to the Inbox, as
+/// Outlook returns snoozed mail (item 1.15).
+async fn wake_scheduled_uids(session: &mut Session<SessionStream>, uids: &[Uid], keywords: &[String], has_move: bool, has_uidplus: bool) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let mut remove: Vec<String> = keywords.to_vec();
+    if remove.is_empty() {
+        remove = snooze_keywords_by_uid(session, uids).await?.into_iter().flat_map(|(_, k)| k).collect();
+    }
+    remove.sort();
+    remove.dedup();
+    remove.retain(|k| valid_keyword_atom(k));
+    remove.push("\\Seen".to_string());
+    store_raw_flags(session, uids, &[], &remove).await?;
+    move_uids_to_path(session, uids, "INBOX", has_move, has_uidplus).await?;
+    Ok(())
 }
 
 /// The account's Drafts folder path from the latest folder list, or `None`
@@ -6440,6 +6847,58 @@ mod tests {
         assert_eq!((by_id.new_uid, by_id.message_id.as_deref()), (None, Some("c@x")), "no COPYUID: Message-ID only");
         assert_eq!(ledger.take(&inbox, Uid(13), &trash), None, "nothing to find it by");
         assert_eq!(ledger.take(&trash, Uid(501), &inbox), None, "never recorded");
+    }
+
+    /// `UnsnoozeMessages` picks the server path only for messages the ledger
+    /// saw move to Scheduled (item 1.15).
+    #[test]
+    fn move_ledger_reports_moves_to_a_given_folder() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let scheduled = MailboxId::new(&account, "Scheduled");
+        let trash = MailboxId::new(&account, "Trash");
+        let mut ledger = MoveLedger::default();
+        ledger.record(&inbox, &scheduled, &[Uid(4)], &[(Uid(4), Uid(90))], &HashMap::new());
+        ledger.record(&inbox, &trash, &[Uid(5)], &[(Uid(5), Uid(91))], &HashMap::new());
+        assert!(ledger.moved_any(&inbox, &[Uid(4), Uid(7)], &scheduled));
+        assert!(!ledger.moved_any(&inbox, &[Uid(5)], &scheduled));
+        assert!(!ledger.moved_any(&trash, &[Uid(4)], &scheduled));
+    }
+
+    /// The Scheduled folder is found by name, case-insensitively, at the top
+    /// level only.
+    #[test]
+    fn scheduled_folder_is_the_top_level_scheduled_mailbox() {
+        let account = AccountId("acc".into());
+        let folders = vec![
+            mailbox(&account, "INBOX", MailboxRole::Inbox, 0),
+            mailbox(&account, "Projects/Scheduled", MailboxRole::Custom, 0),
+            mailbox(&account, "SCHEDULED", MailboxRole::Custom, 0),
+        ];
+        assert_eq!(scheduled_folder(&folders, &account), Some(("SCHEDULED".to_string(), MailboxId::new(&account, "SCHEDULED"))));
+        assert_eq!(scheduled_folder(&folders[..2], &account), None);
+    }
+
+    /// The wake pass takes everything due and reports the next wake time;
+    /// `earliest` folds the session's several due times into one.
+    #[test]
+    fn due_wakes_split_due_items_from_the_next_wake() {
+        let now = chrono::Utc::now();
+        let item = |uid: u32, minutes: i64| ScheduledItem {
+            uid: Uid(uid),
+            until: now + chrono::Duration::minutes(minutes),
+            keywords: vec![lookout_core::snooze_keyword(now + chrono::Duration::minutes(minutes))],
+        };
+        let items = vec![item(1, -5), item(2, 0), item(3, 30), item(4, 10)];
+        let (due, next) = due_wakes(&items, now);
+        assert_eq!(due.iter().map(|i| i.uid).collect::<Vec<_>>(), vec![Uid(1), Uid(2)]);
+        assert_eq!(next, Some(now + chrono::Duration::minutes(10)));
+        assert_eq!(due_wakes(&[], now), (Vec::new(), None));
+        assert_eq!(
+            earliest([None, Some(now), Some(now - chrono::Duration::seconds(1)), None]),
+            Some(now - chrono::Duration::seconds(1))
+        );
+        assert_eq!(earliest([None, None]), None);
     }
 
     /// The ledger stays bounded: the oldest moves are forgotten first.

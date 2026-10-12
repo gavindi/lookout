@@ -1848,10 +1848,25 @@ impl Cache {
     /// passed. Cheap housekeeping meant to run alongside cache work already
     /// off the GTK thread; kept separate from `active_snoozed_uids` so that
     /// read can be called synchronously from the UI thread.
-    pub fn purge_expired_snoozed(&self, now: DateTime<Utc>) -> Result<()> {
+    pub fn purge_expired_snoozed(&self, now: DateTime<Utc>) -> Result<Vec<MailboxId>> {
         let conn = self.conn.lock().unwrap();
+        let woken: Vec<MailboxId> = {
+            let mut stmt = conn.prepare("SELECT DISTINCT mailbox_id FROM snoozed WHERE snoozed_until <= ?1")?;
+            let rows = stmt.query_map(rusqlite::params![now.timestamp()], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?.into_iter().map(MailboxId).collect()
+        };
         conn.execute("DELETE FROM snoozed WHERE snoozed_until <= ?1", rusqlite::params![now.timestamp()])?;
-        Ok(())
+        Ok(woken)
+    }
+
+    /// When the earliest local snooze ends, if any - what the session caps
+    /// its IDLE slice against so a local-only snooze (item 1.15's fallback
+    /// on servers that can't store keywords) wakes on time instead of at the
+    /// next sync.
+    pub fn next_snooze_wake(&self) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        let ts: Option<i64> = conn.query_row("SELECT MIN(snoozed_until) FROM snoozed", [], |row| row.get(0))?;
+        Ok(ts.and_then(|t| DateTime::from_timestamp(t, 0)))
     }
 
     /// Adds an outgoing message to the local outbox, due at `not_before`
@@ -2158,7 +2173,20 @@ mod tests {
         cache.snooze_message(&mailbox_id, Uid(1), now + chrono::Duration::hours(1)).unwrap();
         cache.snooze_message(&mailbox_id, Uid(2), now - chrono::Duration::hours(1)).unwrap();
 
-        cache.purge_expired_snoozed(now).unwrap();
+        assert_eq!(
+            cache.next_snooze_wake().unwrap().map(|t| t.timestamp()),
+            Some((now - chrono::Duration::hours(1)).timestamp())
+        );
+        assert_eq!(
+            cache.purge_expired_snoozed(now).unwrap(),
+            vec![mailbox_id.clone()],
+            "reports the mailbox it woke messages in"
+        );
+        assert_eq!(
+            cache.next_snooze_wake().unwrap().map(|t| t.timestamp()),
+            Some((now + chrono::Duration::hours(1)).timestamp())
+        );
+        assert!(cache.purge_expired_snoozed(now).unwrap().is_empty());
 
         let conn = cache.conn.lock().unwrap();
         let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM snoozed", [], |row| row.get(0)).unwrap();

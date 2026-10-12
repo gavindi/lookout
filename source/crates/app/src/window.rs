@@ -939,6 +939,10 @@ pub(crate) struct UiState {
     /// The bare `Message-ID` of the draft in `rendered_draft`, so its banner
     /// can tell a scheduled send waiting in Drafts (item 1.14 / UX-45).
     rendered_draft_message_id: Option<String>,
+    /// The message on the reading pane when it's waiting in the Scheduled
+    /// folder with a wake time (item 1.15): `(mailbox, uid, until)`, behind
+    /// the "Snoozed until …" bar's Unsnooze. Cleared on every navigation.
+    rendered_snooze: Option<(MailboxId, Uid, chrono::DateTime<chrono::Utc>)>,
     /// Each account's local outbox as last reported by `OutboxContents`
     /// (item 1.14): scheduled sends, messages waiting to go out, and ones
     /// that failed.
@@ -2431,6 +2435,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         message_details: None,
         rendered_draft: None,
         rendered_draft_message_id: None,
+        rendered_snooze: None,
         outbox: HashMap::new(),
         outbox_banner: None,
         outbox_dialog: None,
@@ -4191,6 +4196,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     draft_banner.set_button_label(Some("Edit"));
     draft_banner.set_revealed(false);
     message_page.append(&draft_banner);
+    // The snooze bar (item 1.15): "Snoozed until Tue 08:00" over a message
+    // waiting in the Scheduled folder, revealed by `render_body` from the
+    // message's wake-time keyword. Unsnooze wakes it now (back to the Inbox).
+    let snooze_banner = adw::Banner::new("");
+    snooze_banner.set_widget_name("snooze-banner");
+    snooze_banner.set_button_label(Some("Unsnooze"));
+    snooze_banner.set_revealed(false);
+    {
+        let state = state.clone();
+        snooze_banner.connect_button_clicked(move |_| {
+            let Some((mailbox, uid, _)) = state.borrow().rendered_snooze.clone() else { return };
+            let Some(account_id) = mailbox_account_id(&mailbox) else { return };
+            send_account_command(&state, &account_id, AccountCommand::WakeSnoozed { mailbox, uids: vec![uid] });
+        });
+    }
+    message_page.append(&snooze_banner);
     reading_stack.add_named(&message_page, Some("message"));
     let reading_empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     reading_stack.add_named(&reading_empty, Some("empty"));
@@ -7833,6 +7854,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.trust_banner_dismissed = None;
                     st.rendered_message = None;
                     st.rendered_draft = None;
+                    st.rendered_snooze = None;
                     st.pending_draft_open = None;
                     st.message_theme_override
                 };
@@ -9446,6 +9468,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         st.trust_banner_dismissed = None;
                         st.rendered_message = None;
                         st.rendered_draft = None;
+                        st.rendered_snooze = None;
                         st.pending_draft_open = None;
                         st.message_theme_override
                     };
@@ -9509,6 +9532,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             st.trust_banner_dismissed = None;
                             st.rendered_message = None;
                             st.rendered_draft = None;
+                            st.rendered_snooze = None;
                             st.pending_draft_open = None;
                             st.message_theme_override
                         };
@@ -9649,9 +9673,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // --- Delete/Archive/Report -> AccountCommand::MoveMessages against the
-    // account's Trash/Archive/Junk mailbox; Snooze -> AccountCommand::
-    // SnoozeMessages with a single fixed "tomorrow 9:00 AM local time"
-    // default applied to the whole selection. All four are silent no-ops
+    // account's Trash/Archive/Junk mailbox (Snooze has its own preset menu,
+    // below). All three are silent no-ops
     // with nothing selected, and send exactly one command per distinct
     // mailbox in the selection (see `selected_message_command_targets`) -
     // for today's ordinary single-selection case that's exactly one command,
@@ -9790,37 +9813,38 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             refresh_mark_read_button(&mark_read_button_for_click, &message_list);
         });
     }
+    // --- Snooze ▾ (item 1.15): the button opens Outlook's preset menu (Later
+    // today, Tomorrow, This weekend, Next week, Choose a date…). It stays a
+    // plain button so the Snooze shortcut's `emit_clicked` opens the menu too.
     {
         let message_list = message_list.clone();
         let state = state.clone();
-        snooze_button.connect_clicked(move |_| {
-            let targets = selected_message_command_targets(&message_list, &state);
-            if targets.is_empty() {
-                return;
-            }
-            let tomorrow_9am = chrono::Local::now()
-                .date_naive()
-                .succ_opt()
-                .and_then(|d| d.and_hms_opt(9, 0, 0))
-                .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(chrono::Utc::now);
-            // Undo: clear the (local-only) snooze again (item 1.13). Its
-            // toast is the action's only confirmation.
-            let mut inverse = Vec::new();
-            for (cmd_tx, mailbox, uids) in targets {
-                inverse.push(AccountCommand::UnsnoozeMessages {
-                    mailbox: mailbox.clone(),
-                    uids: uids.clone(),
-                });
-                let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessages {
-                    mailbox,
-                    uids,
-                    until: tomorrow_9am,
-                });
-            }
-            record_undo(&state, "Snoozed until tomorrow 9:00 AM", inverse);
-        });
+        let popover = crate::datetime_picker::build_time_preset_popover(
+            "Snooze until",
+            Rc::new(|now| {
+                crate::snooze::snooze_presets(&now)
+                    .into_iter()
+                    .map(|preset| crate::datetime_picker::TimeChoice {
+                        name: preset.name.to_string(),
+                        at: preset.at,
+                    })
+                    .collect()
+            }),
+            "Choose a date…",
+            crate::datetime_picker::TimeDialog {
+                heading: "Snooze",
+                field_label: "Snooze until",
+                accept: "Snooze",
+                note: None,
+            },
+            Rc::new(move |until| snooze_selection(&state, &message_list, until)),
+        );
+        popover.set_parent(&snooze_button);
+        {
+            let popover = popover.clone();
+            snooze_button.connect_clicked(move |_| popover.popup());
+        }
+        snooze_button.connect_destroy(move |_| popover.unparent());
     }
 
     // --- Main calendar navigation: prev/next/Today move the anchor by the
@@ -15928,6 +15952,7 @@ fn command_mailbox(command: &AccountCommand) -> Option<&MailboxId> {
     match command {
         AccountCommand::RevertMove { moved_to: mailbox, .. }
         | AccountCommand::UnsnoozeMessages { mailbox, .. }
+        | AccountCommand::WakeSnoozed { mailbox, .. }
         | AccountCommand::MoveMessage { mailbox, .. }
         | AccountCommand::MoveMessages { mailbox, .. }
         | AccountCommand::MoveMessagesTo { mailbox, .. }
@@ -15956,6 +15981,26 @@ fn undo_move_description(role: MailboxRole, count: usize) -> String {
         MailboxRole::Junk => format!("{count} {noun} reported as junk"),
         _ => format!("{count} {noun} moved"),
     }
+}
+
+/// Snoozes the selected messages until `until` (item 1.15) and offers Undo.
+/// The session decides whether the snooze lives on the server (the
+/// "Scheduled" folder) or stays local; `UnsnoozeMessages` reverses either.
+fn snooze_selection(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, until: chrono::DateTime<chrono::Utc>) {
+    let targets = selected_message_command_targets(message_list, state);
+    if targets.is_empty() {
+        return;
+    }
+    let mut inverse = Vec::new();
+    for (cmd_tx, mailbox, uids) in targets {
+        inverse.push(AccountCommand::UnsnoozeMessages {
+            mailbox: mailbox.clone(),
+            uids: uids.clone(),
+        });
+        let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessages { mailbox, uids, until });
+    }
+    let when = crate::datetime_picker::format_short_time(&until.with_timezone(&chrono::Local), &chrono::Local::now());
+    record_undo(state, &format!("Snoozed until {when}"), inverse);
 }
 
 /// Records a reversible action and shows its "… / Undo" toast. A no-op when
@@ -16145,7 +16190,10 @@ fn start_schedule_feedback(
     at: chrono::DateTime<chrono::Utc>,
 ) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>) {
     let now = chrono::Local::now();
-    let toast = adw::Toast::new(&format!("Scheduled for {}", crate::compose::format_schedule_time(&at.with_timezone(&chrono::Local), &now)));
+    let toast = adw::Toast::new(&format!(
+        "Scheduled for {}",
+        crate::datetime_picker::format_short_time(&at.with_timezone(&chrono::Local), &now)
+    ));
     let Some(account_id) = account_id else {
         if let Some(overlay) = state.borrow().toast_overlay.clone() {
             overlay.add_toast(toast);
@@ -16414,7 +16462,7 @@ fn fill_outbox_dialog(state: &Rc<RefCell<UiState>>, list: &gtk::Box) {
             } else if item.not_before > now_utc {
                 format!(
                     "Scheduled for {}",
-                    crate::compose::format_schedule_time(&item.not_before.with_timezone(&chrono::Local), &now)
+                    crate::datetime_picker::format_short_time(&item.not_before.with_timezone(&chrono::Local), &now)
                 )
             } else {
                 "Waiting to send".to_string()
@@ -16505,7 +16553,7 @@ fn refresh_draft_banner(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack
             } else if item.not_before > chrono::Utc::now() {
                 format!(
                     "Scheduled to send {}",
-                    crate::compose::format_schedule_time(&item.not_before.with_timezone(&chrono::Local), &chrono::Local::now())
+                    crate::datetime_picker::format_short_time(&item.not_before.with_timezone(&chrono::Local), &chrono::Local::now())
                 )
             } else {
                 "This message is waiting to send".to_string()
@@ -19719,9 +19767,11 @@ fn render_body(
                 .as_ref()
                 .and(summary.message_id.as_deref())
                 .map(|id| crate::compose::strip_angle_brackets(id).to_string());
+            st.rendered_snooze = lookout_core::snooze_until_from_keywords(&summary.keywords).map(|until| (mailbox.clone(), uid, until));
         } else {
             st.rendered_trust_sender = None;
             st.rendered_draft = None;
+            st.rendered_snooze = None;
             st.rendered_draft_message_id = None;
         }
     }
@@ -19729,6 +19779,20 @@ fn render_body(
     // being rendered, so a stale stash can never act on a different row.
     let is_rendered_draft = state.borrow().rendered_draft.as_ref() == Some(&(mailbox.clone(), uid));
     refresh_draft_banner(state, reading_stack, is_rendered_draft);
+    // Snooze bar (item 1.15), for the rendered message only.
+    let snoozed_until = state
+        .borrow()
+        .rendered_snooze
+        .as_ref()
+        .filter(|(m, u, _)| *m == mailbox && *u == uid)
+        .map(|(_, _, until)| *until);
+    if let Some(banner) = find_named_child(reading_stack, "snooze-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+        if let Some(until) = snoozed_until {
+            let when = crate::datetime_picker::format_short_time(&until.with_timezone(&chrono::Local), &chrono::Local::now());
+            banner.set_title(&format!("Snoozed until {when}"));
+        }
+        banner.set_revealed(snoozed_until.is_some());
+    }
     // Sync the "Switch message theme" toggle with its per-email state: the
     // selection handler resets `message_theme_override` to the configured
     // default on every navigation (with the physical sheet/canvas already
@@ -21294,6 +21358,7 @@ mod tests {
             message_details: None,
             rendered_draft: None,
             rendered_draft_message_id: None,
+            rendered_snooze: None,
             outbox: HashMap::new(),
             outbox_banner: None,
             outbox_dialog: None,

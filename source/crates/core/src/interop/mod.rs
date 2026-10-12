@@ -11,6 +11,7 @@
 //! - [`cdo`] — the `X-MICROSOFT-CDO-*` calendar properties (§4.3).
 //! - [`categories`] — Outlook's 25 category colour presets (§4.4, UX-85).
 //! - [`flags`] — follow-up flag semantics (§4.1, §4.4, M-10).
+//! - [`snooze`] — the snooze folder and wake-time keyword (§4.2, M-11).
 //!
 //! Decoders for Outlook's file formats (TNEF, `.msg`, PST) are a later roadmap
 //! item (1.21–1.22, 7.1) and are not here yet.
@@ -21,8 +22,10 @@ pub mod categories;
 pub mod cdo;
 pub mod flags;
 pub mod headers;
+pub mod snooze;
 
 pub use categories::{graph_preset, nearest_preset_for_rgb, preset_by_graph, CategoryPreset, OUTLOOK_CATEGORY_PRESETS};
 pub use cdo::BusyStatus;
 pub use flags::{flag_due_from_keyword, flag_due_keyword, follow_up_from_headers, follow_up_headers, FlagStatus, FollowUpFlag, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX};
 pub use headers::{importance_from_headers, importance_headers, sensitivity_from_headers, sensitivity_header, Importance, MessageSensitivity};
+pub use snooze::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};

@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.169" date="2026-10-13">
+      <description>
+        <p>Snooze now offers Outlook's choices: Later today, Tomorrow, This weekend, Next week, or a date and time you pick. A snoozed message waits in a "Scheduled" folder on your mail server and comes back to your Inbox as unread when its time comes, from whichever computer running Lookout notices first, so a snooze set on one computer also hides the message on your others. Messages in Scheduled show when they'll return, with an Unsnooze button. Accounts whose server can't store the wake time (often Microsoft 365) keep snoozes on this computer, and those now come back on time too.</p>
+      </description>
+    </release>
     <release version="0.9.168" date="2026-10-12">
       <description>
         <p>Calendar settings now apply straight away, with no restart: the first day of the week, your working days and working hours, and two new time-zone choices. Pick the time zone the calendar is shown in, and add a second time zone, which appears as an extra column of hours beside the Day and Week views. Both are chosen from searchable lists. New events start with your default reminder, and all-day events now save on the day you picked (they could land a day early in time zones ahead of UTC).</p>

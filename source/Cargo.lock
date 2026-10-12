@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-app"
-version = "0.9.168"
+version = "0.9.169"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-core"
-version = "0.9.168"
+version = "0.9.169"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2208,7 +2208,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-dav"
-version = "0.9.168"
+version = "0.9.169"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -2232,7 +2232,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-goa"
-version = "0.9.168"
+version = "0.9.169"
 dependencies = [
  "anyhow",
  "lookout-core",
@@ -2244,7 +2244,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-graph"
-version = "0.9.168"
+version = "0.9.169"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-mail"
-version = "0.9.168"
+version = "0.9.169"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",

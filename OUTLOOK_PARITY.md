@@ -42,7 +42,7 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 15 | 15 | 14 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps. No winmail.dat or `.msg`. |
+| Mail (5.1) | 16 | 14 | 14 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps. No winmail.dat or `.msg`. |
 | Compose (5.2) | 7 | 5 | 10 | 1 | Good rich editor and identities, with undo send and schedule send. No emoji, or forwarding with attachments. |
 | Calendar (5.3) | 10 | 14 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours and a second time zone apply live. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No per-event time zone yet. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
@@ -50,7 +50,7 @@ Counts are tallied from the §5 tables.
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **46** | **49** | **57** | **5** | ~29% at parity, ~31% partial |
+| **Total** | **47** | **48** | **57** | **5** | ~30% at parity, ~31% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -131,7 +131,7 @@ Exchange does **not** expose Outlook categories or rich flags over IMAP. On Micr
 | Categories | No standard. Thunderbird uses `$label1…$label5`; Lookout uses `$Lookout-tag-<key>` (`tags.rs`) | 🟡 Lookout-only | Keep the keyword store. On Microsoft 365 also sync to Graph `categories` (§4.4). Optionally read Thunderbird `$label*`. |
 | Junk | `$Junk` / `$NotJunk` (RFC 5788 registry) | Not set | Set on Report Junk / Not Junk so server filters learn. |
 | Forwarded / answered | `$Forwarded`, `\Answered` | **verify** whether set on send | Set both; show the reply/forward indicator icons in the list. |
-| Snooze | No standard. New Outlook moves the item to a server **"Scheduled"** folder and keeps the wake time in a MAPI property | Local-only (`cache.rs` `snoozed` table) | Move to a "Scheduled"-role folder plus `$Lookout-snooze-<unix>` keyword, so any Lookout install restores it (M-11). Can't interoperate with Outlook's own snooze over IMAP (⛔). |
+| Snooze | No standard. New Outlook moves the item to a server **"Scheduled"** folder and keeps the wake time in a MAPI property | Snoozed mail moves to a top-level "Scheduled" folder (created on demand) carrying `$Lookout-snooze-<unix>` (`core/src/interop/snooze.rs`); any connected Lookout install wakes it back to the Inbox, unread. Where the folder's `PERMANENTFLAGS` lack `\*` (Exchange IMAP, typically) the snooze stays local (`cache.rs` `snoozed` table) ✅ | Can't interoperate with Outlook's own snooze over IMAP (⛔). |
 
 ### 4.3 iCalendar / iTIP
 
@@ -243,7 +243,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-08 | Filter menu | `FilterSet`: Unread, Flagged, Has files, High importance, Categorized, To me (combinable check items) | 🟡 | @mentions me pending (M-25/2.13) |
 | M-09 | Categories (named, coloured, multiple) | `app/src/tags.rs` (`$Lookout-tag-*` keywords), Categorize menu, drop-on-tag | 🟡 | No master-list editor with Outlook's 25 colour presets; no Microsoft 365 sync |
 | M-10 | Flag for follow-up with dates | Pin = `\Flagged`; "Follow up" creates a linked task with `due: None` (`window.rs` `build_task_seed_for_email`) | 🟡 | No Today/Tomorrow/This week/Next week/No date/Custom/Mark complete; no flag state on the message itself; no due-date list column |
-| M-11 | Snooze | Fixed "tomorrow 9 AM"; local-only `snoozed` table (`mail/src/cache.rs`) | 🟡 | Presets (later today, tomorrow, this weekend, next week, custom); syncing across installs (§4.2) |
+| M-11 | Snooze | Snooze ▾ presets (Later today, Tomorrow, This weekend, Next week, Choose a date…); synced via the server "Scheduled" folder plus a wake-time keyword, local fallback where keywords aren't stored (§4.2); wakes on time back to the Inbox, unread; "Snoozed until …" bar with Unsnooze; Undo | ✅ | Outlook's own snooze isn't visible over IMAP (⛔) |
 | M-12 | Importance display | `!`/`↓` list glyph from parsed headers | ✅ | — |
 | M-13 | Pin | Pinned section, Graph mirror (`graph_pin.rs`) | ✅ | — |
 | M-14 | Rules | — | ❌ | Client engine plus Sieve plus Graph `messageRules` |
@@ -478,7 +478,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 
 | ID | Element | Outlook | Lookout today | Change | Effort |
 |---|---|---|---|---|---|
-| UX-21 | Mail Home ribbon order | **New mail ▾** · Delete ▾ · Archive · Report ▾ · Sweep · Move to ▾ · Reply · Reply all · Forward ▾ · Read/Unread · Categorize ▾ · Flag ▾ · Pin · Snooze ▾ · Quick steps ▾ · Print · … | New, Reply, Reply all, Forward, Delete, Archive, Report, Pin(★), Flag, Read/Unread, Categorize, Snooze, ⋮ (icon-only) | Reorder into Outlook's groups. Add **New mail ▾** (New event, New contact, New task), Sweep, Move to ▾ (recent folders, "Other folder…"), Forward ▾ (Forward as attachment), Snooze ▾ presets, Quick steps ▾. Labels per UX-16 | S |
+| UX-21 | Mail Home ribbon order | **New mail ▾** · Delete ▾ · Archive · Report ▾ · Sweep · Move to ▾ · Reply · Reply all · Forward ▾ · Read/Unread · Categorize ▾ · Flag ▾ · Pin · Snooze ▾ · Quick steps ▾ · Print · … | New, Reply, Reply all, Forward, Delete, Archive, Report, Pin(★), Flag, Read/Unread, Categorize, Snooze ▾ (presets, 1.15), ⋮ (icon-only) | Reorder into Outlook's groups. Add **New mail ▾** (New event, New contact, New task), Sweep, Move to ▾ (recent folders, "Other folder…"), Forward ▾ (Forward as attachment), Snooze ▾ presets, Quick steps ▾. Labels per UX-16 | S |
 | UX-22 | Mail View ribbon | View settings · Messages ▾ (Show as conversations / individual messages) · Layout: Folder pane ▾ (show / collapsed / hide), Reading pane ▾ (right / bottom / hidden), Density ▾ (Full / Medium / Compact), Message preview ▾ · Zoom · Sender image · Immersive reader · My Day | "Layout" group (`window.rs` ~4422) | Fill out to Outlook's set: M-04, M-05, M-06, M-37, X-04 | M |
 | UX-23 | Folder pane order | Favorites, then each account (by email address) with **Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive**, Notes, Conversation History, then user folders A–Z; "Create new folder" at the end of each account | All Inboxes, Favorites, accounts; each account sorts **Inbox first, then everything alphabetical** (`folder_tree.rs` `sort_paths`), so Deleted Items lands before Drafts | Sort SPECIAL-USE roles in Outlook's fixed order before user folders. Add a "Create new folder" row. Keep All Inboxes (Outlook for Mac has it; harmless) | S |
 | UX-24 | Folder counts | Unread count for most folders; **Drafts shows its total item count**; Junk shows unread; Deleted shows nothing by default | Unread count everywhere; folder ⋯ menu has a count option (`folder_menu.rs`) | Default Drafts to total count, matching Outlook | S |
@@ -615,7 +615,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.12 | ✅ ~~Reopen drafts~~ | C-12 | Open a Drafts message → parse MIME → composer prefill (identity, recipients, HTML, attachments); replace on save | M |
 | 1.13 | ✅ ~~Undo send / undo actions~~ | M-21, C-09 | 0.3 delay (setting 0/5/10 s) plus 0.4 for move/delete/flag/archive | M |
 | 1.14 | ✅ ~~Schedule send~~ | C-08 | Send menu → "Schedule send" date-time; 0.3 `not_before`; banner listing scheduled items; Graph deferred send on Microsoft 365 later (5.x) | M |
-| 1.15 | Snooze presets and sync | M-11 | Preset menu plus custom; Scheduled folder plus keyword (§4.2) | M |
+| 1.15 | ✅ ~~Snooze presets and sync~~ | M-11 | Preset menu plus custom; Scheduled folder plus keyword (§4.2) | M |
 | 1.16 | Follow-up flags | M-10, T-03 | Message-level flag state (keyword `$Lookout-flag-due-<date>` / `$Lookout-flag-done`; Graph `followupFlag` on Microsoft 365); presets; due column; tasks view shows flagged mail; Pin stays separate | L |
 | 1.17 | Message context menu | M-38 | 0.5; full Outlook item menu | M |
 | 1.18 | Outlook keyboard preset | UI-04 | §4.7 table as a second defaults set; picker in Settings; new actions (move to folder, next/previous, mark unread, new event/task/contact, F9) | M |

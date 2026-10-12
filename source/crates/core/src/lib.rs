@@ -32,6 +32,7 @@ pub use interop::{
     preset_by_graph, sensitivity_from_headers, sensitivity_header, BusyStatus, CategoryPreset, FlagStatus, FollowUpFlag, Importance, MessageSensitivity, FLAG_DONE_KEYWORD,
     FLAG_DUE_KEYWORD_PREFIX, OUTLOOK_CATEGORY_PRESETS,
 };
+pub use interop::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
 pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use signature::Signature;
 pub use thread::{ThreadGroup, ThreadKey};

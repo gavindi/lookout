@@ -198,7 +198,7 @@ IMAP directly, only sends commands and reacts to events.
 
 **`AccountCommand`** (`session.rs`) — every variant: `SyncMailbox`, `FetchBody`,
 `FetchAttachment`, `FetchRawMessage`, `Refresh`, `SendMessage { message, not_before, client_token }`,
-`CancelOutbox`, `RescheduleOutbox`, `Reconnect`,
+`CancelOutbox`, `RescheduleOutbox`, `WakeSnoozed`, `Reconnect`,
 `SetPrefetchPolicy`, `MoveMessage`/`MoveMessages`/`MoveMessagesTo`, `EmptyMailbox`,
 `SnoozeMessage`/`SnoozeMessages`, `StoreFlags`/`StoreFlagsMany`, `StoreKeywords`/
 `StoreKeywordsMany`, `PrefetchBodies`, `SaveDraft`/`DeleteDraft`, `SearchMailbox`, `Shutdown`.
@@ -409,6 +409,18 @@ send", item 1.14); `RescheduleOutbox` moves a row's due time with a fresh retry 
 "Retry"). After every outbox change, and once at session start before connecting, the session
 emits `OutboxContents` with the decoded rows (`OutboxItem`), which drives the app's
 scheduled-messages banner and dialog and a scheduled draft's "Cancel send" bar.
+
+**Snooze (item 1.15).** `SnoozeMessages` moves the messages to the account's top-level "Scheduled"
+folder (created on demand) after tagging them `$Lookout-snooze-<unix>`
+(`lookout_core::snooze_keyword`), recording the move in the `MoveLedger` so `UnsnoozeMessages`
+can revert it. That needs the folder's `PERMANENTFLAGS` to include `\*` (checked once per
+connection); otherwise - or if a step fails - the snooze is local, as before: a row in the cache's
+`snoozed` table that filters the message out of `MessagesUpdated`. The loop wakes snoozes the same
+way it drains the outbox: local ones by `purge_expired_snoozed` and a re-emit, server ones by
+scanning Scheduled (`scan_scheduled`: `UID SEARCH ALL` plus a `FLAGS` fetch) and moving due
+messages to INBOX with the keyword and `\Seen` removed. Scheduled is rescanned every 15 minutes
+(`SCHEDULED_RESCAN`) for snoozes made by other installs, and the IDLE slice is capped against the
+earliest wake. `WakeSnoozed` is the reading pane's "Unsnooze".
 
 ### 4.7 Auth and connection (`auth.rs`, `connection.rs`)
 

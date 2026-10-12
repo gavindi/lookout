@@ -45,6 +45,7 @@ mod resources;
 mod settings;
 mod shortcuts;
 mod signatures;
+mod snooze;
 mod tags;
 mod task_editor;
 mod tasks_view;

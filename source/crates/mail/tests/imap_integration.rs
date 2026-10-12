@@ -499,6 +499,67 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let restored = wait_for_event(&evt_rx, |e| undo_move_uid(e).is_some()).await;
     assert_ne!(undo_move_uid(&restored), Some(uid), "the round trip renumbers the message");
 
+    // --- Snooze sync (item 1.15): GreenMail accepts custom keywords, so a
+    // snooze moves the message to a (created-on-demand) "Scheduled" folder
+    // carrying `$Lookout-snooze-<unix>`; Undo brings it back without the
+    // keyword; a short snooze wakes on its own, back in INBOX and unread.
+    let uid = undo_move_uid(&restored).unwrap();
+    let _ = cmd_tx
+        .send(AccountCommand::SnoozeMessages {
+            mailbox: inbox_id.clone(),
+            uids: vec![uid],
+            until: chrono::Utc::now() + chrono::Duration::hours(1),
+        })
+        .await;
+    let folders = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::FoldersUpdated(f) if f.iter().any(|m| m.name == "Scheduled"))).await;
+    let AccountEvent::FoldersUpdated(folders) = folders else { unreachable!() };
+    let scheduled_id = folders.iter().find(|m| m.name == "Scheduled").unwrap().id.clone();
+    wait_for_event(&evt_rx, |e| {
+        matches!(e, AccountEvent::MessagesUpdated { mailbox, .. } if *mailbox == inbox_id) && undo_move_uid(e).is_none()
+    })
+    .await;
+    let _ = cmd_tx.send(AccountCommand::SyncMailbox(scheduled_id.clone())).await;
+    let snoozed = wait_for_event(&evt_rx, |e| {
+        matches!(e, AccountEvent::MessagesUpdated { mailbox, messages, .. }
+            if *mailbox == scheduled_id && messages.iter().any(|m| m.subject.as_deref() == Some("undo move")))
+    })
+    .await;
+    let AccountEvent::MessagesUpdated { messages, .. } = snoozed else { unreachable!() };
+    let in_scheduled = messages.iter().find(|m| m.subject.as_deref() == Some("undo move")).unwrap();
+    assert!(
+        lookout_core::snooze_until_from_keywords(&in_scheduled.keywords).is_some(),
+        "the wake time travels as a keyword"
+    );
+    let _ = cmd_tx
+        .send(AccountCommand::UnsnoozeMessages {
+            mailbox: inbox_id.clone(),
+            uids: vec![uid],
+        })
+        .await;
+    let _ = cmd_tx.send(AccountCommand::SyncMailbox(inbox_id.clone())).await;
+    let back = wait_for_event(&evt_rx, |e| undo_move_uid(e).is_some()).await;
+    let uid = undo_move_uid(&back).unwrap();
+
+    let _ = cmd_tx
+        .send(AccountCommand::SnoozeMessages {
+            mailbox: inbox_id.clone(),
+            uids: vec![uid],
+            until: chrono::Utc::now() + chrono::Duration::seconds(2),
+        })
+        .await;
+    wait_for_event(&evt_rx, |e| {
+        matches!(e, AccountEvent::MessagesUpdated { mailbox, .. } if *mailbox == inbox_id) && undo_move_uid(e).is_none()
+    })
+    .await;
+    let woken = wait_for_event(&evt_rx, |e| {
+        matches!(e, AccountEvent::MessagesUpdated { mailbox, messages, .. }
+            if *mailbox == inbox_id && messages.iter().any(|m| m.subject.as_deref() == Some("undo move") && m.is_unread()))
+    })
+    .await;
+    let AccountEvent::MessagesUpdated { messages, .. } = woken else { unreachable!() };
+    let awake = messages.iter().find(|m| m.subject.as_deref() == Some("undo move")).unwrap();
+    assert!(lookout_core::snooze_until_from_keywords(&awake.keywords).is_none(), "waking drops the keyword");
+
     let _ = cmd_tx.send(AccountCommand::Shutdown).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
