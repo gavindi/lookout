@@ -234,9 +234,46 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let queued = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxQueued { client_token: Some(7), .. })).await;
     let AccountEvent::OutboxQueued { id: undone_id, .. } = queued else { unreachable!() };
     let _ = cmd_tx.send(AccountCommand::CancelOutbox { id: undone_id }).await;
-    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxCancelled { id } if *id == undone_id)).await;
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxCancelled { id, .. } if *id == undone_id)).await;
     let _ = cmd_tx.send(AccountCommand::CancelOutbox { id: undone_id }).await;
     wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxCancelFailed { id } if *id == undone_id)).await;
+
+    // --- Schedule send (item 1.14): a send an hour out is listed by
+    // `OutboxContents`; "Cancel send" hands the payload back (Bcc included);
+    // "Send now" (`RescheduleOutbox`) delivers it straight away.
+    let mut scheduled = msg.clone();
+    scheduled.subject = "scheduled send".to_string();
+    scheduled.bcc = vec!["testuser@localhost".to_string()];
+    let schedule = |message: ComposedMessage, token: u64| AccountCommand::SendMessage {
+        message: Box::new(message),
+        not_before: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        client_token: Some(token),
+    };
+    let _ = cmd_tx.send(schedule(scheduled.clone(), 8)).await;
+    let queued = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxQueued { client_token: Some(8), .. })).await;
+    let AccountEvent::OutboxQueued { id: scheduled_id, .. } = queued else { unreachable!() };
+    wait_for_event(
+        &evt_rx,
+        |e| matches!(e, AccountEvent::OutboxContents { items } if items.iter().any(|i| i.id == scheduled_id && i.subject == "scheduled send" && !i.failed)),
+    )
+    .await;
+    let _ = cmd_tx.send(AccountCommand::CancelOutbox { id: scheduled_id }).await;
+    let cancelled = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxCancelled { id, .. } if *id == scheduled_id)).await;
+    let AccountEvent::OutboxCancelled { message: Some(withdrawn), .. } = cancelled else {
+        panic!("cancel carried no payload")
+    };
+    assert_eq!(withdrawn.subject, "scheduled send");
+    assert_eq!(withdrawn.bcc, vec!["testuser@localhost".to_string()]);
+    let _ = cmd_tx.send(schedule(scheduled, 9)).await;
+    let queued = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxQueued { client_token: Some(9), .. })).await;
+    let AccountEvent::OutboxQueued { id: scheduled_id, .. } = queued else { unreachable!() };
+    let _ = cmd_tx
+        .send(AccountCommand::RescheduleOutbox {
+            id: scheduled_id,
+            not_before: chrono::Utc::now(),
+        })
+        .await;
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxSent { id } if *id == scheduled_id)).await;
 
     let _ = cmd_tx
         .send(AccountCommand::SendMessage {

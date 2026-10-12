@@ -398,6 +398,14 @@ pub enum AccountCommand {
     CancelOutbox {
         id: i64,
     },
+    /// Moves a queued (or permanently failed) outbox row's due time to
+    /// `not_before` with a fresh retry budget - the scheduled-messages
+    /// dialog's "Send now" and "Retry" (item 1.14). Answered with a fresh
+    /// `OutboxContents`.
+    RescheduleOutbox {
+        id: i64,
+        not_before: chrono::DateTime<chrono::Utc>,
+    },
     /// A hint that it's worth retrying the connection now rather than
     /// waiting out the current backoff delay - e.g. the app crate's
     /// `Gio.NetworkMonitor` reporting connectivity just came back. A no-op
@@ -742,9 +750,20 @@ pub enum AccountEvent {
         client_token: Option<u64>,
         message: String,
     },
-    /// A `CancelOutbox` withdrew the row before it went out.
+    /// A `CancelOutbox` withdrew the row before it went out. `message` is
+    /// the withdrawn payload (`None` only if it couldn't be decoded), so the
+    /// UI can reopen a send it holds no copy of - one scheduled in an earlier
+    /// run, or withdrawn from the scheduled-messages dialog (item 1.14).
     OutboxCancelled {
         id: i64,
+        message: Option<Box<OutboxMessage>>,
+    },
+    /// Everything in the account's local outbox: scheduled sends, messages
+    /// waiting to go out, and ones that permanently failed (item 1.14).
+    /// Emitted once at session start - before connecting, so it works
+    /// offline - and again after every outbox change.
+    OutboxContents {
+        items: Vec<OutboxItem>,
     },
     /// A `CancelOutbox` came too late: the row was already sent (or had
     /// permanently failed), so nothing was withdrawn.
@@ -839,6 +858,61 @@ pub trait CredentialProvider: Send + Sync {
 /// whole-folder write would stall this account's actor and hold the worker
 /// against every other account's session too.
 type CacheHandle = std::sync::Arc<Option<crate::cache::Cache>>;
+
+/// One row of the local outbox as the UI lists it (item 1.14): the payload's
+/// display fields, without the raw message bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxItem {
+    pub id: i64,
+    /// When the row is (next) due to go out.
+    pub not_before: chrono::DateTime<chrono::Utc>,
+    /// Every retry failed; the row waits for the user to retry or edit it.
+    pub failed: bool,
+    pub attempts: u32,
+    pub subject: String,
+    /// The visible recipients (To and Cc): the SMTP envelope minus Bcc.
+    pub recipients: Vec<String>,
+    /// The bare `Message-ID` of the Drafts copy the send replaces, if any.
+    pub draft_message_id: Option<String>,
+}
+
+/// The UI's view of the outbox rows, oldest due first. Rows whose payload
+/// doesn't decode are skipped - the drain drops them when they come due.
+fn outbox_items(entries: Vec<crate::cache::OutboxEntry>) -> Vec<OutboxItem> {
+    let mut items: Vec<OutboxItem> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let message = serde_json::from_slice::<OutboxMessage>(&entry.payload).ok()?;
+            let bcc: HashSet<String> = message.bcc.iter().map(|b| bare_address(b).to_ascii_lowercase()).collect();
+            Some(OutboxItem {
+                id: entry.id,
+                not_before: entry.not_before,
+                failed: entry.state == crate::cache::OutboxState::Failed,
+                attempts: entry.attempts,
+                subject: message.subject,
+                recipients: message.recipients.into_iter().filter(|r| !bcc.contains(&bare_address(r).to_ascii_lowercase())).collect(),
+                draft_message_id: message.draft_message_id,
+            })
+        })
+        .collect();
+    items.sort_by_key(|item| (item.not_before, item.id));
+    items
+}
+
+/// The address inside a `Name <address>` token, or the token itself.
+fn bare_address(token: &str) -> &str {
+    match (token.rfind('<'), token.rfind('>')) {
+        (Some(start), Some(end)) if start < end => token[start + 1..end].trim(),
+        _ => token.trim(),
+    }
+}
+
+/// Emits the outbox's current contents as `OutboxContents` (item 1.14).
+async fn emit_outbox_contents(cache: &CacheHandle, events: &async_channel::Sender<AccountEvent>) {
+    if let Some(Ok(entries)) = cache_op(cache, |c| c.all_outbox()).await {
+        let _ = events.send(AccountEvent::OutboxContents { items: outbox_items(entries) }).await;
+    }
+}
 
 /// Runs `op` against the on-disk cache on the blocking thread pool, returning
 /// `None` when no cache is open (or the task was cancelled) and `Some(result)`
@@ -994,6 +1068,10 @@ pub async fn run_account_session(
                 .await;
         }
     }
+
+    // The outbox too, so scheduled and unsent messages are listed (item
+    // 1.14) even while the account can't connect.
+    emit_outbox_contents(&cache, &events).await;
 
     // One-time FTS backfill, fired off to the blocking pool *without*
     // awaiting. It used to run inline before the connection was even
@@ -1463,6 +1541,7 @@ async fn connect_and_run(
                 }
             }
             next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
+            emit_outbox_contents(cache, events).await;
         }
         // Take a command - or a push from the dedicated IDLE connection -
         // that's *already* queued without entering IDLE first. Establishing
@@ -2144,6 +2223,7 @@ async fn connect_and_run(
                                     not_before: due,
                                 })
                                 .await;
+                            emit_outbox_contents(cache, events).await;
                         }
                         Some(Err(e)) => {
                             tracing::warn!("couldn't queue outgoing message: {e}");
@@ -2156,18 +2236,28 @@ async fn connect_and_run(
                     }
                 }
                 AccountCommand::CancelOutbox { id } => {
-                    // Only a row still `pending` is withdrawn; one already
-                    // delivered is gone from the table, and the drain can't be
-                    // mid-send here because commands and the drain share this
-                    // loop.
-                    let cancelled = matches!(cache_op(cache, move |c| c.cancel_outbox(id)).await, Some(Ok(true)));
+                    // A row still `pending` (or permanently `failed`) is
+                    // withdrawn and handed back; one already delivered is gone
+                    // from the table, and the drain can't be mid-send here
+                    // because commands and the drain share this loop.
+                    let withdrawn = cache_op(cache, move |c| c.cancel_outbox(id)).await.and_then(|r| r.ok()).flatten();
                     next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
-                    let event = if cancelled {
-                        AccountEvent::OutboxCancelled { id }
-                    } else {
-                        AccountEvent::OutboxCancelFailed { id }
+                    let event = match withdrawn {
+                        Some(entry) => AccountEvent::OutboxCancelled {
+                            id,
+                            message: serde_json::from_slice::<OutboxMessage>(&entry.payload).ok().map(Box::new),
+                        },
+                        None => AccountEvent::OutboxCancelFailed { id },
                     };
                     let _ = events.send(event).await;
+                    emit_outbox_contents(cache, events).await;
+                }
+                AccountCommand::RescheduleOutbox { id, not_before } => {
+                    if let Some(Err(e)) = cache_op(cache, move |c| c.reschedule_outbox(id, not_before)).await {
+                        tracing::warn!(id, "couldn't reschedule outbox row: {e}");
+                    }
+                    next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
+                    emit_outbox_contents(cache, events).await;
                 }
                 AccountCommand::SaveDraft { msg, replace } => {
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
@@ -5987,6 +6077,48 @@ async fn fetch_body_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `OutboxContents` rows (item 1.14): decoded display fields, Bcc kept
+    /// out of the visible recipients, failed state carried, oldest due first,
+    /// undecodable payloads skipped.
+    #[test]
+    fn outbox_items_list_display_fields_without_bcc() {
+        let now = chrono::Utc::now();
+        let payload = |subject: &str, recipients: &[&str], bcc: &[&str]| {
+            serde_json::to_vec(&OutboxMessage {
+                from: "me@example.com".into(),
+                recipients: recipients.iter().map(|r| r.to_string()).collect(),
+                raw_base64: String::new(),
+                draft_message_id: Some(format!("{subject}@lookout.local")),
+                subject: subject.into(),
+                bcc: bcc.iter().map(|b| b.to_string()).collect(),
+            })
+            .unwrap()
+        };
+        let entry = |id: i64, due: chrono::DateTime<chrono::Utc>, state, payload: Vec<u8>| crate::cache::OutboxEntry {
+            id,
+            account_id: AccountId("acct".into()),
+            not_before: due,
+            attempts: 0,
+            payload,
+            state,
+        };
+        let items = outbox_items(vec![
+            entry(
+                1,
+                now + chrono::Duration::hours(2),
+                crate::cache::OutboxState::Pending,
+                payload("later", &["a@example.com", "Hidden@Example.com"], &["Ada <hidden@example.com>"]),
+            ),
+            entry(2, now, crate::cache::OutboxState::Failed, payload("failed", &["b@example.com"], &[])),
+            entry(3, now, crate::cache::OutboxState::Pending, b"not json".to_vec()),
+        ]);
+        assert_eq!(items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![2, 1]);
+        assert!(items[0].failed);
+        assert_eq!(items[1].subject, "later");
+        assert_eq!(items[1].recipients, vec!["a@example.com".to_string()]);
+        assert_eq!(items[1].draft_message_id.as_deref(), Some("later@lookout.local"));
+    }
 
     fn mailbox(account_id: &AccountId, name: &str, role: MailboxRole, unread: u32) -> Mailbox {
         Mailbox {

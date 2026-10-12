@@ -1919,17 +1919,39 @@ impl Cache {
     }
 
     /// Withdraws an outbox row that hasn't gone out yet - undo send (item
-    /// 1.13). Only a `pending` row is removed; returns whether one was, so a
-    /// row already sent (deleted) or permanently `failed` reports `false`.
-    pub fn cancel_outbox(&self, id: i64) -> Result<bool> {
+    /// 1.13), and schedule send's "Cancel send"/"Edit" (item 1.14). A
+    /// `pending` or permanently `failed` row is removed and returned, so the
+    /// caller can reopen it in the composer; a row already sent (deleted)
+    /// returns `None`.
+    pub fn cancel_outbox(&self, id: i64) -> Result<Option<OutboxEntry>> {
         let conn = self.conn.lock().unwrap();
-        let removed = conn.execute("DELETE FROM outbox WHERE id = ?1 AND state = 'pending'", rusqlite::params![id])?;
-        Ok(removed > 0)
+        let entry = Self::outbox_rows_locked(&conn, "WHERE id = ?1", rusqlite::params![id])?.into_iter().next();
+        if entry.is_some() {
+            conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
+        }
+        Ok(entry)
+    }
+
+    /// Moves an outbox row's due time to `not_before` and makes it `pending`
+    /// again with a fresh retry budget - schedule send's "Send now" and a
+    /// failed row's "Retry" (item 1.14). Returns whether the row still
+    /// existed (it may have gone out in the meantime).
+    pub fn reschedule_outbox(&self, id: i64, not_before: DateTime<Utc>) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE outbox SET not_before = ?1, attempts = 0, state = ?2 WHERE id = ?3",
+            rusqlite::params![not_before.timestamp(), OutboxState::Pending.as_str(), id],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Shared row reader for the outbox queries.
     fn outbox_rows<P: rusqlite::Params>(&self, clause: &str, params: P) -> Result<Vec<OutboxEntry>> {
         let conn = self.conn.lock().unwrap();
+        Self::outbox_rows_locked(&conn, clause, params)
+    }
+
+    fn outbox_rows_locked<P: rusqlite::Params>(conn: &Connection, clause: &str, params: P) -> Result<Vec<OutboxEntry>> {
         let mut stmt = conn.prepare(&format!("SELECT id, account_id, not_before, attempts, payload, state FROM outbox {clause}"))?;
         let rows = stmt.query_map(params, |row| {
             Ok((
@@ -2186,23 +2208,58 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// Undo send's `CancelOutbox`: a pending row is withdrawn once; a row
-    /// already gone (sent) or permanently failed can't be cancelled.
+    /// `CancelOutbox` (undo send, schedule send's "Cancel send"): a pending
+    /// or failed row is withdrawn once and handed back; a row already gone
+    /// (sent) can't be cancelled.
     #[test]
-    fn cancel_outbox_withdraws_only_pending_rows() {
+    fn cancel_outbox_withdraws_pending_and_failed_rows() {
         let account_id = temp_account_id();
         let cache = Cache::open(&account_id).unwrap();
         let now = Utc::now();
 
         let pending = cache.enqueue_outbox(&account_id, now + chrono::Duration::seconds(5), b"undoable").unwrap();
-        assert!(cache.cancel_outbox(pending).unwrap());
-        assert!(!cache.cancel_outbox(pending).unwrap(), "already withdrawn");
+        let withdrawn = cache.cancel_outbox(pending).unwrap().expect("pending row withdrawn");
+        assert_eq!(withdrawn.id, pending);
+        assert_eq!(withdrawn.payload, b"undoable");
+        assert!(cache.cancel_outbox(pending).unwrap().is_none(), "already withdrawn");
         assert_eq!(cache.next_outbox_not_before().unwrap(), None);
 
         let failed = cache.enqueue_outbox(&account_id, now, b"doomed").unwrap();
         assert_eq!(cache.outbox_attempt_failed(failed, now, 1).unwrap(), OutboxState::Failed);
-        assert!(!cache.cancel_outbox(failed).unwrap(), "a failed row isn't pending");
-        assert_eq!(cache.all_outbox().unwrap().len(), 1);
+        let withdrawn = cache.cancel_outbox(failed).unwrap().expect("failed row withdrawn for editing");
+        assert_eq!(withdrawn.state, OutboxState::Failed);
+        assert!(cache.all_outbox().unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Schedule send's "Send now" / "Retry": a pending or failed row becomes
+    /// pending at the new time with a fresh retry budget; a vanished row
+    /// reports `false`.
+    #[test]
+    fn reschedule_outbox_resets_state_and_due_time() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let now = Utc::now();
+        let now_secs = DateTime::from_timestamp(now.timestamp(), 0).unwrap();
+
+        let scheduled = cache.enqueue_outbox(&account_id, now + chrono::Duration::hours(3), b"later").unwrap();
+        assert!(cache.due_outbox(now).unwrap().is_empty());
+        assert!(cache.reschedule_outbox(scheduled, now).unwrap());
+        assert_eq!(cache.due_outbox(now).unwrap().iter().map(|e| e.id).collect::<Vec<_>>(), vec![scheduled]);
+        assert_eq!(cache.next_outbox_not_before().unwrap(), Some(now_secs));
+
+        assert_eq!(cache.outbox_attempt_failed(scheduled, now, 1).unwrap(), OutboxState::Failed);
+        assert!(cache.due_outbox(now).unwrap().is_empty());
+        assert!(cache.reschedule_outbox(scheduled, now).unwrap());
+        let retried = cache.due_outbox(now).unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].state, OutboxState::Pending);
+        assert_eq!(retried[0].attempts, 0);
+
+        cache.delete_outbox(scheduled).unwrap();
+        assert!(!cache.reschedule_outbox(scheduled, now).unwrap());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

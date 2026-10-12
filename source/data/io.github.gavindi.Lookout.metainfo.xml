@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.167" date="2026-10-12">
+      <description>
+        <p>Schedule send: the arrow beside Send offers Tomorrow morning, Tomorrow afternoon, Monday morning or a custom time. A scheduled message waits in Drafts, marked "Scheduled to send", until it goes out, and Cancel send takes it back for editing. A banner above the message list shows scheduled messages and any that are waiting or couldn't be sent, with Send now, Retry and Edit. Lookout must be running for a scheduled message to be sent.</p>
+      </description>
+    </release>
     <release version="0.9.166" date="2026-10-12">
       <description>
         <p>Undo send: after you click Send, the "Sending" notification offers Undo for 5 seconds (choose Off, 5 or 10 seconds in Settings → Mail). Undo stops the message and reopens it in the composer exactly as it was, recipients and attachments included. Undo for deleting, archiving and moving messages now reliably brings back the same messages, and snoozing a message can be undone too.</p>

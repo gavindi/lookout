@@ -43,14 +43,14 @@ Counts are tallied from the §5 tables.
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
 | Mail (5.1) | 15 | 15 | 14 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps. No winmail.dat or `.msg`. |
-| Compose (5.2) | 6 | 5 | 11 | 1 | Good rich editor and identities, with undo send. No schedule send, emoji, or forwarding with attachments. |
+| Compose (5.2) | 7 | 5 | 10 | 1 | Good rich editor and identities, with undo send and schedule send. No emoji, or forwarding with attachments. |
 | Calendar (5.3) | 7 | 14 | 14 | 0 | Views and drag-to-edit are good. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No week-start, working-hours or time-zone settings. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 3 | 3 | 5 | 1 | VTODO and Google Tasks CRUD. No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **42** | **49** | **61** | **5** | ~27% at parity, ~32% partial |
+| **Total** | **43** | **49** | **60** | **5** | ~27% at parity, ~32% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -272,7 +272,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-37 | Immersive Reader / zoom | Dark message theme toggle | 🟡 | Ctrl+scroll / Ctrl+± zoom on the WebKit view; reader mode |
 | M-38 | Message context menu | Row right-click shows only category toggles (`window.rs`) | 🟡 | Full Outlook menu: reply, forward, mark, flag, categorise, move, rules, junk, ignore, delete, view source |
 | M-39 | Notifications | `mail_notifications.rs`, tray, badge | ✅ | Add per-folder / VIP-only options |
-| M-40 | Work offline / outbox | Cache-first reads; NetworkMonitor-aware errors | 🟡 | "Work offline" toggle; queued sends (outbox) |
+| M-40 | Work offline / outbox | Cache-first reads; NetworkMonitor-aware errors; sends queue in the local outbox, and a banner above the message list lists waiting, scheduled and failed ones (Send now / Retry / Edit) | 🟡 | "Work offline" toggle; an Outbox folder in the folder pane |
 | M-41 | List-unsubscribe | One-click POST plus mailto | ✅ | (Better than classic Outlook) |
 | M-42 | Shared mailboxes / delegate access | — | ❌ | Graph (Phase 5); IMAP `NAMESPACE` shared folders |
 | M-43 | Archive folder | SPECIAL-USE `\Archive`, Ctrl+E | ✅ | — |
@@ -291,7 +291,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | C-05 | Importance (High/Low) | `ComposedMessage.importance`; High/Low toggles; three headers written | ✅ | — |
 | C-06 | Sensitivity | — | ❌ | §4.1 |
 | C-07 | Request read / delivery receipt | Read only | 🟡 | DSN (M-27) |
-| C-08 | Schedule send / delay delivery | — | ❌ | Outbox `not_before` (Phase 0); server-side via Graph on Microsoft 365 |
+| C-08 | Schedule send / delay delivery | Send ▾ → Tomorrow morning / Tomorrow afternoon / Monday morning / Custom time…; outbox `not_before`; the message waits in Drafts with a "Scheduled to send …" bar (Cancel send); "N scheduled messages" banner and dialog | ✅ | Client-side: Lookout must be running. Server-side via Graph on Microsoft 365 (5.5) |
 | C-09 | Undo send | Outbox `not_before` delay (Settings → Mail → "Undo send": Off / 5 s / 10 s, default 5); Undo on the "Sending" toast cancels and reopens the composer | ✅ | — |
 | C-10 | Signatures | Rich, per-account defaults for new and reply (`app_config.rs` `signature_defaults`) | ✅ | — |
 | C-11 | Drafts autosave | 5 s autosave to IMAP Drafts | ✅ | — |
@@ -503,11 +503,11 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 | ID | Element | Outlook | Lookout today | Change | Effort |
 |---|---|---|---|---|---|
 | UX-40 | Compose ribbon | Contextual tabs replace Home: **Message** (Attach file ▾, Signature ▾, Importance, Dictate), **Insert** (File, Picture, Table, Link, Emoji, Signature, My Templates, Meeting), **Format text** (font, size, B I U S, highlight, colour, bullets, numbering, indent, align, styles, clear), **Draw**, **Options** (Importance, Sensitivity, Receipts, Delay delivery, Encrypt, Switch to plain text, Spelling language) | Formatting toolbar takes over the action bar (one strip) | Split into Message / Insert / Format text / Options tabs on the shared ribbon component (UX-16). Draw is out of scope | M |
-| UX-41 | Field order | Top bar: **Send ▾** (Schedule send), Discard, Pop out. Then **From** (shown with multiple identities), **To** (Cc / Bcc links at the right end), Cc, Bcc, **Subject**, attachments strip, body. Tab order To → Cc → Subject → body | Send, From dropdown, then To / Cc / Bcc / Subject (`compose.rs` `fields_group`) ✅. The older `mail_compose_pop_in_1.png` screenshot shows Subject above To and should be refreshed | Keep the order; check Tab order To → Cc → Bcc → Subject → body. Send becomes a split button (C-08) | S |
+| UX-41 | Field order | Top bar: **Send ▾** (Schedule send), Discard, Pop out. Then **From** (shown with multiple identities), **To** (Cc / Bcc links at the right end), Cc, Bcc, **Subject**, attachments strip, body. Tab order To → Cc → Subject → body | Send, From dropdown, then To / Cc / Bcc / Subject (`compose.rs` `fields_group`) ✅. The older `mail_compose_pop_in_1.png` screenshot shows Subject above To and should be refreshed | Keep the order; check Tab order To → Cc → Bcc → Subject → body. Send is a split button with Schedule send ✅ (C-08) | S |
 | UX-42 | Recipient pills | Resolved recipients are **pills** (name, presence/avatar, ✕), external recipients flagged, contact lists show a "+" to expand, invalid addresses underlined in red; autocomplete rows show name, address and an ✕ to forget the suggestion | Compose uses `recipient_entry.rs` **plain** comma-separated mode; chip mode exists only in the event editor | Switch compose to chip mode with Outlook's pill behaviour. Expand lists (P-05). Add "Remove from suggestions" (deletes from the `addresses` table) | M |
 | UX-43 | Attachments while composing | Tiles under the subject line; attach via Insert ▸ File ▸ *Browse this computer* / *Recent attachments*; drag-in; tile ▾: Open, Remove, (Share as link) | Attach button; file drop blocked (`compose.rs:722`) | Tiles, a recent-attachments list, drag-in (C-15) | S |
 | UX-44 | Missing icons | — | Compose toolbar shows red "missing image" placeholders on several buttons (`assets/screenshots/mail_compose_pop_in_1.png`) | **verify** on a current build; bundle or rename any missing symbolic icons | S |
-| UX-45 | Send feedback | Toast "Sending…" with **Undo** for N seconds, then sent; schedule send shows a "Scheduled for …" info bar on the draft | "Sending: <subject>" toast with Undo for the undo-send delay, then "Message sent"; failure toast ✅ | "Scheduled for …" info bar with 1.14 | S |
+| UX-45 | Send feedback | Toast "Sending…" with **Undo** for N seconds, then sent; schedule send shows a "Scheduled for …" info bar on the draft | "Sending: <subject>" toast with Undo for the undo-send delay, then "Message sent"; failure toast; schedule send shows "Scheduled for …" with Undo, and the draft's bar reads "Scheduled to send …" with Cancel send ✅ | — | S |
 | UX-46 | Inline vs pop-out | Reply opens **inline** at the top of the conversation in the reading pane, with a Pop out button; New mail opens in the reading pane (or a window by setting) | Same ✅ | — | — |
 
 ### 6.6 Calendar
@@ -614,7 +614,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.11 | Forward with attachments; forward as attachment | C-13 | Fetch original parts (`FetchAttachment`) into the composer; `message/rfc822` part | M |
 | 1.12 | ✅ ~~Reopen drafts~~ | C-12 | Open a Drafts message → parse MIME → composer prefill (identity, recipients, HTML, attachments); replace on save | M |
 | 1.13 | ✅ ~~Undo send / undo actions~~ | M-21, C-09 | 0.3 delay (setting 0/5/10 s) plus 0.4 for move/delete/flag/archive | M |
-| 1.14 | Schedule send | C-08 | Send menu → "Schedule send" date-time; 0.3 `not_before`; banner listing scheduled items; Graph deferred send on Microsoft 365 later (5.x) | M |
+| 1.14 | ✅ ~~Schedule send~~ | C-08 | Send menu → "Schedule send" date-time; 0.3 `not_before`; banner listing scheduled items; Graph deferred send on Microsoft 365 later (5.x) | M |
 | 1.15 | Snooze presets and sync | M-11 | Preset menu plus custom; Scheduled folder plus keyword (§4.2) | M |
 | 1.16 | Follow-up flags | M-10, T-03 | Message-level flag state (keyword `$Lookout-flag-due-<date>` / `$Lookout-flag-done`; Graph `followupFlag` on Microsoft 365); presets; due column; tasks view shows flagged mail; Pin stays separate | L |
 | 1.17 | Message context menu | M-38 | 0.5; full Outlook item menu | M |

@@ -190,6 +190,16 @@ pub struct DraftPrefillContent {
     /// Whether the draft asked for a read receipt
     /// (`Disposition-Notification-To` present).
     pub request_read_receipt: bool,
+    /// The envelope, parsed from the raw headers. A reopened draft takes
+    /// these from its cached `EmailSummary` instead; a withdrawn scheduled
+    /// send (item 1.14) has no summary, only the outbox's raw bytes, so it
+    /// reads them here. `from` is the bare sending address; `to`/`cc` are
+    /// composer tokens like `bcc`.
+    pub from: Option<String>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: Option<String>,
+    pub importance: lookout_core::Importance,
 }
 
 /// Parses a saved draft's raw bytes into the contents the composer prefills
@@ -243,6 +253,10 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
         .collect();
 
     let bcc = message.header("bcc").map(address_header_to_strings).unwrap_or_default();
+    let to = message.header("to").map(address_header_to_strings).unwrap_or_default();
+    let cc = message.header("cc").map(address_header_to_strings).unwrap_or_default();
+    let from = message.from().and_then(|from| from.first()).and_then(|addr| addr.address.as_deref()).map(str::to_string);
+    let subject = message.subject().map(str::to_string);
 
     // Threading and receipt state come from the raw headers rather than
     // mail_parser's typed accessors, matching the app's `reply_threading`
@@ -260,6 +274,7 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
         })
         .unwrap_or_default();
     let request_read_receipt = !lookout_core::parse_disposition_notification_to(&headers).is_empty();
+    let importance = lookout_core::importance_from_headers(&headers).unwrap_or_default();
 
     Some(DraftPrefillContent {
         text_body,
@@ -269,6 +284,11 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
         in_reply_to,
         references,
         request_read_receipt,
+        from,
+        to,
+        cc,
+        subject,
+        importance,
     })
 }
 
@@ -1165,11 +1185,11 @@ mod tests {
             from: "me@example.com".to_string(),
             display_name: None,
             to: vec!["you@example.com".to_string()],
-            cc: vec![],
+            cc: vec!["Bo <cc@example.com>".to_string()],
             bcc: vec!["Ada <hidden@example.com>".to_string()],
             reply_to: vec![],
             subject: "Draft".to_string(),
-            importance: lookout_core::Importance::Normal,
+            importance: lookout_core::Importance::High,
             text_body: "draft body".to_string(),
             html_body: Some("<p>draft body</p><img src=\"cid:img-1@lookout.local\">".to_string()),
             attachments: vec![Attachment {
@@ -1201,6 +1221,11 @@ mod tests {
         assert_eq!(prefill.attachments[0].filename, "notes.txt");
         assert_eq!(prefill.attachments[0].bytes, b"attached notes");
         assert_eq!(prefill.bcc, vec!["Ada <hidden@example.com>".to_string()]);
+        assert_eq!(prefill.from.as_deref(), Some("me@example.com"));
+        assert_eq!(prefill.to, vec!["you@example.com".to_string()]);
+        assert_eq!(prefill.cc, vec!["Bo <cc@example.com>".to_string()]);
+        assert_eq!(prefill.subject.as_deref(), Some("Draft"));
+        assert_eq!(prefill.importance, lookout_core::Importance::High);
     }
 
     /// The iMIP invitation fixture: `parse_body` must surface the

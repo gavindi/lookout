@@ -197,7 +197,8 @@ This channel pair is the seam between the mail engine and the UI — the app cra
 IMAP directly, only sends commands and reacts to events.
 
 **`AccountCommand`** (`session.rs`) — every variant: `SyncMailbox`, `FetchBody`,
-`FetchAttachment`, `FetchRawMessage`, `Refresh`, `SendMessage(Box<ComposedMessage>)`, `Reconnect`,
+`FetchAttachment`, `FetchRawMessage`, `Refresh`, `SendMessage { message, not_before, client_token }`,
+`CancelOutbox`, `RescheduleOutbox`, `Reconnect`,
 `SetPrefetchPolicy`, `MoveMessage`/`MoveMessages`/`MoveMessagesTo`, `EmptyMailbox`,
 `SnoozeMessage`/`SnoozeMessages`, `StoreFlags`/`StoreFlagsMany`, `StoreKeywords`/
 `StoreKeywordsMany`, `PrefetchBodies`, `SaveDraft`/`DeleteDraft`, `SearchMailbox`, `Shutdown`.
@@ -210,7 +211,8 @@ flight.
 **`AccountEvent`** — every variant: `ConnectionStateChanged`, `FoldersUpdated`, `MessagesUpdated`,
 `MailboxSyncStarted`, `PrefetchStarted`/`PrefetchFinished`, `NewMessages`, `PreviewsFetched`,
 `BodyFetched`, `PartFetched`/`PartFetchFailed`, `RawMessageFetched`/`RawMessageFetchFailed`,
-`OutboxQueued`/`OutboxSent`/`OutboxFailed` (§4.6), `MoveFailed`, `StoreFlagsFailed`, `DraftSaved`,
+`OutboxQueued`/`OutboxSent`/`OutboxFailed`, `OutboxCancelled`/`OutboxCancelFailed`,
+`OutboxContents` (§4.6), `MoveFailed`, `StoreFlagsFailed`, `DraftSaved`,
 `MessageMoved`, `MessageSnoozed`, `MailboxExpunged`, `SearchResults`, `Error`.
 
 ### 4.2 The actor loop
@@ -401,7 +403,12 @@ best-effort APPENDing to Sent, deleting the draft only after a successful send, 
 `MAX_OUTBOX_ATTEMPTS` is reached the row is marked `failed` and `OutboxFailed` is emitted, while a
 retry that could still succeed stays silent. The main loop caps its IDLE slice to the next
 `not_before` (`cap_slice_for_outbox`), so a scheduled or undo-send timer wakes the session on time
-rather than waiting out the 25-minute keepalive.
+rather than waiting out the 25-minute keepalive. `CancelOutbox` withdraws a pending or failed row
+and hands its payload back in `OutboxCancelled` (undo send, item 1.13; schedule send's "Cancel
+send", item 1.14); `RescheduleOutbox` moves a row's due time with a fresh retry budget ("Send now",
+"Retry"). After every outbox change, and once at session start before connecting, the session
+emits `OutboxContents` with the decoded rows (`OutboxItem`), which drives the app's
+scheduled-messages banner and dialog and a scheduled draft's "Cancel send" bar.
 
 ### 4.7 Auth and connection (`auth.rs`, `connection.rs`)
 

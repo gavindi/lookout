@@ -62,7 +62,7 @@ pub struct PopOutHandle {
     /// the anchor for re-inserting the toolbar into the composer on pop-out.
     pub toolbar_anchor: gtk::Widget,
     pub cancel_button: gtk::Button,
-    pub send_button: gtk::Button,
+    pub send_button: adw::SplitButton,
     pub from_dropdown: gtk::DropDown,
     pub read_receipt_toggle: gtk::ToggleButton,
     /// The composer's own header row, which the widgets above are removed
@@ -144,10 +144,12 @@ pub struct ComposePrefill {
     pub references: Vec<String>,
 }
 
-/// Runs as Send is clicked, with the message about to be queued: shows the
-/// "Sending" feedback (with Undo during the undo-send delay, item 1.13) and
-/// returns the `SendMessage`'s `not_before` and `client_token`.
-pub type SendStarted = Rc<dyn Fn(&ComposedMessage) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>)>;
+/// Runs as Send is clicked (or a schedule-send time is picked, item 1.14),
+/// with the message about to be queued and its scheduled time, if any: shows
+/// the "Sending" feedback (with Undo during the undo-send delay, item 1.13)
+/// or the "Scheduled for …" one, and returns the `SendMessage`'s
+/// `not_before` and `client_token`.
+pub type SendStarted = Rc<dyn Fn(&ComposedMessage, Option<chrono::DateTime<chrono::Utc>>) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>)>;
 
 /// Whether Reply excludes the original's other recipients (`Reply`) or
 /// carries them all forward minus the replying account itself (`ReplyAll`).
@@ -162,7 +164,7 @@ pub enum ReplyMode {
 /// own brackets around each id it's given, so a raw header value (which
 /// already has them) must be stripped first or the sent header would come
 /// out double-bracketed.
-fn strip_angle_brackets(id: &str) -> &str {
+pub(crate) fn strip_angle_brackets(id: &str) -> &str {
     id.trim().trim_start_matches('<').trim_end_matches('>')
 }
 
@@ -346,6 +348,232 @@ pub fn build_resend_prefill(msg: &ComposedMessage) -> ComposePrefill {
         in_reply_to: msg.in_reply_to.clone(),
         references: msg.references.clone(),
     }
+}
+
+/// Builds the prefill for reopening a send withdrawn from the outbox with no
+/// in-memory copy to hand (item 1.14): one scheduled in an earlier run, or
+/// cancelled from the scheduled-messages dialog or a draft's "Cancel send".
+/// Everything comes from the queued raw message - the same parse a reopened
+/// draft gets, plus the envelope from its headers - except the Bcc list,
+/// which never travels in a sent message's headers and is carried by the
+/// outbox payload instead. The `Message-ID` names the Drafts copy scheduling
+/// saved, so the reopened composer keeps replacing it rather than adding a
+/// second one. `None` when the stored bytes don't parse.
+pub fn build_outbox_prefill(message: &lookout_mail::send::OutboxMessage) -> Option<ComposePrefill> {
+    let raw = message.raw()?;
+    let content = lookout_mail::body::parse_draft_prefill(&raw)?;
+    let join = |list: &[String]| (!list.is_empty()).then(|| list.join(", "));
+    Some(ComposePrefill {
+        to: join(&content.to),
+        cc: join(&content.cc),
+        bcc: join(&message.bcc),
+        subject: content.subject.clone().or_else(|| Some(message.subject.clone())),
+        body: content.text_body,
+        html_body: content.html_body,
+        from: content.from.or_else(|| Some(message.from.clone())),
+        importance: content.importance,
+        request_read_receipt: content.request_read_receipt,
+        attachments: content.attachments,
+        draft_message_id: message.draft_message_id.clone(),
+        draft_saved: message.draft_message_id.is_some(),
+        draft_source: None,
+        in_reply_to: content.in_reply_to,
+        references: content.references,
+    })
+}
+
+/// One of the Send menu's "Schedule send" presets (item 1.14).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchedulePreset<Tz: chrono::TimeZone> {
+    pub name: &'static str,
+    pub at: chrono::DateTime<Tz>,
+}
+
+/// New Outlook's schedule-send presets relative to `now`: tomorrow morning
+/// (8:00), tomorrow afternoon (13:00) and Monday morning (8:00). Monday is
+/// left out when it's tomorrow, since it would just repeat the first entry.
+/// A local time that doesn't exist (a DST gap) resolves to its earliest
+/// valid instant, or the preset is skipped.
+pub fn schedule_presets<Tz: chrono::TimeZone>(now: &chrono::DateTime<Tz>) -> Vec<SchedulePreset<Tz>> {
+    use chrono::{Datelike, Days, Weekday};
+    let tz = now.timezone();
+    let today = now.date_naive();
+    let at = |date: chrono::NaiveDate, hour: u32| date.and_hms_opt(hour, 0, 0).and_then(|naive| naive.and_local_timezone(tz.clone()).earliest());
+    let tomorrow = today + Days::new(1);
+    let days_to_monday = (7 - today.weekday().num_days_from_monday()) % 7;
+    let monday = today + Days::new(u64::from(if days_to_monday == 0 { 7 } else { days_to_monday }));
+    let mut presets = Vec::new();
+    let mut push = |name, at: Option<chrono::DateTime<Tz>>| {
+        if let Some(at) = at {
+            presets.push(SchedulePreset { name, at });
+        }
+    };
+    push("Tomorrow morning", at(tomorrow, 8));
+    push("Tomorrow afternoon", at(tomorrow, 13));
+    if tomorrow.weekday() != Weekday::Mon {
+        push("Monday morning", at(monday, 8));
+    }
+    presets
+}
+
+/// A custom schedule-send time picked as a local date and time: the instant
+/// it names, or `None` when it isn't in the future (or doesn't exist, in a
+/// DST gap) - the dialog keeps its Schedule button insensitive then.
+pub fn validate_schedule_time<Tz: chrono::TimeZone>(local: chrono::NaiveDateTime, now: &chrono::DateTime<Tz>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let at = local.and_local_timezone(now.timezone()).earliest()?;
+    (at > *now).then(|| at.with_timezone(&chrono::Utc))
+}
+
+/// How a scheduled send's time reads in menus, toasts and banners: "Tue
+/// 08:00" within the coming week, "Tue 14 Oct 08:00" further out.
+pub fn format_schedule_time<Tz: chrono::TimeZone>(at: &chrono::DateTime<Tz>, now: &chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    if at.date_naive() < now.date_naive() + chrono::Days::new(7) {
+        at.format("%a %H:%M").to_string()
+    } else {
+        at.format("%a %-d %b %H:%M").to_string()
+    }
+}
+
+/// The custom time's starting point: the next half hour after `now`.
+fn next_half_hour(now: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+    use chrono::Timelike;
+    let base = now.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap_or(now);
+    let minutes_past = base.minute() % 30;
+    base + chrono::Duration::minutes(i64::from(30 - minutes_past))
+}
+
+/// The Send split button's menu (item 1.14): the presets, recomputed every
+/// time the menu opens so "Tomorrow" never goes stale in a long-open
+/// composer, then "Custom time…". `on_pick` receives the chosen instant.
+fn build_schedule_popover(on_pick: Rc<dyn Fn(chrono::DateTime<chrono::Utc>)>) -> gtk::Popover {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let popover = gtk::Popover::builder().child(&list).build();
+    popover.add_css_class("menu");
+    let fill = {
+        let list = list.clone();
+        let popover = popover.clone();
+        move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            list.append(
+                &gtk::Label::builder()
+                    .label("Schedule send")
+                    .css_classes(["heading"])
+                    .xalign(0.0)
+                    .margin_start(8)
+                    .margin_top(4)
+                    .margin_bottom(4)
+                    .build(),
+            );
+            let now = chrono::Local::now();
+            for preset in schedule_presets(&now) {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                row.append(&gtk::Label::builder().label(preset.name).xalign(0.0).hexpand(true).build());
+                row.append(&gtk::Label::builder().label(format_schedule_time(&preset.at, &now)).css_classes(["dim-label"]).build());
+                let button = gtk::Button::builder().child(&row).css_classes(["flat"]).build();
+                let on_pick = on_pick.clone();
+                let popover = popover.clone();
+                let at = preset.at.with_timezone(&chrono::Utc);
+                button.connect_clicked(move |_| {
+                    popover.popdown();
+                    on_pick(at);
+                });
+                list.append(&button);
+            }
+            list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            let custom = gtk::Button::builder()
+                .child(&gtk::Label::builder().label("Custom time…").xalign(0.0).build())
+                .css_classes(["flat"])
+                .build();
+            let on_pick = on_pick.clone();
+            let popover_for_custom = popover.clone();
+            custom.connect_clicked(move |_| {
+                popover_for_custom.popdown();
+                let parent = popover_for_custom.parent();
+                present_custom_schedule_dialog(parent.as_ref(), on_pick.clone());
+            });
+            list.append(&custom);
+        }
+    };
+    fill();
+    popover.connect_show(move |_| fill());
+    popover
+}
+
+/// The "Schedule send" dialog behind "Custom time…": a date and time,
+/// starting at the next half hour, that must be in the future before
+/// Schedule is enabled.
+fn present_custom_schedule_dialog(parent: Option<&gtk::Widget>, on_pick: Rc<dyn Fn(chrono::DateTime<chrono::Utc>)>) {
+    use chrono::Timelike;
+    let initial = next_half_hour(chrono::Local::now().naive_local());
+    let date = Rc::new(Cell::new(initial.date()));
+    let calendar = gtk::Calendar::new();
+    crate::datetime_picker::set_calendar_date(&calendar, &date, initial.date());
+    crate::datetime_picker::wire_calendar(&calendar, &date);
+    let hour = gtk::SpinButton::with_range(0.0, 23.0, 1.0);
+    let minute = gtk::SpinButton::with_range(0.0, 59.0, 1.0);
+    for spin in [&hour, &minute] {
+        spin.set_digits(0);
+        spin.set_width_chars(2);
+    }
+    hour.set_value(f64::from(initial.hour()));
+    minute.set_value(f64::from(initial.minute()));
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.append(&crate::datetime_picker::time_cluster("Send at", &calendar, &hour, &minute));
+    content.append(
+        &gtk::Label::builder()
+            .label("Lookout must be running for the message to be sent.")
+            .css_classes(["dim-label", "caption"])
+            .wrap(true)
+            .xalign(0.0)
+            .build(),
+    );
+    let dialog = adw::AlertDialog::builder()
+        .heading("Schedule send")
+        .default_response("schedule")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("schedule", "Schedule");
+    dialog.set_response_appearance("schedule", adw::ResponseAppearance::Suggested);
+    dialog.set_extra_child(Some(&content));
+
+    let chosen = {
+        let date = date.clone();
+        let hour = hour.clone();
+        let minute = minute.clone();
+        move || {
+            let time = chrono::NaiveTime::from_hms_opt(hour.value() as u32, minute.value() as u32, 0)?;
+            validate_schedule_time(date.get().and_time(time), &chrono::Local::now())
+        }
+    };
+    let refresh: Rc<dyn Fn()> = {
+        let dialog = dialog.clone();
+        let chosen = chosen.clone();
+        Rc::new(move || dialog.set_response_enabled("schedule", chosen().is_some()))
+    };
+    refresh();
+    {
+        let refresh = refresh.clone();
+        calendar.connect_day_selected(move |_| refresh());
+    }
+    for spin in [&hour, &minute] {
+        let refresh = refresh.clone();
+        spin.connect_value_changed(move |_| refresh());
+    }
+    dialog.connect_response(None, move |_, response| {
+        if response == "schedule" {
+            if let Some(at) = chosen() {
+                on_pick(at);
+            }
+        }
+    });
+    dialog.present(parent);
 }
 
 /// `bcc` plus the identity's automatic Bcc addresses, skipping any already
@@ -773,6 +1001,17 @@ impl AutosaveCtx {
         self.in_flight.set(true);
         self.save_if_changed().await;
         self.in_flight.set(false);
+    }
+
+    /// Like `attempt`, but waits out a save already in flight first, so the
+    /// final content is always queued - schedule send (item 1.14) relies on
+    /// the Drafts copy being current, and on `draft_queued` being set,
+    /// before it queues the message.
+    async fn flush(&self) {
+        while self.in_flight.get() {
+            glib::timeout_future(Duration::from_millis(50)).await;
+        }
+        self.attempt().await;
     }
 
     async fn save_if_changed(&self) {
@@ -1927,7 +2166,13 @@ pub fn build_compose_view(
     let cancel_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["user-trash-symbolic", "edit-delete-symbolic"]));
     cancel_button.add_css_class("destructive-action");
     cancel_button.set_tooltip_text(Some("Cancel"));
-    let send_button = gtk::Button::builder().label("Send").css_classes(["suggested-action"]).build();
+    // Send is a split button, as in Outlook: the main part sends now, the
+    // arrow opens the "Schedule send" menu (item 1.14), wired below.
+    let send_button = adw::SplitButton::builder()
+        .label("Send")
+        .css_classes(["suggested-action"])
+        .dropdown_tooltip("Schedule send")
+        .build();
     // Not shown while embedded - it's redundant next to the compose fields
     // right below it - but kept in `top_row` (invisible) as the anchor
     // `reorder_child_after` puts the status label back next to on
@@ -2010,7 +2255,9 @@ pub fn build_compose_view(
         let high_importance_toggle = high_importance_toggle.clone();
         let low_importance_toggle = low_importance_toggle.clone();
         let on_send_started = on_send_started.clone();
-        send_button.connect_clicked(move |_| {
+        // Shared by Send (`None`: now) and the schedule-send menu (`Some`:
+        // the picked time, item 1.14).
+        let send_composed: Rc<dyn Fn(Option<chrono::DateTime<chrono::Utc>>)> = Rc::new(move |schedule| {
             // Commit anything typed but not yet turned into a chip, so the
             // field ends up showing exactly what is about to be sent.
             for row in [&to_row, &cc_row, &bcc_row] {
@@ -2047,6 +2294,14 @@ pub fn build_compose_view(
             let on_done = on_done.clone();
             let on_send_started = on_send_started.clone();
             glib::spawn_future_local(async move {
+                // A scheduled message waits in Drafts until it goes out, as
+                // in new Outlook (UX-45): save it now so the Drafts copy is
+                // current and `draft_queued` names it for the outbox to
+                // delete once sent. Commands reach the session in order, so
+                // the save lands before the outbox row is queued.
+                if schedule.is_some() {
+                    autosave.flush().await;
+                }
                 let (text_body, html_body, inline_images) = if rich {
                     // Reading the editor's live HTML back out is a round trip
                     // through WebKit; if that fails (e.g. the page hasn't
@@ -2102,7 +2357,7 @@ pub fn build_compose_view(
                     references,
                     message_id: draft_message_id_used,
                 };
-                let (not_before, client_token) = on_send_started(&msg);
+                let (not_before, client_token) = on_send_started(&msg, schedule);
                 let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
                     message: Box::new(msg),
                     not_before,
@@ -2112,6 +2367,11 @@ pub fn build_compose_view(
                 on_done();
             });
         });
+        {
+            let send_composed = send_composed.clone();
+            send_button.connect_clicked(move |_| send_composed(None));
+        }
+        send_button.set_popover(Some(&build_schedule_popover(Rc::new(move |at| send_composed(Some(at))))));
     }
 
     // --- Pop-out button wiring: hand the composer (still alive) to the
@@ -2288,6 +2548,7 @@ mod tests {
             in_reply_to: Some("older@example.com".to_string()),
             references: vec!["older@example.com".to_string()],
             request_read_receipt: true,
+            ..Default::default()
         };
 
         let prefill = build_draft_prefill(&summary, &content);
@@ -2306,6 +2567,120 @@ mod tests {
         assert_eq!(prefill.draft_source.as_ref().map(|(m, u)| (m.clone(), *u)), Some((summary.mailbox.clone(), summary.uid)));
         assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
         assert_eq!(prefill.references, vec!["older@example.com".to_string()]);
+    }
+
+    /// A send withdrawn from the outbox with no in-memory copy (schedule
+    /// send's "Cancel send"/"Edit", item 1.14) reopens from the queued raw
+    /// message: envelope from its headers, Bcc from the payload (it's never a
+    /// header on a sent message), bodies with the inline image as a `data:`
+    /// URI, attachments, importance, receipt and threading - and the Drafts
+    /// copy's id, so the composer replaces it.
+    #[test]
+    fn outbox_prefill_reopens_a_withdrawn_scheduled_send() {
+        let msg = ComposedMessage {
+            from: "ada@example.com".to_string(),
+            display_name: Some("Ada".to_string()),
+            to: vec!["Bob <bob@example.com>".to_string()],
+            cc: vec!["dan@example.com".to_string()],
+            bcc: vec!["hidden@example.com".to_string()],
+            reply_to: vec![],
+            subject: "Quarterly numbers".to_string(),
+            text_body: "See chart".to_string(),
+            html_body: Some(r#"<p>See chart</p><img src="cid:chart1">"#.to_string()),
+            attachments: vec![Attachment {
+                filename: "q3.csv".to_string(),
+                content_type: "text/csv".to_string(),
+                bytes: b"a,b\n1,2\n".to_vec(),
+            }],
+            inline_images: vec![InlineImage {
+                cid: "chart1".to_string(),
+                content_type: "image/png".to_string(),
+                bytes: vec![0x89, b'P', b'N', b'G'],
+            }],
+            calendar_part: None,
+            read_receipt: None,
+            request_read_receipt: true,
+            importance: Importance::Low,
+            in_reply_to: Some("older@example.com".to_string()),
+            references: vec!["older@example.com".to_string()],
+            message_id: Some("draft-9@lookout.local".to_string()),
+        };
+
+        let prefill = build_outbox_prefill(&lookout_mail::send::OutboxMessage::from_composed(&msg)).expect("queued message parses");
+        assert_eq!(prefill.to.as_deref(), Some("Bob <bob@example.com>"));
+        assert_eq!(prefill.cc.as_deref(), Some("dan@example.com"));
+        assert_eq!(prefill.bcc.as_deref(), Some("hidden@example.com"));
+        assert_eq!(prefill.subject.as_deref(), Some("Quarterly numbers"));
+        assert_eq!(prefill.from.as_deref(), Some("ada@example.com"));
+        let html = prefill.html_body.as_deref().expect("rich body kept");
+        assert!(html.contains("data:image/png;base64,"), "inline image inlined as data: URI: {html}");
+        assert_eq!(prefill.attachments.len(), 1);
+        assert_eq!(prefill.attachments[0].filename, "q3.csv");
+        assert_eq!(prefill.importance, Importance::Low);
+        assert!(prefill.request_read_receipt);
+        assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
+        assert_eq!(prefill.draft_message_id.as_deref(), Some("draft-9@lookout.local"));
+        assert!(prefill.draft_saved);
+        assert!(prefill.draft_source.is_none());
+    }
+
+    fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<chrono::FixedOffset> {
+        chrono::FixedOffset::east_opt(2 * 3600).unwrap().with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    /// Schedule-send presets (item 1.14): tomorrow 08:00 and 13:00, then the
+    /// coming Monday 08:00 - from a Friday that's three days out.
+    #[test]
+    fn schedule_presets_offer_tomorrow_and_monday() {
+        let presets = schedule_presets(&local(2026, 10, 16, 17, 45)); // Friday
+        let got: Vec<_> = presets.iter().map(|p| (p.name, p.at)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Tomorrow morning", local(2026, 10, 17, 8, 0)),
+                ("Tomorrow afternoon", local(2026, 10, 17, 13, 0)),
+                ("Monday morning", local(2026, 10, 19, 8, 0)),
+            ]
+        );
+        // From a Monday, "Monday morning" is a week out.
+        assert_eq!(schedule_presets(&local(2026, 10, 12, 9, 0))[2].at, local(2026, 10, 19, 8, 0));
+    }
+
+    /// On a Sunday tomorrow *is* Monday, so "Monday morning" would only
+    /// repeat "Tomorrow morning" and is left out.
+    #[test]
+    fn schedule_presets_drop_monday_when_it_is_tomorrow() {
+        let presets = schedule_presets(&local(2026, 10, 18, 20, 0)); // Sunday
+        assert_eq!(presets.iter().map(|p| p.name).collect::<Vec<_>>(), vec!["Tomorrow morning", "Tomorrow afternoon"]);
+        assert_eq!(presets[0].at, local(2026, 10, 19, 8, 0));
+    }
+
+    /// A custom time must be in the future; a valid one comes back in UTC.
+    #[test]
+    fn validate_schedule_time_requires_a_future_time() {
+        let now = local(2026, 10, 12, 10, 0);
+        let at = |h, m| chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap().and_hms_opt(h, m, 0).unwrap();
+        assert_eq!(validate_schedule_time(at(9, 59), &now), None);
+        assert_eq!(validate_schedule_time(at(10, 0), &now), None, "now isn't the future");
+        assert_eq!(validate_schedule_time(at(10, 30), &now), Some(Utc.with_ymd_and_hms(2026, 10, 12, 8, 30, 0).unwrap()));
+    }
+
+    #[test]
+    fn schedule_times_read_short_within_the_week() {
+        let now = local(2026, 10, 12, 10, 0); // Monday
+        assert_eq!(format_schedule_time(&local(2026, 10, 13, 8, 0), &now), "Tue 08:00");
+        assert_eq!(format_schedule_time(&local(2026, 10, 20, 8, 0), &now), "Tue 20 Oct 08:00");
+    }
+
+    #[test]
+    fn custom_schedule_time_starts_at_the_next_half_hour() {
+        let at = |h, m, s| chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap().and_hms_opt(h, m, s).unwrap();
+        assert_eq!(next_half_hour(at(10, 7, 33)), at(10, 30, 0));
+        assert_eq!(next_half_hour(at(10, 30, 0)), at(11, 0, 0));
+        assert_eq!(
+            next_half_hour(at(23, 50, 0)),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap().and_hms_opt(0, 0, 0).unwrap()
+        );
     }
 
     /// Undo send (item 1.13) reopens exactly what was about to go out:

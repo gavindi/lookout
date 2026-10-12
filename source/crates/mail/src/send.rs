@@ -159,6 +159,12 @@ pub struct OutboxMessage {
     /// The subject, kept for the outbox's own UI (a scheduled-send banner,
     /// item 1.14) without having to parse the raw message.
     pub subject: String,
+    /// The blind-copy list as composed. The raw message never carries a
+    /// `Bcc` header (it would leak on the wire), so this is how a withdrawn
+    /// scheduled send gets its Bcc back when it reopens in the composer
+    /// (item 1.14). Defaulted so rows queued before it existed still decode.
+    #[serde(default)]
+    pub bcc: Vec<String>,
 }
 
 impl OutboxMessage {
@@ -173,6 +179,7 @@ impl OutboxMessage {
             raw_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw),
             draft_message_id: msg.message_id.clone(),
             subject: msg.subject.clone(),
+            bcc: msg.bcc.clone(),
         }
     }
 
@@ -525,6 +532,7 @@ mod tests {
         assert!(outbox.recipients.contains(&"hidden@example.com".to_string()));
         assert_eq!(outbox.draft_message_id.as_deref(), Some("draft-1@lookout.local"));
         assert_eq!(outbox.subject, "test");
+        assert_eq!(outbox.bcc, vec!["hidden@example.com".to_string()]);
 
         // The cache stores this as JSON in a BLOB; it must round-trip intact.
         let encoded = serde_json::to_vec(&outbox).unwrap();
@@ -541,8 +549,18 @@ mod tests {
             raw_base64: "not base64!!".into(),
             draft_message_id: None,
             subject: String::new(),
+            bcc: vec![],
         };
         assert_eq!(outbox.raw(), None);
+    }
+
+    /// Rows queued before `bcc` existed (v0.9.166) still decode, with no Bcc.
+    #[test]
+    fn outbox_message_without_bcc_field_still_decodes() {
+        let json = br#"{"from":"a@example.com","recipients":["b@example.com"],"raw_base64":"","draft_message_id":null,"subject":"old"}"#;
+        let decoded: OutboxMessage = serde_json::from_slice(json).unwrap();
+        assert_eq!(decoded.subject, "old");
+        assert!(decoded.bcc.is_empty());
     }
 
     /// Draft saves write the Bcc header - it is the only place a draft

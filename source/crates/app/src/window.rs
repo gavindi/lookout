@@ -936,6 +936,19 @@ pub(crate) struct UiState {
     /// Drafts-folder role so the "Edit" banner's handler knows what to open
     /// (item 1.12). Cleared on every navigation.
     rendered_draft: Option<(MailboxId, Uid)>,
+    /// The bare `Message-ID` of the draft in `rendered_draft`, so its banner
+    /// can tell a scheduled send waiting in Drafts (item 1.14 / UX-45).
+    rendered_draft_message_id: Option<String>,
+    /// Each account's local outbox as last reported by `OutboxContents`
+    /// (item 1.14): scheduled sends, messages waiting to go out, and ones
+    /// that failed.
+    outbox: HashMap<AccountId, Vec<lookout_mail::session::OutboxItem>>,
+    /// The "N scheduled messages" banner above the message list. `None`
+    /// only in tests.
+    outbox_banner: Option<adw::Banner>,
+    /// The "Scheduled messages" dialog and its row container, while open,
+    /// so a fresh `OutboxContents` repaints it in place.
+    outbox_dialog: Option<(adw::Dialog, gtk::Box)>,
     /// A reopened draft's raw fetch in flight (item 1.12), waiting on
     /// `AccountEvent::RawMessageFetched` to build the composer prefill.
     /// Cleared on navigation and by whichever response lands, so a late
@@ -2417,6 +2430,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         message_windows: HashMap::new(),
         message_details: None,
         rendered_draft: None,
+        rendered_draft_message_id: None,
+        outbox: HashMap::new(),
+        outbox_banner: None,
+        outbox_dialog: None,
         pending_draft_open: None,
         unsubscribe_info: None,
         unsubscribe_dismissed: None,
@@ -3653,8 +3670,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // newer timeout).
     let search_debounce: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
+    // The outbox banner (item 1.14): "N scheduled messages" (or waiting /
+    // failed ones) above the list, opening the "Scheduled messages" dialog.
+    // Revealed by `refresh_outbox_ui` whenever an `OutboxContents` arrives.
+    let outbox_banner = adw::Banner::new("");
+    outbox_banner.set_button_label(Some("View"));
+    outbox_banner.set_revealed(false);
+    {
+        let state = state.clone();
+        outbox_banner.connect_button_clicked(move |banner| present_outbox_dialog(&state, banner));
+    }
+    state.borrow_mut().outbox_banner = Some(outbox_banner.clone());
+
     let message_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_box.append(&message_header_row);
+    message_box.append(&outbox_banner);
     message_box.append(&column_header_row);
     message_box.append(&message_list_stack);
     let message_card = card_section(&message_box);
@@ -4396,6 +4426,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         draft_banner.connect_button_clicked(move |_| {
             let source = state.borrow().rendered_draft.clone();
             let Some((mailbox, uid)) = source else { return };
+            // A scheduled send waiting in Drafts (item 1.14): the button is
+            // "Cancel send", which withdraws it from the outbox; the
+            // composer reopens on `OutboxCancelled`.
+            let scheduled = {
+                let st = state.borrow();
+                st.rendered_draft_message_id.as_deref().and_then(|id| scheduled_item_for_draft(&st, &mailbox, id))
+            };
+            if let Some((account_id, item)) = scheduled {
+                send_account_command(&state, &account_id, AccountCommand::CancelOutbox { id: item.id });
+                return;
+            }
             let Some(summary) = message_list.selected_summary().filter(|s| s.mailbox == mailbox && s.uid == uid) else { return };
             // The banner stays revealed: the message page (and with it the
             // banner) is simply hidden while the loading page or composer
@@ -11213,11 +11254,17 @@ fn spawn_account_event_loop(
                             toast_overlay.add_toast(adw::Toast::new("Message sent"));
                         }
                     }
-                    // Undo send (item 1.13) withdrew the message: reopen it.
-                    AccountEvent::OutboxCancelled { id } => {
+                    // Undo send (item 1.13) or schedule send's "Cancel send" /
+                    // "Edit" (item 1.14) withdrew the message: reopen it -
+                    // from the in-memory copy when this run started the send,
+                    // else from the outbox payload the event carries.
+                    AccountEvent::OutboxCancelled { id, message } => {
                         if let Some(pending) = take_pending_send(&state, &account_id, id, None) {
                             toast_overlay.add_toast(adw::Toast::new("Sending cancelled"));
                             reopen_undone_send(&state, &worker, &reading_stack, &account_id, &pending.message);
+                        } else if let Some(prefill) = message.as_deref().and_then(crate::compose::build_outbox_prefill) {
+                            toast_overlay.add_toast(adw::Toast::new("Sending cancelled"));
+                            reopen_withdrawn_send(&state, &worker, &reading_stack, &account_id, prefill);
                         }
                     }
                     // Undo came too late - the message had already gone out
@@ -11234,6 +11281,14 @@ fn spawn_account_event_loop(
                         if !window.is_active() && state.borrow().settings.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED) {
                             crate::mail_notifications::show_send_failed_notification(&app, &account_id, &message);
                         }
+                    }
+                    // The outbox changed (item 1.14): repaint the scheduled-
+                    // messages banner and dialog, and a scheduled draft's bar.
+                    AccountEvent::OutboxContents { items } => {
+                        state.borrow_mut().outbox.insert(account_id.clone(), items);
+                        refresh_outbox_ui(&state);
+                        let is_rendered_draft = state.borrow().rendered_draft.is_some();
+                        refresh_draft_banner(&state, &reading_stack, is_rendered_draft);
                     }
                     AccountEvent::DraftSaved { message_id } => {
                         // Relay the confirmation to whichever composer is open;
@@ -15961,6 +16016,10 @@ pub(crate) struct PendingSend {
     /// Undo was clicked; the `CancelOutbox` goes out as soon as the row id
     /// is known (at once if it already is).
     undo_requested: bool,
+    /// A scheduled send (item 1.14): tracked only while its "Scheduled for
+    /// …" toast offers Undo, so a send going out hours later raises no
+    /// "Message sent" toast, and never counted as an undo-send in flight.
+    scheduled: bool,
 }
 
 /// The "Sending: <subject>" toast title, markup-escaped (toast titles are
@@ -15981,7 +16040,11 @@ fn start_send_feedback(
     state: &Rc<RefCell<UiState>>,
     account_id: Option<AccountId>,
     message: &lookout_mail::ComposedMessage,
+    schedule: Option<chrono::DateTime<chrono::Utc>>,
 ) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>) {
+    if let Some(at) = schedule {
+        return start_schedule_feedback(state, account_id, message, at);
+    }
     let toast = adw::Toast::new(&sending_toast_title(&message.subject));
     toast.set_timeout(0);
     let Some(account_id) = account_id else {
@@ -16018,6 +16081,7 @@ fn start_send_feedback(
         message: message.clone(),
         toast,
         undo_requested: false,
+        scheduled: false,
     });
     if delay <= 0 {
         return (None, Some(client_token));
@@ -16027,6 +16091,59 @@ fn start_send_feedback(
         glib::timeout_add_seconds_local_once(delay as u32, move || end_undo_window(&state, client_token));
     }
     (Some(chrono::Utc::now() + chrono::Duration::seconds(delay.into())), Some(client_token))
+}
+
+/// `start_send_feedback` for a scheduled send (item 1.14): a "Scheduled for
+/// Tue 08:00" toast with Undo, which withdraws the message from the outbox
+/// and reopens it in the composer. The send is tracked in `pending_sends`
+/// only while that toast is up. Returns the scheduled time as `not_before`.
+fn start_schedule_feedback(
+    state: &Rc<RefCell<UiState>>,
+    account_id: Option<AccountId>,
+    message: &lookout_mail::ComposedMessage,
+    at: chrono::DateTime<chrono::Utc>,
+) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>) {
+    let now = chrono::Local::now();
+    let toast = adw::Toast::new(&format!("Scheduled for {}", crate::compose::format_schedule_time(&at.with_timezone(&chrono::Local), &now)));
+    let Some(account_id) = account_id else {
+        if let Some(overlay) = state.borrow().toast_overlay.clone() {
+            overlay.add_toast(toast);
+        }
+        return (Some(at), None);
+    };
+    let client_token = {
+        let mut st = state.borrow_mut();
+        let token = st.next_send_token;
+        st.next_send_token += 1;
+        token
+    };
+    toast.set_button_label(Some("Undo"));
+    toast.set_timeout(UNDO_TOAST_TIMEOUT_SECS);
+    {
+        let state = state.clone();
+        toast.connect_button_clicked(move |_| request_undo_send(&state, client_token));
+    }
+    {
+        // Stop tracking once the toast goes - unless Undo was clicked, in
+        // which case `OutboxCancelled` still needs the entry to reopen it.
+        let state = state.clone();
+        toast.connect_dismissed(move |_| {
+            state.borrow_mut().pending_sends.retain(|p| p.client_token != client_token || p.undo_requested);
+        });
+    }
+    if let Some(overlay) = state.borrow().toast_overlay.clone() {
+        overlay.add_toast(toast.clone());
+    }
+    state.borrow_mut().pending_sends.push(PendingSend {
+        account_id,
+        client_token,
+        outbox_id: None,
+        message: message.clone(),
+        toast,
+        undo_requested: false,
+        scheduled: true,
+    });
+    (Some(at), Some(client_token))
 }
 
 /// The undo-send delay ran out without Undo: swap the toast for a plain
@@ -16111,14 +16228,256 @@ fn take_pending_send(state: &Rc<RefCell<UiState>>, account_id: &AccountId, id: i
 /// appended (the body already has one), and it opens rich exactly when it
 /// was sent with an HTML body.
 fn reopen_undone_send(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, account_id: &AccountId, message: &lookout_mail::ComposedMessage) {
+    reopen_withdrawn_send(state, worker, reading_stack, account_id, crate::compose::build_resend_prefill(message));
+}
+
+/// Opens a send withdrawn from the outbox (undo send, or schedule send's
+/// "Cancel send"/"Edit", item 1.14) in the composer from its `prefill`.
+fn reopen_withdrawn_send(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, account_id: &AccountId, prefill: crate::compose::ComposePrefill) {
     let cmd_tx = state.borrow().accounts.get(account_id).map(|handle| handle.cmd_tx.clone());
     let Some(cmd_tx) = cmd_tx else { return };
-    let prefill = crate::compose::build_resend_prefill(message);
     let rich_text_default = prefill.html_body.is_some();
-    let title = Some(message.subject.clone())
+    let title = prefill
+        .subject
+        .clone()
         .filter(|subject| !subject.trim().is_empty())
         .unwrap_or_else(|| "New message".to_string());
     show_composer_in_reading_pane(state, worker, reading_stack, &title, cmd_tx, prefill, rich_text_default, Some(account_id.clone()), None);
+}
+
+/// Sends `command` on `account_id`'s background channel, if the account is
+/// still connected.
+fn send_account_command(state: &Rc<RefCell<UiState>>, account_id: &AccountId, command: AccountCommand) {
+    let cmd_tx = state.borrow().accounts.get(account_id).map(|handle| handle.cmd_tx.clone());
+    if let Some(cmd_tx) = cmd_tx {
+        let _ = cmd_tx.send_blocking(command);
+    }
+}
+
+/// The outbox rows the banner and the "Scheduled messages" dialog list (item
+/// 1.14), per account in a stable order: everything except a send whose own
+/// "Sending: …" toast is still up (undo send, item 1.13) - that toast already
+/// covers it, and listing it too would flash the banner on every send.
+fn listed_outbox_items(st: &UiState) -> Vec<(AccountId, Vec<lookout_mail::session::OutboxItem>)> {
+    let mut accounts: Vec<&AccountId> = st.outbox.keys().collect();
+    accounts.sort_by(|a, b| a.0.cmp(&b.0));
+    accounts
+        .into_iter()
+        .filter_map(|account_id| {
+            let items: Vec<_> = st.outbox[account_id]
+                .iter()
+                .filter(|item| !st.pending_sends.iter().any(|p| !p.scheduled && p.account_id == *account_id && p.outbox_id == Some(item.id)))
+                .cloned()
+                .collect();
+            (!items.is_empty()).then(|| (account_id.clone(), items))
+        })
+        .collect()
+}
+
+/// The outbox banner's title (item 1.14), or `None` when there's nothing to
+/// list: failed sends first, since they need the user; then "scheduled"
+/// when everything is waiting for a future time, else "waiting to send"
+/// (offline, or retrying after an error).
+fn outbox_banner_text(items: &[&lookout_mail::session::OutboxItem], now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+    let failed = items.iter().filter(|item| item.failed).count();
+    Some(if failed > 0 {
+        plural(failed, "message couldn't be sent", "messages couldn't be sent")
+    } else if items.iter().all(|item| item.not_before > now) {
+        plural(items.len(), "scheduled message", "scheduled messages")
+    } else {
+        plural(items.len(), "message waiting to send", "messages waiting to send")
+    })
+}
+
+/// Repaints the outbox banner and, if it's open, the "Scheduled messages"
+/// dialog from `UiState::outbox` (item 1.14). An open dialog with nothing
+/// left to list closes itself.
+fn refresh_outbox_ui(state: &Rc<RefCell<UiState>>) {
+    let (banner, dialog, title, empty) = {
+        let st = state.borrow();
+        let listed = listed_outbox_items(&st);
+        let items: Vec<_> = listed.iter().flat_map(|(_, items)| items.iter()).collect();
+        let title = outbox_banner_text(&items, chrono::Utc::now());
+        (st.outbox_banner.clone(), st.outbox_dialog.clone(), title, listed.is_empty())
+    };
+    if let Some(banner) = banner {
+        if let Some(title) = &title {
+            banner.set_title(&glib::markup_escape_text(title));
+        }
+        banner.set_revealed(title.is_some());
+    }
+    if let Some((dialog, list)) = dialog {
+        if empty {
+            dialog.close();
+        } else {
+            fill_outbox_dialog(state, &list);
+        }
+    }
+}
+
+/// Opens the "Scheduled messages" dialog (item 1.14) over `parent`.
+fn present_outbox_dialog(state: &Rc<RefCell<UiState>>, parent: &impl IsA<gtk::Widget>) {
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&list)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroller));
+    let dialog = adw::Dialog::builder().title("Scheduled messages").content_width(520).child(&toolbar).build();
+    {
+        let state = state.clone();
+        dialog.connect_closed(move |_| state.borrow_mut().outbox_dialog = None);
+    }
+    state.borrow_mut().outbox_dialog = Some((dialog.clone(), list.clone()));
+    fill_outbox_dialog(state, &list);
+    dialog.present(Some(parent));
+}
+
+/// (Re)builds the dialog's rows: one group per account, one row per message
+/// with "Send now" (or "Retry" for a failed one) and "Edit", which withdraws
+/// it from the outbox and reopens it in the composer (on `OutboxCancelled`).
+fn fill_outbox_dialog(state: &Rc<RefCell<UiState>>, list: &gtk::Box) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let (listed, emails) = {
+        let st = state.borrow();
+        let listed = listed_outbox_items(&st);
+        let emails: HashMap<AccountId, String> = listed
+            .iter()
+            .map(|(id, _)| (id.clone(), st.accounts.get(id).map(|h| h.email.clone()).unwrap_or_else(|| id.0.clone())))
+            .collect();
+        (listed, emails)
+    };
+    let now_utc = chrono::Utc::now();
+    let now = chrono::Local::now();
+    for (account_id, items) in listed {
+        let group = adw::PreferencesGroup::builder().title(glib::markup_escape_text(&emails[&account_id]).as_str()).build();
+        for item in items {
+            let status = if item.failed {
+                "Couldn't send".to_string()
+            } else if item.not_before > now_utc {
+                format!(
+                    "Scheduled for {}",
+                    crate::compose::format_schedule_time(&item.not_before.with_timezone(&chrono::Local), &now)
+                )
+            } else {
+                "Waiting to send".to_string()
+            };
+            let to = if item.recipients.is_empty() {
+                String::new()
+            } else {
+                format!("To: {} · ", item.recipients.join(", "))
+            };
+            let subject = if item.subject.trim().is_empty() { "(No subject)" } else { item.subject.as_str() };
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(subject).as_str())
+                .subtitle(glib::markup_escape_text(&format!("{to}{status}")).as_str())
+                .subtitle_lines(2)
+                .build();
+            let send_now = gtk::Button::builder()
+                .label(if item.failed { "Retry" } else { "Send now" })
+                .valign(gtk::Align::Center)
+                .build();
+            {
+                let state = state.clone();
+                let account_id = account_id.clone();
+                let id = item.id;
+                send_now.connect_clicked(move |_| {
+                    send_account_command(
+                        &state,
+                        &account_id,
+                        AccountCommand::RescheduleOutbox {
+                            id,
+                            not_before: chrono::Utc::now(),
+                        },
+                    )
+                });
+            }
+            let edit = gtk::Button::builder().label("Edit").valign(gtk::Align::Center).build();
+            {
+                let state = state.clone();
+                let account_id = account_id.clone();
+                let id = item.id;
+                edit.connect_clicked(move |_| {
+                    send_account_command(&state, &account_id, AccountCommand::CancelOutbox { id });
+                    let dialog = state.borrow().outbox_dialog.as_ref().map(|(dialog, _)| dialog.clone());
+                    if let Some(dialog) = dialog {
+                        dialog.close();
+                    }
+                });
+            }
+            row.add_suffix(&send_now);
+            row.add_suffix(&edit);
+            group.add(&row);
+        }
+        list.append(&group);
+    }
+}
+
+/// The outbox row a saved draft is waiting to go out as (item 1.14): the
+/// scheduled send whose Drafts copy has `message_id` in `mailbox`'s account.
+fn scheduled_item_for_draft(st: &UiState, mailbox: &MailboxId, message_id: &str) -> Option<(AccountId, lookout_mail::session::OutboxItem)> {
+    let account_id = mailbox_account_id(mailbox)?;
+    let item = st
+        .outbox
+        .get(&account_id)?
+        .iter()
+        .find(|item| item.draft_message_id.as_deref() == Some(message_id))?
+        .clone();
+    Some((account_id, item))
+}
+
+/// Sets the reading pane's draft banner (items 1.12 / 1.14): hidden unless
+/// the rendered message is a draft; "Scheduled to send Tue 08:00" with
+/// "Cancel send" when that draft is a scheduled send waiting to go out (or
+/// "Waiting to send" / "Couldn't send"), else "This is a draft" with "Edit".
+fn refresh_draft_banner(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, is_rendered_draft: bool) {
+    let Some(banner) = find_named_child(reading_stack, "draft-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) else {
+        return;
+    };
+    let scheduled = {
+        let st = state.borrow();
+        match (&st.rendered_draft, st.rendered_draft_message_id.as_deref()) {
+            (Some((mailbox, _)), Some(id)) if is_rendered_draft => scheduled_item_for_draft(&st, mailbox, id).map(|(_, item)| item),
+            _ => None,
+        }
+    };
+    match scheduled {
+        Some(item) => {
+            let title = if item.failed {
+                "This message couldn't be sent".to_string()
+            } else if item.not_before > chrono::Utc::now() {
+                format!(
+                    "Scheduled to send {}",
+                    crate::compose::format_schedule_time(&item.not_before.with_timezone(&chrono::Local), &chrono::Local::now())
+                )
+            } else {
+                "This message is waiting to send".to_string()
+            };
+            banner.set_title(&title);
+            banner.set_button_label(Some("Cancel send"));
+        }
+        None => {
+            banner.set_title("This is a draft");
+            banner.set_button_label(Some("Edit"));
+        }
+    }
+    banner.set_revealed(is_rendered_draft);
 }
 
 /// Removes `uids` from `mailbox` in the message list immediately, ahead of
@@ -19315,21 +19674,21 @@ fn render_body(
             // folder, e.g. search copies) or the mailbox's role. The draft
             // banner below is revealed from this.
             st.rendered_draft = summary_is_draft(&st, &summary).then(|| (mailbox.clone(), uid));
+            st.rendered_draft_message_id = st
+                .rendered_draft
+                .as_ref()
+                .and(summary.message_id.as_deref())
+                .map(|id| crate::compose::strip_angle_brackets(id).to_string());
         } else {
             st.rendered_trust_sender = None;
             st.rendered_draft = None;
+            st.rendered_draft_message_id = None;
         }
     }
     // Draft banner (item 1.12): offer "Edit" only for the message actually
     // being rendered, so a stale stash can never act on a different row.
-    {
-        let st = state.borrow();
-        let is_rendered_draft = st.rendered_draft.as_ref() == Some(&(mailbox.clone(), uid));
-        drop(st);
-        if let Some(banner) = find_named_child(reading_stack, "draft-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
-            banner.set_revealed(is_rendered_draft);
-        }
-    }
+    let is_rendered_draft = state.borrow().rendered_draft.as_ref() == Some(&(mailbox.clone(), uid));
+    refresh_draft_banner(state, reading_stack, is_rendered_draft);
     // Sync the "Switch message theme" toggle with its per-email state: the
     // selection handler resets `message_theme_override` to the configured
     // default on every navigation (with the physical sheet/canvas already
@@ -19656,6 +20015,23 @@ impl ComposeActionBar {
 /// "empty" with a toast. No-op when the message's account isn't connected.
 fn open_draft_composer(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, summary: &EmailSummary) {
     if mailbox_account_id(&summary.mailbox).is_none() {
+        return;
+    }
+    // A draft that is also a scheduled send (item 1.14) must not open a
+    // second, independent composer - sending that would deliver it twice.
+    // "Cancel send" on its banner takes it back for editing instead.
+    let scheduled = {
+        let st = state.borrow();
+        summary
+            .message_id
+            .as_deref()
+            .and_then(|id| scheduled_item_for_draft(&st, &summary.mailbox, crate::compose::strip_angle_brackets(id)))
+            .is_some()
+    };
+    if scheduled {
+        if let Some(overlay) = state.borrow().toast_overlay.clone() {
+            overlay.add_toast(adw::Toast::new("This message is scheduled to send. Cancel send to edit it."));
+        }
         return;
     }
     {
@@ -20064,7 +20440,7 @@ pub(crate) fn show_composer_in_reading_pane(
     let on_send_started: crate::compose::SendStarted = {
         let state = state.clone();
         let account_id = account_id.clone();
-        Rc::new(move |message: &lookout_mail::ComposedMessage| start_send_feedback(&state, account_id.clone(), message))
+        Rc::new(move |message: &lookout_mail::ComposedMessage, schedule| start_send_feedback(&state, account_id.clone(), message, schedule))
     };
     // Backs the To row's address-book button: opens `contact_picker` over
     // whichever window currently hosts the composer (main window or a
@@ -20155,6 +20531,38 @@ pub(crate) fn show_composer_in_reading_pane(
 mod tests {
     use super::*;
     use lookout_core::UidValidity;
+
+    // --- Outbox banner (item 1.14). ---
+
+    fn outbox_item(id: i64, not_before: chrono::DateTime<chrono::Utc>, failed: bool) -> lookout_mail::session::OutboxItem {
+        lookout_mail::session::OutboxItem {
+            id,
+            not_before,
+            failed,
+            attempts: 0,
+            subject: format!("message {id}"),
+            recipients: vec![],
+            draft_message_id: None,
+        }
+    }
+
+    #[test]
+    fn outbox_banner_names_failed_then_scheduled_then_waiting() {
+        let now = chrono::Utc::now();
+        let later = now + chrono::Duration::hours(1);
+        let earlier = now - chrono::Duration::minutes(5);
+        assert_eq!(outbox_banner_text(&[], now), None);
+        let scheduled = [outbox_item(1, later, false), outbox_item(2, later, false)];
+        assert_eq!(outbox_banner_text(&scheduled.iter().collect::<Vec<_>>(), now).as_deref(), Some("2 scheduled messages"));
+        let waiting = [outbox_item(1, later, false), outbox_item(2, earlier, false)];
+        assert_eq!(outbox_banner_text(&waiting.iter().collect::<Vec<_>>(), now).as_deref(), Some("2 messages waiting to send"));
+        let one_failed = [outbox_item(1, later, false), outbox_item(2, earlier, true)];
+        assert_eq!(
+            outbox_banner_text(&one_failed.iter().collect::<Vec<_>>(), now).as_deref(),
+            Some("1 message couldn't be sent")
+        );
+        assert_eq!(outbox_banner_text(&[&outbox_item(3, later, false)], now).as_deref(), Some("1 scheduled message"));
+    }
 
     // --- Pane-width restore maths. Pure, so unlike the widget suites further
     // down these need no display and no `gtk_test::gtk_ready()` gate. ---
@@ -20845,6 +21253,10 @@ mod tests {
             message_windows: HashMap::new(),
             message_details: None,
             rendered_draft: None,
+            rendered_draft_message_id: None,
+            outbox: HashMap::new(),
+            outbox_banner: None,
+            outbox_dialog: None,
             pending_draft_open: None,
             unsubscribe_info: None,
             unsubscribe_dismissed: None,

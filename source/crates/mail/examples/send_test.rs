@@ -168,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::RawMessageFetchFailed { .. } => {}
                     AccountEvent::MoveFailed { .. } => {}
                     AccountEvent::StoreFlagsFailed { .. } => {}
-                    AccountEvent::OutboxCancelled { .. } | AccountEvent::OutboxCancelFailed { .. } => {}
+                    AccountEvent::OutboxCancelled { .. } | AccountEvent::OutboxCancelFailed { .. } | AccountEvent::OutboxContents { .. } => {}
                     AccountEvent::OutboxFailed { message, .. } => {
                         println!("SEND FAILED: {message}");
                         break;
