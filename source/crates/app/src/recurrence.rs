@@ -233,9 +233,23 @@ impl SeriesControl {
     }
 }
 
+/// The seven weekdays in display order for the weekly toggles, starting at
+/// the configured first day of the week (item 3.1).
+fn weekday_order(week_start: Weekday) -> Vec<Weekday> {
+    let mut day = week_start;
+    (0..7)
+        .map(|_| {
+            let current = day;
+            day = day.succ();
+            current
+        })
+        .collect()
+}
+
 /// Builds the Series `MenuButton` + popover. `initial_raw` is the event's
-/// existing raw `rrule` string, if any (`None` for a brand-new event).
-pub fn build_series_control(initial_raw: Option<&str>) -> SeriesControl {
+/// existing raw `rrule` string, if any (`None` for a brand-new event);
+/// `week_start` orders the weekly day toggles.
+pub fn build_series_control(initial_raw: Option<&str>, week_start: Weekday) -> SeriesControl {
     let parsed = initial_raw.map(parse_rrule_string);
     let unrepresentable_raw = match &parsed {
         Some(None) => initial_raw.map(str::to_string),
@@ -280,7 +294,7 @@ pub fn build_series_control(initial_raw: Option<&str>) -> SeriesControl {
     content.append(&interval_row);
 
     let weekday_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
-    let weekday_toggles: Vec<(Weekday, gtk::ToggleButton)> = [Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri, Weekday::Sat, Weekday::Sun]
+    let weekday_toggles: Vec<(Weekday, gtk::ToggleButton)> = weekday_order(week_start)
         .into_iter()
         .map(|day| {
             let toggle = gtk::ToggleButton::builder().label(short_weekday_name(day)).build();
@@ -365,7 +379,10 @@ pub fn build_series_control(initial_raw: Option<&str>) -> SeriesControl {
                     3 => Frequency::Monthly,
                     _ => Frequency::Yearly,
                 };
-                let by_weekday = weekday_toggles.iter().filter(|(_, t)| t.is_active()).map(|(d, _)| *d).collect();
+                // Monday-first whatever the toggle order, so the RRULE's
+                // BYDAY list doesn't depend on the week-start preference.
+                let mut by_weekday: Vec<Weekday> = weekday_toggles.iter().filter(|(_, t)| t.is_active()).map(|(d, _)| *d).collect();
+                by_weekday.sort_by_key(|d| d.num_days_from_monday());
                 let end = match end_dropdown.selected() {
                     1 => RecurrenceEnd::After(end_count_spin.value() as u32),
                     2 => {
@@ -411,6 +428,16 @@ fn update_button_label(button: &gtk::MenuButton, rule: Option<&RecurrenceRule>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weekly_toggles_follow_the_week_start() {
+        assert_eq!(
+            weekday_order(Weekday::Sun),
+            vec![Weekday::Sun, Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri, Weekday::Sat]
+        );
+        assert_eq!(weekday_order(Weekday::Mon)[0], Weekday::Mon);
+        assert_eq!(weekday_order(Weekday::Sat)[6], Weekday::Fri);
+    }
 
     #[test]
     fn round_trips_weekly_with_byday_and_count() {

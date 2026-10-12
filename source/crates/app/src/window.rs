@@ -4591,6 +4591,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .description("Add an account with Calendar enabled in GNOME Online Accounts to see events here.")
         .build();
     let calendar_prefs = state.borrow().settings.calendar_preferences();
+    // The zone every calendar surface shows times in (item 3.1), set before
+    // anything calendar-related is built or rendered.
+    crate::calendar_tz::set_display_zone(crate::calendar_tz::DisplayZone::from_setting(calendar_prefs.primary_tz));
+    crate::message_list::set_week_start(calendar_prefs.week_start);
     let calendar_main = Rc::new(calendar_view::build_main(&calendar_prefs));
     let calendar_sidebar = calendar_view::build_sidebar(calendar_prefs.week_start);
     let calendar_sidebar_card = card_section(&calendar_sidebar.root);
@@ -6680,7 +6684,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Which single day the Mail-screen overview pane's day list is
     // currently showing - separate from `calendar_state.displayed_month`
     // (that's the main Calendar view's own concern).
-    let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(chrono::Utc::now().date_naive()));
+    let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(crate::calendar_tz::display_zone().today()));
     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
 
     // The overview panel's "Upcoming events" section needs the 90-day
@@ -7201,43 +7205,80 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // Config → Calendar → the calendar preferences (item 0.6). Each row writes
-    // its GSettings key; the calendar panel reads them when it is built, so a
-    // change takes effect on the next launch (item 3.1 applies them live).
+    // its GSettings key, then `apply_calendar_prefs` pushes the new values
+    // into every calendar surface at once (item 3.1) - no restart needed.
+    let apply_calendar_prefs: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let sidebar_mini = calendar_sidebar.mini_calendar.clone();
+        let mail_overview_mini = mail_calendar_overview.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        let message_list = message_list.clone();
+        Rc::new(move || {
+            let prefs = state.borrow().settings.calendar_preferences();
+            crate::calendar_tz::set_display_zone(crate::calendar_tz::DisplayZone::from_setting(prefs.primary_tz));
+            calendar_view::apply_preferences(&calendar_main, &prefs);
+            calendar_view::set_mini_week_start(&sidebar_mini, prefs.week_start);
+            calendar_view::set_mini_week_start(&mail_overview_mini, prefs.week_start);
+            refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+            // The mail list's "This week"/"Last week" groups follow the week
+            // start too: regroup what's on screen.
+            crate::message_list::set_week_start(prefs.week_start);
+            let (key, descending) = current_sort(&state);
+            message_list.repopulate(message_list.all_messages(), key, descending);
+        })
+    };
     {
         let state = state.clone();
+        let apply_calendar_prefs = apply_calendar_prefs.clone();
         config_view.calendar_week_start_row.connect_selected_notify(move |row| {
             state.borrow().settings.set_int(crate::settings::CALENDAR_WEEK_START, row.selected() as i32);
+            apply_calendar_prefs();
         });
     }
     {
         let state = state.clone();
+        let apply_calendar_prefs = apply_calendar_prefs.clone();
         config_view.calendar_work_days_row.connect_selected_notify(move |row| {
             let days = crate::settings::work_day_preset_at(row.selected());
             state.borrow().settings.set_strv(crate::settings::CALENDAR_WORK_DAYS, days);
+            apply_calendar_prefs();
         });
     }
     {
         let state = state.clone();
+        let apply_calendar_prefs = apply_calendar_prefs.clone();
         config_view.calendar_work_start_row.connect_value_notify(move |row| {
             state.borrow().settings.set_int(crate::settings::CALENDAR_WORK_START, row.value() as i32);
+            apply_calendar_prefs();
         });
     }
     {
         let state = state.clone();
+        let apply_calendar_prefs = apply_calendar_prefs.clone();
         config_view.calendar_work_end_row.connect_value_notify(move |row| {
             state.borrow().settings.set_int(crate::settings::CALENDAR_WORK_END, row.value() as i32);
+            apply_calendar_prefs();
         });
     }
     {
         let state = state.clone();
-        config_view.calendar_primary_tz_row.connect_changed(move |row| {
-            state.borrow().settings.set_string(crate::settings::CALENDAR_PRIMARY_TZ, row.text().as_str());
+        let apply_calendar_prefs = apply_calendar_prefs.clone();
+        config_view.calendar_primary_tz_row.connect_selected_notify(move |row| {
+            let value = crate::config_view::time_zone_at(row.selected());
+            state.borrow().settings.set_string(crate::settings::CALENDAR_PRIMARY_TZ, &value);
+            apply_calendar_prefs();
         });
     }
     {
         let state = state.clone();
-        config_view.calendar_secondary_tz_row.connect_changed(move |row| {
-            state.borrow().settings.set_string(crate::settings::CALENDAR_SECONDARY_TZ, row.text().as_str());
+        let apply_calendar_prefs = apply_calendar_prefs.clone();
+        config_view.calendar_secondary_tz_row.connect_selected_notify(move |row| {
+            let value = crate::config_view::time_zone_at(row.selected());
+            state.borrow().settings.set_string(crate::settings::CALENDAR_SECONDARY_TZ, &value);
+            apply_calendar_prefs();
         });
     }
     {
@@ -7452,10 +7493,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .calendar_work_end_row
             .set_value(persisted.get_int(crate::settings::CALENDAR_WORK_END).clamp(1, 24) as f64);
-        config_view.calendar_primary_tz_row.set_text(&persisted.get_string(crate::settings::CALENDAR_PRIMARY_TZ));
+        config_view
+            .calendar_primary_tz_row
+            .set_selected(crate::config_view::time_zone_index(&persisted.get_string(crate::settings::CALENDAR_PRIMARY_TZ)));
         config_view
             .calendar_secondary_tz_row
-            .set_text(&persisted.get_string(crate::settings::CALENDAR_SECONDARY_TZ));
+            .set_selected(crate::config_view::time_zone_index(&persisted.get_string(crate::settings::CALENDAR_SECONDARY_TZ)));
         config_view
             .calendar_default_reminder_row
             .set_selected(crate::settings::default_reminder_index(persisted.get_int(crate::settings::CALENDAR_DEFAULT_REMINDER)));
@@ -10044,11 +10087,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     refresh_displayed_calendar_view(&calendar_state, &calendar_main_for_drag);
                 });
             }
-            let mut event = crate::event_editor::calendar_event_from_occurrence(
-                &occ,
-                new_start.with_timezone(&chrono::Local).naive_local(),
-                new_end.with_timezone(&chrono::Local).naive_local(),
-            );
+            let (start_local, end_local) = crate::event_editor::dragged_local_span(&occ, new_start, new_end);
+            let mut event = crate::event_editor::calendar_event_from_occurrence(&occ, start_local, end_local);
             crate::event_editor::apply_edit_scope(&mut event, 0, Some(&occ));
             route_calendar_save(&calendar_state, event.calendar_id.clone(), event);
         });
@@ -10294,7 +10334,7 @@ fn calendar_event_days(calendar_state: &Rc<RefCell<CalendarUiState>>, month: chr
 }
 
 fn current_month_start() -> chrono::NaiveDate {
-    first_of_month(chrono::Utc::now().date_naive())
+    first_of_month(crate::calendar_tz::display_zone().today())
 }
 
 fn first_of_month(date: chrono::NaiveDate) -> chrono::NaiveDate {
@@ -12366,11 +12406,8 @@ fn print_calendar_month<T: IsA<gtk::Window>>(calendar_state: &Rc<RefCell<Calenda
                 let time = if occ.all_day {
                     "All day".to_string()
                 } else {
-                    format!(
-                        "{} – {}",
-                        occ.start.with_timezone(&chrono::Local).format("%H:%M"),
-                        occ.end.with_timezone(&chrono::Local).format("%H:%M")
-                    )
+                    let (start, end) = calendar_view::local_span(&occ);
+                    format!("{} – {}", start.format("%H:%M"), end.format("%H:%M"))
                 };
                 let summary = occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string());
                 let calendar = calendar_names.get(&occ.calendar_id).cloned().unwrap_or_default();
@@ -12470,7 +12507,7 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
         (occurrences, tasks, colors, checked, activate, upcoming_sources)
     };
 
-    let now = chrono::Local::now();
+    let now = crate::calendar_tz::display_zone().now();
     let mut upcoming: Vec<EventOccurrence> = crate::lookout_view::upcoming_occurrences(
         upcoming_sources.iter(),
         now,
@@ -12486,7 +12523,7 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
     upcoming.retain(|occ| calendar_view::covered_local_dates(occ, day, day).is_empty());
 
     let header = gtk::Label::builder()
-        .label(calendar_view::agenda_day_header(day, chrono::Utc::now().date_naive()))
+        .label(calendar_view::agenda_day_header(day, now.date()))
         .css_classes(["caption-heading"])
         .xalign(0.0)
         .build();
@@ -12504,7 +12541,7 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
             let prefix_text = if occ.all_day {
                 "All Day".to_string()
             } else {
-                occ.start.with_timezone(&chrono::Local).format("%H:%M").to_string()
+                calendar_view::local_span(&occ).0.format("%H:%M").to_string()
             };
             append_overview_event_row(&grid, row as i32, &prefix_text, &occ, &colors);
         }
@@ -12525,9 +12562,9 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
     } else {
         let grid = gtk::Grid::builder().row_spacing(10).column_spacing(6).build();
         for (row, occ) in upcoming.into_iter().enumerate() {
-            let start = occ.start.with_timezone(&chrono::Local);
-            let today = now.date_naive();
-            let date = start.date_naive();
+            let start = calendar_view::local_span(&occ).0;
+            let today = now.date();
+            let date = start.date();
             let prefix_text = if date == today {
                 "Today".to_string()
             } else if date == today + chrono::Days::new(1) {
@@ -13028,8 +13065,9 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
             default_pickable_calendar(calendar_state).unwrap_or_else(|| CalendarId(String::new()))
         }
     };
-    let preview = event_editor_preview_data(calendar_state, occ.start.with_timezone(&chrono::Local).date_naive());
+    let preview = event_editor_preview_data(calendar_state, calendar_view::local_span(occ).0.date());
     let owner_email = calendar_owner_email(calendar_state, &occ.calendar_id);
+    let calendar_prefs = state.borrow().settings.calendar_preferences();
     crate::event_editor::show_event_editor(
         window,
         crate::event_editor::EventEditorPrefill {
@@ -13044,6 +13082,7 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
             owner_email,
             read_only,
             read_only_note,
+            calendar_prefs: &calendar_prefs,
         },
         calendar_attendee_suggestions(state, worker),
         {
@@ -13078,6 +13117,7 @@ fn show_new_event_editor(
     };
     let preview = event_editor_preview_data(calendar_state, suggested_start.date());
     let owner_email = calendar_owner_email(calendar_state, &default_calendar);
+    let calendar_prefs = state.borrow().settings.calendar_preferences();
     crate::event_editor::show_event_editor(
         window,
         crate::event_editor::EventEditorPrefill {
@@ -13092,6 +13132,7 @@ fn show_new_event_editor(
             owner_email,
             read_only: false,
             read_only_note: "",
+            calendar_prefs: &calendar_prefs,
         },
         calendar_attendee_suggestions(state, worker),
         {
@@ -13430,7 +13471,7 @@ fn widen_calendar_sync_horizon(calendar_state: &Rc<RefCell<CalendarUiState>>) {
 /// dashboard's shorter one). Month-normalized firsts so map keys and
 /// session sync commands line up.
 fn dashboard_month_window() -> [chrono::NaiveDate; 4] {
-    let current = first_of_month(chrono::Local::now().date_naive());
+    let current = first_of_month(crate::calendar_tz::display_zone().today());
     [
         current,
         current + chrono::Months::new(1),
@@ -18379,17 +18420,16 @@ fn set_invite_row(card: &gtk::Box, row_name: &str, value_name: &str, text: Optio
 /// Follows the 12-hour style the calendar views and the message header use.
 fn format_imip_when(invitation: &lookout_core::ImipInvitation) -> String {
     let recurring = if invitation.rrule.is_some() { " · Recurring" } else { "" };
-    let start = invitation.start.with_timezone(&chrono::Local);
-    let end = invitation.end.with_timezone(&chrono::Local);
+    let (start, end) = crate::calendar_tz::occurrence_span(crate::calendar_tz::display_zone(), invitation.start, invitation.end, invitation.all_day);
     if invitation.all_day {
-        if end.date_naive() == start.date_naive() {
+        if end.date() <= start.date() + chrono::Duration::days(1) {
             return format!("All day · {}{}", start.format("%a %d %b %Y"), recurring);
         }
         // DTEND is exclusive: the last day shown is the one before it.
-        let last_day = end.date_naive() - chrono::Duration::days(1);
+        let last_day = end.date() - chrono::Duration::days(1);
         return format!("All day · {} – {}{}", start.format("%a %d %b %Y"), last_day.format("%a %d %b %Y"), recurring);
     }
-    if end.date_naive() == start.date_naive() {
+    if end.date() == start.date() {
         format!("{} · {} – {}{}", start.format("%a %d %b %Y"), start.format("%I:%M %p"), end.format("%I:%M %p"), recurring)
     } else {
         format!(

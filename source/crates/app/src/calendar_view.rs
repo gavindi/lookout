@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::prelude::*;
 use lookout_core::{CalendarId, CalendarInfo, EventOccurrence};
@@ -22,6 +22,18 @@ const HOURS_PER_DAY: usize = 24;
 /// The short label for `day` ("Sun".."Sat").
 fn weekday_short(day: chrono::Weekday) -> &'static str {
     WEEKDAY_LABELS[day.num_days_from_sunday() as usize]
+}
+
+/// An occurrence's span as wall-clock times in the calendar's display zone
+/// (item 3.1); all-day spans read as their dates, never zone-shifted (see
+/// `calendar_tz`).
+pub(crate) fn local_span(occ: &EventOccurrence) -> (NaiveDateTime, NaiveDateTime) {
+    crate::calendar_tz::occurrence_span(crate::calendar_tz::display_zone(), occ.start, occ.end, occ.all_day)
+}
+
+/// Today in the calendar's display zone.
+fn today() -> NaiveDate {
+    crate::calendar_tz::display_zone().today()
 }
 
 /// The seven weekdays beginning at `week_start`, in week order.
@@ -303,16 +315,23 @@ pub struct MonthGrid {
     on_day_activate: PendingDayActivate,
     /// First day of the week for this grid (the `calendar-week-start`
     /// preference), used by [`first_grid_day`] to place the 6-week window.
-    week_start: chrono::Weekday,
+    /// Shared with the click/drag closures so [`set_month_week_start`]
+    /// applies a change live (item 3.1).
+    week_start: Rc<Cell<chrono::Weekday>>,
+    /// The weekday header labels, relabelled on a week-start change.
+    weekday_labels: Vec<gtk::Label>,
 }
 
 fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
+    let week_start = Rc::new(Cell::new(week_start));
     let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).homogeneous(true).build();
-    for label in ordered_weekday_labels(week_start) {
+    let mut weekday_labels = Vec::with_capacity(7);
+    for label in ordered_weekday_labels(week_start.get()) {
         let weekday_label = gtk::Label::builder().label(label).css_classes(["dim-label", "caption-heading"]).build();
         let cell = gtk::Box::builder().css_classes(["calendar-day-cell"]).hexpand(true).build();
         cell.append(&weekday_label);
         header_row.append(&cell);
+        weekday_labels.push(weekday_label);
     }
 
     let grid = gtk::Grid::builder()
@@ -325,7 +344,7 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
         .build();
 
     let mut day_cells = Vec::with_capacity(42);
-    let anchor_month = Rc::new(RefCell::new(first_of_month(chrono::Utc::now().date_naive())));
+    let anchor_month = Rc::new(RefCell::new(first_of_month(today())));
     let on_day_selected: DaySelectedCallbacks = Rc::new(RefCell::new(Vec::new()));
     let selected_day: Rc<RefCell<Option<NaiveDate>>> = Rc::new(RefCell::new(None));
     let on_day_activate: PendingDayActivate = Rc::new(RefCell::new(None));
@@ -347,6 +366,7 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
         {
             let click_target = container.clone();
             let anchor_month = anchor_month.clone();
+            let week_start = week_start.clone();
             let on_day_selected = on_day_selected.clone();
             let selected_day = selected_day.clone();
             let on_day_activate = on_day_activate.clone();
@@ -359,7 +379,7 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
                     }
                     widget = current.parent();
                 }
-                let date = first_grid_day(*anchor_month.borrow(), week_start) + chrono::Duration::days(index as i64);
+                let date = first_grid_day(*anchor_month.borrow(), week_start.get()) + chrono::Duration::days(index as i64);
                 if *selected_day.borrow() == Some(date) {
                     *selected_day.borrow_mut() = None;
                     click_target.remove_css_class("calendar-selected-cell");
@@ -390,7 +410,7 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
     let month_drag: Rc<RefCell<Option<MonthDrag>>> = Rc::new(RefCell::new(None));
     let chip_events: Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>> = Rc::new(RefCell::new(HashMap::new()));
     let on_drag: PendingEventDrag = Rc::new(RefCell::new(None));
-    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag, week_start);
+    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag, &week_start);
 
     MonthGrid {
         root: root_box.upcast(),
@@ -404,7 +424,20 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
         selected_day,
         on_day_activate,
         week_start,
+        weekday_labels,
     }
+}
+
+/// Changes the grid's first weekday (item 3.1): relabels the weekday header
+/// and re-lays the current month's 6-week window. The caller re-renders the
+/// month's events afterwards.
+pub fn set_month_week_start(mg: &MonthGrid, week_start: chrono::Weekday) {
+    mg.week_start.set(week_start);
+    for (label, text) in mg.weekday_labels.iter().zip(ordered_weekday_labels(week_start)) {
+        label.set_label(text);
+    }
+    let month = *mg.anchor_month.borrow();
+    set_month(mg, month);
 }
 
 /// Rebuilds the grid's date labels/highlighting for the month containing
@@ -414,9 +447,9 @@ pub fn set_month(mg: &MonthGrid, month: NaiveDate) {
     let month = first_of_month(month);
     *mg.anchor_month.borrow_mut() = month;
 
-    let today = chrono::Utc::now().date_naive();
+    let today = today();
     let selected_day = *mg.selected_day.borrow();
-    let grid_start = first_grid_day(month, mg.week_start);
+    let grid_start = first_grid_day(month, mg.week_start.get());
 
     for (i, cell) in mg.day_cells.iter().enumerate() {
         let date = grid_start + chrono::Duration::days(i as i64);
@@ -467,7 +500,7 @@ pub fn set_month_occurrences(
     for cell in &mg.day_cells {
         cell.container.remove_css_class("calendar-drag-target");
     }
-    let grid_start = first_grid_day(*mg.anchor_month.borrow(), mg.week_start);
+    let grid_start = first_grid_day(*mg.anchor_month.borrow(), mg.week_start.get());
 
     for cell in &mg.day_cells {
         clear_children(&cell.events_box);
@@ -522,10 +555,9 @@ fn occurrence_day_range(occ: &EventOccurrence, first: NaiveDate, n: usize) -> Op
     if n == 0 {
         return None;
     }
-    let start_local = occ.start.with_timezone(&chrono::Local);
-    let end_local = occ.end.with_timezone(&chrono::Local);
-    let start_date = start_local.date_naive();
-    let end_date = end_local.date_naive();
+    let (start_local, end_local) = local_span(occ);
+    let start_date = start_local.date();
+    let end_date = end_local.date();
 
     let start_col = (start_date - first).num_days();
     let mut end_col = (end_date - first).num_days();
@@ -590,7 +622,7 @@ fn attach_month_drag(
     chip_events: &Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>>,
     on_activate: &PendingActivate,
     on_drag: &PendingEventDrag,
-    week_start: chrono::Weekday,
+    week_start: &Rc<Cell<chrono::Weekday>>,
 ) {
     let gesture = gtk::GestureClick::new();
     let events_boxes: Vec<gtk::Box> = day_cells.iter().map(|c| c.events_box.clone()).collect();
@@ -600,6 +632,7 @@ fn attach_month_drag(
         let anchor_month = anchor_month.clone();
         let month_drag = month_drag.clone();
         let chip_events = chip_events.clone();
+        let week_start = week_start.clone();
         gesture.connect_pressed(move |_, _, x, y| {
             // Only presses that land on a chip arm the drag; the day cells'
             // own gestures handle everything else.
@@ -617,7 +650,7 @@ fn attach_month_drag(
             let Some(cell) = cell_index_at_point(grid.width() as f64, grid.height() as f64, x, y) else {
                 return;
             };
-            let date = first_grid_day(*anchor_month.borrow(), week_start) + chrono::Duration::days(cell as i64);
+            let date = first_grid_day(*anchor_month.borrow(), week_start.get()) + chrono::Duration::days(cell as i64);
             *month_drag.borrow_mut() = Some(MonthDrag {
                 occ,
                 button,
@@ -635,6 +668,7 @@ fn attach_month_drag(
         let month_drag = month_drag.clone();
         let events_boxes = events_boxes.clone();
         let containers = containers.clone();
+        let week_start = week_start.clone();
         gesture.connect_update(move |gesture, sequence| {
             let Some((x, y)) = gesture.point(sequence) else { return };
             let mut guard = month_drag.borrow_mut();
@@ -650,7 +684,7 @@ fn attach_month_drag(
             let Some(cell) = cell_index_at_point(grid.width() as f64, grid.height() as f64, x, y) else {
                 return;
             };
-            let date = first_grid_day(*anchor_month.borrow(), week_start) + chrono::Duration::days(cell as i64);
+            let date = first_grid_day(*anchor_month.borrow(), week_start.get()) + chrono::Duration::days(cell as i64);
             if d.to_date != date {
                 d.to_date = date;
                 // Live feedback: reparent the chip into the target cell and
@@ -771,11 +805,18 @@ pub struct TimeGrid {
     scroller: gtk::ScrolledWindow,
     /// Weekday/date header labels above the day columns (Week/Work week only;
     /// the Day view's date lives in [`CalendarMain`]'s shared header).
-    headers: Vec<gtk::Label>,
+    /// Rebuilt by [`TimeGrid::set_weekdays`], since a Work week change can
+    /// change the column count.
+    headers: Rc<RefCell<Vec<gtk::Label>>>,
+    /// The header row the `headers` live in (Week/Work week only).
+    header_row: Option<gtk::Box>,
+    /// The blank header cell above the hour gutter (Week/Work week only),
+    /// resized with the gutter by [`TimeGrid::set_zones`].
+    gutter_spacer: Option<gtk::Label>,
     anchor: Rc<RefCell<NaiveDate>>,
     /// Which weekdays make up the columns. The Day view is the single-column
     /// special case (`day_view`), which always shows the anchor date itself.
-    weekdays: Vec<chrono::Weekday>,
+    weekdays: Rc<RefCell<Vec<chrono::Weekday>>>,
     day_view: bool,
     data: TimeGridData,
     /// The click-to-edit callback, set by each `set_time_grid` render pass.
@@ -859,9 +900,20 @@ struct TimeGridData {
     drag: Rc<RefCell<Option<TimeGridDrag>>>,
     /// The business-hours band painted by [`paint_time_grid`], as local hours,
     /// half-open `start..end`. Defaults to 8..18; [`TimeGrid::set_work_hours`]
-    /// sets it from the `CalendarPreferences` when the calendar is built.
-    work_start: Cell<usize>,
-    work_end: Cell<usize>,
+    /// sets it from the `CalendarPreferences`. Shared (`Rc`) with the paint
+    /// closures - a plain `Cell` here was copied into each closure when the
+    /// grid was built, so the configured hours never reached the painter.
+    work_start: Rc<Cell<usize>>,
+    work_end: Rc<Cell<usize>>,
+    /// The weekdays that get the business-hours band (item 3.1): a weekend
+    /// column in Week view, or the Day view on a day off, shows none.
+    work_days: Rc<RefCell<Vec<chrono::Weekday>>>,
+    /// Total width of the hour gutter left of the day columns: one
+    /// [`HOUR_GUTTER_WIDTH`] column, or two when a second time zone is shown.
+    gutter: Rc<Cell<f64>>,
+    /// The second time zone (CAL-10) whose hours are labelled in the outer
+    /// gutter column, if any. See [`TimeGrid::set_zones`].
+    secondary_zone: Rc<Cell<Option<chrono_tz::Tz>>>,
 }
 
 pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
@@ -886,8 +938,11 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         drag_anchor: Rc::new(RefCell::new(None)),
         chip_press: Rc::new(RefCell::new(None)),
         drag: Rc::new(RefCell::new(None)),
-        work_start: Cell::new(8),
-        work_end: Cell::new(18),
+        work_start: Rc::new(Cell::new(8)),
+        work_end: Rc::new(Cell::new(18)),
+        work_days: Rc::new(RefCell::new(crate::settings::CalendarPreferences::default().work_days)),
+        gutter: Rc::new(Cell::new(HOUR_GUTTER_WIDTH)),
+        secondary_zone: Rc::new(Cell::new(None)),
     };
     let hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let on_activate: PendingActivate = Rc::new(RefCell::new(None));
@@ -915,16 +970,21 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
     attach_click(&canvas, false, &data, &on_activate, &on_slot_activate, &on_drag);
 
     let mut headers = Vec::new();
+    let mut header_row_slot = None;
+    let mut gutter_spacer = None;
     let root_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
     if !day_view {
         let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).homogeneous(true).build();
-        header_row.append(&gtk::Label::builder().width_request(HOUR_GUTTER_WIDTH as i32).build());
+        let spacer = gtk::Label::builder().width_request(HOUR_GUTTER_WIDTH as i32).build();
+        header_row.append(&spacer);
+        gutter_spacer = Some(spacer);
         for _ in weekdays {
-            let label = gtk::Label::builder().css_classes(["dim-label", "caption-heading"]).hexpand(true).build();
+            let label = time_grid_header_label();
             header_row.append(&label);
             headers.push(label);
         }
         root_box.append(&header_row);
+        header_row_slot = Some(header_row);
     }
     root_box.append(&band);
 
@@ -943,9 +1003,11 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         band,
         canvas,
         scroller,
-        headers,
-        anchor: Rc::new(RefCell::new(chrono::Utc::now().date_naive())),
-        weekdays: weekdays.to_vec(),
+        headers: Rc::new(RefCell::new(headers)),
+        header_row: header_row_slot,
+        gutter_spacer,
+        anchor: Rc::new(RefCell::new(today())),
+        weekdays: Rc::new(RefCell::new(weekdays.to_vec())),
         day_view,
         data,
         on_activate,
@@ -963,6 +1025,65 @@ impl TimeGrid {
         self.data.work_start.set(start.min(23));
         self.data.work_end.set(end.clamp(1, 24));
         self.canvas.queue_draw();
+    }
+
+    /// Changes the weekdays that make up the columns (item 3.1: a new week
+    /// start, or a new Work week), rebuilding the header labels to match.
+    /// The caller re-renders the grid afterwards (`set_time_grid`).
+    pub(crate) fn set_weekdays(&self, weekdays: &[chrono::Weekday]) {
+        if weekdays.is_empty() {
+            return;
+        }
+        *self.weekdays.borrow_mut() = weekdays.to_vec();
+        if let Some(header_row) = &self.header_row {
+            let mut headers = self.headers.borrow_mut();
+            for label in headers.drain(..) {
+                header_row.remove(&label);
+            }
+            for _ in weekdays {
+                let label = time_grid_header_label();
+                header_row.append(&label);
+                headers.push(label);
+            }
+        }
+    }
+
+    /// Sets which weekdays get the business-hours band and repaints.
+    pub(crate) fn set_work_days(&self, days: &[chrono::Weekday]) {
+        *self.data.work_days.borrow_mut() = days.to_vec();
+        self.canvas.queue_draw();
+    }
+
+    /// Shows (or, with `None`, hides) the second time-zone gutter (item 3.1 /
+    /// CAL-10): the gutter doubles in width, the outer column labels each
+    /// hour row in `secondary`, and the all-day band's gutter names both
+    /// zones. The primary zone is the calendar's display zone.
+    pub(crate) fn set_zones(&self, secondary: Option<chrono_tz::Tz>) {
+        self.data.secondary_zone.set(secondary);
+        self.data.gutter.set(if secondary.is_some() { 2.0 * HOUR_GUTTER_WIDTH } else { HOUR_GUTTER_WIDTH });
+        if let Some(spacer) = &self.gutter_spacer {
+            spacer.set_width_request(self.data.gutter.get() as i32);
+        }
+        self.band.queue_draw();
+        self.canvas.queue_draw();
+    }
+}
+
+/// One weekday/date header label above a Week/Work week column.
+fn time_grid_header_label() -> gtk::Label {
+    gtk::Label::builder().css_classes(["dim-label", "caption-heading"]).hexpand(true).build()
+}
+
+/// The second-zone label for the primary-zone hour row `hour` on `date`: the
+/// same instant in `secondary`, in the gutter's compact 12-hour style - "5pm"
+/// on whole-hour offsets, "2:30pm" on half-hour ones (Asia/Kolkata).
+fn secondary_gutter_label(hour: u32, date: NaiveDate, primary: crate::calendar_tz::DisplayZone, secondary: chrono_tz::Tz) -> String {
+    let Some(naive) = date.and_hms_opt(hour, 0, 0) else { return String::new() };
+    let local = primary.resolve_local(naive).with_timezone(&secondary);
+    if local.minute() == 0 {
+        hour_gutter_text(local.hour() as usize)
+    } else {
+        format!("{}:{:02}{}", hour_12(local.hour()), local.minute(), meridiem(local.hour()))
     }
 }
 
@@ -989,7 +1110,7 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
             }
             let dates_guard = data.dates.borrow();
             let chips_guard = data.chips.borrow();
-            let hit = hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band);
+            let hit = hovered_chip(data.gutter.get(), &chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band);
             if hover.get() != hit {
                 hover.set(hit);
                 canvas_widget.queue_draw();
@@ -1049,10 +1170,10 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
             move |x: f64, y: f64| -> Option<(NaiveDate, i64)> {
                 let dates_guard = data.dates.borrow();
                 let chips_guard = data.chips.borrow();
-                if band || hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band).is_some() {
+                if band || hovered_chip(data.gutter.get(), &chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band).is_some() {
                     return None;
                 }
-                slot_from_point(x, y, canvas_widget.width() as f64, dates_guard.len()).map(|(col, minutes)| (dates_guard[col], minutes))
+                slot_from_point(data.gutter.get(), x, y, canvas_widget.width() as f64, dates_guard.len()).map(|(col, minutes)| (dates_guard[col], minutes))
             }
         };
         // The index of the chip under `(x, y)` (timeline only; band chips are
@@ -1063,7 +1184,7 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
             move |x: f64, y: f64| -> Option<usize> {
                 let dates_guard = data.dates.borrow();
                 let chips_guard = data.chips.borrow();
-                hovered_chip(&chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band)
+                hovered_chip(data.gutter.get(), &chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band)
             }
         };
         let slot_at_update = slot_at.clone();
@@ -1085,8 +1206,9 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
                     if chip.all_day {
                         DragMode::Move
                     } else {
-                        let col_width = col_width_for(pressed_canvas.width() as f64, dates_guard.len());
-                        let (_, cy, _, ch) = chip_geometry(chip, col_width);
+                        let gutter = pressed_data.gutter.get();
+                        let col_width = col_width_for(gutter, pressed_canvas.width() as f64, dates_guard.len());
+                        let (_, cy, _, ch) = chip_geometry(gutter, chip, col_width);
                         if y >= cy + ch - RESIZE_GRAB_HEIGHT {
                             DragMode::ResizeEnd
                         } else {
@@ -1139,12 +1261,12 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
                     (chip.column as i64 * 1440 + chip.start_minutes, chip.column as i64 * 1440 + chip.end_minutes, chip.all_day)
                 };
                 let dates_len = update_data.dates.borrow().len();
-                let Some((col, minutes)) = col_minutes_at(x, y, update_canvas.width() as f64, dates_len) else {
+                let Some((col, minutes)) = col_minutes_at(update_data.gutter.get(), x, y, update_canvas.width() as f64, dates_len) else {
                     return;
                 };
                 // The grab offset comes from the *press* point, so the chip
                 // keeps its grab position exactly as the drag starts.
-                let grab_offset = col_minutes_at(px, py, update_canvas.width() as f64, dates_len)
+                let grab_offset = col_minutes_at(update_data.gutter.get(), px, py, update_canvas.width() as f64, dates_len)
                     .map(|(c, m)| c as i64 * 1440 + m)
                     .unwrap_or(chip_span.0)
                     - chip_span.0;
@@ -1170,7 +1292,7 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
             let drag_state = *update_data.drag.borrow();
             if let Some(mut drag) = drag_state {
                 let dates_len = update_data.dates.borrow().len();
-                let Some((col, minutes)) = col_minutes_at(x, y, update_canvas.width() as f64, dates_len) else {
+                let Some((col, minutes)) = col_minutes_at(update_data.gutter.get(), x, y, update_canvas.width() as f64, dates_len) else {
                     return;
                 };
                 drag_update(&mut drag, col as i64, minutes, dates_len as i64 * 1440);
@@ -1261,12 +1383,12 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
 /// hour gutter or outside the columns. Minutes are rounded to the nearest half
 /// hour and clamped so the slot never starts in the final 30 minutes of the
 /// day (a one-hour default span must stay within the day).
-fn slot_from_point(x: f64, y: f64, width: f64, n_cols: usize) -> Option<(usize, i64)> {
-    if n_cols == 0 || x < HOUR_GUTTER_WIDTH {
+fn slot_from_point(gutter: f64, x: f64, y: f64, width: f64, n_cols: usize) -> Option<(usize, i64)> {
+    if n_cols == 0 || x < gutter {
         return None;
     }
-    let col_width = ((width - HOUR_GUTTER_WIDTH).max(0.0)) / n_cols as f64;
-    let col = (((x - HOUR_GUTTER_WIDTH) / col_width) as usize).min(n_cols - 1);
+    let col_width = ((width - gutter).max(0.0)) / n_cols as f64;
+    let col = (((x - gutter) / col_width) as usize).min(n_cols - 1);
     let minutes = (y / TIME_SLOT_HEIGHT * 60.0) as i64;
     let snapped = (((minutes + 15) / 30) * 30).clamp(0, 1440 - 30);
     Some((col, snapped))
@@ -1274,9 +1396,9 @@ fn slot_from_point(x: f64, y: f64, width: f64, n_cols: usize) -> Option<(usize, 
 
 /// The day-column width for a grid `width` wide with `n_cols` columns - the
 /// shared geometry behind chip hit-testing, geometry, and drag positions.
-fn col_width_for(width: f64, n_cols: usize) -> f64 {
+fn col_width_for(gutter: f64, width: f64, n_cols: usize) -> f64 {
     if n_cols > 0 {
-        ((width - HOUR_GUTTER_WIDTH).max(0.0)) / n_cols as f64
+        ((width - gutter).max(0.0)) / n_cols as f64
     } else {
         0.0
     }
@@ -1287,12 +1409,12 @@ fn col_width_for(width: f64, n_cols: usize) -> f64 {
 /// [`slot_from_point`] but without the half-hour snapping (drag live positions
 /// snap separately in [`drag_update`]) and with the full 0..=1440 minute range
 /// so a drag can end exactly at midnight.
-fn col_minutes_at(x: f64, y: f64, width: f64, n_cols: usize) -> Option<(usize, i64)> {
-    if n_cols == 0 || x < HOUR_GUTTER_WIDTH {
+fn col_minutes_at(gutter: f64, x: f64, y: f64, width: f64, n_cols: usize) -> Option<(usize, i64)> {
+    if n_cols == 0 || x < gutter {
         return None;
     }
-    let col_width = col_width_for(width, n_cols);
-    let col = (((x - HOUR_GUTTER_WIDTH) / col_width) as usize).min(n_cols - 1);
+    let col_width = col_width_for(gutter, width, n_cols);
+    let col = (((x - gutter) / col_width) as usize).min(n_cols - 1);
     let minutes = ((y / TIME_SLOT_HEIGHT * 60.0) as i64).clamp(0, 1440);
     Some((col, minutes))
 }
@@ -1368,18 +1490,14 @@ fn drag_ghost_chip(drag: &TimeGridDrag, occurrence: usize) -> TimeChip {
 /// The index of the chip under `(x, y)` among the chips of one split half
 /// (`band` = all-day chips, otherwise timed chips), or `None`. Uses the same
 /// geometry maths as the paint code, so hover hits exactly what is drawn.
-fn hovered_chip(chips: &[TimeChip], canvas_width: f64, n_cols: usize, x: f64, y: f64, band: bool) -> Option<usize> {
-    let col_width = if n_cols > 0 {
-        ((canvas_width - HOUR_GUTTER_WIDTH).max(0.0)) / n_cols as f64
-    } else {
-        0.0
-    };
+fn hovered_chip(gutter: f64, chips: &[TimeChip], canvas_width: f64, n_cols: usize, x: f64, y: f64, band: bool) -> Option<usize> {
+    let col_width = col_width_for(gutter, canvas_width, n_cols);
     chips
         .iter()
         .enumerate()
         .find(|(_, chip)| {
             chip.all_day == band && {
-                let (cx, cy, cw, ch) = chip_geometry(chip, col_width);
+                let (cx, cy, cw, ch) = chip_geometry(gutter, chip, col_width);
                 x >= cx && x <= cx + cw && y >= cy && y <= cy + ch
             }
         })
@@ -1424,8 +1542,8 @@ pub fn set_time_grid(
     *t.data.dates.borrow_mut() = dates.clone();
     *t.data.chips.borrow_mut() = chips;
 
-    let today = chrono::Utc::now().date_naive();
-    for (i, label) in t.headers.iter().enumerate() {
+    let today = today();
+    for (i, label) in t.headers.borrow().iter().enumerate() {
         let date = dates[i];
         let weekday = WEEKDAY_LABELS[date.weekday().num_days_from_sunday() as usize];
         label.set_label(&format!("{weekday} {}", date.day()));
@@ -1446,7 +1564,7 @@ pub fn set_time_grid(
 /// time-grid view jumps to "now" every time it becomes visible (stack pages
 /// are created once but only the active one is mapped).
 fn scroll_time_grid_to_now(scroller: &gtk::ScrolledWindow) {
-    let now = chrono::Local::now();
+    let now = crate::calendar_tz::display_zone().now();
     scroll_scroller_to_minutes(scroller, now.hour() as i64 * 60 + now.minute() as i64);
 }
 
@@ -1480,8 +1598,9 @@ fn grid_dates(t: &TimeGrid) -> Vec<NaiveDate> {
     if t.day_view {
         vec![anchor]
     } else {
-        let start = week_start(anchor, t.weekdays[0]);
-        (0..t.weekdays.len()).map(|i| start + chrono::Duration::days(i as i64)).collect()
+        let weekdays = t.weekdays.borrow();
+        let start = week_start(anchor, weekdays[0]);
+        (0..weekdays.len()).map(|i| start + chrono::Duration::days(i as i64)).collect()
     }
 }
 
@@ -1506,10 +1625,9 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
     let mut multi: Vec<(i64, i64, i64, i64, usize)> = Vec::new();
 
     for (index, occ) in occurrences.iter().enumerate() {
-        let start_local = occ.start.with_timezone(&chrono::Local);
-        let end_local = occ.end.with_timezone(&chrono::Local);
-        let start_date = start_local.date_naive();
-        let end_date = end_local.date_naive();
+        let (start_local, end_local) = local_span(occ);
+        let start_date = start_local.date();
+        let end_date = end_local.date();
 
         let start_col = (start_date - first).num_days();
         let start_minutes = start_local.hour() as i64 * 60 + start_local.minute() as i64;
@@ -1653,9 +1771,9 @@ fn assign_lanes(ranges: &[(i64, i64)]) -> Vec<usize> {
 /// the all-day band for `all_day` chips). Coordinates are relative to the
 /// chip's own canvas: the all-day band (for `all_day` chips) or the scrollable
 /// timeline below it. Also used for hover hit-testing.
-fn chip_geometry(chip: &TimeChip, col_width: f64) -> (f64, f64, f64, f64) {
+fn chip_geometry(gutter: f64, chip: &TimeChip, col_width: f64) -> (f64, f64, f64, f64) {
     let lane_width = col_width / chip.lanes.max(1) as f64;
-    let x = HOUR_GUTTER_WIDTH + chip.column as f64 * col_width + chip.lane as f64 * lane_width + 1.0;
+    let x = gutter + chip.column as f64 * col_width + chip.lane as f64 * lane_width + 1.0;
     let w = (chip.span as f64 * col_width - 2.0).max(2.0);
     if chip.all_day {
         (x, 1.5, w, ALL_DAY_BAND_HEIGHT - 3.0)
@@ -1674,7 +1792,7 @@ fn chip_text(occ: &EventOccurrence, chip: &TimeChip, chip_height: f64) -> String
     if chip.all_day {
         summary.to_string()
     } else if chip_height >= 20.0 {
-        let time = format_event_time(&occ.start.with_timezone(&chrono::Local));
+        let time = format_event_time(&local_span(occ).0);
         format!("{time} {summary}")
     } else {
         summary.to_string()
@@ -1686,8 +1804,8 @@ fn chip_tooltip(occ: &EventOccurrence, chip: &TimeChip) -> String {
     if chip.all_day {
         occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
     } else {
-        let start = format_event_time(&occ.start.with_timezone(&chrono::Local));
-        let end = format_event_time(&occ.end.with_timezone(&chrono::Local));
+        let start = format_event_time(&local_span(occ).0);
+        let end = format_event_time(&local_span(occ).1);
         format!("{start} – {end}  {}", occ.summary.as_deref().unwrap_or("(untitled)"))
     }
 }
@@ -1706,7 +1824,8 @@ fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &
     let occurrences = data.occurrences.borrow();
     let colors = data.colors.borrow();
     let n = dates.len();
-    let columns_width = (width - HOUR_GUTTER_WIDTH).max(0.0);
+    let gutter = data.gutter.get();
+    let columns_width = (width - gutter).max(0.0);
     let col_width = if n > 0 { columns_width / n as f64 } else { 0.0 };
 
     // No background fill: the band is the main panel's own (translucent)
@@ -1715,14 +1834,32 @@ fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &
     cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_LINE_ALPHA);
     cr.set_line_width(1.0);
     for col in 0..=n {
-        let x = HOUR_GUTTER_WIDTH + col as f64 * col_width;
+        let x = gutter + col as f64 * col_width;
         cr.move_to(x, 0.0);
         cr.line_to(x, height);
     }
     let _ = cr.stroke();
 
+    // The gutter reads "All day" - or, with a second time zone shown, names
+    // the zone above each gutter column (second zone outside, the display
+    // zone next to the grid), as Outlook's two-zone gutter does.
     let dim_text = (fg.0, fg.1, fg.2, GRID_DIM_TEXT_ALPHA);
-    paint_right_text(cr, "All day", HOUR_GUTTER_WIDTH - 5.0, 3.0, 10.0, dim_text, FontWeight::Normal);
+    match data.secondary_zone.get() {
+        Some(secondary) => {
+            let at = dates
+                .first()
+                .and_then(|d| d.and_hms_opt(12, 0, 0))
+                .map(|naive| crate::calendar_tz::display_zone().resolve_local(naive))
+                .unwrap_or_else(Utc::now);
+            let primary_label = crate::calendar_tz::display_zone().label(at);
+            let secondary_label = crate::calendar_tz::DisplayZone::Named(secondary).label(at);
+            paint_right_text(cr, &secondary_label, HOUR_GUTTER_WIDTH - 5.0, 3.0, 10.0, dim_text, FontWeight::Normal);
+            paint_right_text(cr, &primary_label, gutter - 5.0, 3.0, 10.0, dim_text, FontWeight::Normal);
+        }
+        None => {
+            paint_right_text(cr, "All day", gutter - 5.0, 3.0, 10.0, dim_text, FontWeight::Normal);
+        }
+    }
 
     let dragged = data.drag.borrow().map(|d| d.chip);
     for (i, chip) in chips.iter().enumerate() {
@@ -1730,13 +1867,13 @@ fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &
             if dragged == Some(i) {
                 continue;
             }
-            paint_chip(cr, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92);
+            paint_chip(cr, gutter, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92);
         }
     }
     if let Some(drag) = *data.drag.borrow() {
         if drag.all_day {
             let occurrence = chips[drag.chip].occurrence;
-            paint_chip(cr, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
+            paint_chip(cr, gutter, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
         }
     }
 }
@@ -1753,18 +1890,21 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
     let occurrences = data.occurrences.borrow();
     let colors = data.colors.borrow();
     let n = dates.len();
-    let columns_width = (width - HOUR_GUTTER_WIDTH).max(0.0);
+    let gutter = data.gutter.get();
+    let columns_width = (width - gutter).max(0.0);
     let col_width = if n > 0 { columns_width / n as f64 } else { 0.0 };
 
     // No background fill (see `GRID_BUSINESS_ALPHA`): off-hours are the main
     // panel's own translucent background, with a foreground tint marking the
     // business-hours stripe. The band comes from the `calendar-work-start`/
-    // `-end` preferences.
+    // `-end` preferences, on the `calendar-work-days` columns only.
     let work_start = data.work_start.get();
     let work_end = data.work_end.get();
     let business_top = work_start as f64 * TIME_SLOT_HEIGHT;
     let business_height = (work_end.saturating_sub(work_start)) as f64 * TIME_SLOT_HEIGHT;
-    cr.rectangle(HOUR_GUTTER_WIDTH, business_top, columns_width, business_height);
+    for col in business_columns(&dates, &data.work_days.borrow()) {
+        cr.rectangle(gutter + col as f64 * col_width, business_top, col_width, business_height);
+    }
     cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_BUSINESS_ALPHA);
     let _ = cr.fill();
 
@@ -1776,21 +1916,30 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
         if y > height {
             break;
         }
-        cr.move_to(HOUR_GUTTER_WIDTH, y);
+        cr.move_to(gutter, y);
         cr.line_to(width, y);
     }
     for col in 0..=n {
-        let x = HOUR_GUTTER_WIDTH + col as f64 * col_width;
+        let x = gutter + col as f64 * col_width;
         cr.move_to(x, 0.0);
         cr.line_to(x, height);
     }
     let _ = cr.stroke();
 
-    // Gutter labels: right-aligned hour markers beside their rows.
+    // Gutter labels: right-aligned hour markers beside their rows, plus the
+    // second time zone's matching times in the outer column (CAL-10). Those
+    // are converted on the first displayed date, so a DST change inside a
+    // shown week shifts by an hour from that day on - as in Outlook.
     let dim_text = (fg.0, fg.1, fg.2, GRID_DIM_TEXT_ALPHA);
+    let secondary = data.secondary_zone.get();
+    let label_date = dates.first().copied().unwrap_or_else(today);
     for hh in 0..HOURS_PER_DAY {
         let y = hh as f64 * TIME_SLOT_HEIGHT + 3.0;
-        paint_right_text(cr, &hour_gutter_text(hh), HOUR_GUTTER_WIDTH - 5.0, y, 10.0, dim_text, FontWeight::Normal);
+        paint_right_text(cr, &hour_gutter_text(hh), gutter - 5.0, y, 10.0, dim_text, FontWeight::Normal);
+        if let Some(secondary) = secondary {
+            let label = secondary_gutter_label(hh as u32, label_date, crate::calendar_tz::display_zone(), secondary);
+            paint_right_text(cr, &label, HOUR_GUTTER_WIDTH - 5.0, y, 10.0, dim_text, FontWeight::Normal);
+        }
     }
 
     // The highlighted slot range (from a click, or a click-and-drag): a
@@ -1815,10 +1964,10 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
             if height <= 0.0 {
                 continue;
             }
-            cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 1.0, top + 1.0, col_width - 2.0, height - 2.0);
+            cr.rectangle(gutter + col as f64 * col_width + 1.0, top + 1.0, col_width - 2.0, height - 2.0);
             cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_SELECTION_FILL_ALPHA);
             let _ = cr.fill();
-            cr.rectangle(HOUR_GUTTER_WIDTH + col as f64 * col_width + 0.5, top + 0.5, col_width - 1.0, height - 1.0);
+            cr.rectangle(gutter + col as f64 * col_width + 0.5, top + 0.5, col_width - 1.0, height - 1.0);
             cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_SELECTION_STROKE_ALPHA);
             cr.set_line_width(1.0);
             let _ = cr.stroke();
@@ -1831,15 +1980,26 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
             if dragged == Some(i) {
                 continue;
             }
-            paint_chip(cr, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92);
+            paint_chip(cr, gutter, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92);
         }
     }
     if let Some(drag) = *data.drag.borrow() {
         if !drag.all_day {
             let occurrence = chips[drag.chip].occurrence;
-            paint_chip(cr, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
+            paint_chip(cr, gutter, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
         }
     }
+}
+
+/// The column indexes among `dates` that fall on a work day - the columns
+/// [`paint_time_grid`] gives the business-hours band.
+fn business_columns(dates: &[NaiveDate], work_days: &[chrono::Weekday]) -> Vec<usize> {
+    dates
+        .iter()
+        .enumerate()
+        .filter(|(_, date)| work_days.contains(&date.weekday()))
+        .map(|(col, _)| col)
+        .collect()
 }
 
 /// The time-grid canvas's current theme foreground colour, which every
@@ -1852,10 +2012,11 @@ fn foreground_rgb(widget: &impl IsA<gtk::Widget>) -> (f64, f64, f64) {
 /// Paints one event chip (fill, hairline border, hover ring, and its label).
 /// `alpha` scales the fill opacity - the drag ghost paints at a lower alpha
 /// so the grid stays readable under it.
-fn paint_chip(cr: &gtk::cairo::Context, chip: &TimeChip, occ: &EventOccurrence, colors: &HashMap<CalendarId, String>, col_width: f64, hovered: bool, alpha: f64) {
+#[allow(clippy::too_many_arguments)]
+fn paint_chip(cr: &gtk::cairo::Context, gutter: f64, chip: &TimeChip, occ: &EventOccurrence, colors: &HashMap<CalendarId, String>, col_width: f64, hovered: bool, alpha: f64) {
     let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
     let (r, g, b) = css_color_rgb(color);
-    let (cx, cy, cw, ch) = chip_geometry(chip, col_width);
+    let (cx, cy, cw, ch) = chip_geometry(gutter, chip, col_width);
     if cw < 2.0 || ch < 2.0 {
         return;
     }
@@ -1960,7 +2121,7 @@ fn build_agenda_view() -> AgendaView {
     AgendaView {
         root: root_box.upcast(),
         events_box,
-        anchor: Rc::new(RefCell::new(chrono::Utc::now().date_naive())),
+        anchor: Rc::new(RefCell::new(today())),
         on_activate: Rc::new(RefCell::new(None)),
     }
 }
@@ -1978,7 +2139,7 @@ pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurre
     let mut upcoming: Vec<&EventOccurrence> = occurrences
         .iter()
         .filter(|occ| {
-            let date = occ.start.with_timezone(&chrono::Local).date_naive();
+            let date = local_span(occ).0.date();
             date >= anchor && date <= month_end
         })
         .collect();
@@ -1990,10 +2151,10 @@ pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurre
         return;
     }
 
-    let today = chrono::Utc::now().date_naive();
+    let today = today();
     let mut day_groups: Vec<(NaiveDate, Vec<&EventOccurrence>)> = Vec::new();
     for occ in upcoming {
-        let date = occ.start.with_timezone(&chrono::Local).date_naive();
+        let date = local_span(occ).0.date();
         if let Some((_, group)) = day_groups.last_mut().filter(|(d, _)| *d == date) {
             group.push(occ);
         } else {
@@ -2013,11 +2174,7 @@ pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurre
         for occ in group {
             let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
             let time_label = gtk::Label::builder()
-                .label(if occ.all_day {
-                    "All day".to_string()
-                } else {
-                    format_event_time(&occ.start.with_timezone(&chrono::Local))
-                })
+                .label(if occ.all_day { "All day".to_string() } else { format_event_time(&local_span(occ).0) })
                 .css_classes(["dim-label", "caption"])
                 .width_request(96)
                 .xalign(0.0)
@@ -2026,8 +2183,8 @@ pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurre
             let text = if occ.all_day {
                 occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
             } else {
-                let start = format_event_time(&occ.start.with_timezone(&chrono::Local));
-                let end = format_event_time(&occ.end.with_timezone(&chrono::Local));
+                let start = format_event_time(&local_span(occ).0);
+                let end = format_event_time(&local_span(occ).1);
                 format!("{start} – {end}  {}", occ.summary.as_deref().unwrap_or("(untitled)"))
             };
             let summary_label = gtk::Label::builder()
@@ -2195,9 +2352,10 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
     let workweek = build_time_grid(&prefs.work_days, false);
     let week = build_time_grid(&week_days(week_start), false);
     let day = build_time_grid(&[week_start], true);
-    // The Day/Week/Work-week grids share the configured business-hours band.
+    // The Day/Week/Work-week grids share the configured business-hours band
+    // and second time zone.
     for grid in [&workweek, &week, &day] {
-        grid.set_work_hours(prefs.work_start as usize, prefs.work_end as usize);
+        apply_time_grid_preferences(grid, prefs);
     }
     let agenda = build_agenda_view();
     let split = build_split_view(week_start);
@@ -2227,7 +2385,7 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
     root_box.append(&header_row);
     root_box.append(&stack);
 
-    let anchor = Rc::new(RefCell::new(chrono::Utc::now().date_naive()));
+    let anchor = Rc::new(RefCell::new(today()));
     // Empty until `rebuild_calendar_checklist` writes the per-calendar
     // checkbox rules; registered up-front so the provider is live for the
     // whole lifetime of the main panel.
@@ -2288,6 +2446,32 @@ pub fn active_view(c: &CalendarMain) -> &'static str {
         Some("split") => "split",
         _ => "month",
     }
+}
+
+/// The per-grid part of the Calendar preferences: business hours, work days
+/// and the second time-zone gutter. Shared by the main panel's grids and the
+/// event editor's Day-view preview.
+pub(crate) fn apply_time_grid_preferences(grid: &TimeGrid, prefs: &crate::settings::CalendarPreferences) {
+    grid.set_work_hours(prefs.work_start as usize, prefs.work_end as usize);
+    grid.set_work_days(&prefs.work_days);
+    grid.set_zones(prefs.secondary_tz);
+}
+
+/// Applies changed Calendar preferences to every view of the main panel and
+/// re-renders it (item 3.1): the week start (month grids, the header's mini
+/// month, Week view), the Work week's days, business hours and work days,
+/// and the second time zone. The display zone itself is process-wide
+/// (`calendar_tz::set_display_zone`) and is picked up by the re-render.
+pub fn apply_preferences(c: &CalendarMain, prefs: &crate::settings::CalendarPreferences) {
+    set_month_week_start(&c.month, prefs.week_start);
+    set_month_week_start(&c.split.month, prefs.week_start);
+    set_mini_week_start(&c.month_mini, prefs.week_start);
+    c.workweek.set_weekdays(&prefs.work_days);
+    c.week.set_weekdays(&week_days(prefs.week_start));
+    for grid in [&c.workweek, &c.week, &c.day] {
+        apply_time_grid_preferences(grid, prefs);
+    }
+    refresh(c);
 }
 
 /// Re-points every view at `day` (the month/week/day/agenda windows are all
@@ -2381,7 +2565,7 @@ pub fn step(c: &CalendarMain, by: i64) {
 /// Re-anchors every view on today (Month shows today's month, Week this week,
 /// Day today, etc.).
 pub fn go_today(c: &CalendarMain) {
-    set_anchor(c, chrono::Utc::now().date_naive());
+    set_anchor(c, today());
 }
 
 fn refresh(c: &CalendarMain) {
@@ -2412,7 +2596,11 @@ fn header_text(c: &CalendarMain) -> String {
     match active_view(c) {
         "day" => anchor.format("%A %d %B %Y").to_string(),
         "workweek" | "week" => {
-            let weekdays: &[chrono::Weekday] = if active_view(c) == "workweek" { &c.workweek.weekdays } else { &c.week.weekdays };
+            let weekdays = if active_view(c) == "workweek" {
+                c.workweek.weekdays.borrow().clone()
+            } else {
+                c.week.weekdays.borrow().clone()
+            };
             let start = week_start(anchor, weekdays[0]);
             let end = start + chrono::Duration::days(weekdays.len() as i64 - 1);
             if start.year() == end.year() {
@@ -2441,7 +2629,7 @@ fn event_label(occ: &EventOccurrence, colors: &HashMap<CalendarId, String>) -> g
     let text = if occ.all_day {
         occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
     } else {
-        let time = format_event_time(&occ.start.with_timezone(&chrono::Local));
+        let time = format_event_time(&local_span(occ).0);
         format!("{time} {}", occ.summary.as_deref().unwrap_or("(untitled)"))
     };
     let label = gtk::Label::builder()
@@ -2470,9 +2658,9 @@ fn hour_gutter_text(h: usize) -> String {
     format!("{}{}", hour_12(h), meridiem(h))
 }
 
-/// Local time as a compact 12-hour timestamp with minutes: `9:30am`,
-/// `5:00pm`.
-fn format_event_time(local: &chrono::DateTime<chrono::Local>) -> String {
+/// A display-zone wall-clock time as a compact 12-hour timestamp with
+/// minutes: `9:30am`, `5:00pm`.
+fn format_event_time(local: &NaiveDateTime) -> String {
     format!("{}:{:02}{}", hour_12(local.hour()), local.minute(), meridiem(local.hour()))
 }
 
@@ -2525,12 +2713,16 @@ pub struct MiniCalendar {
     event_days: Rc<RefCell<HashSet<NaiveDate>>>,
     on_day_selected: DaySelectedCallbacks,
     /// First day of the week (the `calendar-week-start` preference) for the
-    /// grid's column order and its 6-week window.
-    week_start: chrono::Weekday,
+    /// grid's column order and its 6-week window. Shared with the button
+    /// closures so [`set_mini_week_start`] applies a change live (item 3.1).
+    week_start: Rc<Cell<chrono::Weekday>>,
+    /// The weekday header labels, relabelled on a week-start change.
+    weekday_labels: Vec<gtk::Label>,
 }
 
 pub fn build_mini(week_start: chrono::Weekday) -> MiniCalendar {
-    let anchor_month = Rc::new(RefCell::new(first_of_month(chrono::Utc::now().date_naive())));
+    let week_start = Rc::new(Cell::new(week_start));
+    let anchor_month = Rc::new(RefCell::new(first_of_month(today())));
     let event_days = Rc::new(RefCell::new(HashSet::new()));
     let on_day_selected: DaySelectedCallbacks = Rc::new(RefCell::new(Vec::new()));
 
@@ -2544,9 +2736,11 @@ pub fn build_mini(week_start: chrono::Weekday) -> MiniCalendar {
     header_row.append(&next_button);
 
     let grid = gtk::Grid::builder().row_homogeneous(true).column_homogeneous(true).build();
-    for (col, label) in ordered_weekday_labels(week_start).into_iter().enumerate() {
+    let mut weekday_labels = Vec::with_capacity(7);
+    for (col, label) in ordered_weekday_labels(week_start.get()).into_iter().enumerate() {
         let weekday_label = gtk::Label::builder().label(label).css_classes(["dim-label", "caption"]).build();
         grid.attach(&weekday_label, col as i32, 0, 1, 1);
+        weekday_labels.push(weekday_label);
     }
 
     let mut day_buttons = Vec::with_capacity(42);
@@ -2557,9 +2751,10 @@ pub fn build_mini(week_start: chrono::Weekday) -> MiniCalendar {
             {
                 let anchor_month = anchor_month.clone();
                 let on_day_selected = on_day_selected.clone();
+                let week_start = week_start.clone();
                 button.connect_clicked(move |_| {
                     let month = *anchor_month.borrow();
-                    let date = first_grid_day(month, week_start) + chrono::Duration::days(index);
+                    let date = first_grid_day(month, week_start.get()) + chrono::Duration::days(index);
                     for callback in on_day_selected.borrow().iter() {
                         callback(date);
                     }
@@ -2581,7 +2776,8 @@ pub fn build_mini(week_start: chrono::Weekday) -> MiniCalendar {
         anchor_month,
         event_days,
         on_day_selected,
-        week_start,
+        week_start: week_start.clone(),
+        weekday_labels,
     };
 
     {
@@ -2589,11 +2785,12 @@ pub fn build_mini(week_start: chrono::Weekday) -> MiniCalendar {
         let mini_header = mini.header_label.clone();
         let mini_buttons = mini.day_buttons.clone();
         let mini_days = mini.event_days.clone();
+        let week_start = week_start.clone();
         prev_button.connect_clicked(move |_| {
             let current = *mini_month.borrow();
             let event_days = mini_days.borrow();
             let new_month = current.checked_sub_months(chrono::Months::new(1)).unwrap_or(current);
-            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days, week_start);
+            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days, week_start.get());
         });
     }
     {
@@ -2601,25 +2798,38 @@ pub fn build_mini(week_start: chrono::Weekday) -> MiniCalendar {
         let mini_header = mini.header_label.clone();
         let mini_buttons = mini.day_buttons.clone();
         let mini_days = mini.event_days.clone();
+        let week_start = week_start.clone();
         next_button.connect_clicked(move |_| {
             let current = *mini_month.borrow();
             let event_days = mini_days.borrow();
             let new_month = current.checked_add_months(chrono::Months::new(1)).unwrap_or(current);
-            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days, week_start);
+            relabel_mini(&mini_month, &mini_header, &mini_buttons, new_month, &event_days, week_start.get());
         });
     }
 
     let initial_month = *mini.anchor_month.borrow();
     let initial_days = mini.event_days.borrow().clone();
-    relabel_mini(&mini.anchor_month, &mini.header_label, &mini.day_buttons, initial_month, &initial_days, week_start);
+    relabel_mini(&mini.anchor_month, &mini.header_label, &mini.day_buttons, initial_month, &initial_days, week_start.get());
     mini
+}
+
+/// Changes the mini grid's first weekday (item 3.1): relabels the weekday
+/// header and re-lays the displayed month.
+pub fn set_mini_week_start(mc: &MiniCalendar, week_start: chrono::Weekday) {
+    mc.week_start.set(week_start);
+    for (label, text) in mc.weekday_labels.iter().zip(ordered_weekday_labels(week_start)) {
+        label.set_label(text);
+    }
+    let month = *mc.anchor_month.borrow();
+    let event_days = mc.event_days.borrow().clone();
+    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, &event_days, week_start);
 }
 
 /// Re-points the mini grid at `month`'s month and records which local dates
 /// within it have events (`event_days`) so their day buttons render bold.
 pub fn set_mini_month(mc: &MiniCalendar, month: NaiveDate, event_days: &HashSet<NaiveDate>) {
     *mc.event_days.borrow_mut() = event_days.clone();
-    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days, mc.week_start);
+    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days, mc.week_start.get());
 }
 
 /// Updates which dates in the currently-displayed month have events, without
@@ -2628,7 +2838,7 @@ pub fn set_mini_month(mc: &MiniCalendar, month: NaiveDate, event_days: &HashSet<
 pub fn set_mini_event_days(mc: &MiniCalendar, event_days: &HashSet<NaiveDate>) {
     *mc.event_days.borrow_mut() = event_days.clone();
     let month = *mc.anchor_month.borrow();
-    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days, mc.week_start);
+    relabel_mini(&mc.anchor_month, &mc.header_label, &mc.day_buttons, month, event_days, mc.week_start.get());
 }
 
 /// The first-of-month date the mini grid is currently showing (see
@@ -2649,7 +2859,7 @@ fn relabel_mini(
     *anchor_month.borrow_mut() = month;
     header_label.set_label(&month.format("%B %Y").to_string());
 
-    let today = chrono::Utc::now().date_naive();
+    let today = today();
     let grid_start = first_grid_day(month, week_start);
     for (i, button) in day_buttons.iter().enumerate() {
         let date = grid_start + chrono::Duration::days(i as i64);
@@ -2924,6 +3134,61 @@ fn first_grid_day(month: NaiveDate, week_start: chrono::Weekday) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The second-zone gutter (CAL-10) labels each primary hour row with the
+    /// same instant elsewhere, on the first shown date: whole-hour offsets in
+    /// the compact style, half-hour ones with minutes, and DST on either side
+    /// respected for that date.
+    #[test]
+    fn secondary_gutter_labels_convert_each_hour_row() {
+        use crate::calendar_tz::DisplayZone;
+        let sydney = DisplayZone::Named(chrono_tz::Australia::Sydney);
+        // 12 Oct 2026: Sydney is on AEDT (+11), so 9am there is 22:00 UTC the
+        // day before.
+        let day = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        assert_eq!(secondary_gutter_label(9, day, sydney, chrono_tz::UTC), "10pm");
+        // ...and 3:30am in Kolkata (+5:30).
+        assert_eq!(secondary_gutter_label(9, day, sydney, chrono_tz::Asia::Kolkata), "3:30am");
+        // In July Sydney is on AEST (+10): 9am is 23:00 UTC.
+        let winter = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        assert_eq!(secondary_gutter_label(9, winter, sydney, chrono_tz::UTC), "11pm");
+    }
+
+    /// The business-hours band only goes on work-day columns.
+    #[test]
+    fn business_band_covers_only_work_days() {
+        let week = test_week(); // Sun 2 Aug .. Sat 8 Aug 2026
+        let weekdays = crate::settings::CalendarPreferences::default().work_days;
+        assert_eq!(business_columns(&week, &weekdays), vec![1, 2, 3, 4, 5]);
+        assert_eq!(business_columns(&week[..1], &weekdays), Vec::<usize>::new(), "a Sunday Day view gets no band");
+        assert_eq!(business_columns(&week, &[chrono::Weekday::Sun]), vec![0]);
+    }
+
+    /// Live preference changes (item 3.1): a Work week change rebuilds the
+    /// column headers to the new count, and a week-start change relabels the
+    /// mini month's weekday row.
+    #[test]
+    fn grids_apply_week_preferences_live() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        use chrono::Weekday::*;
+        let grid = build_time_grid(&[Mon, Tue, Wed, Thu, Fri], false);
+        assert_eq!(grid.headers.borrow().len(), 5);
+        grid.set_weekdays(&[Sun, Mon, Tue, Wed]);
+        assert_eq!(grid.headers.borrow().len(), 4);
+        assert_eq!(*grid.weekdays.borrow(), vec![Sun, Mon, Tue, Wed]);
+        grid.set_zones(Some(chrono_tz::UTC));
+        assert_eq!(grid.data.gutter.get(), 2.0 * HOUR_GUTTER_WIDTH);
+        grid.set_zones(None);
+        assert_eq!(grid.data.gutter.get(), HOUR_GUTTER_WIDTH);
+
+        let mini = build_mini(Sun);
+        assert_eq!(mini.weekday_labels[0].label(), weekday_short(Sun));
+        set_mini_week_start(&mini, Mon);
+        assert_eq!(mini.weekday_labels[0].label(), weekday_short(Mon));
+        assert_eq!(mini.weekday_labels[6].label(), weekday_short(Sun));
+    }
     use chrono::NaiveDateTime;
     use lookout_core::EventUid;
 
@@ -3005,11 +3270,7 @@ mod tests {
 
     #[test]
     fn event_times_are_compact_12_hour_with_minutes() {
-        use chrono::TimeZone;
-        let at = |hour: u32, minute: u32| {
-            let naive = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap().and_hms_opt(hour, minute, 0).unwrap();
-            chrono::Local.from_local_datetime(&naive).single().unwrap()
-        };
+        let at = |hour: u32, minute: u32| NaiveDate::from_ymd_opt(2026, 8, 6).unwrap().and_hms_opt(hour, minute, 0).unwrap();
         assert_eq!(format_event_time(&at(9, 30)), "9:30am");
         assert_eq!(format_event_time(&at(17, 0)), "5:00pm");
         assert_eq!(format_event_time(&at(0, 5)), "12:05am");
@@ -3022,19 +3283,20 @@ mod tests {
         (0..7).map(|i| NaiveDate::from_ymd_opt(2026, 8, 2).unwrap() + chrono::Duration::days(i as i64)).collect()
     }
 
-    /// Builds an occurrence whose start/end land on the given naive local
-    /// times regardless of the test host's timezone (they round-trip through
-    /// Local on the way in and out of [`compute_time_grid_chips`]).
+    /// Builds an occurrence whose start/end land on the given naive times in
+    /// the display zone regardless of the test host's timezone - timed spans
+    /// round-trip through the (system) display zone on the way in and out of
+    /// [`compute_time_grid_chips`], all-day spans are UTC-midnight dates.
     fn occ(summary: &str, start: NaiveDateTime, end: NaiveDateTime, all_day: bool) -> EventOccurrence {
-        use chrono::TimeZone;
+        let zone = crate::calendar_tz::display_zone();
         EventOccurrence {
             uid: EventUid(summary.to_string()),
             calendar_id: CalendarId("test".to_string()),
             summary: Some(summary.to_string()),
             description: None,
             location: None,
-            start: chrono::Local.from_local_datetime(&start).single().unwrap().with_timezone(&chrono::Utc),
-            end: chrono::Local.from_local_datetime(&end).single().unwrap().with_timezone(&chrono::Utc),
+            start: zone.occurrence_from_local(start, all_day),
+            end: zone.occurrence_from_local(end, all_day),
             all_day,
             rrule: None,
             recurrence_id: None,
@@ -3159,8 +3421,8 @@ mod tests {
         assert_eq!(range, (5, 8));
         for col in range.0..range.1 {
             let covered = first + chrono::Duration::days(col as i64);
-            assert!(occ.start.with_timezone(&chrono::Local).date_naive() <= covered);
-            assert!(covered < occ.end.with_timezone(&chrono::Local).date_naive());
+            assert!(local_span(&occ).0.date() <= covered);
+            assert!(covered < local_span(&occ).1.date());
         }
     }
 
@@ -3295,21 +3557,21 @@ mod tests {
         // geometry computed here matches what `hovered_chip` derives.
         let canvas_width = 100.0 * 7.0 + HOUR_GUTTER_WIDTH;
 
-        let (bx, by, bw, bh) = chip_geometry(band_chip, 100.0);
+        let (bx, by, bw, bh) = chip_geometry(HOUR_GUTTER_WIDTH, band_chip, 100.0);
         let band_centre = (bx + bw / 2.0, by + bh / 2.0);
         assert_eq!(
-            hovered_chip(&chips, canvas_width, 7, band_centre.0, band_centre.1, true).map(|i| chips[i].all_day),
+            hovered_chip(HOUR_GUTTER_WIDTH, &chips, canvas_width, 7, band_centre.0, band_centre.1, true).map(|i| chips[i].all_day),
             Some(true)
         );
-        assert!(hovered_chip(&chips, canvas_width, 7, band_centre.0, band_centre.1, false).is_none());
+        assert!(hovered_chip(HOUR_GUTTER_WIDTH, &chips, canvas_width, 7, band_centre.0, band_centre.1, false).is_none());
 
-        let (tx, ty, tw, th) = chip_geometry(timed_chip, 100.0);
+        let (tx, ty, tw, th) = chip_geometry(HOUR_GUTTER_WIDTH, timed_chip, 100.0);
         let timed_centre = (tx + tw / 2.0, ty + th / 2.0);
         assert_eq!(
-            hovered_chip(&chips, canvas_width, 7, timed_centre.0, timed_centre.1, false).map(|i| chips[i].all_day),
+            hovered_chip(HOUR_GUTTER_WIDTH, &chips, canvas_width, 7, timed_centre.0, timed_centre.1, false).map(|i| chips[i].all_day),
             Some(false)
         );
-        assert!(hovered_chip(&chips, canvas_width, 7, timed_centre.0, timed_centre.1, true).is_none());
+        assert!(hovered_chip(HOUR_GUTTER_WIDTH, &chips, canvas_width, 7, timed_centre.0, timed_centre.1, true).is_none());
     }
 
     #[test]
@@ -3515,20 +3777,20 @@ mod tests {
     #[test]
     fn slot_from_point_ignores_the_hour_gutter() {
         // Any y inside the gutter column maps to no slot at all.
-        assert!(slot_from_point(HOUR_GUTTER_WIDTH - 1.0, 300.0, 752.0, 7).is_none());
-        assert!(slot_from_point(0.0, 0.0, 752.0, 7).is_none());
+        assert!(slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH - 1.0, 300.0, 752.0, 7).is_none());
+        assert!(slot_from_point(HOUR_GUTTER_WIDTH, 0.0, 0.0, 752.0, 7).is_none());
     }
 
     #[test]
     fn slot_from_point_maps_columns_across_the_canvas() {
         // 700px of columns over 7 days = 100px per column; column 0 starts at
         // the gutter edge, column 4 at x = 52 + 4*100.
-        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH + 1.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
+        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH + 1.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
         assert_eq!(col, 0);
-        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH + 100.0 * 4.0 + 50.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
+        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH + 100.0 * 4.0 + 50.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
         assert_eq!(col, 4);
         // A click past the last column's midpoint still lands in the last one.
-        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH + 700.0 - 1.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
+        let (col, _) = slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH + 700.0 - 1.0, 0.0, HOUR_GUTTER_WIDTH + 700.0, 7).unwrap();
         assert_eq!(col, 6);
     }
 
@@ -3537,15 +3799,15 @@ mod tests {
         // 48px/hour means 0.8px per minute: 9:12am is 552 minutes in, snapped
         // to the nearest half hour → 9:00 (9:30 is further).
         let y_912 = (9 * 60 + 12) as f64 * TIME_SLOT_HEIGHT / 60.0;
-        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, y_912, 752.0, 7).unwrap();
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH + 10.0, y_912, 752.0, 7).unwrap();
         assert_eq!(minutes, 9 * 60);
         // 9:18am snaps up to 9:30.
         let y_918 = (9 * 60 + 18) as f64 * TIME_SLOT_HEIGHT / 60.0;
-        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, y_918, 752.0, 7).unwrap();
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH + 10.0, y_918, 752.0, 7).unwrap();
         assert_eq!(minutes, 9 * 60 + 30);
         // 9:00am on the dot snaps to itself.
         let y_9am = 9.0 * TIME_SLOT_HEIGHT;
-        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, y_9am, 752.0, 7).unwrap();
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH + 10.0, y_9am, 752.0, 7).unwrap();
         assert_eq!(minutes, 9 * 60);
     }
 
@@ -3554,9 +3816,9 @@ mod tests {
         // The bottom edge is minute 1440 of the day; the final 30 minutes are
         // never offered as a start so the one-hour default span stays inside
         // the day.
-        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, 24.0 * TIME_SLOT_HEIGHT, 752.0, 7).unwrap();
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH + 10.0, 24.0 * TIME_SLOT_HEIGHT, 752.0, 7).unwrap();
         assert_eq!(minutes, 1440 - 30);
-        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH + 10.0, 23.9 * TIME_SLOT_HEIGHT, 752.0, 7).unwrap();
+        let (_, minutes) = slot_from_point(HOUR_GUTTER_WIDTH, HOUR_GUTTER_WIDTH + 10.0, 23.9 * TIME_SLOT_HEIGHT, 752.0, 7).unwrap();
         assert_eq!(minutes, 1440 - 30);
     }
 

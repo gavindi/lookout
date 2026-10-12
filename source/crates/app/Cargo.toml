@@ -20,6 +20,11 @@ lookout-graph.workspace = true
 async-channel.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+# IANA zone database for the calendar's display and second time zones (item
+# 3.1); same version `lookout-dav` resolves TZIDs with.
+chrono-tz = "0.10"
+# The system zone's IANA name, for the calendar's zone labels and picker.
+iana-time-zone = "0.1"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "io-util"] }

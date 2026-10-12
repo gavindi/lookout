@@ -454,7 +454,7 @@ fn upcoming_events(ctx: &ToolContext, args: &serde_json::Value) -> Result<serde_
         .and_then(|days| days.as_i64())
         .unwrap_or(DEFAULT_EVENT_HORIZON_DAYS)
         .clamp(1, MAX_EVENT_HORIZON_DAYS);
-    let now = chrono::Local::now();
+    let now = crate::calendar_tz::display_zone().now();
     let horizon = chrono::Duration::days(days);
     let occurrences = crate::lookout_view::upcoming_occurrences(ctx.occurrences.iter(), now, horizon, &ctx.checked_calendars, limit);
     Ok(serialize_events(&occurrences))

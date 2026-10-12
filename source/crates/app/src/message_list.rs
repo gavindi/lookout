@@ -281,9 +281,25 @@ pub enum DateBucket {
     Year(i32),
 }
 
-/// The Monday on or before `date`.
-fn week_start(date: NaiveDate) -> NaiveDate {
-    let offset = date.weekday().num_days_from_monday() as i64;
+/// The first day of the week the "This week"/"Last week" groups use, as
+/// days from Monday - the Calendar's "Week starts on" preference (item 3.1,
+/// as Outlook's date grouping follows it). Set by `set_week_start`; Monday
+/// until then.
+static WEEK_START: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets the first day of the week for the date groups. The caller re-lays
+/// the list afterwards.
+pub fn set_week_start(day: chrono::Weekday) {
+    WEEK_START.store(day.num_days_from_monday() as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn current_week_start() -> chrono::Weekday {
+    chrono::Weekday::try_from(WEEK_START.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(chrono::Weekday::Mon)
+}
+
+/// The `first` weekday on or before `date`.
+fn week_start(date: NaiveDate, first: chrono::Weekday) -> NaiveDate {
+    let offset = (date.weekday().num_days_from_monday() as i64 - first.num_days_from_monday() as i64).rem_euclid(7);
     date - chrono::Duration::days(offset)
 }
 
@@ -304,6 +320,11 @@ fn previous_month(date: NaiveDate) -> (i32, u32) {
 /// puts the 1st of the current month in `ThisWeek` (where a reader looking
 /// for a two-day-old mail expects it) rather than in `ThisMonth`.
 pub fn bucket_for(date: DateTime<Utc>, now: DateTime<Local>) -> DateBucket {
+    bucket_for_week(date, now, current_week_start())
+}
+
+/// [`bucket_for`] with the week starting on `first`.
+fn bucket_for_week(date: DateTime<Utc>, now: DateTime<Local>, first: chrono::Weekday) -> DateBucket {
     let d = date.with_timezone(&Local).date_naive();
     let today = now.date_naive();
 
@@ -316,7 +337,7 @@ pub fn bucket_for(date: DateTime<Utc>, now: DateTime<Local>) -> DateBucket {
     if d == today - chrono::Duration::days(1) {
         return DateBucket::Yesterday;
     }
-    let this_week = week_start(today);
+    let this_week = week_start(today, first);
     if d >= this_week {
         return DateBucket::ThisWeek;
     }
@@ -2661,6 +2682,21 @@ mod tests {
         assert_eq!(bucket_for(utc_on(now, 2026, 8, 17), now), DateBucket::ThisWeek);
         assert_eq!(bucket_for(utc_on(now, 2026, 8, 10), now), DateBucket::LastWeek);
         assert_eq!(bucket_for(utc_on(now, 2026, 8, 3), now), DateBucket::ThisMonth);
+    }
+
+    /// With Sunday as the first day of the week (the Calendar preference),
+    /// Sunday 2 Aug is *this* week from Tuesday 4 Aug, and Saturday 1 Aug
+    /// last week.
+    #[test]
+    fn week_groups_follow_the_configured_week_start() {
+        let now = local(2026, 8, 4, 8);
+        assert_eq!(bucket_for_week(utc_on(now, 2026, 8, 2), now, chrono::Weekday::Sun), DateBucket::ThisWeek);
+        assert_eq!(bucket_for_week(utc_on(now, 2026, 8, 1), now, chrono::Weekday::Sun), DateBucket::LastWeek);
+        assert_eq!(bucket_for_week(utc_on(now, 2026, 8, 2), now, chrono::Weekday::Mon), DateBucket::LastWeek);
+        assert_eq!(
+            week_start(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(), chrono::Weekday::Sat),
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
+        );
     }
 
     #[test]

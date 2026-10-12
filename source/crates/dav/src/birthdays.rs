@@ -19,7 +19,7 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, NaiveTime, Utc};
 use lookout_core::{AccountId, CalendarId, EventOccurrence, EventUid, VCard};
 
 /// Builds the birthday occurrences for one calendar month from every contact
@@ -56,7 +56,7 @@ pub fn birthday_occurrences(account_id: &AccountId, calendar_id: &CalendarId, co
             } else {
                 format!("{name}'s birthday")
             };
-            let start = local_midnight_utc(date);
+            let start = all_day_utc(date);
             occurrences.push(EventOccurrence {
                 uid: EventUid(format!(
                     "birthday:{}:{}",
@@ -112,13 +112,12 @@ fn is_leap_year(year: i32) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
-/// A day anchored at local midnight, expressed in UTC - the same shape the
-/// iCalendar pipeline stores all-day events in, so every view that converts
-/// back to local time places the occurrence on the intended day regardless of
-/// the user's zone.
-fn local_midnight_utc(date: NaiveDate) -> chrono::DateTime<Utc> {
-    let local = date.and_time(NaiveTime::MIN);
-    Local.from_local_datetime(&local).earliest().unwrap_or_else(|| Local.from_utc_datetime(&local)).into()
+/// A day as an all-day boundary: UTC midnight of `date` - exactly the shape
+/// the iCalendar parser stores `VALUE=DATE` events in, which the app reads
+/// back as a date without any zone conversion (so a birthday never moves to
+/// another day in a zone west or east of UTC).
+fn all_day_utc(date: NaiveDate) -> chrono::DateTime<Utc> {
+    date.and_time(NaiveTime::MIN).and_utc()
 }
 
 /// The contact's best display name: `FN` when present, else the structured
@@ -214,7 +213,7 @@ mod tests {
         let occ = &may[0];
         assert_eq!(occ.summary.as_deref(), Some("Alice's 36th birthday"));
         assert!(occ.all_day);
-        assert_eq!(occ.start.with_timezone(&Local).date_naive(), NaiveDate::from_ymd_opt(2026, 5, 23).unwrap());
+        assert_eq!(occ.start.date_naive(), NaiveDate::from_ymd_opt(2026, 5, 23).unwrap());
         assert_eq!(occ.end - occ.start, chrono::Duration::days(1));
         assert_eq!(occ.rrule.as_deref(), Some("FREQ=YEARLY"));
         assert_eq!(occ.reminder_minutes_before, Some(0));
@@ -246,7 +245,7 @@ mod tests {
             );
             assert_eq!(occurrences.len(), 1, "{year}");
             assert_eq!(occurrences[0].summary.as_deref(), Some("Mystery's birthday"));
-            assert_eq!(occurrences[0].start.with_timezone(&Local).date_naive(), NaiveDate::from_ymd_opt(year, 7, 4).unwrap());
+            assert_eq!(occurrences[0].start.date_naive(), NaiveDate::from_ymd_opt(year, 7, 4).unwrap());
         }
     }
 
@@ -259,25 +258,21 @@ mod tests {
             &contacts,
             NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
         );
-        assert_eq!(leap[0].start.with_timezone(&Local).date_naive(), NaiveDate::from_ymd_opt(2024, 2, 29).unwrap());
+        assert_eq!(leap[0].start.date_naive(), NaiveDate::from_ymd_opt(2024, 2, 29).unwrap());
         let plain = birthday_occurrences(
             &AccountId("a1".into()),
             &CalendarId("birthdays".into()),
             &contacts,
             NaiveDate::from_ymd_opt(2023, 2, 1).unwrap(),
         );
-        assert_eq!(plain[0].start.with_timezone(&Local).date_naive(), NaiveDate::from_ymd_opt(2023, 2, 28).unwrap());
+        assert_eq!(plain[0].start.date_naive(), NaiveDate::from_ymd_opt(2023, 2, 28).unwrap());
         let century = birthday_occurrences(
             &AccountId("a1".into()),
             &CalendarId("birthdays".into()),
             &contacts,
             NaiveDate::from_ymd_opt(2100, 2, 1).unwrap(),
         );
-        assert_eq!(
-            century[0].start.with_timezone(&Local).date_naive(),
-            NaiveDate::from_ymd_opt(2100, 2, 28).unwrap(),
-            "2100 is not a leap year"
-        );
+        assert_eq!(century[0].start.date_naive(), NaiveDate::from_ymd_opt(2100, 2, 28).unwrap(), "2100 is not a leap year");
     }
 
     #[test]

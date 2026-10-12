@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.168" date="2026-10-12">
+      <description>
+        <p>Calendar settings now apply straight away, with no restart: the first day of the week, your working days and working hours, and two new time-zone choices. Pick the time zone the calendar is shown in, and add a second time zone, which appears as an extra column of hours beside the Day and Week views. Both are chosen from searchable lists. New events start with your default reminder, and all-day events now save on the day you picked (they could land a day early in time zones ahead of UTC).</p>
+      </description>
+    </release>
     <release version="0.9.167" date="2026-10-12">
       <description>
         <p>Schedule send: the arrow beside Send offers Tomorrow morning, Tomorrow afternoon, Monday morning or a custom time. A scheduled message waits in Drafts, marked "Scheduled to send", until it goes out, and Cancel send takes it back for editing. A banner above the message list shows scheduled messages and any that are waiting or couldn't be sent, with Send now, Retry and Edit. Lookout must be running for a scheduled message to be sent.</p>

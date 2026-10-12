@@ -44,13 +44,13 @@ Counts are tallied from the §5 tables.
 |---|---|---|---|---|---|
 | Mail (5.1) | 15 | 15 | 14 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo). Missing Outlook's organising layer: rules, Focused Inbox, flags with dates, importance, Sweep, Quick Steps. No winmail.dat or `.msg`. |
 | Compose (5.2) | 7 | 5 | 10 | 1 | Good rich editor and identities, with undo send and schedule send. No emoji, or forwarding with attachments. |
-| Calendar (5.3) | 7 | 14 | 14 | 0 | Views and drag-to-edit are good. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No week-start, working-hours or time-zone settings. |
+| Calendar (5.3) | 10 | 14 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours and a second time zone apply live. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No per-event time zone yet. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 3 | 3 | 5 | 1 | VTODO and Google Tasks CRUD. No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **43** | **49** | **60** | **5** | ~27% at parity, ~32% partial |
+| **Total** | **46** | **49** | **57** | **5** | ~29% at parity, ~31% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -319,9 +319,9 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | CAL-05 | Show as: Free/Tentative/Busy/OOF/Working elsewhere | Busy/Free only (`EventTransparency`) | 🟡 | §4.3 |
 | CAL-06 | Private / sensitivity | `EventSensitivity` | ✅ | — |
 | CAL-07 | Categories with colours | Free-text field | 🟡 | Share the mail category master list (M-09) |
-| CAL-08 | Week start | Hard-coded Sunday | ❌ | Setting |
-| CAL-09 | Working hours and days | Hard-coded 08–18, Mon–Fri | ❌ | Setting |
-| CAL-10 | Second time zone in the grid | — | ❌ | |
+| CAL-08 | Week start | Settings → Calendar "Week starts on", applied live to the month grids, mini calendars, Week view, recurrence weekday order and the mail list's "This week / Last week" groups | ✅ | GTK date-picker popovers follow the locale's first weekday |
+| CAL-09 | Working hours and days | "Working days" (Work week view's columns) and "Working hours" (the business-hours band, drawn on work days only), applied live | ✅ | — |
+| CAL-10 | Second time zone in the grid | "Second time zone" picker adds an outer hour gutter to Day/Week/Work week, labelled with both zones; "Time zone" sets the zone the whole calendar is shown in (`app/src/calendar_tz.rs`) | ✅ | — |
 | CAL-11 | Per-event time zone | Reads TZIDs (`dav/src/tzmap.rs`); writes UTC only | 🟡 | TZ picker; emit `TZID` plus `VTIMEZONE` |
 | CAL-12 | Reminders | `app/src/reminders.rs` notifications (Open / Snooze 5 min / Dismiss) | 🟡 | Reminders window (Dismiss all, snooze choices), multiple alarms, default reminder setting |
 | CAL-13 | Recurrence | Full expansion (`dav/src/recurrence.rs`); builder in `app/src/recurrence.rs` limited to daily/weekly/monthly/yearly | 🟡 | "2nd Tuesday", "last weekday", "day 15", yearly by month/day |
@@ -517,7 +517,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 | UX-50 | Calendar Home ribbon | **New event ▾** · Day ▾ · Work week · Week · Month · Split view · Filter ▾ · Share ▾ · Print | New-event icon · Day · Work week · Week · Month · Split view ✅ · Filter/Share/Print **disabled** | Labels match. Make New event a split button (Event, Teams meeting). Enable Print (CAL-23 bug), Filter (categories, show as, recurring), Share (CAL-24) | S |
 | UX-51 | Date navigation | **Today** button and **‹ ›** arrows on the **left**, then the range title, which is a dropdown that opens a month picker | Range title on the left; Today and arrows on the **right** | Move Today/arrows left of the title; title becomes a picker. Ctrl+G Go to date (§4.7) | S |
 | UX-52 | Left pane | Mini month (optional week numbers) · Add calendar · My calendars (coloured checkbox per calendar; hover ⋯: Colour, Rename, Share, Remove) · other groups · Show all | Mini month · Add calendar · My calendars checklist ✅ | Coloured checkboxes in the calendar's colour; per-calendar ⋯ menu (CAL-32); user groups (CAL-33) | S |
-| UX-53 | Time grid | Working hours lighter ✅; **current-time line** (red line plus dot) across today; scrolls to around the current time ✅; 30-minute slots, single-click selects a slot, **drag selects a range** ✅ | Business-hours band and scroll-to-now (`calendar_view.rs` `scroll_time_grid_to_now`) ✅; no current-time line found in the paint code (**verify**) | Add the now-line. Week numbers and second time zone in the gutter (CAL-10) | S |
+| UX-53 | Time grid | Working hours lighter ✅; **current-time line** (red line plus dot) across today; scrolls to around the current time ✅; 30-minute slots, single-click selects a slot, **drag selects a range** ✅ | Business-hours band on work days, scroll-to-now (`calendar_view.rs` `scroll_time_grid_to_now`) and a second time-zone gutter (CAL-10) ✅; no current-time line found in the paint code (**verify**) | Add the now-line. Week numbers in the gutter | S |
 | UX-54 | Calendar View ribbon | Time scale (5/6/10/15/30/60 min) · Colour (calendar vs category) · Show week numbers · Split view orientation · Weather · Overlay vs side-by-side | View tab disabled | Add a View tab with these toggles (CAL-04) | M |
 | UX-55 | Quick create | Single-click or drag on empty time → **quick-create popover** (title, time, all-day, invite attendees, location, Teams toggle, Save, **More options** → full form). Double-click → full form | Activating a slot opens the full editor | Quick-create popover as the default; full editor via More options / double-click | M |
 | UX-56 | Event peek | **Single-click an event → peek card** (title, time, recurrence, location, Join button, organizer, RSVP buttons for invites, Edit, Delete, ⋯). Double-click → full form | Click opens the full editor (`open_event_editor_for` from `connect_event_activated`) | Peek popover on click; editor on double-click / Edit | M |
@@ -648,7 +648,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
-| 3.1 | Apply calendar preferences | CAL-08, CAL-09, CAL-10 | 0.6 everywhere: grid start day, business-hours band, work-week days, second TZ gutter | M |
+| 3.1 | ✅ ~~Apply calendar preferences~~ | CAL-08, CAL-09, CAL-10 | 0.6 everywhere: grid start day, business-hours band, work-week days, second TZ gutter | M |
 | 3.2 | Per-event time zone | CAL-11 | TZ dropdown in `event_editor.rs`; `build_vevent` emits `TZID` plus `VTIMEZONE` (IANA); keep reading Windows names | M |
 | 3.3 | Full show-as | CAL-05 | Dropdown Free/Working elsewhere/Tentative/Busy/Away; §4.3 CDO properties; hatched/striped rendering per state as Outlook does | S |
 | 3.4 | Organizer invitations | CAL-14 | Detect RFC 6638 server scheduling (`schedule-outbox-URL`, `SCHEDULE-AGENT`); else on save send iMIP REQUEST to attendees (`build_imip_vcalendar` plus `SendMessage`); "Send update" on change (`SEQUENCE++`); CANCEL on delete; "Send / Don't send" prompt as Outlook does | L |

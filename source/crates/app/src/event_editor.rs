@@ -84,6 +84,10 @@ pub struct EventEditorPrefill<'a> {
     /// calendar can't be written to (the source differs: feeds vs.
     /// synthesized birthdays). Ignored when not read-only.
     pub read_only_note: &'a str,
+    /// The Calendar preferences (item 3.1): the preview's week start, work
+    /// hours and second time zone, the recurrence weekday order, and the
+    /// default reminder for a new event.
+    pub calendar_prefs: &'a crate::settings::CalendarPreferences,
 }
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
@@ -181,13 +185,10 @@ pub fn show_event_editor(
         .map(|occ| {
             if occ.recurrence_id.is_none() {
                 if let (Some(master_start), Some(master_end)) = (occ.master_start, occ.master_end) {
-                    return (
-                        master_start.with_timezone(&chrono::Local).naive_local(),
-                        master_end.with_timezone(&chrono::Local).naive_local(),
-                    );
+                    return crate::calendar_tz::occurrence_span(crate::calendar_tz::display_zone(), master_start, master_end, occ.all_day);
                 }
             }
-            (occ.start.with_timezone(&chrono::Local).naive_local(), occ.end.with_timezone(&chrono::Local).naive_local())
+            crate::calendar_tz::occurrence_span(crate::calendar_tz::display_zone(), occ.start, occ.end, occ.all_day)
         })
         .or_else(|| {
             prefill
@@ -348,8 +349,9 @@ pub fn show_event_editor(
     // --- Right-hand preview: a mini month calendar above a single-day
     // schedule strip, reusing the widgets the main Calendar tab already
     // builds for itself (`calendar_view::build_mini`/`build_time_grid`).
-    let preview_mini = crate::calendar_view::build_mini(chrono::Weekday::Sun);
-    let preview_day_strip = Rc::new(crate::calendar_view::build_time_grid(&[chrono::Weekday::Mon], true));
+    let preview_mini = crate::calendar_view::build_mini(prefill.calendar_prefs.week_start);
+    let preview_day_strip = Rc::new(crate::calendar_view::build_time_grid(&[prefill.calendar_prefs.week_start], true));
+    crate::calendar_view::apply_time_grid_preferences(&preview_day_strip, prefill.calendar_prefs);
     let preview_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -383,7 +385,7 @@ pub fn show_event_editor(
     let save_button = gtk::Button::with_label(if has_existing { "Save" } else { "Add" });
     save_button.add_css_class("suggested-action");
 
-    let series = recurrence::build_series_control(existing.as_ref().and_then(|occ| occ.rrule.as_deref()));
+    let series = recurrence::build_series_control(existing.as_ref().and_then(|occ| occ.rrule.as_deref()), prefill.calendar_prefs.week_start);
     series.button.set_tooltip_text(Some("Series"));
 
     let busy_model = gtk::StringList::new(&["Busy", "Free"]);
@@ -403,22 +405,10 @@ pub fn show_event_editor(
         .popover(&categorize_popover)
         .build();
 
-    let reminder_choices: &[(&str, Option<i64>)] = &[
-        ("No reminder", None),
-        ("At time of event", Some(0)),
-        ("5 minutes before", Some(5)),
-        ("10 minutes before", Some(10)),
-        ("15 minutes before", Some(15)),
-        ("30 minutes before", Some(30)),
-        ("1 hour before", Some(60)),
-        ("1 day before", Some(1440)),
-    ];
+    let reminder_choices = crate::settings::REMINDER_CHOICES;
     let reminder_model = gtk::StringList::new(&reminder_choices.iter().map(|(label, _)| *label).collect::<Vec<_>>());
     let reminder_dropdown = gtk::DropDown::builder().model(&reminder_model).tooltip_text("Reminder").build();
-    let reminder_index = existing
-        .as_ref()
-        .and_then(|occ| reminder_choices.iter().position(|(_, minutes)| *minutes == occ.reminder_minutes_before))
-        .unwrap_or(0);
+    let reminder_index = initial_reminder_index(existing.as_ref().map(|occ| occ.reminder_minutes_before), prefill.calendar_prefs.default_reminder_minutes);
     reminder_dropdown.set_selected(reminder_index as u32);
 
     let sensitivity_model = gtk::StringList::new(&["Public", "Private", "Confidential"]);
@@ -518,7 +508,13 @@ pub fn show_event_editor(
             let model_end = if all_day { end_local_raw + chrono::Duration::days(1) } else { end_local_raw };
             let selected = calendar_dropdown.selected() as usize;
             let calendar_id = calendar_ids.get(selected).cloned().unwrap_or_else(|| CalendarId(String::new()));
-            let synthetic = synthetic_occurrence(calendar_id, &title_row.text(), local_to_utc(start_local), local_to_utc(model_end), all_day);
+            let synthetic = synthetic_occurrence(
+                calendar_id,
+                &title_row.text(),
+                boundary_to_utc(start_local, all_day),
+                boundary_to_utc(model_end, all_day),
+                all_day,
+            );
             let mut occs = occurrences_for_day(&month_occurrences, day, existing.as_ref());
             occs.push(synthetic);
             crate::calendar_view::set_mini_month(&preview_mini, day, &month_event_days);
@@ -863,10 +859,20 @@ fn synthetic_occurrence(calendar_id: CalendarId, title: &str, start: DateTime<Ut
     }
 }
 
+/// The reminder dropdown's starting choice: an edited event keeps its own
+/// reminder; a new one (`existing` = `None`) starts at the "Default
+/// reminder" preference (item 3.1). A lead time that isn't one of the
+/// [`crate::settings::REMINDER_CHOICES`] shows as "No reminder".
+fn initial_reminder_index(existing: Option<Option<i64>>, default: Option<i64>) -> usize {
+    let wanted = existing.unwrap_or(default);
+    crate::settings::REMINDER_CHOICES.iter().position(|(_, minutes)| *minutes == wanted).unwrap_or(0)
+}
+
 /// The default span for a fresh event: from the next whole hour to an hour
-/// later, both local naive times (23:xx rolls to 00:00 tomorrow).
+/// later, both naive times in the calendar's display zone (23:xx rolls to
+/// 00:00 tomorrow).
 fn default_event_times() -> (NaiveDateTime, NaiveDateTime) {
-    let now = chrono::Local::now().naive_local();
+    let now = crate::calendar_tz::display_zone().now();
     let start = if now.hour() == 23 {
         (now.date() + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap()
     } else {
@@ -884,16 +890,21 @@ fn date_time_from_form(date: &Rc<Cell<NaiveDate>>, hour: &gtk::SpinButton, minut
     date.get().and_hms_opt(h, m, 0).unwrap_or(date.get().and_hms_opt(0, 0, 0).unwrap())
 }
 
-/// Local naive datetime -> UTC, resolving DST gaps/ambiguities deterministically
-/// (a gap takes the pre-transition interpretation; an ambiguous time takes the
-/// earlier offset) rather than panicking.
+/// A naive time in the calendar's display zone (item 3.1) -> UTC, resolving
+/// DST gaps/ambiguities deterministically (see `calendar_tz::DisplayZone::
+/// resolve_local`) rather than panicking.
+#[cfg(test)]
 fn local_to_utc(naive: NaiveDateTime) -> DateTime<Utc> {
-    use chrono::TimeZone;
-    match chrono::Local.from_local_datetime(&naive) {
-        chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc),
-        chrono::LocalResult::Ambiguous(earlier, _later) => earlier.with_timezone(&Utc),
-        chrono::LocalResult::None => chrono::Local.from_utc_datetime(&naive).with_timezone(&Utc),
-    }
+    crate::calendar_tz::display_zone().resolve_local(naive)
+}
+
+/// One boundary of a form or dragged span -> its stored instant: an all-day
+/// boundary is UTC midnight of its date (the encoding the iCalendar parser
+/// produces and the writer's `VALUE=DATE` reads back), a timed one resolves
+/// in the display zone. Encoding all-day days as *local* midnight stored them
+/// a day early east of UTC.
+fn boundary_to_utc(naive: NaiveDateTime, all_day: bool) -> DateTime<Utc> {
+    crate::calendar_tz::display_zone().occurrence_from_local(naive, all_day)
 }
 
 /// Renders the editor's current form state as a self-contained HTML document
@@ -1109,6 +1120,17 @@ pub(crate) fn apply_edit_scope(event: &mut CalendarEvent, scope: usize, occurren
     }
 }
 
+/// The span a drag-reschedule drop hands [`calendar_event_from_occurrence`]:
+/// the dragged instants as display-zone naive times, with an all-day end
+/// turned from the model's exclusive day-after into the inclusive last day
+/// that function expects. Passing the exclusive end straight through
+/// lengthened an all-day event by a day on every drag.
+pub fn dragged_local_span(occ: &EventOccurrence, new_start: DateTime<Utc>, new_end: DateTime<Utc>) -> (NaiveDateTime, NaiveDateTime) {
+    let (start, end) = crate::calendar_tz::occurrence_span(crate::calendar_tz::display_zone(), new_start, new_end, occ.all_day);
+    let end = if occ.all_day { (end - chrono::Duration::days(1)).max(start) } else { end };
+    (start, end)
+}
+
 pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveDateTime, end_local: NaiveDateTime) -> CalendarEvent {
     let model_end = if occ.all_day { end_local + chrono::Duration::days(1) } else { end_local };
     CalendarEvent {
@@ -1117,8 +1139,8 @@ pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveD
         summary: occ.summary.clone(),
         description: occ.description.clone(),
         location: occ.location.clone(),
-        start: local_to_utc(start_local),
-        end: local_to_utc(model_end),
+        start: boundary_to_utc(start_local, occ.all_day),
+        end: boundary_to_utc(model_end, occ.all_day),
         all_day: occ.all_day,
         rrule: occ.rrule.clone(),
         recurrence_id: occ.recurrence_id,
@@ -1183,8 +1205,8 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         summary: (!summary.is_empty()).then(|| summary.to_string()),
         description: (!description.is_empty()).then(|| description.to_string()),
         location: (!location.is_empty()).then(|| location.to_string()),
-        start: local_to_utc(input.start_local),
-        end: local_to_utc(model_end),
+        start: boundary_to_utc(input.start_local, input.all_day),
+        end: boundary_to_utc(model_end, input.all_day),
         all_day: input.all_day,
         rrule: input.rrule,
         recurrence_id: input.recurrence_id,
@@ -1231,6 +1253,25 @@ mod tests {
             owner_email: None,
             existing_meta: None,
         }
+    }
+
+    /// An all-day event chosen for 13 Oct is written as `DTSTART;VALUE=DATE:
+    /// 20261013` whatever the machine's zone (run with `TZ=...` to vary it):
+    /// all-day spans are encoded as UTC midnight of their dates, the shape
+    /// the iCalendar parser produces, never as local midnight.
+    #[test]
+    fn all_day_event_is_written_as_its_chosen_date() {
+        let mut input = base_input();
+        input.all_day = true;
+        let day = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        input.start_local = day.and_hms_opt(0, 0, 0).unwrap();
+        input.end_local = day.and_hms_opt(0, 0, 0).unwrap();
+        let event = build_event_from_input(input).expect("valid all-day range");
+        assert_eq!(event.start, day.and_hms_opt(0, 0, 0).unwrap().and_utc());
+        assert_eq!(event.end, (day + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap().and_utc());
+        let ics = lookout_dav::build_vcalendar(&event);
+        assert!(ics.contains("DTSTART;VALUE=DATE:20261013"), "{ics}");
+        assert!(ics.contains("DTEND;VALUE=DATE:20261014"), "{ics}");
     }
 
     fn occ(uid: &str, day: NaiveDate, recurrence_id: Option<NaiveDateTime>) -> EventOccurrence {
@@ -1415,6 +1456,40 @@ mod tests {
         assert_eq!(event.end, local_to_utc(moved + chrono::Duration::hours(2)));
     }
 
+    /// A new event starts at the "Default reminder"; an edited one keeps its
+    /// own, even "No reminder".
+    #[test]
+    fn new_events_take_the_default_reminder() {
+        let index_of = |minutes: Option<i64>| crate::settings::REMINDER_CHOICES.iter().position(|(_, m)| *m == minutes).unwrap();
+        assert_eq!(initial_reminder_index(None, Some(15)), index_of(Some(15)));
+        assert_eq!(initial_reminder_index(None, None), index_of(None));
+        assert_eq!(initial_reminder_index(Some(None), Some(15)), index_of(None), "an edit keeps no reminder");
+        assert_eq!(initial_reminder_index(Some(Some(60)), Some(15)), index_of(Some(60)));
+        assert_eq!(initial_reminder_index(Some(Some(7)), None), 0, "an unoffered lead time shows as none");
+    }
+
+    /// Dragging a one-day all-day event two days later keeps it one day long
+    /// (it used to grow by a day per drag), and a timed drag keeps its times.
+    #[test]
+    fn dragging_an_all_day_event_keeps_its_length() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        let mut occ = occ("evt", day.date(), None);
+        occ.all_day = true;
+        occ.start = day.and_utc();
+        occ.end = (day + chrono::Duration::days(1)).and_utc();
+        let shift = chrono::Duration::days(2);
+        let (start, end) = dragged_local_span(&occ, occ.start + shift, occ.end + shift);
+        let event = calendar_event_from_occurrence(&occ, start, end);
+        assert_eq!(event.start, (day + shift).and_utc());
+        assert_eq!(event.end, (day + shift + chrono::Duration::days(1)).and_utc());
+
+        let timed = super::tests::occ("timed", day.date(), None);
+        let moved = timed.start + chrono::Duration::hours(3);
+        let (start, end) = dragged_local_span(&timed, moved, timed.end + chrono::Duration::hours(3));
+        let event = calendar_event_from_occurrence(&timed, start, end);
+        assert_eq!((event.start, event.end), (moved, timed.end + chrono::Duration::hours(3)));
+    }
+
     #[test]
     fn calendar_event_from_occurrence_applies_the_exclusive_end_convention_for_all_day() {
         let start = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(), chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
@@ -1424,8 +1499,8 @@ mod tests {
             summary: None,
             description: None,
             location: None,
-            start: local_to_utc(start),
-            end: local_to_utc(start + chrono::Duration::days(2)),
+            start: start.and_utc(),
+            end: (start + chrono::Duration::days(2)).and_utc(),
             all_day: true,
             rrule: None,
             recurrence_id: None,
@@ -1448,8 +1523,8 @@ mod tests {
         // The drag reports the last *day* (inclusive); the model stores the
         // day after.
         let event = calendar_event_from_occurrence(&occ, moved, moved + chrono::Duration::days(1));
-        assert_eq!(event.start, local_to_utc(moved));
-        assert_eq!(event.end, local_to_utc(moved + chrono::Duration::days(2)));
+        assert_eq!(event.start, moved.and_utc());
+        assert_eq!(event.end, (moved + chrono::Duration::days(2)).and_utc());
         assert!(event.all_day);
     }
 

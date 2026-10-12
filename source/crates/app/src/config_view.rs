@@ -321,9 +321,10 @@ pub struct ConfigView {
     /// "Working hours end" spin (Config → Calendar), local hour 1-24.
     pub calendar_work_end_row: adw::SpinRow,
     /// "Time zone" entry (Config → Calendar): an IANA name, empty = system.
-    pub calendar_primary_tz_row: adw::EntryRow,
-    /// "Second time zone" entry (Config → Calendar): an IANA name, empty = none.
-    pub calendar_secondary_tz_row: adw::EntryRow,
+    pub calendar_primary_tz_row: adw::ComboRow,
+    /// "Second time zone" picker (Config → Calendar): "None", then every
+    /// IANA zone (see [`time_zone_at`]).
+    pub calendar_secondary_tz_row: adw::ComboRow,
     /// "Default reminder" preset combo (Config → Calendar).
     pub calendar_default_reminder_row: adw::ComboRow,
     /// "OAuth client id" row (Config → Google Tasks), exposed so the caller
@@ -673,11 +674,11 @@ pub fn build() -> ConfigView {
     calendar_work_end_row.set_title("Working hours end");
     calendar_work_end_row.set_subtitle("Hour the working-hours band ends");
     calendar_settings_group.add(&calendar_work_end_row);
-    let calendar_primary_tz_row = adw::EntryRow::builder().title("Time zone").build();
+    let calendar_primary_tz_row = time_zone_row("Time zone", false);
     calendar_settings_group.add(&calendar_primary_tz_row);
-    let calendar_secondary_tz_row = adw::EntryRow::builder().title("Second time zone").build();
+    let calendar_secondary_tz_row = time_zone_row("Second time zone", true);
     calendar_settings_group.add(&calendar_secondary_tz_row);
-    let reminder_labels: Vec<&str> = crate::settings::DEFAULT_REMINDER_PRESETS.iter().map(|(label, _)| *label).collect();
+    let reminder_labels: Vec<&str> = crate::settings::REMINDER_CHOICES.iter().map(|(label, _)| *label).collect();
     let calendar_default_reminder_row = adw::ComboRow::builder()
         .title("Default reminder")
         .subtitle("Reminder applied to a new event")
@@ -1410,9 +1411,94 @@ pub fn refresh_google_tasks_client_row(row: &adw::ActionRow) {
     row.set_subtitle(&subtitle);
 }
 
+/// Every IANA zone name the time-zone pickers list, sorted (item 3.1).
+fn time_zone_names() -> &'static [&'static str] {
+    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names: Vec<&'static str> = chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
+        names.sort_unstable();
+        names
+    })
+}
+
+/// The stored value for a time-zone picker's `index`: "" for its first entry
+/// ("System time zone" / "None"), else the IANA name.
+pub fn time_zone_at(index: u32) -> String {
+    match index {
+        0 => String::new(),
+        i => time_zone_names().get(i as usize - 1).map(|name| name.to_string()).unwrap_or_default(),
+    }
+}
+
+/// The picker index showing a stored zone: its entry, or the first entry for
+/// a blank or unknown value (which then stores back as "" on the next change).
+pub fn time_zone_index(stored: &str) -> u32 {
+    let Some(tz) = crate::settings::parse_time_zone(stored) else { return 0 };
+    time_zone_names().iter().position(|name| *name == tz.name()).map_or(0, |i| i as u32 + 1)
+}
+
+/// The row subtitle for a picked zone: its current abbreviation and offset
+/// ("AEDT · UTC+11"), or what the first entry means.
+fn time_zone_subtitle(index: u32, secondary: bool) -> String {
+    let now = chrono::Utc::now();
+    let zone = match crate::settings::parse_time_zone(&time_zone_at(index)) {
+        Some(tz) => crate::calendar_tz::DisplayZone::Named(tz),
+        None if secondary => return "Show a second time zone beside the hours in the Day and Week views".to_string(),
+        None => crate::calendar_tz::DisplayZone::System,
+    };
+    let offset = crate::calendar_tz::offset_label(zone.offset_seconds(now));
+    let label = zone.label(now);
+    if label == offset {
+        offset
+    } else {
+        format!("{label} · {offset}")
+    }
+}
+
+/// A searchable time-zone picker row: "System time zone (<name>)" (primary)
+/// or "None" (second zone) first, then every IANA zone. Its subtitle follows
+/// the selection.
+fn time_zone_row(title: &str, secondary: bool) -> adw::ComboRow {
+    let first = if secondary {
+        "None".to_string()
+    } else {
+        match crate::calendar_tz::system_zone_name() {
+            Some(name) => format!("System time zone ({name})"),
+            None => "System time zone".to_string(),
+        }
+    };
+    let model = gtk::StringList::new(&[first.as_str()]);
+    for name in time_zone_names() {
+        model.append(name);
+    }
+    let row = adw::ComboRow::builder()
+        .title(title)
+        .model(&model)
+        .enable_search(true)
+        .expression(gtk::PropertyExpression::new(gtk::StringObject::static_type(), None::<gtk::Expression>, "string"))
+        .subtitle(time_zone_subtitle(0, secondary))
+        .build();
+    row.connect_selected_notify(move |row| row.set_subtitle(&time_zone_subtitle(row.selected(), secondary)));
+    row
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The time-zone pickers store "" for their first entry and the IANA
+    /// name otherwise, and a stored value maps back to its entry - an
+    /// unknown or blank one to the first.
+    #[test]
+    fn time_zone_picker_round_trips_stored_values() {
+        let index = time_zone_index("Asia/Kolkata");
+        assert!(index > 0);
+        assert_eq!(time_zone_at(index), "Asia/Kolkata");
+        assert_eq!(time_zone_index(""), 0);
+        assert_eq!(time_zone_index("Mars/Olympus_Mons"), 0);
+        assert_eq!(time_zone_at(0), "");
+        assert_eq!(time_zone_at(u32::MAX), "", "out of range reads as unset");
+    }
 
     fn card_section(content: &gtk::Widget) -> gtk::Box {
         let card = gtk::Box::builder()

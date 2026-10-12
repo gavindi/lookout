@@ -56,9 +56,10 @@ pub fn notification_id(occ: &EventOccurrence) -> String {
 #[derive(Debug, Clone)]
 pub struct DueAlert {
     pub occurrence: EventOccurrence,
-    /// The occurrence's start in local time, formatted into the
-    /// notification body ("Starts at HH:MM").
-    pub starts_local: chrono::DateTime<chrono::Local>,
+    /// The occurrence's start as wall-clock time in the calendar's display
+    /// zone (item 3.1), formatted into the notification body ("Starts at
+    /// HH:MM").
+    pub starts_local: chrono::NaiveDateTime,
 }
 
 /// The fire-once/alert bookkeeping for every known occurrence.
@@ -139,12 +140,16 @@ impl ReminderEngine {
         let mut due = Vec::new();
         for (key, (_, occ)) in &self.index {
             let Some(minutes) = occ.reminder_minutes_before else { continue };
-            let starts_local = occ.start.with_timezone(&chrono::Local);
-            let alert_at = starts_local - chrono::Duration::minutes(minutes);
+            // An all-day event starts at local midnight of its date (its
+            // stored start is that date's UTC midnight, see `calendar_tz`).
+            let zone = crate::calendar_tz::display_zone();
+            let starts_at = zone.occurrence_instant(occ.start, occ.all_day);
+            let starts_local = zone.occurrence_to_local(occ.start, occ.all_day);
+            let alert_at = starts_at - chrono::Duration::minutes(minutes);
             // The alert is due once its instant has passed but the event
             // hasn't started yet (a late catch-up after the event began is
-            // pointless). `start` is UTC, so `now` is compared on that side.
-            if alert_at > now || occ.start <= now.with_timezone(&Utc) {
+            // pointless). Both sides compare as UTC instants.
+            if alert_at > now.with_timezone(&Utc) || starts_at <= now.with_timezone(&Utc) {
                 continue;
             }
             // Persisted state wins over the calendar: a fired alert never
@@ -456,7 +461,7 @@ mod tests {
         let due = engine.tick(now + Duration::minutes(16));
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].occurrence.uid.0, "fires-once");
-        assert_eq!(due[0].starts_local, start.with_timezone(&chrono::Local));
+        assert_eq!(due[0].starts_local, start.naive_local());
         // Fired once means never again.
         assert!(engine.tick(now + Duration::minutes(25)).is_empty());
         // And the fire is persisted as a "fired" row with no deadline.

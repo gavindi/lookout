@@ -465,11 +465,9 @@ impl SettingsStore {
         let end = self.get_int(CALENDAR_WORK_END).clamp(1, 24) as u32;
         let (work_start, work_end) = if end > start { (start, end) } else { (8, 18) };
 
-        let time_zone = |key: &'static str| {
-            let value = self.get_string(key);
-            let value = value.trim().to_string();
-            (!value.is_empty()).then_some(value)
-        };
+        // A blank or unknown name (a stale or hand-edited dconf value) reads
+        // as unset: the system zone / no second zone.
+        let time_zone = |key: &'static str| parse_time_zone(&self.get_string(key));
         let default_reminder_minutes = match self.get_int(CALENDAR_DEFAULT_REMINDER) {
             minutes if minutes >= 0 => Some(i64::from(minutes)),
             _ => None,
@@ -500,10 +498,12 @@ pub struct CalendarPreferences {
     pub work_start: u32,
     /// Local hour the business-hours band ends, exclusive (1-24).
     pub work_end: u32,
-    /// The user's home time zone (IANA), if set.
-    pub primary_tz: Option<String>,
-    /// An optional second grid time zone (IANA).
-    pub secondary_tz: Option<String>,
+    /// The zone the calendar is shown in, if set; `None` = the system zone
+    /// (item 3.1).
+    pub primary_tz: Option<chrono_tz::Tz>,
+    /// An optional second time zone, shown as an extra hour gutter in the
+    /// Day/Week grids (item 3.1 / CAL-10).
+    pub secondary_tz: Option<chrono_tz::Tz>,
     /// Default reminder lead time for a new event, in minutes; `None` = none.
     pub default_reminder_minutes: Option<i64>,
 }
@@ -520,6 +520,12 @@ impl Default for CalendarPreferences {
             default_reminder_minutes: None,
         }
     }
+}
+
+/// A stored IANA zone name, or `None` when it's blank or unknown.
+pub fn parse_time_zone(value: &str) -> Option<chrono_tz::Tz> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.parse().ok()).flatten()
 }
 
 /// The `Weekday` for the stored `0=Sunday .. 6=Saturday` scheme, or `None` for
@@ -712,28 +718,32 @@ pub fn work_day_preset_at(index: u32) -> Vec<String> {
         .unwrap_or_else(|| WORK_DAY_PRESETS[0].1.iter().map(|day| day.to_string()).collect())
 }
 
-/// Config → Calendar → "Default reminder" presets: a label and the minutes
-/// before the event it stores (-1 = no reminder).
-pub const DEFAULT_REMINDER_PRESETS: &[(&str, i32)] = &[
-    ("No reminder", -1),
-    ("At time of event", 0),
-    ("5 minutes before", 5),
-    ("10 minutes before", 10),
-    ("15 minutes before", 15),
-    ("30 minutes before", 30),
-    ("1 hour before", 60),
-    ("1 day before", 1440),
+/// The reminder lead times offered everywhere a reminder is picked: the
+/// event editor's dropdown and Config → Calendar → "Default reminder"
+/// (one list, so every default maps onto an editor choice). `None` = no
+/// reminder.
+pub const REMINDER_CHOICES: &[(&str, Option<i64>)] = &[
+    ("No reminder", None),
+    ("At time of event", Some(0)),
+    ("5 minutes before", Some(5)),
+    ("10 minutes before", Some(10)),
+    ("15 minutes before", Some(15)),
+    ("30 minutes before", Some(30)),
+    ("1 hour before", Some(60)),
+    ("1 day before", Some(1440)),
 ];
 
-/// The preset index matching `minutes`, or the default ("No reminder") index.
+/// The [`REMINDER_CHOICES`] index for a stored `calendar-default-reminder`
+/// value (minutes, `-1` = none), or the "No reminder" index.
 pub fn default_reminder_index(minutes: i32) -> u32 {
-    DEFAULT_REMINDER_PRESETS.iter().position(|(_, preset)| *preset == minutes).unwrap_or(0) as u32
+    let wanted = (minutes >= 0).then_some(i64::from(minutes));
+    REMINDER_CHOICES.iter().position(|(_, preset)| *preset == wanted).unwrap_or(0) as u32
 }
 
-/// The stored minutes for a [`DEFAULT_REMINDER_PRESETS`] index; out-of-range
-/// indexes fall back to "No reminder".
+/// The stored minutes for a [`REMINDER_CHOICES`] index (`-1` = none); out-of-
+/// range indexes fall back to "No reminder".
 pub fn default_reminder_at(index: u32) -> i32 {
-    DEFAULT_REMINDER_PRESETS.get(index as usize).map(|(_, minutes)| *minutes).unwrap_or(-1)
+    REMINDER_CHOICES.get(index as usize).and_then(|(_, minutes)| *minutes).map_or(-1, |minutes| minutes as i32)
 }
 
 #[cfg(test)]
@@ -971,8 +981,12 @@ mod tests {
         assert_eq!(prefs.week_start, Weekday::Mon);
         assert_eq!(prefs.work_days, vec![Weekday::Mon, Weekday::Tue, Weekday::Sat], "dedup keeps the first occurrence");
         assert_eq!((prefs.work_start, prefs.work_end), (9, 17));
-        assert_eq!(prefs.primary_tz.as_deref(), Some("Europe/Berlin"));
+        assert_eq!(prefs.primary_tz, Some(chrono_tz::Europe::Berlin));
         assert_eq!(prefs.secondary_tz, None, "whitespace-only reads as unset");
+        store.set_string(CALENDAR_SECONDARY_TZ, "Mars/Olympus_Mons");
+        assert_eq!(store.calendar_preferences().secondary_tz, None, "an unknown zone reads as unset");
+        store.set_string(CALENDAR_SECONDARY_TZ, " Asia/Kolkata ");
+        assert_eq!(store.calendar_preferences().secondary_tz, Some(chrono_tz::Asia::Kolkata));
         assert_eq!(prefs.default_reminder_minutes, Some(15));
 
         // Out-of-range or inverted values fall back rather than producing a

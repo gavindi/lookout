@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use chrono::{DateTime, Duration, Local, NaiveDateTime};
+use chrono::{Duration, Local, NaiveDateTime};
 use gtk::prelude::*;
 use lookout_core::{CalendarId, CalendarTask, EmailAddress, EventOccurrence};
 use webkit::prelude::*;
@@ -69,10 +69,12 @@ pub fn outstanding_tasks(tasks: &[CalendarTask], now: NaiveDateTime, limit: usiz
 }
 
 /// The `limit` next occurrences at or after `now` (and within `horizon`),
-/// restricted to the checked calendars, sorted by start time.
+/// restricted to the checked calendars, sorted by start time. `now` and the
+/// starts are compared as wall-clock times in the calendar's display zone
+/// (item 3.1), where an all-day event starts at 00:00 of its date.
 pub fn upcoming_occurrences<'a>(
     occurrences: impl IntoIterator<Item = &'a EventOccurrence>,
-    now: DateTime<Local>,
+    now: NaiveDateTime,
     horizon: Duration,
     checked: &HashSet<CalendarId>,
     limit: usize,
@@ -82,7 +84,7 @@ pub fn upcoming_occurrences<'a>(
         .into_iter()
         .filter(|occ| checked.contains(&occ.calendar_id))
         .filter(|occ| {
-            let start = occ.start.with_timezone(&Local);
+            let start = crate::calendar_tz::display_zone().occurrence_to_local(occ.start, occ.all_day);
             start >= now && start <= horizon_end
         })
         .collect();
@@ -271,6 +273,7 @@ pub fn set_data(view: &LookoutView, data: &LookoutData) {
     let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _c| {}));
     let activate = view.activate.borrow().clone().unwrap_or_else(|| Rc::new(|_t| {}));
     let now_local = Local::now();
+    let calendar_now = crate::calendar_tz::display_zone().now();
 
     // --- People most contacted.
     clear_box(&view.contacts_list);
@@ -305,7 +308,7 @@ pub fn set_data(view: &LookoutView, data: &LookoutData) {
     clear_box(&view.events_list);
     let upcoming = upcoming_occurrences(
         data.events.iter(),
-        now_local,
+        calendar_now,
         Duration::days(EVENT_HORIZON_DAYS),
         &data.checked_calendar_ids,
         UPCOMING_EVENTS_LIMIT,
@@ -314,7 +317,7 @@ pub fn set_data(view: &LookoutView, data: &LookoutData) {
         append_empty(&view.events_list, "No upcoming events.");
     } else {
         for occ in upcoming {
-            view.events_list.append(&event_row(occ, &data.colors, now_local));
+            view.events_list.append(&event_row(occ, &data.colors, calendar_now));
         }
     }
 }
@@ -355,7 +358,7 @@ fn contact_row(address: &EmailAddress, count: i64) -> gtk::Box {
 
 /// One upcoming-event row: a calendar colour dot, the summary, and a
 /// right-aligned time caption ("All day", today's time, or day + time).
-fn event_row(occ: &EventOccurrence, colors: &CalendarColorMap, now: DateTime<Local>) -> gtk::Box {
+fn event_row(occ: &EventOccurrence, colors: &CalendarColorMap, now: NaiveDateTime) -> gtk::Box {
     let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(DEFAULT_CHECK_COLOR).to_string();
     let dot = gtk::DrawingArea::builder().width_request(10).height_request(10).valign(gtk::Align::Center).build();
     dot.set_draw_func(move |_, cr, width, height| {
@@ -374,10 +377,10 @@ fn event_row(occ: &EventOccurrence, colors: &CalendarColorMap, now: DateTime<Loc
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
 
-    let start = occ.start.with_timezone(&Local);
+    let start = crate::calendar_tz::display_zone().occurrence_to_local(occ.start, occ.all_day);
     let time_text = if occ.all_day {
         "All day".to_string()
-    } else if start.date_naive() == now.date_naive() {
+    } else if start.date() == now.date() {
         start.format("%H:%M").to_string()
     } else {
         start.format("%a %d %b · %H:%M").to_string()
@@ -1024,7 +1027,7 @@ mod tests {
 
     #[test]
     fn upcoming_occurrences_filters_checks_and_horizon_and_sorts() {
-        let now = Local.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+        let now = Local.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap().naive_local();
         let checked: HashSet<CalendarId> = [cal("test:cal")].into_iter().collect();
         let occurrences = [
             occ("hidden", 10, 15), // unchecked calendar

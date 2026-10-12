@@ -709,9 +709,18 @@ there's no standalone "agenda" stack entry), and `month` (default). Time-grid vi
 stacked `gtk::DrawingArea`s (all-day band + scrollable timed canvas) with custom cairo
 `set_draw_func` painting; overlapping same-day events are laid out via a greedy interval-
 partitioning `assign_lanes` algorithm. Data-in/widget-out: `set_anchor`/`set_occurrences` are the
-two inputs, both triggering a full `refresh`. Week start, the Work-week columns and the
-business-hours band come from `settings::CalendarPreferences` (item 0.6, passed to `build_main`);
-the time grids' default band is 8..18 when built outside the calendar panel.
+two inputs, both triggering a full `refresh`. Week start, the Work-week columns, the
+business-hours band (painted on work days only) and the second time-zone gutter come from
+`settings::CalendarPreferences` (item 0.6, passed to `build_main`); `apply_preferences` pushes a
+changed set into the built views and re-renders, so Settings changes apply live (item 3.1).
+
+**`calendar_tz.rs`** — the calendar's display time zone (item 3.1): every calendar surface (grids,
+agenda, mini calendars, My Day, the event editor, reminders, the dashboard) shows times via
+`calendar_tz::display_zone()` rather than `chrono::Local`, set process-wide from the "Time zone"
+preference (empty = the system zone). All-day occurrences are encoded as **UTC midnight of their
+dates** (the shape `dav/src/ical.rs` parses `VALUE=DATE` into, and `birthdays.rs` and the event
+editor now produce too) and are read back as dates with no zone conversion, so a zone change never
+moves them to another day.
 
 **`compose.rs`** — plain (`gtk::TextView`) and rich (contenteditable `webkit::WebView`,
 `hardware_acceleration_policy(Never)`) editors coexist, one live at a time; HTML mode sends
