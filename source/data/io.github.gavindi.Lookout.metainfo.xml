@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.171" date="2026-10-13">
+      <description>
+        <p>Right-clicking a message now opens a full menu, in the same order as Outlook: Reply, Reply all and Forward; Delete, Archive, Move and Copy; Mark as read or unread, Flag, Pin, Snooze and Categorize; Report junk; View message details or source; Open in new window and Print. Move and Copy list the folders you used recently, with "Other folder…" for the rest, and Copy can be undone like everything else. Right-click a conversation to act on the whole conversation, or press Shift+F10 or the Menu key. Categorize now works on several messages at once.</p>
+      </description>
+    </release>
     <release version="0.9.170" date="2026-10-13">
       <description>
         <p>Flag now works like Outlook's follow-up flag: flag a message for today, tomorrow, this week, next week, no date or a date you pick, then mark it complete when you're done. Flagged messages show their due date in the list (in red once overdue), can be sorted and filtered by flag, and show a "Follow up" bar with Mark complete. The Insert key flags or clears a message. Your flagged mail also appears in Tasks, so you can see what needs a reply alongside your to-dos. Pin is unchanged and still separate. On Microsoft 365 accounts set to sync with Outlook, flags carry over both ways. Creating a task from a message is now in the More menu.</p>

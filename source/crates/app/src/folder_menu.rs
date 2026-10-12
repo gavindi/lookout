@@ -392,6 +392,29 @@ pub fn present_move_dialog(parent: &gtk::Widget, mailbox: &Mailbox, folders: Vec
     if current_parent.is_some() {
         rows.push((None, "Top level".to_string(), 0));
     }
+    rows.extend(
+        folder_picker_rows(folders, &account_id, |folder| {
+            is_same_or_descendant(&folder.id, &mailbox.id, mailbox.delimiter)
+                || Some(&folder.id) == current_parent.as_ref()
+                || folder.flags.iter().any(|flag| flag.eq_ignore_ascii_case("NoInferiors"))
+        })
+        .into_iter()
+        .map(|(id, name, depth)| (Some(id), name, depth)),
+    );
+    present_folder_picker(
+        parent,
+        &format!("Move \u{201c}{}\u{201d}", display_name(&mailbox.name)),
+        "Choose the folder to move it into.",
+        "Move",
+        rows,
+        on_pick,
+    );
+}
+
+/// `account_id`'s folders in folder-pane order (tree order, depth-first),
+/// as `(id, display name, depth)` rows, less those `exclude` rules out (a
+/// subfolder of an excluded folder still shows).
+pub fn folder_picker_rows(folders: Vec<Mailbox>, account_id: &AccountId, exclude: impl Fn(&Mailbox) -> bool) -> Vec<(MailboxId, String, usize)> {
     fn walk(nodes: &[Rc<crate::folder_tree::FolderNode>], depth: usize, out: &mut Vec<(Mailbox, usize)>) {
         for node in nodes {
             out.push((node.mailbox.clone(), depth));
@@ -399,16 +422,19 @@ pub fn present_move_dialog(parent: &gtk::Widget, mailbox: &Mailbox, folders: Vec
         }
     }
     let mut ordered = Vec::new();
-    walk(&crate::folder_tree::build_folder_roots(folders, &account_id), 0, &mut ordered);
-    for (folder, depth) in ordered {
-        let excluded = is_same_or_descendant(&folder.id, &mailbox.id, mailbox.delimiter)
-            || Some(&folder.id) == current_parent.as_ref()
-            || folder.flags.iter().any(|flag| flag.eq_ignore_ascii_case("NoInferiors"));
-        if !excluded {
-            rows.push((Some(folder.id.clone()), display_name(&folder.name), depth));
-        }
-    }
+    walk(&crate::folder_tree::build_folder_roots(folders, account_id), 0, &mut ordered);
+    ordered
+        .into_iter()
+        .filter(|(folder, _)| !exclude(folder))
+        .map(|(folder, depth)| (folder.id.clone(), display_name(&folder.name), depth))
+        .collect()
+}
 
+/// A folder chooser: `rows` (target, label, depth) indented by depth in a
+/// scrolling list, with `accept` enabled once one is picked. Shared by the
+/// folder menu's Move… and the message context menu's Move ▸ / Copy ▸ →
+/// "Other folder…" (item 1.17).
+pub fn present_folder_picker<T: Clone + 'static>(parent: &gtk::Widget, heading: &str, body: &str, accept: &str, rows: Vec<(T, String, usize)>, on_pick: impl Fn(T) + 'static) {
     let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).css_classes(["boxed-list"]).build();
     for (_, label, depth) in &rows {
         let label = gtk::Label::builder()
@@ -430,22 +456,32 @@ pub fn present_move_dialog(parent: &gtk::Widget, mailbox: &Mailbox, folders: Vec
         .child(&list)
         .build();
     let dialog = adw::AlertDialog::builder()
-        .heading(format!("Move \u{201c}{}\u{201d}", display_name(&mailbox.name)))
-        .body("Choose the folder to move it into.")
-        .default_response("move")
+        .heading(heading)
+        .body(body)
+        .default_response("accept")
         .close_response("cancel")
         .build();
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("move", "Move");
-    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
-    dialog.set_response_enabled("move", false);
+    dialog.add_response("accept", accept);
+    dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
+    dialog.set_response_enabled("accept", false);
     dialog.set_extra_child(Some(&scroller));
     {
         let dialog = dialog.clone();
-        list.connect_row_selected(move |_, row| dialog.set_response_enabled("move", row.is_some()));
+        list.connect_row_selected(move |_, row| dialog.set_response_enabled("accept", row.is_some()));
+    }
+    {
+        // Double-clicking (or Enter on) a folder picks it, like a file chooser.
+        let dialog = dialog.clone();
+        list.connect_row_activated(move |_, _| {
+            if dialog.is_response_enabled("accept") {
+                dialog.emit_by_name::<()>("response", &[&"accept"]);
+                dialog.close();
+            }
+        });
     }
     dialog.connect_response(None, move |_, response| {
-        if response != "move" {
+        if response != "accept" {
             return;
         }
         let Some(row) = list.selected_row() else { return };

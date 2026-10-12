@@ -34,7 +34,7 @@ use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::google_tasks::{self, GoogleTasksCommand, GoogleTasksEvent, TaskList};
 use crate::last_view::{self, LastSelection};
-use crate::message_list::{format_row_date, unified_merge_order, Filter, FilterSet, MessageItem, MessageListModel, SelectionKind, SortKey};
+use crate::message_list::{format_row_date, unified_merge_order, Filter, FilterSet, MessageItem, MessageListModel, SelectionKind, SortKey, ThreadId};
 use crate::microsoft_oauth::MicrosoftCredentialProvider;
 use crate::ui_state_db::UiStateDb;
 use crate::worker::Worker;
@@ -210,12 +210,12 @@ struct MessageRowWidgets {
     mark_read_btn: gtk::Button,
     follow_up_btn: gtk::Button,
     pin_btn: gtk::Button,
-    /// The right-click context menu's popover, parented to this row in setup
-    /// and repopulated at press time.
-    tag_popover: gtk::Popover,
     /// The message this row currently shows. Set by `bind`, read by the
     /// quick-action handlers when they fire.
     bound: Rc<RefCell<Option<EmailSummary>>>,
+    /// The conversation this row heads, when it's a conversation header -
+    /// what its right-click menu acts on (item 1.17).
+    bound_thread: Rc<RefCell<Option<ThreadId>>>,
 }
 
 /// Weak handles to a row's display-dependent widgets - the avatar/checkbox
@@ -675,6 +675,14 @@ struct PendingRawMessage {
     initial_name: String,
 }
 
+/// A message-menu action waiting for `(mailbox, uid)`'s body
+/// (`UiState::body_waiter`).
+struct BodyWaiter {
+    mailbox: MailboxId,
+    uid: Uid,
+    run: Box<dyn FnOnce(EmailBody)>,
+}
+
 /// The single "Message details" dialog (item 1.10 / M-30) while one is open,
 /// tracked in `UiState::message_details`: its window plus the widgets the
 /// async raw-message reply fills, and the `(mailbox, uid)` it belongs to so
@@ -700,6 +708,26 @@ struct MessageDetailsDialog {
     /// The failure page's message label, set when the fetch errors or times
     /// out.
     error_label: gtk::Label,
+    /// The Details / Source pages, so re-presenting the dialog can switch to
+    /// the page asked for.
+    pages: adw::ViewStack,
+}
+
+/// Which page "View message details" opens on: Details, or Source (the
+/// message context menu's View ▸ View message source, item 1.17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailsPage {
+    Details,
+    Source,
+}
+
+impl DetailsPage {
+    fn name(self) -> &'static str {
+        match self {
+            DetailsPage::Details => "details",
+            DetailsPage::Source => "source",
+        }
+    }
 }
 
 /// A saved draft whose "Edit" action is waiting on its raw bytes (item 1.12),
@@ -1186,6 +1214,14 @@ pub(crate) struct UiState {
     /// Each folder's local display preferences (icon colour, count mode),
     /// from the folder pane's "⋯" menu. Persisted in the UI-state database.
     folder_prefs: HashMap<MailboxId, crate::ui_state_db::FolderPrefs>,
+    /// Each account's recently used message move/copy targets, most recent
+    /// first - the message context menu's Move ▸ / Copy ▸ shortcuts (item
+    /// 1.17). Persisted in the UI-state database.
+    recent_folders: HashMap<AccountId, Vec<MailboxId>>,
+    /// A message-menu action waiting for a message's body (Reply, Forward,
+    /// Print on a message not read yet): run by the `BodyFetched` handler when
+    /// that body lands. One at a time - a newer request replaces it.
+    body_waiter: Option<BodyWaiter>,
     /// Config → Mail → "Load images from the web": whether the reading pane's
     /// WebView may load remote `image/*` subresources. Consulted by the
     /// load-policy handler on every resource decision. Persisted via the
@@ -2409,6 +2445,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // can re-seed the pane's collapse state instead of starting all-default.
     let (expanded_folders, collapsed_groups) = ui_db.as_ref().and_then(|db| db.load_folder_expansion().ok()).unwrap_or_default();
     let folder_prefs = ui_db.as_ref().and_then(|db| db.load_folder_prefs().ok()).unwrap_or_default();
+    let recent_folders = ui_db.as_ref().and_then(|db| db.load_recent_folders().ok()).unwrap_or_default();
     // Shared keyring handle for manually-added ("other") IMAP/SMTP accounts -
     // see `other_accounts.rs`. Cloned into the add-account dialog, the
     // startup connect loop, and the Config view's edit/remove actions.
@@ -2485,6 +2522,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         favorites: crate::folder_menu::dedup_in_order(settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId)),
         favorite_display_order: Vec::new(),
         folder_prefs,
+        recent_folders,
+        body_waiter: None,
         load_remote_images: settings.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES),
         rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
         trusted_senders,
@@ -2541,9 +2580,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     apply_tag_colors(&tags, &tag_colors);
     let message_list_for_rows = message_list.clone();
-    let tags_for_rows = tags.clone();
     let tags_for_bind = tags.clone();
-    let tag_colors_for_rows = tag_colors.clone();
+    // What the message context menu (item 1.17) works with; every row's
+    // right-click opens it.
+    let message_menu_context = MessageMenuContext {
+        state: state.clone(),
+        worker: worker.clone(),
+        reading_stack: reading_stack.clone(),
+        message_list: message_list.clone(),
+        tags: tags.clone(),
+        tag_colors: tag_colors.clone(),
+    };
+    let message_menu_context_for_rows = message_menu_context.clone();
     // Declared here, ahead of the row factory below, so each row's `setup`
     // can bind its avatar/checkbox visibility to this button's `active`
     // state (see the property bindings inside `connect_setup`) - appended
@@ -2835,11 +2883,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // click at several messages at once.
         let bound: Rc<RefCell<Option<EmailSummary>>> = Rc::new(RefCell::new(None));
 
-        // The right-click (Categorize) popover for this row. Parented once to
-        // the row's overlay; its contents are repopulated from the row's
-        // current message at press time.
-        let tag_popover = gtk::Popover::new();
-        tag_popover.set_parent(&overlay);
+        // The conversation this row heads, when it's a conversation header.
+        let bound_thread: Rc<RefCell<Option<ThreadId>>> = Rc::new(RefCell::new(None));
 
         let checkbox_suppress: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
@@ -2884,20 +2929,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
 
         {
+            // The message context menu (item 1.17) on right-click.
             let bound = bound.clone();
-            let tag_popover = tag_popover.clone();
-            let tags = tags_for_rows.clone();
-            let state = state_clone.clone();
-            let message_list = message_list_for_rows.clone();
-            let tag_colors = tag_colors_for_rows.clone();
+            let bound_thread = bound_thread.clone();
+            let context = message_menu_context_for_rows.clone();
+            let list_item_weak = list_item.downgrade();
             let context_menu = gtk::GestureClick::new();
             context_menu.set_button(gtk::gdk::BUTTON_SECONDARY);
-            context_menu.connect_pressed(move |_, _, x, y| {
-                let Some(summary) = bound.borrow().clone() else { return };
-                let boxed = build_tag_menu(&tags, &state, Some(summary), &message_list, &tag_colors);
-                tag_popover.set_child(Some(&boxed));
-                tag_popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                tag_popover.popup();
+            context_menu.connect_pressed(move |gesture, _, x, y| {
+                let Some(anchor) = gesture.widget() else { return };
+                let position = list_item_weak
+                    .upgrade()
+                    .map(|list_item| list_item.position())
+                    .filter(|pos| *pos != gtk::INVALID_LIST_POSITION);
+                let target = match (bound.borrow().clone(), bound_thread.borrow().clone()) {
+                    (Some(summary), _) => MessageMenuTarget::Row {
+                        summary: Box::new(summary),
+                        position,
+                    },
+                    (None, Some(thread)) => MessageMenuTarget::Thread(thread),
+                    (None, None) => return,
+                };
+                if open_message_menu(&context, &anchor, Some((x, y)), target) {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
             });
             overlay.add_controller(context_menu);
         }
@@ -3191,7 +3246,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     mark_read_btn,
                     follow_up_btn,
                     pin_btn,
-                    tag_popover,
+                    bound_thread,
                     bound,
                 },
             );
@@ -3233,6 +3288,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 list_item.set_selectable(false);
                 list_item.set_activatable(false);
                 *widgets.bound.borrow_mut() = None;
+                *widgets.bound_thread.borrow_mut() = None;
             }
             MessageItem::Message(summary) => {
                 widgets.header_box.set_visible(false);
@@ -3363,6 +3419,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.tag_dots.set_visible(!shown.is_empty());
 
                 *widgets.bound.borrow_mut() = Some((**summary).clone());
+                *widgets.bound_thread.borrow_mut() = None;
             }
             MessageItem::Thread(thread) => {
                 widgets.header_box.set_visible(false);
@@ -3379,6 +3436,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 list_item.set_selectable(false);
                 list_item.set_activatable(false);
                 *widgets.bound.borrow_mut() = None;
+                *widgets.bound_thread.borrow_mut() = Some(thread.id.clone());
                 widgets.thread_expander.set_list_row(Some(&row));
                 widgets.thread_sender.set_label(&thread.sender);
                 widgets.thread_attachment_icon.set_visible(thread.has_attachment);
@@ -3422,8 +3480,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         };
         let widgets = unsafe { widgets.as_ref() };
         *widgets.bound.borrow_mut() = None;
+        *widgets.bound_thread.borrow_mut() = None;
         widgets.action_box.set_visible(false);
-        widgets.tag_popover.popdown();
         // Don't keep a recycled row pinned to a `TreeListRow` it no longer
         // renders.
         widgets.expander.set_list_row(None);
@@ -3446,6 +3504,32 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // whether the user is at the top of the list when a rebuild lands, and the
     // view to put them back there if they were (see `pin_to_top`).
     message_list.attach_scroller(&message_scroller, &message_list_view);
+    // Shift+F10 / the Menu key open the message context menu (item 1.17) on
+    // the selection, pointing at the focused row - the keyboard's
+    // right-click (UX-90).
+    {
+        let context = message_menu_context.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |controller, key, _, modifiers| {
+            let menu_key = key == gtk::gdk::Key::Menu || (key == gtk::gdk::Key::F10 && modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK));
+            if !menu_key {
+                return glib::Propagation::Proceed;
+            }
+            let Some(list_view) = controller.widget() else { return glib::Propagation::Proceed };
+            let point = list_view
+                .root()
+                .and_then(|root| root.focus())
+                .filter(|focus| focus.is_ancestor(&list_view))
+                .and_then(|focus| focus.compute_bounds(&list_view))
+                .map(|bounds| (f64::from(bounds.x() + 24.0), f64::from(bounds.y() + bounds.height() / 2.0)));
+            if open_message_menu(&context, &list_view, point, MessageMenuTarget::Selection) {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        message_list_view.add_controller(keys);
+    }
     // Double-click / Enter on a message opens it in its own window (item
     // 1.9, Outlook's UX-37): `GtkListView::activate` fires for both, and the
     // row factory's `bind` has already made message rows activatable and
@@ -4875,8 +4959,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let mark_read_button = gtk::Button::from_icon_name(themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]));
     refresh_mark_read_button(&mark_read_button, &message_list);
     // Categorize: a menu of the defined color tags, toggle-checked against
-    // the selected message. Its popover is rebuilt on every `show` so the
-    // check states track whichever message is selected when it opens.
+    // the selected messages. Its popover is rebuilt on every `show` so the
+    // check states track whichever messages are selected when it opens.
     let categorize_button = gtk::MenuButton::builder()
         .icon_name(themed_icon_name(&["tag-symbolic", "mail-mark-important-symbolic"]))
         .build();
@@ -4889,8 +4973,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list = message_list.clone();
         let tag_colors = tag_colors.clone();
         categorize_popover.connect_show(move |popover| {
-            let target = message_list.selected_summary();
-            let boxed = build_tag_menu(&tags, &state, target, &message_list, &tag_colors);
+            let targets = message_list.selected_summaries();
+            let boxed = build_tag_menu(&tags, &state, targets, &message_list, &tag_colors);
             popover.set_child(Some(&boxed));
         });
     }
@@ -9748,7 +9832,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // account's Trash/Archive/Junk mailbox (Snooze has its own preset menu,
     // below). All three are silent no-ops
     // with nothing selected, and send exactly one command per distinct
-    // mailbox in the selection (see `selected_message_command_targets`) -
+    // mailbox in the selection (see `command_targets_for`) -
     // for today's ordinary single-selection case that's exactly one command,
     // same as before.
     for (button, role) in [
@@ -9758,26 +9842,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     ] {
         let message_list = message_list.clone();
         let state = state.clone();
-        button.connect_clicked(move |_| {
-            // One undo entry for the whole action, even across accounts: its
-            // inverse moves each group back from the role folder it landed in
-            // (item 0.4).
-            let mut inverse = Vec::new();
-            let mut count = 0usize;
-            for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
-                optimistic_remove_messages(&state, &message_list, &mailbox, &uids);
-                if let Some(destination) = mailbox_account_id(&mailbox).and_then(|account_id| role_mailbox_id(&state, &account_id, role)) {
-                    inverse.push(AccountCommand::RevertMove {
-                        moved_from: mailbox.clone(),
-                        moved_to: destination,
-                        uids: uids.clone(),
-                    });
-                }
-                count += uids.len();
-                let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages { mailbox, uids, role });
-            }
-            record_undo(&state, &undo_move_description(role, count), inverse);
-        });
+        button.connect_clicked(move |_| move_messages_to_role(&state, &message_list, &message_list.selected_summaries(), role));
     }
     // --- Pin/Unpin -> AccountCommand::StoreFlagsMany toggling `\Flagged`
     // on every selected message. The direction is computed once over the
@@ -9792,34 +9857,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let pin_button_for_click = pin_button.clone();
         pin_button.connect_clicked(move |_| {
             let summaries = message_list.selected_summaries();
-            if summaries.is_empty() {
-                return;
-            }
             let pinning = summaries.iter().any(|s| !s.is_pinned());
-            let (add, remove) = if pinning {
-                (vec![SystemFlagBit::Flagged], Vec::new())
-            } else {
-                (Vec::new(), vec![SystemFlagBit::Flagged])
-            };
-            // One undo entry for the whole action: the opposite `\Flagged`
-            // change on every affected message (item 0.4).
-            let mut inverse = Vec::new();
-            for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
-                optimistic_toggle_pinned(&state, &message_list, &mailbox, &uids, pinning);
-                inverse.push(AccountCommand::StoreFlagsMany {
-                    mailbox: mailbox.clone(),
-                    uids: uids.clone(),
-                    add: remove.clone(),
-                    remove: add.clone(),
-                });
-                let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
-                    mailbox,
-                    uids,
-                    add: add.clone(),
-                    remove: remove.clone(),
-                });
-            }
-            record_undo(&state, if pinning { "Pinned" } else { "Unpinned" }, inverse);
+            set_messages_pinned(&state, &message_list, &summaries, pinning);
             // The optimistic patch above already moved every affected
             // message into/out of the Pinned group and restored the
             // selection, so the aggregate state `refresh_pin_button` reads
@@ -9858,34 +9897,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mark_read_button_for_click = mark_read_button.clone();
         mark_read_button.connect_clicked(move |_| {
             let summaries = message_list.selected_summaries();
-            if summaries.is_empty() {
-                return;
-            }
             let mark_read = summaries.iter().any(|s| s.is_unread());
-            let (add, remove) = if mark_read {
-                (vec![SystemFlagBit::Seen], Vec::new())
-            } else {
-                (Vec::new(), vec![SystemFlagBit::Seen])
-            };
-            // One undo entry for the whole action: the opposite `\Seen` change
-            // on every affected message (item 0.4).
-            let mut inverse = Vec::new();
-            for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
-                optimistic_toggle_read(&state, &message_list, &mailbox, &uids, mark_read);
-                inverse.push(AccountCommand::StoreFlagsMany {
-                    mailbox: mailbox.clone(),
-                    uids: uids.clone(),
-                    add: remove.clone(),
-                    remove: add.clone(),
-                });
-                let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
-                    mailbox,
-                    uids,
-                    add: add.clone(),
-                    remove: remove.clone(),
-                });
-            }
-            record_undo(&state, if mark_read { "Marked as read" } else { "Marked as unread" }, inverse);
+            set_messages_read(&state, &message_list, &summaries, mark_read);
             refresh_mark_read_button(&mark_read_button_for_click, &message_list);
         });
     }
@@ -9907,12 +9920,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     .collect()
             }),
             "Choose a date…",
-            crate::datetime_picker::TimeDialog {
-                heading: "Snooze",
-                field_label: "Snooze until",
-                accept: "Snooze",
-                note: None,
-            },
+            snooze_time_dialog(),
             Rc::new(move |until| snooze_selection(&state, &message_list, until)),
         );
         popover.set_parent(&snooze_button);
@@ -11181,9 +11189,22 @@ fn spawn_account_event_loop(
                             st.body_cache.insert(mailbox.clone(), uid, body.clone());
                             is_current
                         };
+                        // A message-menu action waiting for this body (item
+                        // 1.17) runs once the borrow above is dropped.
+                        let waiter = {
+                            let mut st = state.borrow_mut();
+                            match &st.body_waiter {
+                                Some(waiter) if waiter.mailbox == mailbox && waiter.uid == uid => st.body_waiter.take(),
+                                _ => None,
+                            }
+                        };
+                        let waiting_body = waiter.as_ref().map(|_| body.clone());
                         if should_render {
                             tracing::debug!(?mailbox, uid = uid.0, "FetchBody: body arrived on UI thread");
                             render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
+                        }
+                        if let (Some(waiter), Some(body)) = (waiter, waiting_body) {
+                            (waiter.run)(body);
                         }
                     }
                     AccountEvent::PartFetched { mailbox, uid, part, bytes } => {
@@ -14860,6 +14881,8 @@ fn handle_message_drag_drop(state: &Rc<RefCell<UiState>>, target: &Mailbox, valu
             target: target.id.clone(),
         });
     }
+    // The drop target is now a recent folder for Move ▸ / Copy ▸ (item 1.17).
+    record_recent_folder(state, &target.id);
     true
 }
 
@@ -15075,30 +15098,35 @@ fn apply_tag_colors(tags: &Rc<RefCell<crate::tags::TagSet>>, provider: &gtk::Css
     provider.load_from_string(&css);
 }
 
-/// Sends a `StoreKeywords` command for `summary` to its owning account's
-/// session. The session `STORE`s the atoms, patches the cache, and re-emits,
-/// which repaints the row's tag dots.
-fn send_keyword_store(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, add: Vec<String>, remove: Vec<String>) {
-    let Some(account_id) = mailbox_account_id(&summary.mailbox) else { return };
-    let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
-    let Some(cmd_tx) = cmd_tx else { return };
+/// Adds (`add`) or removes the category `keyword` on `summaries`: one
+/// `StoreKeywordsMany` per mailbox to its owning account's session, which
+/// `STORE`s the atom, patches the cache, and re-emits (repainting the rows'
+/// tag dots). Undo restores each message's previous state - only the
+/// messages the change actually touched are reversed.
+fn send_keyword_store(state: &Rc<RefCell<UiState>>, summaries: &[EmailSummary], keyword: &str, add: bool) {
+    let changed: Vec<EmailSummary> = summaries.iter().filter(|s| s.keywords.iter().any(|k| k == keyword) != add).cloned().collect();
+    let (to_add, to_remove) = if add {
+        (vec![keyword.to_string()], Vec::new())
+    } else {
+        (Vec::new(), vec![keyword.to_string()])
+    };
+    let mut inverse = Vec::new();
+    for (cmd_tx, mailbox, uids) in command_targets_for(state, &changed) {
+        inverse.push(AccountCommand::StoreKeywordsMany {
+            mailbox: mailbox.clone(),
+            uids: uids.clone(),
+            add: to_remove.clone(),
+            remove: to_add.clone(),
+        });
+        let _ = cmd_tx.send_blocking(AccountCommand::StoreKeywordsMany {
+            mailbox,
+            uids,
+            add: to_add.clone(),
+            remove: to_remove.clone(),
+        });
+    }
     // Undo: the reverse keyword STORE (item 0.4).
-    record_undo(
-        state,
-        if add.is_empty() { "Category removed" } else { "Categorised" },
-        vec![AccountCommand::StoreKeywords {
-            mailbox: summary.mailbox.clone(),
-            uid: summary.uid,
-            add: remove.clone(),
-            remove: add.clone(),
-        }],
-    );
-    let _ = cmd_tx.send_blocking(AccountCommand::StoreKeywords {
-        mailbox: summary.mailbox.clone(),
-        uid: summary.uid,
-        add,
-        remove,
-    });
+    record_undo(state, if add { "Categorised" } else { "Category removed" }, inverse);
 }
 
 /// Applies the tag `key` to every message in the dragged payload - the drop
@@ -15153,6 +15181,288 @@ fn handle_keyword_drag_drop(state: &Rc<RefCell<UiState>>, key: &str, value: &gli
     sent
 }
 
+/// What the message context menu (item 1.17) needs from the window, shared
+/// by every row's right-click and the list's Shift+F10 / Menu key.
+#[derive(Clone)]
+struct MessageMenuContext {
+    state: Rc<RefCell<UiState>>,
+    worker: Rc<Worker>,
+    reading_stack: gtk::Stack,
+    message_list: MessageListModel,
+    tags: Rc<RefCell<crate::tags::TagSet>>,
+    tag_colors: gtk::CssProvider,
+}
+
+/// Where the message context menu was opened.
+enum MessageMenuTarget {
+    /// A message row (`position` in the list, when known). Boxed, as
+    /// `MessageItem::Message` is, since `EmailSummary` is large.
+    Row { summary: Box<EmailSummary>, position: Option<u32> },
+    /// A conversation header: the menu acts on every message in it.
+    Thread(ThreadId),
+    /// The current selection (the keyboard's Shift+F10 / Menu key).
+    Selection,
+}
+
+/// The messages the menu acts on for `target`, plus the one the
+/// single-message verbs (Reply, Forward, View ▸, Open in new window, Print)
+/// use. A right-click on a row inside the selection acts on the selection;
+/// on any other row it selects that row alone first, as Outlook does. A
+/// conversation header acts on the whole conversation, its newest message
+/// being the single one.
+fn message_menu_targets(message_list: &MessageListModel, target: MessageMenuTarget) -> (Vec<EmailSummary>, Option<EmailSummary>) {
+    let selection_targets = |selected: Vec<EmailSummary>| {
+        let primary = (selected.len() == 1).then(|| selected[0].clone());
+        (selected, primary)
+    };
+    match target {
+        MessageMenuTarget::Row { summary, position } => {
+            let summary = *summary;
+            let selected = message_list.selected_summaries();
+            if selected.iter().any(|s| s.mailbox == summary.mailbox && s.uid == summary.uid) {
+                return selection_targets(selected);
+            }
+            if let Some(position) = position {
+                message_list.selection.select_item(position, true);
+            }
+            (vec![summary.clone()], Some(summary))
+        }
+        MessageMenuTarget::Thread(id) => {
+            let messages = message_list.thread_messages(&id);
+            let newest = messages.iter().max_by_key(|s| s.date).cloned();
+            (messages, newest)
+        }
+        MessageMenuTarget::Selection => selection_targets(message_list.selected_summaries()),
+    }
+}
+
+/// Opens the message context menu (item 1.17) on `anchor`, pointing at
+/// `point` (in `anchor`'s coordinates) or at the whole widget. Returns
+/// whether there was anything to act on.
+fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widget, point: Option<(f64, f64)>, target: MessageMenuTarget) -> bool {
+    use crate::message_menu::{FlagEntry, MenuChoices, SnoozeEntry, TargetFacts};
+
+    let (targets, primary) = message_menu_targets(&context.message_list, target);
+    if targets.is_empty() {
+        return false;
+    }
+    let state = &context.state;
+    let account = mailbox_account_id(&targets[0].mailbox);
+    let (menu_state, recent_folders) = {
+        let st = state.borrow();
+        let facts: Vec<TargetFacts> = targets
+            .iter()
+            .map(|summary| TargetFacts {
+                account: mailbox_account_id(&summary.mailbox).map(|id| id.0).unwrap_or_default(),
+                role: mailbox_role(&st, &summary.mailbox),
+                unread: summary.is_unread(),
+                pinned: summary.is_pinned(),
+                draft: summary_is_draft(&st, summary),
+                snoozed: lookout_core::snooze_until_from_keywords(&summary.keywords).is_some(),
+            })
+            .collect();
+        let folders = account.as_ref().and_then(|id| st.accounts.get(id)).map(|handle| handle.folders.clone()).unwrap_or_default();
+        let has_archive = folders.iter().any(|folder| folder.role == MailboxRole::Archive);
+        let menu_state = crate::message_menu::message_menu_state(&facts, primary.is_some(), has_archive);
+        // The account's recent folders that still exist, less the one every
+        // target is already in.
+        let current = targets.iter().all(|s| s.mailbox == targets[0].mailbox).then(|| targets[0].mailbox.clone());
+        let recent: Vec<(MailboxId, String)> = account
+            .as_ref()
+            .and_then(|id| st.recent_folders.get(id))
+            .into_iter()
+            .flatten()
+            .filter(|id| Some(*id) != current.as_ref())
+            .filter_map(|id| {
+                folders
+                    .iter()
+                    .find(|folder| folder.id == *id)
+                    .map(|folder| (id.clone(), lookout_core::display_name(&folder.name)))
+            })
+            .collect();
+        (menu_state, recent)
+    };
+    let today = crate::calendar_tz::display_zone().today();
+    let prefs = state.borrow().settings.calendar_preferences();
+    let now = chrono::Local::now();
+    let choices = MenuChoices {
+        recent_folders,
+        flags: crate::follow_up::flag_presets(today, prefs.week_start, &prefs.work_days)
+            .into_iter()
+            .map(|preset| FlagEntry {
+                name: preset.name.to_string(),
+                due: preset.due,
+            })
+            .collect(),
+        snoozes: crate::snooze::snooze_presets(&now)
+            .into_iter()
+            .map(|preset| SnoozeEntry {
+                label: format!("{} ({})", preset.name, crate::datetime_picker::format_short_time(&preset.at, &now)),
+                at: preset.at.with_timezone(&chrono::Utc),
+            })
+            .collect(),
+    };
+
+    let description = crate::message_menu::message_menu_description(&menu_state, &choices);
+    let dispatch: crate::context_menu::Dispatch = {
+        let context = context.clone();
+        let anchor = anchor.downgrade();
+        let targets = targets.clone();
+        let primary = primary.clone();
+        Rc::new(move |name, param| {
+            let Some(action) = crate::message_menu::message_action_for(name, param.as_ref()) else {
+                return;
+            };
+            let Some(anchor) = anchor.upgrade() else { return };
+            run_message_menu_action(&context, &anchor, &targets, primary.as_ref(), action);
+        })
+    };
+    let menu = crate::context_menu::ContextMenu::new(&description, &crate::message_menu::action_specs(), dispatch);
+    for (name, enabled) in crate::message_menu::enabled_actions(&menu_state) {
+        menu.set_enabled(name, enabled);
+    }
+    let categorize = build_tag_menu(&context.tags, state, targets, &context.message_list, &context.tag_colors);
+    menu.add_child(&categorize, crate::message_menu::CATEGORIZE_SLOT);
+
+    let popover = menu.popover.clone();
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk::Align::Start);
+    popover.set_parent(anchor);
+    menu.insert_action_group(anchor, crate::message_menu::NAMESPACE);
+    if let Some((x, y)) = point {
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    }
+    // Built per opening, so it's dropped once closed - after the activated
+    // item has run, hence the idle.
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
+    });
+    popover.popup();
+    true
+}
+
+/// Runs one message context-menu action on `targets` (`primary` for the
+/// single-message verbs) through the same helpers the ribbon uses, so every
+/// verb behaves - and undoes - the same wherever it's invoked.
+fn run_message_menu_action(
+    context: &MessageMenuContext,
+    anchor: &gtk::Widget,
+    targets: &[EmailSummary],
+    primary: Option<&EmailSummary>,
+    action: crate::message_menu::MessageMenuAction,
+) {
+    use crate::message_menu::MessageMenuAction as A;
+    let state = &context.state;
+    let message_list = &context.message_list;
+    let app_window = anchor.root().and_downcast::<adw::ApplicationWindow>();
+    match action {
+        A::Reply | A::ReplyAll | A::Forward => {
+            let Some(summary) = primary.cloned() else { return };
+            let mode = match action {
+                A::Reply => Some(crate::compose::ReplyMode::Reply),
+                A::ReplyAll => Some(crate::compose::ReplyMode::ReplyAll),
+                _ => None,
+            };
+            reply_to_message(state, &context.worker, &context.reading_stack, summary, mode);
+        }
+        A::Delete => move_messages_to_role(state, message_list, targets, MailboxRole::Trash),
+        A::Archive => move_messages_to_role(state, message_list, targets, MailboxRole::Archive),
+        A::ReportJunk => move_messages_to_role(state, message_list, targets, MailboxRole::Junk),
+        A::MoveTo(folder) => move_messages_to_folder(state, message_list, targets, &folder),
+        A::CopyTo(folder) => copy_messages_to_folder(state, targets, &folder),
+        A::MoveOther | A::CopyOther => {
+            let Some(account_id) = targets.first().and_then(|s| mailbox_account_id(&s.mailbox)) else {
+                return;
+            };
+            let folders = state.borrow().accounts.get(&account_id).map(|handle| handle.folders.clone()).unwrap_or_default();
+            let current = targets.iter().all(|s| s.mailbox == targets[0].mailbox).then(|| targets[0].mailbox.clone());
+            // Folders that can't hold messages (`\Noselect`) aren't offered.
+            let rows = crate::folder_menu::folder_picker_rows(folders, &account_id, |folder| {
+                Some(&folder.id) == current.as_ref() || folder.flags.iter().any(|flag| flag.eq_ignore_ascii_case("Noselect"))
+            });
+            let moving = matches!(action, A::MoveOther);
+            let noun = if targets.len() == 1 { "item" } else { "items" };
+            let heading = format!("{} {} {noun}", if moving { "Move" } else { "Copy" }, targets.len());
+            let state = state.clone();
+            let message_list = message_list.clone();
+            let targets = targets.to_vec();
+            crate::folder_menu::present_folder_picker(
+                anchor,
+                &heading,
+                if moving { "Choose the folder to move to." } else { "Choose the folder to copy to." },
+                if moving { "Move" } else { "Copy" },
+                rows,
+                move |folder: MailboxId| {
+                    if moving {
+                        move_messages_to_folder(&state, &message_list, &targets, &folder);
+                    } else {
+                        copy_messages_to_folder(&state, &targets, &folder);
+                    }
+                },
+            );
+        }
+        A::SetRead(mark_read) => set_messages_read(state, message_list, targets, mark_read),
+        A::Pin(pinning) => set_messages_pinned(state, message_list, targets, pinning),
+        A::Flag(flag) => set_follow_up(state, message_list, targets.to_vec(), flag),
+        A::FlagCustom => {
+            let state = state.clone();
+            let message_list = message_list.clone();
+            let targets = targets.to_vec();
+            crate::datetime_picker::present_date_dialog(
+                Some(anchor),
+                "Flag for follow-up",
+                "Due date",
+                "Flag",
+                crate::calendar_tz::display_zone().today(),
+                Rc::new(move |due| set_follow_up(&state, &message_list, targets.clone(), crate::follow_up::flagged(Some(due)))),
+            );
+        }
+        A::Snooze(until) => snooze_messages(state, targets, until),
+        A::SnoozeCustom => {
+            let state = state.clone();
+            let targets = targets.to_vec();
+            crate::datetime_picker::present_time_dialog(Some(anchor), &snooze_time_dialog(), Rc::new(move |until| snooze_messages(&state, &targets, until)));
+        }
+        A::Unsnooze => {
+            let snoozed: Vec<EmailSummary> = targets
+                .iter()
+                .filter(|s| lookout_core::snooze_until_from_keywords(&s.keywords).is_some())
+                .cloned()
+                .collect();
+            for (cmd_tx, mailbox, uids) in command_targets_for(state, &snoozed) {
+                let _ = cmd_tx.send_blocking(AccountCommand::WakeSnoozed { mailbox, uids });
+            }
+        }
+        A::ViewDetails | A::ViewSource => {
+            let (Some(summary), Some(parent)) = (primary, app_window) else { return };
+            let page = if matches!(action, A::ViewSource) { DetailsPage::Source } else { DetailsPage::Details };
+            show_message_details_dialog(state, &parent, summary, page);
+        }
+        A::OpenWindow => {
+            let (Some(summary), Some(parent)) = (primary, app_window) else { return };
+            crate::message_window::open_message_window(&parent, state, &context.worker, &context.reading_stack, summary);
+        }
+        A::Print => {
+            let (Some(summary), Some(parent)) = (primary, anchor.root().and_downcast::<gtk::Window>()) else {
+                return;
+            };
+            print_message(state, &parent, summary);
+        }
+    }
+}
+
+/// The Snooze menus' "Choose a date…" dialog (the ribbon's and the message
+/// context menu's).
+fn snooze_time_dialog() -> crate::datetime_picker::TimeDialog {
+    crate::datetime_picker::TimeDialog {
+        heading: "Snooze",
+        field_label: "Snooze until",
+        accept: "Snooze",
+        note: None,
+    }
+}
+
 /// Builds the "More" menu popover's contents: "Open in new window" opens the
 /// selected message in its own window (item 1.9), "View message details…"
 /// shows the details/source dialog (item 1.10), "Save as .eml…" exports the
@@ -15195,7 +15505,7 @@ fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: 
             popover.popdown();
             let Some(parent) = popover.root().and_downcast::<adw::ApplicationWindow>() else { return };
             let Some(summary) = message_list.selected_summary() else { return };
-            show_message_details_dialog(&state, &parent, &summary);
+            show_message_details_dialog(&state, &parent, &summary, DetailsPage::Details);
         });
     }
     boxed.append(&details_button);
@@ -15270,16 +15580,20 @@ fn print_visible_message(reading_stack: &gtk::Stack, parent: &gtk::Window) {
                 .and_downcast::<gtk::TextView>()
                 .map(|text_view| text_view.buffer().text(&text_view.buffer().start_iter(), &text_view.buffer().end_iter(), false))
                 .unwrap_or_default();
-            let html = format!(
-                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
-                 <style>body {{ font-family: sans-serif; white-space: pre-wrap; margin: 1em; }}</style>\
-                 </head><body>{}</body></html>",
-                glib::markup_escape_text(&text)
-            );
-            print_html_once(&html, parent);
+            print_html_once(&plain_text_print_html(&text), parent);
         }
         _ => {}
     }
+}
+
+/// A plain-text body as a minimal printable HTML page.
+fn plain_text_print_html(text: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+         <style>body {{ font-family: sans-serif; white-space: pre-wrap; margin: 1em; }}</style>\
+         </head><body>{}</body></html>",
+        glib::markup_escape_text(text)
+    )
 }
 
 /// Prints an HTML string through a throwaway offscreen WebView once its load
@@ -15299,16 +15613,17 @@ pub(crate) fn print_html_once<T: IsA<gtk::Window>>(html: &str, parent: &T) {
 }
 
 /// Builds the tag menu shown by both the toolbar Categorize popover and the
-/// message row's right-click menu: one toggle row per defined tag (a color
-/// dot plus a check button, checked when `target` carries that tag's
-/// keyword), then a "Manage tags…" row. `target` is the message the toggles
-/// act on; `None` (nothing selected) renders the toggles disabled. The
-/// caller owns showing it - for the toolbar it's the popover child (rebuilt
-/// on every `show`), for a row it's the row's context popover.
+/// message context menu's Categorize ▸: one toggle row per defined tag (a
+/// color dot plus a check button - checked when every target carries that
+/// tag's keyword, mixed when only some do), then a "Manage tags…" row.
+/// `targets` are the messages the toggles act on, all at once; none
+/// (nothing selected) renders the toggles disabled. The caller owns showing
+/// it - for the toolbar it's the popover child (rebuilt on every `show`), for
+/// the context menu a custom slot.
 fn build_tag_menu(
     tags: &Rc<RefCell<crate::tags::TagSet>>,
     state: &Rc<RefCell<UiState>>,
-    target: Option<EmailSummary>,
+    targets: Vec<EmailSummary>,
     message_list: &MessageListModel,
     tag_colors: &gtk::CssProvider,
 ) -> gtk::Box {
@@ -15341,22 +15656,22 @@ fn build_tag_menu(
                 .valign(gtk::Align::Center)
                 .build();
             let toggle = gtk::CheckButton::builder().label(&tag.name).build();
-            let has = target.as_ref().is_some_and(|s| s.keywords.contains(&lookout_core::tag_keyword(&tag.key)));
-            toggle.set_active(has);
-            toggle.set_sensitive(target.is_some());
+            let keyword = lookout_core::tag_keyword(&tag.key);
+            let (active, inconsistent) = tag_check_state(&targets, &keyword);
+            toggle.set_active(active);
+            toggle.set_inconsistent(inconsistent);
+            toggle.set_sensitive(!targets.is_empty());
             row.append(&dot);
             row.append(&toggle);
 
-            let summary = target.clone();
-            let key = tag.key.clone();
+            let targets = targets.clone();
             let state = state.clone();
             let state_for_toggle = state.clone();
             toggle.connect_toggled(move |t| {
-                if let Some(summary) = &summary {
-                    let keyword = lookout_core::tag_keyword(&key);
-                    let (add, remove) = if t.is_active() { (vec![keyword], Vec::new()) } else { (Vec::new(), vec![keyword]) };
-                    send_keyword_store(&state_for_toggle, summary, add, remove);
-                }
+                // A mixed check applies the tag to every target on its
+                // first click, as Outlook does.
+                t.set_inconsistent(false);
+                send_keyword_store(&state_for_toggle, &targets, &keyword, t.is_active());
             });
             // Dropping messages onto the tag row applies that tag to all of
             // them - the batch counterpart of the toggles (one
@@ -15394,6 +15709,13 @@ fn build_tag_menu(
     }
     boxed.append(&manage);
     boxed
+}
+
+/// A Categorize check's `(active, inconsistent)` state for `targets`:
+/// checked when every target carries `keyword`, mixed when only some do.
+fn tag_check_state(targets: &[EmailSummary], keyword: &str) -> (bool, bool) {
+    let carrying = targets.iter().filter(|s| s.keywords.iter().any(|k| k == keyword)).count();
+    (carrying > 0 && carrying == targets.len(), carrying > 0 && carrying < targets.len())
 }
 
 /// The tag-management dialog: list existing tags (color swatch + editable
@@ -16349,6 +16671,8 @@ pub(crate) struct UndoEntry {
 fn command_mailbox(command: &AccountCommand) -> Option<&MailboxId> {
     match command {
         AccountCommand::RevertMove { moved_to: mailbox, .. }
+        | AccountCommand::RevertCopy { copied_to: mailbox, .. }
+        | AccountCommand::CopyMessagesTo { mailbox, .. }
         | AccountCommand::UnsnoozeMessages { mailbox, .. }
         | AccountCommand::WakeSnoozed { mailbox, .. }
         | AccountCommand::MoveMessage { mailbox, .. }
@@ -16383,10 +16707,15 @@ fn undo_move_description(role: MailboxRole, count: usize) -> String {
 }
 
 /// Snoozes the selected messages until `until` (item 1.15) and offers Undo.
-/// The session decides whether the snooze lives on the server (the
-/// "Scheduled" folder) or stays local; `UnsnoozeMessages` reverses either.
 fn snooze_selection(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, until: chrono::DateTime<chrono::Utc>) {
-    let targets = selected_message_command_targets(message_list, state);
+    snooze_messages(state, &message_list.selected_summaries(), until);
+}
+
+/// Snoozes `summaries` until `until` (item 1.15) and offers Undo. The
+/// session decides whether the snooze lives on the server (the "Scheduled"
+/// folder) or stays local; `UnsnoozeMessages` reverses either.
+fn snooze_messages(state: &Rc<RefCell<UiState>>, summaries: &[EmailSummary], until: chrono::DateTime<chrono::Utc>) {
+    let targets = command_targets_for(state, summaries);
     if targets.is_empty() {
         return;
     }
@@ -16400,6 +16729,243 @@ fn snooze_selection(state: &Rc<RefCell<UiState>>, message_list: &MessageListMode
     }
     let when = crate::datetime_picker::format_short_time(&until.with_timezone(&chrono::Local), &chrono::Local::now());
     record_undo(state, &format!("Snoozed until {when}"), inverse);
+}
+
+/// Moves `summaries` to their accounts' `role` folder (Delete, Archive,
+/// Report junk) - the ribbon buttons' and the message context menu's shared
+/// path. Rows go at once, one `MoveMessages` per source mailbox, and one undo
+/// entry covers the whole action, even across accounts: its inverse moves
+/// each group back from the role folder it landed in (item 0.4).
+fn move_messages_to_role(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: &[EmailSummary], role: MailboxRole) {
+    let mut inverse = Vec::new();
+    let mut count = 0usize;
+    for (cmd_tx, mailbox, uids) in command_targets_for(state, summaries) {
+        optimistic_remove_messages(state, message_list, &mailbox, &uids);
+        if let Some(destination) = mailbox_account_id(&mailbox).and_then(|account_id| role_mailbox_id(state, &account_id, role)) {
+            inverse.push(AccountCommand::RevertMove {
+                moved_from: mailbox.clone(),
+                moved_to: destination,
+                uids: uids.clone(),
+            });
+        }
+        count += uids.len();
+        let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages { mailbox, uids, role });
+    }
+    record_undo(state, &undo_move_description(role, count), inverse);
+}
+
+/// Moves `summaries` into the folder `target` (the message context menu's
+/// Move ▸, item 1.17): rows go at once, one `MoveMessagesTo` per source
+/// mailbox (the ones already there are skipped), one undo entry, and
+/// `target` becomes the account's most recent folder.
+fn move_messages_to_folder(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: &[EmailSummary], target: &MailboxId) {
+    let mut inverse = Vec::new();
+    let mut count = 0usize;
+    for (cmd_tx, mailbox, uids) in command_targets_for(state, summaries) {
+        if mailbox == *target || mailbox_account_id(&mailbox) != mailbox_account_id(target) {
+            continue;
+        }
+        optimistic_remove_messages(state, message_list, &mailbox, &uids);
+        inverse.push(AccountCommand::RevertMove {
+            moved_from: mailbox.clone(),
+            moved_to: target.clone(),
+            uids: uids.clone(),
+        });
+        count += uids.len();
+        let _ = cmd_tx.send_blocking(AccountCommand::MoveMessagesTo {
+            mailbox,
+            uids,
+            target: target.clone(),
+        });
+    }
+    if count > 0 {
+        record_recent_folder(state, target);
+    }
+    record_undo(state, &undo_move_description(MailboxRole::Custom, count), inverse);
+}
+
+/// Copies `summaries` into the folder `target` (Copy ▸, item 1.17): one
+/// `CopyMessagesTo` per source mailbox, and Undo removes the copies again
+/// (`RevertCopy`).
+fn copy_messages_to_folder(state: &Rc<RefCell<UiState>>, summaries: &[EmailSummary], target: &MailboxId) {
+    let mut inverse = Vec::new();
+    let mut count = 0usize;
+    for (cmd_tx, mailbox, uids) in command_targets_for(state, summaries) {
+        if mailbox == *target || mailbox_account_id(&mailbox) != mailbox_account_id(target) {
+            continue;
+        }
+        inverse.push(AccountCommand::RevertCopy {
+            copied_from: mailbox.clone(),
+            copied_to: target.clone(),
+            uids: uids.clone(),
+        });
+        count += uids.len();
+        let _ = cmd_tx.send_blocking(AccountCommand::CopyMessagesTo {
+            mailbox,
+            uids,
+            target: target.clone(),
+        });
+    }
+    if count > 0 {
+        record_recent_folder(state, target);
+    }
+    let noun = if count == 1 { "item" } else { "items" };
+    record_undo(state, &format!("{count} {noun} copied"), inverse);
+}
+
+/// Makes `folder` its account's most recently used move/copy target and
+/// persists the list (Move ▸ / Copy ▸, item 1.17).
+fn record_recent_folder(state: &Rc<RefCell<UiState>>, folder: &MailboxId) {
+    let Some(account_id) = mailbox_account_id(folder) else { return };
+    let mut st = state.borrow_mut();
+    let recent = st.recent_folders.entry(account_id.clone()).or_default();
+    crate::message_menu::push_recent_folder(recent, folder.clone());
+    let recent = recent.clone();
+    if let Some(db) = &st.ui_db {
+        if let Err(e) = db.set_recent_folders(&account_id, &recent) {
+            tracing::warn!("recent folders won't persist: {e}");
+        }
+    }
+}
+
+/// Pins (`pinning`) or unpins `summaries`: shows it at once, one
+/// `StoreFlagsMany` per mailbox, and one undo entry - the opposite
+/// `\Flagged` change on every affected message (item 0.4).
+fn set_messages_pinned(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: &[EmailSummary], pinning: bool) {
+    let (add, remove) = if pinning {
+        (vec![SystemFlagBit::Flagged], Vec::new())
+    } else {
+        (Vec::new(), vec![SystemFlagBit::Flagged])
+    };
+    let mut inverse = Vec::new();
+    for (cmd_tx, mailbox, uids) in command_targets_for(state, summaries) {
+        optimistic_toggle_pinned(state, message_list, &mailbox, &uids, pinning);
+        inverse.push(AccountCommand::StoreFlagsMany {
+            mailbox: mailbox.clone(),
+            uids: uids.clone(),
+            add: remove.clone(),
+            remove: add.clone(),
+        });
+        let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
+            mailbox,
+            uids,
+            add: add.clone(),
+            remove: remove.clone(),
+        });
+    }
+    record_undo(state, if pinning { "Pinned" } else { "Unpinned" }, inverse);
+}
+
+/// Marks `summaries` read (`mark_read`) or unread: shows it at once, one
+/// `StoreFlagsMany` per mailbox, and one undo entry - the opposite `\Seen`
+/// change on every affected message (item 0.4).
+fn set_messages_read(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: &[EmailSummary], mark_read: bool) {
+    let (add, remove) = if mark_read {
+        (vec![SystemFlagBit::Seen], Vec::new())
+    } else {
+        (Vec::new(), vec![SystemFlagBit::Seen])
+    };
+    let mut inverse = Vec::new();
+    for (cmd_tx, mailbox, uids) in command_targets_for(state, summaries) {
+        optimistic_toggle_read(state, message_list, &mailbox, &uids, mark_read);
+        inverse.push(AccountCommand::StoreFlagsMany {
+            mailbox: mailbox.clone(),
+            uids: uids.clone(),
+            add: remove.clone(),
+            remove: add.clone(),
+        });
+        let _ = cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
+            mailbox,
+            uids,
+            add: add.clone(),
+            remove: remove.clone(),
+        });
+    }
+    record_undo(state, if mark_read { "Marked as read" } else { "Marked as unread" }, inverse);
+}
+
+/// Runs `run` with `summary`'s body: at once when it's cached, else once
+/// `FetchBody` brings it (`UiState::body_waiter`, run by the `BodyFetched`
+/// handler). A newer request replaces a waiting one, and a body that never
+/// arrives simply drops it. A silent no-op when the account is offline.
+fn with_message_body(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, run: impl FnOnce(EmailBody) + 'static) {
+    let cached = state.borrow_mut().cached_body(&summary.mailbox, summary.uid);
+    if let Some(body) = cached {
+        run(body);
+        return;
+    }
+    let key = (summary.mailbox.clone(), summary.uid);
+    let (cmd_tx, in_flight) = {
+        let st = state.borrow();
+        let cmd_tx = mailbox_account_id(&summary.mailbox)
+            .and_then(|account_id| st.accounts.get(&account_id))
+            .map(|handle| handle.interactive_cmd_tx.clone());
+        (cmd_tx, st.pending_body_request.as_ref() == Some(&key))
+    };
+    let Some(cmd_tx) = cmd_tx else { return };
+    state.borrow_mut().body_waiter = Some(BodyWaiter {
+        mailbox: key.0.clone(),
+        uid: key.1,
+        run: Box::new(run),
+    });
+    if !in_flight {
+        let _ = cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox: key.0, uid: key.1 });
+    }
+}
+
+/// Opens a reply (`Some(mode)`) to, or a forward (`None`) of, `summary` in
+/// the reading pane - the message context menu's Reply / Reply all /
+/// Forward, which (unlike the ribbon's) may act on a message whose body
+/// hasn't loaded yet, so the composer opens once it has.
+fn reply_to_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, summary: EmailSummary, mode: Option<crate::compose::ReplyMode>) {
+    let Some((from_email, cmd_tx)) = reply_send_context(state, &summary) else { return };
+    let state_for_body = state.clone();
+    let worker = worker.clone();
+    let reading_stack = reading_stack.clone();
+    with_message_body(state, &summary.clone(), move |body| {
+        let (prefill, title) = match mode {
+            Some(mode) => (
+                crate::compose::build_reply_prefill(&summary, &body, &from_email, mode),
+                match mode {
+                    crate::compose::ReplyMode::Reply => "Reply",
+                    crate::compose::ReplyMode::ReplyAll => "Reply All",
+                },
+            ),
+            None => (crate::compose::build_forward_prefill(&summary, &body), "Forward"),
+        };
+        let rich_text_default = state_for_body.borrow().rich_text_default;
+        show_composer_in_reading_pane(
+            &state_for_body,
+            &worker,
+            &reading_stack,
+            title,
+            cmd_tx,
+            prefill,
+            rich_text_default,
+            mailbox_account_id(&summary.mailbox),
+            Some(crate::config_view::SignatureDefault::Reply),
+        );
+    });
+}
+
+/// Prints `summary` whether or not the reading pane shows it (the message
+/// context menu's Print): its body - fetched first if need be - goes through
+/// an offscreen WebView under the same remote-content policy the reading
+/// pane applies to that sender.
+fn print_message(state: &Rc<RefCell<UiState>>, parent: &gtk::Window, summary: &EmailSummary) {
+    let state_for_body = state.clone();
+    let parent = parent.clone();
+    let trust_sender = mailbox_account_id(&summary.mailbox).zip(summary.from.first().map(|a| a.address.trim().to_lowercase()));
+    with_message_body(state, summary, move |body| {
+        let html = match &body.html_body {
+            Some(html) => {
+                let (images_allowed, all_allowed) = remote_content_policy(&state_for_body, trust_sender.as_ref(), false);
+                wrap_message_with_csp(html, images_allowed, all_allowed)
+            }
+            None => plain_text_print_html(body.text_body.as_deref().unwrap_or_default()),
+        };
+        print_html_once(&html, &parent);
+    });
 }
 
 /// Records a reversible action and shows its "… / Undo" toast. A no-op when
@@ -17422,28 +17988,21 @@ fn patch_previews(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel,
     message_list.repopulate(all, key, descending);
 }
 
-/// Groups every currently-selected message in `message_list` by the
-/// `(account, mailbox)` it lives in, for the batch Delete/Archive/Report/
-/// Snooze/Flag/Mark-read button handlers - mirrors the lookup already done
-/// inline by the `FetchBody`-on-selection handler above, generalized from
-/// one message to a set of them. The account is derived from each message's
-/// own `MailboxId` rather than the view's `current_account`, so the unified
-/// "All Inboxes" list routes each message to the right account regardless of
-/// which mailboxes are mixed into the selection.
+/// Groups `summaries` by the `(account, mailbox)` they live in, for the
+/// batch Delete/Archive/Report/Snooze/Pin/Mark-read actions - the ribbon's
+/// (on the selection) and the message context menu's (item 1.17, on its
+/// targets, which may be a conversation header's messages). The account is
+/// derived from each message's own `MailboxId` rather than the view's
+/// `current_account`, so the unified "All Inboxes" list routes each message
+/// to the right account regardless of which mailboxes are mixed in.
 ///
 /// Returns one entry per distinct mailbox touched - so a batch action sends
 /// exactly one plural `AccountCommand` per mailbox, not one per message -
-/// with each group's uids in selection order. A message whose account has
+/// with each group's uids in `summaries` order. A message whose account has
 /// since disconnected is silently dropped from its group rather than failing
-/// the whole batch, same convention as this function's single-message
-/// predecessor. Empty (nothing selected, or every account disconnected)
-/// yields an empty `Vec`, which every caller below treats as a no-op loop.
-///
-/// For exactly one selected message this returns exactly one entry with
-/// `uids == vec![uid]` - a strict, behavior-preserving generalization of the
-/// function it replaces.
-fn selected_message_command_targets(message_list: &MessageListModel, state: &Rc<RefCell<UiState>>) -> Vec<(async_channel::Sender<AccountCommand>, MailboxId, Vec<Uid>)> {
-    let summaries = message_list.selected_summaries();
+/// the whole batch. No messages (or every account disconnected) yields an
+/// empty `Vec`, which every caller treats as a no-op loop.
+fn command_targets_for(state: &Rc<RefCell<UiState>>, summaries: &[EmailSummary]) -> Vec<(async_channel::Sender<AccountCommand>, MailboxId, Vec<Uid>)> {
     let st = state.borrow();
     let mut groups: HashMap<(AccountId, MailboxId), (async_channel::Sender<AccountCommand>, Vec<Uid>)> = HashMap::new();
     for summary in summaries {
@@ -17464,7 +18023,7 @@ fn selected_message_command_targets(message_list: &MessageListModel, state: &Rc<
 /// disconnected, or the selected message's body isn't in the in-memory cache
 /// (its body hasn't arrived yet, or it's outside the cache's bounded recency
 /// window) - the calling handler is then a silent no-op, same convention as
-/// `selected_message_command_target`. The
+/// `command_targets_for`. The
 /// "From" identity is the message's owning account, so replies composed from
 /// the unified view go out from the right address.
 fn selected_message_reply_context(
@@ -17919,8 +18478,8 @@ fn persist_folder_prefs(state: &Rc<RefCell<UiState>>) {
 
 /// Re-keys everything the UI holds by mailbox id after the folder `from` was
 /// renamed or moved to `to` (its subfolders move with it): the Favorites
-/// list, the folder prefs, the expanded-subfolder memory, and the open folder
-/// (with its remembered last view). The session has already re-pointed its
+/// list, the folder prefs, the expanded-subfolder memory, the recent move
+/// targets, and the open folder (with its remembered last view). The session has already re-pointed its
 /// own open folder and resyncs it under the new id.
 fn rekey_renamed_folder(state: &Rc<RefCell<UiState>>, from: &MailboxId, to: &MailboxId, delimiter: char) {
     use lookout_mail::mailbox_name::rekey_mailbox_id;
@@ -17935,6 +18494,13 @@ fn rekey_renamed_folder(state: &Rc<RefCell<UiState>>, from: &MailboxId, to: &Mai
             .into_iter()
             .map(|id| rekey_mailbox_id(&id, from, to, delimiter).unwrap_or(id))
             .collect();
+        for recent in st.recent_folders.values_mut() {
+            for id in recent.iter_mut() {
+                if let Some(rekeyed) = rekey_mailbox_id(id, from, to, delimiter) {
+                    *id = rekeyed;
+                }
+            }
+        }
         if let Some(current) = st.current_mailbox.as_ref().and_then(|current| rekey_mailbox_id(current, from, to, delimiter)) {
             st.current_mailbox = Some(current.clone());
             if matches!(st.mail_view, MailView::Single) {
@@ -17951,6 +18517,20 @@ fn rekey_renamed_folder(state: &Rc<RefCell<UiState>>, from: &MailboxId, to: &Mai
     persist_favorites(state);
     persist_folder_prefs(state);
     persist_folder_expansion(state);
+    persist_recent_folders(state, from);
+}
+
+/// Writes the recent move targets of `folder`'s account back to the UI-state
+/// database (after a folder rename or delete changed them).
+fn persist_recent_folders(state: &Rc<RefCell<UiState>>, folder: &MailboxId) {
+    let Some(account_id) = mailbox_account_id(folder) else { return };
+    let st = state.borrow();
+    if let Some(db) = &st.ui_db {
+        let recent = st.recent_folders.get(&account_id).cloned().unwrap_or_default();
+        if let Err(e) = db.set_recent_folders(&account_id, &recent) {
+            tracing::warn!("recent folders won't persist: {e}");
+        }
+    }
 }
 
 /// Forgets everything the UI holds for the folder `root` and its subfolders
@@ -17963,6 +18543,9 @@ fn forget_deleted_folder(state: &Rc<RefCell<UiState>>, root: &MailboxId, delimit
         st.favorites.retain(|id| !is_same_or_descendant(id, root, delimiter));
         st.folder_prefs.retain(|id, _| !is_same_or_descendant(id, root, delimiter));
         st.expanded_folders.retain(|id| !is_same_or_descendant(id, root, delimiter));
+        for recent in st.recent_folders.values_mut() {
+            recent.retain(|id| !is_same_or_descendant(id, root, delimiter));
+        }
         let open_was_deleted = st.current_mailbox.as_ref().is_some_and(|current| is_same_or_descendant(current, root, delimiter));
         if open_was_deleted {
             let inbox = mailbox_account_id(root)
@@ -17984,6 +18567,7 @@ fn forget_deleted_folder(state: &Rc<RefCell<UiState>>, root: &MailboxId, delimit
     persist_favorites(state);
     persist_folder_prefs(state);
     persist_folder_expansion(state);
+    persist_recent_folders(state, root);
 }
 
 /// Adds `mailbox` to, or removes it from, the folder tree's Favorites
@@ -19247,12 +19831,13 @@ const MESSAGE_SOURCE_DISPLAY_CAP: usize = 4 * 1024 * 1024;
 /// (`deliver_raw_to_details_dialog`). One dialog at a time - opening it for
 /// the same message re-presents the existing one, and for a different
 /// message replaces it.
-fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: &adw::ApplicationWindow, summary: &EmailSummary) {
+fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: &adw::ApplicationWindow, summary: &EmailSummary, page: DetailsPage) {
     // Re-present an existing dialog opened for the same message.
     {
         let st = state.borrow();
         if let Some(existing) = st.message_details.as_ref() {
             if existing.mailbox == summary.mailbox && existing.uid == summary.uid {
+                existing.pages.set_visible_child_name(page.name());
                 existing.window.present();
                 return;
             }
@@ -19379,6 +19964,7 @@ fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: &adw::Appli
     stack.add_titled(&status_stack, Some("source"), "Source");
     switcher.set_stack(Some(&stack));
     stack.set_vexpand(true);
+    stack.set_visible_child_name(page.name());
 
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     content.append(&header);
@@ -19440,6 +20026,7 @@ fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: &adw::Appli
         headers_view: headers_view.clone(),
         source_view: source_view.clone(),
         error_label: error_label.clone(),
+        pages: stack.clone(),
     });
     if !send_fetch_raw_message(state, &summary.mailbox, summary.uid) {
         error_label.set_text("The message source can't be loaded while the account is offline.");
@@ -21803,6 +22390,8 @@ mod tests {
             favorites: Vec::new(),
             favorite_display_order: Vec::new(),
             folder_prefs: HashMap::new(),
+            recent_folders: HashMap::new(),
+            body_waiter: None,
             load_remote_images: false,
             rich_text_default: true,
             trusted_senders: HashMap::new(),
@@ -23139,5 +23728,143 @@ mod tests {
             })
             .collect();
         assert_eq!(months, vec![m2, m1]);
+    }
+
+    /// The message context menu's right-click rule (item 1.17): a row inside
+    /// the selection acts on the whole selection, any other row is selected
+    /// alone first, and a conversation header acts on its messages with the
+    /// newest one for the single-message verbs.
+    #[test]
+    fn message_menu_targets_follow_the_right_click_rule() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let one = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        let two = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+        let three = summary(Uid(3), "acc:INBOX", 2026, 8, 1, 11);
+        let message_list = MessageListModel::build();
+        message_list.set_threaded(false);
+        message_list.repopulate(vec![one.clone(), two.clone(), three.clone()], SortKey::Date, true);
+        let position_of = |uid: Uid| {
+            (0..message_list.selection.n_items())
+                .find(|&p| message_list.summary_at_position(p).is_some_and(|s| s.uid == uid))
+                .expect("listed")
+        };
+        let uids = |summaries: &[EmailSummary]| summaries.iter().map(|s| s.uid.0).collect::<HashSet<_>>();
+
+        message_list.selection.select_item(position_of(Uid(1)), true);
+        message_list.selection.select_item(position_of(Uid(2)), false);
+        let (targets, primary) = message_menu_targets(
+            &message_list,
+            MessageMenuTarget::Row {
+                summary: Box::new(two.clone()),
+                position: Some(position_of(Uid(2))),
+            },
+        );
+        assert_eq!(uids(&targets), HashSet::from([1, 2]), "a row inside the selection acts on all of it");
+        assert!(primary.is_none(), "no single message for Reply among several");
+        assert_eq!(uids(&message_list.selected_summaries()), HashSet::from([1, 2]), "the selection is kept");
+
+        let (targets, primary) = message_menu_targets(
+            &message_list,
+            MessageMenuTarget::Row {
+                summary: Box::new(three.clone()),
+                position: Some(position_of(Uid(3))),
+            },
+        );
+        assert_eq!(uids(&targets), HashSet::from([3]));
+        assert_eq!(primary.map(|s| s.uid), Some(Uid(3)));
+        assert_eq!(uids(&message_list.selected_summaries()), HashSet::from([3]), "any other row is selected alone");
+
+        // `summary()` gives every message the same thread key, so threading
+        // makes one conversation of the three.
+        message_list.set_threaded(true);
+        let thread: ThreadId = (MailboxId("acc:INBOX".into()), lookout_core::ThreadKey("t".into()));
+        let (targets, primary) = message_menu_targets(&message_list, MessageMenuTarget::Thread(thread));
+        assert_eq!(uids(&targets), HashSet::from([1, 2, 3]), "a conversation header acts on every message in it");
+        assert_eq!(primary.map(|s| s.uid), Some(Uid(3)), "its newest message answers Reply");
+    }
+
+    /// Categorize's checks over several messages: checked when all carry the
+    /// category, mixed when some do.
+    #[test]
+    fn tag_check_state_is_all_some_or_none() {
+        let keyword = lookout_core::tag_keyword("work");
+        let mut tagged = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        tagged.keywords.insert(keyword.clone());
+        let plain = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+        assert_eq!(tag_check_state(&[tagged.clone(), tagged.clone()], &keyword), (true, false));
+        assert_eq!(tag_check_state(&[tagged, plain.clone()], &keyword), (false, true));
+        assert_eq!(tag_check_state(&[plain], &keyword), (false, false));
+        assert_eq!(tag_check_state(&[], &keyword), (false, false));
+    }
+
+    /// Categorize over a mixed set only stores the keyword on the messages
+    /// that lack it, and Undo takes it off exactly those.
+    #[test]
+    fn categorize_touches_only_the_messages_it_changes() {
+        let acc = AccountId("acc".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+        let keyword = lookout_core::tag_keyword("work");
+        let mut tagged = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+        tagged.keywords.insert(keyword.clone());
+        let plain = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+
+        send_keyword_store(&state, &[tagged, plain], &keyword, true);
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::StoreKeywordsMany { uids, add, remove, .. }) => {
+                assert_eq!(uids, vec![Uid(2)]);
+                assert_eq!(add, vec![keyword.clone()]);
+                assert!(remove.is_empty());
+            }
+            other => panic!("expected StoreKeywordsMany, got {other:?}"),
+        }
+        assert!(undo_last(&state));
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::StoreKeywordsMany { uids, add, remove, .. }) => {
+                assert_eq!(uids, vec![Uid(2)]);
+                assert!(add.is_empty());
+                assert_eq!(remove, vec![keyword]);
+            }
+            other => panic!("expected the undo StoreKeywordsMany, got {other:?}"),
+        }
+    }
+
+    /// Copy ▸ sends one `CopyMessagesTo` per source mailbox (skipping
+    /// messages already in the target), makes the target a recent folder,
+    /// and Undo sends `RevertCopy` for exactly what was copied.
+    #[test]
+    fn copy_to_folder_records_recent_folder_and_undoes_by_revert_copy() {
+        let acc = AccountId("acc".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1), test_mailbox(&acc, "Projects", 0)])]);
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+        let projects = MailboxId("acc:Projects".into());
+        let inbox_message = summary(Uid(4), "acc:INBOX", 2026, 8, 1, 9);
+        let already_there = summary(Uid(9), "acc:Projects", 2026, 8, 1, 10);
+
+        copy_messages_to_folder(&state, &[inbox_message, already_there], &projects);
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::CopyMessagesTo { mailbox, uids, target }) => {
+                assert_eq!(mailbox, MailboxId("acc:INBOX".into()));
+                assert_eq!(uids, vec![Uid(4)]);
+                assert_eq!(target, projects);
+            }
+            other => panic!("expected CopyMessagesTo, got {other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "the message already in Projects isn't copied");
+        assert_eq!(state.borrow().recent_folders[&acc], vec![projects.clone()]);
+
+        assert!(undo_last(&state));
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::RevertCopy { copied_from, copied_to, uids }) => {
+                assert_eq!(copied_from, MailboxId("acc:INBOX".into()));
+                assert_eq!(copied_to, projects);
+                assert_eq!(uids, vec![Uid(4)]);
+            }
+            other => panic!("expected RevertCopy, got {other:?}"),
+        }
     }
 }

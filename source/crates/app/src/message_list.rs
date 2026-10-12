@@ -1372,6 +1372,22 @@ impl MessageListModel {
         self.summary_at(position)
     }
 
+    /// Every listed message of the conversation `id`, whether or not its
+    /// header is expanded - what a right-click on a conversation header acts
+    /// on (item 1.17). Messages hidden by the active filter aren't listed,
+    /// so they aren't included either.
+    pub fn thread_messages(&self, id: &ThreadId) -> Vec<EmailSummary> {
+        let threads = self.threads.borrow();
+        let Some(tracked) = threads.get(id) else { return Vec::new() };
+        (0..tracked.store.n_items())
+            .filter_map(|i| tracked.store.item(i).and_downcast::<glib::BoxedAnyObject>())
+            .filter_map(|boxed| match &*boxed.borrow::<MessageItem>() {
+                MessageItem::Message(summary) => Some((**summary).clone()),
+                MessageItem::Section(_) | MessageItem::Thread(_) => None,
+            })
+            .collect()
+    }
+
     /// The full `EmailSummary` at flat position `i`, or `None` if that row is
     /// a section or thread header. Like `message_at`, but cloning the whole
     /// summary rather than just its `(mailbox, uid)` identity - `message_at`

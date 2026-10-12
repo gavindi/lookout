@@ -499,6 +499,35 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let restored = wait_for_event(&evt_rx, |e| undo_move_uid(e).is_some()).await;
     assert_ne!(undo_move_uid(&restored), Some(uid), "the round trip renumbers the message");
 
+    // --- Copy ▸ and its undo (item 1.17): the copy lands in the target with
+    // the original left in place, and `RevertCopy` removes the copy alone.
+    let original = undo_move_uid(&restored).unwrap();
+    let in_drafts = |e: &AccountEvent| match e {
+        AccountEvent::MessagesUpdated { mailbox, messages, .. } if *mailbox == drafts_id => Some(messages.iter().any(|m| m.subject.as_deref() == Some("undo move"))),
+        _ => None,
+    };
+    let _ = cmd_tx
+        .send(AccountCommand::CopyMessagesTo {
+            mailbox: inbox_id.clone(),
+            uids: vec![original],
+            target: drafts_id.clone(),
+        })
+        .await;
+    let _ = cmd_tx.send(AccountCommand::SyncMailbox(drafts_id.clone())).await;
+    wait_for_event(&evt_rx, |e| in_drafts(e) == Some(true)).await;
+    let _ = cmd_tx
+        .send(AccountCommand::RevertCopy {
+            copied_from: inbox_id.clone(),
+            copied_to: drafts_id.clone(),
+            uids: vec![original],
+        })
+        .await;
+    let _ = cmd_tx.send(AccountCommand::SyncMailbox(drafts_id.clone())).await;
+    wait_for_event(&evt_rx, |e| in_drafts(e) == Some(false)).await;
+    let _ = cmd_tx.send(AccountCommand::SyncMailbox(inbox_id.clone())).await;
+    let kept = wait_for_event(&evt_rx, |e| undo_move_uid(e).is_some()).await;
+    assert_eq!(undo_move_uid(&kept), Some(original), "the original stays put through copy and undo");
+
     // --- Snooze sync (item 1.15): GreenMail accepts custom keywords, so a
     // snooze moves the message to a (created-on-demand) "Scheduled" folder
     // carrying `$Lookout-snooze-<unix>`; Undo brings it back without the

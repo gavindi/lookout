@@ -42,15 +42,15 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 17 | 13 | 14 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No winmail.dat or `.msg`. |
-| Compose (5.2) | 7 | 5 | 10 | 1 | Good rich editor and identities, with undo send and schedule send. No emoji, or forwarding with attachments. |
-| Calendar (5.3) | 10 | 14 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours and a second time zone apply live. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No per-event time zone yet. |
+| Mail (5.1) | 20 | 11 | 13 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No winmail.dat or `.msg`. |
+| Compose (5.2) | 9 | 5 | 8 | 1 | Good rich editor and identities, with undo send and schedule send. No emoji, or forwarding with attachments. |
+| Calendar (5.3) | 11 | 13 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours and a second time zone apply live. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No per-event time zone yet. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 3 | 3 | 5 | 1 | VTODO and Google Tasks CRUD. No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **48** | **47** | **57** | **5** | ~31% at parity, ~30% partial |
+| **Total** | **54** | **44** | **54** | **5** | ~34% at parity, ~28% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -97,7 +97,7 @@ There is a full map in SCAFFOLD.md. These are the extension points the roadmap r
 | JSON config | `source/crates/app/src/app_config.rs` (`settings.json`) | Rules (client-side), category master list, signature defaults |
 | GSettings | `source/data/gschema/io.github.gavindi.Lookout.gschema.xml` | Scalar preferences (week start, reading-pane position, mark-as-read delay) |
 | UI state and dispatch | `source/crates/app/src/window.rs` (`UiState`, `CalendarUiState`) | All UI |
-| Context menus (pattern) | `source/crates/app/src/folder_menu.rs` | Message, event, contact and task context menus |
+| Context menus | `source/crates/app/src/context_menu.rs` (builder); `folder_menu.rs`, `message_menu.rs` (1.17) | Folder and message menus today; event, contact and task menus next |
 | Shortcut registry | `source/crates/app/src/shortcuts.rs` | Outlook keymap preset, new actions |
 | Notifications | `mail_notifications.rs`, `reminders.rs` (`ReminderEngine`), `tray.rs`, `launcher_entry.rs` | Reminders window, scheduled-send notices |
 | Microsoft auth | `microsoft_oauth.rs` (`EXCHANGE_SCOPES`, `GRAPH_SCOPES`, `COMBINED_SCOPES`) | `lookout-graph` |
@@ -271,7 +271,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-35 | Phishing / unverified-sender / external banners | `EmailBody.auth_results` exists, never filled | ❌ | §4.1 |
 | M-36 | Translate | — | ❌ | Pluggable provider (LibreTranslate, or the assistant endpoint) |
 | M-37 | Immersive Reader / zoom | Dark message theme toggle | 🟡 | Ctrl+scroll / Ctrl+± zoom on the WebKit view; reader mode |
-| M-38 | Message context menu | Row right-click shows only category toggles (`window.rs`) | 🟡 | Full Outlook menu: reply, forward, mark, flag, categorise, move, rules, junk, ignore, delete, view source |
+| M-38 | Message context menu | Right-click (or Shift+F10 / Menu) on a row or conversation header: Reply, Reply all, Forward · Delete, Archive, Move ▸, Copy ▸ (recent folders, Other folder…) · Mark as read/unread, Flag ▸, Pin, Snooze ▸, Categorize ▸ · Report ▸ · View ▸ details / source · Open in new window, Print (`message_menu.rs`, 1.17) | ✅ | Ignore (2.8), Block ▸ (2.9), Rules ▸ Create rule (2.5) and Report phishing / Not junk (1.24) join it as those land |
 | M-39 | Notifications | `mail_notifications.rs`, tray, badge | ✅ | Add per-folder / VIP-only options |
 | M-40 | Work offline / outbox | Cache-first reads; NetworkMonitor-aware errors; sends queue in the local outbox, and a banner above the message list lists waiting, scheduled and failed ones (Send now / Retry / Edit) | 🟡 | "Work offline" toggle; an Outbox folder in the folder pane |
 | M-41 | List-unsubscribe | One-click POST plus mailto | ✅ | (Better than classic Outlook) |
@@ -454,7 +454,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 | UX-03 | **Junk Email** | Server folder name shown verbatim (e.g. "Junk Mail") | Show the well-known display name for SPECIAL-USE roles (Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive), with an option to "Use server folder names" |
 | UX-04 | **New mail** / **New event** / **New contact** / **New task** | Tray says "Compose…"; ribbon icon has no label | "New mail" everywhere (tray, ribbon, menus) |
 | UX-05 | **Report** ▸ Report junk / Report phishing / Not junk | "Report" (junk only) | Split button with the three verbs (M-17, S-09) |
-| UX-06 | **Move to** ▸ (recent folders, Other folder…) | Drag-and-drop only | Ribbon and context-menu action (UX-21) |
+| UX-06 | **Move to** ▸ (recent folders, Other folder…) | Drag-and-drop; context menu Move ▸ / Copy ▸ with recent folders and Other folder… (1.17) | Ribbon action (UX-21), reusing the context menu's recent folders |
 | UX-07 | **Read / Unread**, **Mark all as read** | "Mark read/unread" toggle | Label shows the action that will happen ("Mark as unread" on a read message) |
 | UX-08 | **Discard** (compose) | Trash icon | Tooltip and accessible name "Discard" |
 | UX-09 | **Automatic replies**, **Focused / Other**, **Sweep**, **Quick steps**, **Rules**, **Reading pane**, **My Day**, **To Do** | Mostly absent (features missing) | Use these exact names when the features land |
@@ -494,7 +494,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 | UX-33 | Info bars | Stacked bars above the body: "You replied to this message on …" / "You forwarded …", "Some content has been blocked — Show blocked content", "This sender is external", "This message was identified as junk — It's not junk", "Follow up. Due by …", "This item will be deleted in N days", importance/sensitivity notes | Remote-content banner ✅; read-receipt banner ✅; invitation banner ✅; "Follow up. Due by …" ✅ | One info-bar stack component with Outlook's wording and order. Add replied/forwarded (`\Answered`/`$Forwarded`), external (S-06), junk ("It's not junk"), follow-up (M-10), importance/sensitivity (M-12, C-06) | M |
 | UX-34 | Attachments in reading pane | Tiles (file-type icon, name, size) under the header; each tile ▾: Preview, Download, Save to…; "Download all" / "Save all" link | Attachment rows with a ☰ menu (Open / Open with / Save) ✅ | Tile layout, Preview as the default click (M-32, 7.3), "Download all" (M-33) | S |
 | UX-35 | Conversation in reading pane | Stacked message cards, newest on top (option): older collapsed to sender + one-line preview, click to expand; inline "Reply" at the top | One message at a time | Implement with 1.7 (M-04) | L |
-| UX-36 | Message context menu | Reply, Reply all, Forward · Delete, Archive, Move ▸, Copy ▸ · Mark as unread, Flag ▸, Pin, Snooze ▸, Categorize ▸ · Ignore, Report ▸, Block ▸ · Rules ▸ Create rule · View ▸ · Open in new window, Print | Category toggles only | Exactly this list and order (M-38, 1.17) | M |
+| UX-36 | Message context menu | Reply, Reply all, Forward · Delete, Archive, Move ▸, Copy ▸ · Mark as unread, Flag ▸, Pin, Snooze ▸, Categorize ▸ · Ignore, Report ▸, Block ▸ · Rules ▸ Create rule · View ▸ · Open in new window, Print | This list and order ✅ (1.17), less Ignore, Block ▸ and Rules ▸; Report ▸ holds Report junk only | Add Ignore (2.8), Block ▸ (2.9), Rules ▸ Create rule (2.5) and Report phishing / Not junk (1.24) in their slots | S |
 | UX-37 | Default open / navigation | Single-click selects (marks read per setting); **double-click or Enter opens a separate window**; after delete/move: "open next item" (setting: next / previous / return to list); Esc closes a popped-out item | Single-click opens in the pane; double-click/Enter open a standalone window (1.9); Esc closes that window, and **hides** the reading pane in the main window | "After moving or deleting" setting. Esc should close popped-out items in the main window too, not hide the reading pane (remap Lookout's close-pane action, or keep it only in the Lookout keymap) | S |
 | UX-38 | Drag and drop | Drag to a folder = move; **Ctrl+drag = copy**; drag onto the Calendar app icon / My Day calendar = new event; onto To Do = task; onto a category is not supported | Rows → folders/tags; out as `.eml` ✅ | Add Ctrl=copy, drop on nav-rail Calendar/Tasks icons and My Day (UX-18). Keep drop-on-category (a Lookout extra) | S |
 | UX-39 | Sender avatars | Contact photo if known, else coloured initials; setting "Show sender images" | Coloured initials ✅ | Photos from vCard / Graph (P-03); on/off setting | S |
@@ -618,14 +618,14 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.14 | ✅ ~~Schedule send~~ | C-08 | Send menu → "Schedule send" date-time; 0.3 `not_before`; banner listing scheduled items; Graph deferred send on Microsoft 365 later (5.x) | M |
 | 1.15 | ✅ ~~Snooze presets and sync~~ | M-11 | Preset menu plus custom; Scheduled folder plus keyword (§4.2) | M |
 | 1.16 | ✅ ~~Follow-up flags~~ | M-10, T-03 | Message-level flag state (keyword `$Lookout-flag-due-<date>` / `$Lookout-flag-done`; Graph `followupFlag` on Microsoft 365); presets; due column; tasks view shows flagged mail; Pin stays separate | L |
-| 1.17 | Message context menu | M-38 | 0.5; full Outlook item menu | M |
+| 1.17 | ✅ ~~Message context menu~~ | M-38 | 0.5; full Outlook item menu | M |
 | 1.18 | Outlook keyboard preset | UI-04 | §4.7 table as a second defaults set; picker in Settings; new actions (move to folder, next/previous, mark unread, new event/task/contact, F9) | M |
 | 1.19 | Attachment reminder | C-16 | Regex over body (localisable word list) on send → dialog | S |
 | 1.20 | Emoji, file drop, zoom | C-14, C-15, M-37 | `gtk::EmojiChooser`; drop target on composer; WebKit zoom level plus Ctrl+±/scroll | S |
 | 1.21 | TNEF decode | M-45 | §4.6 in `core/src/interop/tnef.rs`, hooked into `mail/src/structure.rs` | M |
 | 1.22 | Open `.msg` | M-29 | `cfb` plus a property mapper → `EmailBody` for the viewer; drag-in to APPEND | M |
 | 1.23 | Save all / zip | M-33 | Folder chooser plus `zip` crate | S |
-| 1.24 | Junk keywords and Not Junk | M-17 | `$Junk`/`$NotJunk`; "Not junk" in the Junk folder | S |
+| 1.24 | Junk keywords and Not Junk | M-17 | `$Junk`/`$NotJunk`; "Not junk" in the Junk folder, also under the context menu's Report ▸ (`message_menu.rs`) | S |
 
 ### Phase 2: Organise and search
 
@@ -635,11 +635,11 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 2.2 | Search query language | M-18 | Parser in `mail/src/search_query.rs`: `from: to: cc: subject: body: has:attachment is:unread is:read is:flagged is:pinned category: received:>=2026-01-01 received:lastweek size:>1MB folder:`; compile to FTS5 `MATCH` plus SQL predicates locally and IMAP `SEARCH` keys remotely; keep `sanitize_fts_query` for free text | M |
 | 2.3 | Search UI: refiners, scope, history | M-18 | Scope dropdown (current folder / subfolders / account / all); refiner chips; recent searches in `ui_state_db` | M |
 | 2.4 | Search Folders | M-19 | Saved queries as virtual folders in the tree (unread mail, flagged, from VIPs, large mail, custom) | M |
-| 2.5 | Rules engine | M-14 | One model, `Rule { conditions: [From/To/Subject/Body/Header/HasAttachment/Importance/Size/SentOnlyToMe/List-Id], exceptions, actions: [Move/Copy/Delete/Flag/Categorise/MarkRead/Forward/Redirect/StopProcessing] }`, executed by three backends: (a) **client**, run on `NewMessages` in the session; (b) **Sieve** via ManageSieve (§4.5) when the server advertises it; (c) **Graph** `messageRules`. Rules UI shows where each rule runs; "Run rules now" on a folder; "Create rule…" from a message. | L |
+| 2.5 | Rules engine | M-14 | One model, `Rule { conditions: [From/To/Subject/Body/Header/HasAttachment/Importance/Size/SentOnlyToMe/List-Id], exceptions, actions: [Move/Copy/Delete/Flag/Categorise/MarkRead/Forward/Redirect/StopProcessing] }`, executed by three backends: (a) **client**, run on `NewMessages` in the session; (b) **Sieve** via ManageSieve (§4.5) when the server advertises it; (c) **Graph** `messageRules`. Rules UI shows where each rule runs; "Run rules now" on a folder; "Create rule…" from a message (and the context menu's Rules ▸, `message_menu.rs`). | L |
 | 2.6 | Quick Steps | M-15 | Named action chains (reuses rule actions) in the ribbon and a shortcut slot | M |
 | 2.7 | Sweep | M-16 | Dialog from a message: delete/move all from sender, keep latest, delete older than 10 days; optional standing rule | M |
-| 2.8 | Ignore / Clean up conversation | M-20 | Ignore: thread-ID list, client rule moves new arrivals to Deleted. Clean up: delete messages whose text is wholly quoted in a later message | M |
-| 2.9 | Safe / blocked senders | M-17 | Lists in `ui_state_db`, enforced by the client rule backend; "Block sender" in the context menu; trusted senders (S-01) reuse the safe list | S |
+| 2.8 | Ignore / Clean up conversation | M-20 | Ignore: thread-ID list, client rule moves new arrivals to Deleted; "Ignore" in the context menu (`message_menu.rs`). Clean up: delete messages whose text is wholly quoted in a later message | M |
+| 2.9 | Safe / blocked senders | M-17 | Lists in `ui_state_db`, enforced by the client rule backend; "Block sender" in the context menu (`message_menu.rs`); trusted senders (S-01) reuse the safe list | S |
 | 2.10 | My Templates | C-17 | Stored HTML snippets; insert from the composer | S |
 | 2.11 | Automatic replies | M-24 | Settings page: on/off, schedule, internal/external messages; Graph `automaticRepliesSetting` or Sieve `vacation`; banner in Mail while active | M |
 | 2.12 | Focused Inbox | M-03 | Microsoft 365: read `inferenceClassification`, "Move to Focused/Other" writes overrides. Elsewhere, optional local classifier (sender seen in Sent/contacts = Focused; bulk/List-Id = Other). Tabs above the Inbox list | L |

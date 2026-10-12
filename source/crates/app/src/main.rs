@@ -36,6 +36,7 @@ mod lookout_view;
 mod mail_notifications;
 mod message_header;
 mod message_list;
+mod message_menu;
 mod message_window;
 mod microsoft_oauth;
 mod online_accounts;

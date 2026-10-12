@@ -189,6 +189,12 @@ impl UiStateDb {
                 color TEXT,
                 count_mode TEXT NOT NULL DEFAULT 'unread'
             );
+            CREATE TABLE IF NOT EXISTS recent_folders (
+                account TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                mailbox_id TEXT NOT NULL,
+                PRIMARY KEY (account, position)
+            );
             ",
         )?;
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
@@ -338,6 +344,34 @@ impl UiStateDb {
             for (mailbox, pref) in prefs.iter().filter(|(_, pref)| !pref.is_default()) {
                 stmt.execute(rusqlite::params![mailbox.0, pref.color, pref.count_mode.as_str()])?;
             }
+        }
+        tx.commit()
+    }
+
+    /// Each account's recently used message-move/copy targets, most recent
+    /// first - the message context menu's Move ▸ / Copy ▸ shortcuts (item
+    /// 1.17). Persisted as a preference: the version wipe leaves it alone.
+    pub fn load_recent_folders(&self) -> rusqlite::Result<HashMap<AccountId, Vec<MailboxId>>> {
+        let mut stmt = self.conn.prepare("SELECT account, mailbox_id FROM recent_folders ORDER BY account, position")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out: HashMap<AccountId, Vec<MailboxId>> = HashMap::new();
+        for row in rows {
+            let (account, mailbox) = row?;
+            out.entry(AccountId(account)).or_default().push(MailboxId(mailbox));
+        }
+        Ok(out)
+    }
+
+    /// Replaces `account`'s recent-folder list with `folders` (most recent
+    /// first); an empty list removes it.
+    pub fn set_recent_folders(&self, account: &AccountId, folders: &[MailboxId]) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM recent_folders WHERE account = ?1", [&account.0])?;
+        for (position, mailbox) in folders.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO recent_folders (account, position, mailbox_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![account.0, position as i64, mailbox.0],
+            )?;
         }
         tx.commit()
     }
@@ -715,6 +749,41 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, "@news.example");
         assert_eq!(loaded[0].2, lookout_core::TrustLevel::Images);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recent_folders_round_trip_replace_and_wipe_survival() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("recent-folders");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_recent_folders().unwrap().is_empty());
+        let work = AccountId("work".into());
+        let home = AccountId("home".into());
+        let projects = MailboxId("work:Projects".into());
+        let receipts = MailboxId("work:Receipts".into());
+        db.set_recent_folders(&work, &[receipts.clone(), projects.clone()]).unwrap();
+        db.set_recent_folders(&home, &[MailboxId("home:Family".into())]).unwrap();
+        let loaded = db.load_recent_folders().unwrap();
+        assert_eq!(loaded[&work], vec![receipts.clone(), projects.clone()], "order is kept");
+        assert_eq!(loaded[&home], vec![MailboxId("home:Family".into())]);
+
+        // Replace semantics, per account; an empty list removes the account.
+        db.set_recent_folders(&work, std::slice::from_ref(&projects)).unwrap();
+        db.set_recent_folders(&home, &[]).unwrap();
+        let loaded = db.load_recent_folders().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[&work], vec![projects.clone()]);
+
+        // A preference: the version wipe leaves it alone.
+        db.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
+        drop(db);
+        let upgraded = UiStateDb::open().unwrap();
+        assert_eq!(upgraded.load_recent_folders().unwrap()[&work], vec![projects]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

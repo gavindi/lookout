@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag to build and release (e.g. 0.9.170)"
+        description: "Git tag to build and release (e.g. 0.9.171)"
         required: true
 
 defaults:

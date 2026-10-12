@@ -464,6 +464,28 @@ pub enum AccountCommand {
         moved_to: MailboxId,
         uids: Vec<Uid>,
     },
+    /// Copies `uids` from `mailbox` into `target` (the message context
+    /// menu's Copy ▸, item 1.17): `UID COPY` over the joined UID set, the
+    /// originals staying where they are. The session records where the
+    /// copies landed - the `COPYUID` map (UIDPLUS), else the cached
+    /// `Message-ID` plus the target's pre-copy `UIDNEXT` - so `RevertCopy`
+    /// removes exactly them. A failure is answered with an `Error`.
+    CopyMessagesTo {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        target: MailboxId,
+    },
+    /// Undoes an earlier `CopyMessagesTo`: permanently removes from
+    /// `copied_to` the copies made of `uids` in `copied_from` (`\Deleted` +
+    /// expunge), found the way `RevertMove` finds moved messages. A
+    /// `Message-ID` search only looks above the target's pre-copy `UIDNEXT`,
+    /// so a message that was already there is never touched. Answered with
+    /// an `Error` if none of the copies can be found.
+    RevertCopy {
+        copied_from: MailboxId,
+        copied_to: MailboxId,
+        uids: Vec<Uid>,
+    },
     /// Permanently deletes every message in `mailbox` - the "empty Trash /
     /// Junk" quick action, so the UI only offers it for those roles. SELECTs
     /// the mailbox on demand, then `UID SEARCH ALL` + STORE `\Deleted` +
@@ -1187,6 +1209,10 @@ pub async fn run_account_session(
     // Outlives a reconnect, like `prefetch_failures`: undo is offered for a
     // few seconds and a network blip in between mustn't defeat it.
     let mut move_ledger = MoveLedger::default();
+    // Where this session's copies landed, for undo (`RevertCopy`) - kept
+    // apart from `move_ledger` so copying and then moving the same message
+    // can't overwrite one record with the other.
+    let mut copy_ledger = MoveLedger::default();
 
     // The dedicated IDLE-only connection's coordination channels (see
     // `run_idle_supervisor`/`run_idle_connection` and the design note above
@@ -1217,6 +1243,7 @@ pub async fn run_account_session(
             carried_command.take(),
             &mut prefetch_failures,
             &mut move_ledger,
+            &mut copy_ledger,
         )
         .await
         {
@@ -1303,6 +1330,7 @@ async fn connect_and_run(
     mut carried_command: Option<AccountCommand>,
     prefetch_failures: &mut HashMap<MailboxId, u32>,
     move_ledger: &mut MoveLedger,
+    copy_ledger: &mut MoveLedger,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
     let (mut session, caps) = login(config, credential).await?;
@@ -2780,6 +2808,132 @@ async fn connect_and_run(
                         }
                         Err(e) => {
                             tracing::warn!(%moved_from, %moved_to, "undo move failed: {e}");
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't undo: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::CopyMessagesTo { mailbox, uids, target } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let prefix = format!("{}:", account_id.0);
+                    let (Some(path), Some(target_path)) = (mailbox.0.strip_prefix(&prefix).map(str::to_string), target.0.strip_prefix(&prefix).map(str::to_string)) else {
+                        continue;
+                    };
+                    if path == target_path {
+                        continue;
+                    }
+                    // The target's UIDNEXT before the copy: every copy lands
+                    // at or above it, which bounds `RevertCopy`'s Message-ID
+                    // fallback to the copies alone. STATUS runs before the
+                    // SELECT so the target is never the selected mailbox
+                    // (RFC 3501 §6.3.10 advises against STATUS on it).
+                    let floor = match session.status(&target_path, "(UIDNEXT)").await {
+                        Ok(meta) => meta.uid_next.map(Uid),
+                        Err(e) => {
+                            tracing::warn!(%target, "STATUS before copy failed: {e}");
+                            None
+                        }
+                    };
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    match copy_uids_to_path(&mut session, &uids, &target_path).await {
+                        Ok(copied) => {
+                            let message_ids = cached_message_ids(cache, &mailbox, &uids).await;
+                            copy_ledger.record_above(&mailbox, &target, &uids, &copied, &message_ids, floor);
+                            refresh_folders_targeted(
+                                &mut session,
+                                &mut folders,
+                                &account_id,
+                                std::slice::from_ref(&target),
+                                &current_mailbox_id,
+                                condstore,
+                                cache,
+                                events,
+                                &mut dirty_mailboxes,
+                            )
+                            .await;
+                            sync_mailbox(
+                                &mut session,
+                                &account_id,
+                                &current_mailbox_name,
+                                &current_mailbox_id,
+                                events,
+                                cache,
+                                &mut folders,
+                                interactive_commands,
+                                Some(&session_selected),
+                                condstore,
+                                qresync,
+                            )
+                            .await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                        Err(e) => {
+                            tracing::warn!(%mailbox, %target, "copy failed: {e}");
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't copy messages: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::RevertCopy { copied_from, copied_to, uids } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let Some(to_path) = copied_to.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    if session_selected != copied_to {
+                        session.select(&to_path).await?;
+                        session_selected = copied_to.clone();
+                    }
+                    let removed = match resolve_moved_uids(&mut session, copy_ledger, &copied_from, &copied_to, &uids).await {
+                        Ok(found) if found.is_empty() => Err("the copies are no longer there".to_string()),
+                        Ok(found) => purge_uids(&mut session, &found, has_uidplus).await.map(|_| found).map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    match removed {
+                        Ok(found) => {
+                            if let Some(Err(e)) = cache_op(cache, {
+                                let copied_to = copied_to.clone();
+                                move |c| c.delete_messages(&copied_to, &found)
+                            })
+                            .await
+                            {
+                                tracing::warn!("failed to drop removed copies from cache: {e}");
+                            }
+                            emit_cached_messages_after_removal(cache, &copied_to, events).await;
+                            refresh_folders_targeted(
+                                &mut session,
+                                &mut folders,
+                                &account_id,
+                                std::slice::from_ref(&copied_to),
+                                &current_mailbox_id,
+                                condstore,
+                                cache,
+                                events,
+                                &mut dirty_mailboxes,
+                            )
+                            .await;
+                            sync_mailbox(
+                                &mut session,
+                                &account_id,
+                                &current_mailbox_name,
+                                &current_mailbox_id,
+                                events,
+                                cache,
+                                &mut folders,
+                                interactive_commands,
+                                Some(&session_selected),
+                                condstore,
+                                qresync,
+                            )
+                            .await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                        Err(e) => {
+                            tracing::warn!(%copied_from, %copied_to, "undo copy failed: {e}");
                             let _ = events.send(AccountEvent::Error(format!("Couldn't undo: {e}"))).await;
                         }
                     }
@@ -4345,19 +4499,14 @@ async fn move_message_to_role(
 async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], path: &str, has_move: bool, has_uidplus: bool) -> Result<Vec<(Uid, Uid)>> {
     let uid_chunks = uid_set_chunks(uids);
     let mut moved = Vec::new();
-    let mut record = |copy_uid: Option<async_imap::types::CopyUid>| {
-        if let Some(copy_uid) = copy_uid {
-            moved.extend(copy_uid.pairs.into_iter().map(|(from, to)| (Uid(from), Uid(to))));
-        }
-    };
     if has_move {
         for uid_set in &uid_chunks {
-            record(session.uid_mv_mapped(uid_set, path).await?);
+            if let Some(copy_uid) = session.uid_mv_mapped(uid_set, path).await? {
+                moved.extend(copy_uid.pairs.into_iter().map(|(from, to)| (Uid(from), Uid(to))));
+            }
         }
     } else {
-        for uid_set in &uid_chunks {
-            record(session.uid_copy_mapped(uid_set, path).await?);
-        }
+        moved = copy_uids_to_path(session, uids, path).await?;
         for uid_set in &uid_chunks {
             let _: Vec<_> = session.uid_store(uid_set, "+FLAGS (\\Deleted)").await?.try_collect().await?;
         }
@@ -4376,6 +4525,21 @@ async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], p
     Ok(moved)
 }
 
+/// `UID COPY` of `uids` from the *currently selected* mailbox into `path`,
+/// one command per UID-set chunk - the Copy ▸ path (`CopyMessagesTo`) and the
+/// first half of a MOVE on servers without RFC 6851. Returns the `(source
+/// UID, copy UID)` pairs from the `COPYUID` response codes (RFC 4315); empty
+/// when the server doesn't send them.
+async fn copy_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], path: &str) -> Result<Vec<(Uid, Uid)>> {
+    let mut copied = Vec::new();
+    for uid_set in &uid_set_chunks(uids) {
+        if let Some(copy_uid) = session.uid_copy_mapped(uid_set, path).await? {
+            copied.extend(copy_uid.pairs.into_iter().map(|(from, to)| (Uid(from), Uid(to))));
+        }
+    }
+    Ok(copied)
+}
+
 /// How many moved messages `MoveLedger` remembers. Undo is only offered for
 /// a few seconds after a move, so this only has to outlast a burst of moves.
 const MOVE_LEDGER_CAPACITY: usize = 2048;
@@ -4390,6 +4554,10 @@ struct MovedMessage {
     /// Its `Message-ID` (bare), from the cached envelope, for finding it by
     /// search when there's no `new_uid` (or it has gone stale).
     message_id: Option<String>,
+    /// The lowest UID it can have in `to` - the destination's `UIDNEXT`
+    /// before a copy - so a `Message-ID` search never picks a message that
+    /// was there beforehand (the original, for a copy). `None` for moves.
+    floor: Option<Uid>,
 }
 
 /// Where the messages this session moved ended up, keyed by `(source
@@ -4409,12 +4577,20 @@ impl MoveLedger {
     /// `COPYUID` pairing (possibly empty) and `message_ids` the cached
     /// `Message-ID`s by source UID.
     fn record(&mut self, from: &MailboxId, to: &MailboxId, uids: &[Uid], moved: &[(Uid, Uid)], message_ids: &HashMap<Uid, String>) {
+        self.record_above(from, to, uids, moved, message_ids, None);
+    }
+
+    /// `record` for a copy: `floor` is `to`'s `UIDNEXT` before the copy,
+    /// below which a `Message-ID` search must not look (see
+    /// [`MovedMessage::floor`]).
+    fn record_above(&mut self, from: &MailboxId, to: &MailboxId, uids: &[Uid], moved: &[(Uid, Uid)], message_ids: &HashMap<Uid, String>, floor: Option<Uid>) {
         let new_uids: HashMap<Uid, Uid> = moved.iter().copied().collect();
         for &uid in uids {
             let entry = MovedMessage {
                 to: to.clone(),
                 new_uid: new_uids.get(&uid).copied(),
                 message_id: message_ids.get(&uid).cloned(),
+                floor,
             };
             if entry.new_uid.is_none() && entry.message_id.is_none() {
                 continue;
@@ -4490,8 +4666,16 @@ async fn resolve_moved_uids(session: &mut Session<SessionStream>, ledger: &mut M
             continue;
         }
         let Some(message_id) = moved.message_id else { continue };
-        let found = session.uid_search(format!("HEADER Message-Id {}", imap_quote(&format!("<{message_id}>")))).await?;
-        if let Some(uid) = found.into_iter().map(Uid).filter(|uid| !resolved.contains(uid)).max_by_key(|uid| uid.0) {
+        let header = format!("HEADER Message-Id {}", imap_quote(&format!("<{message_id}>")));
+        let query = match moved.floor {
+            Some(floor) => format!("UID {}:* {header}", floor.0),
+            None => header,
+        };
+        // `n:*` still matches the highest UID when every UID is below `n`
+        // (RFC 3501 §6.4.8), hence the floor is re-checked on the results.
+        let found = session.uid_search(query).await?;
+        let above_floor = |uid: &Uid| moved.floor.is_none_or(|floor| uid.0 >= floor.0);
+        if let Some(uid) = found.into_iter().map(Uid).filter(|uid| above_floor(uid) && !resolved.contains(uid)).max_by_key(|uid| uid.0) {
             resolved.push(uid);
         }
     }
@@ -4894,10 +5078,24 @@ async fn purge_by_message_id(session: &mut Session<SessionStream>, message_id: &
 /// UID is known, and whose `Message-ID` may be missing on foreign drafts).
 /// Same UIDPLUS caveat as `purge_by_message_id`'s non-UIDPLUS fallback.
 async fn purge_uid(session: &mut Session<SessionStream>, uid: Uid, has_uidplus: bool) -> Result<()> {
-    let uid_set = uid.0.to_string();
-    let _: Vec<_> = session.uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    purge_uids(session, &[uid], has_uidplus).await
+}
+
+/// Permanently removes `uids` from the *currently selected* mailbox - the
+/// batch form of `purge_uid`, used by `RevertCopy` to take back copies. Same
+/// UIDPLUS caveat as `purge_by_message_id`'s non-UIDPLUS fallback.
+async fn purge_uids(session: &mut Session<SessionStream>, uids: &[Uid], has_uidplus: bool) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let chunks = uid_set_chunks(uids);
+    for uid_set in &chunks {
+        let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    }
     if has_uidplus {
-        let _: Vec<_> = session.uid_expunge(&uid_set).await?.try_collect().await?;
+        for uid_set in &chunks {
+            let _: Vec<_> = session.uid_expunge(uid_set).await?.try_collect().await?;
+        }
     } else {
         let _: Vec<_> = session.expunge().await?.try_collect().await?;
     }
@@ -7105,6 +7303,30 @@ mod tests {
         assert_eq!(ledger.entries.len(), MOVE_LEDGER_CAPACITY);
         assert_eq!(ledger.take(&inbox, Uid(2), &trash), None, "evicted");
         assert_eq!(ledger.take(&inbox, Uid(3), &trash).unwrap().new_uid, Some(Uid(100_003)));
+    }
+
+    /// A copy's ledger entry carries the target's pre-copy UIDNEXT, so
+    /// `RevertCopy`'s Message-ID fallback can't reach a message that was
+    /// already there; a move's entry has no floor.
+    #[test]
+    fn copy_ledger_entries_carry_the_target_floor() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let projects = MailboxId::new(&account, "Projects");
+        let ids: HashMap<Uid, String> = [(Uid(7), "a@example.com".to_string())].into();
+        let mut copies = MoveLedger::default();
+        copies.record_above(&inbox, &projects, &[Uid(6), Uid(7)], &[(Uid(6), Uid(40))], &ids, Some(Uid(40)));
+
+        let by_uid = copies.take(&inbox, Uid(6), &projects).unwrap();
+        assert_eq!((by_uid.new_uid, by_uid.floor), (Some(Uid(40)), Some(Uid(40))));
+        let by_id = copies.take(&inbox, Uid(7), &projects).unwrap();
+        assert_eq!(by_id.new_uid, None);
+        assert_eq!(by_id.message_id.as_deref(), Some("a@example.com"));
+        assert_eq!(by_id.floor, Some(Uid(40)));
+
+        let mut moves = MoveLedger::default();
+        moves.record(&inbox, &projects, &[Uid(7)], &[], &ids);
+        assert_eq!(moves.take(&inbox, Uid(7), &projects).unwrap().floor, None);
     }
 
     #[test]

@@ -275,9 +275,7 @@ impl ContextMenu {
     }
 
     /// Inserts the action group on an arbitrary widget - the manual-popover
-    /// path (a message row's right-click, item 1.17). The folder menu uses
-    /// `attach_button` instead, hence the allow.
-    #[allow(dead_code)]
+    /// path (a message row's right-click, item 1.17).
     pub fn insert_action_group(&self, widget: &impl IsA<gtk::Widget>, namespace: &str) {
         widget.insert_action_group(namespace, Some(&self.actions));
     }

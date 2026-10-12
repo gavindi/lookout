@@ -199,7 +199,7 @@ IMAP directly, only sends commands and reacts to events.
 **`AccountCommand`** (`session.rs`) — every variant: `SyncMailbox`, `FetchBody`,
 `FetchAttachment`, `FetchRawMessage`, `Refresh`, `SendMessage { message, not_before, client_token }`,
 `CancelOutbox`, `RescheduleOutbox`, `WakeSnoozed`, `Reconnect`,
-`SetPrefetchPolicy`, `MoveMessage`/`MoveMessages`/`MoveMessagesTo`, `EmptyMailbox`,
+`SetPrefetchPolicy`, `MoveMessage`/`MoveMessages`/`MoveMessagesTo`, `CopyMessagesTo`/`RevertCopy`, `EmptyMailbox`,
 `SnoozeMessage`/`SnoozeMessages`, `StoreFlags`/`StoreFlagsMany`, `StoreKeywords`/
 `StoreKeywordsMany`, `SetFollowUp`, `ApplyRemoteFollowUps`, `PrefetchBodies`, `SaveDraft`/`DeleteDraft`,
 `SearchMailbox`, `Shutdown`.
@@ -840,7 +840,10 @@ management, keyring-backed; `theme.rs` — bundled named-color CSS theming; `bac
 — window-background image persistence; `shortcuts.rs` — keyboard shortcuts matched by physical
 keycode (layout-independent); `context_menu.rs` — the shared context-menu builder (item 0.5): a
 declarative `MenuDescription` compiled to a `gio::Menu` plus a `SimpleActionGroup` routed through
-one dispatch closure, used by `folder_menu.rs` and the message/event/contact menus to come.
+one dispatch closure, used by `folder_menu.rs`, `message_menu.rs` and the event/contact menus to
+come; `message_menu.rs` — the message context menu (item 1.17): Outlook's entries and order, the
+enable rules (`message_menu_state`) and the item → `MessageMenuAction` mapping, with `window.rs`'s
+`open_message_menu`/`run_message_menu_action` running each action through the ribbon's helpers.
 `window.rs`'s `UiState.undo_stack` holds the reversible-action
 history (item 0.4): each destructive action records an `UndoEntry { id, description, inverse }`,
 shows a bottom-left toast whose Undo button reverses exactly that entry, and is also undoable with
