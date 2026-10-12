@@ -218,6 +218,9 @@ pub(crate) use self::request::Request;
 mod quota;
 pub use self::quota::*;
 
+mod copy_uid;
+pub use self::copy_uid::{expand_uid_set, CopyUid};
+
 /// Responses that the server sends that are not related to the current command.
 ///
 /// [RFC 3501](https://tools.ietf.org/html/rfc3501#section-7) states that clients need to be able

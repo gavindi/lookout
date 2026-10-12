@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 /// composed text. The app fills this in when the user (or the
 /// send-receipts-automatically policy) responds to a displayed message's
 /// `Disposition-Notification-To` request.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReadReceipt {
     /// The original message's `Message-ID`, bare or angle-bracketed - echoed
     /// into the report's `Original-Message-ID` field and the envelope's
@@ -80,7 +80,7 @@ pub struct InlineImage {
 /// fallback); `html_body`, when present, is emitted alongside it as a
 /// `multipart/alternative` so HTML-capable clients get the rich version and
 /// everything else the text.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ComposedMessage {
     pub from: String,
     /// The sending identity's display name, if any. Never sent bare: the

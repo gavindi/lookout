@@ -379,7 +379,25 @@ pub enum AccountCommand {
     /// Boxed: the message can be large (an iMIP reply carries a whole
     /// iCalendar document), and commands are passed one at a time through an
     /// mpsc channel - the heap indirection keeps the command enum compact.
-    SendMessage(Box<ComposedMessage>),
+    SendMessage {
+        message: Box<ComposedMessage>,
+        /// When the message may go out; `None` sends as soon as possible.
+        /// A few seconds ahead is undo send (item 1.13), further out is
+        /// schedule send (item 1.14).
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+        /// An opaque caller-chosen tag echoed back on `OutboxQueued` (and on
+        /// `OutboxFailed` if queueing itself fails), so the UI can tie the
+        /// outbox row to the send it started.
+        client_token: Option<u64>,
+    },
+    /// Withdraws a queued outbox row before it goes out - undo send (item
+    /// 1.13). Answered with `OutboxCancelled` when the row was still waiting,
+    /// or `OutboxCancelFailed` when it has already been sent (or given up
+    /// on). Commands are handled before the outbox drain runs, so a cancel
+    /// queued ahead of the row's due time always wins.
+    CancelOutbox {
+        id: i64,
+    },
     /// A hint that it's worth retrying the connection now rather than
     /// waiting out the current backoff delay - e.g. the app crate's
     /// `Gio.NetworkMonitor` reporting connectivity just came back. A no-op
@@ -425,6 +443,18 @@ pub enum AccountCommand {
         mailbox: MailboxId,
         uids: Vec<Uid>,
         target: MailboxId,
+    },
+    /// Undoes an earlier move (item 1.13): puts the messages that were
+    /// `uids` in `moved_from` back there from `moved_to`. A move gives each
+    /// message a new UID in its destination, so the session resolves them
+    /// from what it recorded when it made the move - the server's `COPYUID`
+    /// map (UIDPLUS), else a search of `moved_to` for the `Message-ID` the
+    /// message had in the local cache. Answered with an `Error` if none of
+    /// the messages can be found.
+    RevertMove {
+        moved_from: MailboxId,
+        moved_to: MailboxId,
+        uids: Vec<Uid>,
     },
     /// Permanently deletes every message in `mailbox` - the "empty Trash /
     /// Junk" quick action, so the UI only offers it for those roles. SELECTs
@@ -481,6 +511,12 @@ pub enum AccountCommand {
         mailbox: MailboxId,
         uids: Vec<Uid>,
         until: chrono::DateTime<chrono::Utc>,
+    },
+    /// Clears the local snooze on `uids` so they show again right away - the
+    /// undo of `SnoozeMessages` (item 1.13).
+    UnsnoozeMessages {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
     },
     /// Adds and/or removes IMAP system flags on one message (`STORE`), for
     /// the client-driven flag changes this app makes: marking a message read
@@ -681,6 +717,10 @@ pub enum AccountEvent {
     /// row, quoted again by the matching `OutboxSent`/`OutboxFailed`.
     OutboxQueued {
         id: i64,
+        /// The `SendMessage`'s `client_token`, echoed back.
+        client_token: Option<u64>,
+        /// When the row is due to go out.
+        not_before: chrono::DateTime<chrono::Utc>,
     },
     /// An outbox row was delivered: SMTP accepted it and it was archived to
     /// Sent. Replaces the old synchronous-send `SendCompleted`, so the UI can
@@ -696,7 +736,20 @@ pub enum AccountEvent {
     /// specific message.
     OutboxFailed {
         id: i64,
+        /// The `SendMessage`'s `client_token` when the failure was queueing
+        /// it in the first place (`id` is then 0); `None` for a delivery
+        /// failure, which is identified by `id`.
+        client_token: Option<u64>,
         message: String,
+    },
+    /// A `CancelOutbox` withdrew the row before it went out.
+    OutboxCancelled {
+        id: i64,
+    },
+    /// A `CancelOutbox` came too late: the row was already sent (or had
+    /// permanently failed), so nothing was withdrawn.
+    OutboxCancelFailed {
+        id: i64,
     },
     /// A `MoveMessage`/`MoveMessages`/`MoveMessagesTo` request failed. Kept
     /// distinct from `Error` below, mirroring `SendFailed`, so the UI can
@@ -990,6 +1043,10 @@ pub async fn run_account_session(
     // folder whose message can never be parsed instead of looping on it
     // forever (see `PREFETCH_FAILURE_LIMIT`).
     let mut prefetch_failures: HashMap<MailboxId, u32> = HashMap::new();
+    // Where this session's moves put each message, for undo (`RevertMove`).
+    // Outlives a reconnect, like `prefetch_failures`: undo is offered for a
+    // few seconds and a network blip in between mustn't defeat it.
+    let mut move_ledger = MoveLedger::default();
 
     // The dedicated IDLE-only connection's coordination channels (see
     // `run_idle_supervisor`/`run_idle_connection` and the design note above
@@ -1019,6 +1076,7 @@ pub async fn run_account_session(
             &idle_notify_rx,
             carried_command.take(),
             &mut prefetch_failures,
+            &mut move_ledger,
         )
         .await
         {
@@ -1104,6 +1162,7 @@ async fn connect_and_run(
     idle_notify: &async_channel::Receiver<MailboxId>,
     mut carried_command: Option<AccountCommand>,
     prefetch_failures: &mut HashMap<MailboxId, u32>,
+    move_ledger: &mut MoveLedger,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
     let (mut session, caps) = login(config, credential).await?;
@@ -1394,6 +1453,7 @@ async fn connect_and_run(
                                 let _ = events
                                     .send(AccountEvent::OutboxFailed {
                                         id,
+                                        client_token: None,
                                         message: format!("Couldn't send message: {e}"),
                                     })
                                     .await;
@@ -2048,55 +2108,66 @@ async fn connect_and_run(
                     };
                     let _ = events.send(AccountEvent::SearchResults { mailbox, query, messages }).await;
                 }
-                AccountCommand::SendMessage(msg) => {
+                AccountCommand::SendMessage {
+                    message: msg,
+                    not_before,
+                    client_token,
+                } => {
                     // Persist to the local outbox instead of sending inline:
                     // the drain at the top of the loop delivers it when due,
                     // so a slow SMTP server can't stall the session and the
                     // same path backs undo send, schedule send and the offline
                     // outbox (items 1.13/1.14). The raw message is built once,
                     // here.
+                    let queue_failed = |message: String| AccountEvent::OutboxFailed { id: 0, client_token, message };
                     let payload = match serde_json::to_vec(&OutboxMessage::from_composed(&msg)) {
                         Ok(payload) => payload,
                         Err(e) => {
                             tracing::warn!("couldn't serialize outgoing message: {e}");
-                            let _ = events
-                                .send(AccountEvent::OutboxFailed {
-                                    id: 0,
-                                    message: format!("Couldn't queue message: {e}"),
-                                })
-                                .await;
+                            let _ = events.send(queue_failed(format!("Couldn't queue message: {e}"))).await;
                             continue;
                         }
                     };
+                    let due = not_before.unwrap_or_else(chrono::Utc::now);
                     let queued = cache_op(cache, {
                         let account_id = account_id.clone();
-                        move |c| c.enqueue_outbox(&account_id, chrono::Utc::now(), &payload)
+                        move |c| c.enqueue_outbox(&account_id, due, &payload)
                     })
                     .await;
                     match queued {
                         Some(Ok(id)) => {
-                            next_outbox_due = Some(chrono::Utc::now());
-                            let _ = events.send(AccountEvent::OutboxQueued { id }).await;
+                            next_outbox_due = Some(next_outbox_due.map_or(due, |next| next.min(due)));
+                            let _ = events
+                                .send(AccountEvent::OutboxQueued {
+                                    id,
+                                    client_token,
+                                    not_before: due,
+                                })
+                                .await;
                         }
                         Some(Err(e)) => {
                             tracing::warn!("couldn't queue outgoing message: {e}");
-                            let _ = events
-                                .send(AccountEvent::OutboxFailed {
-                                    id: 0,
-                                    message: format!("Couldn't queue message: {e}"),
-                                })
-                                .await;
+                            let _ = events.send(queue_failed(format!("Couldn't queue message: {e}"))).await;
                         }
                         None => {
                             tracing::warn!("no cache open; dropping outgoing message");
-                            let _ = events
-                                .send(AccountEvent::OutboxFailed {
-                                    id: 0,
-                                    message: "Couldn't queue message: no local cache".to_string(),
-                                })
-                                .await;
+                            let _ = events.send(queue_failed("Couldn't queue message: no local cache".to_string())).await;
                         }
                     }
+                }
+                AccountCommand::CancelOutbox { id } => {
+                    // Only a row still `pending` is withdrawn; one already
+                    // delivered is gone from the table, and the drain can't be
+                    // mid-send here because commands and the drain share this
+                    // loop.
+                    let cancelled = matches!(cache_op(cache, move |c| c.cancel_outbox(id)).await, Some(Ok(true)));
+                    next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
+                    let event = if cancelled {
+                        AccountEvent::OutboxCancelled { id }
+                    } else {
+                        AccountEvent::OutboxCancelFailed { id }
+                    };
+                    let _ = events.send(event).await;
                 }
                 AccountCommand::SaveDraft { msg, replace } => {
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
@@ -2186,7 +2257,9 @@ async fn connect_and_run(
                         session_selected = mailbox.clone();
                     }
                     match move_message_to_role(&mut session, &folders, &account_id, &[uid], role, has_move, has_uidplus).await {
-                        Ok(()) => {
+                        Ok((destination, moved)) => {
+                            let message_ids = cached_message_ids(cache, &mailbox, &[uid]).await;
+                            move_ledger.record(&mailbox, &destination, &[uid], &moved, &message_ids);
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
                             // The MOVE already succeeded server-side, so drop the
                             // message from the cache and republish the remaining
@@ -2262,7 +2335,9 @@ async fn connect_and_run(
                         session_selected = mailbox.clone();
                     }
                     match move_message_to_role(&mut session, &folders, &account_id, &uids, role, has_move, has_uidplus).await {
-                        Ok(()) => {
+                        Ok((destination, moved)) => {
+                            let message_ids = cached_message_ids(cache, &mailbox, &uids).await;
+                            move_ledger.record(&mailbox, &destination, &uids, &moved, &message_ids);
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
                             if let Some(Err(e)) = cache_op(cache, {
                                 let mailbox = mailbox.clone();
@@ -2336,7 +2411,9 @@ async fn connect_and_run(
                         session_selected = mailbox.clone();
                     }
                     match move_uids_to_path(&mut session, &uids, &target_path, has_move, has_uidplus).await {
-                        Ok(()) => {
+                        Ok(moved) => {
+                            let message_ids = cached_message_ids(cache, &mailbox, &uids).await;
+                            move_ledger.record(&mailbox, &target, &uids, &moved, &message_ids);
                             // `Custom` here is just a marker for the generic
                             // "Moved" toast - the target was an arbitrary
                             // folder, not a special-use role.
@@ -2388,6 +2465,74 @@ async fn connect_and_run(
                                     message: format!("Couldn't move messages: {e}"),
                                 })
                                 .await;
+                        }
+                    }
+                }
+                AccountCommand::RevertMove { moved_from, moved_to, uids } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let prefix = format!("{}:", account_id.0);
+                    let (Some(from_path), Some(to_path)) = (moved_from.0.strip_prefix(&prefix).map(str::to_string), moved_to.0.strip_prefix(&prefix).map(str::to_string)) else {
+                        continue;
+                    };
+                    if from_path == to_path {
+                        continue;
+                    }
+                    if session_selected != moved_to {
+                        session.select(&to_path).await?;
+                        session_selected = moved_to.clone();
+                    }
+                    let reverted = match resolve_moved_uids(&mut session, move_ledger, &moved_from, &moved_to, &uids).await {
+                        Ok(found) if found.is_empty() => Err("the messages are no longer there".to_string()),
+                        Ok(found) => move_uids_to_path(&mut session, &found, &from_path, has_move, has_uidplus)
+                            .await
+                            .map(|_| found)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    match reverted {
+                        Ok(found) => {
+                            if let Some(Err(e)) = cache_op(cache, {
+                                let moved_to = moved_to.clone();
+                                move |c| c.delete_messages(&moved_to, &found)
+                            })
+                            .await
+                            {
+                                tracing::warn!("failed to drop un-moved messages from cache: {e}");
+                            }
+                            emit_cached_messages_after_removal(cache, &moved_to, events).await;
+                            refresh_folders_targeted(
+                                &mut session,
+                                &mut folders,
+                                &account_id,
+                                &[moved_from.clone(), moved_to.clone()],
+                                &current_mailbox_id,
+                                condstore,
+                                cache,
+                                events,
+                                &mut dirty_mailboxes,
+                            )
+                            .await;
+                            sync_mailbox(
+                                &mut session,
+                                &account_id,
+                                &current_mailbox_name,
+                                &current_mailbox_id,
+                                events,
+                                cache,
+                                &mut folders,
+                                interactive_commands,
+                                Some(&session_selected),
+                                condstore,
+                                qresync,
+                            )
+                            .await?;
+                            session_selected = current_mailbox_id.clone();
+                        }
+                        Err(e) => {
+                            tracing::warn!(%moved_from, %moved_to, "undo move failed: {e}");
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't undo: {e}"))).await;
                         }
                     }
                 }
@@ -2680,6 +2825,31 @@ async fn connect_and_run(
                         tracing::warn!("failed to record snooze: {e}");
                     }
                     let _ = events.send(AccountEvent::MessageSnoozed).await;
+                    sync_mailbox(
+                        &mut session,
+                        &account_id,
+                        &current_mailbox_name,
+                        &current_mailbox_id,
+                        events,
+                        cache,
+                        &mut folders,
+                        interactive_commands,
+                        Some(&session_selected),
+                        condstore,
+                        qresync,
+                    )
+                    .await?;
+                    session_selected = current_mailbox_id.clone();
+                }
+                AccountCommand::UnsnoozeMessages { mailbox, uids } => {
+                    if let Some(Err(e)) = cache_op(cache, {
+                        let mailbox = mailbox.clone();
+                        move |c| c.unsnooze_messages(&mailbox, &uids)
+                    })
+                    .await
+                    {
+                        tracing::warn!("failed to clear snooze: {e}");
+                    }
                     sync_mailbox(
                         &mut session,
                         &account_id,
@@ -3594,14 +3764,15 @@ async fn move_message_to_role(
     role: MailboxRole,
     has_move: bool,
     has_uidplus: bool,
-) -> Result<()> {
+) -> Result<(MailboxId, Vec<(Uid, Uid)>)> {
     let Some(target) = folders.iter().find(|m| m.role == role) else {
         return Err(Error::NoSuchFolder(role));
     };
     let Some(path) = target.id.0.strip_prefix(&format!("{}:", account_id.0)) else {
-        return Ok(());
+        return Ok((target.id.clone(), Vec::new()));
     };
-    move_uids_to_path(session, uids, path, has_move, has_uidplus).await
+    let moved = move_uids_to_path(session, uids, path, has_move, has_uidplus).await?;
+    Ok((target.id.clone(), moved))
 }
 
 /// The IMAP move itself, shared by the role-based (`MoveMessages`) and
@@ -3609,15 +3780,25 @@ async fn move_message_to_role(
 /// set (RFC 6851) when the server advertises it, else COPY + STORE
 /// `\Deleted` + EXPUNGE. `has_move`/`has_uidplus` come from the single
 /// post-login `CAPABILITY` fetch, never a per-batch round trip.
-async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], path: &str, has_move: bool, has_uidplus: bool) -> Result<()> {
+///
+/// Returns the `(source UID, destination UID)` pairs the server reported in
+/// its `COPYUID` response codes (RFC 4315) - what lets `RevertMove` find the
+/// messages again for undo. Empty when the server doesn't send them.
+async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], path: &str, has_move: bool, has_uidplus: bool) -> Result<Vec<(Uid, Uid)>> {
     let uid_chunks = uid_set_chunks(uids);
+    let mut moved = Vec::new();
+    let mut record = |copy_uid: Option<async_imap::types::CopyUid>| {
+        if let Some(copy_uid) = copy_uid {
+            moved.extend(copy_uid.pairs.into_iter().map(|(from, to)| (Uid(from), Uid(to))));
+        }
+    };
     if has_move {
         for uid_set in &uid_chunks {
-            session.uid_mv(uid_set, path).await?;
+            record(session.uid_mv_mapped(uid_set, path).await?);
         }
     } else {
         for uid_set in &uid_chunks {
-            session.uid_copy(uid_set, path).await?;
+            record(session.uid_copy_mapped(uid_set, path).await?);
         }
         for uid_set in &uid_chunks {
             let _: Vec<_> = session.uid_store(uid_set, "+FLAGS (\\Deleted)").await?.try_collect().await?;
@@ -3634,7 +3815,122 @@ async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], p
             let _: Vec<_> = session.expunge().await?.try_collect().await?;
         }
     }
-    Ok(())
+    Ok(moved)
+}
+
+/// How many moved messages `MoveLedger` remembers. Undo is only offered for
+/// a few seconds after a move, so this only has to outlast a burst of moves.
+const MOVE_LEDGER_CAPACITY: usize = 2048;
+
+/// What `MoveLedger` remembers about one moved message.
+#[derive(Debug, Clone, PartialEq)]
+struct MovedMessage {
+    /// The mailbox it was moved to.
+    to: MailboxId,
+    /// Its UID there, from the move's `COPYUID` (`None` without UIDPLUS).
+    new_uid: Option<Uid>,
+    /// Its `Message-ID` (bare), from the cached envelope, for finding it by
+    /// search when there's no `new_uid` (or it has gone stale).
+    message_id: Option<String>,
+}
+
+/// Where the messages this session moved ended up, keyed by `(source
+/// mailbox, source UID)`. A MOVE renumbers each message in its destination,
+/// so this is how `RevertMove` (undo) finds them again: by the `COPYUID` UID
+/// when the server reported one, else by `Message-ID`. Lives for the whole
+/// account session (across reconnects), bounded by [`MOVE_LEDGER_CAPACITY`]
+/// with the oldest entries evicted first.
+#[derive(Default)]
+struct MoveLedger {
+    entries: HashMap<(MailboxId, Uid), MovedMessage>,
+    order: VecDeque<(MailboxId, Uid)>,
+}
+
+impl MoveLedger {
+    /// Records that `uids` moved from `from` to `to`; `moved` is the
+    /// `COPYUID` pairing (possibly empty) and `message_ids` the cached
+    /// `Message-ID`s by source UID.
+    fn record(&mut self, from: &MailboxId, to: &MailboxId, uids: &[Uid], moved: &[(Uid, Uid)], message_ids: &HashMap<Uid, String>) {
+        let new_uids: HashMap<Uid, Uid> = moved.iter().copied().collect();
+        for &uid in uids {
+            let entry = MovedMessage {
+                to: to.clone(),
+                new_uid: new_uids.get(&uid).copied(),
+                message_id: message_ids.get(&uid).cloned(),
+            };
+            if entry.new_uid.is_none() && entry.message_id.is_none() {
+                continue;
+            }
+            let key = (from.clone(), uid);
+            if self.entries.insert(key.clone(), entry).is_none() {
+                self.order.push_back(key);
+            }
+        }
+        while self.order.len() > MOVE_LEDGER_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    /// What was recorded for the message that was `uid` in `from`, if its
+    /// last recorded move went to `to`, forgetting the entry.
+    fn take(&mut self, from: &MailboxId, uid: Uid, to: &MailboxId) -> Option<MovedMessage> {
+        let key = (from.clone(), uid);
+        if self.entries.get(&key).is_none_or(|entry| entry.to != *to) {
+            return None;
+        }
+        self.order.retain(|k| k != &key);
+        self.entries.remove(&key)
+    }
+}
+
+/// The cached `Message-ID`s (bare) of `uids` in `mailbox`, read before a move
+/// drops them from the cache, for `MoveLedger`.
+async fn cached_message_ids(cache: &CacheHandle, mailbox: &MailboxId, uids: &[Uid]) -> HashMap<Uid, String> {
+    let summaries = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let uids = uids.to_vec();
+        move |c| c.load_summaries(&mailbox, &uids)
+    })
+    .await
+    .and_then(|r| r.ok())
+    .unwrap_or_default();
+    summaries
+        .into_iter()
+        .filter_map(|(uid, summary)| {
+            let id = summary.message_id?.trim().trim_matches(|c| c == '<' || c == '>').to_string();
+            (!id.is_empty()).then_some((uid, id))
+        })
+        .collect()
+}
+
+/// Finds, in the *currently selected* mailbox (`moved_to`), the messages
+/// `RevertMove` should put back: the `COPYUID` UIDs the ledger recorded for
+/// them (kept only if they still exist - one `UID SEARCH UID` round trip),
+/// else a `HEADER Message-Id` search per message whose id was cached. A
+/// search matching several copies picks the newest (highest UID) not
+/// already chosen.
+async fn resolve_moved_uids(session: &mut Session<SessionStream>, ledger: &mut MoveLedger, moved_from: &MailboxId, moved_to: &MailboxId, uids: &[Uid]) -> Result<Vec<Uid>> {
+    let recorded: Vec<MovedMessage> = uids.iter().filter_map(|&uid| ledger.take(moved_from, uid, moved_to)).collect();
+    let candidates: Vec<Uid> = recorded.iter().filter_map(|m| m.new_uid).collect();
+    let mut present: HashSet<u32> = HashSet::new();
+    for uid_set in uid_set_chunks(&candidates) {
+        present.extend(session.uid_search(format!("UID {uid_set}")).await?);
+    }
+    let mut resolved: Vec<Uid> = Vec::new();
+    for moved in recorded {
+        if let Some(uid) = moved.new_uid.filter(|uid| present.contains(&uid.0)) {
+            resolved.push(uid);
+            continue;
+        }
+        let Some(message_id) = moved.message_id else { continue };
+        let found = session.uid_search(format!("HEADER Message-Id {}", imap_quote(&format!("<{message_id}>")))).await?;
+        if let Some(uid) = found.into_iter().map(Uid).filter(|uid| !resolved.contains(uid)).max_by_key(|uid| uid.0) {
+            resolved.push(uid);
+        }
+    }
+    Ok(resolved)
 }
 
 /// Best-effort `APPEND` of a just-sent raw message to the account's Sent
@@ -5987,6 +6283,47 @@ mod tests {
     #[test]
     fn uid_set_chunks_empty_input_sends_no_command() {
         assert!(uid_set_chunks(&[]).is_empty());
+    }
+
+    /// `RevertMove` finds moved messages through the ledger: an entry is
+    /// handed out once, only for the destination it actually went to, with
+    /// whatever was known (COPYUID UID and/or cached Message-ID); a message
+    /// with neither isn't recorded at all.
+    #[test]
+    fn move_ledger_maps_a_moved_uid_to_its_destination_once() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let trash = MailboxId::new(&account, "Trash");
+        let archive = MailboxId::new(&account, "Archive");
+        let mut ledger = MoveLedger::default();
+        let ids = HashMap::from([(Uid(10), "a@x".to_string()), (Uid(12), "c@x".to_string())]);
+        ledger.record(&inbox, &trash, &[Uid(10), Uid(11), Uid(12), Uid(13)], &[(Uid(10), Uid(501)), (Uid(11), Uid(502))], &ids);
+
+        assert_eq!(ledger.take(&inbox, Uid(10), &archive), None, "wrong destination");
+        let first = ledger.take(&inbox, Uid(10), &trash).unwrap();
+        assert_eq!((first.new_uid, first.message_id.as_deref()), (Some(Uid(501)), Some("a@x")));
+        assert_eq!(ledger.take(&inbox, Uid(10), &trash), None, "handed out once");
+        assert_eq!(ledger.take(&inbox, Uid(11), &trash).unwrap().new_uid, Some(Uid(502)));
+        let by_id = ledger.take(&inbox, Uid(12), &trash).unwrap();
+        assert_eq!((by_id.new_uid, by_id.message_id.as_deref()), (None, Some("c@x")), "no COPYUID: Message-ID only");
+        assert_eq!(ledger.take(&inbox, Uid(13), &trash), None, "nothing to find it by");
+        assert_eq!(ledger.take(&trash, Uid(501), &inbox), None, "never recorded");
+    }
+
+    /// The ledger stays bounded: the oldest moves are forgotten first.
+    #[test]
+    fn move_ledger_evicts_the_oldest_entries_past_capacity() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let trash = MailboxId::new(&account, "Trash");
+        let mut ledger = MoveLedger::default();
+        let uids: Vec<Uid> = (0..MOVE_LEDGER_CAPACITY as u32 + 3).map(Uid).collect();
+        let moved: Vec<(Uid, Uid)> = uids.iter().map(|uid| (*uid, Uid(uid.0 + 100_000))).collect();
+        ledger.record(&inbox, &trash, &uids, &moved, &HashMap::new());
+
+        assert_eq!(ledger.entries.len(), MOVE_LEDGER_CAPACITY);
+        assert_eq!(ledger.take(&inbox, Uid(2), &trash), None, "evicted");
+        assert_eq!(ledger.take(&inbox, Uid(3), &trash).unwrap().new_uid, Some(Uid(100_003)));
     }
 
     #[test]

@@ -1813,6 +1813,21 @@ impl Cache {
         Ok(())
     }
 
+    /// Clears the snooze on `uids` in `mailbox_id` (the undo of
+    /// `snooze_messages`), so they show in the folder again at once.
+    pub fn unsnooze_messages(&self, mailbox_id: &MailboxId, uids: &[Uid]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM snoozed WHERE mailbox_id = ?1 AND uid = ?2")?;
+            for uid in uids {
+                stmt.execute(rusqlite::params![mailbox_id.0, uid.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns every uid in `mailbox_id` still snoozed as of `now`. Pure
     /// read - safe to call synchronously off the GTK main thread (a plain
     /// indexed SELECT, no write lock contention). Expiry is filtered here
@@ -1901,6 +1916,15 @@ impl Cache {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
+    }
+
+    /// Withdraws an outbox row that hasn't gone out yet - undo send (item
+    /// 1.13). Only a `pending` row is removed; returns whether one was, so a
+    /// row already sent (deleted) or permanently `failed` reports `false`.
+    pub fn cancel_outbox(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute("DELETE FROM outbox WHERE id = ?1 AND state = 'pending'", rusqlite::params![id])?;
+        Ok(removed > 0)
     }
 
     /// Shared row reader for the outbox queries.
@@ -2140,6 +2164,45 @@ mod tests {
 
         cache.snooze_messages(&mailbox_id, &[Uid(1), Uid(4)], now - chrono::Duration::hours(1)).unwrap();
         assert_eq!(cache.active_snoozed_uids(&mailbox_id, now).unwrap(), HashSet::from([Uid(2), Uid(3)]));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `UnsnoozeMessages` (undo snooze): clearing a snooze shows the listed
+    /// uids again and leaves the others snoozed.
+    #[test]
+    fn unsnoozing_clears_only_the_listed_uids() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let now = Utc::now();
+
+        cache.snooze_messages(&mailbox_id, &[Uid(1), Uid(2), Uid(3)], now + chrono::Duration::hours(1)).unwrap();
+        cache.unsnooze_messages(&mailbox_id, &[Uid(1), Uid(3), Uid(9)]).unwrap();
+        assert_eq!(cache.active_snoozed_uids(&mailbox_id, now).unwrap(), HashSet::from([Uid(2)]));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Undo send's `CancelOutbox`: a pending row is withdrawn once; a row
+    /// already gone (sent) or permanently failed can't be cancelled.
+    #[test]
+    fn cancel_outbox_withdraws_only_pending_rows() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let now = Utc::now();
+
+        let pending = cache.enqueue_outbox(&account_id, now + chrono::Duration::seconds(5), b"undoable").unwrap();
+        assert!(cache.cancel_outbox(pending).unwrap());
+        assert!(!cache.cancel_outbox(pending).unwrap(), "already withdrawn");
+        assert_eq!(cache.next_outbox_not_before().unwrap(), None);
+
+        let failed = cache.enqueue_outbox(&account_id, now, b"doomed").unwrap();
+        assert_eq!(cache.outbox_attempt_failed(failed, now, 1).unwrap(), OutboxState::Failed);
+        assert!(!cache.cancel_outbox(failed).unwrap(), "a failed row isn't pending");
+        assert_eq!(cache.all_outbox().unwrap().len(), 1);
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

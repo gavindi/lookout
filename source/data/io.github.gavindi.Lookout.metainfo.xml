@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.166" date="2026-10-12">
+      <description>
+        <p>Undo send: after you click Send, the "Sending" notification offers Undo for 5 seconds (choose Off, 5 or 10 seconds in Settings → Mail). Undo stops the message and reopens it in the composer exactly as it was, recipients and attachments included. Undo for deleting, archiving and moving messages now reliably brings back the same messages, and snoozing a message can be undone too.</p>
+      </description>
+    </release>
     <release version="0.9.165" date="2026-10-12">
       <description>
         <p>Drafts can now be reopened for editing: a message in the Drafts folder shows a "This is a draft" bar above its preview with an Edit button, and double-clicking it (or pressing Enter) opens the composer. Recipients, subject, the formatted body with its inline images, attachments, importance and the sending identity all come back as they were saved, and saving updates the original draft in place instead of leaving a second copy behind.</p>

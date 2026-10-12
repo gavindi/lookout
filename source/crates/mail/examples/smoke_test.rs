@@ -146,9 +146,11 @@ async fn main() -> anyhow::Result<()> {
                         }
                         got_body = true;
                     }
-                    AccountEvent::OutboxQueued { id } => println!("outbox queued: {id}"),
+                    AccountEvent::OutboxQueued { id, .. } => println!("outbox queued: {id}"),
                     AccountEvent::OutboxSent { id } => println!("outbox sent: {id}"),
-                    AccountEvent::OutboxFailed { id, message } => println!("outbox failed: {id}: {message}"),
+                    AccountEvent::OutboxFailed { id, message, .. } => println!("outbox failed: {id}: {message}"),
+                    AccountEvent::OutboxCancelled { id } => println!("outbox cancelled: {id}"),
+                    AccountEvent::OutboxCancelFailed { id } => println!("outbox cancel too late: {id}"),
                     AccountEvent::DraftSaved { message_id } => println!("draft saved: {message_id}"),
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
                     AccountEvent::MailboxCreated { .. } | AccountEvent::MailboxRenamed { .. } | AccountEvent::MailboxDeleted { .. } => {}

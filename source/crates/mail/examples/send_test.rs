@@ -117,7 +117,13 @@ async fn main() -> anyhow::Result<()> {
                                 references: vec![],
                                 message_id: None,
                             };
-                            let _ = cmd_tx.send(AccountCommand::SendMessage(Box::new(msg))).await;
+                            let _ = cmd_tx
+                                .send(AccountCommand::SendMessage {
+                                    message: Box::new(msg),
+                                    not_before: None,
+                                    client_token: None,
+                                })
+                                .await;
                             sent_command = true;
                         }
                         sent_mailbox_id = folders
@@ -125,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
                             .find(|m| matches!(m.role, lookout_core::MailboxRole::Sent))
                             .map(|m| m.id.clone());
                     }
-                    AccountEvent::OutboxQueued { id } => println!("OutboxQueued ({id})"),
+                    AccountEvent::OutboxQueued { id, .. } => println!("OutboxQueued ({id})"),
                     AccountEvent::OutboxSent { .. } => {
                         println!("OutboxSent received");
                         send_completed = true;
@@ -162,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::RawMessageFetchFailed { .. } => {}
                     AccountEvent::MoveFailed { .. } => {}
                     AccountEvent::StoreFlagsFailed { .. } => {}
+                    AccountEvent::OutboxCancelled { .. } | AccountEvent::OutboxCancelFailed { .. } => {}
                     AccountEvent::OutboxFailed { message, .. } => {
                         println!("SEND FAILED: {message}");
                         break;

@@ -824,6 +824,24 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         Ok(())
     }
 
+    /// Like [`Session::uid_copy`], but also returns the server's `COPYUID`
+    /// response code (RFC 4315 UIDPLUS) pairing each source UID with the UID
+    /// its copy got in `mailbox_name`. `None` when the server sent no
+    /// `COPYUID` (no UIDPLUS, or `UIDNOTSTICKY`).
+    pub async fn uid_copy_mapped<S1: AsRef<str>, S2: AsRef<str>>(&mut self, uid_set: S1, mailbox_name: S2) -> Result<Option<CopyUid>> {
+        let id = self.run_command(format!("UID COPY {} {}", uid_set.as_ref(), validate_str(mailbox_name.as_ref())?)).await?;
+        self.conn.check_done_ok_with_copy_uid(&id, Some(self.unsolicited_responses_tx.clone())).await
+    }
+
+    /// Like [`Session::uid_mv`], but also returns the server's `COPYUID`
+    /// response code, which a `UID MOVE` sends as an untagged `OK` ahead of
+    /// its `EXPUNGE`s (RFC 6851 section 4.3). `None` when the server sent no
+    /// `COPYUID`.
+    pub async fn uid_mv_mapped<S1: AsRef<str>, S2: AsRef<str>>(&mut self, uid_set: S1, mailbox_name: S2) -> Result<Option<CopyUid>> {
+        let id = self.run_command(format!("UID MOVE {} {}", uid_set.as_ref(), validate_str(mailbox_name.as_ref())?)).await?;
+        self.conn.check_done_ok_with_copy_uid(&id, Some(self.unsolicited_responses_tx.clone())).await
+    }
+
     /// The [`LIST` command](https://tools.ietf.org/html/rfc3501#section-6.3.8) returns a subset of
     /// names from the complete set of all names available to the client.  It returns the name
     /// attributes, hierarchy delimiter, and name of each such name; see [`Name`] for more detail.
@@ -1205,6 +1223,42 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
                 return Err(Error::ConnectionLost);
             };
             response = res;
+        }
+    }
+
+    /// [`Connection::check_done_ok`] that also captures a `COPYUID` response
+    /// code, from either an untagged `OK` (`UID MOVE`) or the tagged
+    /// completion (`UID COPY`). Untagged responses other than the `COPYUID`
+    /// one are forwarded to `unsolicited` as usual.
+    pub(crate) async fn check_done_ok_with_copy_uid(&mut self, id: &RequestId, unsolicited: Option<channel::Sender<UnsolicitedResponse>>) -> Result<Option<CopyUid>> {
+        let mut copy_uid = None;
+        loop {
+            let Some(response) = self.stream.try_next().await? else {
+                return Err(Error::ConnectionLost);
+            };
+            match response.parsed() {
+                Response::Done { status, code, information, tag } => {
+                    self.check_status_ok(status, code.as_ref(), information.as_deref())?;
+                    if let Some(imap_proto::ResponseCode::CopyUid(validity, source, destination)) = code {
+                        copy_uid = CopyUid::from_sets(*validity, source, destination).or(copy_uid);
+                    }
+                    if tag == id {
+                        return Ok(copy_uid);
+                    }
+                }
+                Response::Data {
+                    status: imap_proto::Status::Ok,
+                    code: Some(imap_proto::ResponseCode::CopyUid(validity, source, destination)),
+                    ..
+                } => {
+                    copy_uid = CopyUid::from_sets(*validity, source, destination);
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(unsolicited) = unsolicited.clone() {
+                handle_unilateral(response, unsolicited);
+            }
         }
     }
 
@@ -1741,6 +1795,42 @@ mod tests {
         let mut session = mock_session!(mock_stream);
         session.uid_mv("41:42", mailbox_name).await.unwrap();
         assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid uid move command");
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn uid_mv_mapped_reads_the_untagged_copyuid() {
+        let response = b"* OK [COPYUID 1511554416 142,399 41:42] Moved UIDs.\r\n\
+            * 2 EXPUNGE\r\n\
+            * 1 EXPUNGE\r\n\
+            A0001 OK Move completed\r\n"
+            .to_vec();
+        let mailbox_name = "MEETING";
+        let command = format!("A0001 UID MOVE 142,399 {}\r\n", quote!(mailbox_name));
+        let mut session = mock_session!(MockStream::new(response));
+        let copy_uid = session.uid_mv_mapped("142,399", mailbox_name).await.unwrap().unwrap();
+        assert!(session.stream.inner.written_buf == command.as_bytes().to_vec(), "Invalid uid move command");
+        assert_eq!(copy_uid.uid_validity, 1511554416);
+        assert_eq!(copy_uid.pairs, vec![(142, 41), (399, 42)]);
+        // The EXPUNGEs still reach the unsolicited channel.
+        assert_eq!(session.unsolicited_responses.len(), 2);
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn uid_copy_mapped_reads_the_tagged_copyuid() {
+        let response = b"A0001 OK [COPYUID 38505 304,319:320 3956:3958] Done\r\n".to_vec();
+        let mut session = mock_session!(MockStream::new(response));
+        let copy_uid = session.uid_copy_mapped("304,319:320", "Trash").await.unwrap().unwrap();
+        assert_eq!(copy_uid.pairs, vec![(304, 3956), (319, 3957), (320, 3958)]);
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn uid_mv_mapped_without_uidplus_returns_none() {
+        let response = b"* 1 EXPUNGE\r\nA0001 OK Move completed\r\n".to_vec();
+        let mut session = mock_session!(MockStream::new(response));
+        assert_eq!(session.uid_mv_mapped("7", "Trash").await.unwrap(), None);
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]

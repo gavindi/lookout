@@ -118,6 +118,10 @@ pub const MARK_AS_READ_MODE: &str = "mark-as-read-mode";
 /// screen before it is marked read when [`MARK_AS_READ_MODE`] is
 /// "after-delay".
 pub const MARK_AS_READ_DELAY: &str = "mark-as-read-delay";
+/// Config → Mail → "Undo send": seconds a sent message waits in the outbox
+/// before it goes out, while the "Sending" toast offers Undo (item 1.13).
+/// One of [`UNDO_SEND_DELAYS`]; 0 sends at once with no Undo.
+pub const MAIL_UNDO_SEND_SECONDS: &str = "mail-undo-send-seconds";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
 /// Calendar → "Week starts on": first day of the week, as 0=Sunday .. 6=Saturday.
 pub const CALENDAR_WEEK_START: &str = "calendar-week-start";
@@ -273,6 +277,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_SHOW_SENDER_IMAGES, Value::Bool(true));
     map.insert(MARK_AS_READ_MODE, Value::String("on-selection-change".into()));
     map.insert(MARK_AS_READ_DELAY, Value::Int(5));
+    map.insert(MAIL_UNDO_SEND_SECONDS, Value::Int(5));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(CALENDAR_WEEK_START, Value::Int(0));
     map.insert(CALENDAR_WORK_DAYS, Value::Strv(vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()]));
@@ -650,6 +655,31 @@ pub fn mark_as_read_delay(value: i32) -> i32 {
     value.clamp(1, MAX_MARK_AS_READ_DELAY)
 }
 
+/// Config → Mail → "Undo send": the offered delays in seconds, in `ComboRow`
+/// order. 5 seconds is the default, as in the new Outlook and Gmail.
+pub const UNDO_SEND_DELAYS: [i32; 3] = [0, 5, 10];
+
+/// The `ComboRow` labels matching [`UNDO_SEND_DELAYS`] by index.
+pub const UNDO_SEND_LABELS: [&str; 3] = ["Off", "5 seconds", "10 seconds"];
+
+/// Index of a stored undo-send delay (for the config `ComboRow`); a value
+/// that isn't one of [`UNDO_SEND_DELAYS`] shows as the default (5 seconds).
+pub fn undo_send_index(seconds: i32) -> u32 {
+    UNDO_SEND_DELAYS.iter().position(|value| *value == seconds).unwrap_or(1) as u32
+}
+
+/// The undo-send delay at a [`UNDO_SEND_DELAYS`] index; out-of-range indexes
+/// fall back to the default.
+pub fn undo_send_at(index: u32) -> i32 {
+    UNDO_SEND_DELAYS.get(index as usize).copied().unwrap_or(UNDO_SEND_DELAYS[1])
+}
+
+/// Clamps a stored undo-send delay to the schema's 0-10 second range, so a
+/// hand-edited dconf value can't hold a send back for longer.
+pub fn undo_send_delay(seconds: i32) -> i32 {
+    seconds.clamp(0, 10)
+}
+
 /// Config → Calendar → "Week starts on" labels, indexed 0=Sunday .. 6=Saturday
 /// (the stored `calendar-week-start` scheme).
 pub const WEEK_START_LABELS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -875,6 +905,19 @@ mod tests {
         assert_eq!(mark_as_read_delay(0), 1);
         assert_eq!(mark_as_read_delay(5), 5);
         assert_eq!(mark_as_read_delay(999), MAX_MARK_AS_READ_DELAY);
+    }
+
+    #[test]
+    fn undo_send_helpers_map_delays_and_clamp() {
+        assert_eq!(undo_send_index(0), 0);
+        assert_eq!(undo_send_index(5), 1);
+        assert_eq!(undo_send_index(10), 2);
+        assert_eq!(undo_send_index(7), 1, "an unoffered value shows as the default");
+        assert_eq!(undo_send_at(0), 0);
+        assert_eq!(undo_send_at(2), 10);
+        assert_eq!(undo_send_at(99), 5);
+        assert_eq!(undo_send_delay(-3), 0);
+        assert_eq!(undo_send_delay(30), 10);
     }
 
     #[test]

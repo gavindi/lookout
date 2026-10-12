@@ -220,7 +220,31 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         references: vec![],
         message_id: None,
     };
-    let _ = cmd_tx.send(AccountCommand::SendMessage(Box::new(msg))).await;
+    // --- Undo send (item 1.13): a send held back by `not_before` can be
+    // withdrawn before it's due; a second cancel finds nothing to withdraw.
+    let mut undone = msg.clone();
+    undone.subject = "undone send".to_string();
+    let _ = cmd_tx
+        .send(AccountCommand::SendMessage {
+            message: Box::new(undone),
+            not_before: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
+            client_token: Some(7),
+        })
+        .await;
+    let queued = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxQueued { client_token: Some(7), .. })).await;
+    let AccountEvent::OutboxQueued { id: undone_id, .. } = queued else { unreachable!() };
+    let _ = cmd_tx.send(AccountCommand::CancelOutbox { id: undone_id }).await;
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxCancelled { id } if *id == undone_id)).await;
+    let _ = cmd_tx.send(AccountCommand::CancelOutbox { id: undone_id }).await;
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxCancelFailed { id } if *id == undone_id)).await;
+
+    let _ = cmd_tx
+        .send(AccountCommand::SendMessage {
+            message: Box::new(msg),
+            not_before: None,
+            client_token: None,
+        })
+        .await;
     wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxSent { .. })).await;
 
     // --- On-demand attachment fetch. The session API can't APPEND an
@@ -399,6 +423,44 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         unreachable!()
     };
     assert_eq!(second_bytes, raw_message, "cached raw message must match the original");
+
+    // --- Undo move (item 1.13): `RevertMove` puts a moved message back even
+    // though the move renumbered it in the destination - via the COPYUID the
+    // session recorded, or (on a server without UIDPLUS) the Message-ID it
+    // remembered from the cached envelope.
+    append_raw(
+        &host,
+        imap_plain_port,
+        b"From: sender@example.com\r\nTo: testuser@localhost\r\nMessage-ID: <undo-move@lookout.test>\r\nSubject: undo move\r\n\r\nmove me\r\n",
+    )
+    .await;
+    let _ = cmd_tx.send(AccountCommand::Refresh).await;
+    let undo_move_uid = |e: &AccountEvent| match e {
+        AccountEvent::MessagesUpdated { mailbox, messages, .. } if *mailbox == inbox_id => messages.iter().find(|m| m.subject.as_deref() == Some("undo move")).map(|m| m.uid),
+        _ => None,
+    };
+    let listed = wait_for_event(&evt_rx, |e| undo_move_uid(e).is_some()).await;
+    let uid = undo_move_uid(&listed).unwrap();
+    let _ = cmd_tx
+        .send(AccountCommand::MoveMessagesTo {
+            mailbox: inbox_id.clone(),
+            uids: vec![uid],
+            target: drafts_id.clone(),
+        })
+        .await;
+    wait_for_event(&evt_rx, |e| {
+        matches!(e, AccountEvent::MessagesUpdated { mailbox, .. } if *mailbox == inbox_id) && undo_move_uid(e).is_none()
+    })
+    .await;
+    let _ = cmd_tx
+        .send(AccountCommand::RevertMove {
+            moved_from: inbox_id.clone(),
+            moved_to: drafts_id.clone(),
+            uids: vec![uid],
+        })
+        .await;
+    let restored = wait_for_event(&evt_rx, |e| undo_move_uid(e).is_some()).await;
+    assert_ne!(undo_move_uid(&restored), Some(uid), "the round trip renumbers the message");
 
     let _ = cmd_tx.send(AccountCommand::Shutdown).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;

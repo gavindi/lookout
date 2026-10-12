@@ -226,6 +226,12 @@
       <summary>Mark-as-read delay in seconds</summary>
       <description>Seconds a message must stay on screen before it is marked read when the mark-as-read mode is 'after-delay'.</description>
     </key>
+    <key name="mail-undo-send-seconds" type="i">
+      <range min="0" max="10"/>
+      <default>5</default>
+      <summary>Undo send delay in seconds</summary>
+      <description>Seconds a sent message waits in the outbox before it goes out, during which the "Sending" notification offers Undo. 0 sends immediately with no Undo.</description>
+    </key>
     <key name="mail-notifications-enabled" type="b">
       <default>true</default>
       <summary>Mail notifications</summary>

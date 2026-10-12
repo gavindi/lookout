@@ -969,13 +969,14 @@ pub(crate) struct UiState {
     /// is back to 0 - see `mail_notifications::withdraw_new_mail_notification`.
     /// `None` only in tests, where no real `Application` exists.
     app: Option<adw::Application>,
-    /// Persistent "Sending: <subject>" toasts shown while a queued send is
-    /// outstanding, queued per account in the order their sends were
-    /// dispatched. The per-account session delivers outbox rows one at a time
-    /// and in order, so `OutboxSent`/`OutboxFailed` always answers the oldest
-    /// outstanding send for that account - popping the front on either event
-    /// and dismissing it is enough to retract the right toast.
-    sending_toasts: HashMap<AccountId, VecDeque<adw::Toast>>,
+    /// Sends started from a composer that haven't gone out yet, each with its
+    /// "Sending: <subject>" toast (item 1.13). Matched to account events by
+    /// `client_token` until `OutboxQueued` names the outbox row, then by row
+    /// id - so a read receipt or invitation reply going out in between can't
+    /// retract the wrong toast.
+    pending_sends: Vec<PendingSend>,
+    /// The `client_token` for the next composer send.
+    next_send_token: u64,
     /// The reversible-action history behind the Undo toast and Ctrl+Z
     /// (item 0.4). Most-recent last; entries time out with their toast (see
     /// `show_undo_toast`) and are bounded by `MAX_UNDO_ENTRIES`.
@@ -2429,7 +2430,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rendered_inline_parts: Vec::new(),
         temp_attachment_files: HashSet::new(),
         toast_overlay: Some(toast_overlay.clone()),
-        sending_toasts: HashMap::new(),
+        pending_sends: Vec::new(),
+        next_send_token: 1,
         undo_stack: Vec::new(),
         next_undo_id: 0,
         pending_html_reveal: false,
@@ -3051,10 +3053,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         record_undo(
                             &state,
                             &undo_move_description(MailboxRole::Trash, 1),
-                            vec![AccountCommand::MoveMessagesTo {
-                                mailbox: trash,
+                            vec![AccountCommand::RevertMove {
+                                moved_from: mailbox.clone(),
+                                moved_to: trash,
                                 uids: vec![uid],
-                                target: mailbox.clone(),
                             }],
                         );
                     }
@@ -7110,6 +7112,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Undo send": how long a send waits in the outbox with
+    // Undo on offer (item 1.13). Read at each Send, so it applies to the next.
+    {
+        let state = state.clone();
+        config_view.undo_send_row.connect_selected_notify(move |row| {
+            state
+                .borrow()
+                .settings
+                .set_int(crate::settings::MAIL_UNDO_SEND_SECONDS, crate::settings::undo_send_at(row.selected()));
+        });
+    }
+
     // Config → Mail → "Mail notifications": gates the new-mail/send-failure
     // desktop notifications. Read straight off the setting at the point each
     // event fires (see `connect_account`), so nothing needs re-arming here.
@@ -7376,6 +7390,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .mark_as_read_delay_row
                 .set_value(persisted.get_int(crate::settings::MARK_AS_READ_DELAY).clamp(1, 60) as f64);
         }
+        config_view
+            .undo_send_row
+            .set_selected(crate::settings::undo_send_index(persisted.get_int(crate::settings::MAIL_UNDO_SEND_SECONDS)));
         config_view
             .mail_notifications_row
             .set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
@@ -9571,10 +9588,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             for (cmd_tx, mailbox, uids) in selected_message_command_targets(&message_list, &state) {
                 optimistic_remove_messages(&state, &message_list, &mailbox, &uids);
                 if let Some(destination) = mailbox_account_id(&mailbox).and_then(|account_id| role_mailbox_id(&state, &account_id, role)) {
-                    inverse.push(AccountCommand::MoveMessagesTo {
-                        mailbox: destination,
+                    inverse.push(AccountCommand::RevertMove {
+                        moved_from: mailbox.clone(),
+                        moved_to: destination,
                         uids: uids.clone(),
-                        target: mailbox.clone(),
                     });
                 }
                 count += uids.len();
@@ -9704,13 +9721,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(chrono::Utc::now);
+            // Undo: clear the (local-only) snooze again (item 1.13). Its
+            // toast is the action's only confirmation.
+            let mut inverse = Vec::new();
             for (cmd_tx, mailbox, uids) in targets {
+                inverse.push(AccountCommand::UnsnoozeMessages {
+                    mailbox: mailbox.clone(),
+                    uids: uids.clone(),
+                });
                 let _ = cmd_tx.send_blocking(AccountCommand::SnoozeMessages {
                     mailbox,
                     uids,
                     until: tomorrow_9am,
                 });
             }
+            record_undo(&state, "Snoozed until tomorrow 9:00 AM", inverse);
         });
     }
 
@@ -11172,20 +11197,36 @@ fn spawn_account_event_loop(
                     }
                     // The message was persisted to the local outbox (item 0.3).
                     // The "Sending: …" toast was already shown when Send was
-                    // clicked, so there's nothing to do here until it actually
-                    // goes out (`OutboxSent`/`OutboxFailed`) - a scheduled send
-                    // (item 1.14) will use this to show a "Scheduled for …" bar.
-                    AccountEvent::OutboxQueued { .. } => {}
-                    AccountEvent::OutboxSent { .. } => {
-                        if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
-                            toast.dismiss();
+                    // clicked; bind it to the outbox row so its Undo can
+                    // cancel it and `OutboxSent`/`OutboxFailed` retract it. A
+                    // scheduled send (item 1.14) will also use this to show a
+                    // "Scheduled for …" bar.
+                    AccountEvent::OutboxQueued { id, client_token, .. } => {
+                        if let Some(client_token) = client_token {
+                            bind_pending_send(&state, &account_id, client_token, id);
                         }
-                        toast_overlay.add_toast(adw::Toast::new("Message sent"));
                     }
-                    AccountEvent::OutboxFailed { message, .. } => {
-                        if let Some(toast) = state.borrow_mut().sending_toasts.get_mut(&account_id).and_then(VecDeque::pop_front) {
-                            toast.dismiss();
+                    // Only a composer send gets "Message sent": read receipts
+                    // and invitation replies announce themselves when sent.
+                    AccountEvent::OutboxSent { id } => {
+                        if take_pending_send(&state, &account_id, id, None).is_some() {
+                            toast_overlay.add_toast(adw::Toast::new("Message sent"));
                         }
+                    }
+                    // Undo send (item 1.13) withdrew the message: reopen it.
+                    AccountEvent::OutboxCancelled { id } => {
+                        if let Some(pending) = take_pending_send(&state, &account_id, id, None) {
+                            toast_overlay.add_toast(adw::Toast::new("Sending cancelled"));
+                            reopen_undone_send(&state, &worker, &reading_stack, &account_id, &pending.message);
+                        }
+                    }
+                    // Undo came too late - the message had already gone out
+                    // (its `OutboxSent` arrived first and said so).
+                    AccountEvent::OutboxCancelFailed { .. } => {
+                        toast_overlay.add_toast(adw::Toast::new("Too late to undo: the message was already sent"));
+                    }
+                    AccountEvent::OutboxFailed { id, client_token, message } => {
+                        take_pending_send(&state, &account_id, id, client_token);
                         toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                         // The toast above is enough while the window is focused;
                         // a desktop notification is for when the user isn't
@@ -11201,15 +11242,11 @@ fn spawn_account_event_loop(
                             let _ = tx.try_send(message_id);
                         }
                     }
-                    AccountEvent::MessageMoved { role } => {
-                        let label = match role {
-                            MailboxRole::Trash => "Deleted",
-                            MailboxRole::Archive => "Archived",
-                            MailboxRole::Junk => "Reported as junk",
-                            _ => "Moved",
-                        };
-                        toast_overlay.add_toast(adw::Toast::new(label));
-                    }
+                    // Every move path already showed its "… / Undo" toast
+                    // the moment it was clicked (item 1.13); a second
+                    // "Deleted"/"Moved" toast once the server confirms would
+                    // only queue up behind it and bury the Undo.
+                    AccountEvent::MessageMoved { .. } => {}
                     AccountEvent::MoveFailed { mailbox, uids, role, message } => {
                         // The move actually failed server-side, so put back
                         // exactly the rows `optimistic_remove_messages` hid for
@@ -11249,9 +11286,8 @@ fn spawn_account_event_loop(
                         };
                         toast_overlay.add_toast(adw::Toast::new(label));
                     }
-                    AccountEvent::MessageSnoozed => {
-                        toast_overlay.add_toast(adw::Toast::new("Snoozed until tomorrow 9:00 AM"));
-                    }
+                    // The snooze button's Undo toast already confirmed it.
+                    AccountEvent::MessageSnoozed => {}
                     AccountEvent::MailboxCreated { mailbox } => {
                         // Open the new folder's parent, so it's visible once the
                         // re-list that follows lands in `FoldersUpdated`.
@@ -13754,7 +13790,11 @@ fn respond_to_imip_invitation(
         references: vec![],
         message_id: None,
     };
-    let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(Box::new(message)));
+    let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+        message: Box::new(message),
+        not_before: None,
+        client_token: None,
+    });
     toast_overlay.add_toast(adw::Toast::new(toast));
 
     // Best-effort calendar write: the reply already went out, so a missing
@@ -14309,10 +14349,10 @@ fn handle_message_drag_drop(state: &Rc<RefCell<UiState>>, target: &Mailbox, valu
         record_undo(
             state,
             &undo_move_description(MailboxRole::Custom, uids.len()),
-            vec![AccountCommand::MoveMessagesTo {
-                mailbox: target.id.clone(),
+            vec![AccountCommand::RevertMove {
+                moved_from: source.clone(),
+                moved_to: target.id.clone(),
                 uids: uids.clone(),
-                target: source.clone(),
             }],
         );
         let _ = cmd_tx.send_blocking(AccountCommand::MoveMessagesTo {
@@ -15785,11 +15825,14 @@ pub(crate) struct UndoEntry {
 }
 
 /// The mailbox a command acts on, used to route its inverse back to the right
-/// account. `None` for commands with no mailbox (`SendMessage` today, whose
-/// undo is the outbox `not_before` delay rather than this stack).
+/// account. `None` for commands with no mailbox (`SendMessage` and
+/// `CancelOutbox`: undo send is the outbox `not_before` delay and the
+/// "Sending" toast's own Undo, not this stack).
 fn command_mailbox(command: &AccountCommand) -> Option<&MailboxId> {
     match command {
-        AccountCommand::MoveMessage { mailbox, .. }
+        AccountCommand::RevertMove { moved_to: mailbox, .. }
+        | AccountCommand::UnsnoozeMessages { mailbox, .. }
+        | AccountCommand::MoveMessage { mailbox, .. }
         | AccountCommand::MoveMessages { mailbox, .. }
         | AccountCommand::MoveMessagesTo { mailbox, .. }
         | AccountCommand::SnoozeMessage { mailbox, .. }
@@ -15904,6 +15947,178 @@ fn show_undo_toast(state: &Rc<RefCell<UiState>>, id: u64, description: &str) {
         });
     }
     overlay.add_toast(toast);
+}
+
+/// A composer send that hasn't gone out yet (item 1.13): its toast, and the
+/// message itself so Undo can reopen it in the composer.
+pub(crate) struct PendingSend {
+    account_id: AccountId,
+    client_token: u64,
+    /// The outbox row, once `OutboxQueued` has named it.
+    outbox_id: Option<i64>,
+    message: lookout_mail::ComposedMessage,
+    toast: adw::Toast,
+    /// Undo was clicked; the `CancelOutbox` goes out as soon as the row id
+    /// is known (at once if it already is).
+    undo_requested: bool,
+}
+
+/// The "Sending: <subject>" toast title, markup-escaped (toast titles are
+/// Pango markup, and a subject may contain `&` or `<`).
+fn sending_toast_title(subject: &str) -> String {
+    let subject = if subject.trim().is_empty() { "(No subject)" } else { subject };
+    glib::markup_escape_text(&format!("Sending: {subject}")).to_string()
+}
+
+/// The `on_send_started` behind every composer's Send: shows the persistent
+/// "Sending: <subject>" toast and records the send in `pending_sends`. With
+/// an undo-send delay configured (Config → Mail → "Undo send"), the toast
+/// offers Undo for that long and the returned `not_before` holds the message
+/// in the outbox until then; afterwards the toast loses its button and stays
+/// until the send completes. Returns the `SendMessage`'s `(not_before,
+/// client_token)`.
+fn start_send_feedback(
+    state: &Rc<RefCell<UiState>>,
+    account_id: Option<AccountId>,
+    message: &lookout_mail::ComposedMessage,
+) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>) {
+    let toast = adw::Toast::new(&sending_toast_title(&message.subject));
+    toast.set_timeout(0);
+    let Some(account_id) = account_id else {
+        // Nothing to tie it to (no account events will retract it), so let
+        // it time out normally.
+        toast.set_timeout(5);
+        if let Some(overlay) = state.borrow().toast_overlay.clone() {
+            overlay.add_toast(toast);
+        }
+        return (None, None);
+    };
+    let delay = crate::settings::undo_send_delay(state.borrow().settings.get_int(crate::settings::MAIL_UNDO_SEND_SECONDS));
+    let client_token = {
+        let mut st = state.borrow_mut();
+        let token = st.next_send_token;
+        st.next_send_token += 1;
+        token
+    };
+    if delay > 0 {
+        toast.set_button_label(Some("Undo"));
+        // Shown straight away, ahead of any toast already up, so Undo is
+        // reachable for the whole delay.
+        toast.set_priority(adw::ToastPriority::High);
+        let state = state.clone();
+        toast.connect_button_clicked(move |_| request_undo_send(&state, client_token));
+    }
+    if let Some(overlay) = state.borrow().toast_overlay.clone() {
+        overlay.add_toast(toast.clone());
+    }
+    state.borrow_mut().pending_sends.push(PendingSend {
+        account_id,
+        client_token,
+        outbox_id: None,
+        message: message.clone(),
+        toast,
+        undo_requested: false,
+    });
+    if delay <= 0 {
+        return (None, Some(client_token));
+    }
+    {
+        let state = state.clone();
+        glib::timeout_add_seconds_local_once(delay as u32, move || end_undo_window(&state, client_token));
+    }
+    (Some(chrono::Utc::now() + chrono::Duration::seconds(delay.into())), Some(client_token))
+}
+
+/// The undo-send delay ran out without Undo: swap the toast for a plain
+/// persistent "Sending: <subject>" one (an `adw::Toast`'s button can't be
+/// taken away once shown) that stays until the send completes.
+fn end_undo_window(state: &Rc<RefCell<UiState>>, client_token: u64) {
+    let overlay = state.borrow().toast_overlay.clone();
+    let mut st = state.borrow_mut();
+    let Some(pending) = st.pending_sends.iter_mut().find(|p| p.client_token == client_token && !p.undo_requested) else {
+        return;
+    };
+    let toast = adw::Toast::new(&sending_toast_title(&pending.message.subject));
+    toast.set_timeout(0);
+    let previous = std::mem::replace(&mut pending.toast, toast.clone());
+    drop(st);
+    previous.dismiss();
+    if let Some(overlay) = overlay {
+        overlay.add_toast(toast);
+    }
+}
+
+/// The "Sending" toast's Undo: withdraw the message from the outbox. The
+/// toast dismisses itself on click; the composer reopens when the account
+/// confirms with `OutboxCancelled`.
+fn request_undo_send(state: &Rc<RefCell<UiState>>, client_token: u64) {
+    let (account_id, outbox_id) = {
+        let mut st = state.borrow_mut();
+        let Some(pending) = st.pending_sends.iter_mut().find(|p| p.client_token == client_token) else {
+            return;
+        };
+        pending.undo_requested = true;
+        (pending.account_id.clone(), pending.outbox_id)
+    };
+    if let Some(id) = outbox_id {
+        send_cancel_outbox(state, &account_id, id);
+    }
+}
+
+fn send_cancel_outbox(state: &Rc<RefCell<UiState>>, account_id: &AccountId, id: i64) {
+    let cmd_tx = state.borrow().accounts.get(account_id).map(|handle| handle.cmd_tx.clone());
+    if let Some(cmd_tx) = cmd_tx {
+        let _ = cmd_tx.send_blocking(AccountCommand::CancelOutbox { id });
+    }
+}
+
+/// `OutboxQueued`: binds the pending send started with `client_token` to its
+/// outbox row, sending the deferred `CancelOutbox` if Undo was clicked first.
+fn bind_pending_send(state: &Rc<RefCell<UiState>>, account_id: &AccountId, client_token: u64, id: i64) {
+    let undo = {
+        let mut st = state.borrow_mut();
+        let Some(pending) = st.pending_sends.iter_mut().find(|p| p.client_token == client_token && p.account_id == *account_id) else {
+            return;
+        };
+        pending.outbox_id = Some(id);
+        pending.undo_requested
+    };
+    if undo {
+        send_cancel_outbox(state, account_id, id);
+    }
+}
+
+/// Removes and returns the pending send for an outbox event: by
+/// `client_token` when the event carries one (a send that failed to queue),
+/// else by outbox row id. Its toast is dismissed.
+fn take_pending_send(state: &Rc<RefCell<UiState>>, account_id: &AccountId, id: i64, client_token: Option<u64>) -> Option<PendingSend> {
+    let mut st = state.borrow_mut();
+    let position = st.pending_sends.iter().position(|p| {
+        p.account_id == *account_id
+            && match client_token {
+                Some(token) => p.client_token == token,
+                None => p.outbox_id == Some(id),
+            }
+    })?;
+    let pending = st.pending_sends.remove(position);
+    drop(st);
+    pending.toast.dismiss();
+    Some(pending)
+}
+
+/// Undo send landed (`OutboxCancelled`): reopen the message in the composer
+/// exactly as it was about to go out, as Outlook does. No signature is
+/// appended (the body already has one), and it opens rich exactly when it
+/// was sent with an HTML body.
+fn reopen_undone_send(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, account_id: &AccountId, message: &lookout_mail::ComposedMessage) {
+    let cmd_tx = state.borrow().accounts.get(account_id).map(|handle| handle.cmd_tx.clone());
+    let Some(cmd_tx) = cmd_tx else { return };
+    let prefill = crate::compose::build_resend_prefill(message);
+    let rich_text_default = prefill.html_body.is_some();
+    let title = Some(message.subject.clone())
+        .filter(|subject| !subject.trim().is_empty())
+        .unwrap_or_else(|| "New message".to_string());
+    show_composer_in_reading_pane(state, worker, reading_stack, &title, cmd_tx, prefill, rich_text_default, Some(account_id.clone()), None);
 }
 
 /// Removes `uids` from `mailbox` in the message list immediately, ahead of
@@ -18900,7 +19115,14 @@ fn send_read_receipt(state: &Rc<RefCell<UiState>>, automatic: bool) -> bool {
         references: vec![bare_id],
         message_id: None,
     };
-    if cmd_tx.send_blocking(AccountCommand::SendMessage(Box::new(message))).is_err() {
+    if cmd_tx
+        .send_blocking(AccountCommand::SendMessage {
+            message: Box::new(message),
+            not_before: None,
+            client_token: None,
+        })
+        .is_err()
+    {
         return false;
     }
     {
@@ -19834,24 +20056,15 @@ pub(crate) fn show_composer_in_reading_pane(
             complete(merge_contact_suggestions(mail_history, &carddav, &prefix, 8));
         });
     });
-    // Shows the persistent "Sending: <subject>" toast the instant Send is
-    // clicked, and registers it in `sending_toasts` so the account event
-    // loop can retract it once the send actually completes or fails - see
-    // `AccountEvent::OutboxSent`/`OutboxFailed` in `connect_account`.
-    let on_send_started: Rc<dyn Fn(String)> = {
+    // Shows the "Sending: <subject>" toast the instant Send is clicked - with
+    // Undo for the undo-send delay (item 1.13) - and registers the send in
+    // `pending_sends` so the account event loop can retract the toast once it
+    // completes, fails or is cancelled (see `AccountEvent::OutboxQueued` and
+    // friends in `connect_account`).
+    let on_send_started: crate::compose::SendStarted = {
         let state = state.clone();
         let account_id = account_id.clone();
-        Rc::new(move |subject: String| {
-            let toast = adw::Toast::new(&format!("Sending: {subject}"));
-            toast.set_timeout(0);
-            let overlay = state.borrow().toast_overlay.clone();
-            if let Some(overlay) = overlay {
-                overlay.add_toast(toast.clone());
-            }
-            if let Some(id) = &account_id {
-                state.borrow_mut().sending_toasts.entry(id.clone()).or_default().push_back(toast);
-            }
-        })
+        Rc::new(move |message: &lookout_mail::ComposedMessage| start_send_feedback(&state, account_id.clone(), message))
     };
     // Backs the To row's address-book button: opens `contact_picker` over
     // whichever window currently hosts the composer (main window or a
@@ -20645,7 +20858,8 @@ mod tests {
             rendered_inline_parts: Vec::new(),
             temp_attachment_files: HashSet::new(),
             toast_overlay: None,
-            sending_toasts: HashMap::new(),
+            pending_sends: Vec::new(),
+            next_send_token: 1,
             undo_stack: Vec::new(),
             next_undo_id: 0,
             pending_html_reveal: false,
@@ -21684,6 +21898,19 @@ mod tests {
             other => panic!("expected MoveMessagesTo, got {other:?}"),
         }
         assert!(cmd_rx.try_recv().is_err(), "cross-account messages are dropped, so only one command goes out");
+
+        // Its Undo puts them back by `RevertMove`, which resolves the UIDs the
+        // move gave them in the target (item 1.13) - not a move of the source
+        // UIDs, which mean nothing in the target folder.
+        assert!(undo_last(&state));
+        match cmd_rx.try_recv() {
+            Ok(AccountCommand::RevertMove { moved_from, moved_to, uids }) => {
+                assert_eq!(moved_from, MailboxId("acc:INBOX".into()));
+                assert_eq!(moved_to, MailboxId("acc:Archive".into()));
+                assert_eq!(uids, vec![Uid(7), Uid(9)]);
+            }
+            other => panic!("expected RevertMove, got {other:?}"),
+        }
     }
 
     /// Anything that isn't the message-drag payload must be declined so GTK
@@ -21740,25 +21967,46 @@ mod tests {
         record_undo(
             &state,
             "1 item deleted",
-            vec![AccountCommand::MoveMessagesTo {
-                mailbox: MailboxId("acc:Trash".into()),
+            vec![AccountCommand::RevertMove {
+                moved_from: MailboxId("acc:INBOX".into()),
+                moved_to: MailboxId("acc:Trash".into()),
                 uids: vec![Uid(7)],
-                target: MailboxId("acc:INBOX".into()),
             }],
         );
         assert_eq!(state.borrow().undo_stack.len(), 1);
 
         assert!(undo_last(&state));
         match cmd_rx.try_recv() {
-            Ok(AccountCommand::MoveMessagesTo { mailbox, uids, target }) => {
-                assert_eq!(mailbox, MailboxId("acc:Trash".into()));
+            Ok(AccountCommand::RevertMove { moved_from, moved_to, uids }) => {
+                assert_eq!(moved_from, MailboxId("acc:INBOX".into()));
+                assert_eq!(moved_to, MailboxId("acc:Trash".into()));
                 assert_eq!(uids, vec![Uid(7)]);
-                assert_eq!(target, MailboxId("acc:INBOX".into()));
             }
-            other => panic!("expected MoveMessagesTo, got {other:?}"),
+            other => panic!("expected RevertMove, got {other:?}"),
         }
         assert!(state.borrow().undo_stack.is_empty(), "Ctrl+Z consumes the entry");
         assert!(!undo_last(&state), "nothing left to undo");
+    }
+
+    /// Undo snooze routes `UnsnoozeMessages` to the account owning the
+    /// snoozed messages' mailbox.
+    #[test]
+    fn undo_snooze_routes_unsnooze_to_the_owning_account() {
+        let acc = AccountId("acc".into());
+        let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+
+        record_undo(
+            &state,
+            "Snoozed until tomorrow 9:00 AM",
+            vec![AccountCommand::UnsnoozeMessages {
+                mailbox: MailboxId("acc:INBOX".into()),
+                uids: vec![Uid(3)],
+            }],
+        );
+        assert!(undo_last(&state));
+        assert!(matches!(cmd_rx.try_recv(), Ok(AccountCommand::UnsnoozeMessages { uids, .. }) if uids == vec![Uid(3)]));
     }
 
     /// A toast's own Undo button removes exactly its entry, leaving later

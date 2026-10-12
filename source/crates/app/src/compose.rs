@@ -131,6 +131,11 @@ pub struct ComposePrefill {
     /// without a `Message-ID` still replaces rather than duplicates.
     /// Consumed by that first save; later saves purge by `Message-ID`.
     pub draft_source: Option<(MailboxId, Uid)>,
+    /// The draft is already stored in Drafts under `draft_message_id` - a
+    /// message whose send was undone (item 1.13), whose autosaved draft the
+    /// outbox hadn't deleted yet. Its first autosave then replaces that copy
+    /// by `Message-ID` instead of appending a second one.
+    pub draft_saved: bool,
     /// RFC 5322 `In-Reply-To` - the bare Message-Id (no `<>`) of the message
     /// being replied to. `mail_builder`'s `MessageId` header writer adds the
     /// angle brackets itself, so this must NOT include them.
@@ -138,6 +143,11 @@ pub struct ComposePrefill {
     /// RFC 5322 `References` - bare Message-Ids (no `<>`), oldest first.
     pub references: Vec<String>,
 }
+
+/// Runs as Send is clicked, with the message about to be queued: shows the
+/// "Sending" feedback (with Undo during the undo-send delay, item 1.13) and
+/// returns the `SendMessage`'s `not_before` and `client_token`.
+pub type SendStarted = Rc<dyn Fn(&ComposedMessage) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>)>;
 
 /// Whether Reply excludes the original's other recipients (`Reply`) or
 /// carries them all forward minus the replying account itself (`ReplyAll`).
@@ -296,9 +306,58 @@ pub fn build_draft_prefill(summary: &EmailSummary, content: &DraftPrefillContent
             .filter(|id| !id.is_empty())
             .map(str::to_string),
         draft_source: Some((summary.mailbox.clone(), summary.uid)),
+        draft_saved: false,
         in_reply_to: content.in_reply_to.clone(),
         references: content.references.clone(),
     }
+}
+
+/// Builds the prefill for reopening a message whose send was undone (item
+/// 1.13): exactly what was about to go out - identity, recipients (Bcc
+/// included), subject, bodies, attachments, importance, receipt request and
+/// threading. The message is round-tripped through its draft MIME form
+/// (`build_draft_raw_message` → `parse_draft_prefill`, as a reopened draft
+/// is) so inline images come back as `data:` URIs the editor can show. Its
+/// `Message-ID`, when set, names the autosaved draft still in Drafts (the
+/// outbox only deletes it once the message is sent), so the reopened
+/// composer keeps replacing that copy.
+pub fn build_resend_prefill(msg: &ComposedMessage) -> ComposePrefill {
+    let (raw, _, _) = lookout_mail::send::build_draft_raw_message(msg);
+    let content = lookout_mail::body::parse_draft_prefill(&raw);
+    let join = |list: &[String]| (!list.is_empty()).then(|| list.join(", "));
+    let (body, html_body, attachments) = match content {
+        Some(content) => (content.text_body, content.html_body, content.attachments),
+        None => (Some(msg.text_body.clone()), None, msg.attachments.clone()),
+    };
+    ComposePrefill {
+        to: join(&msg.to),
+        cc: join(&msg.cc),
+        bcc: join(&msg.bcc),
+        subject: Some(msg.subject.clone()),
+        body,
+        html_body,
+        from: Some(msg.from.clone()),
+        importance: msg.importance,
+        request_read_receipt: msg.request_read_receipt,
+        attachments,
+        draft_message_id: msg.message_id.clone(),
+        draft_saved: msg.message_id.is_some(),
+        draft_source: None,
+        in_reply_to: msg.in_reply_to.clone(),
+        references: msg.references.clone(),
+    }
+}
+
+/// `bcc` plus the identity's automatic Bcc addresses, skipping any already
+/// listed (case-insensitively) - a reopened draft or undone send already
+/// carries them from its first save, so they mustn't be added twice.
+fn with_identity_bcc(mut bcc: Vec<String>, identity: &Identity) -> Vec<String> {
+    for address in identity.bcc.iter().map(|a| a.address.clone()) {
+        if !bcc.iter().any(|existing| existing.eq_ignore_ascii_case(&address)) {
+            bcc.push(address);
+        }
+    }
+    bcc
 }
 
 /// HTML-escapes the characters that would otherwise break out of element
@@ -742,8 +801,7 @@ impl AutosaveCtx {
         *self.last_saved.borrow_mut() = Some(snap.clone());
         self.draft_queued.set(true);
         let identity = selected_identity(&self.identities, &self.from_dropdown);
-        let mut bcc = parse_recipients(&snap.bcc);
-        bcc.extend(identity.bcc.iter().map(|a| a.address.clone()));
+        let bcc = with_identity_bcc(parse_recipients(&snap.bcc), &identity);
         let msg = ComposedMessage {
             from: identity.email,
             display_name: (!identity.name.trim().is_empty()).then(|| identity.name.clone()),
@@ -1226,7 +1284,7 @@ pub fn build_compose_view(
     suggestions: SuggestionSource,
     open_contact_picker: crate::contact_picker::ContactPickerOpener,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
-    on_send_started: Rc<dyn Fn(String)>,
+    on_send_started: SendStarted,
 ) -> (gtk::Box, gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
     // Plain single-line fields (no chips) - see `RecipientEntry::new_plain`.
     // The To row has no caption label of its own: the To button beside it
@@ -1819,7 +1877,7 @@ pub fn build_compose_view(
         last_saved: Rc::new(RefCell::new(None)),
         // A reopened draft is already stored: its first save must replace,
         // not append (and its Send must delete the stored copy).
-        draft_queued: Rc::new(Cell::new(prefill.draft_source.is_some())),
+        draft_queued: Rc::new(Cell::new(prefill.draft_source.is_some() || prefill.draft_saved)),
         in_flight: Rc::new(Cell::new(false)),
         draft_message_id: draft_message_id.clone(),
         replace_uid,
@@ -2023,8 +2081,7 @@ pub fn build_compose_view(
                 // is scheduled leaves the draft in Drafts until it's sent.
                 let draft_message_id_used = autosave.draft_queued.get().then(|| (*draft_message_id).clone());
                 let identity = selected_identity(&identities, &from_dropdown);
-                let mut bcc = bcc.clone();
-                bcc.extend(identity.bcc.iter().map(|a| a.address.clone()));
+                let bcc = with_identity_bcc(bcc.clone(), &identity);
                 let msg = ComposedMessage {
                     from: identity.email,
                     display_name: (!identity.name.trim().is_empty()).then(|| identity.name.clone()),
@@ -2045,8 +2102,12 @@ pub fn build_compose_view(
                     references,
                     message_id: draft_message_id_used,
                 };
-                on_send_started(msg.subject.clone());
-                let _ = cmd_tx.send_blocking(AccountCommand::SendMessage(Box::new(msg)));
+                let (not_before, client_token) = on_send_started(&msg);
+                let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+                    message: Box::new(msg),
+                    not_before,
+                    client_token,
+                });
                 closed.set(true);
                 on_done();
             });
@@ -2245,6 +2306,87 @@ mod tests {
         assert_eq!(prefill.draft_source.as_ref().map(|(m, u)| (m.clone(), *u)), Some((summary.mailbox.clone(), summary.uid)));
         assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
         assert_eq!(prefill.references, vec!["older@example.com".to_string()]);
+    }
+
+    /// Undo send (item 1.13) reopens exactly what was about to go out:
+    /// recipients including Bcc, identity, subject, bodies with the inline
+    /// image back as a `data:` URI, attachments, importance, receipt request,
+    /// threading - and the autosaved draft's id, flagged as already stored so
+    /// the reopened composer replaces it rather than saving a second copy.
+    #[test]
+    fn resend_prefill_reopens_the_undone_message_verbatim() {
+        let msg = ComposedMessage {
+            from: "ada@example.com".to_string(),
+            display_name: Some("Ada".to_string()),
+            to: vec!["Bob <bob@example.com>".to_string(), "carol@example.com".to_string()],
+            cc: vec!["dan@example.com".to_string()],
+            bcc: vec!["hidden@example.com".to_string()],
+            reply_to: vec![],
+            subject: "Quarterly numbers".to_string(),
+            text_body: "See chart".to_string(),
+            html_body: Some(r#"<p>See chart</p><img src="cid:chart1">"#.to_string()),
+            attachments: vec![Attachment {
+                filename: "q3.csv".to_string(),
+                content_type: "text/csv".to_string(),
+                bytes: b"a,b\n1,2\n".to_vec(),
+            }],
+            inline_images: vec![InlineImage {
+                cid: "chart1".to_string(),
+                content_type: "image/png".to_string(),
+                bytes: vec![0x89, b'P', b'N', b'G'],
+            }],
+            calendar_part: None,
+            read_receipt: None,
+            request_read_receipt: true,
+            importance: Importance::High,
+            in_reply_to: Some("older@example.com".to_string()),
+            references: vec!["older@example.com".to_string()],
+            message_id: Some("draft-9@lookout.local".to_string()),
+        };
+
+        let prefill = build_resend_prefill(&msg);
+        assert_eq!(prefill.to.as_deref(), Some("Bob <bob@example.com>, carol@example.com"));
+        assert_eq!(prefill.cc.as_deref(), Some("dan@example.com"));
+        assert_eq!(prefill.bcc.as_deref(), Some("hidden@example.com"));
+        assert_eq!(prefill.subject.as_deref(), Some("Quarterly numbers"));
+        assert_eq!(prefill.from.as_deref(), Some("ada@example.com"));
+        let html = prefill.html_body.as_deref().expect("rich body kept");
+        assert!(html.contains("data:image/png;base64,"), "inline image inlined as data: URI: {html}");
+        assert!(!html.contains("cid:"), "{html}");
+        assert_eq!(prefill.attachments.len(), 1);
+        assert_eq!(prefill.attachments[0].filename, "q3.csv");
+        assert_eq!(prefill.attachments[0].bytes, b"a,b\n1,2\n");
+        assert_eq!(prefill.importance, Importance::High);
+        assert!(prefill.request_read_receipt);
+        assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
+        assert_eq!(prefill.references, vec!["older@example.com".to_string()]);
+        assert_eq!(prefill.draft_message_id.as_deref(), Some("draft-9@lookout.local"));
+        assert!(prefill.draft_saved);
+        assert!(prefill.draft_source.is_none());
+
+        // Never autosaved: no stored draft to replace.
+        let unsaved = build_resend_prefill(&ComposedMessage { message_id: None, ..msg });
+        assert!(unsaved.draft_message_id.is_none());
+        assert!(!unsaved.draft_saved);
+    }
+
+    /// The identity's automatic Bcc is added once, even when the list
+    /// already carries it (a reopened draft or undone send).
+    #[test]
+    fn identity_bcc_is_not_duplicated() {
+        let mut identity = Identity::new(AccountId("/test/account".to_string()), "Ada", "ada@example.com");
+        identity.bcc = vec![EmailAddress {
+            name: None,
+            address: "Archive@Example.com".to_string(),
+        }];
+        assert_eq!(
+            with_identity_bcc(vec!["x@example.com".to_string()], &identity),
+            vec!["x@example.com".to_string(), "Archive@Example.com".to_string()]
+        );
+        assert_eq!(
+            with_identity_bcc(vec!["archive@example.com".to_string()], &identity),
+            vec!["archive@example.com".to_string()]
+        );
     }
 
     #[test]

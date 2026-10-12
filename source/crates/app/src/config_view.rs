@@ -297,6 +297,9 @@ pub struct ConfigView {
     /// "After" spin (Config → Mail): seconds a message stays open before it is
     /// marked read; only enabled when "Mark as read" selects "after-delay".
     pub mark_as_read_delay_row: adw::SpinRow,
+    /// "Undo send" combo (Config → Mail); its selected index maps to
+    /// `UNDO_SEND_DELAYS`.
+    pub undo_send_row: adw::ComboRow,
     /// "Mail notifications" switch (Config → Mail), exposed so the caller can
     /// wire its `active` state into the `Gio::Notification` new-mail/send-
     /// failure notifications.
@@ -619,6 +622,12 @@ pub fn build() -> ConfigView {
     mark_as_read_delay_row.set_title("After");
     mark_as_read_delay_row.set_subtitle("Seconds a message stays open before it is marked read");
     mail_settings_group.add(&mark_as_read_delay_row);
+    let undo_send_row = adw::ComboRow::builder()
+        .title("Undo send")
+        .subtitle("Delay sending so you can cancel")
+        .model(&gtk::StringList::new(&crate::settings::UNDO_SEND_LABELS))
+        .build();
+    mail_settings_group.add(&undo_send_row);
     let mail_notifications_row = adw::SwitchRow::builder()
         .title("Mail notifications")
         .subtitle("Show a desktop notification when new mail arrives or a send fails")
@@ -987,6 +996,7 @@ pub fn build() -> ConfigView {
         read_receipts_row,
         mark_as_read_row,
         mark_as_read_delay_row,
+        undo_send_row,
         mail_notifications_row,
         dock_badge_row,
         calendar_alerts_row,
