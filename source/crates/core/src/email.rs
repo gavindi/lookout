@@ -348,6 +348,55 @@ pub struct AuthenticationResults {
     pub dmarc: Option<DmarcResult>,
 }
 
+impl SpfResult {
+    pub fn is_pass(self) -> bool {
+        self == SpfResult::Pass
+    }
+
+    /// A definite negative verdict (`fail`, `softfail`) — as opposed to the
+    /// inconclusive/neutral/error results.
+    pub fn is_failure(self) -> bool {
+        matches!(self, SpfResult::Fail | SpfResult::SoftFail)
+    }
+}
+
+impl DkimResult {
+    pub fn is_pass(self) -> bool {
+        self == DkimResult::Pass
+    }
+
+    pub fn is_failure(self) -> bool {
+        matches!(self, DkimResult::Fail | DkimResult::Policy)
+    }
+}
+
+impl DmarcResult {
+    pub fn is_pass(self) -> bool {
+        self == DmarcResult::Pass
+    }
+
+    pub fn is_failure(self) -> bool {
+        self == DmarcResult::Fail
+    }
+}
+
+impl AuthenticationResults {
+    /// Whether no method reported a verdict at all (so no banner is warranted).
+    pub fn is_empty(&self) -> bool {
+        self.spf.is_none() && self.dkim.is_none() && self.dmarc.is_none()
+    }
+
+    /// Whether any method reported a pass.
+    pub fn any_pass(&self) -> bool {
+        self.spf.is_some_and(SpfResult::is_pass) || self.dkim.is_some_and(DkimResult::is_pass) || self.dmarc.is_some_and(DmarcResult::is_pass)
+    }
+
+    /// Whether any method reported a definite failure.
+    pub fn any_failure(&self) -> bool {
+        self.spf.is_some_and(SpfResult::is_failure) || self.dkim.is_some_and(DkimResult::is_failure) || self.dmarc.is_some_and(DmarcResult::is_failure)
+    }
+}
+
 /// Fetched lazily on message open. With a `BODYSTRUCTURE`-derived part
 /// structure in the message's summary, only the text parts (and headers) are
 /// downloaded (`BODY.PEEK[<part>]`); without one, the whole message is
@@ -496,6 +545,57 @@ fn looks_like_address(value: &str) -> bool {
     clean(local) && clean(domain)
 }
 
+/// The domain half of an address (everything after the last `@`), or the whole
+/// string when there is none.
+fn address_domain(address: &str) -> &str {
+    address.rsplit('@').next().unwrap_or(address).trim()
+}
+
+/// Whether an address's display name impersonates a *different* address — the
+/// classic phishing shape where a friendly name hides the real sender, e.g.
+/// `"support@paypal.com" <attacker@evil.example>`. Returns the embedded address
+/// when it looks like one and its domain differs from the real address's;
+/// `None` when there is no display name, no embedded address, or the domains
+/// match. Deliberately conservative: a plain name (`PayPal Support`) is never a
+/// mismatch.
+pub fn display_name_address_mismatch(addr: &EmailAddress) -> Option<String> {
+    let name = addr.name.as_deref()?.trim().trim_matches('"').trim();
+    if !name.contains('@') {
+        return None;
+    }
+    let candidate = name
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c: char| "<>(),;:\"\\".contains(c)))
+        .find(|token| looks_like_address(token))?;
+    if address_domain(candidate).eq_ignore_ascii_case(address_domain(&addr.address)) {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+/// Whether `address` is outside every domain in `internal_domains` — the
+/// external-sender tag (S-06). The list is matched case-insensitively, each
+/// entry against the address's domain exactly or as a parent of a subdomain
+/// (`example.com` matches `mail.example.com`). Returns `false` when the list
+/// is empty (the tag is off), the address has no domain, or it matches an
+/// internal entry.
+pub fn is_external_sender(address: &str, internal_domains: &[String]) -> bool {
+    if internal_domains.is_empty() {
+        return false;
+    }
+    let Some((_, domain)) = address.trim().rsplit_once('@') else {
+        return false;
+    };
+    let domain = domain.trim().trim_end_matches('>').trim().to_ascii_lowercase();
+    if domain.is_empty() {
+        return false;
+    }
+    !internal_domains.iter().any(|entry| {
+        let entry = entry.trim().trim_start_matches('@').trim_start_matches('.').to_ascii_lowercase();
+        !entry.is_empty() && (domain == entry || domain.ends_with(&format!(".{entry}")))
+    })
+}
+
 /// Whether the message is machine-generated (RFC 3834 `Auto-Submitted`):
 /// `auto-generated` and `auto-replied` mark automated mail that must never
 /// receive an automated response, or the response would loop. An absent
@@ -625,6 +725,57 @@ mod tests {
             address: "ada@example.com".into(),
         };
         assert_eq!(addr.display_label(), "ada@example.com");
+    }
+
+    #[test]
+    fn display_name_address_mismatch_flags_a_hidden_address() {
+        let spoof = EmailAddress {
+            name: Some("support@paypal.com".into()),
+            address: "attacker@evil.example".into(),
+        };
+        assert_eq!(display_name_address_mismatch(&spoof).as_deref(), Some("support@paypal.com"));
+
+        let quoted = EmailAddress {
+            name: Some("\"billing@bank.example\"".into()),
+            address: "attacker@evil.example".into(),
+        };
+        assert_eq!(display_name_address_mismatch(&quoted).as_deref(), Some("billing@bank.example"));
+    }
+
+    #[test]
+    fn display_name_address_mismatch_ignores_ordinary_names_and_same_domain() {
+        let plain = EmailAddress {
+            name: Some("PayPal Support".into()),
+            address: "service@paypal.com".into(),
+        };
+        assert_eq!(display_name_address_mismatch(&plain), None);
+
+        let same = EmailAddress {
+            name: Some("support@paypal.com".into()),
+            address: "help@paypal.com".into(),
+        };
+        assert_eq!(display_name_address_mismatch(&same), None);
+
+        let no_name = EmailAddress::new("attacker@evil.example");
+        assert_eq!(display_name_address_mismatch(&no_name), None);
+    }
+
+    #[test]
+    fn external_sender_matches_domains_and_subdomains() {
+        let domains = vec!["Example.com".to_string(), "corp.test".to_string()];
+        assert!(!is_external_sender("Ada <ada@example.com>", &domains));
+        assert!(!is_external_sender("ada@mail.example.com", &domains));
+        assert!(!is_external_sender("ada@corp.test", &domains));
+        assert!(is_external_sender("ada@gmail.com", &domains));
+        // A suffix that is not a subdomain boundary must not match.
+        assert!(is_external_sender("ada@notexample.com", &domains));
+    }
+
+    #[test]
+    fn external_sender_is_false_without_a_list_or_domain() {
+        assert!(!is_external_sender("ada@gmail.com", &[]));
+        assert!(!is_external_sender("no-at-sign", &["example.com".to_string()]));
+        assert!(!is_external_sender("ada@", &["example.com".to_string()]));
     }
 
     #[test]

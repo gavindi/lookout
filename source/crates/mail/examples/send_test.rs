@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
                                 read_receipt: None,
                                 request_read_receipt: false,
                                 importance: lookout_core::Importance::Normal,
+                                sensitivity: lookout_core::MessageSensitivity::Normal,
                                 in_reply_to: None,
                                 references: vec![],
                                 message_id: None,

@@ -43,14 +43,14 @@ Counts are tallied from the §5 tables.
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
 | Mail (5.1) | 25 | 7 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
-| Compose (5.2) | 12 | 4 | 6 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop and an attachment reminder. No forwarding with attachments. |
+| Compose (5.2) | 13 | 4 | 5 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder and sensitivity. No forwarding with attachments. |
 | Calendar (5.3) | 15 | 9 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 4 | 2 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
-| Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
+| Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **67** | **34** | **51** | **5** | ~42% at parity, ~22% partial |
+| **Total** | **72** | **33** | **47** | **5** | ~46% at parity, ~21% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -114,12 +114,12 @@ Wire-level facts that implementations must match. Anything marked **verify** sho
 | Concept | Outlook writes | Outlook reads | Lookout plan |
 |---|---|---|---|
 | Importance | `Importance: High\|Normal\|Low`, `X-Priority: 1 (Highest)` … `5 (Lowest)`, `X-MSMail-Priority: High\|Normal\|Low` | Any of these, plus RFC 2156 `Priority: urgent\|normal\|non-urgent` | Parse all four into `EmailSummary.importance` (needs envelope header fetch, `BODY.PEEK[HEADER.FIELDS (...)]`). Write all three Outlook headers on send. |
-| Sensitivity | `Sensitivity: Personal\|Private\|Company-Confidential` (RFC 2156) | Same | Compose option and reading-pane banner. |
+| Sensitivity | `Sensitivity: Personal\|Private\|Company-Confidential` (RFC 2156) | Same | ✅ Compose dropdown (6.5) and reading-pane/popped-out banner. |
 | Read receipt | `Disposition-Notification-To:` | Same | ✅ already (`send.rs`, RFC 8098). |
 | Delivery receipt | SMTP DSN `NOTIFY=SUCCESS,FAILURE` (RFC 3461) | DSN reports (`multipart/report; report-type=delivery-status`) | Needs DSN support in the SMTP layer (**verify** `lettre`); render DSNs as a status card. |
 | Follow-up flag (internet) | `X-Message-Flag: Follow up` (classic, to internet recipients); `Reply-By:` (RFC 2156) | Same | Display "Follow up / Reply by" banner. Parsing exists (`follow_up_from_headers`); showing it needs the two headers in the envelope fetch and a cache version bump (UX-33). |
 | TNEF | `application/ms-tnef` part named `winmail.dat` | — | Decode (§4.6). |
-| Auth results | n/a (server adds `Authentication-Results:`, RFC 8601) | Drives the "unverified sender" banner | Fill the existing but unused `EmailBody.auth_results` (`source/crates/core/src/email.rs:334`). |
+| Auth results | n/a (server adds `Authentication-Results:`, RFC 8601) | Drives the "unverified sender" banner | ✅ `auth_results_from_headers` (6.1) fills `EmailBody.auth_results`; the reading pane shows the failure/unverified banner. |
 
 ### 4.2 IMAP keywords: cross-client conventions
 
@@ -402,13 +402,13 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 |---|---|---|---|---|
 | S-01 | Block remote content | `mail-load-remote-images`, trusted senders | ✅ | — |
 | S-02 | Sandboxed rendering | WebKit sandbox | ✅ | — |
-| S-03 | Sender authentication banners | Types present, unpopulated | 🟡 | §4.1 |
+| S-03 | Sender authentication banners | `auth_results_from_headers` (RFC 8601) fills `EmailBody.auth_results`; the reading pane and popped-out window show a failure/unverified info bar, plus a `From` display-name ↔ address mismatch banner (6.1) | ✅ | — |
 | S-04 | S/MIME sign/encrypt/verify | — | ❌ | GPGME (gpgsm) |
 | S-05 | OpenPGP | — | ❌ | GPGME (gpg) |
-| S-06 | External-sender tag | — | ❌ | Configurable internal domains |
-| S-07 | Sensitivity labels (Purview) | — | ⛔ | Tenant-specific; show the header-based sensitivity only |
-| S-08 | Link safety (hover shows real URL, warn on mismatch) | — | ❌ | WebKit `mouse-target-changed` → status bar; text/href mismatch warning |
-| S-09 | Report phishing | Report junk only | ❌ | Report-as-phishing (forward-as-attachment to configured address) |
+| S-06 | External-sender tag | `is_external_sender` plus a `mail-internal-domains` list; the reading pane and popped-out window tag an outside sender as external (6.2) | ✅ | — |
+| S-07 | Sensitivity labels (Purview) | ⛔ | Tenant-specific; show the header-based sensitivity only |
+| S-08 | Link safety (hover shows real URL, warn on mismatch) | Hover status strip with the real URL; a pure scanner warns (and confirms before opening) when an anchor's text names a different host (6.3) | ✅ | — |
+| S-09 | Report phishing | Report phishing in the Report menu and split button: forwards the message as a `message/rfc822` attachment to a configured address, then moves it to Junk (6.7) | ✅ | — |
 
 ### 5.8 Desktop, UI and extras
 
@@ -703,13 +703,13 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
-| 6.1 | Authentication-Results banners | S-03, M-35 | Parse RFC 8601 into `EmailBody.auth_results`; banners for fail/none and for display-name ↔ address mismatches | S |
-| 6.2 | External-sender tag | S-06 | Per-account internal domains; "External" chip | S |
-| 6.3 | Link safety | S-08 | Hover status bar with the real URL; warn when text and href domains differ | S |
+| 6.1 | ✅ ~~Authentication-Results banners~~ | S-03, M-35 | Parse RFC 8601 into `EmailBody.auth_results`; banners for fail/none and for display-name ↔ address mismatches | S |
+| 6.2 | ✅ ~~External-sender tag~~ | S-06 | Global internal domains (`mail-internal-domains`); "External" info bar | S |
+| 6.3 | ✅ ~~Link safety~~ | S-08 | Hover status strip with the real URL; confirm before opening when text and href domains differ | S |
 | 6.4 | S/MIME and OpenPGP | S-04, S-05, C-21 | GPGME (`gpgme` crate). `gpgsm` covers S/MIME and `gpg` covers OpenPGP, one dependency and key storage in the user's existing keyrings. Verify/decrypt in `mail/src/body.rs`; sign/encrypt in `send.rs`; status bar in the reading pane; per-message toggles in compose; certificate import in Settings | L |
-| 6.5 | Sensitivity | C-06 | Compose option plus banner (§4.1) | S |
+| 6.5 | ✅ ~~Sensitivity~~ | C-06 | Compose option plus banner (§4.1) | S |
 | 6.6 | DSN | M-27, C-07 | SMTP `NOTIFY`/`RET`/`ENVID` (**verify** `lettre` support, else extend `send.rs`); DSN report card | M |
-| 6.7 | Report phishing | S-09 | Forward-as-attachment to a configurable address, then move to Junk | S |
+| 6.7 | ✅ ~~Report phishing~~ | S-09 | Forward-as-attachment to a configurable address, then move to Junk | S |
 
 ### Phase 7: Migration and extras
 

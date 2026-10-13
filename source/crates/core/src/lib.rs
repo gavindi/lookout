@@ -21,17 +21,17 @@ pub use calendar::{
     SchedulingInfo, TaskPriority, TaskStatus, WebcalSubscription,
 };
 pub use email::{
-    cid_matches, header_value, is_auto_submitted, is_report_message, parse_disposition_notification_to, parse_imip_method, parse_list_unsubscribe, sanitize_tag_key,
-    tag_key_from_keyword, tag_keyword, AuthenticationResults, BodyPart, ContactsProvider, DkimResult, DmarcResult, EmailAddress, EmailBody, EmailSummary, ImipInvitation,
-    ImipMethod, ListUnsubscribe, SpfResult, SystemFlagBit, TAG_KEYWORD_PREFIX,
+    cid_matches, display_name_address_mismatch, header_value, is_auto_submitted, is_external_sender, is_report_message, parse_disposition_notification_to,
+    parse_imip_method, parse_list_unsubscribe, sanitize_tag_key, tag_key_from_keyword, tag_keyword, AuthenticationResults, BodyPart, ContactsProvider, DkimResult, DmarcResult, EmailAddress,
+    EmailBody, EmailSummary, ImipInvitation, ImipMethod, ListUnsubscribe, SpfResult, SystemFlagBit, TAG_KEYWORD_PREFIX,
 };
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
 pub use interop::{
-    flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers, follow_up_keywords,
-    graph_preset, importance_from_headers, importance_headers, is_flag_keyword, nearest_preset_for_rgb, preset_by_graph, preset_by_index, preset_by_name, sensitivity_from_headers,
-    sensitivity_header, BusyStatus, CategoryPreset, FlagStatus, FollowUpFlag, Importance, MessageSensitivity, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD,
-    OUTLOOK_CATEGORY_PRESETS,
+    auth_results_from_headers, flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers,
+    follow_up_keywords, graph_preset, importance_from_headers, importance_headers, is_flag_keyword, nearest_preset_for_rgb, preset_by_graph, preset_by_index, preset_by_name,
+    sensitivity_from_headers, sensitivity_header, BusyStatus, CategoryPreset, FlagStatus, FollowUpFlag, Importance, MessageSensitivity, AUTHENTICATION_RESULTS_HEADER,
+    FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD, OUTLOOK_CATEGORY_PRESETS,
 };
 pub use interop::{
     is_tnef_content_type, junk_keyword, junk_keyword_change, junk_keywords, tnef_attachment_ref, tnef_part_number, TnefAttachment, TnefContents, TnefError, JUNK_KEYWORD,

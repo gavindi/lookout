@@ -256,6 +256,16 @@
       <summary>Warn if a message looks like it is missing an attachment</summary>
       <description>Before sending, look for words like "attached" or "enclosure" in the subject and body; if the message has no attachments, ask whether to send it anyway.</description>
     </key>
+    <key name="mail-internal-domains" type="as">
+      <default>[]</default>
+      <summary>Internal email domains</summary>
+      <description>Domains belonging to your organisation. The reading pane tags a sender whose address is outside this list as external. Empty disables the tag.</description>
+    </key>
+    <key name="mail-report-phishing-address" type="s">
+      <default>''</default>
+      <summary>Report phishing address</summary>
+      <description>Where "Report phishing" forwards a message as an attachment before moving it to Junk. Empty hides the Report phishing action.</description>
+    </key>
     <key name="mail-notifications-enabled" type="b">
       <default>true</default>
       <summary>Mail notifications</summary>

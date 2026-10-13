@@ -324,6 +324,12 @@ pub struct ConfigView {
     /// its `active` state into the Unity LauncherEntry dock badge (the
     /// Ubuntu dock's unread-count overlay).
     pub dock_badge_row: adw::SwitchRow,
+    /// "Internal domains" entry (Config → Mail): a comma-separated list of
+    /// domains the reading pane treats as internal (item 6.2 / S-06).
+    pub internal_domains_entry: gtk::Entry,
+    /// "Report phishing address" entry (Config → Mail): where Report phishing
+    /// forwards a message as an attachment (item 6.7 / S-09).
+    pub report_phishing_entry: gtk::Entry,
     /// "Event alerts" switch (Config → Calendar), exposed so the caller can
     /// wire its `active` state into the `Gio::Notification` reminder
     /// scheduling.
@@ -669,6 +675,25 @@ pub fn build() -> ConfigView {
         .active(true)
         .build();
     mail_settings_group.add(&dock_badge_row);
+    // Internal domains (item 6.2 / S-06): addresses outside this list are
+    // tagged external in the reading pane. Comma-separated in one entry; the
+    // caller splits it into the `mail-internal-domains` string list.
+    let internal_domains_row = adw::ActionRow::builder()
+        .title("Internal domains")
+        .subtitle("Tag senders outside these domains as external")
+        .build();
+    let internal_domains_entry = gtk::Entry::builder().placeholder_text("example.com, example.org").build();
+    internal_domains_row.set_child(Some(&internal_domains_entry));
+    mail_settings_group.add(&internal_domains_row);
+    // Report phishing address (item 6.7 / S-09): where Report phishing
+    // forwards a message as an attachment before moving it to Junk.
+    let report_phishing_row = adw::ActionRow::builder()
+        .title("Report phishing address")
+        .subtitle("Forward reported messages here as an attachment; empty hides the action")
+        .build();
+    let report_phishing_entry = gtk::Entry::builder().placeholder_text("phishing@example.com").build();
+    report_phishing_row.set_child(Some(&report_phishing_entry));
+    mail_settings_group.add(&report_phishing_row);
 
     // The real "Calendar" group, replacing that section's placeholder: the
     // event-alerts toggle, wired by the caller into the `Gio::Notification`
@@ -1054,6 +1079,8 @@ pub fn build() -> ConfigView {
         warn_no_attachment_row,
         mail_notifications_row,
         dock_badge_row,
+        internal_domains_entry,
+        report_phishing_entry,
         calendar_alerts_row,
         calendar_week_start_row,
         calendar_work_days_row,

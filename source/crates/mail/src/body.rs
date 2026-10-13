@@ -42,7 +42,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         is_calendar.then(|| String::from_utf8_lossy(part.contents()).into_owned())
     });
 
-    let headers = message.headers_raw().map(|(name, value)| (name.to_string(), value.trim().to_string())).collect();
+    let headers: Vec<(String, String)> = message.headers_raw().map(|(name, value)| (name.to_string(), value.trim().to_string())).collect();
 
     // mail-parser numbers its parts by flat index, not by IMAP section path;
     // compute the `BODY[<n>]` path for every part so `EmailBody::parts`
@@ -105,6 +105,8 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         _ => (parts, text_body, html_body, calendar_ics),
     };
 
+    let auth_results = lookout_core::auth_results_from_headers(&headers);
+
     Some(EmailBody {
         uid,
         text_body,
@@ -112,7 +114,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         calendar_ics,
         parts,
         headers,
-        auth_results: None,
+        auth_results,
     })
 }
 
@@ -257,6 +259,8 @@ pub struct DraftPrefillContent {
     pub cc: Vec<String>,
     pub subject: Option<String>,
     pub importance: lookout_core::Importance,
+    /// The draft's RFC 2156 `Sensitivity`. `Normal` when the header is absent.
+    pub sensitivity: lookout_core::MessageSensitivity,
 }
 
 /// Parses a saved draft's raw bytes into the contents the composer prefills
@@ -326,6 +330,7 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
         .unwrap_or_default();
     let request_read_receipt = !lookout_core::parse_disposition_notification_to(&headers).is_empty();
     let importance = lookout_core::importance_from_headers(&headers).unwrap_or_default();
+    let sensitivity = lookout_core::sensitivity_from_headers(&headers).unwrap_or_default();
 
     Some(DraftPrefillContent {
         text_body,
@@ -340,6 +345,7 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
         cc,
         subject,
         importance,
+        sensitivity,
     })
 }
 
@@ -487,6 +493,8 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         None => (parts, text_body, html_body, calendar_ics),
     };
 
+    let auth_results = lookout_core::auth_results_from_headers(&headers);
+
     EmailBody {
         uid,
         text_body,
@@ -494,7 +502,7 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         calendar_ics,
         parts,
         headers,
-        auth_results: None,
+        auth_results,
     }
 }
 
@@ -1282,6 +1290,7 @@ mod tests {
             reply_to: vec![],
             subject: "Draft".to_string(),
             importance: lookout_core::Importance::High,
+            sensitivity: lookout_core::MessageSensitivity::Private,
             text_body: "draft body".to_string(),
             html_body: Some("<p>draft body</p><img src=\"cid:img-1@lookout.local\">".to_string()),
             attachments: vec![Attachment {

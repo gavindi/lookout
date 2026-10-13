@@ -7,7 +7,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use base64::Engine;
 use gtk::{gio, glib};
-use lookout_core::{header_value, AccountId, EmailAddress, EmailBody, EmailSummary, Identity, Importance, MailboxId, Signature, Uid};
+use lookout_core::{header_value, AccountId, EmailAddress, EmailBody, EmailSummary, Identity, Importance, MailboxId, MessageSensitivity, Signature, Uid};
 use lookout_mail::body::DraftPrefillContent;
 use lookout_mail::session::{AccountCommand, DraftReplace};
 use lookout_mail::{new_message_id, Attachment, ComposedMessage, InlineImage};
@@ -113,6 +113,9 @@ pub struct ComposePrefill {
     pub from: Option<String>,
     /// The saved importance. `Normal` (the default) for non-draft prefills.
     pub importance: Importance,
+    /// The saved RFC 2156 `Sensitivity`. `Normal` (the default) for
+    /// non-draft prefills and for drafts that carried no `Sensitivity` header.
+    pub sensitivity: MessageSensitivity,
     /// Whether the saved draft asked for a read receipt
     /// (`Disposition-Notification-To`).
     pub request_read_receipt: bool,
@@ -297,6 +300,7 @@ pub fn build_draft_prefill(summary: &EmailSummary, content: &DraftPrefillContent
         html_body: content.html_body.clone(),
         from: summary.from.first().map(|a| a.address.clone()),
         importance: summary.importance,
+        sensitivity: content.sensitivity,
         request_read_receipt: content.request_read_receipt,
         attachments: content.attachments.clone(),
         // Defensive bracket strip: envelope-parsed ids are usually bare, but
@@ -335,6 +339,7 @@ pub fn build_resend_prefill(msg: &ComposedMessage) -> ComposePrefill {
         html_body,
         from: Some(msg.from.clone()),
         importance: msg.importance,
+        sensitivity: msg.sensitivity,
         request_read_receipt: msg.request_read_receipt,
         attachments,
         draft_message_id: msg.message_id.clone(),
@@ -367,6 +372,7 @@ pub fn build_outbox_prefill(message: &lookout_mail::send::OutboxMessage) -> Opti
         html_body: content.html_body,
         from: content.from.or_else(|| Some(message.from.clone())),
         importance: content.importance,
+        sensitivity: content.sensitivity,
         request_read_receipt: content.request_read_receipt,
         attachments: content.attachments,
         draft_message_id: message.draft_message_id.clone(),
@@ -706,6 +712,10 @@ struct DraftSnapshot {
     /// toolbar's High/Low toggles - a flip re-saves the draft so it carries
     /// the matching `Importance`/`X-Priority` headers.
     importance: Importance,
+    /// The composed message's RFC 2156 sensitivity, from the toolbar's
+    /// dropdown - a change re-saves the draft so it carries (or drops) the
+    /// `Sensitivity` header.
+    sensitivity: MessageSensitivity,
     body: String,
     body_text: String,
     attachments: Vec<PendingAttachment>,
@@ -769,6 +779,28 @@ fn selected_importance(high: &gtk::ToggleButton, low: &gtk::ToggleButton) -> Imp
     }
 }
 
+/// The four RFC 2156 sensitivity labels, in dropdown order. Index 0 is
+/// `Normal`; the order matches [`sensitivity_from_index`].
+const SENSITIVITY_LABELS: [&str; 4] = ["Normal", "Personal", "Private", "Company-Confidential"];
+
+fn selected_sensitivity(dropdown: &gtk::DropDown) -> MessageSensitivity {
+    match dropdown.selected() {
+        1 => MessageSensitivity::Personal,
+        2 => MessageSensitivity::Private,
+        3 => MessageSensitivity::CompanyConfidential,
+        _ => MessageSensitivity::Normal,
+    }
+}
+
+fn sensitivity_index(sensitivity: MessageSensitivity) -> u32 {
+    match sensitivity {
+        MessageSensitivity::Normal => 0,
+        MessageSensitivity::Personal => 1,
+        MessageSensitivity::Private => 2,
+        MessageSensitivity::CompanyConfidential => 3,
+    }
+}
+
 /// Everything the draft autosave touches, in one clonable bundle. This exists
 /// because reading the rich editor is `async` (see `read_content`) and an
 /// `Rc<dyn Fn()>` closure can't hold an `async` body - each caller clones a
@@ -782,6 +814,7 @@ struct AutosaveCtx {
     read_receipt_toggle: gtk::ToggleButton,
     high_importance_toggle: gtk::ToggleButton,
     low_importance_toggle: gtk::ToggleButton,
+    sensitivity_dropdown: gtk::DropDown,
     rich_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
     rich_web_view: Rc<webkit::WebView>,
@@ -846,6 +879,7 @@ impl AutosaveCtx {
             rich,
             read_receipt: self.read_receipt_toggle.is_active(),
             importance: selected_importance(&self.high_importance_toggle, &self.low_importance_toggle),
+            sensitivity: selected_sensitivity(&self.sensitivity_dropdown),
             body,
             body_text,
             attachments: self.attachments.borrow().clone(),
@@ -919,6 +953,7 @@ impl AutosaveCtx {
             read_receipt: None,
             request_read_receipt: snap.read_receipt,
             importance: snap.importance,
+            sensitivity: snap.sensitivity,
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             message_id: Some((*self.draft_message_id).clone()),
@@ -1688,6 +1723,15 @@ pub fn build_compose_view(
     }
     read_receipt_toggle.set_active(prefill.request_read_receipt);
 
+    // --- Sensitivity: RFC 2156 `Sensitivity` (Normal / Personal / Private /
+    // Company-Confidential), written by `build_raw_message` when it isn't
+    // Normal. A dropdown trailing the importance buttons in the editor
+    // toolbar, which the window layer moves as a whole into a pop-out window,
+    // so it needs no reparenting of its own.
+    let sensitivity_model = gtk::StringList::new(&SENSITIVITY_LABELS);
+    let sensitivity_dropdown = gtk::DropDown::builder().model(&sensitivity_model).tooltip_text("Sensitivity").build();
+    sensitivity_dropdown.set_selected(sensitivity_index(prefill.sensitivity));
+
     let body_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .left_margin(8)
@@ -2004,6 +2048,8 @@ pub fn build_compose_view(
     editor_toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
     editor_toolbar.append(&high_importance_toggle);
     editor_toolbar.append(&low_importance_toggle);
+    // Sensitivity trails importance.
+    editor_toolbar.append(&sensitivity_dropdown);
 
     {
         let web_view = rich_web_view.clone();
@@ -2046,6 +2092,7 @@ pub fn build_compose_view(
         read_receipt_toggle: read_receipt_toggle.clone(),
         high_importance_toggle: high_importance_toggle.clone(),
         low_importance_toggle: low_importance_toggle.clone(),
+        sensitivity_dropdown: sensitivity_dropdown.clone(),
         rich_toggle: rich_toggle.clone(),
         body_view: body_view.clone(),
         rich_web_view: rich_web_view.clone(),
@@ -2234,6 +2281,7 @@ pub fn build_compose_view(
             let read_receipt_toggle = read_receipt_toggle.clone();
             let high_importance_toggle = high_importance_toggle.clone();
             let low_importance_toggle = low_importance_toggle.clone();
+            let sensitivity_dropdown = sensitivity_dropdown.clone();
             let attachments = attachments.clone();
             let in_reply_to = in_reply_to.clone();
             let references = references.clone();
@@ -2328,6 +2376,7 @@ pub fn build_compose_view(
                     read_receipt: None,
                     request_read_receipt: read_receipt_toggle.is_active(),
                     importance: selected_importance(&high_importance_toggle, &low_importance_toggle),
+                    sensitivity: selected_sensitivity(&sensitivity_dropdown),
                     in_reply_to,
                     references,
                     message_id: draft_message_id_used,
@@ -2523,6 +2572,7 @@ mod tests {
             in_reply_to: Some("older@example.com".to_string()),
             references: vec!["older@example.com".to_string()],
             request_read_receipt: true,
+            sensitivity: MessageSensitivity::Private,
             ..Default::default()
         };
 
@@ -2535,6 +2585,7 @@ mod tests {
         assert_eq!(prefill.html_body.as_deref(), Some("<p>draft text</p>"));
         assert_eq!(prefill.from.as_deref(), Some("ada@example.com"));
         assert_eq!(prefill.importance, Importance::High);
+        assert_eq!(prefill.sensitivity, MessageSensitivity::Private);
         assert!(prefill.request_read_receipt);
         assert_eq!(prefill.attachments.len(), 1);
         assert_eq!(prefill.attachments[0].bytes, b"notes");
@@ -2576,6 +2627,7 @@ mod tests {
             read_receipt: None,
             request_read_receipt: true,
             importance: Importance::Low,
+            sensitivity: MessageSensitivity::Private,
             in_reply_to: Some("older@example.com".to_string()),
             references: vec!["older@example.com".to_string()],
             message_id: Some("draft-9@lookout.local".to_string()),
@@ -2592,6 +2644,7 @@ mod tests {
         assert_eq!(prefill.attachments.len(), 1);
         assert_eq!(prefill.attachments[0].filename, "q3.csv");
         assert_eq!(prefill.importance, Importance::Low);
+        assert_eq!(prefill.sensitivity, MessageSensitivity::Private);
         assert!(prefill.request_read_receipt);
         assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
         assert_eq!(prefill.draft_message_id.as_deref(), Some("draft-9@lookout.local"));
@@ -2661,6 +2714,7 @@ mod tests {
             read_receipt: None,
             request_read_receipt: true,
             importance: Importance::High,
+            sensitivity: MessageSensitivity::CompanyConfidential,
             in_reply_to: Some("older@example.com".to_string()),
             references: vec!["older@example.com".to_string()],
             message_id: Some("draft-9@lookout.local".to_string()),
@@ -2679,6 +2733,7 @@ mod tests {
         assert_eq!(prefill.attachments[0].filename, "q3.csv");
         assert_eq!(prefill.attachments[0].bytes, b"a,b\n1,2\n");
         assert_eq!(prefill.importance, Importance::High);
+        assert_eq!(prefill.sensitivity, MessageSensitivity::CompanyConfidential);
         assert!(prefill.request_read_receipt);
         assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
         assert_eq!(prefill.references, vec!["older@example.com".to_string()]);
@@ -2831,6 +2886,7 @@ mod tests {
             rich: false,
             read_receipt: false,
             importance: Importance::Normal,
+            sensitivity: MessageSensitivity::Normal,
             body: body_text.to_string(),
             body_text: body_text.to_string(),
             attachments: vec![],
@@ -2888,6 +2944,7 @@ mod tests {
             rich: true,
             read_receipt: false,
             importance: Importance::Normal,
+            sensitivity: MessageSensitivity::Normal,
             body: "<p><br></p>".to_string(),
             body_text: "\n".to_string(),
             attachments: vec![],

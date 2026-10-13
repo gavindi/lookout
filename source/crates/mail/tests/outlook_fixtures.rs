@@ -86,6 +86,24 @@ fn invitation_fixtures_carry_microsoft_extensions() {
 }
 
 #[test]
+fn authentication_results_drive_the_unverified_sender_verdict() {
+    let body = parse("auth-results.eml");
+    let results = body.auth_results.as_ref().expect("Authentication-Results parsed");
+    assert_eq!(results.spf, Some(lookout_core::SpfResult::SoftFail));
+    assert_eq!(results.dkim, Some(lookout_core::DkimResult::Fail));
+    assert_eq!(results.dmarc, Some(lookout_core::DmarcResult::Fail));
+    assert!(results.any_failure());
+    assert!(!results.any_pass());
+
+    // The display name hides a different address (the phishing shape).
+    let from = lookout_core::EmailAddress {
+        name: Some("support@paypal.com".to_string()),
+        address: "attacker@evil.example".to_string(),
+    };
+    assert_eq!(lookout_core::display_name_address_mismatch(&from).as_deref(), Some("support@paypal.com"));
+}
+
+#[test]
 fn importance_and_sensitivity_headers_round_trip() {
     let body = parse("importance-high.eml");
     assert_eq!(importance_from_headers(&body.headers), Some(Importance::High));

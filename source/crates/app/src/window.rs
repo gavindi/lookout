@@ -888,7 +888,7 @@ pub(crate) struct UiState {
     pub(crate) ui_db: Option<Rc<crate::ui_state_db::UiStateDb>>,
     /// The GSettings-backed preference store (see `settings`), resolved once
     /// in `build_window` and written through on every preference change.
-    settings: Rc<crate::settings::SettingsStore>,
+    pub(crate) settings: Rc<crate::settings::SettingsStore>,
     /// The relational-data config (`settings.json`): sending identities and
     /// folder-role overrides. Loaded at startup, written through by the
     /// manage-identities dialog. See `app_config`.
@@ -1008,6 +1008,12 @@ pub(crate) struct UiState {
     /// away first, in which case the late response is dropped as stale). See
     /// `PendingRawMessage`.
     pending_raw_message: Option<PendingRawMessage>,
+    /// A Report phishing run (item 6.7 / S-09) waiting on the target's raw
+    /// bytes: when `RawMessageFetched` lands for this `(mailbox, uid)`, the
+    /// message is forwarded as a `.eml` attachment to the configured address
+    /// and then moved to Junk. Only ever one in flight; cleared on delivery or
+    /// failure.
+    pending_report_phishing: Option<(MailboxId, Uid)>,
     /// Open "message in new window" pop-outs (item 1.9 / M-31), keyed by
     /// `(mailbox, uid)` - one window per message; `open_message_window`
     /// re-presents an existing window instead of opening a second. The stored
@@ -1322,6 +1328,17 @@ pub(crate) struct UiState {
     /// shows nothing or the message has no usable sender (the debug `.eml`
     /// viewer, which also has no account to key trust on).
     rendered_trust_sender: Option<(AccountId, String)>,
+    /// The impersonated address from the rendered message's `From` display
+    /// name when it hides a *different* address (`"support@paypal.com"
+    /// <attacker@evil.example>`), re-stashed by `render_body`. Drives the
+    /// sender-authentication banner (S-03). `None` when there is no display
+    /// name, no embedded address, or the domains match.
+    rendered_from_mismatch: Option<String>,
+    /// The `href`s of the rendered message's links whose visible text names a
+    /// different host (item 6.3 / S-08), computed once per render by
+    /// `render_body`. The reading pane's link-click handler confirms before
+    /// opening one of these. Empty for messages with no body or no risky link.
+    rendered_link_warnings: Vec<String>,
     /// Session-only "load remote images just this once" override for the
     /// message currently on the reading pane - the external-content banner's
     /// transient action. Cleared on every navigation.
@@ -2582,6 +2599,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         pending_attachment: None,
         pending_attachment_batch: None,
         pending_raw_message: None,
+        pending_report_phishing: None,
         message_windows: HashMap::new(),
         message_details: None,
         rendered_draft: None,
@@ -2639,6 +2657,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
         trusted_senders,
         rendered_trust_sender: None,
+        rendered_from_mismatch: None,
+        rendered_link_warnings: Vec::new(),
         load_once_images: false,
         message_theme_override: false,
         trust_banner_dismissed: None,
@@ -4169,7 +4189,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the main frame, not for subresources, so the response veto below
     // can't be the gate that holds the block.
     let state_for_policy = state.clone();
-    web_view.connect_decide_policy(move |_view, decision, decision_type| {
+    web_view.connect_decide_policy(move |view, decision, decision_type| {
         let uri_is_local = |uri: &str| -> bool {
             let scheme = uri.split(':').next().unwrap_or("");
             matches!(scheme, "data" | "cid" | "about" | "file")
@@ -4189,7 +4209,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let is_user_gesture = navigation.as_ref().map(|a| a.is_user_gesture()).unwrap_or(false);
                 if is_link_click || is_user_gesture {
                     if let Some(uri) = navigation.as_ref().and_then(|a| a.request()).and_then(|r| r.uri()) {
-                        open_uri_in_default_browser(&uri);
+                        // Item 6.3 / S-08: a link whose visible text names a
+                        // different host gets a confirmation first.
+                        let suspicious = state_for_policy.borrow().rendered_link_warnings.iter().any(|href| href == &uri);
+                        if suspicious {
+                            show_suspicious_link_dialog(view, &uri);
+                        } else {
+                            open_uri_in_default_browser(&uri);
+                        }
                     }
                     decision.ignore();
                     return true;
@@ -4388,6 +4415,55 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     trust_banner.set_button_label(Some("Trust sender…"));
     trust_banner.set_revealed(false);
     message_page.append(&trust_banner);
+    // The sender-authentication banner (item 6.1 / S-03, M-35): revealed by
+    // `render_body` when the message's `Authentication-Results` show a failure
+    // or leave the sender unverified, or when the display name impersonates a
+    // different address. No button - it is an advisory info bar (UX-33).
+    let auth_banner = adw::Banner::new("");
+    auth_banner.set_widget_name("auth-banner");
+    auth_banner.set_revealed(false);
+    message_page.append(&auth_banner);
+    // The external-sender banner (item 6.2 / S-06): revealed when the sender's
+    // domain is outside the configured internal-domain list. No button.
+    let external_banner = adw::Banner::new("This sender is external");
+    external_banner.set_widget_name("external-banner");
+    external_banner.set_revealed(false);
+    message_page.append(&external_banner);
+    // The sensitivity banner (item 6.5 / C-06): revealed for a message whose
+    // RFC 2156 `Sensitivity` is set (Personal / Private /
+    // Company-Confidential). No button.
+    let sensitivity_banner = adw::Banner::new("");
+    sensitivity_banner.set_widget_name("sensitivity-banner");
+    sensitivity_banner.set_revealed(false);
+    message_page.append(&sensitivity_banner);
+    // Link-safety status (item 6.3 / S-08): shows the real target of the link
+    // under the pointer, so a misleading anchor text can't hide where a click
+    // goes. Pinned at the bottom of the message page, hidden unless a link is
+    // hovered.
+    let link_status = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .css_classes(["dim-label"])
+        .margin_start(12)
+        .margin_end(12)
+        .margin_bottom(4)
+        .visible(false)
+        .build();
+    link_status.set_widget_name("link-status");
+    message_page.append(&link_status);
+    {
+        let link_status = link_status.clone();
+        web_view.connect_mouse_target_changed(move |_view, hit_test, _modifiers| {
+            if hit_test.context_is_link() {
+                if let Some(uri) = hit_test.link_uri() {
+                    link_status.set_text(&uri);
+                    link_status.set_visible(true);
+                    return;
+                }
+            }
+            link_status.set_visible(false);
+        });
+    }
     // The read-receipt banner (RFC 8098 `Disposition-Notification-To`),
     // between the header and the body like the others: revealed by
     // `render_body` when the message on screen requests a read receipt and
@@ -5101,8 +5177,41 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     delete_button.set_tooltip_text(Some("Delete"));
     let archive_button = gtk::Button::from_icon_name("mail-archive-symbolic");
     archive_button.set_tooltip_text(Some("Archive"));
-    let report_button = gtk::Button::from_icon_name("mail-mark-junk-symbolic");
+    // Report ▾ (UX-05): the main part reports the selection as junk; the
+    // arrow opens Report junk / Report phishing / Not junk. Report phishing
+    // (item 6.7 / S-09) is a no-op when no reporting address is set.
+    let report_button = adw::SplitButton::builder().icon_name("mail-mark-junk-symbolic").dropdown_tooltip("Report options").build();
     report_button.set_tooltip_text(Some("Report"));
+    {
+        let group = gio::SimpleActionGroup::new();
+        let junk_action = gio::SimpleAction::new("junk", None);
+        {
+            let state = state.clone();
+            let message_list = message_list.clone();
+            junk_action.connect_activate(move |_, _| set_junk_selection(&state, &message_list, &message_list.selected_summaries(), true));
+        }
+        group.add_action(&junk_action);
+        let phishing_action = gio::SimpleAction::new("phishing", None);
+        {
+            let state = state.clone();
+            let message_list = message_list.clone();
+            phishing_action.connect_activate(move |_, _| report_phishing_selection(&state, &message_list.selected_summaries()));
+        }
+        group.add_action(&phishing_action);
+        let not_junk_action = gio::SimpleAction::new("not-junk", None);
+        {
+            let state = state.clone();
+            let message_list = message_list.clone();
+            not_junk_action.connect_activate(move |_, _| set_junk_selection(&state, &message_list, &message_list.selected_summaries(), false));
+        }
+        group.add_action(&not_junk_action);
+        report_button.insert_action_group("report", Some(&group));
+        let report_menu = gio::Menu::new();
+        report_menu.append(Some("Report junk"), Some("report.junk"));
+        report_menu.append(Some("Report phishing"), Some("report.phishing"));
+        report_menu.append(Some("Not junk"), Some("report.not-junk"));
+        report_button.set_menu_model(Some(&report_menu));
+    }
     let pin_button = gtk::Button::from_icon_name(pin_icon_name(false));
     pin_button.set_tooltip_text(Some("Pin/Unpin"));
     refresh_pin_button(&pin_button, &message_list);
@@ -7646,6 +7755,27 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Internal domains" (item 6.2 / S-06): split the
+    // comma/whitespace-separated entry into the `mail-internal-domains`
+    // string list. The reading pane's external-sender tag reads it on the
+    // next render (it isn't re-rendered per keystroke).
+    {
+        let state = state.clone();
+        config_view.internal_domains_entry.connect_changed(move |entry| {
+            let domains = crate::settings::parse_domain_list(&entry.text());
+            state.borrow().settings.set_strv(crate::settings::MAIL_INTERNAL_DOMAINS, domains);
+        });
+    }
+
+    // Config → Mail → "Report phishing address" (item 6.7 / S-09): the
+    // address Report phishing forwards to. Empty hides the action.
+    {
+        let state = state.clone();
+        config_view.report_phishing_entry.connect_changed(move |entry| {
+            state.borrow().settings.set_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS, entry.text().trim());
+        });
+    }
+
     // Config → Mail → "Trusted senders…": opens the manage dialog for the
     // external-content trust flow (add/remove sender entries, change trust
     // levels). Every change writes through to the UI-state database and the
@@ -8049,6 +8179,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.animations_row.set_active(persisted.get_bool(crate::settings::ANIMATE_TRANSITIONS));
         config_view.message_theme_dark_row.set_active(persisted.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK));
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
+        config_view.internal_domains_entry.set_text(&crate::settings::format_domain_list(
+            &persisted.get_strv(crate::settings::MAIL_INTERNAL_DOMAINS),
+        ));
+        config_view.report_phishing_entry.set_text(&persisted.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
         config_view.spell_check_row.set_active(persisted.get_bool(crate::settings::MAIL_SPELL_CHECK));
         {
@@ -8324,7 +8458,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         (crate::shortcuts::ACTION_FORWARD, &forward_button),
         (crate::shortcuts::ACTION_DELETE, &delete_button),
         (crate::shortcuts::ACTION_ARCHIVE, &archive_button),
-        (crate::shortcuts::ACTION_REPORT_JUNK, &report_button),
         (crate::shortcuts::ACTION_SNOOZE, &snooze_button),
         (crate::shortcuts::ACTION_PIN, &pin_button),
         (crate::shortcuts::ACTION_MARK_READ, &mark_read_button),
@@ -8332,6 +8465,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let button = button.clone();
         dispatch.insert(action, Rc::new(move || button.emit_clicked()));
     }
+    // Report junk (its shortcut): the Report split button's main action.
+    dispatch.insert(
+        crate::shortcuts::ACTION_REPORT_JUNK,
+        Rc::new({
+            let report_button = report_button.clone();
+            move || report_button.emit_clicked()
+        }),
+    );
     // Flag / clear flag (Insert, item 1.16): the Flag button's main action.
     // Insert also toggles overwrite in text fields, so it's left to them
     // while one has focus.
@@ -11857,6 +11998,50 @@ fn spawn_account_event_loop(
                         if let Some(pending) = pending_draft {
                             open_draft_composer_with_raw(&state, &worker, &reading_stack, &pending.summary, &bytes);
                         }
+                        // A Report phishing run (item 6.7 / S-09) waiting on
+                        // these bytes: forward the message as an attachment to
+                        // the configured address, then move it to Junk. Done
+                        // before the export branch below, which moves `bytes`
+                        // into its async task.
+                        let pending_report = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_report_phishing.take() {
+                                Some((m, u)) if m == mailbox && u == uid => true,
+                                other => {
+                                    st.pending_report_phishing = other;
+                                    false
+                                }
+                            }
+                        };
+                        if pending_report {
+                            let summary = message_list.all_messages().into_iter().find(|m| m.mailbox == mailbox && m.uid == uid);
+                            if let Some(summary) = summary {
+                                match report_phishing_message(&state, &summary, &bytes) {
+                                    Some(message) => {
+                                        let account_id = mailbox_account_id(&summary.mailbox);
+                                        let sent = account_id
+                                            .and_then(|id| state.borrow().accounts.get(&id).map(|handle| handle.cmd_tx.clone()))
+                                            .map(|cmd_tx| {
+                                                cmd_tx
+                                                    .send_blocking(AccountCommand::SendMessage {
+                                                        message: Box::new(message),
+                                                        not_before: None,
+                                                        client_token: None,
+                                                    })
+                                                    .is_ok()
+                                            })
+                                            .unwrap_or(false);
+                                        if sent {
+                                            set_junk_selection(&state, &message_list, std::slice::from_ref(&summary), true);
+                                            toast_overlay.add_toast(adw::Toast::new("Message reported as phishing"));
+                                        } else {
+                                            toast_overlay.add_toast(adw::Toast::new("Couldn't report the message: the account isn't connected"));
+                                        }
+                                    }
+                                    None => toast_overlay.add_toast(adw::Toast::new("Set a Report phishing address in Settings first")),
+                                }
+                            }
+                        }
                         // The .eml export's whole raw message arrived. Only act if
                         // it belongs to the outstanding export request; a response
                         // that lands after the user selected a different message
@@ -11886,6 +12071,21 @@ fn spawn_account_event_loop(
                         // what went wrong, so neither is left on its spinner.
                         crate::message_window::deliver_error(&state, &mailbox, uid, &message);
                         deliver_raw_error_to_details_dialog(&state, &mailbox, uid, &message);
+                        // A Report phishing run (item 6.7 / S-09) waiting on
+                        // this fetch fails as a whole.
+                        let report_failed = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_report_phishing.take() {
+                                Some((m, u)) if m == mailbox && u == uid => true,
+                                other => {
+                                    st.pending_report_phishing = other;
+                                    false
+                                }
+                            }
+                        };
+                        if report_failed {
+                            toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't report the message: {message}"))));
+                        }
                         // A draft "Edit" action (item 1.12) waiting on the
                         // same fetch: drop back to the empty pane and say why.
                         let draft_pending = {
@@ -16228,6 +16428,8 @@ fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widget, point: 
                 at: preset.at.with_timezone(&chrono::Utc),
             })
             .collect(),
+        report_phishing: targets.len() == 1
+            && !state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().is_empty(),
     };
 
     let description = crate::message_menu::message_menu_description(&menu_state, &choices);
@@ -16297,6 +16499,7 @@ fn run_message_menu_action(
         A::Archive => move_messages_to_role(state, message_list, targets, MailboxRole::Archive),
         A::ReportJunk => set_junk_selection(state, message_list, targets, true),
         A::NotJunk => set_junk_selection(state, message_list, targets, false),
+        A::ReportPhishing => report_phishing_selection(state, targets),
         A::MoveTo(folder) => move_messages_to_folder(state, message_list, targets, &folder),
         A::CopyTo(folder) => copy_messages_to_folder(state, targets, &folder),
         A::MoveOther | A::CopyOther => {
@@ -18246,6 +18449,97 @@ fn set_junk_selection(state: &Rc<RefCell<UiState>>, message_list: &MessageListMo
         format!("{count} {noun} marked as not junk")
     };
     record_undo(state, &description, inverse);
+}
+
+/// Starts a Report phishing run (item 6.7 / S-09) for the single target: the
+/// message's raw bytes are fetched, then - in the `RawMessageFetched` handler
+/// - forwarded as a `.eml` attachment to the configured address and the
+/// message moved to Junk. A no-op when no reporting address is set or there is
+/// no target.
+fn report_phishing_selection(state: &Rc<RefCell<UiState>>, targets: &[EmailSummary]) {
+    let Some(summary) = targets.first() else { return };
+    if state
+        .borrow()
+        .settings
+        .get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS)
+        .trim()
+        .is_empty()
+    {
+        return;
+    }
+    state.borrow_mut().pending_report_phishing = Some((summary.mailbox.clone(), summary.uid));
+    if !send_fetch_raw_message(state, &summary.mailbox, summary.uid) {
+        state.borrow_mut().pending_report_phishing = None;
+    }
+}
+
+/// Builds the forwarding message a Report phishing run sends: the original
+/// message as a `message/rfc822` attachment to the configured address, from
+/// the target's own account. `None` when the address is unset or the account
+/// handle is gone.
+fn report_phishing_message(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, raw: &[u8]) -> Option<lookout_mail::ComposedMessage> {
+    let address = state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().to_string();
+    if address.is_empty() {
+        return None;
+    }
+    let account_id = mailbox_account_id(&summary.mailbox)?;
+    let (from, display_name) = {
+        let st = state.borrow();
+        let handle = st.accounts.get(&account_id)?;
+        (handle.email.clone(), handle.display_name.clone())
+    };
+    let subject = summary.subject.clone().unwrap_or_default();
+    let report_subject = if subject.trim().is_empty() {
+        "Phishing report".to_string()
+    } else {
+        format!("Phishing report: {}", subject.trim())
+    };
+    Some(lookout_mail::ComposedMessage {
+        from,
+        display_name: (!display_name.trim().is_empty()).then_some(display_name),
+        to: vec![address],
+        cc: vec![],
+        bcc: vec![],
+        reply_to: vec![],
+        subject: report_subject,
+        importance: lookout_core::Importance::Normal,
+        sensitivity: lookout_core::MessageSensitivity::Normal,
+        text_body: "Forwarding a message reported as phishing. The original is attached.".to_string(),
+        html_body: None,
+        attachments: vec![lookout_mail::Attachment {
+            filename: phishing_attachment_name(&subject),
+            content_type: "message/rfc822".to_string(),
+            bytes: raw.to_vec(),
+        }],
+        inline_images: vec![],
+        calendar_part: None,
+        read_receipt: None,
+        request_read_receipt: false,
+        in_reply_to: None,
+        references: vec![],
+        message_id: None,
+    })
+}
+
+/// A safe `.eml` filename derived from a message's subject.
+fn phishing_attachment_name(subject: &str) -> String {
+    let mut name = String::new();
+    for ch in subject.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            name.push(ch);
+        } else if ch == ' ' || ch == '.' {
+            name.push('_');
+        }
+        if name.len() >= 60 {
+            break;
+        }
+    }
+    let name = name.trim_matches('_');
+    if name.is_empty() {
+        "message.eml".to_string()
+    } else {
+        format!("{name}.eml")
+    }
 }
 
 /// Moves `summaries` into the folder `target` (the message context menu's
@@ -22331,6 +22625,7 @@ fn send_read_receipt(state: &Rc<RefCell<UiState>>, automatic: bool) -> bool {
         }),
         request_read_receipt: false,
         importance: lookout_core::Importance::Normal,
+        sensitivity: lookout_core::MessageSensitivity::Normal,
         in_reply_to: Some(bare_id.clone()),
         references: vec![bare_id],
         message_id: None,
@@ -22483,6 +22778,28 @@ fn open_uri_in_default_browser(uri: &str) {
             tracing::warn!("failed to open link {uri} in the default browser: {e}");
         }
     }
+}
+
+/// Confirms before opening a link whose visible text named a different host
+/// (item 6.3 / S-08) - the message body's text can't be trusted to state the
+/// real destination. Opens in the default browser only on "Open".
+fn show_suspicious_link_dialog(parent: &impl IsA<gtk::Widget>, uri: &str) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Open this link?")
+        .body(format!("The link's text doesn't match where it actually goes:\n\n{uri}"))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("open", "Open");
+    dialog.set_response_appearance("open", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let uri = uri.to_string();
+    dialog.connect_response(None, move |_, response| {
+        if response == "open" {
+            open_uri_in_default_browser(&uri);
+        }
+    });
+    dialog.present(Some(parent));
 }
 
 /// The reading pane's conversation page widgets (item 1.7).
@@ -23429,6 +23746,25 @@ fn build_conversation_ui(ctx: &ConversationContext, reading_stack: &gtk::Stack) 
     (ui, page)
 }
 
+/// The sender-authentication banner's title (item 6.1 / S-03, M-35), or `None`
+/// when there is nothing to warn about. A display-name/address mismatch is the
+/// most specific cue; otherwise a definite SPF/DKIM/DMARC failure warns, and a
+/// set of results with no pass at all (e.g. all `none`) reads as unverified.
+/// Returns `None` when there are no results and no mismatch.
+pub(crate) fn auth_banner_title(results: Option<&lookout_core::AuthenticationResults>, mismatch: Option<&str>) -> Option<String> {
+    if let Some(impersonated) = mismatch {
+        return Some(format!("The sender's name includes {impersonated}, which may not match their address"));
+    }
+    let results = results?;
+    if results.any_failure() {
+        Some("This message may not be from the sender it claims to be".to_string())
+    } else if !results.any_pass() {
+        Some("The sender of this message could not be verified".to_string())
+    } else {
+        None
+    }
+}
+
 fn render_body(
     state: &Rc<RefCell<UiState>>,
     reading_stack: &gtk::Stack,
@@ -23481,6 +23817,10 @@ fn render_body(
     // `cid:`-bearing parts for the scheme handler to resolve against.
     drop_pending_cid(state);
     state.borrow_mut().rendered_inline_parts = body.parts.iter().filter(|p| p.cid.is_some()).cloned().collect();
+    // Link-safety warnings (item 6.3 / S-08) for the message being rendered:
+    // the hrefs of anchors whose visible text names a different host. The
+    // link-click handler confirms before opening one of these.
+    state.borrow_mut().rendered_link_warnings = body.html_body.as_deref().map(crate::link_safety::suspicious_link_hrefs).unwrap_or_default();
     // Apply the header for the message being rendered now. The selection
     // handler stores the summary here instead of updating the header
     // immediately, so the previous message's header stays on screen through
@@ -23502,6 +23842,10 @@ fn render_body(
             rendered_follow_up = summary.follow_up().map(|flag| (mailbox.clone(), uid, flag));
             let sender = summary.from.first().map(|a| a.address.trim().to_lowercase());
             st.rendered_trust_sender = mailbox_account_id(&mailbox).zip(sender);
+            // Display-name impersonation (6.1 / S-03): a From display name that
+            // hides a different address drives the auth banner alongside the
+            // server's Authentication-Results.
+            st.rendered_from_mismatch = summary.from.first().and_then(lookout_core::display_name_address_mismatch);
             // Draft status (item 1.12): the message-list summary's `\Draft`
             // flag (which also catches drafts surfaced outside the Drafts
             // folder, e.g. search copies) or the mailbox's role. The draft
@@ -23515,6 +23859,7 @@ fn render_body(
             st.rendered_snooze = lookout_core::snooze_until_from_keywords(&summary.keywords).map(|until| (mailbox.clone(), uid, until));
         } else {
             st.rendered_trust_sender = None;
+            st.rendered_from_mismatch = None;
             st.rendered_draft = None;
             st.rendered_snooze = None;
             st.rendered_draft_message_id = None;
@@ -23648,6 +23993,50 @@ fn render_body(
                     banner.set_title(&format!("Remote content from {sender} is blocked"));
                     banner.set_revealed(!dismissed && (images_blocked || other_blocked));
                 }
+            }
+        }
+    }
+    // Sender-authentication banner (item 6.1 / S-03, M-35): a definite
+    // SPF/DKIM/DMARC failure, an unverifiable sender, or a display name that
+    // hides a different address. Read from the body's parsed
+    // `Authentication-Results` and the mismatch stashed from the summary.
+    {
+        let st = state.borrow();
+        if let Some(banner) = find_named_child(reading_stack, "auth-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+            match auth_banner_title(body.auth_results.as_ref(), st.rendered_from_mismatch.as_deref()) {
+                Some(title) => {
+                    banner.set_title(&title);
+                    banner.set_revealed(true);
+                }
+                None => banner.set_revealed(false),
+            }
+        }
+    }
+    // External-sender banner (item 6.2 / S-06): the rendered sender's domain
+    // is outside the configured internal-domain list. Off when the list is
+    // empty, so the tag only ever appears once the user has set it up.
+    {
+        let st = state.borrow();
+        let domains = st.settings.get_strv(crate::settings::MAIL_INTERNAL_DOMAINS);
+        if let Some(banner) = find_named_child(reading_stack, "external-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+            let external = st
+                .rendered_trust_sender
+                .as_ref()
+                .is_some_and(|(_, sender)| lookout_core::is_external_sender(sender, &domains));
+            banner.set_revealed(external);
+        }
+    }
+    // Sensitivity banner (item 6.5 / C-06): the rendered message's RFC 2156
+    // `Sensitivity`. Normal is left off the wire, so the banner only appears
+    // for Personal / Private / Company-Confidential.
+    {
+        let sensitivity = lookout_core::sensitivity_from_headers(&body.headers).unwrap_or_default();
+        if let Some(banner) = find_named_child(reading_stack, "sensitivity-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+            if let Some(label) = sensitivity.as_header_value() {
+                banner.set_title(&format!("Sensitivity: {label}"));
+                banner.set_revealed(true);
+            } else {
+                banner.set_revealed(false);
             }
         }
     }
@@ -25113,6 +25502,7 @@ mod tests {
             pending_attachment: None,
             pending_attachment_batch: None,
             pending_raw_message: None,
+            pending_report_phishing: None,
             message_windows: HashMap::new(),
             message_details: None,
             rendered_draft: None,
@@ -25170,6 +25560,8 @@ mod tests {
             rich_text_default: true,
             trusted_senders: HashMap::new(),
             rendered_trust_sender: None,
+            rendered_from_mismatch: None,
+            rendered_link_warnings: Vec::new(),
             load_once_images: false,
             message_theme_override: false,
             trust_banner_dismissed: None,

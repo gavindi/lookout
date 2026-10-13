@@ -670,7 +670,14 @@ impl Cache {
         // caches' raw rows can't be served and are wiped once. Envelope rows
         // survive; their `structure` stays `None` until the next sync, which
         // is exactly the fallback path's cue.
-        const BODY_CACHE_VERSION: i64 = 4;
+        // Version 6: `EmailBody` gained `auth_results` (the parsed RFC 8601
+        // Authentication-Results verdicts, item 6.1). Old rows decode with it
+        // `None`, and since it is *derived* from the raw headers at assembly
+        // time it can't be back-filled from the stored JSON, so bodies are
+        // wiped once and reassembled. The value must stay above
+        // `ENVELOPE_CACHE_VERSION` (5), or the shared `user_version`
+        // high-water mark would swallow the bump.
+        const BODY_CACHE_VERSION: i64 = 6;
         // Version 3: the whole-message fallback path (`parse_body`) used to
         // number attachment parts by enumerate counter ("0", "1", ...) instead
         // of their IMAP section paths, so cached bodies from those builds
@@ -2922,25 +2929,25 @@ mod tests {
         assert!(cache.load_messages(&mailbox_id).unwrap().is_empty(), "a pre-migration cache must be wiped");
         assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), "a pre-migration body must be wiped");
 
-        // Simulate a version-4 database (body format current, but envelopes
-        // fetched before the selected-header block): the messages are wiped so
-        // they re-fetch with importance/sensitivity/List-Id, while the
-        // current-format bodies survive.
+        // Simulate a version-5 database (envelopes current, but bodies stored
+        // before `EmailBody.auth_results` was parsed): the bodies are wiped so
+        // each is reassembled with the parsed verdicts, while the current
+        // envelope rows survive.
         cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 3, None)]).unwrap();
-        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("current-format body")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("stale body")).unwrap();
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 4).unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
         }
-        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("kept body")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("stale body")).unwrap();
         let cache = Cache::open(&account_id).unwrap();
         assert!(
-            cache.load_messages(&mailbox_id).unwrap().is_empty(),
-            "a version-4 cache's envelopes must be wiped for the header re-fetch"
+            !cache.load_messages(&mailbox_id).unwrap().is_empty(),
+            "a version-5 cache's envelope rows must survive"
         );
         assert!(
-            cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(),
-            "a version-4 cache's current-format bodies must survive"
+            !cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(),
+            "a version-5 body must be wiped for the auth_results re-parse"
         );
 
         let _ = std::fs::remove_file(path);
@@ -4316,15 +4323,15 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         // Create a database with envelopes + a body but no search index at all,
-        // exactly what a pre-search build left on disk (user_version 5: the
-        // envelope/body-format and header migrations done, the FTS index
+        // exactly what a pre-search build left on disk (user_version current:
+        // the envelope/body-format and header migrations done, the FTS index
         // absent).
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 "
-                PRAGMA user_version = 5;
+                PRAGMA user_version = 6;
                 CREATE TABLE messages (
                     mailbox_id TEXT NOT NULL,
                     uid INTEGER NOT NULL,

@@ -1,0 +1,18 @@
+Return-Path: <spoofed@example.com>
+Authentication-Results: mx.example.net;
+ spf=softfail smtp.mailfrom=example.com;
+ dkim=fail header.d=example.com;
+ dmarc=fail header.from=example.com
+Authentication-Results: scanner.example.net; dmarc=none
+Received: from mail.example.com ([203.0.113.9])
+ by mx.example.net with ESMTPS id abc123
+ for <victim@example.net>; Tue, 14 Oct 2026 09:12:03 +0000
+From: "support@paypal.com" <attacker@evil.example>
+To: victim@example.net
+Subject: Urgent: verify your account
+Date: Tue, 14 Oct 2026 09:12:00 +0000
+Message-ID: <auth-fixture@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Your account will be suspended unless you confirm your details.

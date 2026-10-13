@@ -74,6 +74,9 @@ pub(crate) struct MessageWindowState {
     content_stack: gtk::Stack,
     text_view: gtk::TextView,
     remote_banner: adw::Banner,
+    auth_banner: adw::Banner,
+    external_banner: adw::Banner,
+    sensitivity_banner: adw::Banner,
     page_stack: gtk::Stack,
     error_label: gtk::Label,
 }
@@ -209,6 +212,15 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     remote_banner.set_button_label(Some("Load images"));
     remote_banner.set_revealed(false);
 
+    // Sender-authentication (6.1), external-sender (6.2) and sensitivity
+    // (6.5) info bars, mirroring the main reading pane's. No buttons.
+    let auth_banner = adw::Banner::new("");
+    auth_banner.set_revealed(false);
+    let external_banner = adw::Banner::new("This sender is external");
+    external_banner.set_revealed(false);
+    let sensitivity_banner = adw::Banner::new("");
+    sensitivity_banner.set_revealed(false);
+
     let attachments = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
     attachments.set_widget_name("attachments");
     attachments.set_visible(false);
@@ -219,6 +231,9 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     // the "body" content stack.
     let message_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_page.append(&remote_banner);
+    message_page.append(&auth_banner);
+    message_page.append(&external_banner);
+    message_page.append(&sensitivity_banner);
     message_page.append(&attachments);
     message_page.append(&content_stack);
 
@@ -297,6 +312,9 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
         content_stack: content_stack.clone(),
         text_view: text_view.clone(),
         remote_banner: remote_banner.clone(),
+        auth_banner: auth_banner.clone(),
+        external_banner: external_banner.clone(),
+        sensitivity_banner: sensitivity_banner.clone(),
         page_stack: page_stack.clone(),
         error_label: error_label.clone(),
     }));
@@ -527,7 +545,23 @@ fn render_raw(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowStat
 /// policy (with this window's load-once override), rebuilds the attachment
 /// strip, and updates the header from the stored summary.
 fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowState>>, body: &EmailBody, raw: Option<&[u8]>) {
-    let (mailbox, uid, summary, header, web_view, content_stack, text_view, remote_banner, page_stack, allow_images, allow_all, load_images_once) = {
+    let (
+        mailbox,
+        uid,
+        summary,
+        header,
+        web_view,
+        content_stack,
+        text_view,
+        remote_banner,
+        auth_banner,
+        external_banner,
+        sensitivity_banner,
+        page_stack,
+        allow_images,
+        allow_all,
+        load_images_once,
+    ) = {
         let e = entry.borrow();
         (
             e.mailbox.clone(),
@@ -538,6 +572,9 @@ fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowSta
             e.content_stack.clone(),
             e.text_view.clone(),
             e.remote_banner.clone(),
+            e.auth_banner.clone(),
+            e.external_banner.clone(),
+            e.sensitivity_banner.clone(),
             e.page_stack.clone(),
             e.allow_images.clone(),
             e.allow_all.clone(),
@@ -545,6 +582,29 @@ fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowSta
         )
     };
     header.update(&summary);
+
+    // Sender-authentication (6.1), external-sender (6.2) and sensitivity
+    // (6.5) info bars, mirroring the reading pane's.
+    {
+        let mismatch = summary.from.first().and_then(lookout_core::display_name_address_mismatch);
+        match crate::window::auth_banner_title(body.auth_results.as_ref(), mismatch.as_deref()) {
+            Some(title) => {
+                auth_banner.set_title(&title);
+                auth_banner.set_revealed(true);
+            }
+            None => auth_banner.set_revealed(false),
+        }
+        let domains = state.borrow().settings.get_strv(crate::settings::MAIL_INTERNAL_DOMAINS);
+        let external = summary.from.first().is_some_and(|a| lookout_core::is_external_sender(&a.address, &domains));
+        external_banner.set_revealed(external);
+        match lookout_core::sensitivity_from_headers(&body.headers).unwrap_or_default().as_header_value() {
+            Some(label) => {
+                sensitivity_banner.set_title(&format!("Sensitivity: {label}"));
+                sensitivity_banner.set_revealed(true);
+            }
+            None => sensitivity_banner.set_revealed(false),
+        }
+    }
 
     // The reading pane's attachment strip, reused verbatim: its Open/Save
     // actions ask the account for the part's bytes; the completed fetch is

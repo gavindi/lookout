@@ -10,8 +10,9 @@
 //! the same wherever it's invoked.
 //!
 //! Entries whose features haven't landed yet are left out rather than shown
-//! greyed: Ignore (2.8), Block ▸ (2.9), Rules ▸ Create rule (2.5), and Report
-//! ▸ Report phishing (6.7). Each adds itself here when it lands.
+//! greyed: Ignore (2.8), Block ▸ (2.9) and Rules ▸ Create rule (2.5). Report ▸
+//! Report phishing (6.7) is included only when a reporting address is set.
+//! Each adds itself here when it lands.
 //!
 //! Copyright (C) <2026>  <Gavin Graham & Contributors>
 //! Software released under the GPL3 license
@@ -57,6 +58,10 @@ pub enum MessageMenuAction {
     /// Mark the targets as not junk (move back to the Inbox and set RFC 5788
     /// `$NotJunk`, item 1.24); offered inside the Junk folder.
     NotJunk,
+    /// Forward the target as an attachment to the configured reporting
+    /// address, then move it to Junk (item 6.7 / S-09). Offered only when a
+    /// report-phishing address is set.
+    ReportPhishing,
     ViewDetails,
     ViewSource,
     OpenWindow,
@@ -150,6 +155,10 @@ pub struct MenuChoices {
     pub recent_folders: Vec<(MailboxId, String)>,
     pub flags: Vec<FlagEntry>,
     pub snoozes: Vec<SnoozeEntry>,
+    /// Whether a report-phishing address is configured (item 6.7 / S-09).
+    /// When false the Report ▸ Report phishing entry is left out entirely, as
+    /// the module docs' "features not landed yet" rule does elsewhere.
+    pub report_phishing: bool,
 }
 
 /// Every action the menu's group carries.
@@ -173,6 +182,7 @@ pub fn action_specs() -> Vec<ActionSpec> {
         "unsnooze",
         "report-junk",
         "not-junk",
+        "report-phishing",
         "view-details",
         "view-source",
         "open-window",
@@ -269,23 +279,23 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
         }
         menu.submenu("Snooze", snooze.section().action("Choose a date…", ns("snooze-custom")))
     };
-    menu.submenu("Categorize", MenuDescription::new().section().custom(CATEGORIZE_SLOT))
-        .section()
-        .submenu(
-            "Report",
-            MenuDescription::new().section().action("Report junk", ns("report-junk")).action("Not junk", ns("not-junk")),
-        )
-        .section()
-        .submenu(
-            "View",
-            MenuDescription::new()
-                .section()
-                .action("View message details", ns("view-details"))
-                .action("View message source", ns("view-source")),
-        )
-        .section()
-        .action("Open in new window", ns("open-window"))
-        .action("Print", ns("print"))
+    menu = menu.submenu("Categorize", MenuDescription::new().section().custom(CATEGORIZE_SLOT)).section();
+    let mut report = MenuDescription::new().section().action("Report junk", ns("report-junk"));
+    if choices.report_phishing {
+        report = report.action("Report phishing", ns("report-phishing"));
+    }
+    report = report.action("Not junk", ns("not-junk"));
+    menu = menu.submenu("Report", report).section();
+    menu.submenu(
+        "View",
+        MenuDescription::new()
+            .section()
+            .action("View message details", ns("view-details"))
+            .action("View message source", ns("view-source")),
+    )
+    .section()
+    .action("Open in new window", ns("open-window"))
+    .action("Print", ns("print"))
 }
 
 /// Maps an activated action's bare name and parameter back to what it asks
@@ -323,6 +333,7 @@ pub fn message_action_for(name: &str, param: Option<&glib::Variant>) -> Option<M
         "unsnooze" => MessageMenuAction::Unsnooze,
         "report-junk" => MessageMenuAction::ReportJunk,
         "not-junk" => MessageMenuAction::NotJunk,
+        "report-phishing" => MessageMenuAction::ReportPhishing,
         "view-details" => MessageMenuAction::ViewDetails,
         "view-source" => MessageMenuAction::ViewSource,
         "open-window" => MessageMenuAction::OpenWindow,
@@ -400,6 +411,13 @@ mod tests {
             ]
         );
         assert_eq!(labels(submenu(&menu, "Report")), vec![vec!["Report junk", "Not junk"]]);
+        // Report phishing joins the Report menu only when an address is set.
+        let configured = MenuChoices {
+            report_phishing: true,
+            ..MenuChoices::default()
+        };
+        let menu = message_menu_description(&state, &configured);
+        assert_eq!(labels(submenu(&menu, "Report")), vec![vec!["Report junk", "Report phishing", "Not junk"]]);
         assert_eq!(labels(submenu(&menu, "View")), vec![vec!["View message details", "View message source"]]);
         assert_eq!(labels(submenu(&menu, "Categorize")), vec![vec![format!("[{CATEGORIZE_SLOT}]")]]);
     }
@@ -491,6 +509,7 @@ mod tests {
                 label: "Tomorrow".into(),
                 at: wake,
             }],
+            report_phishing: false,
         };
         let menu = message_menu_description(&message_menu_state(&[facts(None)], true, true), &choices);
         assert_eq!(labels(submenu(&menu, "Move")), vec![vec!["Projects"], vec!["Other folder…"]]);
@@ -538,6 +557,7 @@ mod tests {
             ("unsnooze", MessageMenuAction::Unsnooze),
             ("report-junk", MessageMenuAction::ReportJunk),
             ("not-junk", MessageMenuAction::NotJunk),
+            ("report-phishing", MessageMenuAction::ReportPhishing),
             ("view-details", MessageMenuAction::ViewDetails),
             ("view-source", MessageMenuAction::ViewSource),
             ("open-window", MessageMenuAction::OpenWindow),

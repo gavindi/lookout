@@ -16,6 +16,7 @@ behaviour rather than an interpretation of the specs.
 | `teams-invite.eml` | A Teams meeting: `X-MICROSOFT-SKYPETEAMSMEETINGURL`, `X-MICROSOFT-ONLINEMEETINGCONFLINK`, and the join link in `DESCRIPTION`/`LOCATION`. |
 | `importance-high.eml` | `Importance: High` + `X-Priority: 1 (Highest)` + `X-MSMail-Priority: High`, a `Sensitivity: Private`, and a `List-Id`. |
 | `sensitivity-private.eml` | RFC 2156 `Sensitivity: Company-Confidential`. |
+| `auth-results.eml` | RFC 8601 `Authentication-Results` (SPF softfail, DKIM fail, DMARC fail, plus a second header), with a `From` display name impersonating a different address — drives the unverified-sender banner (S-03, M-35). |
 | `winmail.dat` | A synthetic TNEF stream (`[MS-OXTNEF]`): plain/RTF/HTML bodies, a MAPI property stream, two attachments and an inline image. |
 | `tnef-message.eml` | The `winmail.dat` above wrapped in the MIME envelope Outlook sends: `text/plain` plus `application/ms-tnef; name="winmail.dat"`. |
 

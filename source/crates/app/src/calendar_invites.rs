@@ -143,6 +143,7 @@ pub fn build_imip_message(
         reply_to: Vec::new(),
         subject,
         importance: lookout_core::Importance::default(),
+        sensitivity: lookout_core::MessageSensitivity::Normal,
         text_body,
         html_body: None,
         attachments: Vec::new(),

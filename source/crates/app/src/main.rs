@@ -35,6 +35,7 @@ mod gtk_test;
 mod identities;
 mod last_view;
 mod launcher_entry;
+mod link_safety;
 mod lookout_view;
 mod mail_notifications;
 mod message_header;

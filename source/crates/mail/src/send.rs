@@ -98,6 +98,10 @@ pub struct ComposedMessage {
     /// `build_raw_message` as the three Outlook headers (`Importance`,
     /// `X-Priority`, `X-MSMail-Priority`) via the Phase 0.1 interop layer.
     pub importance: lookout_core::Importance,
+    /// Message sensitivity (RFC 2156 `Sensitivity`). `Normal` is the default
+    /// and leaves the header off the wire, matching Outlook; `Personal`,
+    /// `Private` and `CompanyConfidential` write it.
+    pub sensitivity: lookout_core::MessageSensitivity,
     pub text_body: String,
     /// Optional HTML rendering of the same body. Both parts are sent when
     /// set; recipients that only handle plain text fall back to `text_body`.
@@ -239,6 +243,10 @@ fn build_raw_message_inner(msg: &ComposedMessage, include_bcc: bool) -> (Vec<u8>
         for (name, value) in lookout_core::importance_headers(msg.importance) {
             builder = builder.header(name, raw_header(value));
         }
+    }
+    // RFC 2156 `Sensitivity`. Normal is left off the wire, matching Outlook.
+    if let Some((name, value)) = lookout_core::sensitivity_header(msg.sensitivity) {
+        builder = builder.header(name, raw_header(value.to_string()));
     }
     if let Some(receipt) = &msg.read_receipt {
         // RFC 8098 §3: a `multipart/report; report-type=disposition-notification`
@@ -510,6 +518,7 @@ mod tests {
             read_receipt: None,
             request_read_receipt: false,
             importance: lookout_core::Importance::Normal,
+            sensitivity: lookout_core::MessageSensitivity::Normal,
             in_reply_to: None,
             references: vec![],
             message_id: None,

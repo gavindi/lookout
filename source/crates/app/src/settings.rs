@@ -103,6 +103,13 @@ pub const MAIL_FILTERS: &str = "mail-filters";
 /// all). Defaults to "all", the pre-scope behaviour of searching every
 /// account's cache.
 pub const MAIL_SEARCH_SCOPE: &str = "mail-search-scope";
+/// Config → Mail → "Internal domains": addresses outside this list are tagged
+/// external in the reading pane (S-06). Empty disables the tag.
+pub const MAIL_INTERNAL_DOMAINS: &str = "mail-internal-domains";
+/// Config → Mail → "Report phishing address": where Report phishing forwards a
+/// message as an attachment before moving it to Junk (S-09). Empty hides the
+/// action.
+pub const MAIL_REPORT_PHISHING_ADDRESS: &str = "mail-report-phishing-address";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
@@ -287,6 +294,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_CONVERSATION_INCLUDE_SENT, Value::Bool(true));
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
     map.insert(MAIL_SEARCH_SCOPE, Value::String("all".into()));
+    map.insert(MAIL_INTERNAL_DOMAINS, Value::Strv(Vec::new()));
+    map.insert(MAIL_REPORT_PHISHING_ADDRESS, Value::String(String::new()));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
@@ -660,6 +669,26 @@ pub fn preview_lines(value: i32) -> i32 {
     value.clamp(0, MAX_PREVIEW_LINES)
 }
 
+/// Splits the "Internal domains" entry into the `mail-internal-domains`
+/// string list (item 6.2 / S-06). Domains may be separated by commas,
+/// semicolons or whitespace; each is trimmed, stripped of a leading `@`,
+/// lowercased, and de-duplicated, preserving order. Empty tokens are dropped.
+pub fn parse_domain_list(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for token in text.split([';', ' ', '\t', '\n', ',']) {
+        let token = token.trim().trim_start_matches('@').to_ascii_lowercase();
+        if !token.is_empty() && !out.contains(&token) {
+            out.push(token);
+        }
+    }
+    out
+}
+
+/// Renders a domain list back into the entry's comma-separated text.
+pub fn format_domain_list(domains: &[String]) -> String {
+    domains.join(", ")
+}
+
 /// Config → Mail → "Mark as read": the stored `mark-as-read-mode` values, in
 /// UI (a `ComboRow`) order. "on-selection-change" is the default (and what an
 /// unset GSettings value resolves to), matching Outlook.
@@ -822,6 +851,20 @@ mod tests {
         assert_eq!(store.get_string(SORT_KEY), "sender");
         store.set_string(SORT_KEY, "subject");
         assert_eq!(store.get_string(SORT_KEY), "subject");
+    }
+
+    #[test]
+    fn domain_list_parses_separators_case_and_duplicates() {
+        assert_eq!(parse_domain_list("Example.com, @example.org; example.com\ncorp.test"), vec!["example.com", "example.org", "corp.test"]);
+        assert!(parse_domain_list("   ").is_empty());
+        assert_eq!(format_domain_list(&parse_domain_list("a.com,b.com")), "a.com, b.com");
+    }
+
+    #[test]
+    fn internal_domains_and_phishing_address_default_to_empty() {
+        let store = resolve();
+        assert!(store.get_strv(MAIL_INTERNAL_DOMAINS).is_empty());
+        assert_eq!(store.get_string(MAIL_REPORT_PHISHING_ADDRESS), "");
     }
 
     #[test]

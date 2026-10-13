@@ -9,11 +9,13 @@
 //! ([`crate::calendar::EventSensitivity`]) - the two share no values.
 //!
 //! Only parsing and emission live here; persistence on `EmailSummary` is a
-//! later item (0.2), and `Authentication-Results` parsing is separate (6.1).
+//! later item (0.2). `Authentication-Results` parsing (6.1 / S-03, M-35) also
+//! lives here: it is read off the wire and drives the "unverified sender"
+//! banner alongside importance and sensitivity.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use crate::email::header_value;
+use crate::email::{header_value, AuthenticationResults, DkimResult, DmarcResult, SpfResult};
 
 /// `Importance:` (RFC 2156) — the canonical Outlook name.
 pub const IMPORTANCE_HEADER: &str = "Importance";
@@ -25,6 +27,10 @@ pub const X_MSMAIL_PRIORITY_HEADER: &str = "X-MSMail-Priority";
 pub const PRIORITY_HEADER: &str = "Priority";
 /// `Sensitivity:` (RFC 2156).
 pub const SENSITIVITY_HEADER: &str = "Sensitivity";
+/// `Authentication-Results:` (RFC 8601) — added by the receiving boundary
+/// (the server, or a scanner), not by the sender. Its `spf` / `dkim` / `dmarc`
+/// method verdicts drive the reading pane's "unverified sender" banner.
+pub const AUTHENTICATION_RESULTS_HEADER: &str = "Authentication-Results";
 
 /// A message's importance (Graph `importance: low|normal|high`). The `Normal`
 /// default matches Outlook: an unmarked message is normal importance.
@@ -142,6 +148,93 @@ pub fn sensitivity_header(sensitivity: MessageSensitivity) -> Option<(&'static s
     sensitivity.as_header_value().map(|value| (SENSITIVITY_HEADER, value))
 }
 
+/// Reads a message's `Authentication-Results` header(s) (RFC 8601) into the
+/// `spf` / `dkim` / `dmarc` verdicts each method reported. The header is a
+/// `authserv-id` followed by semicolon-separated `method=result` clauses, e.g.
+/// `mx.example.com; spf=pass smtp.mailfrom=a.com; dkim=softfail; dmarc=fail`.
+/// Clauses may carry trailing `property=value` detail (`header.d=…`,
+/// `smtp.mailfrom=…`, `reason=…`) which is ignored; the `auth` overall result
+/// has no field here and is skipped.
+///
+/// Returns `None` when no header is present or none of `spf` / `dkim` /
+/// `dmarc` carried a recognised verdict (so a message with no usable
+/// authentication information never raises a banner). When several headers or
+/// clauses name the same method, the first occurrence in wire order wins —
+/// the closest (topmost) authentication boundary is the most authoritative.
+pub fn auth_results_from_headers(headers: &[(String, String)]) -> Option<AuthenticationResults> {
+    let mut out = AuthenticationResults::default();
+    let mut found = false;
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case(AUTHENTICATION_RESULTS_HEADER) {
+            continue;
+        }
+        for clause in value.split(|c: char| c == ';' || c.is_whitespace()) {
+            let Some((method, result)) = clause.split_once('=') else {
+                continue;
+            };
+            let result = result.trim().trim_matches('"').to_ascii_lowercase();
+            let applied = match method.trim().to_ascii_lowercase().as_str() {
+                "spf" => set_once(&mut out.spf, spf_result(&result)),
+                "dkim" => set_once(&mut out.dkim, dkim_result(&result)),
+                "dmarc" => set_once(&mut out.dmarc, dmarc_result(&result)),
+                _ => false,
+            };
+            found |= applied;
+        }
+    }
+    found.then_some(out)
+}
+
+/// Fills `slot` from `value` only while it is still empty; reports whether a
+/// value was written, so the caller can tell a recognised method from an
+/// unknown one.
+fn set_once<T>(slot: &mut Option<T>, value: Option<T>) -> bool {
+    if slot.is_none() {
+        if let Some(value) = value {
+            *slot = Some(value);
+            return true;
+        }
+    }
+    false
+}
+
+fn spf_result(value: &str) -> Option<SpfResult> {
+    match value {
+        "pass" => Some(SpfResult::Pass),
+        "fail" => Some(SpfResult::Fail),
+        "softfail" => Some(SpfResult::SoftFail),
+        "neutral" => Some(SpfResult::Neutral),
+        "none" => Some(SpfResult::None),
+        "temperror" => Some(SpfResult::TempError),
+        "permerror" => Some(SpfResult::PermError),
+        _ => None,
+    }
+}
+
+fn dkim_result(value: &str) -> Option<DkimResult> {
+    match value {
+        "pass" => Some(DkimResult::Pass),
+        "fail" => Some(DkimResult::Fail),
+        "policy" => Some(DkimResult::Policy),
+        "neutral" => Some(DkimResult::Neutral),
+        "none" => Some(DkimResult::None),
+        "temperror" => Some(DkimResult::TempError),
+        "permerror" => Some(DkimResult::PermError),
+        _ => None,
+    }
+}
+
+fn dmarc_result(value: &str) -> Option<DmarcResult> {
+    match value {
+        "pass" => Some(DmarcResult::Pass),
+        "fail" => Some(DmarcResult::Fail),
+        "none" => Some(DmarcResult::None),
+        "temperror" => Some(DmarcResult::TempError),
+        "permerror" => Some(DmarcResult::PermError),
+        _ => None,
+    }
+}
+
 /// `High`/`Normal`/`Low` (also tolerates `medium`), case-insensitively.
 fn importance_from_word(value: &str) -> Option<Importance> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -250,5 +343,47 @@ mod tests {
     fn normal_sensitivity_emits_no_header() {
         assert_eq!(sensitivity_header(MessageSensitivity::Normal), None);
         assert_eq!(sensitivity_header(MessageSensitivity::Private), Some((SENSITIVITY_HEADER, "Private")));
+    }
+
+    #[test]
+    fn auth_results_parses_all_three_methods() {
+        let h = headers(&[(
+            "Authentication-Results",
+            "mx.example.com; spf=pass smtp.mailfrom=a.com; dkim=fail header.d=a.com; dmarc=pass header.from=a.com",
+        )]);
+        let parsed = auth_results_from_headers(&h).expect("header present");
+        assert_eq!(parsed.spf, Some(SpfResult::Pass));
+        assert_eq!(parsed.dkim, Some(DkimResult::Fail));
+        assert_eq!(parsed.dmarc, Some(DmarcResult::Pass));
+        assert!(parsed.any_pass());
+        assert!(parsed.any_failure());
+    }
+
+    #[test]
+    fn auth_results_maps_softfail_and_errors() {
+        let soft = headers(&[("authentication-results", "h; spf=softfail")]);
+        assert_eq!(auth_results_from_headers(&soft).unwrap().spf, Some(SpfResult::SoftFail));
+        let err = headers(&[("Authentication-Results", "h; dkim=temperror; dmarc=permerror")]);
+        let parsed = auth_results_from_headers(&err).unwrap();
+        assert_eq!(parsed.dkim, Some(DkimResult::TempError));
+        assert_eq!(parsed.dmarc, Some(DmarcResult::PermError));
+        assert!(!parsed.any_pass());
+        assert!(!parsed.any_failure());
+    }
+
+    #[test]
+    fn auth_results_first_clause_wins_and_unknown_is_ignored() {
+        let h = headers(&[("Authentication-Results", "h; spf=none; spf=pass; auth=pass; dmarc=banana")]);
+        let parsed = auth_results_from_headers(&h).unwrap();
+        assert_eq!(parsed.spf, Some(SpfResult::None));
+        // `auth` has no field and `dmarc=banana` is unknown, so dmarc stays None.
+        assert_eq!(parsed.dmarc, None);
+    }
+
+    #[test]
+    fn auth_results_absent_or_unrecognised_is_none() {
+        assert_eq!(auth_results_from_headers(&[]), None);
+        assert_eq!(auth_results_from_headers(&headers(&[("Authentication-Results", "h; auth=pass")])), None);
+        assert_eq!(auth_results_from_headers(&headers(&[("Subject", "spf=pass")])), None);
     }
 }

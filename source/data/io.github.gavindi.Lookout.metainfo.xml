@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.181" date="2026-10-14">
+      <description>
+        <p>Mail now flags the messages you should be careful with. The reading pane shows a warning when a message's sender cannot be verified or its name hides a different address, and tags senders from outside the internal domains you list in Settings, Mail. Hovering a link shows where it really goes, and a link whose text names a different site asks before opening. Messages can carry a Sensitivity of Normal, Personal, Private or Company-Confidential, set from the composer. Reporting a phishing message forwards it, as an attachment, to an address you choose and then moves it to Junk; those three Report actions now share the toolbar's Report button.</p>
+      </description>
+    </release>
     <release version="0.9.180" date="2026-10-14">
       <description>
         <p>Search now speaks Outlook's query language. Type from:, to:, subject:, has:attachment, is:unread, is:flagged, category:, received: or size: in the search bar to narrow results, and choose a scope - this folder, the whole account, or every mailbox. A Refine form builds a query from fields, the active operators appear as chips you can remove, and your recent searches are remembered in a drop-down when the empty search box has focus.</p>
