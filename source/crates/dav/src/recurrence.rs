@@ -105,8 +105,9 @@ where
 
 fn expand_set(set: RRuleSet, event: &CalendarEvent, window_start: DateTime<Utc>, window_end: DateTime<Utc>) -> Vec<EventOccurrence> {
     let duration = event.end - event.start;
-    let tz_start = window_start.with_timezone(&rrule::Tz::UTC);
-    let tz_end = window_end.with_timezone(&rrule::Tz::UTC);
+    let tz = expansion_zone(event);
+    let tz_start = window_start.with_timezone(&tz);
+    let tz_end = window_end.with_timezone(&tz);
     let result = set.after(tz_start).before(tz_end).all(MAX_OCCURRENCES);
     if result.limited {
         tracing::warn!(uid = %event.uid, "RRULE expansion hit the {MAX_OCCURRENCES}-occurrence cap within the requested window");
@@ -125,6 +126,7 @@ fn expand_set(set: RRuleSet, event: &CalendarEvent, window_start: DateTime<Utc>,
                 start: start_utc,
                 end: start_utc + duration,
                 all_day: event.all_day,
+                time_zone: event.time_zone.clone(),
                 rrule: event.rrule.clone(),
                 recurrence_id: None,
                 exdates: event.exdates.clone(),
@@ -147,17 +149,30 @@ fn expand_set(set: RRuleSet, event: &CalendarEvent, window_start: DateTime<Utc>,
 }
 
 fn build_rrule_set(event: &CalendarEvent, rrule_str: &str) -> Result<RRuleSet, String> {
-    let dtstart = event.start.with_timezone(&rrule::Tz::UTC);
+    let tz = expansion_zone(event);
+    let dtstart = event.start.with_timezone(&tz);
     let unvalidated: RRule<Unvalidated> = rrule_str.parse().map_err(|e| format!("{e}"))?;
     let validated = unvalidated.validate(dtstart).map_err(|e| format!("{e}"))?;
     let mut set = RRuleSet::new(dtstart).rrule(validated);
     for exdate in &event.exdates {
-        set = set.exdate(exdate.with_timezone(&rrule::Tz::UTC));
+        set = set.exdate(exdate.with_timezone(&tz));
     }
     for rdate in &event.rdates {
-        set = set.rdate(rdate.with_timezone(&rrule::Tz::UTC));
+        set = set.rdate(rdate.with_timezone(&tz));
     }
     Ok(set)
+}
+
+/// The zone an event's RRULE expands in (CAL-11): the event's own IANA zone
+/// when it has one - so a 09:00 Berlin weekly series stays 09:00 local across
+/// the DST change, as an iCalendar `TZID` means - and UTC otherwise.
+fn expansion_zone(event: &CalendarEvent) -> rrule::Tz {
+    event
+        .time_zone
+        .as_deref()
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
+        .map(rrule::Tz::from)
+        .unwrap_or(rrule::Tz::UTC)
 }
 
 fn single_occurrence_if_overlapping(event: &CalendarEvent, window_start: DateTime<Utc>, window_end: DateTime<Utc>) -> Vec<EventOccurrence> {
@@ -171,6 +186,7 @@ fn single_occurrence_if_overlapping(event: &CalendarEvent, window_start: DateTim
             start: event.start,
             end: event.end,
             all_day: event.all_day,
+            time_zone: event.time_zone.clone(),
             rrule: event.rrule.clone(),
             recurrence_id: None,
             exdates: event.exdates.clone(),
@@ -208,6 +224,7 @@ mod tests {
             start: start.parse().unwrap(),
             end: end.parse().unwrap(),
             all_day: false,
+            time_zone: None,
             rrule: rrule.map(str::to_string),
             recurrence_id: None,
             recurrence_range: lookout_core::RecurrenceRange::default(),
@@ -243,6 +260,24 @@ mod tests {
         let event = base_event("2026-06-15T14:00:00Z", "2026-06-15T15:00:00Z", None);
         let (start, end) = window("2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
         assert!(expand_occurrences(&event, start, end).is_empty());
+    }
+
+    /// CAL-11: a weekly series anchored in Berlin keeps its 09:00 local time
+    /// across the 29 March 2026 DST change - 08:00 UTC on 23 March (CET),
+    /// 07:00 UTC on 30 March (CEST) - which is the point of storing a `TZID`.
+    #[test]
+    fn zoned_weekly_series_keeps_its_local_wall_time_across_dst() {
+        let mut event = base_event("2026-03-23T08:00:00Z", "2026-03-23T09:00:00Z", Some("FREQ=WEEKLY;COUNT=3"));
+        event.time_zone = Some("Europe/Berlin".to_string());
+        let (start, end) = window("2026-03-01T00:00:00Z", "2026-05-01T00:00:00Z");
+        let occurrences = expand_occurrences(&event, start, end);
+        assert_eq!(occurrences.len(), 3);
+        assert_eq!(occurrences[0].start, "2026-03-23T08:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(occurrences[1].start, "2026-03-30T07:00:00Z".parse::<DateTime<Utc>>().unwrap(), "09:00 CEST");
+        assert_eq!(occurrences[2].start, "2026-04-06T07:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(occurrences[1].time_zone.as_deref(), Some("Europe/Berlin"));
+        // The 1-hour duration is preserved (it isn't a wall-clock end).
+        assert_eq!(occurrences[1].end - occurrences[1].start, chrono::Duration::hours(1));
     }
 
     #[test]

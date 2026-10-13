@@ -997,6 +997,7 @@ mod tests {
             start: Local.with_ymd_and_hms(2026, 8, day, hour, 0, 0).unwrap().with_timezone(&Utc),
             end: Local.with_ymd_and_hms(2026, 8, day, hour + 1, 0, 0).unwrap().with_timezone(&Utc),
             all_day: false,
+            time_zone: None,
             rrule: None,
             recurrence_id: None,
             exdates: Vec::new(),

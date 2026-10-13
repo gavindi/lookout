@@ -9,6 +9,7 @@ behaviour rather than an interpretation of the specs.
 | File | Exercises |
 |---|---|
 | `invite.eml` | iMIP `METHOD:REQUEST`, `X-MICROSOFT-CDO-*` busy/intended status, a Windows `TZID` + `VTIMEZONE`, `SEQUENCE:0`. |
+| `invite-iana-tz.ics` | The IANA-`TZID` invitation form other clients (Thunderbird, Google) send, next to Outlook's Windows IDs (CAL-11). |
 | `invite-update.eml` | An updated invitation: `SEQUENCE:1` / `X-MICROSOFT-CDO-APPT-SEQUENCE:1`, moved time and location. |
 | `cancel.eml` | iMIP `METHOD:CANCEL` with `STATUS:CANCELLED` and an incremented `SEQUENCE`. |
 | `counter.eml` | An attendee's iTIP `METHOD:COUNTER` proposing a new time (CAL-17). |

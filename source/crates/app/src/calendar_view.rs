@@ -3472,6 +3472,7 @@ mod tests {
             start: zone.occurrence_from_local(start, all_day),
             end: zone.occurrence_from_local(end, all_day),
             all_day,
+            time_zone: None,
             rrule: None,
             recurrence_id: None,
             exdates: Vec::new(),

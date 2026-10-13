@@ -579,6 +579,7 @@ mod tests {
             start,
             end: start + chrono::Duration::hours(1),
             all_day: false,
+            time_zone: None,
             rrule: None,
             recurrence_id: None,
             exdates: Vec::new(),

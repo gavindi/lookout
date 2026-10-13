@@ -1455,14 +1455,11 @@ pub fn refresh_google_tasks_client_row(row: &adw::ActionRow) {
     row.set_subtitle(&subtitle);
 }
 
-/// Every IANA zone name the time-zone pickers list, sorted (item 3.1).
+/// Every IANA zone name the time-zone pickers list, sorted (item 3.1) - the
+/// shared list lives in `calendar_tz` now that the event editor's per-event
+/// picker (CAL-11) uses it too.
 fn time_zone_names() -> &'static [&'static str] {
-    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        let mut names: Vec<&'static str> = chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
-        names.sort_unstable();
-        names
-    })
+    crate::calendar_tz::iana_zone_names()
 }
 
 /// The stored value for a time-zone picker's `index`: "" for its first entry

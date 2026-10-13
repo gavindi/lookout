@@ -120,6 +120,15 @@ pub struct CalendarEvent {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub all_day: bool,
+    /// The event's own IANA time zone (CAL-11), when it has one - Outlook's
+    /// per-event "time zone" and the `TZID` a CalDAV or Outlook document
+    /// carries. `start`/`end` stay UTC instants; this records which zone the
+    /// event's wall-clock times belong to, so the editor can enter/display
+    /// them there and the writer can emit `TZID` plus `VTIMEZONE`. `None`
+    /// for a floating or UTC event, and for all-day events (their
+    /// `VALUE=DATE` boundaries are zone-independent).
+    #[serde(default)]
+    pub time_zone: Option<String>,
     /// Raw RRULE value (RFC 5545 `RECUR` value), unparsed - parsing is
     /// `lookout-dav`'s job since this crate has no I/O deps and RRULE parsing
     /// is a heavier dependency than this crate should carry.
@@ -210,6 +219,9 @@ pub struct EventOccurrence {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub all_day: bool,
+    /// The event's own IANA time zone (see [`CalendarEvent::time_zone`]).
+    #[serde(default)]
+    pub time_zone: Option<String>,
     /// The master's raw RRULE (see [`CalendarEvent::rrule`]), so editing an
     /// occurrence can preserve the series it came from. `None` for a
     /// non-recurring event.

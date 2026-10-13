@@ -135,6 +135,7 @@ mod tests {
             start: Utc::now(),
             end: Utc::now(),
             all_day: false,
+            time_zone: None,
             rrule: None,
             recurrence_id: None,
             exdates: Vec::new(),

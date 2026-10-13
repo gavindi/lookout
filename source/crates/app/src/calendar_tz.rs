@@ -44,6 +44,18 @@ pub fn system_zone_name() -> Option<String> {
     iana_time_zone::get_timezone().ok().filter(|name| !name.is_empty())
 }
 
+/// Every IANA zone name the time-zone pickers offer, sorted - the Calendar
+/// preferences' two pickers (3.1) and the event editor's per-event zone
+/// (CAL-11) share the one list.
+pub fn iana_zone_names() -> &'static [&'static str] {
+    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names: Vec<&'static str> = chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
+        names.sort_unstable();
+        names
+    })
+}
+
 /// Resolves a wall-clock time in `tz` to an instant without panicking: an
 /// ambiguous time (a DST fall-back) takes the earlier offset, and a time in a
 /// gap (a spring-forward) is read with the offset in effect just before it -

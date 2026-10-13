@@ -88,6 +88,7 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         start: start_utc,
         end: end_utc,
         all_day,
+        time_zone: event_time_zone(event),
         rrule: event.property_value("RRULE").map(|s| s.to_string()),
         recurrence_id: parse_recurrence_id(event),
         recurrence_range: parse_recurrence_range(event),
@@ -341,18 +342,67 @@ fn parse_ical_duration(raw: &str) -> Duration {
 /// Serializes a [`CalendarEvent`] into a single-VEVENT iCalendar document
 /// suitable for a CalDAV `PUT` (the create/update body). Round-trips through
 /// [`parse_vevents`]: UID/DTSTART/DTEND are preserved, all-day events become
-/// `VALUE=DATE` values and timed events UTC `DATE-TIME`, and an existing RRULE
-/// is carried over verbatim so editing a recurring master edits the whole
-/// series rather than flattening it into a one-off (per-occurrence overrides
-/// remain out of scope, see the parse-side note on [`parse_vevents_with_meta`]).
+/// `VALUE=DATE` values, a timed event with an IANA `time_zone` is written as
+/// `TZID`-qualified local time with a matching `VTIMEZONE` (CAL-11) and one
+/// without stays UTC `DATE-TIME`, and an existing RRULE is carried over
+/// verbatim so editing a recurring master edits the whole series rather than
+/// flattening it into a one-off (per-occurrence overrides remain out of scope,
+/// see the parse-side note on [`parse_vevents_with_meta`]).
 ///
 /// The `icalendar` builder emits RFC 5545-correct CRLF line folding and
 /// escaping for us; `DTSTAMP` is generated fresh on every build (the editor
 /// intentionally never edits it).
+///
+/// The event's own IANA time zone (CAL-11): the `TZID` on its `DTSTART`,
+/// normalized to an IANA name (a Windows ID from an Outlook/Exchange
+/// invitation maps through `tzmap`). `None` for a UTC or floating start and
+/// for all-day events, whose `DATE` start carries no zone. An unknown `TZID`
+/// never reaches here - `resolve_datetime_utc` has already dropped the event.
+fn event_time_zone(event: &icalendar::Event) -> Option<String> {
+    let start = event.get_start()?;
+    let DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { tzid, .. }) = start else {
+        return None;
+    };
+    let zone = tzid
+        .parse::<chrono_tz::Tz>()
+        .ok()
+        .or_else(|| crate::tzmap::windows_to_iana(&tzid).and_then(|iana| iana.parse().ok()))?;
+    Some(zone.name().to_string())
+}
+
+/// The IANA zone a timed event is written with (CAL-11). An all-day event is
+/// always written as `VALUE=DATE` without `TZID` (its boundaries are
+/// zone-independent), and an unknown stored name - never produced by the
+/// parser, but a hand-edited cache could carry one - falls back to UTC rather
+/// than failing the write.
+fn write_zone(event: &CalendarEvent) -> Option<chrono_tz::Tz> {
+    if event.all_day {
+        return None;
+    }
+    event.time_zone.as_deref().and_then(|name| name.parse().ok())
+}
+
+/// The `VTIMEZONE` component for a timed event's `TZID`, inserted into an
+/// already-serialized single-VEVENT document (CAL-11). `icalendar` 0.17 has
+/// no VTIMEZONE support and its generic `Other` component isn't public, so
+/// the block is built as text (`crate::vtimezone`) and spliced in just before
+/// the `VEVENT` - after the calendar properties, where RFC 5545 wants a
+/// top-level component.
+fn with_vtimezone(ics: String, event: &CalendarEvent) -> String {
+    let Some(tz) = write_zone(event) else {
+        return ics;
+    };
+    let mut ics = ics;
+    if let Some(vevent_start) = ics.find("BEGIN:VEVENT") {
+        ics.insert_str(vevent_start, &crate::vtimezone::build(tz, event.start));
+    }
+    ics
+}
+
 pub fn build_vcalendar(event: &CalendarEvent) -> String {
     let mut calendar = icalendar::Calendar::new();
     calendar.push(build_vevent(event).done());
-    format!("{calendar}")
+    with_vtimezone(format!("{calendar}"), event)
 }
 
 /// Serializes a [`CalendarEvent`] into an iMIP message payload (RFC 6047):
@@ -384,7 +434,7 @@ pub fn build_imip_vcalendar(event: &CalendarEvent, method: ImipMethod) -> String
         vevent.append_property(Property::new("TRANSP", "OPAQUE"));
     }
     calendar.push(vevent);
-    format!("{calendar}")
+    with_vtimezone(format!("{calendar}"), event)
 }
 
 /// Parses every VTODO out of a raw iCalendar document into [`CalendarTask`]s,
@@ -564,6 +614,7 @@ pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
 
 fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     let mut vevent = icalendar::Event::new();
+    let zone = write_zone(event);
 
     vevent.uid(&event.uid.0);
     if let Some(summary) = &event.summary {
@@ -582,6 +633,13 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
         // reconstructs (`end - start == 1 day` round-trips exactly).
         vevent.all_day(event.start.date_naive());
         vevent.ends(event.end.date_naive());
+    } else if let Some(tz) = zone {
+        // CAL-11: a timed event with its own zone is written as wall-clock
+        // local time plus `TZID` (the `icalendar` builder adds the parameter
+        // for a `(naive time, zone)` start/end), so the wall time - not the
+        // UTC instant - is what a recurring series keeps across a DST change.
+        vevent.starts((event.start.with_timezone(&tz).naive_local(), tz));
+        vevent.ends((event.end.with_timezone(&tz).naive_local(), tz));
     } else {
         vevent.starts(event.start);
         vevent.ends(event.end);
@@ -598,7 +656,7 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     // RANGE=THISANDFUTURE parameter (RFC 5545 §3.2.13) is emitted when the
     // override extends over every later instance.
     if let Some(recurrence_id) = &event.recurrence_id {
-        let mut prop = recurrence_property("RECURRENCE-ID", *recurrence_id, event.all_day);
+        let mut prop = recurrence_property("RECURRENCE-ID", *recurrence_id, event.all_day, zone);
         if event.recurrence_range == RecurrenceRange::ThisAndFuture {
             prop.add_parameter("RANGE", "THISANDFUTURE");
         }
@@ -610,10 +668,10 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     // produced; a TZID-qualified exclusion a server stored is normalized to
     // its UTC instant but keeps its exact meaning.
     for exdate in &event.exdates {
-        vevent.append_multi_property(recurrence_property("EXDATE", *exdate, event.all_day).done());
+        vevent.append_multi_property(recurrence_property("EXDATE", *exdate, event.all_day, zone).done());
     }
     for rdate in &event.rdates {
-        vevent.append_multi_property(recurrence_property("RDATE", *rdate, event.all_day).done());
+        vevent.append_multi_property(recurrence_property("RDATE", *rdate, event.all_day, zone).done());
     }
     append_attendees(&mut vevent, &event.attendees);
     // RFC 5545 §3.6.1 requires an ORGANIZER whenever ATTENDEEs are present;
@@ -658,10 +716,16 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     vevent
 }
 
-/// A `RECURRENCE-ID`/`EXDATE`/`RDATE` property for `dt`, emitted as a DATE
-/// value for all-day series (anchored on midnight UTC, the form
-/// [`convert_event`]'s parser produces) or a UTC DATE-TIME otherwise.
-fn recurrence_property(key: &str, dt: DateTime<Utc>, all_day: bool) -> Property {
+/// A `RECURRENCE-ID`/`EXDATE`/`RDATE` property for `dt`: a DATE value for
+/// all-day series (anchored on midnight UTC, the form [`convert_event`]'s
+/// parser produces), zone-local time with the event's `TZID` when it has one
+/// (the value type must match `DTSTART`'s), or a UTC DATE-TIME otherwise.
+fn recurrence_property(key: &str, dt: DateTime<Utc>, all_day: bool, zone: Option<chrono_tz::Tz>) -> Property {
+    if let Some(tz) = zone {
+        let mut prop = Property::new(key, dt.with_timezone(&tz).naive_local().format("%Y%m%dT%H%M%S").to_string());
+        prop.add_parameter("TZID", tz.name());
+        return prop;
+    }
     let value = if all_day {
         dt.format("%Y%m%d").to_string()
     } else {
@@ -745,6 +809,103 @@ mod tests {
         assert_eq!(events[0].end, "2026-07-10T14:00:00Z".parse::<DateTime<Utc>>().unwrap());
     }
 
+    /// CAL-11: a `TZID`-qualified start is remembered as the event's own IANA
+    /// zone - a Windows ID from Outlook normalizes through the CLDR table -
+    /// while the instants stay UTC.
+    #[test]
+    fn parses_and_normalizes_the_event_time_zone() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:tz-1@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART;TZID=Europe/Berlin:20260710T090000\r\nDTEND;TZID=Europe/Berlin:20260710T100000\r\nSUMMARY:Berlin morning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let events = parse_vevents(&cal_id(), ics);
+        assert_eq!(events[0].time_zone.as_deref(), Some("Europe/Berlin"));
+        assert_eq!(events[0].start, "2026-07-10T07:00:00Z".parse::<DateTime<Utc>>().unwrap());
+
+        let windows = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:tz-2@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART;TZID=\"W. Europe Standard Time\":20260710T090000\r\nDTEND;TZID=\"W. Europe Standard Time\":20260710T100000\r\nSUMMARY:Outlook morning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let events = parse_vevents(&cal_id(), windows);
+        assert_eq!(events[0].time_zone.as_deref(), Some("Europe/Berlin"), "Windows IDs normalize to IANA");
+
+        let utc = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:tz-3@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260710T090000Z\r\nDTEND:20260710T100000Z\r\nSUMMARY:UTC\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_vevents(&cal_id(), utc)[0].time_zone, None, "a UTC start carries no zone");
+    }
+
+    /// CAL-11: a timed event with a `time_zone` is written as `TZID`-qualified
+    /// wall-clock time with a matching `VTIMEZONE` before the VEVENT, and
+    /// round-trips to the same instants and zone. The iMIP form carries it too.
+    #[test]
+    fn build_vcalendar_emits_tzid_and_vtimezone() {
+        let mut event = full_event();
+        event.time_zone = Some("Europe/Berlin".to_string());
+        // 15 July 2026, 16:00 CEST = 14:00 UTC.
+        let ics = build_vcalendar(&event);
+        assert!(ics.contains("DTSTART;TZID=Europe/Berlin:20260715T160000"), "{ics}");
+        assert!(ics.contains("DTEND;TZID=Europe/Berlin:20260715T170000"), "{ics}");
+        assert!(ics.contains("BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n"), "{ics}");
+        assert!(ics.contains("TZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200"), "March transition:\n{ics}");
+        assert!(ics.contains("TZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100"), "October transition:\n{ics}");
+        let vtimezone = ics.find("BEGIN:VTIMEZONE").expect("VTIMEZONE present");
+        let vevent = ics.find("BEGIN:VEVENT").expect("VEVENT present");
+        assert!(vtimezone < vevent, "VTIMEZONE must precede the VEVENT:\n{ics}");
+
+        let round = &parse_vevents(&cal_id(), &ics)[0];
+        assert_eq!(round.start, event.start);
+        assert_eq!(round.end, event.end);
+        assert_eq!(round.time_zone.as_deref(), Some("Europe/Berlin"));
+
+        let imip = build_imip_vcalendar(&event, ImipMethod::Request);
+        assert!(imip.contains("BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n"), "{imip}");
+    }
+
+    /// CAL-11: a zoned event's `EXDATE`/`RECURRENCE-ID` use the same `TZID`
+    /// as `DTSTART` (RFC 5545 requires a matching value type) and round-trip
+    /// to the same UTC instants.
+    #[test]
+    fn build_writes_recurrence_properties_in_the_event_zone() {
+        let mut event = full_event();
+        event.time_zone = Some("Europe/Berlin".to_string());
+        event.rrule = Some("FREQ=WEEKLY".to_string());
+        event.exdates = vec!["2026-07-22T14:00:00Z".parse().unwrap()];
+        let ics = build_vcalendar(&event);
+        assert!(ics.contains("EXDATE;TZID=Europe/Berlin:20260722T160000"), "{ics}");
+        let round = &parse_vevents(&cal_id(), &ics)[0];
+        assert_eq!(round.exdates, event.exdates);
+    }
+
+    /// An all-day event never gains a `TZID` or `VTIMEZONE`, whatever zone it
+    /// carries: its `VALUE=DATE` boundaries are zone-independent.
+    #[test]
+    fn all_day_events_stay_zone_free() {
+        let mut event = full_event();
+        event.all_day = true;
+        event.time_zone = Some("Europe/Berlin".to_string());
+        event.start = "2026-07-20T00:00:00Z".parse().unwrap();
+        event.end = "2026-07-21T00:00:00Z".parse().unwrap();
+        let ics = build_vcalendar(&event);
+        assert!(ics.contains("DTSTART;VALUE=DATE:20260720"), "{ics}");
+        assert!(!ics.contains("TZID"), "{ics}");
+        assert!(!ics.contains("VTIMEZONE"), "{ics}");
+    }
+
+    /// The checked-in non-Outlook invitation fixture (item 0.8, CAL-11): an
+    /// IANA `TZID` plus a full VTIMEZONE as Thunderbird/Google send it. The
+    /// zone is recorded, the instants resolve with DST, and a rebuild emits
+    /// `TZID` + a generated VTIMEZONE that round-trips.
+    #[test]
+    fn parses_the_iana_tzid_invitation_fixture() {
+        let ics = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/outlook/invite-iana-tz.ics"));
+        let events = parse_vevents(&cal_id(), ics);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].time_zone.as_deref(), Some("Europe/Berlin"));
+        // 10 August 2026 is CEST (UTC+2).
+        assert_eq!(events[0].start, "2026-08-10T08:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(events[0].end, "2026-08-10T09:00:00Z".parse::<DateTime<Utc>>().unwrap());
+
+        let built = build_vcalendar(&events[0]);
+        assert!(built.contains("DTSTART;TZID=Europe/Berlin:20260810T100000"), "{built}");
+        assert!(built.contains("BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n"), "{built}");
+        let round = &parse_vevents(&cal_id(), &built)[0];
+        assert_eq!(round.start, events[0].start);
+        assert_eq!(round.time_zone, events[0].time_zone);
+    }
+
     #[test]
     fn falls_back_to_zero_length_when_no_dtend_or_duration() {
         let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:no-end@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nSUMMARY:Point in time\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
@@ -777,6 +938,7 @@ mod tests {
             start: "2026-07-15T14:00:00Z".parse().unwrap(),
             end: "2026-07-15T15:00:00Z".parse().unwrap(),
             all_day: false,
+            time_zone: None,
             rrule: None,
             recurrence_id: None,
             recurrence_range: RecurrenceRange::default(),

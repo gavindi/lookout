@@ -16,6 +16,7 @@ mod recurrence;
 pub mod session;
 pub mod subscription;
 mod tzmap;
+mod vtimezone;
 mod xml;
 
 pub use birthdays::birthday_occurrences;

@@ -70,6 +70,7 @@ pub fn birthday_occurrences(account_id: &AccountId, calendar_id: &CalendarId, co
                 start,
                 end: start + chrono::Duration::days(1),
                 all_day: true,
+                time_zone: None,
                 // A birthday is an annual recurrence; carrying the RRULE keeps
                 // the occurrence's series semantics visible in the read-only
                 // editor, which is the only editor these events ever reach.

@@ -203,15 +203,24 @@ pub fn show_event_editor(
     // own times are the override's, and prefilling the master anchor would
     // re-anchor the override to the series time.
     let existing_all_day = existing.as_ref().map(|occ| occ.all_day).unwrap_or(false);
+    // CAL-11: an event with its own time zone pre-fills (and saves) its
+    // wall-clock fields in that zone; one without follows the calendar's
+    // display zone.
+    let event_display_zone = existing
+        .as_ref()
+        .and_then(|occ| occ.time_zone.as_deref())
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
+        .map(crate::calendar_tz::DisplayZone::Named)
+        .unwrap_or_else(crate::calendar_tz::display_zone);
     let (initial_start, initial_end) = existing
         .as_ref()
         .map(|occ| {
             if occ.recurrence_id.is_none() {
                 if let (Some(master_start), Some(master_end)) = (occ.master_start, occ.master_end) {
-                    return crate::calendar_tz::occurrence_span(crate::calendar_tz::display_zone(), master_start, master_end, occ.all_day);
+                    return crate::calendar_tz::occurrence_span(event_display_zone, master_start, master_end, occ.all_day);
                 }
             }
-            crate::calendar_tz::occurrence_span(crate::calendar_tz::display_zone(), occ.start, occ.end, occ.all_day)
+            crate::calendar_tz::occurrence_span(event_display_zone, occ.start, occ.end, occ.all_day)
         })
         .or_else(|| {
             prefill
@@ -235,6 +244,13 @@ pub fn show_event_editor(
     for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
         spin.set_sensitive(!existing_all_day);
     }
+    // CAL-11: the event's own time zone, in the date/time row (UX-59). The
+    // picker lists every IANA zone; an all-day event has no zone, so it goes
+    // insensitive with the time spins.
+    let zone_model = gtk::StringList::new(crate::calendar_tz::iana_zone_names());
+    let zone_dropdown = gtk::DropDown::builder().model(&zone_model).enable_search(true).tooltip_text("Time zone").build();
+    zone_dropdown.set_selected(initial_zone_index(existing.as_ref().and_then(|occ| occ.time_zone.as_deref())));
+    zone_dropdown.set_sensitive(!existing_all_day);
     {
         let start_date = start_date.clone();
         let end_date = end_date.clone();
@@ -243,8 +259,10 @@ pub fn show_event_editor(
         let end_hour = end_hour.clone();
         let end_minute = end_minute.clone();
         let end_calendar = end_calendar.clone();
+        let zone_dropdown = zone_dropdown.clone();
         all_day_switch.connect_active_notify(move |switch| {
             let on = switch.is_active();
+            zone_dropdown.set_sensitive(!on);
             for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
                 spin.set_sensitive(!on);
             }
@@ -285,6 +303,10 @@ pub fn show_event_editor(
     all_day_box.append(&gtk::Label::new(Some("All day")));
     all_day_box.append(&all_day_switch);
     datetime_row.append(&all_day_box);
+    let zone_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).valign(gtk::Align::Start).build();
+    zone_box.append(&gtk::Label::builder().label("Time zone").css_classes(["dim-label", "caption"]).xalign(0.0).build());
+    zone_box.append(&zone_dropdown);
+    datetime_row.append(&zone_box);
 
     // --- Location + video call + notes.
     let location_row = adw::EntryRow::builder().title("Location").build();
@@ -523,9 +545,11 @@ pub fn show_event_editor(
         let preview_day_strip = preview_day_strip.clone();
         let displayed_day = displayed_day.clone();
         let existing = existing.clone();
+        let zone_dropdown = zone_dropdown.clone();
         Rc::new(move || {
             let day = displayed_day.get();
             let all_day = all_day_switch.is_active();
+            let zone = selected_zone(&zone_dropdown);
             let start_local = date_time_from_form(&start_date, &start_hour, &start_minute, all_day);
             let end_local_raw = date_time_from_form(&end_date, &end_hour, &end_minute, all_day);
             let model_end = if all_day { end_local_raw + chrono::Duration::days(1) } else { end_local_raw };
@@ -534,8 +558,8 @@ pub fn show_event_editor(
             let synthetic = synthetic_occurrence(
                 calendar_id,
                 &title_row.text(),
-                boundary_to_utc(start_local, all_day),
-                boundary_to_utc(model_end, all_day),
+                boundary_to_utc_in(zone, start_local, all_day),
+                boundary_to_utc_in(zone, model_end, all_day),
                 all_day,
             );
             let mut occs = occurrences_for_day(&month_occurrences, day, existing.as_ref());
@@ -577,6 +601,10 @@ pub fn show_event_editor(
     }
     {
         let refresh_preview = refresh_preview.clone();
+        zone_dropdown.connect_selected_notify(move |_| refresh_preview());
+    }
+    {
+        let refresh_preview = refresh_preview.clone();
         let displayed_day = displayed_day.clone();
         crate::calendar_view::connect_day_selected(&preview_mini, move |date| {
             displayed_day.set(date);
@@ -614,6 +642,7 @@ pub fn show_event_editor(
         let start_minute = start_minute.clone();
         let end_hour = end_hour.clone();
         let end_minute = end_minute.clone();
+        let zone_dropdown = zone_dropdown.clone();
         let video_toggle = video_toggle.clone();
         let video_url_row = video_url_row.clone();
         let categorize_entry = categorize_entry.clone();
@@ -646,6 +675,7 @@ pub fn show_event_editor(
                 location: location_row.text().to_string(),
                 description: description_buffer.text(&description_buffer.start_iter(), &description_buffer.end_iter(), false).to_string(),
                 all_day: all_day_switch.is_active(),
+                time_zone: if all_day_switch.is_active() { None } else { selected_zone_name(&zone_dropdown) },
                 start_local: date_time_from_form(&start_date, &start_hour, &start_minute, all_day_switch.is_active()),
                 end_local: date_time_from_form(&end_date, &end_hour, &end_minute, all_day_switch.is_active()),
                 attendee_tokens: attendees_field.addresses(),
@@ -859,6 +889,7 @@ fn synthetic_occurrence(calendar_id: CalendarId, title: &str, start: DateTime<Ut
         start,
         end,
         all_day,
+        time_zone: None,
         rrule: None,
         recurrence_id: None,
         exdates: Vec::new(),
@@ -924,6 +955,57 @@ fn local_to_utc(naive: NaiveDateTime) -> DateTime<Utc> {
 /// a day early east of UTC.
 fn boundary_to_utc(naive: NaiveDateTime, all_day: bool) -> DateTime<Utc> {
     crate::calendar_tz::display_zone().occurrence_from_local(naive, all_day)
+}
+
+/// Like [`boundary_to_utc`], but resolving a timed boundary in the event's own
+/// zone (CAL-11) when it has one - the form's wall-clock fields are entered in
+/// the "Time zone" picker's zone. Falls back to the calendar display zone when
+/// the event carries none or the stored name doesn't parse.
+fn boundary_to_utc_in(zone: Option<chrono_tz::Tz>, naive: NaiveDateTime, all_day: bool) -> DateTime<Utc> {
+    zone.map(crate::calendar_tz::DisplayZone::Named)
+        .unwrap_or_else(crate::calendar_tz::display_zone)
+        .occurrence_from_local(naive, all_day)
+}
+
+/// A stored IANA zone name as a zone, if it parses.
+fn event_zone(name: Option<&str>) -> Option<chrono_tz::Tz> {
+    name.and_then(|name| name.parse().ok())
+}
+
+/// The IANA name at a time-zone dropdown index (`None` out of range).
+fn zone_name_at(index: u32) -> Option<&'static str> {
+    crate::calendar_tz::iana_zone_names().get(index as usize).copied()
+}
+
+/// The time-zone picker's starting entry (CAL-11): the edited event's own
+/// zone when it has one, else the calendar's display zone - so a new event is
+/// created in the zone the grid shows, and saving a previously zone-less event
+/// pins it to the zone its wall clock was displayed in (the instants don't
+/// move). An unresolvable display zone falls back to the UTC entry.
+fn initial_zone_index(existing: Option<&str>) -> u32 {
+    let display = crate::calendar_tz::display_zone().tz().map(|tz| tz.name().to_string());
+    let wanted = existing.map(str::to_string).or(display).unwrap_or_else(|| "UTC".to_string());
+    index_of_zone(&wanted)
+}
+
+/// The index of an IANA name in the picker list, or the UTC entry's (0 when
+/// even UTC is missing, which can't happen with chrono-tz's own list).
+fn index_of_zone(name: &str) -> u32 {
+    let names = crate::calendar_tz::iana_zone_names();
+    match names.iter().position(|candidate| *candidate == name) {
+        Some(index) => index as u32,
+        None => names.iter().position(|candidate| *candidate == "UTC").unwrap_or(0) as u32,
+    }
+}
+
+/// The zone the time-zone picker currently shows.
+fn selected_zone(dropdown: &gtk::DropDown) -> Option<chrono_tz::Tz> {
+    zone_name_at(dropdown.selected()).and_then(|name| name.parse().ok())
+}
+
+/// The IANA name the picker currently shows, for storing on the event.
+fn selected_zone_name(dropdown: &gtk::DropDown) -> Option<String> {
+    zone_name_at(dropdown.selected()).map(str::to_string)
 }
 
 /// Renders the editor's current form state as a self-contained HTML document
@@ -1040,6 +1122,10 @@ struct FormInput {
     location: String,
     description: String,
     all_day: bool,
+    /// The event's own IANA time zone (CAL-11) from the picker: the
+    /// wall-clock `start_local`/`end_local` resolve in it. `None` for an
+    /// all-day event, whose `VALUE=DATE` boundaries are zone-independent.
+    time_zone: Option<String>,
     start_local: NaiveDateTime,
     /// The form's raw end (inclusive last day for all-day; +1 day exclusive
     /// shift happens below).
@@ -1161,6 +1247,7 @@ pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveD
         start: boundary_to_utc(start_local, occ.all_day),
         end: boundary_to_utc(model_end, occ.all_day),
         all_day: occ.all_day,
+        time_zone: occ.time_zone.clone(),
         rrule: occ.rrule.clone(),
         recurrence_id: occ.recurrence_id,
         recurrence_range: RecurrenceRange::default(),
@@ -1217,6 +1304,8 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
     let summary = input.title.trim();
     let location = input.location.trim();
     let description = input.description.trim();
+    let zone = event_zone(input.time_zone.as_deref());
+    let time_zone = if input.all_day { None } else { input.time_zone };
 
     Ok(CalendarEvent {
         uid,
@@ -1224,9 +1313,10 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         summary: (!summary.is_empty()).then(|| summary.to_string()),
         description: (!description.is_empty()).then(|| description.to_string()),
         location: (!location.is_empty()).then(|| location.to_string()),
-        start: boundary_to_utc(input.start_local, input.all_day),
-        end: boundary_to_utc(model_end, input.all_day),
+        start: boundary_to_utc_in(zone, input.start_local, input.all_day),
+        end: boundary_to_utc_in(zone, model_end, input.all_day),
         all_day: input.all_day,
+        time_zone,
         rrule: input.rrule,
         recurrence_id: input.recurrence_id,
         recurrence_range: input.recurrence_range,
@@ -1255,6 +1345,7 @@ mod tests {
             location: String::new(),
             description: String::new(),
             all_day: false,
+            time_zone: None,
             start_local: start,
             end_local: start + chrono::Duration::hours(1),
             attendee_tokens: Vec::new(),
@@ -1293,6 +1384,38 @@ mod tests {
         assert!(ics.contains("DTEND;VALUE=DATE:20261014"), "{ics}");
     }
 
+    /// CAL-11: a timed event built with a time zone resolves its wall-clock
+    /// times in that zone and stores the IANA name; an all-day event drops it
+    /// (its `VALUE=DATE` boundaries are zone-independent).
+    #[test]
+    fn time_zone_resolves_the_forms_wall_clock_times() {
+        let mut input = base_input();
+        input.time_zone = Some("Europe/Berlin".to_string());
+        // base_input is 12 Aug 2026 09:00-10:00 wall clock; CEST is UTC+2.
+        let event = build_event_from_input(input).expect("valid range");
+        assert_eq!(event.time_zone.as_deref(), Some("Europe/Berlin"));
+        assert_eq!(event.start, "2026-08-12T07:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(event.end, "2026-08-12T08:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        let ics = lookout_dav::build_vcalendar(&event);
+        assert!(ics.contains("DTSTART;TZID=Europe/Berlin:20260812T090000"), "{ics}");
+        assert!(ics.contains("BEGIN:VTIMEZONE"), "{ics}");
+
+        let mut all_day = base_input();
+        all_day.all_day = true;
+        all_day.time_zone = Some("Europe/Berlin".to_string());
+        let event = build_event_from_input(all_day).expect("valid all-day range");
+        assert_eq!(event.time_zone, None, "an all-day event has no zone");
+    }
+
+    /// CAL-11: the picker starts on the edited event's own zone, and an
+    /// unknown stored name falls back to the UTC entry.
+    #[test]
+    fn zone_picker_starts_on_the_events_zone() {
+        assert_eq!(zone_name_at(initial_zone_index(Some("Asia/Kolkata"))), Some("Asia/Kolkata"));
+        assert_eq!(zone_name_at(initial_zone_index(Some("Mars/Olympus_Mons"))), Some("UTC"));
+        assert_eq!(zone_name_at(index_of_zone("Europe/Berlin")), Some("Europe/Berlin"));
+    }
+
     fn occ(uid: &str, day: NaiveDate, recurrence_id: Option<NaiveDateTime>) -> EventOccurrence {
         let start = day.and_hms_opt(9, 0, 0).unwrap();
         EventOccurrence {
@@ -1304,6 +1427,7 @@ mod tests {
             start: local_to_utc(start),
             end: local_to_utc(start + chrono::Duration::hours(1)),
             all_day: false,
+            time_zone: None,
             rrule: None,
             recurrence_id: recurrence_id.map(local_to_utc),
             exdates: Vec::new(),
@@ -1433,6 +1557,7 @@ mod tests {
             start: local_to_utc(start),
             end: local_to_utc(start + chrono::Duration::hours(1)),
             all_day: false,
+            time_zone: None,
             rrule: None,
             recurrence_id: None,
             exdates: Vec::new(),
@@ -1534,6 +1659,7 @@ mod tests {
             start: start.and_utc(),
             end: (start + chrono::Duration::days(2)).and_utc(),
             all_day: true,
+            time_zone: None,
             rrule: None,
             recurrence_id: None,
             exdates: Vec::new(),
@@ -1575,6 +1701,7 @@ mod tests {
             start: instance,
             end: instance + chrono::Duration::hours(1),
             all_day: false,
+            time_zone: None,
             rrule: Some("FREQ=WEEKLY".to_string()),
             recurrence_id: None,
             exdates: vec!["2026-08-19T09:00:00Z".parse().unwrap()],
