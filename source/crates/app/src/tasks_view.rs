@@ -156,7 +156,11 @@ pub fn build_tasks_view() -> TasksView {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&flagged);
     content.append(&list);
-    let root = gtk::ScrolledWindow::builder().child(&content).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build();
+    let root = gtk::ScrolledWindow::builder()
+        .child(&content)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
     TasksView {
         root,
         list,
@@ -273,7 +277,12 @@ pub(crate) fn flagged_mail_row(message: &EmailSummary, today: NaiveDate, complet
     if due_date.is_some_and(|d| d < today) {
         due.add_css_class("task-due-overdue");
     }
-    let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).margin_start(4).margin_end(4).build();
+    let row_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(4)
+        .margin_end(4)
+        .build();
     if let Some(check) = &check {
         row_box.append(check);
     }

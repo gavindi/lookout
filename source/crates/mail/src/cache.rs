@@ -413,7 +413,12 @@ fn flag_status_code(status: FlagStatus) -> i64 {
 fn load_local_follow_ups(conn: &Connection) -> Result<HashMap<String, FollowUpFlag>> {
     let mut stmt = conn.prepare("SELECT message_key, status, due, completed FROM follow_up_flags")?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<i64>>(3)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
     })?;
     let mut out = HashMap::new();
     for row in rows {
@@ -458,7 +463,6 @@ fn overlay_local_follow_ups(conn: &Connection, messages: &mut [EmailSummary]) ->
     }
     Ok(())
 }
-
 
 /// Converts a free-text user query into a valid FTS5 `MATCH` expression, or
 /// `None` when there's nothing to search for.
@@ -2090,7 +2094,6 @@ impl Cache {
         Ok(messages)
     }
 
-
     /// Adds an outgoing message to the local outbox, due at `not_before`
     /// (`Utc::now()` for a normal send, a future time for schedule send).
     /// Returns the new row's id, which the session quotes in its
@@ -3015,8 +3018,12 @@ mod tests {
         let taken_at = Utc::now();
         // `a` was flagged before the snapshot (and cleared in Outlook since);
         // `b` was cleared here after the snapshot was taken.
-        cache.set_local_follow_ups(std::slice::from_ref(&a), &flagged(None), taken_at - chrono::Duration::minutes(5)).unwrap();
-        cache.set_local_follow_ups(std::slice::from_ref(&b), &FollowUpFlag::default(), taken_at + chrono::Duration::seconds(5)).unwrap();
+        cache
+            .set_local_follow_ups(std::slice::from_ref(&a), &flagged(None), taken_at - chrono::Duration::minutes(5))
+            .unwrap();
+        cache
+            .set_local_follow_ups(std::slice::from_ref(&b), &FollowUpFlag::default(), taken_at + chrono::Duration::seconds(5))
+            .unwrap();
         cache
             .apply_remote_follow_ups(&[("<b@x>".to_string(), flagged(None)), ("c@x".to_string(), flagged(None))], taken_at)
             .unwrap();
@@ -3063,7 +3070,15 @@ mod tests {
             .collect();
         uids.sort();
         assert_eq!(uids, vec![1, 2, 3]);
-        assert_eq!(cache.conversation_members_in(&sent_window, &["<mid@x>".to_string()]).unwrap().iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(
+            cache
+                .conversation_members_in(&sent_window, &["<mid@x>".to_string()])
+                .unwrap()
+                .iter()
+                .map(|m| m.uid.0)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
         assert!(cache.conversation_members_in(&sent, &[]).unwrap().is_empty());
         assert!(cache.conversation_members_in(&sent, &["<>".to_string()]).unwrap().is_empty());
 

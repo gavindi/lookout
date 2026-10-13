@@ -230,6 +230,15 @@ impl BodyPart {
     pub fn is_calendar(&self) -> bool {
         self.content_type.eq_ignore_ascii_case("text/calendar")
     }
+
+    /// Whether this part is a TNEF payload (`application/ms-tnef` and its
+    /// historical spellings). The body-fetch path downloads these alongside
+    /// the text parts so the decoder (OUTLOOK_PARITY.md §4.6, M-45) can turn
+    /// their inner attachments into ordinary parts; the raw `winmail.dat`
+    /// part itself only remains in the strip when decoding fails.
+    pub fn is_tnef(&self) -> bool {
+        crate::interop::is_tnef_content_type(&self.content_type)
+    }
 }
 
 /// Matches a `cid:` reference from a message's HTML against a MIME part's

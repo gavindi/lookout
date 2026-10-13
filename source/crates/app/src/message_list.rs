@@ -240,7 +240,11 @@ impl FilterSet {
 
     /// The active filters' action states, for persisting in `mail-filters`.
     pub fn to_states(self) -> Vec<String> {
-        Filter::ALL.into_iter().filter(|filter| self.contains(*filter)).map(|filter| filter.action_state().to_string()).collect()
+        Filter::ALL
+            .into_iter()
+            .filter(|filter| self.contains(*filter))
+            .map(|filter| filter.action_state().to_string())
+            .collect()
     }
 
     /// Rebuilds a set from persisted action states; unknown entries are
@@ -495,7 +499,11 @@ fn initial_letter(value: Option<&str>) -> String {
 /// `None` when it carries no category. `keywords` is a `BTreeSet`, so the
 /// first match is deterministic.
 fn tag_sort_key(message: &EmailSummary) -> Option<String> {
-    message.keywords.iter().find_map(|keyword| lookout_core::tag_key_from_keyword(keyword)).map(str::to_lowercase)
+    message
+        .keywords
+        .iter()
+        .find_map(|keyword| lookout_core::tag_key_from_keyword(keyword))
+        .map(str::to_lowercase)
 }
 
 /// The grouping key and header label for `message` under `key`. Because the
@@ -906,7 +914,15 @@ fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
 /// message is pinned and a pinned copy would just duplicate the list) - `apply_layout`'s
 /// `splice_pinned_section` renders them as their own leading section,
 /// independent of `sort_key`/`threaded`.
-fn compute_layout(truth: Vec<EmailSummary>, filter: FilterSet, viewer: &HashSet<String>, sort_key: SortKey, sort_descending: bool, threaded: bool, now: DateTime<Local>) -> ComputedLayout {
+fn compute_layout(
+    truth: Vec<EmailSummary>,
+    filter: FilterSet,
+    viewer: &HashSet<String>,
+    sort_key: SortKey,
+    sort_descending: bool,
+    threaded: bool,
+    now: DateTime<Local>,
+) -> ComputedLayout {
     let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m, viewer)).collect();
     sort_messages(&mut messages, sort_key, sort_descending);
     let pinned = if filter.contains(Filter::Pinned) {
@@ -1979,11 +1995,7 @@ impl MessageListModel {
         splice_diff(&store, &old_keys, &new_keys, &rows);
         let label = group_label(&GroupKey::Pinned, now);
         let root_keys = vec![RowKey::Section(section_row_key(GroupKey::Pinned, &label))];
-        let root_rows: Vec<glib::Object> = vec![glib::BoxedAnyObject::new(MessageItem::Section(SectionRow {
-            group: GroupKey::Pinned,
-            label,
-        }))
-        .upcast()];
+        let root_rows: Vec<glib::Object> = vec![glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { group: GroupKey::Pinned, label })).upcast()];
         (HashSet::from([GroupKey::Pinned]), root_keys, root_rows)
     }
 
@@ -3174,11 +3186,7 @@ mod tests {
         let groups: Vec<GroupKey> = sections.iter().map(|(b, _, _)| b.clone()).collect();
         assert_eq!(
             groups,
-            vec![
-                GroupKey::Date(DateBucket::Older),
-                GroupKey::Date(DateBucket::LastMonth),
-                GroupKey::Date(DateBucket::Today),
-            ]
+            vec![GroupKey::Date(DateBucket::Older), GroupKey::Date(DateBucket::LastMonth), GroupKey::Date(DateBucket::Today),]
         );
     }
 
@@ -3607,8 +3615,13 @@ mod tests {
         assert_eq!(group_of(SortKey::Importance, &alice, now).0, GroupKey::Importance(0));
         assert_eq!(group_of(SortKey::Flag, &alice, now).0, GroupKey::Flag(crate::follow_up::FlagBucket::Unflagged));
         let mut flagged = alice.clone();
-        flagged.keywords.extend(lookout_core::follow_up_keywords(&crate::follow_up::flagged(Some(now.date_naive()))));
-        assert_eq!(group_of(SortKey::Flag, &flagged, now), (GroupKey::Flag(crate::follow_up::FlagBucket::Today), "Today".to_string()));
+        flagged
+            .keywords
+            .extend(lookout_core::follow_up_keywords(&crate::follow_up::flagged(Some(now.date_naive()))));
+        assert_eq!(
+            group_of(SortKey::Flag, &flagged, now),
+            (GroupKey::Flag(crate::follow_up::FlagBucket::Today), "Today".to_string())
+        );
         assert_eq!(group_of(SortKey::Attachments, &alice, now).0, GroupKey::Attachment(true));
 
         // A senderless, categoryless fixture groups under "#" / "".
@@ -3733,7 +3746,10 @@ mod tests {
 
         let mut pinned = summary(3, Utc::now());
         pinned.flags = std::collections::BTreeSet::from([lookout_core::SystemFlagBit::Flagged]);
-        assert!(FilterSet::none().with(Filter::Unread, true).matches(&pinned, &viewer), "a pinned-but-unread message belongs to both filters");
+        assert!(
+            FilterSet::none().with(Filter::Unread, true).matches(&pinned, &viewer),
+            "a pinned-but-unread message belongs to both filters"
+        );
         assert!(FilterSet::none().with(Filter::Pinned, true).matches(&pinned, &viewer));
 
         let mut pinned_read = summary(4, Utc::now());

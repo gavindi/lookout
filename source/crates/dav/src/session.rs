@@ -500,7 +500,13 @@ async fn write_event(
 /// temporal span, so the whole set is always refetched (they're small).
 /// Same cache-first fast-paint and per-collection failure isolation as
 /// `sync_month`.
-async fn sync_tasks(client: &DavClient, calendars: &[CalendarInfo], credential: &Credential, events: &async_channel::Sender<CalendarSessionEvent>, cache: Option<&CalendarCache>) -> Result<()> {
+async fn sync_tasks(
+    client: &DavClient,
+    calendars: &[CalendarInfo],
+    credential: &Credential,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+    cache: Option<&CalendarCache>,
+) -> Result<()> {
     if let Some(cache) = cache {
         if let Ok(Some(tasks)) = cache.load_tasks() {
             let _ = events.send(CalendarSessionEvent::TasksUpdated(tasks)).await;

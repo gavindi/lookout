@@ -40,10 +40,21 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, on
         builder.build()
     };
 
-    let search = gtk::SearchEntry::builder().placeholder_text("Search contacts").margin_start(12).margin_end(12).margin_top(12).build();
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search contacts")
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(12)
+        .build();
 
     let list = gtk::ListBox::builder().css_classes(["boxed-list"]).build();
-    let scroller = gtk::ScrolledWindow::builder().child(&list).vexpand(true).margin_start(12).margin_end(12).margin_top(6).build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .vexpand(true)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .build();
 
     // Keyed by lowercased address rather than list position, so a check
     // survives the list being rebuilt (filtered) out from under it.
@@ -106,8 +117,17 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, on
                     });
                 }
 
-                let name = gtk::Label::builder().label(candidate.display_label()).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
-                let text_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).valign(gtk::Align::Center).build();
+                let name = gtk::Label::builder()
+                    .label(candidate.display_label())
+                    .xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build();
+                let text_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(2)
+                    .hexpand(true)
+                    .valign(gtk::Align::Center)
+                    .build();
                 text_box.append(&name);
                 // A contact with no separate display name would otherwise
                 // show its address twice.

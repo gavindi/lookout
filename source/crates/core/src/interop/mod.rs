@@ -13,9 +13,11 @@
 //! - [`flags`] — follow-up flag semantics (§4.1, §4.4, M-10).
 //! - [`junk`] — the RFC 5788 `$Junk` / `$NotJunk` keywords (§4.2, M-17).
 //! - [`snooze`] — the snooze folder and wake-time keyword (§4.2, M-11).
+//! - [`tnef`] — the TNEF (`winmail.dat`) decoder, RTF decompression and HTML
+//!   de-encapsulation (§4.6, M-45).
 //!
-//! Decoders for Outlook's file formats (TNEF, `.msg`, PST) are a later roadmap
-//! item (1.21–1.22, 7.1) and are not here yet.
+//! Decoders for Outlook's remaining file formats (`.msg`, PST) are a later
+//! roadmap item (1.22, 7.1) and are not here yet.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -25,6 +27,7 @@ pub mod flags;
 pub mod headers;
 pub mod junk;
 pub mod snooze;
+pub mod tnef;
 
 pub use categories::{graph_preset, nearest_preset_for_rgb, preset_by_graph, CategoryPreset, OUTLOOK_CATEGORY_PRESETS};
 pub use cdo::BusyStatus;
@@ -35,3 +38,4 @@ pub use flags::{
 pub use headers::{importance_from_headers, importance_headers, sensitivity_from_headers, sensitivity_header, Importance, MessageSensitivity};
 pub use junk::{junk_keyword, junk_keyword_change, junk_keywords, JUNK_KEYWORD, NOT_JUNK_KEYWORD};
 pub use snooze::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
+pub use tnef::{is_tnef_content_type, tnef_attachment_ref, tnef_part_number, TnefAttachment, TnefContents, TnefError, TNEF_CONTENT_TYPE};

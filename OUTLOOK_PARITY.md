@@ -42,7 +42,7 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 22 | 9 | 13 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No winmail.dat or `.msg`. |
+| Mail (5.1) | 23 | 9 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 12 | 4 | 6 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop and an attachment reminder. No forwarding with attachments. |
 | Calendar (5.3) | 11 | 13 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours and a second time zone apply live. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No per-event time zone yet. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
@@ -50,7 +50,7 @@ Counts are tallied from the §5 tables.
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **59** | **41** | **52** | **5** | ~38% at parity, ~26% partial |
+| **Total** | **60** | **41** | **51** | **5** | ~38% at parity, ~26% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -190,7 +190,7 @@ Widen `GRAPH_SCOPES` in `microsoft_oauth.rs` **incrementally per feature**. Ever
 
 | Format | Spec | Plan |
 |---|---|---|
-| `winmail.dat` (TNEF) | [MS-OXTNEF] | Decoder in `core/src/interop/tnef.rs`: extract attachments (`attAttachData`/`attAttachTitle`), the RTF body (decompress per [MS-OXRTFCP]; de-encapsulate HTML per [MS-OXRTFEX]), and the meeting request if present. Hook it into `mail/src/structure.rs` so TNEF parts become normal attachments. |
+| `winmail.dat` (TNEF) | [MS-OXTNEF] | ✅ (1.21) Decoder in `core/src/interop/tnef.rs`: attachments (`attAttachData`/`attAttachTitle`, plus `attMAPIProps` long names, MIME tags and Content-IDs), the bodies (`PR_BODY_HTML`, else RTF decompressed per [MS-OXRTFCP] and de-encapsulated per [MS-OXRTFEX]), and an embedded iCalendar (an `.ics` attachment or a VCALENDAR body). Hooked into the mail body assembly (`mail/src/body.rs`) and the `FetchAttachment` handler (`mail/src/session.rs`), so TNEF parts become normal parts, fetched on demand as `tnef:<source>:<n>`. A MAPI-native meeting reconstruction remains out of scope. |
 | `.msg` | [MS-OXMSG] on a CFB container | Read via the `cfb` crate plus a property-stream mapper (or evaluate the `msg_parser` crate). Open when dropped or double-clicked; "Save as .msg" is lower priority. |
 | PST | [MS-PST] | Import wizard. Evaluate Microsoft's open-source Rust PST crate (`outlook-pst`; **verify** status and licence) before falling back to `libpff`. |
 | Outlook CSV contacts | Outlook's "Comma Separated Values" export columns (`First Name`, `Last Name`, `Company`, `Job Title`, `E-mail Address`, `E-mail 2 Address`, `Business Phone`, `Mobile Phone`, `Home Street`, …) | Import and export mapping in `contacts_view.rs` (P-08). |
@@ -278,8 +278,8 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-42 | Shared mailboxes / delegate access | — | ❌ | Graph (Phase 5); IMAP `NAMESPACE` shared folders |
 | M-43 | Archive folder | SPECIAL-USE `\Archive`, Ctrl+E | ✅ | — |
 | M-44 | Drag and drop | Rows → folders/tags; out as `.eml` | ✅ | Drop `.eml`/`.msg` *into* a folder (IMAP APPEND) |
-| M-45 | TNEF / winmail.dat | — | ❌ | §4.6 |
-| M-46 | Voting buttons | — | ⛔ | Decode and display incoming votes only (from TNEF) |
+| M-45 | TNEF / winmail.dat | Decoded (`core/src/interop/tnef.rs`, 1.21): inner attachments become normal parts fetched by the existing `FetchAttachment` path (`tnef:<source>:<n>`), the HTML/plain body and RTF (MS-OXRTFCP + MS-OXRTFEX) are read, an embedded iCalendar surfaces as an invite, inline images keep their `cid:`, and a malformed payload stays as `winmail.dat` | ✅ | — |
+| M-46 | Voting buttons | — | ⛔ | Decode and display incoming votes only (from TNEF); the payload is now readable (1.21), the display is not built |
 
 ### 5.2 Compose
 
@@ -622,7 +622,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.18 | Outlook keyboard preset | UI-04 | §4.7 table as a second defaults set; picker in Settings; new actions (move to folder, next/previous, mark unread, new event/task/contact, F9) | M |
 | 1.19 | ✅ ~~Attachment reminder~~ | C-16 | Regex over body (localisable word list) on send → dialog | S |
 | 1.20 | ✅ ~~Emoji, file drop, zoom~~ | C-14, C-15, M-37 | `gtk::EmojiChooser`; drop target on composer; WebKit zoom level plus Ctrl+±/scroll | S |
-| 1.21 | TNEF decode | M-45 | §4.6 in `core/src/interop/tnef.rs`, hooked into `mail/src/structure.rs` | M |
+| 1.21 | ✅ ~~TNEF decode~~ | M-45 | §4.6 in `core/src/interop/tnef.rs`, hooked into the body assembly (`mail/src/body.rs`) and the on-demand `FetchAttachment` handler (`mail/src/session.rs`); synthetic, generator-pinned fixtures | M |
 | 1.22 | Open `.msg` | M-29 | `cfb` plus a property mapper → `EmailBody` for the viewer; drag-in to APPEND | M |
 | 1.23 | ✅ ~~Save all / zip~~ | M-33 | Folder chooser plus `zip` crate | S |
 | 1.24 | ✅ ~~Junk keywords and Not Junk~~ | M-17 | `$Junk`/`$NotJunk`; "Not junk" in the Junk folder, also under the context menu's Report ▸ (`message_menu.rs`) | S |

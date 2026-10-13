@@ -34,7 +34,28 @@ fn every_checked_in_outlook_fixture_parses() {
         assert!(parse_body(Uid(0), &raw).is_some(), "{name} must parse as a message");
         count += 1;
     }
-    assert!(count >= 7, "expected the full Outlook corpus, found {count} .eml fixtures");
+    assert!(count >= 8, "expected the full Outlook corpus, found {count} .eml fixtures");
+}
+
+#[test]
+fn tnef_fixture_exposes_its_inner_attachments() {
+    let path = outlook_dir().join("tnef-message.eml");
+    let raw = std::fs::read(&path).expect("the synthetic winmail.dat message is checked in");
+    let body = parse_body(Uid(0), &raw).expect("parses as a message");
+
+    // The raw `winmail.dat` part is replaced by the payload's attachments,
+    // numbered into the synthetic `tnef:<source>:<index>` scheme the session's
+    // FetchAttachment answers.
+    assert!(body.parts.iter().all(|part| !part.is_tnef()));
+    let report = body.parts.iter().find(|part| part.part_number == "tnef:2:1").expect("text attachment decoded");
+    assert_eq!(report.filename.as_deref(), Some("report.txt"));
+    assert!(report.is_attachment);
+    let logo = body.parts.iter().find(|part| part.part_number == "tnef:2:2").expect("inline image decoded");
+    assert_eq!(logo.cid.as_deref(), Some("logo123@lookout.test"));
+    assert!(!logo.is_attachment);
+
+    assert_eq!(body.html_body.as_deref(), Some("<html><body><p>Hello <b>world</b></p></body></html>"));
+    assert!(body.calendar_ics.as_deref().is_some_and(|ics| ics.contains("METHOD:REQUEST")));
 }
 
 #[test]

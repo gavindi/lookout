@@ -75,6 +75,16 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.174" date="2026-10-13">
+      <description>
+        <p>Messages sent from classic Outlook in Rich Text format arrive with everything wrapped in a winmail.dat file, which Lookout used to show as an unreadable attachment. It now opens them: the files inside - documents, images, even meeting invitations - appear as normal attachments you can open, save, "Save all" or forward, formatted messages show their real formatting and inline images, and an invitation inside is offered as an Accept / Tentative / Decline card like any other. A winmail.dat that can't be read still shows as a normal attachment, so nothing is lost.</p>
+      </description>
+    </release>
+    <release version="0.9.173" date="2026-10-13">
+      <description>
+        <p>Four mail and compose conveniences. Lookout now asks before sending a message that mentions an attachment when nothing is attached, with a "Warn if..." switch under Settings → Mail. The composer gains an emoji picker, attaches files dropped onto it, and zooms with Ctrl+scroll or Ctrl+= / Ctrl+- / Ctrl+0. A message with more than one attachment shows Save all and Download as zip. And reporting junk - or not junk - now sets the standard $Junk / $NotJunk mail keywords, so server-side spam filters learn from your decision.</p>
+      </description>
+    </release>
     <release version="0.9.172" date="2026-10-13">
       <description>
         <p>Selecting a conversation now shows all of its messages in the reading pane, stacked like Outlook's: the newest and any unread messages are open, and the rest are collapsed to the sender and a line of preview. Click one to open it. Each message has its own Reply, Reply all, Forward and More actions. Your own replies from Sent Items are included. View ▸ Messages switches between conversations and individual messages and puts the newest message on top or at the bottom. Both settings are also in Settings.</p>

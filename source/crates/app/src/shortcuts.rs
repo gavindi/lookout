@@ -312,13 +312,7 @@ pub fn chord_from_key(display: &gdk::Display, keycode: u32, state: gdk::Modifier
 /// /navigation keys no entry field types. Everything else requires a
 /// modifier so shortcuts can't eat ordinary typing.
 fn allowed_without_modifier(key: gdk::Key) -> bool {
-    if key == gdk::Key::Delete
-        || key == gdk::Key::Insert
-        || key == gdk::Key::Escape
-        || key == gdk::Key::BackSpace
-        || key == gdk::Key::Tab
-        || key == gdk::Key::Return
-    {
+    if key == gdk::Key::Delete || key == gdk::Key::Insert || key == gdk::Key::Escape || key == gdk::Key::BackSpace || key == gdk::Key::Tab || key == gdk::Key::Return {
         return true;
     }
     let name = key.name().unwrap_or_default().to_string();

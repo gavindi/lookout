@@ -601,9 +601,7 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         ..Default::default()
     };
     let follow_up_of = |e: &AccountEvent| match e {
-        AccountEvent::MessagesUpdated { mailbox, messages, .. } if *mailbox == inbox_id => {
-            messages.iter().find(|m| m.uid == uid).map(|m| m.follow_up())
-        }
+        AccountEvent::MessagesUpdated { mailbox, messages, .. } if *mailbox == inbox_id => messages.iter().find(|m| m.uid == uid).map(|m| m.follow_up()),
         _ => None,
     };
     let _ = cmd_tx
@@ -613,9 +611,17 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
             flag: flagged.clone(),
         })
         .await;
-    let listed = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::FlaggedMessages { messages } if messages.iter().any(|m| m.uid == uid))).await;
+    let listed = wait_for_event(
+        &evt_rx,
+        |e| matches!(e, AccountEvent::FlaggedMessages { messages } if messages.iter().any(|m| m.uid == uid)),
+    )
+    .await;
     let AccountEvent::FlaggedMessages { messages } = listed else { unreachable!() };
-    assert_eq!(messages.iter().find(|m| m.uid == uid).unwrap().follow_up(), Some(flagged.clone()), "listed for the Tasks view");
+    assert_eq!(
+        messages.iter().find(|m| m.uid == uid).unwrap().follow_up(),
+        Some(flagged.clone()),
+        "listed for the Tasks view"
+    );
     let _ = cmd_tx.send(AccountCommand::Refresh).await;
     wait_for_event(&evt_rx, |e| follow_up_of(e) == Some(Some(flagged.clone()))).await;
 
@@ -633,7 +639,10 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let AccountEvent::MessagesUpdated { messages, .. } = completed else { unreachable!() };
     let done = messages.iter().find(|m| m.uid == uid).unwrap();
     assert!(done.keywords.contains(lookout_core::FLAG_DONE_KEYWORD));
-    assert!(!done.keywords.iter().any(|k| k.starts_with(lookout_core::FLAG_DUE_KEYWORD_PREFIX)), "completing drops the due keyword");
+    assert!(
+        !done.keywords.iter().any(|k| k.starts_with(lookout_core::FLAG_DUE_KEYWORD_PREFIX)),
+        "completing drops the due keyword"
+    );
 
     // Undo of the completion: back to the dated flag, then clear it.
     let _ = cmd_tx

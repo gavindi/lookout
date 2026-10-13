@@ -690,7 +690,7 @@ fn attach_month_drag(
                 // Live feedback: reparent the chip into the target cell and
                 // highlight it.
                 let target = &events_boxes[cell];
-                if !d.button.parent().is_some_and(|parent| parent == *target.upcast_ref::<gtk::Widget>()) {
+                if d.button.parent().is_none_or(|parent| parent != *target.upcast_ref::<gtk::Widget>()) {
                     d.button.unparent();
                     target.append(&d.button);
                 }

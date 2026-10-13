@@ -1,6 +1,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use base64::Engine;
+use lookout_core::interop::{tnef, TnefContents};
 use lookout_core::{BodyPart, EmailBody, Uid};
 use mail_parser::{Addr, Address as MailAddress, HeaderValue, Message, MessageParser, MimeHeaders, PartType};
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
     // bare links in its text nodes (`linkify_html_text_nodes`), while a
     // plain-text-only message is free to be rebuilt from scratch
     // (`linkify_to_html`) since there's no markup to preserve.
+    let has_real_html = matches!(message.html_part(0).map(|p| &p.body), Some(PartType::Html(_)));
     let html_body = match message.html_part(0).map(|p| &p.body) {
         Some(PartType::Html(html)) => Some(linkify_html_text_nodes(html.as_ref())),
         _ => text_body.as_deref().map(linkify_to_html),
@@ -46,6 +48,14 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
     // compute the `BODY[<n>]` path for every part so `EmailBody::parts`
     // carries numbers an on-demand `FetchAttachment` can actually fetch with.
     let paths = part_paths(&message);
+    // A TNEF payload (`winmail.dat`, item 1.21 / M-45) is decoded before the
+    // parts list is finished: its inner attachments replace the raw part, and
+    // its RTF/plain bodies fill in whatever the MIME parts don't carry.
+    let tnef_payload = message.attachments.iter().find_map(|id| {
+        let part = message.parts.get(*id as usize)?;
+        let content_type = part.content_type().map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or(""))).unwrap_or_default();
+        lookout_core::is_tnef_content_type(&content_type).then(|| (paths.get(id).cloned(), part.contents().to_vec()))
+    });
     let parts = message
         .attachments
         .iter()
@@ -87,6 +97,14 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         })
         .collect();
 
+    let (parts, text_body, html_body, calendar_ics) = match tnef_payload {
+        Some((Some(source_part), payload)) => match tnef::parse(&payload) {
+            Ok(contents) => apply_tnef(&contents, &source_part, parts, text_body, html_body, has_real_html, calendar_ics),
+            Err(_) => (parts, text_body, html_body, calendar_ics),
+        },
+        _ => (parts, text_body, html_body, calendar_ics),
+    };
+
     Some(EmailBody {
         uid,
         text_body,
@@ -96,6 +114,45 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         headers,
         auth_results: None,
     })
+}
+
+/// Applies a decoded TNEF payload to a message's assembled pieces (item 1.21,
+/// M-45): the raw `winmail.dat` [`BodyPart`] is dropped and the payload's
+/// attachments become synthetic parts numbered `tnef:<source part>:<n>` -
+/// which the session's `FetchAttachment` handler decodes on demand - with a
+/// MAPI Content-ID making one inline (kept out of the strip) exactly as it
+/// does for a MIME image. Bodies fill in only where the MIME side left a
+/// gap: TNEF's HTML loses to a genuine `text/html` part but beats the
+/// plain-text synthesis (`has_real_html` tells the two apart), and an
+/// embedded iCalendar payload loses to a real `text/calendar` part.
+#[allow(clippy::too_many_arguments)]
+fn apply_tnef(
+    contents: &TnefContents,
+    source_part: &str,
+    parts: Vec<BodyPart>,
+    text_body: Option<String>,
+    html_body: Option<String>,
+    has_real_html: bool,
+    calendar_ics: Option<String>,
+) -> (Vec<BodyPart>, Option<String>, Option<String>, Option<String>) {
+    let mut parts: Vec<BodyPart> = parts.into_iter().filter(|part| !part.is_tnef()).collect();
+    for (index, attachment) in contents.attachments.iter().enumerate() {
+        let inline = attachment.cid.is_some();
+        parts.push(BodyPart {
+            part_number: lookout_core::tnef_part_number(source_part, index + 1),
+            content_type: attachment.content_type.clone(),
+            charset: None,
+            transfer_encoding: None,
+            filename: Some(attachment.filename.clone()),
+            cid: attachment.cid.clone(),
+            size: attachment.data.len() as u32,
+            is_attachment: !inline,
+        });
+    }
+    let text_body = text_body.or_else(|| contents.plain_body.clone());
+    let html_body = if has_real_html { html_body } else { contents.html_body.clone().or(html_body) };
+    let calendar_ics = calendar_ics.or_else(|| contents.ics.clone());
+    (parts, text_body, html_body, calendar_ics)
 }
 
 /// Finds the part of a raw RFC 5322 message that corresponds to a requested
@@ -239,8 +296,7 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
                 return None;
             }
             let disposition = part.content_disposition();
-            let is_attachment = disposition.as_ref().is_some_and(|d| d.is_attachment())
-                || part.attachment_name().is_some() && disposition.as_ref().is_none_or(|d| !d.is_inline());
+            let is_attachment = disposition.as_ref().is_some_and(|d| d.is_attachment()) || part.attachment_name().is_some() && disposition.as_ref().is_none_or(|d| !d.is_inline());
             if !is_attachment {
                 return None;
             }
@@ -266,12 +322,7 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
         .map(|value| value.trim().trim_start_matches('<').trim_end_matches('>').to_string())
         .filter(|value| !value.is_empty());
     let references = lookout_core::header_value(&headers, "references")
-        .map(|value| {
-            value
-                .split_whitespace()
-                .map(|id| id.trim_start_matches('<').trim_end_matches('>').to_string())
-                .collect()
-        })
+        .map(|value| value.split_whitespace().map(|id| id.trim_start_matches('<').trim_end_matches('>').to_string()).collect())
         .unwrap_or_default();
     let request_read_receipt = !lookout_core::parse_disposition_notification_to(&headers).is_empty();
     let importance = lookout_core::importance_from_headers(&headers).unwrap_or_default();
@@ -387,12 +438,19 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
     // are transfer-decoded with the same decoder the attachment path uses and
     // kept as-is - iCalendar is already text, so no charset conversion.
     let mut calendar_ics: Option<String> = None;
+    // The message's TNEF payload (item 1.21 / M-45), transfer-decoded like an
+    // attachment and applied after the text parts are assembled.
+    let mut tnef_payload: Option<(String, Vec<u8>)> = None;
     for (part_number, bytes) in fetched {
         let Some(part) = all_parts.iter().find(|p| p.part_number == *part_number) else {
             continue;
         };
         if part.is_calendar() {
             calendar_ics = Some(String::from_utf8_lossy(&transfer_part_bytes(part, bytes)).into_owned());
+            continue;
+        }
+        if part.is_tnef() {
+            tnef_payload = Some((part.part_number.clone(), transfer_part_bytes(part, bytes)));
             continue;
         }
         if !part.is_text() {
@@ -410,21 +468,31 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         .find(|(is_html, text, _)| !*is_html && text.is_some())
         .and_then(|(_, text, _)| text.clone())
         .or_else(|| decoded.iter().find_map(|(_, text, _)| text.clone()));
+    let has_real_html = decoded.iter().any(|(is_html, _, _)| *is_html);
     let html_body = decoded
         .iter()
         .find(|(is_html, _, html)| *is_html && html.is_some())
         .and_then(|(_, _, html)| html.clone())
         .or_else(|| decoded.iter().find_map(|(_, _, html)| html.clone()));
 
+    // The calendar part is body content, not an attachment - it must not
+    // surface in the strip's metadata list alongside the actual attachments
+    // (same treatment as the text leaves).
+    let parts: Vec<BodyPart> = all_parts.iter().filter(|p| !p.is_text() && !p.is_calendar()).cloned().collect();
+    let (parts, text_body, html_body, calendar_ics) = match tnef_payload {
+        Some((source_part, payload)) => match tnef::parse(&payload) {
+            Ok(contents) => apply_tnef(&contents, &source_part, parts, text_body, html_body, has_real_html, calendar_ics),
+            Err(_) => (parts, text_body, html_body, calendar_ics),
+        },
+        None => (parts, text_body, html_body, calendar_ics),
+    };
+
     EmailBody {
         uid,
         text_body,
         html_body,
         calendar_ics,
-        // The calendar part is body content, not an attachment - it must not
-        // surface in the strip's metadata list alongside the actual
-        // attachments (same treatment as the text leaves).
-        parts: all_parts.iter().filter(|p| !p.is_text() && !p.is_calendar()).cloned().collect(),
+        parts,
         headers,
         auth_results: None,
     }
@@ -655,7 +723,9 @@ fn escape_attr(text: &str) -> String {
 /// legitimately contains balanced parens keeps them).
 fn match_url(text: &str, start: usize) -> Option<usize> {
     let rest = &text[start..];
-    let scheme_len = ["http://", "https://"].iter().find_map(|s| rest.get(..s.len()).filter(|r| r.eq_ignore_ascii_case(s)).map(|_| s.len()))?;
+    let scheme_len = ["http://", "https://"]
+        .iter()
+        .find_map(|s| rest.get(..s.len()).filter(|r| r.eq_ignore_ascii_case(s)).map(|_| s.len()))?;
     let after_scheme = start + scheme_len;
     let mut end = after_scheme;
     for (offset, c) in text[after_scheme..].char_indices() {
@@ -950,20 +1020,32 @@ mod tests {
         // "Details here!http://..." - no whitespace before the scheme - is
         // exactly the reported case; the URL is recognized anyway, and its
         // query string's `&` is escaped in the emitted href.
-        assert!(html.contains(r#"<a href="http://example.com/path?a=1&amp;b=2">http://example.com/path?a=1&amp;b=2</a>"#), "html was: {html}");
+        assert!(
+            html.contains(r#"<a href="http://example.com/path?a=1&amp;b=2">http://example.com/path?a=1&amp;b=2</a>"#),
+            "html was: {html}"
+        );
         assert!(html.contains(r#"<a href="mailto:carol@example.org">carol@example.org</a>"#), "html was: {html}");
     }
 
     #[test]
     fn linkify_to_html_recognizes_a_url_glued_to_punctuation() {
-        assert_eq!(linkify_to_html("Info:http://example.com end"), r#"Info:<a href="http://example.com">http://example.com</a> end"#);
-        assert_eq!(linkify_to_html("Click here!https://example.com end"), r#"Click here!<a href="https://example.com">https://example.com</a> end"#);
+        assert_eq!(
+            linkify_to_html("Info:http://example.com end"),
+            r#"Info:<a href="http://example.com">http://example.com</a> end"#
+        );
+        assert_eq!(
+            linkify_to_html("Click here!https://example.com end"),
+            r#"Click here!<a href="https://example.com">https://example.com</a> end"#
+        );
     }
 
     #[test]
     fn linkify_to_html_trims_trailing_sentence_punctuation() {
         assert_eq!(linkify_to_html("see http://example.com."), r#"see <a href="http://example.com">http://example.com</a>."#);
-        assert_eq!(linkify_to_html("see http://example.com, ok"), r#"see <a href="http://example.com">http://example.com</a>, ok"#);
+        assert_eq!(
+            linkify_to_html("see http://example.com, ok"),
+            r#"see <a href="http://example.com">http://example.com</a>, ok"#
+        );
         assert_eq!(linkify_to_html("(see http://example.com)"), r#"(see <a href="http://example.com">http://example.com</a>)"#);
     }
 
@@ -985,7 +1067,10 @@ mod tests {
 
     #[test]
     fn linkify_to_html_links_a_bare_email_address() {
-        assert_eq!(linkify_to_html("reach carol@example.org today"), r#"reach <a href="mailto:carol@example.org">carol@example.org</a> today"#);
+        assert_eq!(
+            linkify_to_html("reach carol@example.org today"),
+            r#"reach <a href="mailto:carol@example.org">carol@example.org</a> today"#
+        );
     }
 
     #[test]
@@ -996,7 +1081,10 @@ mod tests {
     #[test]
     fn linkify_html_text_nodes_links_a_bare_url_in_a_text_node() {
         let html = linkify_html_text_nodes("<p>Info:http://example.com/a?x=1&amp;y=2 for details.</p>");
-        assert_eq!(html, r#"<p>Info:<a href="http://example.com/a?x=1&amp;y=2">http://example.com/a?x=1&amp;y=2</a> for details.</p>"#);
+        assert_eq!(
+            html,
+            r#"<p>Info:<a href="http://example.com/a?x=1&amp;y=2">http://example.com/a?x=1&amp;y=2</a> for details.</p>"#
+        );
     }
 
     #[test]
@@ -1007,9 +1095,7 @@ mod tests {
 
     #[test]
     fn linkify_html_text_nodes_does_not_touch_style_or_script_content() {
-        let html = linkify_html_text_nodes(
-            r#"<style>body { background: url(http://example.com/bg.png); }</style><script>var u = "http://example.com/js";</script>"#,
-        );
+        let html = linkify_html_text_nodes(r#"<style>body { background: url(http://example.com/bg.png); }</style><script>var u = "http://example.com/js";</script>"#);
         assert_eq!(
             html,
             r#"<style>body { background: url(http://example.com/bg.png); }</style><script>var u = "http://example.com/js";</script>"#
@@ -1029,10 +1115,16 @@ mod tests {
         // The bug this fixture reproduces: a genuine sender text/html part
         // whose own markup never wraps its URL in <a> - "link:http://..."
         // with no space, exactly the reported case.
-        assert!(html.contains(r#"link:<a href="http://example.com/track?a=1&amp;b=2">http://example.com/track?a=1&amp;b=2</a>"#), "html was: {html}");
+        assert!(
+            html.contains(r#"link:<a href="http://example.com/track?a=1&amp;b=2">http://example.com/track?a=1&amp;b=2</a>"#),
+            "html was: {html}"
+        );
         // The sender's own existing link and its display text must survive
         // untouched - no nested <a>, no altered href.
-        assert!(html.contains(r#"<a href="http://example.com/existing?x=1&amp;y=2">click here http://not-a-real-link.example</a>"#), "html was: {html}");
+        assert!(
+            html.contains(r#"<a href="http://example.com/existing?x=1&amp;y=2">click here http://not-a-real-link.example</a>"#),
+            "html was: {html}"
+        );
         // A CSS `url(...)` inside <style> must never become a link.
         assert!(html.contains("background: url(http://example.com/bg.png)"), "html was: {html}");
         assert!(!html.contains(r#"url(<a href"#), "html was: {html}");
@@ -1616,5 +1708,74 @@ mod tests {
         let mut wrong_cid = text_part("2", "image/png", None, "base64");
         wrong_cid.cid = Some("some-other-id".to_string());
         assert!(find_part_in_raw(&raw, &wrong_cid).is_none());
+    }
+
+    /// The whole-message path (item 1.21 / M-45): a `winmail.dat` part is
+    /// decoded and replaced by its inner attachments as synthetic parts, with
+    /// the MAPI HTML body and the embedded iCalendar surfaced.
+    #[test]
+    fn tnef_fixture_decodes_into_inner_attachments() {
+        let body = parse_body(Uid(0), &fixture("outlook/tnef-message.eml")).expect("parses");
+        assert!(body.parts.iter().all(|part| !part.is_tnef()), "the raw winmail.dat part is replaced");
+        assert_eq!(body.html_body.as_deref(), Some("<html><body><p>Hello <b>world</b></p></body></html>"));
+
+        let report = body
+            .parts
+            .iter()
+            .find(|part| part.part_number == "tnef:2:1")
+            .expect("the text attachment is a synthetic part");
+        assert_eq!(report.filename.as_deref(), Some("report.txt"));
+        assert_eq!(report.content_type, "text/plain");
+        assert!(report.is_attachment);
+
+        let logo = body.parts.iter().find(|part| part.part_number == "tnef:2:2").expect("the inline image is a synthetic part");
+        assert_eq!(logo.cid.as_deref(), Some("logo123@lookout.test"));
+        assert!(!logo.is_attachment, "an inline image stays out of the attachment strip");
+
+        assert!(
+            body.calendar_ics.as_deref().is_some_and(|ics| ics.contains("SUMMARY:Synthetic TNEF invitation")),
+            "the embedded iCalendar surfaces for the invitation banner"
+        );
+        let strip: Vec<&BodyPart> = body.parts.iter().filter(|part| part.is_attachment).collect();
+        assert_eq!(strip.len(), 1, "only the text file belongs in the attachment strip");
+        assert_eq!(strip[0].filename.as_deref(), Some("report.txt"));
+    }
+
+    /// The partial-fetch path does the same decode: the TNEF part now joins
+    /// the text/calendar parts in the body fetch, and assembly replaces it.
+    #[test]
+    fn tnef_partial_assembly_replaces_the_raw_part() {
+        let dat = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/outlook/winmail.dat")).expect("fixture");
+        let mut tnef = text_part("2", "application/ms-tnef", None, "7bit");
+        tnef.filename = Some("winmail.dat".to_string());
+        tnef.is_attachment = true;
+        let all_parts = vec![text_part("1", "text/plain", Some("utf-8"), "7bit"), tnef];
+        let fetched = vec![("1".to_string(), b"Plain text part sent alongside winmail.dat.\r\n".to_vec()), ("2".to_string(), dat)];
+
+        let body = assemble_body_from_parts(Uid(0), Vec::new(), &all_parts, &fetched);
+        assert!(body.parts.iter().all(|part| !part.is_tnef()));
+        assert!(body
+            .parts
+            .iter()
+            .any(|part| part.part_number == "tnef:2:1" && part.filename.as_deref() == Some("report.txt")));
+        assert!(body.html_body.as_deref().is_some_and(|html| html.contains("Hello <b>world</b>")));
+        assert!(body.calendar_ics.is_some());
+    }
+
+    /// A payload the decoder can't make sense of leaves the raw `winmail.dat`
+    /// attachment in the strip - the message stays usable rather than losing
+    /// its only attachment.
+    #[test]
+    fn malformed_tnef_keeps_the_raw_attachment() {
+        let mut tnef = text_part("2", "application/ms-tnef", None, "7bit");
+        tnef.filename = Some("winmail.dat".to_string());
+        tnef.is_attachment = true;
+        let all_parts = vec![text_part("1", "text/plain", Some("utf-8"), "7bit"), tnef];
+        let fetched = vec![("1".to_string(), b"body".to_vec()), ("2".to_string(), b"not a tnef stream".to_vec())];
+
+        let body = assemble_body_from_parts(Uid(0), Vec::new(), &all_parts, &fetched);
+        let raw = body.parts.iter().find(|part| part.part_number == "2").expect("raw part kept");
+        assert!(raw.is_tnef());
+        assert!(raw.is_attachment);
     }
 }

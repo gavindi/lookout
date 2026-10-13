@@ -2229,12 +2229,12 @@ async fn connect_and_run(
                             tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: served from disk cache");
                             Ok(Some(bytes))
                         }
-                        Some(Ok(None)) => fetch_attachment_part(&mut session, uid, &part).await,
+                        Some(Ok(None)) => fetch_attachment_bytes(cache, &mut session, &mailbox, uid, uidvalidity, &part).await,
                         Some(Err(e)) => {
                             tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "failed to read cached attachment: {e}");
-                            fetch_attachment_part(&mut session, uid, &part).await
+                            fetch_attachment_bytes(cache, &mut session, &mailbox, uid, uidvalidity, &part).await
                         }
-                        None => fetch_attachment_part(&mut session, uid, &part).await,
+                        None => fetch_attachment_bytes(cache, &mut session, &mailbox, uid, uidvalidity, &part).await,
                     };
                     let bytes = match fetched {
                         Ok(Some(bytes)) => Some(bytes),
@@ -6594,7 +6594,7 @@ fn body_from_fetch(uid: Uid, fetch: &Fetch, parts: &[BodyPart]) -> Option<EmailB
         .unwrap_or_default();
 
     let mut fetched: Vec<(String, Vec<u8>)> = Vec::new();
-    for part in parts.iter().filter(|p| p.is_text() || p.is_calendar()) {
+    for part in parts.iter().filter(|p| p.is_text() || p.is_calendar() || p.is_tnef()) {
         if let Some(bytes) = fetch.section(&part_section_path(&part.part_number)) {
             fetched.push((part.part_number.clone(), bytes.to_vec()));
         }
@@ -6617,7 +6617,7 @@ fn body_from_fetch(uid: Uid, fetch: &Fetch, parts: &[BodyPart]) -> Option<EmailB
 /// to fetch or the server didn't return the requested sections; the caller
 /// falls back to a whole-message fetch rather than showing an empty pane.
 async fn fetch_body_partial(session: &mut Session<SessionStream>, uid: Uid, parts: &[BodyPart]) -> Result<Option<EmailBody>> {
-    let text_parts: Vec<&BodyPart> = parts.iter().filter(|p| p.is_text() || p.is_calendar()).collect();
+    let text_parts: Vec<&BodyPart> = parts.iter().filter(|p| p.is_text() || p.is_calendar() || p.is_tnef()).collect();
     if text_parts.is_empty() {
         return Ok(None);
     }
@@ -6684,7 +6684,7 @@ async fn fetch_bodies_batch(
     // section and falls back to a whole-message fetch below.
     let mut part_numbers: Vec<&str> = Vec::new();
     for parts in batch.iter().filter_map(|uid| structures.get(uid)) {
-        for part in parts.iter().filter(|p| p.is_text() || p.is_calendar()) {
+        for part in parts.iter().filter(|p| p.is_text() || p.is_calendar() || p.is_tnef()) {
             if !part_numbers.contains(&part.part_number.as_str()) {
                 part_numbers.push(part.part_number.as_str());
             }
@@ -6862,6 +6862,90 @@ async fn fetch_attachment_part(session: &mut Session<SessionStream>, uid: Uid, p
         return Ok(None);
     };
     Ok(Some(crate::body::transfer_part_bytes(part, bytes)))
+}
+
+/// Fetches one attachment part's bytes for the on-demand
+/// `AccountCommand::FetchAttachment`: an ordinary MIME part through
+/// `fetch_attachment_part`, or - for the synthetic `tnef:<source>:<index>`
+/// part number an inner TNEF attachment carries (item 1.21 / M-45) - the
+/// source TNEF part decoded and its `index`-th (1-based) attachment returned.
+/// The synthetic number never reaches IMAP: it isn't a valid section path.
+async fn fetch_attachment_bytes(
+    cache: &CacheHandle,
+    session: &mut Session<SessionStream>,
+    mailbox: &MailboxId,
+    uid: Uid,
+    uidvalidity: UidValidity,
+    part: &BodyPart,
+) -> Result<Option<Vec<u8>>> {
+    let Some((source_part, index)) = lookout_core::tnef_attachment_ref(&part.part_number) else {
+        return fetch_attachment_part(session, uid, part).await;
+    };
+    let Some(payload) = fetch_tnef_source(cache, session, mailbox, uid, uidvalidity, source_part).await? else {
+        return Ok(None);
+    };
+    let Ok(contents) = lookout_core::interop::tnef::parse(&payload) else {
+        tracing::warn!(?mailbox, uid = uid.0, part = %part.part_number, "FetchAttachment: TNEF payload failed to decode");
+        return Ok(None);
+    };
+    Ok(contents.attachments.get(index - 1).map(|attachment| attachment.data.clone()))
+}
+
+/// The transfer-decoded bytes of the TNEF part numbered `source_part`, for a
+/// synthetic inner-attachment fetch: the attachment flat-file cache first
+/// (an earlier fetch may have stored it), then the message's
+/// `BODYSTRUCTURE`-derived part, then a re-derive from the whole raw message
+/// when the structure is missing or stale - the same ladder
+/// `fetch_stale_part_fallback` uses for ordinary parts.
+async fn fetch_tnef_source(
+    cache: &CacheHandle,
+    session: &mut Session<SessionStream>,
+    mailbox: &MailboxId,
+    uid: Uid,
+    uidvalidity: UidValidity,
+    source_part: &str,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(Ok(Some(bytes))) = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let source_part = source_part.to_string();
+        move |c| c.load_attachment(&mailbox, uid, uidvalidity, &source_part)
+    })
+    .await
+    {
+        return Ok(Some(bytes));
+    }
+
+    let structure = cache_op(cache, {
+        let mailbox = mailbox.clone();
+        move |c| c.load_summary(&mailbox, uid)
+    })
+    .await
+    .and_then(|result| result.ok())
+    .flatten()
+    .and_then(|summary| summary.structure);
+    if let Some(source) = structure
+        .as_deref()
+        .and_then(|parts| parts.iter().find(|part| part.part_number == source_part && part.is_tnef()))
+    {
+        return fetch_attachment_part(session, uid, source).await;
+    }
+
+    let Some(raw) = fetch_raw_message_cached(cache, session, mailbox, uid, uidvalidity).await? else {
+        return Ok(None);
+    };
+    // Content-type matching only: the real part's filename isn't known when
+    // the structure is gone, and `application/ms-tnef` is unique enough.
+    let requested = BodyPart {
+        part_number: source_part.to_string(),
+        content_type: lookout_core::TNEF_CONTENT_TYPE.to_string(),
+        charset: None,
+        transfer_encoding: None,
+        filename: None,
+        cid: None,
+        size: 0,
+        is_attachment: true,
+    };
+    Ok(crate::body::find_part_in_raw(&raw, &requested))
 }
 
 /// Fallback for an attachment part whose section no longer exists on the

@@ -179,7 +179,11 @@ impl RecipientEntry {
         let entry = gtk::Text::builder().hexpand(true).width_request(120).build();
 
         let (root, header, flow) = if plain {
-            let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["recipient-field"]).build();
+            let root = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .css_classes(["recipient-field"])
+                .build();
             if title.is_empty() {
                 entry.set_placeholder_text(Some("Recipients"));
             } else {
@@ -204,7 +208,11 @@ impl RecipientEntry {
                 .build();
             flow.append(&entry);
 
-            let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).css_classes(["recipient-field"]).build();
+            let root = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(2)
+                .css_classes(["recipient-field"])
+                .build();
             root.append(&header);
             root.append(&flow);
             (root, header, Some(flow))
