@@ -157,7 +157,16 @@ pub struct RecipientEntry {
     /// a keystroke that arrives while an earlier lookup is still in flight
     /// can't have its results overwritten by that stale reply afterward.
     suggestion_generation: Rc<Cell<u64>>,
+    /// Fired whenever the recipient set may have changed - a chip committed
+    /// or removed, or the entry text edited. The event editor uses it to keep
+    /// its footer action label ("Save" / "Send") in step with whether the
+    /// event has attendees; one slot is enough for its single consumer.
+    changed: Rc<RefCell<Option<AddressesChangedCallback>>>,
 }
+
+/// Callback slot for [`RecipientEntry::connect_addresses_changed`] - named so
+/// the field's type reads as a sentence rather than four nested generics.
+type AddressesChangedCallback = Rc<dyn Fn()>;
 
 impl RecipientEntry {
     /// A chip-mode field: each recipient is a removable pill. Used by the
@@ -249,6 +258,7 @@ impl RecipientEntry {
             suggestions: Rc::new(RefCell::new(Vec::new())),
             source: Rc::new(RefCell::new(None)),
             suggestion_generation: Rc::new(Cell::new(0)),
+            changed: Rc::new(RefCell::new(None)),
         };
         this.connect_handlers();
         this
@@ -274,6 +284,7 @@ impl RecipientEntry {
         }
         *self.tokens.borrow_mut() = parse_address_tokens(text);
         self.rebuild_chips();
+        self.notify_changed();
     }
 
     /// Every recipient, including anything still being typed but not yet
@@ -299,6 +310,19 @@ impl RecipientEntry {
 
     pub fn set_suggestion_source(&self, source: SuggestionSource) {
         *self.source.borrow_mut() = Some(source);
+    }
+
+    /// Registers the callback fired whenever the recipient set may have
+    /// changed: a keystroke in the entry, a token committed to a chip, a chip
+    /// removed, or the contents replaced programmatically.
+    pub fn connect_addresses_changed<F: Fn() + 'static>(&self, f: F) {
+        *self.changed.borrow_mut() = Some(Rc::new(f));
+    }
+
+    fn notify_changed(&self) {
+        if let Some(changed) = self.changed.borrow().as_ref() {
+            changed();
+        }
     }
 
     /// Commits whatever is typed, then reports the tokens. Called by Send so
@@ -346,6 +370,7 @@ impl RecipientEntry {
             }
         }
         self.rebuild_chips();
+        self.notify_changed();
     }
 
     fn connect_handlers(&self) {
@@ -377,6 +402,7 @@ impl RecipientEntry {
         {
             let this = self.clone();
             self.entry.connect_changed(move |entry| {
+                this.notify_changed();
                 let text = entry.text().to_string();
                 if this.plain {
                     let start = current_segment_start(&text);
@@ -399,6 +425,7 @@ impl RecipientEntry {
                 gtk::gdk::Key::BackSpace if !this.plain && this.entry.text().is_empty() => {
                     this.tokens.borrow_mut().pop();
                     this.rebuild_chips();
+                    this.notify_changed();
                     glib::Propagation::Stop
                 }
                 // Tab would otherwise move focus with a token half-entered
@@ -471,6 +498,7 @@ impl RecipientEntry {
         self.entry.set_text("");
         self.popover.popdown();
         self.rebuild_chips();
+        self.notify_changed();
     }
 
     /// Plain mode's counterpart to `commit_entry_text`: normalizes the
@@ -536,6 +564,7 @@ impl RecipientEntry {
                 }
                 drop(tokens);
                 this.rebuild_chips();
+                this.notify_changed();
             });
         }
 

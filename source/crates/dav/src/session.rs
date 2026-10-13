@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
-use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EventOccurrence, EventUid};
+use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EventOccurrence, EventUid, SchedulingInfo};
 
 use crate::cache::CalendarCache;
 use crate::client::DavClient;
@@ -92,6 +92,13 @@ pub enum CalendarCommand {
 pub enum CalendarSessionEvent {
     ConnectionStateChanged(ConnectionState),
     CalendarsUpdated(Vec<CalendarInfo>),
+    /// The account principal's RFC 6638 scheduling capability
+    /// (`schedule-outbox-URL`/`schedule-inbox-URL`), reported once per
+    /// connection right after discovery. The app stores it per account: an
+    /// outbox means the server delivers iTIP itself, so the client-side iMIP
+    /// sender stands down (and a later CAL-19 free/busy request has its POST
+    /// target).
+    SchedulingUpdated(SchedulingInfo),
     OccurrencesUpdated {
         month: NaiveDate,
         occurrences: Vec<EventOccurrence>,
@@ -235,9 +242,15 @@ async fn connect_and_run(
     let credential = credentials.calendar_credential().await.map_err(Error::LoginFailed)?;
     let client = DavClient::new(&config.base_url, config.accept_ssl_errors, config.username.clone())?;
 
-    let home_href = client.discover_calendar_home(&credential).await?;
-    let calendars = client.list_calendars(&home_href, &config.account_id, &credential).await?;
+    let discovery = client.discover_calendar(&credential).await?;
+    let calendars = client.list_calendars(&discovery.home_set_href, &config.account_id, &credential).await?;
     let _ = events.send(CalendarSessionEvent::CalendarsUpdated(calendars.clone())).await;
+    let _ = events
+        .send(CalendarSessionEvent::SchedulingUpdated(SchedulingInfo {
+            schedule_outbox: discovery.schedule_outbox_href,
+            schedule_inbox: discovery.schedule_inbox_href,
+        }))
+        .await;
 
     let mut current_month = first_of_month(chrono::Utc::now().date_naive());
     sync_month(&client, &calendars, &credential, current_month, events, cache).await?;

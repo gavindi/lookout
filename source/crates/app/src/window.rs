@@ -11,7 +11,8 @@ use chrono::{Datelike, Timelike};
 use gtk::{gio, glib};
 use lookout_core::{
     display_name, AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody,
-    EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, UidValidity, VCard, WebcalSubscription,
+    EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SchedulingInfo, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, UidValidity, VCard,
+    WebcalSubscription,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
@@ -1502,6 +1503,11 @@ struct CalendarAccountHandle {
     /// Latest full task list from the account's last `TasksUpdated` - tasks
     /// have no month window, so a whole-set snapshot is the natural unit.
     last_tasks: Vec<CalendarTask>,
+    /// RFC 6638 scheduling capability discovered on the account principal:
+    /// an advertised `schedule-outbox-URL` means the server delivers iTIP
+    /// itself, so organizer saves skip the client-side iMIP sender (and later
+    /// CAL-19 free/busy has its POST target). Defaults to "client schedules".
+    scheduling: SchedulingInfo,
 }
 
 /// The original-message details a read receipt (RFC 8098 MDN) is built
@@ -6811,10 +6817,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let calendar_view_button = calendar_view_button.clone();
+        let toast_overlay = toast_overlay.clone();
         Rc::new(move |occ: EventOccurrence| {
             window.present();
             calendar_view_button.set_active(true);
-            open_event_editor_for(&window, &state, &worker, &calendar_state, &occ);
+            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &occ);
         })
     });
     // --- Mail notification actions. `app.raise-window` and `app.open-mailbox`
@@ -10372,8 +10379,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let worker = worker.clone();
         let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
         calendar_view::connect_event_activated(&calendar_main, move |occ| {
-            open_event_editor_for(&window, &state, &worker, &calendar_state, &occ);
+            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &occ);
         });
     }
     // --- Calendar drag-reschedule: dropping an event chip at a new position
@@ -10384,6 +10392,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // recurring occurrence's drag lands as a per-occurrence override ("This
     // occurrence" scope): the instance moves without re-anchoring the series.
     {
+        let window = window.clone();
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
         let calendar_main_for_drag = calendar_main.clone();
         let toast_overlay = toast_overlay.clone();
@@ -10418,7 +10428,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let (start_local, end_local) = crate::event_editor::dragged_local_span(&occ, new_start, new_end);
             let mut event = crate::event_editor::calendar_event_from_occurrence(&occ, start_local, end_local);
             crate::event_editor::apply_edit_scope(&mut event, 0, Some(&occ));
-            route_calendar_save(&calendar_state, event.calendar_id.clone(), event);
+            // A drag is an edit: it bumps SEQUENCE and offers the "send
+            // update?" prompt, exactly like a save from the editor.
+            save_event_with_invites(&window, &state, &calendar_state, &toast_overlay, Some(&occ), event.calendar_id.clone(), event);
         });
     }
     // --- Calendar main grid interactions: the first click on an empty time
@@ -13086,6 +13098,7 @@ fn connect_calendar_account(
             last_synced_month: None,
             occurrences_by_month: HashMap::new(),
             last_tasks: Vec::new(),
+            scheduling: SchedulingInfo::default(),
         },
     );
 
@@ -13103,6 +13116,11 @@ fn connect_calendar_account(
             }
             for event in collapse_calendar_events(batch) {
                 match event {
+                    CalendarSessionEvent::SchedulingUpdated(info) => {
+                        if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                            handle.scheduling = info;
+                        }
+                    }
                     CalendarSessionEvent::ConnectionStateChanged(state) => {
                         if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
                             handle.connection_state = state.clone();
@@ -13393,12 +13411,17 @@ fn default_pickable_calendar(calendar_state: &Rc<RefCell<CalendarUiState>>) -> O
 }
 
 /// Best-effort address for the account owning `calendar_id`, used as
-/// `ORGANIZER` when an event ends up with attendees. GOA calendar accounts
-/// carry no dedicated email field, but their display name is commonly *is*
-/// the account's email address (Google/Nextcloud/Fastmail all populate it
-/// that way) - accepted only when it actually looks like one, else `None`
-/// (a documented non-conformance the event editor already tolerates).
-fn calendar_owner_email(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> Option<String> {
+/// `ORGANIZER` when an event ends up with attendees. Prefers the connected
+/// mail account behind the same GOA account (the identity invitations
+/// actually send from, see `invite_identity`); GOA calendar accounts carry no
+/// dedicated email field, so the display name - commonly *is* the account's
+/// address (Google/Nextcloud/Fastmail all populate it that way) - is the
+/// fallback, accepted only when it actually looks like one, else `None` (a
+/// documented non-conformance the event editor already tolerates).
+fn calendar_owner_email(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> Option<String> {
+    if let Some((identity, _)) = invite_identity(state, calendar_state, calendar_id) {
+        return Some(identity.email);
+    }
     let st = calendar_state.borrow();
     let display_name = st
         .accounts
@@ -13444,7 +13467,14 @@ fn event_editor_preview_data(calendar_state: &Rc<RefCell<CalendarUiState>>, anch
 /// or the birthdays calendar) opens the editor in read-only mode - neither
 /// has a write-back path - so every input is disabled and the save/delete
 /// actions are hidden, with a dim note explaining the source.
-fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, calendar_state: &Rc<RefCell<CalendarUiState>>, occ: &EventOccurrence) {
+fn open_event_editor_for(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    occ: &EventOccurrence,
+) {
     let (read_only, read_only_note) = {
         let st = calendar_state.borrow();
         let note = st.read_only_note(&occ.calendar_id);
@@ -13464,7 +13494,7 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
         }
     };
     let preview = event_editor_preview_data(calendar_state, calendar_view::local_span(occ).0.date());
-    let owner_email = calendar_owner_email(calendar_state, &occ.calendar_id);
+    let owner_email = calendar_owner_email(state, calendar_state, &occ.calendar_id);
     let calendar_prefs = state.borrow().settings.calendar_preferences();
     crate::event_editor::show_event_editor(
         window,
@@ -13484,12 +13514,23 @@ fn open_event_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiS
         },
         calendar_attendee_suggestions(state, worker),
         {
+            let window = window.clone();
+            let state = state.clone();
             let calendar_state = calendar_state.clone();
-            move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
+            let toast_overlay = toast_overlay.clone();
+            let previous = occ.clone();
+            move |calendar_id, event| {
+                save_event_with_invites(&window, &state, &calendar_state, &toast_overlay, Some(&previous), calendar_id, event);
+            }
         },
         {
+            let window = window.clone();
+            let state = state.clone();
             let calendar_state = calendar_state.clone();
-            move |calendar_id, occ| route_calendar_delete(&calendar_state, calendar_id, occ)
+            let toast_overlay = toast_overlay.clone();
+            move |calendar_id, occ| {
+                delete_event_with_invites(&window, &state, &calendar_state, &toast_overlay, calendar_id, occ);
+            }
         },
     );
 }
@@ -13514,7 +13555,7 @@ fn show_new_event_editor(
         return;
     };
     let preview = event_editor_preview_data(calendar_state, suggested_start.date());
-    let owner_email = calendar_owner_email(calendar_state, &default_calendar);
+    let owner_email = calendar_owner_email(state, calendar_state, &default_calendar);
     let calendar_prefs = state.borrow().settings.calendar_preferences();
     crate::event_editor::show_event_editor(
         window,
@@ -13534,12 +13575,22 @@ fn show_new_event_editor(
         },
         calendar_attendee_suggestions(state, worker),
         {
+            let window = window.clone();
+            let state = state.clone();
             let calendar_state = calendar_state.clone();
-            move |calendar_id, event| route_calendar_save(&calendar_state, calendar_id, event)
+            let toast_overlay = toast_overlay.clone();
+            move |calendar_id, event| {
+                save_event_with_invites(&window, &state, &calendar_state, &toast_overlay, None, calendar_id, event);
+            }
         },
         {
+            let window = window.clone();
+            let state = state.clone();
             let calendar_state = calendar_state.clone();
-            move |calendar_id, occ| route_calendar_delete(&calendar_state, calendar_id, occ)
+            let toast_overlay = toast_overlay.clone();
+            move |calendar_id, occ| {
+                delete_event_with_invites(&window, &state, &calendar_state, &toast_overlay, calendar_id, occ);
+            }
         },
     );
 }
@@ -13621,8 +13672,10 @@ fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar
             rdates: Vec::new(),
             href: occ.master_href.clone().or_else(|| occ.href.clone()),
             etag: occ.master_etag.clone().or_else(|| occ.etag.clone()),
+            sequence: occ.sequence,
             attendees: occ.attendees.clone(),
             organizer: occ.organizer.clone(),
+            schedule_agent: occ.schedule_agent,
             categories: occ.categories.clone(),
             sensitivity: occ.sensitivity,
             show_as: occ.show_as,
@@ -13643,6 +13696,263 @@ fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar
         href,
         etag: occ.etag,
     });
+}
+
+/// The owning account's discovered RFC 6638 scheduling capability, defaulting
+/// to "the client schedules" for an unknown calendar (matching
+/// `SchedulingInfo::default`) - the save/delete route warns about the unknown
+/// calendar itself.
+fn calendar_scheduling(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> SchedulingInfo {
+    calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .find(|handle| handle.calendars.iter().any(|calendar| calendar.id == *calendar_id))
+        .map(|handle| handle.scheduling.clone())
+        .unwrap_or_default()
+}
+
+/// The mail identity that organizes `calendar_id`'s events: the calendar
+/// account's GOA id is the same D-Bus object path its Mail interface carries
+/// (see `lookout-goa`'s discovery), so the mail handle with that id is the
+/// same account and its address is the `From`/`ORGANIZER`. Falls back to the
+/// display-name heuristic (`calendar_owner_email`) matched against a mail
+/// account's address for calendar-only sessions. `None` means "no mail
+/// account to send from" - the event still saves, just without invitations.
+fn invite_identity(
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    calendar_id: &CalendarId,
+) -> Option<(crate::calendar_invites::OrganizerIdentity, async_channel::Sender<AccountCommand>)> {
+    let (account_id, display_name) = calendar_state.borrow().accounts.iter().find_map(|(id, handle)| {
+        handle
+            .calendars
+            .iter()
+            .any(|calendar| calendar.id == *calendar_id)
+            .then(|| (id.clone(), handle.display_name.clone()))
+    })?;
+    let state = state.borrow();
+    if let Some(handle) = state.accounts.get(&account_id) {
+        return Some((organizer_identity(handle), handle.cmd_tx.clone()));
+    }
+    let candidate = crate::recipient_entry::is_plausible_address(&display_name).then_some(display_name)?;
+    state
+        .accounts
+        .values()
+        .find(|handle| handle.email.eq_ignore_ascii_case(&candidate))
+        .map(|handle| (organizer_identity(handle), handle.cmd_tx.clone()))
+}
+
+fn organizer_identity(handle: &AccountHandle) -> crate::calendar_invites::OrganizerIdentity {
+    crate::calendar_invites::OrganizerIdentity {
+        email: handle.email.clone(),
+        display_name: (!handle.display_name.trim().is_empty()).then(|| handle.display_name.clone()),
+    }
+}
+
+/// Presents an Outlook-style "send / don't send" prompt and runs `on_accept`
+/// on the affirmative answer; the close/Escape response declines. The dialog
+/// is presented via the main loop, so the caller's own action (the save or
+/// delete) has already been dispatched by the time the user answers.
+fn prompt_invite(window: &adw::ApplicationWindow, heading: &str, body: &str, accept_label: &str, on_accept: impl FnOnce() + 'static) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .default_response("send")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Don't send");
+    dialog.add_response("send", accept_label);
+    dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+    let (respond_tx, respond_rx) = async_channel::bounded(1);
+    dialog.connect_response(None, move |_dialog, response| {
+        let _ = respond_tx.send_blocking(response == "send");
+    });
+    dialog.present(Some(window));
+    glib::spawn_future_local(async move {
+        if matches!(respond_rx.recv().await, Ok(true)) {
+            on_accept();
+        }
+    });
+}
+
+/// Sends one iMIP message through the organizer's mail account's outbox and
+/// toasts the outcome. A message with no recipients left after removing the
+/// organizer's own address is dropped silently (that's an event with only the
+/// organizer on its attendee list, not a failure).
+fn send_invite(
+    cmd_tx: &async_channel::Sender<AccountCommand>,
+    identity: &crate::calendar_invites::OrganizerIdentity,
+    event: &CalendarEvent,
+    kind: crate::calendar_invites::InviteKind,
+    toast_overlay: &adw::ToastOverlay,
+    toast: &str,
+) {
+    let message = crate::calendar_invites::invite_message(event, kind, identity);
+    if message.to.is_empty() {
+        return;
+    }
+    let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+        message: Box::new(message),
+        not_before: None,
+        client_token: None,
+    });
+    toast_overlay.add_toast(adw::Toast::new(toast));
+}
+
+fn no_invite_sender_toast(toast_overlay: &adw::ToastOverlay, action: &str) {
+    toast_overlay.add_toast(adw::Toast::new(&format!("{action} - no connected mail account matches this calendar.")));
+}
+
+/// The organizer-aware save path (OUTLOOK_PARITY item 3.4 / CAL-14): bumps
+/// `SEQUENCE` on edits, routes the PUT exactly as `route_calendar_save` does,
+/// then either sends the invitation immediately (a new meeting), prompts for
+/// an update, or prompts to cancel removed attendees - except on a server
+/// that schedules itself (RFC 6638), where saving is the whole job. Used by
+/// the event editor and the drag-reschedule gesture; the `.ics` import and
+/// the incoming-invitation upsert deliberately use the plain route, since
+/// neither is an organizer action.
+fn save_event_with_invites(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    previous: Option<&EventOccurrence>,
+    calendar_id: CalendarId,
+    mut event: CalendarEvent,
+) {
+    // RFC 5545 §3.8.1.4: a revision the attendees see must move SEQUENCE
+    // forward. Bumped whether the client or the server delivers, so a
+    // scheduling server re-schedules too.
+    if let Some(previous) = previous {
+        if !event.attendees.is_empty() || !previous.attendees.is_empty() {
+            event.sequence = previous.sequence + 1;
+        }
+        // Preserve another scheduling client's per-event override.
+        if event.schedule_agent.is_none() {
+            event.schedule_agent = previous.schedule_agent;
+        }
+    }
+    // The organizer identity is resolved before the PUT so a meeting whose
+    // stored ORGANIZER is missing (older events, or an account whose address
+    // only became known now) is stamped with the address we'd send from.
+    let identity = invite_identity(state, calendar_state, &calendar_id);
+    if event.organizer.is_none() && !event.attendees.is_empty() {
+        if let Some((identity, _)) = &identity {
+            event.organizer = Some(EmailAddress::new(identity.email.clone()));
+        }
+    }
+    let delivery = crate::calendar_invites::delivery_for(&calendar_scheduling(calendar_state, &calendar_id), event.schedule_agent);
+    let action = if delivery == crate::calendar_invites::Delivery::Client {
+        crate::calendar_invites::classify_save(previous, &event)
+    } else {
+        crate::calendar_invites::SaveInvite::None
+    };
+    route_calendar_save(calendar_state, calendar_id, event.clone());
+
+    let summary = event.summary.clone().unwrap_or_default();
+    let Some(action) = (action != crate::calendar_invites::SaveInvite::None).then_some(action) else {
+        return;
+    };
+    let Some((identity, cmd_tx)) = identity else {
+        let action = match action {
+            crate::calendar_invites::SaveInvite::Request => "Invitations not sent",
+            crate::calendar_invites::SaveInvite::PromptCancel => "Cancellation not sent",
+            _ => "Update not sent",
+        };
+        no_invite_sender_toast(toast_overlay, action);
+        return;
+    };
+    // A meeting organized by someone else (an invitation stored from mail):
+    // saving our copy must never mail its attendees on the organizer's
+    // behalf. The cancellation path checks the pre-edit state, since removing
+    // every attendee also clears the ORGANIZER.
+    let organizer_matches = match action {
+        crate::calendar_invites::SaveInvite::PromptCancel => previous.map(|previous| previous.organizer.as_ref()).unwrap_or(event.organizer.as_ref()),
+        _ => event.organizer.as_ref(),
+    };
+    if !crate::calendar_invites::is_organizer(organizer_matches, &identity.email) {
+        return;
+    }
+    match action {
+        crate::calendar_invites::SaveInvite::None => {}
+        crate::calendar_invites::SaveInvite::Request => {
+            send_invite(&cmd_tx, &identity, &event, crate::calendar_invites::InviteKind::Request, toast_overlay, "Invitation sent");
+        }
+        crate::calendar_invites::SaveInvite::PromptUpdate => {
+            let toast_overlay = toast_overlay.clone();
+            let body = format!("\"{summary}\" was updated. Send the attendees an update?");
+            prompt_invite(window, "Send update to attendees?", &body, "Send update", move || {
+                send_invite(&cmd_tx, &identity, &event, crate::calendar_invites::InviteKind::Update, &toast_overlay, "Update sent");
+            });
+        }
+        crate::calendar_invites::SaveInvite::PromptCancel => {
+            let Some(previous) = previous.cloned() else { return };
+            let toast_overlay = toast_overlay.clone();
+            let mut cancel_event = crate::calendar_invites::cancellation_event(&previous, Some(EmailAddress::new(identity.email.clone())));
+            // The cancellation must sort after the last REQUEST, which
+            // carried the pre-edit sequence.
+            cancel_event.sequence = previous.sequence + 1;
+            let body = format!("\"{summary}\" has no attendees left. Cancel with the people who were removed?");
+            prompt_invite(window, "Send cancellation to removed attendees?", &body, "Send cancellation", move || {
+                send_invite(
+                    &cmd_tx,
+                    &identity,
+                    &cancel_event,
+                    crate::calendar_invites::InviteKind::Cancel,
+                    &toast_overlay,
+                    "Cancellation sent",
+                );
+            });
+        }
+    }
+}
+
+/// The organizer-aware delete path: routes the deletion exactly as
+/// `route_calendar_delete` does (recurring instances become EXDATEs, overrides
+/// and standalone events lose their resource), then prompts to send a
+/// cancellation to the attendees - the delete itself always happens, matching
+/// Outlook, so "Don't send" leaves a silent removal. Server-scheduled
+/// accounts skip the prompt.
+fn delete_event_with_invites(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    calendar_id: CalendarId,
+    occ: EventOccurrence,
+) {
+    let delivery = crate::calendar_invites::delivery_for(&calendar_scheduling(calendar_state, &calendar_id), occ.schedule_agent);
+    let action = crate::calendar_invites::classify_delete(&occ, delivery);
+    route_calendar_delete(calendar_state, calendar_id, occ.clone());
+    if action != crate::calendar_invites::DeleteInvite::PromptCancel {
+        return;
+    }
+    match invite_identity(state, calendar_state, &occ.calendar_id) {
+        Some((identity, cmd_tx)) => {
+            // An event organized by someone else (stored from an incoming
+            // invitation): deleting our copy must not cancel it for its real
+            // organizer's attendees.
+            if !crate::calendar_invites::is_organizer(occ.organizer.as_ref(), &identity.email) {
+                return;
+            }
+            let toast_overlay = toast_overlay.clone();
+            let summary = occ.summary.clone().unwrap_or_default();
+            let cancel_event = crate::calendar_invites::cancellation_event(&occ, Some(EmailAddress::new(identity.email.clone())));
+            let body = format!("\"{summary}\" was deleted. Notify the attendees with a cancellation?");
+            prompt_invite(window, "Send cancellation to attendees?", &body, "Send cancellation", move || {
+                send_invite(
+                    &cmd_tx,
+                    &identity,
+                    &cancel_event,
+                    crate::calendar_invites::InviteKind::Cancel,
+                    &toast_overlay,
+                    "Cancellation sent",
+                );
+            });
+        }
+        None => no_invite_sender_toast(toast_overlay, "Cancellation not sent"),
+    }
 }
 
 /// The account session that owns `calendar_id`, for task writes - the
@@ -14522,7 +14832,6 @@ fn respond_to_imip_invitation(
             status,
         }),
     }
-    let reply_ics = lookout_dav::build_imip_vcalendar(&event, lookout_core::ImipMethod::Reply);
     let (subject_prefix, toast) = match status {
         AttendeeStatus::Accepted => ("Accepted", "Invitation accepted"),
         AttendeeStatus::Tentative => ("Tentatively accepted", "Marked as tentative"),
@@ -14533,26 +14842,19 @@ fn respond_to_imip_invitation(
         Some(summary) => format!("{subject_prefix}: {summary}"),
         None => subject_prefix.to_string(),
     };
-    let message = lookout_mail::ComposedMessage {
-        from: from_email.to_string(),
-        display_name: display_name.map(str::to_string).filter(|n| !n.trim().is_empty()),
-        to: vec![organizer.address.clone()],
-        cc: vec![],
-        bcc: vec![],
-        reply_to: vec![],
-        subject,
-        text_body: format!("{subject_prefix}."),
-        html_body: None,
-        attachments: vec![],
-        inline_images: vec![],
-        calendar_part: Some(reply_ics),
-        read_receipt: None,
-        request_read_receipt: false,
-        importance: lookout_core::Importance::Normal,
-        in_reply_to: invitation.in_reply_to.clone(),
-        references: vec![],
-        message_id: None,
+    let identity = crate::calendar_invites::OrganizerIdentity {
+        email: from_email.to_string(),
+        display_name: display_name.map(str::to_string).filter(|name| !name.trim().is_empty()),
     };
+    let message = crate::calendar_invites::build_imip_message(
+        &event,
+        lookout_core::ImipMethod::Reply,
+        &identity,
+        vec![organizer.address.clone()],
+        subject,
+        format!("{subject_prefix}."),
+        invitation.in_reply_to.clone(),
+    );
     let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
         message: Box::new(message),
         not_before: None,
@@ -24881,8 +25183,10 @@ mod tests {
             etag: None,
             master_href: None,
             master_etag: None,
+            sequence: 0,
             attendees: vec![],
             organizer: None,
+            schedule_agent: None,
             categories: vec![],
             sensitivity: Default::default(),
             show_as: Default::default(),

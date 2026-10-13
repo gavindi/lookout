@@ -35,6 +35,19 @@ pub enum AttendeeStatus {
     Tentative,
 }
 
+/// RFC 6638 `SCHEDULE-AGENT` parameter on an iCalendar `ORGANIZER` property:
+/// who delivers the invitations for the event. Only the organizer's value is
+/// interpreted here - `Client` (set by a scheduling client that keeps
+/// delivery in its own hands) suppresses server-side scheduling, `Server` (a
+/// 6638 server's own marker) and an absent parameter leave delivery to the
+/// server when it supports scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ScheduleAgent {
+    Server,
+    Client,
+    None,
+}
+
 /// A user-subscribed webcal (`.ics` feed) calendar: fetch-only by design -
 /// feeds can't be written back to, so these never appear as event-editor
 /// targets. Persisted in `settings.json` (`AppConfig`), keyed by `id` so the
@@ -81,6 +94,35 @@ pub enum EventTransparency {
     #[default]
     Busy,
     Free,
+}
+
+/// RFC 6638 CalDAV scheduling capability, discovered from the account
+/// principal (`CALDAV:schedule-outbox-URL` / `schedule-inbox-URL`). An outbox
+/// URL means the server itself delivers iTIP messages for events stored in
+/// its calendars (implicit scheduling), so the client must not also send its
+/// own iMIP mail; a server that doesn't advertise one leaves delivery to the
+/// client. `None` everywhere is the safe default for non-scheduling servers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulingInfo {
+    /// The account principal's `CALDAV:schedule-outbox-URL`, when advertised -
+    /// where a client POSTs VFREEBUSY requests and, on a scheduling-capable
+    /// server, the marker that the server handles iTIP itself.
+    #[serde(default)]
+    pub schedule_outbox: Option<String>,
+    /// The account principal's `CALDAV:schedule-inbox-URL`, when advertised -
+    /// where the server posts incoming scheduling messages; kept for the
+    /// free/busy work (CAL-19) that consumes the outbox.
+    #[serde(default)]
+    pub schedule_inbox: Option<String>,
+}
+
+impl SchedulingInfo {
+    /// Whether the server says it schedules: implicitly delivering iTIP
+    /// REQUEST/REPLY/CANCEL for events written to its calendars, so the app
+    /// must skip its own client-side iMIP sending (RFC 6638 §6).
+    pub fn supports_server_scheduling(&self) -> bool {
+        self.schedule_outbox.is_some()
+    }
 }
 
 /// A CalDAV calendar collection discovered under an account's calendar-home-set.
@@ -167,6 +209,12 @@ pub struct CalendarEvent {
     /// (HTTP 412) instead of silently clobbering a concurrent change.
     #[serde(default)]
     pub etag: Option<String>,
+    /// RFC 5545 `SEQUENCE` (default 0): the organizer bumps it on every
+    /// significant revision sent to attendees, so an iTIP client can order
+    /// updates and ignore stale ones. Read/written on the wire; the app
+    /// increments it when an organizer saves an event with attendees.
+    #[serde(default)]
+    pub sequence: i64,
     #[serde(default)]
     pub attendees: Vec<Attendee>,
     /// The event's organizer, emitted as `ORGANIZER` only when `attendees`
@@ -175,6 +223,11 @@ pub struct CalendarEvent {
     /// determined - a documented non-conformance rather than a blocker.
     #[serde(default)]
     pub organizer: Option<EmailAddress>,
+    /// RFC 6638 `SCHEDULE-AGENT` on the `ORGANIZER` property, when present -
+    /// the per-event override of who delivers invitations (see
+    /// [`ScheduleAgent`]). `None` means the parameter was absent.
+    #[serde(default)]
+    pub schedule_agent: Option<ScheduleAgent>,
     #[serde(default)]
     pub categories: Vec<String>,
     #[serde(default)]
@@ -265,10 +318,17 @@ pub struct EventOccurrence {
     pub master_href: Option<String>,
     #[serde(default)]
     pub master_etag: Option<String>,
+    /// The master event's `SEQUENCE` (see [`CalendarEvent::sequence`]), so an
+    /// organizer editing from any occurrence can bump the series revision.
+    #[serde(default)]
+    pub sequence: i64,
     #[serde(default)]
     pub attendees: Vec<Attendee>,
     #[serde(default)]
     pub organizer: Option<EmailAddress>,
+    /// The master's `SCHEDULE-AGENT` (see [`CalendarEvent::schedule_agent`]).
+    #[serde(default)]
+    pub schedule_agent: Option<ScheduleAgent>,
     #[serde(default)]
     pub categories: Vec<String>,
     #[serde(default)]

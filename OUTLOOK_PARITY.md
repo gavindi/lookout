@@ -44,18 +44,18 @@ Counts are tallied from the §5 tables.
 |---|---|---|---|---|---|
 | Mail (5.1) | 23 | 9 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 12 | 4 | 6 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop and an attachment reminder. No forwarding with attachments. |
-| Calendar (5.3) | 13 | 11 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. |
+| Calendar (5.3) | 14 | 10 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 3 | 3 | 5 | 1 | VTODO and Google Tasks CRUD. No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **62** | **39** | **51** | **5** | ~40% at parity, ~25% partial |
+| **Total** | **63** | **38** | **51** | **5** | ~40% at parity, ~25% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
 1. **Microsoft 365 calendar, contacts and To Do** (A-03…A-05). Accounts users "add from Outlook" show no calendar.
-2. **Sending meeting invitations as organizer** (CAL-14). `build_imip_vcalendar` already supports REQUEST and CANCEL but is only called for REPLY.
+2. ✅ ~~**Sending meeting invitations as organizer** (CAL-14) - done: client iMIP REQUEST/update/CANCEL, or RFC 6638 server scheduling.~~
 3. **Rules** (M-14), both client-side and server-side (Sieve / Graph).
 4. **Undo send and undo actions** (M-21, C-09).
 5. **Spell check** (C-02). WebKit can do this; it's switched off.
@@ -326,7 +326,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | CAL-11 | Per-event time zone | The event model carries an IANA `time_zone`; the editor's searchable "Time zone" picker enters/edits times in it (new events default to the display zone), `build_vevent` emits `TZID` + a generated `VTIMEZONE` (explicit transitions, event year ±2) and RRULE expansion is zone-anchored so local wall time survives DST; Windows TZIDs still read via `dav/src/tzmap.rs` (3.2) | ✅ | — |
 | CAL-12 | Reminders | `app/src/reminders.rs` notifications (Open / Snooze 5 min / Dismiss) | 🟡 | Reminders window (Dismiss all, snooze choices), multiple alarms, default reminder setting |
 | CAL-13 | Recurrence | Full expansion (`dav/src/recurrence.rs`); builder in `app/src/recurrence.rs` limited to daily/weekly/monthly/yearly | 🟡 | "2nd Tuesday", "last weekday", "day 15", yearly by month/day |
-| CAL-14 | Send meeting invitations (organizer) | Attendees saved to CalDAV only; `build_imip_vcalendar(Request/Cancel)` is never called from the app | 🟡 | iMIP REQUEST on save, update on change, CANCEL on delete, unless the server does RFC 6638 implicit scheduling |
+| CAL-14 | Send meeting invitations (organizer) | Saving an event with attendees sends iMIP REQUEST (client-side, or defers to a server advertising RFC 6638 `schedule-outbox-URL`); edits prompt "Send update" and bump `SEQUENCE`; deletes prompt a CANCEL, `RECURRENCE-ID`-anchored for a series instance; the editor's footer reads Send / Send update (3.4) | ✅ | — |
 | CAL-15 | RSVP | `respond_to_imip_invitation` (Accept/Maybe/Decline) | 🟡 | "Edit response before sending", "Don't send a response", comment |
 | CAL-16 | Response tracking | `AttendeeStatus` parsed, never shown; incoming REPLY only dismisses banner | ❌ | Apply REPLY to the stored event; tracking list with counts |
 | CAL-17 | Propose new time | — | ❌ | §4.3 COUNTER |
@@ -524,7 +524,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 | UX-56 | Event peek | **Single-click an event → peek card** (title, time, recurrence, location, Join button, organizer, RSVP buttons for invites, Edit, Delete, ⋯). Double-click → full form | Click opens the full editor (`open_event_editor_for` from `connect_event_activated`) | Peek popover on click; editor on double-click / Edit | M |
 | UX-57 | Event chips | Calendar-colour fill with a darker **left stripe**; title, location; icons for recurring ↻, private 🔒, online meeting, reminder; **show-as styling**: tentative = hatched, free = outline only, OOF = purple, working elsewhere = dotted | Coloured chips at 92% opacity; the show-as styling landed with 3.3 (CAL-05): free hollow, tentative hatched, away purple-tinted, working elsewhere dotted | Left stripe and the icon set (Track U.7) | S |
 | UX-58 | Month view overflow | "+N more" opens a day popover listing everything | "+N more" label, no popover (`calendar_view.rs` comment ~439) | Day popover | S |
-| UX-59 | Event form | Title · Attendees (Required / Optional; "Response options" ▾) · date/time row with All day, **time zone**, **Repeat** · Location (room suggestions) · **Teams meeting** toggle · Reminder ▾ · Show as ▾ · Categorize ▾ · Private · **Scheduling assistant** · **rich-text** description · footer button reads **Save** with no attendees and **Send** with attendees | Editor has most fields and now the date/time row's **time zone** picker (CAL-11, 3.2); plain-text Notes; no scheduling assistant or Send/Save switch (CAL-19) | Field order per Outlook; Save ↔ Send label; rich-text notes (reuse the composer's WebKit editor); Scheduling assistant tab (3.8) | M |
+| UX-59 | Event form | Title · Attendees (Required / Optional; "Response options" ▾) · date/time row with All day, **time zone**, **Repeat** · Location (room suggestions) · **Teams meeting** toggle · Reminder ▾ · Show as ▾ · Categorize ▾ · Private · **Scheduling assistant** · **rich-text** description · footer button reads **Save** with no attendees and **Send** with attendees | Editor has most fields, the date/time row's **time zone** picker (CAL-11, 3.2) and the Save/Send footer switch (3.4); plain-text Notes; no scheduling assistant (CAL-19) | Field order per Outlook; rich-text notes (reuse the composer's WebKit editor); Scheduling assistant tab (3.8) | M |
 | UX-60 | Invitation card in mail | Accept ▾ / Tentative ▾ / Decline ▾ (each: *Edit response before sending* / *Send response now* / *Don't send a response*), **Propose new time ▾**, and a **mini day timeline** showing the slot against your other events with conflicts highlighted | Accept / Maybe / Decline card ✅ (`render_invite_card`) | Split buttons (CAL-15), Propose new time (CAL-17), mini timeline with conflict highlight (CAL-35). Rename "Maybe" to "Tentative" | M |
 | UX-61 | Reminders window | Separate always-on-top window: list of due items, "Dismiss all", Snooze ▾ duration, Join (online meetings), Open | Desktop notifications only | 3.9 (CAL-12) | M |
 
@@ -652,7 +652,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 3.1 | ✅ ~~Apply calendar preferences~~ | CAL-08, CAL-09, CAL-10 | 0.6 everywhere: grid start day, business-hours band, work-week days, second TZ gutter | M |
 | 3.2 | ✅ ~~Per-event time zone~~ | CAL-11 | TZ dropdown in `event_editor.rs`; `build_vevent` emits `TZID` plus `VTIMEZONE` (IANA); keep reading Windows names | M |
 | 3.3 | ✅ ~~Full show-as~~ | CAL-05 | Dropdown Free/Working elsewhere/Tentative/Busy/Away; §4.3 CDO properties; hatched/striped rendering per state as Outlook does | S |
-| 3.4 | Organizer invitations | CAL-14 | Detect RFC 6638 server scheduling (`schedule-outbox-URL`, `SCHEDULE-AGENT`); else on save send iMIP REQUEST to attendees (`build_imip_vcalendar` plus `SendMessage`); "Send update" on change (`SEQUENCE++`); CANCEL on delete; "Send / Don't send" prompt as Outlook does | L |
+| 3.4 | ✅ ~~Organizer invitations~~ | CAL-14 | Detect RFC 6638 server scheduling (`schedule-outbox-URL`, `SCHEDULE-AGENT`); else on save send iMIP REQUEST to attendees (`build_imip_vcalendar` plus `SendMessage`); "Send update" on change (`SEQUENCE++`); CANCEL on delete; "Send / Don't send" prompt as Outlook does | L |
 | 3.5 | RSVP options | CAL-15 | Split buttons: "Send response now / Edit response / Don't send"; comment field; `respond_to_imip_invitation` gains params | S |
 | 3.6 | Response tracking | CAL-16 | Apply incoming REPLY `PARTSTAT` to the stored event (organizer copy) and PUT; "Tracking" tab in the editor with per-attendee status and counts | M |
 | 3.7 | Propose new time / forward | CAL-17, CAL-18 | COUNTER and DECLINECOUNTER builders plus organizer accept-proposal flow; forward = REQUEST to new attendee plus notify organizer; honour `X-MICROSOFT-DISALLOW-COUNTER` | M |

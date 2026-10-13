@@ -427,8 +427,18 @@ pub fn show_event_editor(
     // the same `set_sensitive(false)` convention the main calendar toolbar
     // already uses for controls with no backend behind them yet.
     let cancel_button = gtk::Button::with_label("Cancel");
-    let save_button = gtk::Button::with_label(if has_existing { "Save" } else { "Add" });
+    let save_button = gtk::Button::with_label(save_button_label(has_existing, !attendees_field.addresses().is_empty()));
     save_button.add_css_class("suggested-action");
+    // UX-59: the footer verb follows the form - an appointment saves, a
+    // meeting with attendees sends (Outlook's own switch). Kept in step live
+    // through the attendees field's change callback.
+    {
+        let save_button = save_button.clone();
+        let label_field = attendees_field.clone();
+        attendees_field.connect_addresses_changed(move || {
+            save_button.set_label(save_button_label(has_existing, !label_field.addresses().is_empty()));
+        });
+    }
 
     let series = recurrence::build_series_control(existing.as_ref().and_then(|occ| occ.rrule.as_deref()), prefill.calendar_prefs.week_start);
     series.button.set_tooltip_text(Some("Series"));
@@ -899,8 +909,10 @@ fn synthetic_occurrence(calendar_id: CalendarId, title: &str, start: DateTime<Ut
         etag: None,
         master_href: None,
         master_etag: None,
+        sequence: 0,
         attendees: Vec::new(),
         organizer: None,
+        schedule_agent: None,
         categories: Vec::new(),
         sensitivity: EventSensitivity::default(),
         show_as: BusyStatus::default(),
@@ -916,6 +928,18 @@ fn synthetic_occurrence(calendar_id: CalendarId, title: &str, start: DateTime<Ut
 fn initial_reminder_index(existing: Option<Option<i64>>, default: Option<i64>) -> usize {
     let wanted = existing.unwrap_or(default);
     crate::settings::REMINDER_CHOICES.iter().position(|(_, minutes)| *minutes == wanted).unwrap_or(0)
+}
+
+/// The event form's footer action label (UX-59): an appointment saves, while
+/// an event with attendees sends its invitations - "Send update" when the
+/// event already exists. Pure so the switch is unit-tested without GTK.
+fn save_button_label(has_existing: bool, has_attendees: bool) -> &'static str {
+    match (has_existing, has_attendees) {
+        (_, false) if has_existing => "Save",
+        (_, false) => "Add",
+        (false, true) => "Send",
+        (true, true) => "Send update",
+    }
 }
 
 /// The default span for a fresh event: from the next whole hour to an hour
@@ -1255,8 +1279,10 @@ pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveD
         rdates: Vec::new(),
         href: occ.href.clone(),
         etag: occ.etag.clone(),
+        sequence: occ.sequence,
         attendees: occ.attendees.clone(),
         organizer: occ.organizer.clone(),
+        schedule_agent: occ.schedule_agent,
         categories: occ.categories.clone(),
         sensitivity: occ.sensitivity,
         show_as: occ.show_as,
@@ -1324,8 +1350,13 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         rdates: Vec::new(),
         href,
         etag,
+        // The composition wrapper (`calendar_invites::save_event_with_invites`)
+        // stamps both from the previous occurrence: an edit bumps SEQUENCE
+        // and keeps any SCHEDULE-AGENT override another client stored.
+        sequence: 0,
         attendees,
         organizer,
+        schedule_agent: None,
         categories: input.categories,
         sensitivity: input.sensitivity,
         show_as: input.show_as,
@@ -1437,8 +1468,10 @@ mod tests {
             etag: None,
             master_href: None,
             master_etag: None,
+            sequence: 0,
             attendees: Vec::new(),
             organizer: None,
+            schedule_agent: None,
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
             show_as: BusyStatus::default(),
@@ -1527,6 +1560,15 @@ mod tests {
         assert!(event.organizer.is_none());
     }
 
+    /// UX-59: the footer verb tracks whether the event has attendees.
+    #[test]
+    fn footer_action_label_follows_the_attendee_list() {
+        assert_eq!(save_button_label(false, false), "Add", "a new appointment adds");
+        assert_eq!(save_button_label(true, false), "Save", "an existing appointment saves");
+        assert_eq!(save_button_label(false, true), "Send", "a new meeting sends its invitation");
+        assert_eq!(save_button_label(true, true), "Send update", "an edited meeting sends an update");
+    }
+
     #[test]
     fn omits_conference_url_when_toggle_off_even_if_url_field_has_text() {
         let mut input = base_input();
@@ -1567,12 +1609,14 @@ mod tests {
             etag: Some("\"abc\"".to_string()),
             master_href: None,
             master_etag: None,
+            sequence: 0,
             attendees: vec![Attendee {
                 address: EmailAddress::new("alice@example.com"),
                 role: AttendeeRole::Required,
                 status: AttendeeStatus::Accepted,
             }],
             organizer: Some(EmailAddress::new("me@example.com")),
+            schedule_agent: None,
             categories: vec!["team".to_string()],
             sensitivity: EventSensitivity::Private,
             show_as: BusyStatus::Free,
@@ -1669,8 +1713,10 @@ mod tests {
             etag: None,
             master_href: None,
             master_etag: None,
+            sequence: 0,
             attendees: Vec::new(),
             organizer: None,
+            schedule_agent: None,
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
             show_as: BusyStatus::default(),
@@ -1711,8 +1757,10 @@ mod tests {
             etag: Some("\"m1\"".to_string()),
             master_href: None,
             master_etag: None,
+            sequence: 0,
             attendees: Vec::new(),
             organizer: None,
+            schedule_agent: None,
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
             show_as: BusyStatus::default(),

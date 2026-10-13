@@ -141,6 +141,67 @@ pub struct ContactRecord {
     pub card: VCard,
 }
 
+/// Principal-scoped discovery results: the calendar home collection
+/// (RFC 4791 §6.2.1) plus the RFC 6638 scheduling URLs when the server
+/// advertises them. `home_set_href` always falls back to the configured base
+/// URL so callers never have to handle "no principal".
+#[derive(Debug, Clone)]
+pub struct CalendarDiscovery {
+    pub home_set_href: String,
+    /// `CALDAV:schedule-outbox-URL` from the principal, when supported.
+    pub schedule_outbox_href: Option<String>,
+    /// `CALDAV:schedule-inbox-URL` from the principal, when supported.
+    pub schedule_inbox_href: Option<String>,
+}
+
+impl DavClient {
+    /// RFC 4791 discovery: PROPFIND `base_url` for `current-user-principal`,
+    /// then PROPFIND that principal URL for `calendar-home-set` plus the
+    /// RFC 6638 scheduling URLs. Falls back to treating `base_url` itself as
+    /// the home-set if a server skips `current-user-principal` (logged, not a
+    /// hard error - some minimal CalDAV servers do this), in which case
+    /// scheduling is treated as unsupported (client-side iMIP remains).
+    pub async fn discover_calendar(&self, credential: &Credential) -> Result<CalendarDiscovery> {
+        let principal = self
+            .propfind(self.base_url.clone(), 0, credential, &["D:current-user-principal"])
+            .await?
+            .into_iter()
+            .find_map(|r| r.prop(NS_DAV, "current-user-principal").map(str::to_string));
+
+        let Some(principal_href) = principal else {
+            tracing::warn!("server didn't answer current-user-principal; treating the configured URL as the calendar-home-set directly");
+            return Ok(CalendarDiscovery {
+                home_set_href: self.base_url.to_string(),
+                schedule_outbox_href: None,
+                schedule_inbox_href: None,
+            });
+        };
+        let principal_url = self.resolve(&principal_href)?;
+
+        let responses = self
+            .propfind(principal_url, 0, credential, &["C:calendar-home-set", "C:schedule-outbox-URL", "C:schedule-inbox-URL"])
+            .await?;
+        let home_set = responses.iter().find_map(|r| r.prop(NS_CALDAV, "calendar-home-set").map(str::to_string));
+        let schedule_outbox_href = responses.iter().find_map(|r| r.prop(NS_CALDAV, "schedule-outbox-URL").map(str::to_string));
+        let schedule_inbox_href = responses.iter().find_map(|r| r.prop(NS_CALDAV, "schedule-inbox-URL").map(str::to_string));
+        if schedule_outbox_href.is_some() {
+            tracing::debug!("server advertises RFC 6638 scheduling (schedule-outbox-URL); client-side iMIP will stand down");
+        }
+
+        Ok(CalendarDiscovery {
+            home_set_href: match home_set {
+                Some(href) => href,
+                None => {
+                    tracing::warn!("server didn't answer calendar-home-set; treating the configured URL as the calendar-home-set directly");
+                    self.base_url.to_string()
+                }
+            },
+            schedule_outbox_href,
+            schedule_inbox_href,
+        })
+    }
+}
+
 impl DavClient {
     pub async fn discover_addressbook_home(&self, credential: &Credential) -> Result<String> {
         let principal = self
@@ -699,7 +760,7 @@ mod tests {
         let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
         let credential = Credential::OAuth2AccessToken("stale-token".to_string());
 
-        let err = client.discover_calendar_home(&credential).await.unwrap_err();
+        let err = client.discover_calendar(&credential).await.unwrap_err();
         assert!(matches!(err, Error::Unauthorized(_)), "expected Unauthorized, got {err:?}");
     }
 
@@ -716,7 +777,7 @@ mod tests {
         let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
         let credential = Credential::Password("secret".to_string());
 
-        let err = client.discover_calendar_home(&credential).await.unwrap_err();
+        let err = client.discover_calendar(&credential).await.unwrap_err();
         assert!(matches!(err, Error::Discovery(_)), "expected Discovery, got {err:?}");
     }
 
@@ -843,11 +904,13 @@ mod tests {
         let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
         let credential = Credential::Password("secret".to_string());
 
-        let home_href = client.discover_calendar_home(&credential).await.unwrap();
-        assert_eq!(home_href, "/calendars/alice/home/");
+        let discovery = client.discover_calendar(&credential).await.unwrap();
+        assert_eq!(discovery.home_set_href, "/calendars/alice/home/");
+        assert_eq!(discovery.schedule_outbox_href, None, "a principal without RFC 6638 URLs must report none");
+        assert_eq!(discovery.schedule_inbox_href, None);
 
         let account_id = AccountId("test-account".to_string());
-        let calendars = client.list_calendars(&home_href, &account_id, &credential).await.unwrap();
+        let calendars = client.list_calendars(&discovery.home_set_href, &account_id, &credential).await.unwrap();
         assert_eq!(calendars.len(), 3, "the home collection itself must not be mistaken for a calendar");
         assert_eq!(calendars[0].display_name, "Personal");
         assert_eq!(calendars[0].href, "/calendars/alice/home/personal/");
@@ -870,6 +933,58 @@ mod tests {
         // event - the write path needs both to PUT/DELETE it back.
         assert_eq!(events[0].href.as_deref(), Some("/calendars/alice/home/personal/event1.ics"));
         assert_eq!(events[0].etag.as_deref(), Some("\"abc123\""));
+    }
+
+    #[tokio::test]
+    async fn discovers_scheduling_urls_when_the_principal_advertises_them() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PROPFIND"))
+            .and(path("/dav/"))
+            .respond_with(ResponseTemplate::new(207).insert_header("Content-Type", "application/xml").set_body_string(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/dav/</D:href>
+    <D:propstat>
+      <D:prop><D:current-user-principal><D:href>/principals/alice/</D:href></D:current-user-principal></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PROPFIND"))
+            .and(path("/principals/alice/"))
+            .respond_with(ResponseTemplate::new(207).insert_header("Content-Type", "application/xml").set_body_string(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/principals/alice/</D:href>
+    <D:propstat>
+      <D:status>HTTP/1.1 200 OK</D:status>
+      <D:prop>
+        <C:calendar-home-set><D:href>/calendars/alice/home/</D:href></C:calendar-home-set>
+        <C:schedule-outbox-URL><D:href>/calendars/alice/outbox/</D:href></C:schedule-outbox-URL>
+        <C:schedule-inbox-URL><D:href>/calendars/alice/inbox/</D:href></C:schedule-inbox-URL>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        let discovery = client.discover_calendar(&credential).await.unwrap();
+        assert_eq!(discovery.home_set_href, "/calendars/alice/home/");
+        assert_eq!(discovery.schedule_outbox_href.as_deref(), Some("/calendars/alice/outbox/"));
+        assert_eq!(discovery.schedule_inbox_href.as_deref(), Some("/calendars/alice/inbox/"));
     }
 
     #[tokio::test]

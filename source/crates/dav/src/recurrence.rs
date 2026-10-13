@@ -82,6 +82,11 @@ where
             occ.master_end = Some(master.end);
             occ.master_href = master.href.clone();
             occ.master_etag = master.etag.clone();
+            // The revision number and scheduling override belong to the
+            // series, not the override VEVENT, so an organizer save routed
+            // through any occurrence bumps the master's SEQUENCE.
+            occ.sequence = master.sequence;
+            occ.schedule_agent = master.schedule_agent;
             // The master's EXDATEs (which govern the whole series) ride along
             // too - the override's own exclusions are empty in practice, and
             // the master's must survive a whole-series save from this
@@ -136,8 +141,10 @@ fn expand_set(set: RRuleSet, event: &CalendarEvent, window_start: DateTime<Utc>,
                 etag: event.etag.clone(),
                 master_href: None,
                 master_etag: None,
+                sequence: event.sequence,
                 attendees: event.attendees.clone(),
                 organizer: event.organizer.clone(),
+                schedule_agent: event.schedule_agent,
                 categories: event.categories.clone(),
                 sensitivity: event.sensitivity,
                 show_as: event.show_as,
@@ -196,8 +203,10 @@ fn single_occurrence_if_overlapping(event: &CalendarEvent, window_start: DateTim
             etag: event.etag.clone(),
             master_href: None,
             master_etag: None,
+            sequence: event.sequence,
             attendees: event.attendees.clone(),
             organizer: event.organizer.clone(),
+            schedule_agent: event.schedule_agent,
             categories: event.categories.clone(),
             sensitivity: event.sensitivity,
             show_as: event.show_as,
@@ -232,8 +241,10 @@ mod tests {
             rdates: Vec::new(),
             href: None,
             etag: None,
+            sequence: 0,
             attendees: Vec::new(),
             organizer: None,
+            schedule_agent: None,
             categories: Vec::new(),
             sensitivity: lookout_core::EventSensitivity::default(),
             show_as: lookout_core::BusyStatus::default(),

@@ -17,8 +17,8 @@ pub mod trust;
 pub mod vcard;
 
 pub use calendar::{
-    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, CalendarTask, EventOccurrence, EventSensitivity, EventTransparency, RecurrenceRange, TaskPriority,
-    TaskStatus, WebcalSubscription,
+    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, CalendarTask, EventOccurrence, EventSensitivity, EventTransparency, RecurrenceRange, ScheduleAgent,
+    SchedulingInfo, TaskPriority, TaskStatus, WebcalSubscription,
 };
 pub use email::{
     cid_matches, header_value, is_auto_submitted, is_report_message, parse_disposition_notification_to, parse_imip_method, parse_list_unsubscribe, sanitize_tag_key,

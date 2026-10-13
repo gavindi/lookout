@@ -8,6 +8,7 @@ mod assistant_tools;
 mod background;
 mod background_image;
 mod calendar_colors;
+mod calendar_invites;
 mod calendar_tz;
 mod calendar_view;
 mod chat_links;

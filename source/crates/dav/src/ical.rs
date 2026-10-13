@@ -7,7 +7,7 @@ use icalendar::{
 use lookout_core::interop::cdo;
 use lookout_core::{
     Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventUid, ImipInvitation, ImipMethod,
-    RecurrenceRange, TaskPriority, TaskStatus, TaskUid,
+    RecurrenceRange, ScheduleAgent, TaskPriority, TaskStatus, TaskUid,
 };
 
 /// Parses every VEVENT out of a raw iCalendar document (as returned by a
@@ -100,8 +100,10 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         // [`parse_vevents_with_meta`].
         href: None,
         etag: None,
+        sequence: parse_sequence(event),
         attendees: parse_attendees(event),
         organizer: parse_organizer(event),
+        schedule_agent: parse_schedule_agent(event),
         categories: parse_categories(event),
         sensitivity: event.get_class().map(from_ical_class).unwrap_or_default(),
         show_as: parse_show_as(event),
@@ -192,6 +194,35 @@ fn parse_attendees(event: &icalendar::Event) -> Vec<Attendee> {
 /// parsed organizer only ever carries a bare address.
 fn parse_organizer(event: &icalendar::Event) -> Option<EmailAddress> {
     event.property_value("ORGANIZER").map(|v| EmailAddress::new(strip_mailto(v).to_string()))
+}
+
+/// RFC 5545 `SEQUENCE` (default 0; a negative or malformed value is treated
+/// as the default rather than trusted). Outlook's own
+/// `X-MICROSOFT-CDO-APPT-SEQUENCE` mirror is used as a fallback when the
+/// standard property is absent.
+fn parse_sequence(event: &icalendar::Event) -> i64 {
+    event
+        .property_value("SEQUENCE")
+        .or_else(|| event.property_value(cdo::X_MICROSOFT_CDO_APPT_SEQUENCE))
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(0)
+}
+
+/// RFC 6638 `SCHEDULE-AGENT` on the `ORGANIZER` property (see
+/// [`ScheduleAgent`]). Read from the raw property because `icalendar` has no
+/// typed accessor for it; unknown values are treated as absent.
+fn parse_schedule_agent(event: &icalendar::Event) -> Option<ScheduleAgent> {
+    let value = property_refs(event, "ORGANIZER")
+        .first()
+        .and_then(|p| p.params().get("SCHEDULE-AGENT"))
+        .map(|p| p.value().to_ascii_uppercase());
+    match value.as_deref() {
+        Some("SERVER") => Some(ScheduleAgent::Server),
+        Some("CLIENT") => Some(ScheduleAgent::Client),
+        Some("NONE") => Some(ScheduleAgent::None),
+        _ => None,
+    }
 }
 
 /// `CATEGORIES` is one of `icalendar`'s hard-coded multi-value properties
@@ -414,20 +445,20 @@ pub fn build_vcalendar(event: &CalendarEvent) -> String {
 /// rather than a parameter on the shared builder.
 pub fn build_imip_vcalendar(event: &CalendarEvent, method: ImipMethod) -> String {
     let mut calendar = icalendar::Calendar::new();
-    let method = match method {
+    let method_name = match method {
         ImipMethod::Request => "REQUEST",
         ImipMethod::Reply => "REPLY",
         ImipMethod::Cancel => "CANCEL",
     };
-    calendar.append_property(icalendar::Property::new("METHOD", method));
-    let mut vevent = build_vevent(event);
+    calendar.append_property(icalendar::Property::new("METHOD", method_name));
+    let mut vevent = build_vevent_form(event, Some(method));
     // Outlook's iMIP form states show-as explicitly in both forms (§4.3): the
     // five-state CDO property and the binary TRANSP (`TRANSPARENT` is already
     // there for Free), plus the intended status on an organizer's REQUEST.
     if vevent.property_value(cdo::X_MICROSOFT_CDO_BUSYSTATUS).is_none() {
         vevent.append_property(Property::new(cdo::X_MICROSOFT_CDO_BUSYSTATUS, event.show_as.as_cdo()));
     }
-    if method == "REQUEST" {
+    if method == ImipMethod::Request {
         vevent.append_property(Property::new(cdo::X_MICROSOFT_CDO_INTENDEDSTATUS, event.show_as.as_cdo()));
     }
     if vevent.property_value("TRANSP").is_none() {
@@ -613,6 +644,17 @@ pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
 }
 
 fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
+    build_vevent_form(event, None)
+}
+
+/// The shared VEVENT serializer. `form` selects the iTIP refinements Outlook
+/// adds to the email form of a document (RFC 6638 §4 / RFC 5546): a REQUEST
+/// asks every attendee for a response (`RSVP=TRUE`), a CANCEL marks the
+/// VEVENT cancelled, and both carry the current `SEQUENCE` even when it is
+/// zero - a CalDAV PUT body (form `None`) omits `SEQUENCE` while it is 0 and
+/// never carries `STATUS`, since the stored object describes the meeting, not
+/// a delivery verb.
+fn build_vevent_form(event: &CalendarEvent, form: Option<ImipMethod>) -> icalendar::Event {
     let mut vevent = icalendar::Event::new();
     let zone = write_zone(event);
 
@@ -673,7 +715,7 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     for rdate in &event.rdates {
         vevent.append_multi_property(recurrence_property("RDATE", *rdate, event.all_day, zone).done());
     }
-    append_attendees(&mut vevent, &event.attendees);
+    append_attendees(&mut vevent, &event.attendees, form == Some(ImipMethod::Request));
     // RFC 5545 §3.6.1 requires an ORGANIZER whenever ATTENDEEs are present;
     // omitted otherwise, and omitted even with attendees if the owning
     // account's own address couldn't be determined (see `CalendarEvent::organizer`).
@@ -682,6 +724,17 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
             let mut prop = Property::new("ORGANIZER", format!("mailto:{}", organizer.address));
             if let Some(name) = &organizer.name {
                 prop.add_parameter("CN", name);
+            }
+            // RFC 6638 §7.1: the per-event override of who delivers
+            // invitations, round-tripped verbatim so a CLIENT override a
+            // scheduling client stored survives an update here.
+            if let Some(agent) = event.schedule_agent {
+                let value = match agent {
+                    ScheduleAgent::Server => "SERVER",
+                    ScheduleAgent::Client => "CLIENT",
+                    ScheduleAgent::None => "NONE",
+                };
+                prop.add_parameter("SCHEDULE-AGENT", value);
             }
             vevent.append_property(prop.done());
         }
@@ -712,6 +765,20 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     if let Some(minutes) = event.reminder_minutes_before {
         vevent.alarm(Alarm::display("Reminder", Trigger::before_start(Duration::minutes(minutes))));
     }
+    // RFC 5545 §3.8.1.4 `SEQUENCE`: written on the stored object only once it
+    // is meaningful (non-zero), but always on the iMIP form - Outlook writes
+    // it even at 0, and a CANCEL needs it to be ordered after the REQUEST it
+    // withdraws. The `X-MICROSOFT-CDO-APPT-SEQUENCE` mirror is Outlook's own
+    // property (§4.3; the fixture corpus carries it).
+    if form.is_some() || event.sequence > 0 {
+        vevent.append_property(Property::new("SEQUENCE", event.sequence.to_string()));
+    }
+    if form.is_some() {
+        vevent.append_property(Property::new(cdo::X_MICROSOFT_CDO_APPT_SEQUENCE, event.sequence.to_string()));
+    }
+    if form == Some(ImipMethod::Cancel) {
+        vevent.append_property(Property::new("STATUS", "CANCELLED"));
+    }
 
     vevent
 }
@@ -738,7 +805,7 @@ fn recurrence_property(key: &str, dt: DateTime<Utc>, all_day: bool, zone: Option
     prop
 }
 
-fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee]) {
+fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee], rsvp: bool) {
     for attendee in attendees {
         let mut ical_attendee = IcalAttendee::new(format!("mailto:{}", attendee.address.address))
             .role(match attendee.role {
@@ -753,6 +820,10 @@ fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee]) {
             });
         if let Some(name) = &attendee.address.name {
             ical_attendee = ical_attendee.cn(name.clone());
+        }
+        // RFC 5546 §3.2.3: an organizer's REQUEST asks for a response.
+        if rsvp {
+            ical_attendee = ical_attendee.rsvp(true);
         }
         vevent.attendee(ical_attendee);
     }
@@ -946,8 +1017,10 @@ mod tests {
             rdates: Vec::new(),
             href: None,
             etag: None,
+            sequence: 0,
             attendees: Vec::new(),
             organizer: None,
+            schedule_agent: None,
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
             show_as: BusyStatus::default(),
@@ -1239,6 +1312,101 @@ mod tests {
             assert_eq!(events[0].uid.0, event.uid.0);
             assert_eq!(events[0].start, event.start);
         }
+    }
+
+    /// RFC 5545 §3.8.1.4: the stored CalDAV body only carries `SEQUENCE`
+    /// once it is non-zero, while a round trip preserves it exactly - and
+    /// Outlook's `X-MICROSOFT-CDO-APPT-SEQUENCE` mirror is honoured as a
+    /// fallback when the standard property is absent.
+    #[test]
+    fn build_vcalendar_round_trips_sequence() {
+        let mut event = full_event();
+        let ics = build_vcalendar(&event);
+        assert!(!ics.contains("SEQUENCE"), "a zero sequence shouldn't add a line: {ics}");
+        assert_eq!(parse_vevents(&cal_id(), &ics)[0].sequence, 0);
+
+        event.sequence = 3;
+        let ics = build_vcalendar(&event);
+        assert!(ics.contains("SEQUENCE:3"), "a non-zero sequence must round-trip: {ics}");
+        assert_eq!(parse_vevents(&cal_id(), &ics)[0].sequence, 3);
+
+        let cdo_only = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:evt-2@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nX-MICROSOFT-CDO-APPT-SEQUENCE:4\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_vevents(&cal_id(), cdo_only)[0].sequence, 4, "Outlook's CDO mirror is the fallback");
+    }
+
+    /// The iMIP forms Outlook puts in email: REQUEST carries the revision and
+    /// asks every attendee for a response; CANCEL withdraws the meeting with
+    /// `STATUS:CANCELLED`; the stored PUT body carries neither `STATUS` nor
+    /// `METHOD` - and the CDO sequence mirror rides along on both.
+    #[test]
+    fn imip_forms_carry_sequence_rsvp_and_cancelled_status() {
+        let mut event = full_event();
+        event.sequence = 2;
+        event.attendees = vec![
+            Attendee {
+                address: EmailAddress::new("alice@example.com"),
+                role: AttendeeRole::Required,
+                status: AttendeeStatus::NeedsAction,
+            },
+            Attendee {
+                address: EmailAddress::new("bob@example.com"),
+                role: AttendeeRole::Optional,
+                status: AttendeeStatus::Accepted,
+            },
+        ];
+        event.organizer = Some(EmailAddress::new("organizer@example.com"));
+
+        let request = build_imip_vcalendar(&event, ImipMethod::Request);
+        assert!(request.contains("SEQUENCE:2"), "REQUEST must carry the revision: {request}");
+        assert!(request.contains("X-MICROSOFT-CDO-APPT-SEQUENCE:2"), "REQUEST must carry Outlook's mirror: {request}");
+        assert_eq!(request.matches("RSVP=TRUE").count(), 2, "every attendee of a REQUEST is asked to respond: {request}");
+        assert!(!request.contains("STATUS:CANCELLED"));
+
+        let cancel = build_imip_vcalendar(&event, ImipMethod::Cancel);
+        assert!(cancel.contains("STATUS:CANCELLED"), "CANCEL withdraws the meeting: {cancel}");
+        assert!(cancel.contains("SEQUENCE:2"), "CANCEL must carry the revision: {cancel}");
+        assert!(!cancel.contains("RSVP=TRUE"), "a withdrawal doesn't ask for a response: {cancel}");
+
+        let reply = build_imip_vcalendar(&event, ImipMethod::Reply);
+        assert!(!reply.contains("RSVP=TRUE"));
+        assert!(!reply.contains("STATUS:CANCELLED"));
+
+        let stored = build_vcalendar(&event);
+        assert!(!stored.contains("METHOD") && !stored.contains("STATUS"), "the CalDAV body isn't an iTIP delivery: {stored}");
+
+        assert_eq!(parse_vevents(&cal_id(), &request)[0].sequence, 2);
+        assert_eq!(parse_vevents(&cal_id(), &cancel)[0].sequence, 2);
+    }
+
+    /// RFC 6638 §7.1: `SCHEDULE-AGENT` on `ORGANIZER` round-trips, so a
+    /// `CLIENT` override another scheduling client stored isn't erased by
+    /// this app's next PUT. An absent parameter stays absent.
+    #[test]
+    fn organizer_schedule_agent_round_trips() {
+        let attendee = Attendee {
+            address: EmailAddress::new("alice@example.com"),
+            role: AttendeeRole::Required,
+            status: AttendeeStatus::NeedsAction,
+        };
+        let with_agent = |agent: Option<ScheduleAgent>| {
+            let mut event = full_event();
+            event.attendees = vec![attendee.clone()];
+            event.organizer = Some(EmailAddress::new("organizer@example.com"));
+            event.schedule_agent = agent;
+            event
+        };
+
+        let client = build_vcalendar(&with_agent(Some(ScheduleAgent::Client)));
+        assert!(client.contains("SCHEDULE-AGENT=CLIENT"), "the CLIENT override must be written: {client}");
+        assert_eq!(parse_vevents(&cal_id(), &client)[0].schedule_agent, Some(ScheduleAgent::Client));
+
+        let server = build_vcalendar(&with_agent(Some(ScheduleAgent::Server)));
+        assert!(server.contains("SCHEDULE-AGENT=SERVER"), "SERVER must round-trip: {server}");
+        assert_eq!(parse_vevents(&cal_id(), &server)[0].schedule_agent, Some(ScheduleAgent::Server));
+
+        let absent = build_vcalendar(&with_agent(None));
+        assert!(!absent.contains("SCHEDULE-AGENT"), "an absent parameter must stay absent: {absent}");
+        assert_eq!(parse_vevents(&cal_id(), &absent)[0].schedule_agent, None);
     }
 
     #[test]

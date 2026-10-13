@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.178" date="2026-10-13">
+      <description>
+        <p>Meetings now invite their attendees. When you save an event with people on it, Lookout sends the invitation for you, and editing it offers to send an update first; deleting a meeting offers to send a cancellation. Invitations use the same format Outlook does, so Accept, Tentative and Decline work in the recipient's mail app. On calendar servers that send invitations themselves, Lookout stays out of the way and lets the server do it. The event editor's Save button reads Send when the event has attendees, so it is clear when mail is about to go out.</p>
+      </description>
+    </release>
     <release version="0.9.177" date="2026-10-13">
       <description>
         <p>Events can now carry their own time zone. The event editor's date and time row gains a searchable Time zone picker: an edit opens in the event's own zone, a new event starts in the zone your calendar is shown in, and invitations from other apps that name a time zone (Thunderbird, Google Calendar) keep it. Lookout writes the zone into the event together with the rules other calendar apps need, and recurring events keep their local time across daylight-saving changes instead of drifting an hour.</p>
