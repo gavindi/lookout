@@ -183,6 +183,25 @@ fn vcard_primary_email(card: &VCard) -> String {
     card.emails.first().map(|email| email.address.clone()).unwrap_or_else(|| "No email address".to_string())
 }
 
+/// The contact's `PHOTO` as a decoded texture, when it carries embedded bytes
+/// the image loader can decode. A URI-only photo yields `None` (remote images
+/// aren't fetched here), as does a decode failure - the caller falls back to
+/// coloured initials.
+fn contact_photo_texture(photo: &lookout_core::Photo) -> Option<gtk::gdk::Texture> {
+    let data = photo.data.clone()?;
+    gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(data)).ok()
+}
+
+/// Renders a birthday/anniversary for the details dialog: the yearless form
+/// (`MM-DD`) when the year is omitted, else the full ISO date.
+fn format_contact_date(value: lookout_core::Birthday) -> String {
+    if value.omit_year {
+        value.date.format("%m-%d").to_string()
+    } else {
+        value.date.format("%Y-%m-%d").to_string()
+    }
+}
+
 fn vcard_details_text(account_label: &str, category_label: &str, card: &VCard) -> String {
     let mut lines = vec![
         format!("Account: {account_label}"),
@@ -230,6 +249,32 @@ fn vcard_details_text(account_label: &str, category_label: &str, card: &VCard) -
         }
     }
 
+    if !card.urls.is_empty() {
+        lines.push("Websites:".to_string());
+        for url in &card.urls {
+            lines.push(format!("  - {url}"));
+        }
+    }
+
+    if !card.impp.is_empty() {
+        lines.push("Instant messaging:".to_string());
+        for impp in &card.impp {
+            let types = if impp.types.is_empty() {
+                "".to_string()
+            } else {
+                format!(" ({})", impp.types.join(", "))
+            };
+            lines.push(format!("  - {}{}", impp.uri, types));
+        }
+    }
+
+    if let Some(birthday) = card.birthday {
+        lines.push(format!("Birthday: {}", format_contact_date(birthday)));
+    }
+    if let Some(anniversary) = card.anniversary {
+        lines.push(format!("Anniversary: {}", format_contact_date(anniversary)));
+    }
+
     if let Some(org) = &card.organization {
         let value = org.iter().map(|part| part.trim()).filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" / ");
         if !value.is_empty() {
@@ -239,6 +284,12 @@ fn vcard_details_text(account_label: &str, category_label: &str, card: &VCard) -
     if let Some(title) = &card.title {
         if !title.trim().is_empty() {
             lines.push(format!("Title: {}", title.trim()));
+        }
+    }
+    // Custom/unknown properties are shown read-only, last.
+    for property in &card.other {
+        if !property.value.trim().is_empty() {
+            lines.push(format!("{}: {}", property.name, property.value.trim()));
         }
     }
     if let Some(note) = &card.note {
@@ -608,8 +659,10 @@ pub fn show_create_contact_for(
         telephones: Vec::new(),
         addresses: Vec::new(),
         urls: Vec::new(),
+        impp: Vec::new(),
         note: None,
         birthday: None,
+        anniversary: None,
         categories: Vec::new(),
         other: Vec::new(),
     };
@@ -1387,15 +1440,27 @@ pub fn rebuild_contacts_list_ui(
 
         let display_name = vcard_display_name(&entry.card);
         let primary_email = vcard_primary_email(&entry.card);
-        let avatar = gtk::Label::builder()
+        // The avatar: coloured initials underneath, the contact's `PHOTO` on
+        // top when the card carries embedded bytes (same shape as the mail
+        // list's sender avatar). A photo-less or undecodable card keeps the
+        // initials.
+        let avatar_label = gtk::Label::builder()
             .css_classes(["avatar-circle"])
             .label(crate::message_header::initials(Some(&display_name), &primary_email))
+            .build();
+        avatar_label.add_css_class(crate::message_header::avatar_color_class(&primary_email));
+        let avatar_photo = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).css_classes(["avatar-photo"]).build();
+        if let Some(texture) = entry.card.photo.as_ref().and_then(contact_photo_texture) {
+            avatar_photo.set_paintable(Some(&texture));
+        }
+        let avatar = gtk::Overlay::builder()
             .width_request(32)
             .height_request(32)
             .halign(gtk::Align::Center)
             .valign(gtk::Align::Center)
+            .child(&avatar_label)
             .build();
-        avatar.add_css_class(crate::message_header::avatar_color_class(&primary_email));
+        avatar.add_overlay(&avatar_photo);
 
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
         row_box.set_margin_start(10);

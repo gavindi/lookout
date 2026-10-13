@@ -1,0 +1,19 @@
+BEGIN:VCARD
+VERSION:4.0
+UID:ada-lovelace@example.com
+KIND:individual
+FN:Ada Lovelace
+N:Lovelace;Ada;;;
+ORG:Analytical Engines Ltd
+TITLE:Mathematician
+EMAIL;TYPE=work:ada@example.com
+TEL;TYPE=cell:+15550100
+ADR;TYPE=work:;;12 Difference St;London;;EC1A 1BB;United Kingdom
+URL:https://ada.example.com
+IMPP;TYPE=work:xmpp:ada@example.com
+BDAY:1815-12-10
+ANNIVERSARY:1835-07-08
+PHOTO;MEDIATYPE=image/png;ENCODING=b:SGk=
+CATEGORIES:Colleagues,History
+X-SPOUSE:William King
+END:VCARD

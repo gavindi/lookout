@@ -6,10 +6,11 @@
 //! with its server-side `href`/`etag`, then registers `on_save` (create),
 //! `on_update` (edit in place) and `on_delete` callbacks - the dialog never
 //! talks to the network itself; the caller routes the produced [`VCard`] to
-//! the account's CardDAV command channel. Unedited fields ride along
-//! untouched: the editor starts from a clone of the existing card and only
-//! rewrites the fields it exposes, so properties the form doesn't know about
-//! (custom `X-` props, `KIND:group` membership, URLs, ...) survive an edit.
+//! the account's CardDAV command channel. The editor starts from a clone of
+//! the existing card and rewrites the fields it exposes (including
+//! `URL`/`IMPP`/`ANNIVERSARY`/`PHOTO` and arbitrary custom properties), so a
+//! `KIND:group` membership or a property the form has no row for still
+//! survives an edit.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -17,7 +18,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use lookout_core::{AddressField, EmailField, TelephoneField, VCard};
+use gtk::{gio, glib};
+use lookout_core::{AddressField, EmailField, ImppField, OtherProperty, Photo, TelephoneField, VCard};
 
 /// The create callback's target: the picked book's href and the card.
 type CreateCallback = Rc<dyn Fn(String, VCard)>;
@@ -53,12 +55,120 @@ const FIELD_TYPES: [&str; 3] = ["work", "home", "other"];
 /// without walking the widget tree.
 struct FieldRow {
     boxed: gtk::Box,
-    /// The row's main text entry: email address, phone number, or street.
+    /// The row's main text entry: email address, phone number, street, URL,
+    /// IM URI, or a custom property's name.
     entry: gtk::Entry,
-    /// The address row's second entry (city); `None` for email/phone rows.
+    /// The row's optional second entry: an address's city, or a custom
+    /// property's value; `None` for email/phone/URL/IM rows.
     city_entry: Option<gtk::Entry>,
     dropdown: gtk::DropDown,
     remove: gtk::Button,
+}
+
+/// Builds one dynamic email/phone/IM row: a text entry, a `TYPE` dropdown
+/// (`work` / `home` / `other`) and a remove button.
+fn build_field_row(initial: &str, initial_type: Option<&str>) -> FieldRow {
+    let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+
+    let entry = gtk::Entry::new();
+    entry.set_text(initial);
+    entry.set_hexpand(true);
+    boxed.append(&entry);
+
+    let type_list = gtk::StringList::new(&FIELD_TYPES);
+    let dropdown = gtk::DropDown::builder().model(&type_list).valign(gtk::Align::Center).build();
+    let selected = initial_type
+        .and_then(|t| FIELD_TYPES.iter().position(|candidate| candidate.eq_ignore_ascii_case(t)))
+        .unwrap_or(0);
+    dropdown.set_selected(selected as u32);
+    boxed.append(&dropdown);
+
+    let remove = remove_button();
+    boxed.append(&remove);
+
+    FieldRow {
+        boxed,
+        entry,
+        city_entry: None,
+        dropdown,
+        remove,
+    }
+}
+
+/// Builds an address row: a street entry, a city entry and a remove button.
+fn build_address_row(street: &str, city: &str) -> FieldRow {
+    let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    let street_entry = gtk::Entry::new();
+    street_entry.set_placeholder_text(Some("Street"));
+    street_entry.set_text(street);
+    street_entry.set_hexpand(true);
+    boxed.append(&street_entry);
+    let city_entry = gtk::Entry::new();
+    city_entry.set_placeholder_text(Some("City"));
+    city_entry.set_text(city);
+    city_entry.set_width_chars(14);
+    boxed.append(&city_entry);
+    let remove = remove_button();
+    boxed.append(&remove);
+    let type_list = gtk::StringList::new(&FIELD_TYPES);
+    let dropdown = gtk::DropDown::builder().model(&type_list).valign(gtk::Align::Center).build();
+    dropdown.set_visible(false);
+    boxed.append(&dropdown);
+    FieldRow {
+        boxed,
+        entry: street_entry,
+        city_entry: Some(city_entry),
+        dropdown,
+        remove,
+    }
+}
+
+/// Builds a website row: one URL entry, with the shared row's type dropdown
+/// hidden (the model's `URL` is a bare string).
+fn build_url_row(url: &str) -> FieldRow {
+    let row = build_field_row(url, None);
+    row.dropdown.set_visible(false);
+    row.entry.set_placeholder_text(Some("https://example.com"));
+    row
+}
+
+/// Builds a custom-property row: a name entry and a value entry. Reuses the
+/// shared row shape as `entry` (name) plus `city_entry` (value) so the remove
+/// wiring works unchanged.
+fn build_custom_row(name: &str, value: &str) -> FieldRow {
+    let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    let name_entry = gtk::Entry::new();
+    name_entry.set_placeholder_text(Some("Field"));
+    name_entry.set_text(name);
+    name_entry.set_width_chars(14);
+    boxed.append(&name_entry);
+    let value_entry = gtk::Entry::new();
+    value_entry.set_placeholder_text(Some("Value"));
+    value_entry.set_text(value);
+    value_entry.set_hexpand(true);
+    boxed.append(&value_entry);
+    let remove = remove_button();
+    boxed.append(&remove);
+    let type_list = gtk::StringList::new(&FIELD_TYPES);
+    let dropdown = gtk::DropDown::builder().model(&type_list).valign(gtk::Align::Center).build();
+    dropdown.set_visible(false);
+    boxed.append(&dropdown);
+    FieldRow {
+        boxed,
+        entry: name_entry,
+        city_entry: Some(value_entry),
+        dropdown,
+        remove,
+    }
+}
+
+/// The flat "Remove" button every dynamic row carries.
+fn remove_button() -> gtk::Button {
+    let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+    remove.set_css_classes(&["flat"]);
+    remove.set_valign(gtk::Align::Center);
+    remove.set_tooltip_text(Some("Remove"));
+    remove
 }
 
 /// Opens the contact editor as a modal dialog. `on_save` fires with the
@@ -125,81 +235,27 @@ pub fn show_contact_editor(
     title_row.set_title("Title");
     let birthday_row = adw::EntryRow::new();
     birthday_row.set_title("Birthday");
+    let anniversary_row = adw::EntryRow::new();
+    anniversary_row.set_title("Anniversary");
     let groups_row = adw::EntryRow::new();
     groups_row.set_title("Groups");
     let notes_entry = adw::EntryRow::new();
     notes_entry.set_title("Notes");
     notes_entry.set_show_apply_button(true);
 
-    // --- Dynamic email/phone/address rows.
-    let build_field_row = |initial: &str, initial_type: Option<&str>| -> FieldRow {
-        let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-
-        let entry = gtk::Entry::new();
-        entry.set_text(initial);
-        entry.set_hexpand(true);
-        boxed.append(&entry);
-
-        let type_list = gtk::StringList::new(&FIELD_TYPES);
-        let dropdown = gtk::DropDown::builder().model(&type_list).valign(gtk::Align::Center).build();
-        let selected = initial_type
-            .and_then(|t| FIELD_TYPES.iter().position(|candidate| candidate.eq_ignore_ascii_case(t)))
-            .unwrap_or(0);
-        dropdown.set_selected(selected as u32);
-        boxed.append(&dropdown);
-
-        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
-        remove.set_css_classes(&["flat"]);
-        remove.set_valign(gtk::Align::Center);
-        remove.set_tooltip_text(Some("Remove"));
-        boxed.append(&remove);
-
-        FieldRow {
-            boxed,
-            entry,
-            city_entry: None,
-            dropdown,
-            remove,
-        }
-    };
-
-    let build_address_row = |street: &str, city: &str| -> FieldRow {
-        let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-        let street_entry = gtk::Entry::new();
-        street_entry.set_placeholder_text(Some("Street"));
-        street_entry.set_text(street);
-        street_entry.set_hexpand(true);
-        boxed.append(&street_entry);
-        let city_entry = gtk::Entry::new();
-        city_entry.set_placeholder_text(Some("City"));
-        city_entry.set_text(city);
-        city_entry.set_width_chars(14);
-        boxed.append(&city_entry);
-        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
-        remove.set_css_classes(&["flat"]);
-        remove.set_valign(gtk::Align::Center);
-        remove.set_tooltip_text(Some("Remove"));
-        boxed.append(&remove);
-        let type_list = gtk::StringList::new(&FIELD_TYPES);
-        let dropdown = gtk::DropDown::builder().model(&type_list).valign(gtk::Align::Center).build();
-        dropdown.set_visible(false);
-        boxed.append(&dropdown);
-        FieldRow {
-            boxed,
-            entry: street_entry,
-            city_entry: Some(city_entry),
-            dropdown,
-            remove,
-        }
-    };
-
     let emails: Rc<RefCell<Vec<FieldRow>>> = Rc::new(RefCell::new(Vec::new()));
     let phones: Rc<RefCell<Vec<FieldRow>>> = Rc::new(RefCell::new(Vec::new()));
     let addresses: Rc<RefCell<Vec<FieldRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let websites: Rc<RefCell<Vec<FieldRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let ims: Rc<RefCell<Vec<FieldRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let customs: Rc<RefCell<Vec<FieldRow>>> = Rc::new(RefCell::new(Vec::new()));
 
     let emails_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
     let phones_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
     let addresses_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+    let websites_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+    let ims_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+    let customs_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
 
     // Every row's remove button removes that row from its container and
     // vector, matched by widget identity (the row struct itself is owned by
@@ -218,6 +274,33 @@ pub fn show_contact_editor(
         }
     };
 
+    // --- Photo: the contact's `PHOTO`, previewed and replaced/cleared from
+    // the form. The held `Photo` is written back on save; a card that carried
+    // only a photo URI keeps it unless the user sets or removes a photo.
+    let photo_state: Rc<RefCell<Option<Photo>>> = Rc::new(RefCell::new(seed.as_ref().and_then(|card| card.photo.clone())));
+    let photo_picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Cover)
+        .width_request(96)
+        .height_request(96)
+        .css_classes(["contact-photo"])
+        .build();
+    let refresh_photo: Rc<dyn Fn()> = {
+        let photo_state = photo_state.clone();
+        let photo_picture = photo_picture.clone();
+        Rc::new(move || {
+            let texture = photo_state
+                .borrow()
+                .as_ref()
+                .and_then(|photo| photo.data.clone())
+                .and_then(|data| gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(data)).ok());
+            match texture {
+                Some(texture) => photo_picture.set_paintable(Some(&texture)),
+                None => photo_picture.set_paintable(None::<&gtk::gdk::Texture>),
+            }
+        })
+    };
+    refresh_photo();
+
     // --- Repopulate from the existing card (or the create prefill).
     if let Some(card) = &seed {
         name_row.set_text(card.full_name.as_deref().unwrap_or(""));
@@ -228,6 +311,13 @@ pub fn show_contact_editor(
                 birthday_row.set_text(&birthday.date.format("%m-%d").to_string());
             } else {
                 birthday_row.set_text(&birthday.date.format("%Y-%m-%d").to_string());
+            }
+        }
+        if let Some(anniversary) = card.anniversary {
+            if anniversary.omit_year {
+                anniversary_row.set_text(&anniversary.date.format("%m-%d").to_string());
+            } else {
+                anniversary_row.set_text(&anniversary.date.format("%Y-%m-%d").to_string());
             }
         }
         groups_row.set_text(&card.categories.join(", "));
@@ -249,6 +339,24 @@ pub fn show_contact_editor(
             wire_remove(&row, &addresses, &addresses_box);
             addresses_box.append(&row.boxed);
             addresses.borrow_mut().push(row);
+        }
+        for url in &card.urls {
+            let row = build_url_row(url);
+            wire_remove(&row, &websites, &websites_box);
+            websites_box.append(&row.boxed);
+            websites.borrow_mut().push(row);
+        }
+        for impp in &card.impp {
+            let row = build_field_row(&impp.uri, impp.types.first().map(String::as_str));
+            wire_remove(&row, &ims, &ims_box);
+            ims_box.append(&row.boxed);
+            ims.borrow_mut().push(row);
+        }
+        for property in &card.other {
+            let row = build_custom_row(&property.name, &property.value);
+            wire_remove(&row, &customs, &customs_box);
+            customs_box.append(&row.boxed);
+            customs.borrow_mut().push(row);
         }
     }
 
@@ -289,6 +397,87 @@ pub fn show_contact_editor(
         }
     });
 
+    let add_website = gtk::Button::with_label("Add website");
+    add_website.connect_clicked({
+        let websites = websites.clone();
+        let websites_box = websites_box.clone();
+        move |_| {
+            let row = build_url_row("");
+            wire_remove(&row, &websites, &websites_box);
+            websites_box.append(&row.boxed);
+            websites.borrow_mut().push(row);
+        }
+    });
+
+    let add_im = gtk::Button::with_label("Add IM");
+    add_im.connect_clicked({
+        let ims = ims.clone();
+        let ims_box = ims_box.clone();
+        move |_| {
+            let row = build_field_row("", None);
+            wire_remove(&row, &ims, &ims_box);
+            ims_box.append(&row.boxed);
+            ims.borrow_mut().push(row);
+        }
+    });
+
+    let add_custom = gtk::Button::with_label("Add field");
+    add_custom.connect_clicked({
+        let customs = customs.clone();
+        let customs_box = customs_box.clone();
+        move |_| {
+            let row = build_custom_row("", "");
+            wire_remove(&row, &customs, &customs_box);
+            customs_box.append(&row.boxed);
+            customs.borrow_mut().push(row);
+        }
+    });
+
+    // --- Photo controls: pick an image file, or clear the current photo.
+    let set_photo_button = gtk::Button::with_label("Set photo…");
+    set_photo_button.connect_clicked({
+        let photo_state = photo_state.clone();
+        let refresh_photo = refresh_photo.clone();
+        let parent = dialog.clone();
+        move |_| {
+            let parent = parent.clone();
+            let photo_state = photo_state.clone();
+            let refresh_photo = refresh_photo.clone();
+            glib::spawn_future_local(async move {
+                let filter = gtk::FileFilter::new();
+                filter.add_pixbuf_formats();
+                filter.set_name(Some("Images"));
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                let picker = gtk::FileDialog::builder().title("Choose a photo").filters(&filters).build();
+                let Ok(file) = picker.open_future(Some(&parent)).await else { return };
+                let Ok((bytes, _etag)) = file.load_contents_future().await else { return };
+                let media_type = file
+                    .query_info_future("standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
+                    .await
+                    .ok()
+                    .and_then(|info| info.content_type())
+                    .and_then(|content_type| gio::functions::content_type_get_mime_type(&content_type))
+                    .map(|mime| mime.to_string());
+                *photo_state.borrow_mut() = Some(Photo {
+                    media_type,
+                    data: Some(bytes.to_vec()),
+                    uri: None,
+                });
+                refresh_photo();
+            });
+        }
+    });
+    let remove_photo_button = gtk::Button::with_label("Remove photo");
+    remove_photo_button.connect_clicked({
+        let photo_state = photo_state.clone();
+        let refresh_photo = refresh_photo.clone();
+        move |_| {
+            *photo_state.borrow_mut() = None;
+            refresh_photo();
+        }
+    });
+
     // --- Assemble the form.
     let content_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -306,11 +495,25 @@ pub fn show_contact_editor(
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     content.append(&scroller);
 
+    let photo_buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .valign(gtk::Align::Center)
+        .build();
+    photo_buttons.append(&set_photo_button);
+    photo_buttons.append(&remove_photo_button);
+    let photo_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
+    photo_row.append(&photo_picture);
+    photo_row.append(&photo_buttons);
+
     content_box.append(&book_row);
+    content_box.append(&section_header("Photo"));
+    content_box.append(&photo_row);
     content_box.append(&name_row);
     content_box.append(&org_row);
     content_box.append(&title_row);
     content_box.append(&birthday_row);
+    content_box.append(&anniversary_row);
     content_box.append(&section_header("Emails"));
     content_box.append(&emails_box);
     content_box.append(&add_email);
@@ -320,6 +523,15 @@ pub fn show_contact_editor(
     content_box.append(&section_header("Addresses"));
     content_box.append(&addresses_box);
     content_box.append(&add_address);
+    content_box.append(&section_header("Websites"));
+    content_box.append(&websites_box);
+    content_box.append(&add_website);
+    content_box.append(&section_header("Instant messaging"));
+    content_box.append(&ims_box);
+    content_box.append(&add_im);
+    content_box.append(&section_header("Custom fields"));
+    content_box.append(&customs_box);
+    content_box.append(&add_custom);
     content_box.append(&section_header("Notes"));
     content_box.append(&notes_entry);
     content_box.append(&groups_row);
@@ -370,8 +582,10 @@ pub fn show_contact_editor(
             telephones: Vec::new(),
             addresses: Vec::new(),
             urls: Vec::new(),
+            impp: Vec::new(),
             note: None,
             birthday: None,
+            anniversary: None,
             categories: Vec::new(),
             other: Vec::new(),
         });
@@ -433,23 +647,58 @@ pub fn show_contact_editor(
         let note = notes_entry.text().trim().to_string();
         card.note = if note.is_empty() { None } else { Some(note) };
 
-        let birthday = birthday_row.text().trim().to_string();
-        card.birthday = if birthday.is_empty() {
-            None
-        } else if let Ok(date) = chrono::NaiveDate::parse_from_str(&birthday, "%Y-%m-%d") {
-            // A full date entered (or left untouched from a dated card)
-            // clears any year-omission the card carried.
-            Some(lookout_core::Birthday { date, omit_year: false })
-        } else if let Ok(date) = chrono::NaiveDate::parse_from_str(&birthday, "%m-%d") {
-            // Yearless form ("MM-DD", how yearless cards show in the entry):
-            // the birthday recurs every year.
-            Some(lookout_core::Birthday { date, omit_year: true })
-        } else {
-            // Invalid input - the Save handler just doesn't fire.
-            return None;
+        // Invalid date input fails the whole save (the handler just doesn't
+        // fire), matching the birthday behaviour.
+        card.birthday = match parse_date_entry(birthday_row.text().as_str()) {
+            Some(value) => value,
+            None => return None,
+        };
+        card.anniversary = match parse_date_entry(anniversary_row.text().as_str()) {
+            Some(value) => value,
+            None => return None,
         };
 
+        card.urls = websites
+            .borrow()
+            .iter()
+            .map(|row| row.entry.text().trim().to_string())
+            .filter(|url| !url.is_empty())
+            .collect();
+
+        let mut impp_out = Vec::new();
+        for row in ims.borrow().iter() {
+            let uri = row.entry.text().trim().to_string();
+            if uri.is_empty() {
+                continue;
+            }
+            let types = vec![FIELD_TYPES[row.dropdown.selected() as usize].to_string()];
+            impp_out.push(ImppField { types, uri });
+        }
+        card.impp = impp_out;
+
+        // Custom properties: the row's name identifies the property, and its
+        // original `Parameter`s are carried over from the card being edited
+        // (matched by name) so an `X-*;TYPE=...` value isn't flattened.
+        let original_custom = card.other.clone();
+        let mut other_out = Vec::new();
+        for row in customs.borrow().iter() {
+            let name = row.entry.text().trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let value = row.city_entry.as_ref().map(|entry| entry.text().trim().to_string()).unwrap_or_default();
+            let params = original_custom
+                .iter()
+                .find(|property| property.name.eq_ignore_ascii_case(&name))
+                .map(|property| property.params.clone())
+                .unwrap_or_default();
+            other_out.push(OtherProperty { name, params, value });
+        }
+        card.other = other_out;
+
         card.categories = groups_row.text().split(',').map(str::trim).filter(|part| !part.is_empty()).map(str::to_string).collect();
+
+        card.photo = photo_state.borrow().clone();
 
         Some(card)
     });
@@ -486,6 +735,24 @@ pub fn show_contact_editor(
 
     dialog.set_content(Some(&content));
     dialog.present();
+}
+
+/// Parses the Birthday/Anniversary entry text into a [`lookout_core::Birthday`].
+/// An empty string clears the field (`Some(None)`); a full `YYYY-MM-DD` date
+/// clears any year-omission; `MM-DD` marks the date yearless (it recurs every
+/// year); anything else is invalid (`None`) and fails the save.
+fn parse_date_entry(text: &str) -> Option<Option<lookout_core::Birthday>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(None);
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Some(Some(lookout_core::Birthday { date, omit_year: false }));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%m-%d") {
+        return Some(Some(lookout_core::Birthday { date, omit_year: true }));
+    }
+    None
 }
 
 fn section_header(label: &str) -> gtk::Label {

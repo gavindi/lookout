@@ -1093,8 +1093,10 @@ mod tests {
             telephones: Vec::new(),
             addresses: Vec::new(),
             urls: Vec::new(),
+            impp: Vec::new(),
             note: None,
             birthday: None,
+            anniversary: None,
             categories: Vec::new(),
             other: Vec::new(),
         }

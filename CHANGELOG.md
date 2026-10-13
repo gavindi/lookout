@@ -13,6 +13,10 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.182] - 2026-10-14
+**Reference**: People — full contact field editing (Phase 4.1 / P-02, P-03)
+**Summary**: Touches `crates/core/src/{lib,vcard}.rs`, `crates/app/src/{contacts_editor,contacts_view}.rs` and adds `test-fixtures/contacts/outlook-contact.vcf`; no data-format change (cards are stored as vCard text, so a re-sync isn't needed). `VCard` gains first-class `ANNIVERSARY` (sharing the `Birthday` date shapes, including the yearless `--MMDD` form) and `IMPP` (instant-messaging URI plus `TYPE`); both previously fell into the catch-all `other` list. The contact editor gains rows for Anniversary, Websites (`URL`), Instant messaging (`IMPP`), arbitrary custom properties (the `other` list, with their original parameters preserved), and a `PHOTO` preview with Set photo… (a file picker that sniffs the image type) and Remove. The People list shows a contact's embedded photo over its coloured initials, and the details dialog lists websites, IM, birthday, anniversary and custom fields. Covered by `vcard` unit tests (anniversary, yearless anniversary, `IMPP` with types, "no longer in `other`", custom-property preservation) plus a fixture round-trip.
+
 ## [v0.9.181] - 2026-10-14
 **Reference**: Outlook Parity Sprint 15 — security and compliance (Phase 6.1, 6.2, 6.3, 6.5, 6.7)
 **Summary**: One sprint, five Phase 6 items; see the five entries below. Two GSettings keys are added (`mail-internal-domains`, `mail-report-phishing-address`) and the mail body cache's `user_version` is bumped (6) so cached bodies are re-assembled with the new parsed `Authentication-Results` verdicts; no mail schema change otherwise.

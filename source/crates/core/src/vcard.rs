@@ -23,8 +23,17 @@ pub struct VCard {
     pub telephones: Vec<TelephoneField>,
     pub addresses: Vec<AddressField>,
     pub urls: Vec<String>,
+    /// The contact's instant-messaging addresses (`IMPP`, RFC 6350 §6.4.3),
+    /// each a URI such as `xmpp:user@example.com` or `sip:user@example.com`.
+    /// Kept apart from `urls` because Outlook's contact form shows IM as its
+    /// own row.
+    pub impp: Vec<ImppField>,
     pub note: Option<String>,
     pub birthday: Option<Birthday>,
+    /// The contact's anniversary (`ANNIVERSARY`, RFC 6350 §6.6.6), a work or
+    /// wedding anniversary. Shares the `Birthday` date shapes (a full date, or
+    /// the yearless `--MMDD` form).
+    pub anniversary: Option<Birthday>,
     pub categories: Vec<String>,
     pub other: Vec<OtherProperty>,
 }
@@ -74,6 +83,14 @@ pub struct EmailField {
 pub struct TelephoneField {
     pub types: Vec<String>,
     pub number: String,
+}
+
+/// One `IMPP` (instant-messaging) value: a URI plus its optional `TYPE`
+/// parameters (`work` / `home` / `other`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImppField {
+    pub types: Vec<String>,
+    pub uri: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,8 +165,10 @@ impl VCard {
             telephones: Vec::new(),
             addresses: Vec::new(),
             urls: Vec::new(),
+            impp: Vec::new(),
             note: None,
             birthday: None,
+            anniversary: None,
             categories: Vec::new(),
             other: Vec::new(),
         };
@@ -188,8 +207,10 @@ impl VCard {
                 "TEL" => card.telephones.push(parse_telephone_field(&params, &value)),
                 "ADR" => card.addresses.push(parse_address_field(&params, &value)?),
                 "URL" => card.urls.push(value),
+                "IMPP" => card.impp.push(parse_impp_field(&params, &value)),
                 "NOTE" => card.note = Some(value),
                 "BDAY" => card.birthday = Some(parse_birthday(&value)?),
+                "ANNIVERSARY" => card.anniversary = Some(parse_birthday(&value)?),
                 "X-APPLE-OMIT-YEAR" => apple_omit_year = true,
                 "CATEGORIES" => card.categories = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
                 _ => card.other.push(OtherProperty { name, params, value }),
@@ -302,6 +323,10 @@ impl VCard {
         for url in &self.urls {
             lines.push(format!("URL:{}", escape_value(url)));
         }
+        for impp in &self.impp {
+            let params = param_string(&impp.types, "TYPE");
+            lines.push(format!("IMPP{}:{}", params, escape_value(&impp.uri)));
+        }
         if let Some(note) = &self.note {
             lines.push(format!("NOTE:{}", escape_value(note)));
         }
@@ -315,6 +340,16 @@ impl VCard {
                 lines.push(format!("X-APPLE-OMIT-YEAR:{}", bday.date.format("%Y")));
             } else {
                 lines.push(format!("BDAY:{}", bday.date.format("%Y-%m-%d")));
+            }
+        }
+        if let Some(anniversary) = &self.anniversary {
+            // Same shapes as `BDAY` (RFC 6350 §6.6.6 defers to §3.3.4). The
+            // `X-APPLE-OMIT-YEAR` marker is BDAY-only, so a yearless
+            // anniversary is written in the RFC 6350 `--MMDD` form alone.
+            if anniversary.omit_year {
+                lines.push(format!("ANNIVERSARY:--{}", anniversary.date.format("%m%d")));
+            } else {
+                lines.push(format!("ANNIVERSARY:{}", anniversary.date.format("%Y-%m-%d")));
             }
         }
         if !self.categories.is_empty() {
@@ -449,6 +484,13 @@ fn parse_telephone_field(params: &[Parameter], value: &str) -> TelephoneField {
     TelephoneField {
         types: param_values(params, "TYPE"),
         number: value.to_string(),
+    }
+}
+
+fn parse_impp_field(params: &[Parameter], value: &str) -> ImppField {
+    ImppField {
+        types: param_values(params, "TYPE"),
+        uri: value.to_string(),
     }
 }
 
@@ -687,9 +729,17 @@ mod tests {
                 label: Some("123 Main St\nAnytown, CA 94102".to_string()),
             }],
             urls: vec!["https://example.com".to_string()],
+            impp: vec![ImppField {
+                types: vec!["work".to_string()],
+                uri: "xmpp:ada@example.com".to_string(),
+            }],
             note: Some("Example contact".to_string()),
             birthday: Some(Birthday {
                 date: NaiveDate::from_ymd_opt(1990, 5, 23).unwrap(),
+                omit_year: false,
+            }),
+            anniversary: Some(Birthday {
+                date: NaiveDate::from_ymd_opt(2015, 9, 1).unwrap(),
                 omit_year: false,
             }),
             categories: vec!["friend".to_string(), "colleague".to_string()],
@@ -700,10 +750,25 @@ mod tests {
         assert_eq!(parsed.full_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(parsed.organization.as_ref().unwrap()[0], "Example Corp");
         assert_eq!(parsed.categories, vec!["friend", "colleague"]);
+        assert_eq!(parsed.urls, vec!["https://example.com".to_string()]);
+        assert_eq!(
+            parsed.impp,
+            vec![ImppField {
+                types: vec!["work".to_string()],
+                uri: "xmpp:ada@example.com".to_string(),
+            }]
+        );
         assert_eq!(
             parsed.birthday,
             Some(Birthday {
                 date: NaiveDate::from_ymd_opt(1990, 5, 23).unwrap(),
+                omit_year: false,
+            })
+        );
+        assert_eq!(
+            parsed.anniversary,
+            Some(Birthday {
+                date: NaiveDate::from_ymd_opt(2015, 9, 1).unwrap(),
                 omit_year: false,
             })
         );
@@ -838,6 +903,88 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_round_trips_anniversary() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nANNIVERSARY:2015-09-01\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert_eq!(
+            card.anniversary,
+            Some(Birthday {
+                date: NaiveDate::from_ymd_opt(2015, 9, 1).unwrap(),
+                omit_year: false,
+            })
+        );
+        let serialized = card.serialize();
+        assert!(serialized.contains("ANNIVERSARY:2015-09-01"), "{serialized}");
+        assert_eq!(VCard::parse(&serialized).unwrap().anniversary, card.anniversary);
+    }
+
+    #[test]
+    fn parses_yearless_anniversary() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nANNIVERSARY:--0901\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        let anniversary = card.anniversary.expect("anniversary parsed");
+        assert!(anniversary.omit_year);
+        assert_eq!(anniversary.date.format("%m-%d").to_string(), "09-01");
+        // A yearless anniversary round-trips without Apple's BDAY-only marker.
+        let serialized = card.serialize();
+        assert!(serialized.contains("ANNIVERSARY:--0901"), "{serialized}");
+        assert!(!serialized.contains("X-APPLE-OMIT-YEAR"), "{serialized}");
+    }
+
+    #[test]
+    fn parses_impp_with_types_and_round_trips() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nIMPP;TYPE=work:xmpp:ada@example.com\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert_eq!(
+            card.impp,
+            vec![ImppField {
+                types: vec!["work".to_string()],
+                uri: "xmpp:ada@example.com".to_string(),
+            }]
+        );
+        let reparsed = VCard::parse(&card.serialize()).unwrap();
+        assert_eq!(reparsed.impp, card.impp);
+    }
+
+    #[test]
+    fn anniversary_and_impp_no_longer_fall_into_other() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nANNIVERSARY:2015-09-01\r\nIMPP:xmpp:a@b\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert!(card.other.iter().all(|prop| prop.name != "ANNIVERSARY" && prop.name != "IMPP"), "{:?}", card.other);
+    }
+
+    #[test]
+    fn custom_and_unknown_properties_are_preserved_through_a_round_trip() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nX-FOO;TYPE=x:bar\r\nNICKNAME:Bee\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert!(card.other.iter().any(|prop| prop.name == "X-FOO" && prop.value == "bar"));
+        assert!(card.other.iter().any(|prop| prop.name == "NICKNAME" && prop.value == "Bee"));
+        let reparsed = VCard::parse(&card.serialize()).unwrap();
+        assert_eq!(reparsed.other.len(), card.other.len());
+        assert!(reparsed.other.iter().any(|prop| prop.name == "X-FOO" && prop.value == "bar"));
+    }
+
+    #[test]
+    fn parses_the_outlook_contact_fixture() {
+        let card = VCard::parse(include_str!("../../../test-fixtures/contacts/outlook-contact.vcf")).expect("fixture parses");
+        assert_eq!(card.full_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(card.title.as_deref(), Some("Mathematician"));
+        assert_eq!(card.urls, vec!["https://ada.example.com".to_string()]);
+        assert_eq!(card.impp.first().map(|impp| impp.uri.as_str()), Some("xmpp:ada@example.com"));
+        assert_eq!(card.birthday.map(|birthday| birthday.date.to_string()), Some("1815-12-10".to_string()));
+        assert_eq!(card.anniversary.map(|anniversary| anniversary.date.to_string()), Some("1835-07-08".to_string()));
+        assert_eq!(card.photo.as_ref().and_then(|photo| photo.data.as_deref()), Some(&b"Hi"[..]));
+        assert!(card.other.iter().any(|property| property.name == "X-SPOUSE" && property.value == "William King"));
+        assert_eq!(card.categories, vec!["Colleagues".to_string(), "History".to_string()]);
+        // The whole card round-trips without losing the new fields.
+        let reparsed = VCard::parse(&card.serialize()).expect("round trip parses");
+        assert_eq!(reparsed.urls, card.urls);
+        assert_eq!(reparsed.impp, card.impp);
+        assert_eq!(reparsed.anniversary, card.anniversary);
+        assert_eq!(reparsed.other, card.other);
+    }
+
+    #[test]
     fn parses_escaped_values() {
         let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Foo\\, Bar\r\nNOTE:Line1\\nLine2\r\nEND:VCARD\r\n";
         let card = VCard::parse(text).unwrap();
@@ -869,8 +1016,10 @@ mod tests {
             telephones: Vec::new(),
             addresses: Vec::new(),
             urls: Vec::new(),
+            impp: Vec::new(),
             note: None,
             birthday: None,
+            anniversary: None,
             categories: Vec::new(),
             other: Vec::new(),
         };

@@ -45,12 +45,12 @@ Counts are tallied from the §5 tables.
 | Mail (5.1) | 25 | 7 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 13 | 4 | 5 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder and sensitivity. No forwarding with attachments. |
 | Calendar (5.3) | 15 | 9 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
-| People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
+| People (5.4) | 5 | 4 | 3 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine. No profile card, CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 4 | 2 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **72** | **33** | **47** | **5** | ~46% at parity, ~21% partial |
+| **Total** | **74** | **31** | **47** | **5** | ~47% at parity, ~20% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -354,8 +354,8 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | ID | Outlook feature | Lookout today | Status | Gap |
 |---|---|---|---|---|
 | P-01 | Contact CRUD, multi email/phone/address | `core/src/vcard.rs`, `app/src/contacts_editor.rs` | ✅ | — |
-| P-02 | Anniversary, IM, website, custom fields | Preserved, not editable | 🟡 | Editor rows |
-| P-03 | Photo | Not displayed | 🟡 | Show vCard `PHOTO`; Graph photo; sender avatar in list |
+| P-02 | Anniversary, IM, website, custom fields | Editor rows for anniversary (`ANNIVERSARY`), IM (`IMPP`), website (`URL`) and custom properties, each property's original parameters preserved (4.1) | ✅ | — |
+| P-03 | Photo | Shown in the People list avatar (over the initials) and previewed/set/removed in the editor; Mail sender avatars already use it (4.1) | ✅ | Graph photo via 5.2 |
 | P-04 | Groups / favourites | Groups, starred contacts | ✅ | — |
 | P-05 | Contact lists in compose | Lists shown, not expandable in picker/autocomplete | 🟡 | Expand on insert (Outlook "+" expansion) |
 | P-06 | Search in People | Only in picker/autocomplete | 🟡 | Search entry in People tab; global search scope |
@@ -674,7 +674,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
-| 4.1 | Full contact field editing | P-02, P-03 | Editor rows for anniversary, IM (`IMPP`), URL, custom; photo view and set (`PHOTO`) | M |
+| 4.1 | ✅ ~~Full contact field editing~~ | P-02, P-03 | Editor rows for anniversary, IM (`IMPP`), URL, custom; photo view and set (`PHOTO`) | M |
 | 4.2 | Profile card | P-10 | Popover on sender name/avatar click in reading pane and list: contact info, recent mail (FTS query by address), upcoming shared events, actions (email, schedule, add to contacts) | M |
 | 4.3 | Contact lists in compose | P-05, C-18 | Lists appear in autocomplete/picker; expand to members on insert; optional `+` expander chip | S |
 | 4.4 | People search and sort | P-06, P-07 | Search entry in the People tab; File-as setting; global search scope "People" | S |
