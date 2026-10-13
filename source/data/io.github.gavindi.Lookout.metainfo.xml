@@ -75,6 +75,16 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.177" date="2026-10-13">
+      <description>
+        <p>Events can now carry their own time zone. The event editor's date and time row gains a searchable Time zone picker: an edit opens in the event's own zone, a new event starts in the zone your calendar is shown in, and invitations from other apps that name a time zone (Thunderbird, Google Calendar) keep it. Lookout writes the zone into the event together with the rules other calendar apps need, and recurring events keep their local time across daylight-saving changes instead of drifting an hour.</p>
+      </description>
+    </release>
+    <release version="0.9.176" date="2026-10-13">
+      <description>
+        <p>An event's Show as menu now offers all five Outlook states - Free, Working elsewhere, Tentative, Busy and Away - instead of just Busy and Free. Calendar chips show each state the way Outlook does: Free outlined only, Tentative hatched, Away tinted purple, Working elsewhere dotted. The status is read from and written to the standard Outlook calendar properties, so it survives a round trip through other calendar apps.</p>
+      </description>
+    </release>
     <release version="0.9.175" date="2026-10-13">
       <description>
         <p>A small polish to the View tab: the Reading pane button in the ribbon now shows a proper two-pane layout icon instead of a missing-image box, and the Messages button shows an envelope instead of a reply arrow.</p>
