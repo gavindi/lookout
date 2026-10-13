@@ -5189,7 +5189,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     reading_pane_menu.append(Some("Bottom"), Some("win.reading-pane-position('bottom')"));
     reading_pane_menu.append(Some("Off"), Some("win.reading-pane-position('off')"));
     let reading_pane_button = gtk::MenuButton::builder()
-        .icon_name("document-preview-symbolic")
+        .icon_name(themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic", "view-paged-symbolic"]))
         .tooltip_text("Reading pane")
         .css_classes(["flat"])
         .valign(gtk::Align::Center)
@@ -5215,7 +5215,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     messages_menu.append_section(Some("Conversation reading pane"), &order_section);
     let messages_button = gtk::MenuButton::builder()
-        .icon_name(themed_icon_name(&["mail-replied-symbolic", "mail-forwarded-symbolic"]))
+        .icon_name(themed_icon_name(&["mail-unread-symbolic", "mail-read-symbolic", "mail-message-new-symbolic"]))
         .tooltip_text("Messages")
         .css_classes(["flat"])
         .valign(gtk::Align::Center)
