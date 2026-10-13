@@ -20,6 +20,10 @@ pub const AVATAR_COLOR_CLASSES: [&str; 6] = ["avatar-color-0", "avatar-color-1",
 #[derive(Clone)]
 pub struct MessageHeader {
     pub subject_bar: gtk::Box,
+    /// "Back to conversation", shown above the subject while a message of
+    /// the conversation view is open on its own ("Show details", item 1.7);
+    /// hidden otherwise. Wired in `window.rs`.
+    pub back_button: gtk::Button,
     pub widget: gtk::Box,
     pub action_bar: gtk::Box,
     subject_label: gtk::Label,
@@ -71,6 +75,13 @@ pub fn build() -> MessageHeader {
     let subject_label = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["message-header-subject"]).build();
     let subject_bar = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["message-subject-bar"]).build();
     subject_bar.set_widget_name("subject-bar");
+    let back_button = gtk::Button::builder()
+        .child(&adw::ButtonContent::builder().icon_name("go-previous-symbolic").label("Back to conversation").build())
+        .css_classes(["flat"])
+        .halign(gtk::Align::Start)
+        .visible(false)
+        .build();
+    subject_bar.append(&back_button);
     subject_bar.append(&subject_label);
 
     let avatar_label = gtk::Label::builder()
@@ -182,6 +193,7 @@ pub fn build() -> MessageHeader {
 
     MessageHeader {
         subject_bar,
+        back_button,
         widget,
         action_bar,
         subject_label,

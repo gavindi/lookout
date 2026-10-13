@@ -239,6 +239,15 @@ pub struct ConfigView {
     /// "Show sender images" switch (Config → Appearance): whether message-list
     /// rows and the reading-pane header show a sender avatar.
     pub show_sender_images_row: adw::SwitchRow,
+    /// "Show email grouped by conversation" switch (Config → Appearance),
+    /// mirroring View ▸ Messages ▸ "Show as conversations" (`mail-threaded`).
+    pub conversations_row: adw::SwitchRow,
+    /// "Conversation reading pane" dropdown (Config → Appearance): newest
+    /// message on top or bottom (`mail-conversation-order`, item 1.7).
+    pub conversation_order_row: adw::ComboRow,
+    /// "Include messages from Sent Items" switch (Config → Appearance):
+    /// whether the conversation view shows your replies from Sent Items.
+    pub conversation_include_sent_row: adw::SwitchRow,
     /// "Custom accent color" switch (Config → Appearance), exposed so the
     /// caller can arm the accent picker row and map its state to the
     /// `accent-color` GSettings key (off = follow the system accent).
@@ -828,6 +837,27 @@ pub fn build() -> ConfigView {
         .subtitle("Show a contact photo, or coloured initials, for the sender of each message")
         .build();
     appearance_group.add(&show_sender_images_row);
+    // Conversations (item 1.7): grouping in the list, plus the order and
+    // reach of the stacked conversation in the reading pane. The first two
+    // mirror the View ribbon's "Messages" menu.
+    let conversations_row = adw::SwitchRow::builder()
+        .title("Show email grouped by conversation")
+        .subtitle("Group replies under one row in the message list and show the whole conversation in the reading pane")
+        .build();
+    appearance_group.add(&conversations_row);
+    let conversation_order_row = adw::ComboRow::builder()
+        .title("Conversation reading pane")
+        .subtitle("Order of the messages when the reading pane shows a conversation")
+        .model(&gtk::StringList::new(&crate::settings::CONVERSATION_ORDER_LABELS))
+        .build();
+    appearance_group.add(&conversation_order_row);
+    let conversation_include_sent_row = adw::SwitchRow::builder()
+        .title("Include messages from Sent Items")
+        .subtitle("Show your own replies among a conversation's messages")
+        .build();
+    appearance_group.add(&conversation_include_sent_row);
+    conversations_row.bind_property("active", &conversation_order_row, "sensitive").sync_create().build();
+    conversations_row.bind_property("active", &conversation_include_sent_row, "sensitive").sync_create().build();
     let privacy_group = placeholder_group("Privacy");
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
@@ -981,6 +1011,9 @@ pub fn build() -> ConfigView {
         reading_pane_row,
         preview_lines_row,
         show_sender_images_row,
+        conversations_row,
+        conversation_order_row,
+        conversation_include_sent_row,
         accent_switch_row,
         accent_color_row,
         accent_color_button,

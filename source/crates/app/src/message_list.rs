@@ -1045,6 +1045,7 @@ type DisplayedMessages = Option<(SortKey, bool, FilterSet, bool, Vec<MessageRowK
 /// no-op case), a single message drives it, and two or more messages show
 /// a "N selected" placeholder instead - see the selection handler in
 /// `window.rs`.
+#[derive(Debug)]
 pub enum SelectionKind {
     Empty,
     // Never constructed by `selection_kind()` today - headers are
@@ -1056,7 +1057,65 @@ pub enum SelectionKind {
     #[allow(dead_code)]
     Section,
     Message(Box<EmailSummary>),
+    /// A conversation header alone (item 1.7): the conversation's listed
+    /// messages, oldest first. Ribbon verbs act on all of them, and the
+    /// reading pane shows the whole conversation.
+    Thread(ThreadId, Vec<EmailSummary>),
     Multiple(Vec<EmailSummary>),
+}
+
+/// One selected row's identity, header or message - what a rebuild restores
+/// the highlight from, since a selected conversation header has no message
+/// identity of its own.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum RowIdentity {
+    Message(MailboxId, Uid),
+    Thread(ThreadId),
+}
+
+/// What the reading pane should show for the current selection (item 1.7).
+/// A message that belongs to a listed conversation, or the conversation's
+/// header, shows the whole conversation; a lone message (or any message
+/// when conversations are off) shows on its own, as before.
+#[derive(Debug)]
+pub enum ReadingTarget {
+    Empty,
+    Single(Box<EmailSummary>),
+    /// `messages` are the conversation's listed messages; `focus` is the
+    /// selected child row, or `None` when the header itself is selected.
+    Conversation {
+        id: ThreadId,
+        messages: Vec<EmailSummary>,
+        focus: Option<(MailboxId, Uid)>,
+    },
+    Multiple(Vec<EmailSummary>),
+}
+
+/// Resolves a selection into a reading-pane target. `conversation_of` names
+/// the listed conversation (identity and messages) a message belongs to,
+/// or `None` for a message shown on its own - always `None` while
+/// conversations are off, since the list then has no conversation rows.
+pub fn reading_target_for(kind: SelectionKind, conversation_of: impl Fn(&EmailSummary) -> Option<(ThreadId, Vec<EmailSummary>)>) -> ReadingTarget {
+    match kind {
+        SelectionKind::Empty | SelectionKind::Section => ReadingTarget::Empty,
+        SelectionKind::Multiple(summaries) => ReadingTarget::Multiple(summaries),
+        SelectionKind::Thread(id, messages) => ReadingTarget::Conversation { id, messages, focus: None },
+        SelectionKind::Message(summary) => match conversation_of(&summary) {
+            Some((id, messages)) if messages.len() > 1 => ReadingTarget::Conversation {
+                id,
+                messages,
+                focus: Some((summary.mailbox.clone(), summary.uid)),
+            },
+            _ => ReadingTarget::Single(summary),
+        },
+    }
+}
+
+/// The newest of a conversation's messages - what single-message verbs
+/// (Reply, Forward, Open, Print) act on when a conversation header is the
+/// target, as in Outlook.
+pub fn newest_message(messages: &[EmailSummary]) -> Option<EmailSummary> {
+    messages.iter().max_by_key(|m| m.date).cloned()
 }
 
 /// A child `gio::ListStore` (a section's or a thread's) paired with the
@@ -1329,33 +1388,69 @@ impl MessageListModel {
     /// The selected row's message, or `None` when nothing is selected, the
     /// selection has landed on a section header, or more than one message is
     /// selected.
+    /// With a conversation header selected, its newest message - what
+    /// single-message verbs act on, as in Outlook.
     pub fn selected_summary(&self) -> Option<EmailSummary> {
         match self.selection_kind() {
             SelectionKind::Message(summary) => Some(*summary),
+            SelectionKind::Thread(_, messages) => newest_message(&messages),
             _ => None,
         }
     }
 
-    /// Every message currently selected, in ascending row-position order.
-    /// Empty when nothing is selected; a lone section header can never
-    /// appear here since headers are unselectable (see `bind()` in
-    /// `window.rs`).
+    /// Every message currently selected, in ascending row-position order. A
+    /// selected conversation header stands for every listed message of its
+    /// conversation (item 1.7), each listed once even when some of its rows
+    /// are selected too. A lone section header can never appear here since
+    /// section headers are unselectable (see `bind()` in `window.rs`).
     pub fn selected_summaries(&self) -> Vec<EmailSummary> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<(MailboxId, Uid)> = HashSet::new();
+        for row in self.selected_rows() {
+            let messages = match row {
+                RowIdentity::Message(..) => Vec::new(),
+                RowIdentity::Thread(id) => self.thread_messages(&id),
+            };
+            for summary in messages {
+                if seen.insert((summary.mailbox.clone(), summary.uid)) {
+                    out.push(summary);
+                }
+            }
+        }
+        for p in self.selected_positions() {
+            if let Some(summary) = self.summary_at(p) {
+                if seen.insert((summary.mailbox.clone(), summary.uid)) {
+                    out.push(summary);
+                }
+            }
+        }
+        out
+    }
+
+    /// The flat positions of every selected row, ascending.
+    fn selected_positions(&self) -> Vec<u32> {
         let bitset = self.selection.selection();
         let mut out = Vec::with_capacity(bitset.size() as usize);
         if let Some((mut iter, first)) = gtk::BitsetIter::init_first(&bitset) {
             let mut pos = Some(first);
             while let Some(p) = pos {
-                if let Some(summary) = self.summary_at(p) {
-                    out.push(summary);
-                }
+                out.push(p);
                 pos = iter.next();
             }
         }
         out
     }
 
+    /// The identity of every selected row, header or message.
+    fn selected_rows(&self) -> Vec<RowIdentity> {
+        self.selected_positions().into_iter().filter_map(|p| self.row_identity_at(p)).collect()
+    }
+
     pub fn selection_kind(&self) -> SelectionKind {
+        let rows = self.selected_rows();
+        if let [RowIdentity::Thread(id)] = rows.as_slice() {
+            return SelectionKind::Thread(id.clone(), self.thread_messages(id));
+        }
         let mut summaries = self.selected_summaries();
         match summaries.len() {
             0 => SelectionKind::Empty,
@@ -1364,12 +1459,45 @@ impl MessageListModel {
         }
     }
 
-    /// The `EmailSummary` at flat list position `position`, or `None` for a
-    /// section/thread header row. Used by the message list view's `activate`
-    /// handler (Enter / double-click), whose position is relative to the
-    /// same model (`selection`) `summary_at` walks.
+    /// What the reading pane shows for the current selection (item 1.7): a
+    /// header, or a message inside a listed conversation, shows the whole
+    /// conversation.
+    pub fn reading_target(&self) -> ReadingTarget {
+        reading_target_for(self.selection_kind(), |summary| {
+            let id = self.conversation_of(&summary.mailbox, summary.uid)?;
+            let messages = self.thread_messages(&id);
+            Some((id, messages))
+        })
+    }
+
+    /// The listed conversation `(mailbox, uid)` belongs to, or `None` when
+    /// the message isn't under a conversation header (a lone message, or
+    /// conversations are off).
+    pub fn conversation_of(&self, mailbox: &MailboxId, uid: Uid) -> Option<ThreadId> {
+        if !*self.threaded.borrow() {
+            return None;
+        }
+        let threads = self.threads.borrow();
+        threads
+            .iter()
+            .find(|(_, tracked)| {
+                (0..tracked.store.n_items())
+                    .filter_map(|i| tracked.store.item(i).and_downcast::<glib::BoxedAnyObject>())
+                    .any(|boxed| matches!(&*boxed.borrow::<MessageItem>(), MessageItem::Message(m) if m.mailbox == *mailbox && m.uid == uid))
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// The `EmailSummary` at flat list position `position`; for a
+    /// conversation header, its newest message (Outlook opens that one on
+    /// Enter / double-click); `None` for a section header. Used by the
+    /// message list view's `activate` handler, whose position is relative
+    /// to the same model (`selection`) `summary_at` walks.
     pub fn summary_at_position(&self, position: u32) -> Option<EmailSummary> {
-        self.summary_at(position)
+        match self.row_identity_at(position)? {
+            RowIdentity::Thread(id) => newest_message(&self.thread_messages(&id)),
+            RowIdentity::Message(..) => self.summary_at(position),
+        }
     }
 
     /// Every listed message of the conversation `id`, whether or not its
@@ -1565,7 +1693,7 @@ impl MessageListModel {
         // the N=1 fallback `restore_selection` uses when that one row didn't
         // survive the rebuild.
         let bitset = self.selection.selection();
-        let previous_selection: Vec<(MailboxId, Uid)> = self.selected_summaries().iter().map(|s| (s.mailbox.clone(), s.uid)).collect();
+        let previous_selection = self.selected_rows();
         let previous_single_index = if bitset.size() == 1 {
             gtk::BitsetIter::init_first(&bitset).map(|(_, first)| first).unwrap_or(gtk::INVALID_LIST_POSITION)
         } else {
@@ -1996,17 +2124,17 @@ impl MessageListModel {
     /// selection handler in `window.rs` re-derives its state from scratch
     /// each time it fires, so N firings would re-run that logic (and briefly
     /// flash through intermediate partial-selection states) for no reason.
-    fn restore_selection(&self, previous: Vec<(MailboxId, Uid)>, previous_single_index: u32) {
+    fn restore_selection(&self, previous: Vec<RowIdentity>, previous_single_index: u32) {
         let n = self.selection.n_items();
         if n == 0 {
             return;
         }
-        let previous: HashSet<(MailboxId, Uid)> = previous.into_iter().collect();
+        let previous: HashSet<RowIdentity> = previous.into_iter().collect();
         let survivors = gtk::Bitset::new_empty();
         let mut survivor_count = 0u32;
         for i in 0..n {
-            if let Some((m, u)) = self.message_at(i) {
-                if previous.contains(&(m, u)) {
+            if let Some(identity) = self.row_identity_at(i) {
+                if previous.contains(&identity) {
                     survivors.add(i);
                     survivor_count += 1;
                 }
@@ -2032,6 +2160,19 @@ impl MessageListModel {
         }
         if index < n {
             self.selection.select_item(index, true);
+        }
+    }
+
+    /// The identity of the row at flat position `i`: a message or a
+    /// conversation header; `None` for a section header.
+    fn row_identity_at(&self, i: u32) -> Option<RowIdentity> {
+        let row = self.selection.item(i).and_downcast::<gtk::TreeListRow>()?;
+        let boxed = row.item().and_downcast::<glib::BoxedAnyObject>()?;
+        let item = boxed.borrow::<MessageItem>();
+        match &*item {
+            MessageItem::Message(summary) => Some(RowIdentity::Message(summary.mailbox.clone(), summary.uid)),
+            MessageItem::Thread(thread) => Some(RowIdentity::Thread(thread.id.clone())),
+            MessageItem::Section(_) => None,
         }
     }
 
@@ -2471,6 +2612,50 @@ mod tests {
         // Today's header + thread header + its 2 children + the single.
         assert_eq!(threaded.selection.n_items(), 5, "the thread did not expand");
         assert!(threaded.collapsed_threads.borrow().is_empty(), "a rebuild recorded a phantom thread collapse");
+
+        // --- A conversation header is a selection target (item 1.7): it
+        // stands for the whole conversation, the newest message for the
+        // single-message verbs, and the reading pane shows the conversation;
+        // a child row shows the conversation focused on it; a lone message
+        // shows on its own ---
+        // Rows: Today, thread header, its two children (oldest first), single.
+        threaded.selection.select_item(1, true);
+        match threaded.selection_kind() {
+            SelectionKind::Thread(_, messages) => assert_eq!(messages.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1, 2]),
+            other => panic!("a selected header is a Thread selection, got {other:?}"),
+        }
+        assert_eq!(threaded.selected_summaries().len(), 2, "the header stands for both messages");
+        assert_eq!(threaded.selected_summary().map(|m| m.uid.0), Some(2), "single-message verbs take the newest");
+        assert_eq!(threaded.summary_at_position(1).map(|m| m.uid.0), Some(2), "Enter on the header opens the newest");
+        assert!(matches!(threaded.reading_target(), ReadingTarget::Conversation { focus: None, .. }));
+        // The header's selection survives a rebuild that keeps the thread.
+        threaded.repopulate(
+            vec![in_thread(summary(2, today), "t"), in_thread(summary(1, yesterday), "t"), summary(3, today)],
+            SortKey::Date,
+            false,
+        );
+        threaded.repopulate(
+            vec![in_thread(summary(2, today), "t"), in_thread(summary(1, yesterday), "t"), summary(3, today)],
+            SortKey::Date,
+            true,
+        );
+        assert!(matches!(threaded.selection_kind(), SelectionKind::Thread(..)), "a rebuild lost the header selection");
+        threaded.selection.select_item(2, true);
+        match threaded.reading_target() {
+            ReadingTarget::Conversation { messages, focus, .. } => {
+                assert_eq!(messages.len(), 2);
+                assert_eq!(focus.map(|(_, uid)| uid.0), Some(1), "a child row focuses the conversation on itself");
+            }
+            other => panic!("a child row shows its conversation, got {other:?}"),
+        }
+        threaded.selection.select_item(4, true);
+        assert!(matches!(threaded.reading_target(), ReadingTarget::Single(m) if m.uid.0 == 3));
+        // Header plus a lone message: both count, the conversation in full.
+        threaded.selection.select_item(1, true);
+        threaded.selection.select_item(4, false);
+        assert_eq!(threaded.selected_summaries().iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(matches!(threaded.reading_target(), ReadingTarget::Multiple(_)));
+        threaded.selection.unselect_all();
 
         threaded.tree.child_row(0).expect("root row 0").set_expanded(true);
         let thread_row = threaded.tree.child_row(0).expect("root row 0").child_row(0).expect("thread row");
@@ -2995,6 +3180,41 @@ mod tests {
                 GroupKey::Date(DateBucket::Today),
             ]
         );
+    }
+
+    /// The reading pane's target (item 1.7): a header or a conversation's
+    /// row shows the conversation, a lone message (or a one-message
+    /// "conversation") shows on its own.
+    #[test]
+    fn reading_target_shows_conversations_for_headers_and_their_rows() {
+        let today = Utc::now();
+        let a = in_thread(summary(1, today - chrono::Duration::hours(1)), "t");
+        let b = in_thread(summary(2, today), "t");
+        let id: ThreadId = (a.mailbox.clone(), a.thread_key.clone());
+        let both = vec![a.clone(), b.clone()];
+        let lookup = |m: &EmailSummary| (m.thread_key.0 == "t").then(|| (id.clone(), both.clone()));
+
+        match reading_target_for(SelectionKind::Thread(id.clone(), both.clone()), lookup) {
+            ReadingTarget::Conversation { focus, messages, .. } => {
+                assert!(focus.is_none());
+                assert_eq!(messages.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        match reading_target_for(SelectionKind::Message(Box::new(b.clone())), lookup) {
+            ReadingTarget::Conversation { focus, .. } => assert_eq!(focus, Some((b.mailbox.clone(), b.uid))),
+            other => panic!("{other:?}"),
+        }
+        let lone = summary(3, today);
+        assert!(matches!(reading_target_for(SelectionKind::Message(Box::new(lone)), lookup), ReadingTarget::Single(_)));
+        let only = |_: &EmailSummary| Some((id.clone(), vec![a.clone()]));
+        assert!(
+            matches!(reading_target_for(SelectionKind::Message(Box::new(a.clone())), only), ReadingTarget::Single(_)),
+            "a conversation of one is just a message"
+        );
+        assert!(matches!(reading_target_for(SelectionKind::Empty, lookup), ReadingTarget::Empty));
+        assert!(matches!(reading_target_for(SelectionKind::Multiple(both.clone()), lookup), ReadingTarget::Multiple(_)));
+        assert_eq!(newest_message(&[b, a]).map(|m| m.uid.0), Some(2), "the newest by date, not by position");
     }
 
     fn in_thread(mut summary: EmailSummary, key: &str) -> EmailSummary {

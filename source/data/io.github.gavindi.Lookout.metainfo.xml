@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.172" date="2026-10-13">
+      <description>
+        <p>Selecting a conversation now shows all of its messages in the reading pane, stacked like Outlook's: the newest and any unread messages are open, and the rest are collapsed to the sender and a line of preview. Click one to open it. Each message has its own Reply, Reply all, Forward and More actions. Your own replies from Sent Items are included. View ▸ Messages switches between conversations and individual messages and puts the newest message on top or at the bottom. Both settings are also in Settings.</p>
+      </description>
+    </release>
     <release version="0.9.171" date="2026-10-13">
       <description>
         <p>Right-clicking a message now opens a full menu, in the same order as Outlook: Reply, Reply all and Forward; Delete, Archive, Move and Copy; Mark as read or unread, Flag, Pin, Snooze and Categorize; Report junk; View message details or source; Open in new window and Print. Move and Copy list the folders you used recently, with "Other folder…" for the rest, and Copy can be undone like everything else. Right-click a conversation to act on the whole conversation, or press Shift+F10 or the Menu key. Categorize now works on several messages at once.</p>

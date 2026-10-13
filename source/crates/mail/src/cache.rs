@@ -2057,6 +2057,39 @@ impl Cache {
         Ok(messages)
     }
 
+    /// The messages of `mailbox_id` that belong to a conversation known by
+    /// `message_ids` (bare or `<>`-bracketed Message-IDs): those whose own
+    /// Message-ID, In-Reply-To or any References entry is one of them. The
+    /// reading pane's conversation view (item 1.7) uses it to pull the user's
+    /// replies out of Sent Items, whose thread keys are computed per folder
+    /// and so never match the list's. Includes the prefetch's `partial` rows,
+    /// so a Sent folder never opened in full still contributes, and overlays
+    /// local follow-up flags like every other read path.
+    pub fn conversation_members_in(&self, mailbox_id: &MailboxId, message_ids: &[String]) -> Result<Vec<EmailSummary>> {
+        let ids: Vec<String> = message_ids.iter().map(|id| bare_message_id(id)).filter(|id| !id.is_empty()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json = serde_json::to_string(&ids)?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT data FROM messages WHERE mailbox_id = ?1 AND ( \
+               trim(json_extract(data, '$.message_id'), '<> ') IN (SELECT value FROM json_each(?2)) \
+               OR trim(json_extract(data, '$.in_reply_to'), '<> ') IN (SELECT value FROM json_each(?2)) \
+               OR EXISTS (SELECT 1 FROM json_each(data, '$.references') AS r \
+                          WHERE trim(r.value, '<> ') IN (SELECT value FROM json_each(?2))))",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![mailbox_id.0, ids_json], |row| row.get::<_, String>(0))?;
+        let mut messages = Vec::new();
+        for row in rows {
+            if let Ok(msg) = serde_json::from_str::<EmailSummary>(&row?) {
+                messages.push(msg);
+            }
+        }
+        overlay_local_follow_ups(&conn, &mut messages)?;
+        Ok(messages)
+    }
+
 
     /// Adds an outgoing message to the local outbox, due at `not_before`
     /// (`Utc::now()` for a normal send, a future time for schedule send).
@@ -2992,6 +3025,47 @@ mod tests {
         assert_eq!(loaded[&Uid(1)].follow_up(), None, "the snapshot no longer lists a");
         assert_eq!(loaded[&Uid(2)].follow_up(), None, "the newer local clear wins over the snapshot");
         assert!(loaded[&Uid(3)].is_flagged_for_follow_up());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A conversation's Sent Items members are found by Message-ID,
+    /// In-Reply-To or References, bracketed or not; unrelated mail and other
+    /// folders stay out, and the prefetch's partial rows count.
+    #[test]
+    fn conversation_members_match_by_id_reply_or_references() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let sent = MailboxId::new(&account_id, "Sent");
+        let inbox = MailboxId::new(&account_id, "INBOX");
+        let same = with_message_id(sample_summary(&sent, 1, None), "<root@x>");
+        let mut reply = with_message_id(sample_summary(&sent, 2, None), "<reply@x>");
+        reply.in_reply_to = Some("<root@x>".into());
+        let mut deep = with_message_id(sample_summary(&sent, 3, None), "<deep@x>");
+        deep.references = vec!["<other@x>".into(), "<mid@x>".into()];
+        let unrelated = with_message_id(sample_summary(&sent, 4, None), "<elsewhere@x>");
+        cache.replace_messages(&sent, UidValidity(1), &[same, reply, deep, unrelated]).unwrap();
+        // A Sent folder never opened in full: only the prefetch's window.
+        let sent_window = MailboxId::new(&account_id, "Sent Window");
+        let mut partial = with_message_id(sample_summary(&sent_window, 5, None), "<late@x>");
+        partial.in_reply_to = Some("mid@x".into());
+        cache.store_partial_messages(&sent_window, UidValidity(1), &[partial]).unwrap();
+        let mut in_inbox = with_message_id(sample_summary(&inbox, 6, None), "<inbox@x>");
+        in_inbox.in_reply_to = Some("<root@x>".into());
+        cache.replace_messages(&inbox, UidValidity(1), &[in_inbox]).unwrap();
+
+        let mut uids: Vec<u32> = cache
+            .conversation_members_in(&sent, &["root@x".to_string(), "<mid@x>".to_string()])
+            .unwrap()
+            .iter()
+            .map(|m| m.uid.0)
+            .collect();
+        uids.sort();
+        assert_eq!(uids, vec![1, 2, 3]);
+        assert_eq!(cache.conversation_members_in(&sent_window, &["<mid@x>".to_string()]).unwrap().iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![5]);
+        assert!(cache.conversation_members_in(&sent, &[]).unwrap().is_empty());
+        assert!(cache.conversation_members_in(&sent, &["<>".to_string()]).unwrap().is_empty());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

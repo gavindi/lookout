@@ -34,7 +34,7 @@ use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::google_tasks::{self, GoogleTasksCommand, GoogleTasksEvent, TaskList};
 use crate::last_view::{self, LastSelection};
-use crate::message_list::{format_row_date, unified_merge_order, Filter, FilterSet, MessageItem, MessageListModel, SelectionKind, SortKey, ThreadId};
+use crate::message_list::{format_row_date, unified_merge_order, Filter, FilterSet, MessageItem, MessageListModel, ReadingTarget, SelectionKind, SortKey, ThreadId};
 use crate::microsoft_oauth::MicrosoftCredentialProvider;
 use crate::ui_state_db::UiStateDb;
 use crate::worker::Worker;
@@ -530,6 +530,11 @@ fn reading_pane_choice_index(choice: &str) -> u32 {
 /// ribbon's dropdown and the Settings `ComboRow`.
 type ApplyReadingPane = Rc<dyn Fn(&str, bool)>;
 
+/// Applies a conversation-order choice ("newest-top"/"newest-bottom", item
+/// 1.7) and, when the second argument is true, writes it through to
+/// GSettings. Shared by View ▸ Messages and the Settings `ComboRow`.
+type ApplyConversationOrder = Rc<dyn Fn(&str, bool)>;
+
 /// The initial state of the View ribbon's reading-pane dropdown action
 /// (`win.reading-pane-position`): "off" when the reading pane is hidden,
 /// otherwise the stored position ("right" or "bottom").
@@ -538,6 +543,16 @@ fn reading_pane_action_state(settings: &crate::settings::SettingsStore) -> Strin
         return "off".to_string();
     }
     settings.get_string(crate::settings::LAYOUT_READING_PANE_POSITION)
+}
+
+/// The `win.message-organization` state for a `mail-threaded` value: Outlook's
+/// View ▸ Messages ▸ "Show as conversations" / "Show as individual messages".
+fn message_organization_value(threaded: bool) -> &'static str {
+    if threaded {
+        "conversations"
+    } else {
+        "messages"
+    }
 }
 
 /// The reading-pane dropdown's tooltip, naming its current position.
@@ -761,18 +776,15 @@ struct CidSchemeRequest {
     cid: String,
 }
 
-/// One inline `cid:` image fetch in flight for the message on the reading
-/// pane, tracked in `UiState::pending_cid` and keyed by the `BodyPart`'s
-/// part number. Answered with the part's bytes (`AccountEvent::PartFetched`)
-/// or an error (`PartFetchFailed`, a timeout, or the user moving to another
-/// message); `request` is the WebKit URI-scheme request the answer is
-/// finished into. The part itself isn't kept - the response arms re-read it
-/// from the event.
-struct PendingCid {
-    mailbox: MailboxId,
-    uid: Uid,
-    request: webkit::URISchemeRequest,
-}
+/// The inline `cid:` image fetches in flight for the reading pane's message
+/// (or its conversation's cards, item 1.7), tracked in
+/// `UiState::pending_cid` keyed by `(mailbox, uid, part number)`. Each holds
+/// every WebKit URI-scheme request waiting on that part - a body can embed
+/// the same image twice - answered together with the part's bytes
+/// (`AccountEvent::PartFetched`) or an error (`PartFetchFailed`, a timeout,
+/// or the user moving to another message). The part itself isn't kept - the
+/// response arms re-read it from the event.
+type PendingCidKey = (MailboxId, Uid, String);
 
 /// A small bounded LRU of recently-viewed message bodies, keyed by
 /// `(mailbox, uid)`, front = most recently used. See `BODY_CACHE_IN_MEMORY`.
@@ -1008,7 +1020,21 @@ pub(crate) struct UiState {
     /// fetched bytes (`AccountEvent::PartFetched`) or an error
     /// (`PartFetchFailed`, a timeout, or the user moving on). See
     /// `PendingCid`.
-    pending_cid: HashMap<String, PendingCid>,
+    pending_cid: HashMap<PendingCidKey, Vec<webkit::URISchemeRequest>>,
+    /// The conversation on the reading pane's "conversation" page (item
+    /// 1.7), or `None` while the pane shows a single message or nothing.
+    rendered_conversation: Option<ConversationPane>,
+    /// The `cid:`-bearing parts of each conversation card whose body has
+    /// loaded, keyed by message - the conversation counterpart of
+    /// `rendered_inline_parts`.
+    conversation_inline_parts: HashMap<(MailboxId, Uid), Vec<BodyPart>>,
+    /// The conversation page's widgets, set once when the reading pane is
+    /// built, so the account event loop can reach them.
+    conversation_ui: Option<Rc<ConversationUi>>,
+    /// The conversation's unread cards the reader has seen, to be marked
+    /// read when the selection moves away ("on-selection-change" mode, item
+    /// 1.8) - the conversation counterpart of `mark_read_on_leave`.
+    conversation_mark_on_leave: Vec<(MailboxId, Uid)>,
     /// The `cid:`-bearing parts of the message currently on the reading pane
     /// (a subset of the last rendered `EmailBody::parts`), used to resolve
     /// the `cid:` references WebKit's scheme handler forwards. Stale the
@@ -2497,6 +2523,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         read_receipts_sent: HashSet::new(),
         read_receipt_context: None,
         pending_cid: HashMap::new(),
+        rendered_conversation: None,
+        conversation_inline_parts: HashMap::new(),
+        conversation_ui: None,
+        conversation_mark_on_leave: Vec::new(),
         rendered_inline_parts: Vec::new(),
         temp_attachment_files: HashSet::new(),
         toast_overlay: Some(toast_overlay.clone()),
@@ -3427,14 +3457,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.thread_box.set_visible(true);
                 widgets.action_box.set_visible(false);
                 widgets.tag_dots.set_visible(false);
-                // A conversation header is not a selection target, exactly
-                // like a section header: clicking it expands/collapses (via
-                // the `TreeExpander`) rather than selecting, and it can never
-                // enter `MultiSelection`'s selection set. The batch actions'
-                // checkboxes and the hover quick actions both key off the row
-                // being a message, so a thread row shows neither.
-                list_item.set_selectable(false);
-                list_item.set_activatable(false);
+                // A conversation header is a selection target (item 1.7):
+                // selecting it shows the whole conversation in the reading
+                // pane, and verbs act on every message in it, as in
+                // Outlook; its `TreeExpander` arrow expands/collapses it.
+                // The batch actions' checkboxes and the hover quick actions
+                // key off the row being a message, so a thread row shows
+                // neither.
+                list_item.set_selectable(true);
+                list_item.set_activatable(true);
                 *widgets.bound.borrow_mut() = None;
                 *widgets.bound_thread.borrow_mut() = Some(thread.id.clone());
                 widgets.thread_expander.set_list_row(Some(&row));
@@ -4046,18 +4077,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // - WebKitGTK only delivers `decide-policy` *response* decisions for
     // the main frame, not for subresources, so the response veto below
     // can't be the gate that holds the block.
-    // Opens an `http(s)` URI in the system's default browser. Other schemes
-    // are deliberately ignored - `data:`/`cid:`/`about:`/`file:` are local to
-    // the pane, and `mailto:` is itself a mail client's business (a
-    // compose-from-link flow is the later refinement).
-    fn open_uri_in_default_browser(uri: &str) {
-        let scheme = uri.split(':').next().unwrap_or("");
-        if matches!(scheme, "http" | "https") {
-            if let Err(e) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
-                tracing::warn!("failed to open link {uri} in the default browser: {e}");
-            }
-        }
-    }
     let state_for_policy = state.clone();
     web_view.connect_decide_policy(move |_view, decision, decision_type| {
         let uri_is_local = |uri: &str| -> bool {
@@ -4385,6 +4404,35 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     reading_error_page.set_child(Some(&reading_error_retry));
     reading_error_page.set_widget_name("body-error-page");
     reading_stack.add_named(&reading_error_page, Some("error"));
+    // The conversation page (item 1.7): a selected conversation, or a
+    // message inside one, shows here as stacked cards.
+    let conversation_context = ConversationContext {
+        state: state.clone(),
+        worker: worker.clone(),
+        message_header: message_header.clone(),
+        menu: MessageMenuContext {
+            reading_stack: reading_stack.clone(),
+            ..message_menu_context.clone()
+        },
+    };
+    {
+        let (conversation_ui, conversation_page) = build_conversation_ui(&conversation_context, &reading_stack);
+        reading_stack.add_named(&conversation_page, Some("conversation"));
+        state.borrow_mut().conversation_ui = Some(conversation_ui);
+    }
+    // "Back to conversation" on a message opened on its own from a card.
+    {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        message_header.back_button.connect_clicked(move |button| {
+            button.set_visible(false);
+            if state.borrow().rendered_conversation.is_none() {
+                return;
+            }
+            clear_single_message_state(&state);
+            reading_stack.set_visible_child_name("conversation");
+        });
+    }
     reading_stack.set_visible_child_name("empty");
     // Retry acts on whatever fetch most recently failed, re-arming the whole
     // dispatch (pending request + timeout + loading page).
@@ -5115,17 +5163,44 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let overview_pane_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").build();
     overview_pane_toggle.set_tooltip_text(Some("Calendar overview"));
     overview_pane_toggle.set_active(true);
-    let conversations_toggle = gtk::ToggleButton::builder()
+    // View ▸ Messages ▾ (UX-22, item 1.7): Outlook's "Show as conversations /
+    // individual messages" plus the conversation reading pane's order. Both
+    // drive stateful `win.` actions whose handlers (wired below, once the
+    // message list exists) persist to GSettings and mirror Config →
+    // Appearance's rows.
+    let messages_menu = gio::Menu::new();
+    let organization_section = gio::Menu::new();
+    organization_section.append(Some("Show as conversations"), Some("win.message-organization('conversations')"));
+    organization_section.append(Some("Show as individual messages"), Some("win.message-organization('messages')"));
+    messages_menu.append_section(None, &organization_section);
+    let order_section = gio::Menu::new();
+    for (value, label) in crate::settings::CONVERSATION_ORDERS.iter().zip(crate::settings::CONVERSATION_ORDER_LABELS) {
+        order_section.append(Some(label), Some(&format!("win.conversation-order('{value}')")));
+    }
+    messages_menu.append_section(Some("Conversation reading pane"), &order_section);
+    let messages_button = gtk::MenuButton::builder()
         .icon_name(themed_icon_name(&["mail-replied-symbolic", "mail-forwarded-symbolic"]))
+        .tooltip_text("Messages")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .menu_model(&messages_menu)
         .build();
-    conversations_toggle.set_tooltip_text(Some("Conversations: group replies under collapsible thread headers"));
-    conversations_toggle.set_active(true);
+    let message_organization_action = gio::SimpleAction::new_stateful(
+        "message-organization",
+        Some(glib::VariantTy::STRING),
+        &message_organization_value(settings.get_bool(crate::settings::MAIL_THREADED)).to_variant(),
+    );
+    let conversation_order_action = gio::SimpleAction::new_stateful(
+        "conversation-order",
+        Some(glib::VariantTy::STRING),
+        &crate::settings::conversation_order_at(crate::settings::conversation_order_index(&settings.get_string(crate::settings::MAIL_CONVERSATION_ORDER))).to_variant(),
+    );
     let view_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     view_toolbar.append(&layout_label);
     view_toolbar.append(&folder_pane_toggle);
     view_toolbar.append(&reading_pane_button);
     view_toolbar.append(&overview_pane_toggle);
-    view_toolbar.append(&conversations_toggle);
+    view_toolbar.append(&messages_button);
 
     let view_toolbar_stack = gtk::Stack::new();
     view_toolbar_stack.add_named(&command_toolbar, Some("mail-home"));
@@ -5345,16 +5420,99 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     {
-        // Conversations: re-render the message list in or out of thread
-        // grouping. The mode lives in the model (`set_threaded`), and the
-        // setting persists it - mirroring how the sort controls own their
-        // state in `UiState` while GSettings mirrors it.
-        let state = state.clone();
-        let message_list = message_list.clone();
-        conversations_toggle.connect_toggled(move |btn| {
-            state.borrow().settings.set_bool(crate::settings::MAIL_THREADED, btn.is_active());
-            message_list.set_threaded(btn.is_active());
-        });
+        // Conversations (View ▸ Messages, Config → Appearance): re-render the
+        // message list in or out of thread grouping. The mode lives in the
+        // model (`set_threaded`), and the setting persists it - mirroring how
+        // the sort controls own their state in `UiState` while GSettings
+        // mirrors it. `suppress_rows` stops the Config rows' own notify
+        // handlers from echoing a change back through here.
+        let suppress_rows: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let apply_threaded: Rc<dyn Fn(bool, bool)> = {
+            let state = state.clone();
+            let message_list = message_list.clone();
+            let config_view = config_view.clone();
+            let message_organization_action = message_organization_action.clone();
+            let conversation_order_action = conversation_order_action.clone();
+            let suppress_rows = suppress_rows.clone();
+            Rc::new(move |threaded: bool, persist: bool| {
+                message_organization_action.set_state(&message_organization_value(threaded).to_variant());
+                conversation_order_action.set_enabled(threaded);
+                suppress_rows.set(true);
+                config_view.conversations_row.set_active(threaded);
+                suppress_rows.set(false);
+                if persist {
+                    state.borrow().settings.set_bool(crate::settings::MAIL_THREADED, threaded);
+                }
+                message_list.set_threaded(threaded);
+            })
+        };
+        let apply_order: ApplyConversationOrder = {
+            let state = state.clone();
+            let config_view = config_view.clone();
+            let conversation_order_action = conversation_order_action.clone();
+            let suppress_rows = suppress_rows.clone();
+            let conversation_context = conversation_context.clone();
+            Rc::new(move |choice: &str, persist: bool| {
+                let index = crate::settings::conversation_order_index(choice);
+                let choice = crate::settings::conversation_order_at(index);
+                conversation_order_action.set_state(&choice.to_variant());
+                suppress_rows.set(true);
+                config_view.conversation_order_row.set_selected(index);
+                suppress_rows.set(false);
+                if persist {
+                    state.borrow().settings.set_string(crate::settings::MAIL_CONVERSATION_ORDER, choice);
+                    relayout_conversation(&conversation_context);
+                }
+            })
+        };
+        {
+            let apply_threaded = apply_threaded.clone();
+            message_organization_action.connect_activate(move |_action, parameter| {
+                let Some(choice) = parameter.and_then(|p| p.str()) else { return };
+                apply_threaded(choice == "conversations", true);
+            });
+        }
+        {
+            let apply_threaded = apply_threaded.clone();
+            let suppress_rows = suppress_rows.clone();
+            config_view.conversations_row.connect_active_notify(move |row| {
+                if !suppress_rows.get() {
+                    apply_threaded(row.is_active(), true);
+                }
+            });
+        }
+        {
+            let apply_order = apply_order.clone();
+            conversation_order_action.connect_activate(move |_action, parameter| {
+                let Some(choice) = parameter.and_then(|p| p.str()) else { return };
+                apply_order(choice, true);
+            });
+        }
+        {
+            let apply_order = apply_order.clone();
+            let suppress_rows = suppress_rows.clone();
+            config_view.conversation_order_row.connect_selected_notify(move |row| {
+                if !suppress_rows.get() {
+                    apply_order(crate::settings::conversation_order_at(row.selected()), true);
+                }
+            });
+        }
+        {
+            let state = state.clone();
+            let conversation_context = conversation_context.clone();
+            config_view.conversation_include_sent_row.connect_active_notify(move |row| {
+                let store = state.borrow().settings.clone();
+                if store.get_bool(crate::settings::MAIL_CONVERSATION_INCLUDE_SENT) != row.is_active() {
+                    store.set_bool(crate::settings::MAIL_CONVERSATION_INCLUDE_SENT, row.is_active());
+                    relayout_conversation(&conversation_context);
+                }
+            });
+        }
+        // Seed every control from the stored state without writing back.
+        let persisted = state.borrow().settings.clone();
+        apply_threaded(persisted.get_bool(crate::settings::MAIL_THREADED), false);
+        apply_order(&persisted.get_string(crate::settings::MAIL_CONVERSATION_ORDER), false);
+        config_view.conversation_include_sent_row.set_active(persisted.get_bool(crate::settings::MAIL_CONVERSATION_INCLUDE_SENT));
     }
     // Phase 5: apply the persisted Layout toggles now that their handlers are
     // wired (each `set_active` fires `toggled`, which sets the card's
@@ -5364,7 +5522,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let persisted = state.borrow().settings.clone();
         folder_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_FOLDER_PANE));
         overview_pane_toggle.set_active(persisted.get_bool(crate::settings::LAYOUT_CALENDAR_OVERVIEW));
-        conversations_toggle.set_active(persisted.get_bool(crate::settings::MAIL_THREADED));
     }
 
     // Which sub-page each view should show when its nav-rail button becomes
@@ -5802,6 +5959,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         window.add_action(action);
     }
     window.add_action(&reading_pane_action);
+    window.add_action(&message_organization_action);
+    window.add_action(&conversation_order_action);
 
     // --- Close-to-background: the window's close button hides the window
     // instead of exiting (Config → General → "Keep running when the window
@@ -7920,11 +8079,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         Rc::new({
             let window = window.clone();
             let reading_stack = reading_stack.clone();
+            let state = state.clone();
             move || {
-                if reading_stack.visible_child_name().as_deref() == Some("message") {
-                    let parent: &gtk::Window = window.upcast_ref();
-                    print_visible_message(&reading_stack, parent);
-                }
+                let parent: &gtk::Window = window.upcast_ref();
+                print_reading_pane(&state, &reading_stack, parent);
             }
         }),
     );
@@ -9568,23 +9726,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let web_view = web_view.clone();
         let user_content_manager = user_content_manager.clone();
         let theme_override_sheet = theme_override_sheet.clone();
+        let conversation_context = conversation_context.clone();
         message_list.selection.connect_selection_changed(move |_sel, pos, n_items| {
-            let kind = match message_list_for_selection.selection_kind() {
-                SelectionKind::Empty => "Empty",
-                SelectionKind::Section => "Section",
-                SelectionKind::Message(_) => "Message",
-                SelectionKind::Multiple(_) => "Multiple",
+            let target = message_list_for_selection.reading_target();
+            let kind = match &target {
+                ReadingTarget::Empty => "Empty",
+                ReadingTarget::Single(_) => "Message",
+                ReadingTarget::Conversation { .. } => "Conversation",
+                ReadingTarget::Multiple(_) => "Multiple",
             };
             tracing::debug!(pos, n_items, kind, "selection-changed fired");
             refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
             refresh_pin_button(&pin_button, &message_list_for_selection);
             refresh_flag_button(&flag_button, &message_list_for_selection);
-            let summary = match message_list_for_selection.selection_kind() {
-                SelectionKind::Message(summary) => *summary,
-                // A date section header - unreachable via the mouse (headers
-                // are unselectable, see `bind()`), kept as a defensive no-op.
-                SelectionKind::Section => return,
-                SelectionKind::Multiple(summaries) => {
+            let summary = match target {
+                ReadingTarget::Single(summary) => {
+                    // A lone message (or any message while conversations are
+                    // off): leave a conversation that was showing.
+                    leave_conversation(&state);
+                    *summary
+                }
+                // A conversation header, or a message inside a listed
+                // conversation: the whole conversation (item 1.7).
+                ReadingTarget::Conversation { id, messages, focus } => {
+                    open_conversation(&conversation_context, id, messages, focus);
+                    return;
+                }
+                ReadingTarget::Multiple(summaries) => {
+                    leave_conversation(&state);
                     // Two or more messages selected: show the "N selected"
                     // placeholder and skip mark-as-read/body-fetch entirely -
                     // the same state reset the `Empty` arm below does, since
@@ -9634,7 +9803,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     reading_stack.set_visible_child_name("multi");
                     return;
                 }
-                SelectionKind::Empty => {
+                ReadingTarget::Empty => {
                     // Nothing selected: show the "no message selected"
                     // placeholder and drop every per-message state - but only
                     // once this is confirmed to persist. A list repopulate's
@@ -9659,6 +9828,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         if !matches!(message_list_for_selection.selection_kind(), SelectionKind::Empty) {
                             return;
                         }
+                        leave_conversation(&state);
                         // The pane is genuinely empty now: mark the message we
                         // just left read in "on-selection-change" mode (item
                         // 1.8) and drop any delayed mark queued for it.
@@ -11199,6 +11369,8 @@ fn spawn_account_event_loop(
                             }
                         };
                         let waiting_body = waiter.as_ref().map(|_| body.clone());
+                        // A conversation card waiting on this body (item 1.7).
+                        conversation_body_arrived(&state, &mailbox, uid, body.clone());
                         if should_render {
                             tracing::debug!(?mailbox, uid = uid.0, "FetchBody: body arrived on UI thread");
                             render_body(&state, &reading_stack, &message_header, mailbox, uid, body);
@@ -11216,14 +11388,8 @@ fn spawn_account_event_loop(
                         // linger because the map only ever holds the current
                         // message's requests. Runs first so the strip closures
                         // below can move `part`/`bytes` into their futures.
-                        let cid_request = {
-                            let mut st = state.borrow_mut();
-                            match st.pending_cid.get(&part.part_number) {
-                                Some(p) if p.mailbox == mailbox && p.uid == uid => Some(st.pending_cid.remove(&part.part_number).expect("present").request),
-                                _ => None,
-                            }
-                        };
-                        if let Some(cid_request) = cid_request {
+                        let cid_requests = state.borrow_mut().pending_cid.remove(&(mailbox.clone(), uid, part.part_number.clone()));
+                        for cid_request in cid_requests.into_iter().flatten() {
                             tracing::debug!(?mailbox, uid = uid.0, part = %part.part_number, bytes = bytes.len(), "cid: image bytes arrived; finishing WebKit request");
                             let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
                             cid_request.finish(&stream, bytes.len() as i64, Some(&part.content_type));
@@ -11309,14 +11475,8 @@ fn spawn_account_event_loop(
                         // The same failure for an inline `cid:` image request:
                         // finish the WebKit request with an error so the browser
                         // draws a broken image rather than waiting forever.
-                        let cid_request = {
-                            let mut st = state.borrow_mut();
-                            match st.pending_cid.get(&part_number) {
-                                Some(p) if p.mailbox == mailbox && p.uid == uid => Some(st.pending_cid.remove(&part_number).expect("present").request),
-                                _ => None,
-                            }
-                        };
-                        if let Some(cid_request) = cid_request {
+                        let cid_requests = state.borrow_mut().pending_cid.remove(&(mailbox.clone(), uid, part_number.clone()));
+                        for cid_request in cid_requests.into_iter().flatten() {
                             tracing::warn!(?mailbox, uid = uid.0, part = %part_number, "cid: inline image fetch failed: {message}");
                             finish_cid_request_error(&cid_request, "the inline image could not be fetched");
                         }
@@ -15200,6 +15360,9 @@ enum MessageMenuTarget {
     Row { summary: Box<EmailSummary>, position: Option<u32> },
     /// A conversation header: the menu acts on every message in it.
     Thread(ThreadId),
+    /// One message on its own, whatever is selected - a conversation card's
+    /// "More actions" (item 1.7).
+    Message(Box<EmailSummary>),
     /// The current selection (the keyboard's Shift+F10 / Menu key).
     Selection,
 }
@@ -15232,7 +15395,16 @@ fn message_menu_targets(message_list: &MessageListModel, target: MessageMenuTarg
             let newest = messages.iter().max_by_key(|s| s.date).cloned();
             (messages, newest)
         }
-        MessageMenuTarget::Selection => selection_targets(message_list.selected_summaries()),
+        MessageMenuTarget::Message(summary) => (vec![(*summary).clone()], Some(*summary)),
+        // A selected conversation header acts on the whole conversation,
+        // with its newest message for the single-message verbs (item 1.7).
+        MessageMenuTarget::Selection => match message_list.selection_kind() {
+            SelectionKind::Thread(_, messages) => {
+                let newest = crate::message_list::newest_message(&messages);
+                (messages, newest)
+            }
+            _ => selection_targets(message_list.selected_summaries()),
+        },
     }
 }
 
@@ -15543,18 +15715,44 @@ fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: 
     // Print is only meaningful while a message is actually showing in the
     // reading pane; the selection alone isn't enough (it may be a selection
     // the pane hasn't rendered yet, or nothing rendered at all).
-    print_button.set_sensitive(has_selection && reading_stack.visible_child_name().as_deref() == Some("message"));
+    print_button.set_sensitive(has_selection && matches!(reading_stack.visible_child_name().as_deref(), Some("message") | Some("conversation")));
     {
         let popover = popover.clone();
         let reading_stack = reading_stack.clone();
+        let state = state.clone();
         print_button.connect_clicked(move |_| {
             popover.popdown();
             let Some(parent) = popover.root().and_downcast::<gtk::Window>() else { return };
-            print_visible_message(&reading_stack, &parent);
+            print_reading_pane(&state, &reading_stack, &parent);
         });
     }
     boxed.append(&print_button);
     boxed
+}
+
+/// Prints what the reading pane shows: the message on the "message" page,
+/// or - on the conversation page (item 1.7) - the selected card's message,
+/// else the newest, as Outlook prints the selected item. Nothing otherwise.
+fn print_reading_pane(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, parent: &gtk::Window) {
+    match reading_stack.visible_child_name().as_deref() {
+        Some("message") => print_visible_message(reading_stack, parent),
+        Some("conversation") => {
+            let summary = {
+                let st = state.borrow();
+                st.rendered_conversation.as_ref().and_then(|pane| {
+                    let messages: Vec<EmailSummary> = pane.cards.iter().map(|card| card.member.summary.clone()).collect();
+                    pane.focus
+                        .as_ref()
+                        .and_then(|(mailbox, uid)| messages.iter().find(|m| &m.mailbox == mailbox && m.uid == *uid).cloned())
+                        .or_else(|| crate::message_list::newest_message(&messages))
+                })
+            };
+            if let Some(summary) = summary {
+                print_message(state, parent, &summary);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Prints the currently-visible message body. HTML bodies print directly
@@ -19256,9 +19454,11 @@ fn finish_cid_request_error(request: &webkit::URISchemeRequest, message: &str) {
 /// subresources of a message the user has left.
 fn drop_pending_cid(state: &Rc<RefCell<UiState>>) {
     let pending = std::mem::take(&mut state.borrow_mut().pending_cid);
-    for (part_number, pending) in pending {
+    for ((_, _, part_number), requests) in pending {
         tracing::debug!(part = %part_number, "cid: dropping pending inline-image request");
-        finish_cid_request_error(&pending.request, "the message changed before the inline image arrived");
+        for request in requests {
+            finish_cid_request_error(&request, "the message changed before the inline image arrived");
+        }
     }
 }
 
@@ -19275,12 +19475,21 @@ fn drop_pending_cid(state: &Rc<RefCell<UiState>>) {
 fn dispatch_cid_request(state: &Rc<RefCell<UiState>>, cid: &str, request: webkit::URISchemeRequest) {
     let target = (|| {
         let st = state.borrow();
-        let (mailbox, uid) = st.rendered_message.clone()?;
-        let part = st
-            .rendered_inline_parts
-            .iter()
-            .find(|p| p.cid.as_deref().is_some_and(|c| lookout_core::cid_matches(cid, c)))?
-            .clone();
+        // A conversation card's reference names its card (item 1.7); any
+        // other is the single-message view's.
+        let (mailbox, uid, cid, parts) = match crate::conversation_view::split_card_cid(cid) {
+            Some((card, cid)) => {
+                let pane = st.rendered_conversation.as_ref()?;
+                let (mailbox, uid) = pane.cards.get(card)?.key();
+                let parts = st.conversation_inline_parts.get(&(mailbox.clone(), uid))?.clone();
+                (mailbox, uid, cid, parts)
+            }
+            None => {
+                let (mailbox, uid) = st.rendered_message.clone()?;
+                (mailbox, uid, cid, st.rendered_inline_parts.clone())
+            }
+        };
+        let part = parts.iter().find(|p| p.cid.as_deref().is_some_and(|c| lookout_core::cid_matches(cid, c)))?.clone();
         let cmd_tx = mailbox_account_id(&mailbox).and_then(|id| st.accounts.get(&id)).map(|h| h.interactive_cmd_tx.clone())?;
         Some((mailbox, uid, part, cmd_tx))
     })();
@@ -19288,18 +19497,19 @@ fn dispatch_cid_request(state: &Rc<RefCell<UiState>>, cid: &str, request: webkit
         finish_cid_request_error(&request, "this message has no matching inline image");
         return;
     };
-    let part_number = part.part_number.clone();
-    state.borrow_mut().pending_cid.insert(
-        part_number.clone(),
-        PendingCid {
-            mailbox: mailbox.clone(),
-            uid,
-            request,
-        },
-    );
-    tracing::debug!(?mailbox, uid = uid.0, cid, part = %part_number, "cid: inline image request dispatched to account actor");
+    let key = (mailbox.clone(), uid, part.part_number.clone());
+    let already_fetching = {
+        let mut st = state.borrow_mut();
+        let waiting = st.pending_cid.entry(key.clone()).or_default();
+        waiting.push(request);
+        waiting.len() > 1
+    };
+    if already_fetching {
+        return;
+    }
+    tracing::debug!(?mailbox, uid = uid.0, cid, part = %part.part_number, "cid: inline image request dispatched to account actor");
     let _ = cmd_tx.send_blocking(AccountCommand::FetchAttachment { mailbox, uid, part });
-    arm_cid_timeout(state, part_number);
+    arm_cid_timeout(state, key);
 }
 
 /// Backstop for a `cid:` image fetch whose answer is lost (e.g. the session
@@ -19307,18 +19517,16 @@ fn dispatch_cid_request(state: &Rc<RefCell<UiState>>, cid: &str, request: webkit
 /// WebKit request with an error after a generous grace period instead of
 /// letting the page hang on it. Only fires if this exact request is still
 /// the outstanding one.
-fn arm_cid_timeout(state: &Rc<RefCell<UiState>>, part_number: String) {
+fn arm_cid_timeout(state: &Rc<RefCell<UiState>>, key: PendingCidKey) {
     let state_for_timeout = state.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
-        let request = {
-            let mut st = state_for_timeout.borrow_mut();
-            match st.pending_cid.get(&part_number) {
-                Some(_) => st.pending_cid.remove(&part_number).expect("present").request,
-                None => return glib::ControlFlow::Break,
-            }
+        let Some(requests) = state_for_timeout.borrow_mut().pending_cid.remove(&key) else {
+            return glib::ControlFlow::Break;
         };
-        tracing::warn!(part = %part_number, "cid: inline image fetch timed out");
-        finish_cid_request_error(&request, "the inline image could not be fetched");
+        tracing::warn!(part = %key.2, "cid: inline image fetch timed out");
+        for request in requests {
+            finish_cid_request_error(&request, "the inline image could not be fetched");
+        }
         glib::ControlFlow::Break
     });
 }
@@ -20654,7 +20862,12 @@ pub(crate) fn remote_content_policy(state: &Rc<RefCell<UiState>>, trust_sender: 
 /// `rendered_message` check so a fetch started from a pop-out completes even
 /// after the reading pane has moved to a different message.
 pub(crate) fn message_is_visible(st: &UiState, mailbox: &MailboxId, uid: Uid) -> bool {
-    st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid)) || st.message_windows.contains_key(&(mailbox.clone(), uid))
+    st.rendered_message.as_ref() == Some(&(mailbox.clone(), uid))
+        || st.message_windows.contains_key(&(mailbox.clone(), uid))
+        || st
+            .rendered_conversation
+            .as_ref()
+            .is_some_and(|pane| pane.cards.iter().any(|card| card.member.summary.mailbox == *mailbox && card.member.summary.uid == uid))
 }
 
 /// Dispatches `FetchRawMessage` for `(mailbox, uid)` on its account's
@@ -20673,6 +20886,929 @@ pub(crate) fn send_fetch_raw_message(state: &Rc<RefCell<UiState>>, mailbox: &Mai
             .is_ok(),
         None => false,
     }
+}
+
+// --- Conversation view (item 1.7, M-04 / UX-35) ---------------------------
+//
+// The reading pane's "conversation" page: every message of the selected
+// conversation stacked as cards in one WebView (`conversation_view` builds
+// the document and holds the trusted script). It lives beside the single-
+// message "message" page rather than replacing it - a lone message, any
+// message while conversations are off, and "Show details" on a card still
+// render there, with every banner it has.
+
+/// Opens an `http(s)` URI in the system's default browser - a link clicked
+/// in the reading pane's message or conversation views. Other schemes are
+/// deliberately ignored - `data:`/`cid:`/`about:`/`file:` are local to the
+/// pane, and `mailto:` is itself a mail client's business (a
+/// compose-from-link flow is the later refinement).
+fn open_uri_in_default_browser(uri: &str) {
+    let scheme = uri.split(':').next().unwrap_or("");
+    if matches!(scheme, "http" | "https") {
+        if let Err(e) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
+            tracing::warn!("failed to open link {uri} in the default browser: {e}");
+        }
+    }
+}
+
+/// The reading pane's conversation page widgets (item 1.7).
+pub(crate) struct ConversationUi {
+    subject_label: gtk::Label,
+    theme_button: gtk::ToggleButton,
+    web_view: webkit::WebView,
+    reading_stack: gtk::Stack,
+    /// Set while the app itself flips `theme_button`, so its handler doesn't
+    /// rebuild the document for a change that isn't the reader's.
+    suppress_theme: Cell<bool>,
+}
+
+/// The conversation on the reading pane (item 1.7).
+struct ConversationPane {
+    id: ThreadId,
+    /// The listed messages it was built from: a list refresh that changes
+    /// them rebuilds the view, one that only changes their flags updates
+    /// the cards in place.
+    listed: Vec<EmailSummary>,
+    cards: Vec<crate::conversation_view::Card>,
+    /// The list row the reader selected, or `None` for the header.
+    focus: Option<(MailboxId, Uid)>,
+    /// Bumped on every build, so a late cache read for an older build is
+    /// dropped.
+    generation: u64,
+    /// The document has finished loading, so script calls can reach it.
+    ready: bool,
+    /// Script calls made before `ready`, run in order once it is.
+    queued: Vec<String>,
+    /// A scroll offset to restore once a rebuilt document has loaded.
+    restore_scroll: Option<f64>,
+    /// Cards whose blocked remote content the reader chose to show.
+    load_once: HashSet<(MailboxId, Uid)>,
+    /// The "Switch message theme" override, for every card.
+    dark: bool,
+    /// Opened unread cards waiting on the "after a delay" mark-as-read
+    /// timer, and the timer.
+    mark_pending: Vec<(MailboxId, Uid)>,
+    mark_timer: Option<glib::SourceId>,
+}
+
+/// What a conversation script message needs to act.
+#[derive(Clone)]
+struct ConversationContext {
+    state: Rc<RefCell<UiState>>,
+    worker: Rc<Worker>,
+    message_header: crate::message_header::MessageHeader,
+    menu: MessageMenuContext,
+}
+
+fn next_conversation_generation() -> u64 {
+    thread_local! {
+        static NEXT: Cell<u64> = const { Cell::new(0) };
+    }
+    NEXT.with(|next| {
+        next.set(next.get() + 1);
+        next.get()
+    })
+}
+
+/// Runs `script` in the conversation document's script world, or queues it
+/// until the document has loaded.
+fn run_conversation_script(state: &Rc<RefCell<UiState>>, script: String) {
+    let ui = {
+        let mut st = state.borrow_mut();
+        let Some(pane) = st.rendered_conversation.as_mut() else { return };
+        if !pane.ready {
+            pane.queued.push(script);
+            return;
+        }
+        st.conversation_ui.clone()
+    };
+    let Some(ui) = ui else { return };
+    ui.web_view.evaluate_javascript(
+        &script,
+        Some(crate::conversation_view::SCRIPT_WORLD),
+        None,
+        None::<&gio::Cancellable>,
+        |result| {
+            if let Err(e) = result {
+                tracing::debug!("conversation script call failed: {e}");
+            }
+        },
+    );
+}
+
+/// Resets the single-message view's per-message state when the pane moves
+/// to a conversation, so coming back to that message later renders it
+/// afresh rather than looking already shown.
+fn clear_single_message_state(state: &Rc<RefCell<UiState>>) {
+    flush_mark_read_on_leave(state);
+    cancel_pending_mark_read(state);
+    {
+        let mut st = state.borrow_mut();
+        st.pending_body_request = None;
+        st.body_fetch_error = None;
+        st.body_fetch_generation += 1;
+        st.pending_html_reveal = false;
+        st.reveal_generation += 1;
+        st.pending_header = None;
+        st.pending_attachment = None;
+        st.pending_raw_message = None;
+        st.unsubscribe_info = None;
+        st.unsubscribe_dismissed = None;
+        st.imip = None;
+        st.imip_dismissed = None;
+        st.read_receipt_request = None;
+        st.read_receipt_dismissed = None;
+        st.read_receipt_context = None;
+        st.rendered_trust_sender = None;
+        st.load_once_images = false;
+        st.trust_banner_dismissed = None;
+        st.rendered_message = None;
+        st.rendered_draft = None;
+        st.rendered_snooze = None;
+        st.rendered_follow_up = None;
+        st.pending_draft_open = None;
+    }
+    drop_pending_cid(state);
+}
+
+/// Leaves the conversation on the reading pane, if there is one: marks the
+/// cards read that "on-selection-change" mode was holding (item 1.8), stops
+/// a pending delayed mark, and drops the conversation's state.
+fn leave_conversation(state: &Rc<RefCell<UiState>>) {
+    let (pane, on_leave) = {
+        let mut st = state.borrow_mut();
+        let pane = st.rendered_conversation.take();
+        st.conversation_inline_parts.clear();
+        (pane, std::mem::take(&mut st.conversation_mark_on_leave))
+    };
+    let Some(mut pane) = pane else { return };
+    if let Some(timer) = pane.mark_timer.take() {
+        timer.remove();
+    }
+    for (mailbox, uid) in on_leave {
+        mark_message_read(state, &mailbox, uid);
+    }
+    drop_pending_cid(state);
+}
+
+/// Shows conversation `id` on the reading pane (item 1.7): `listed` are its
+/// messages in the list, `focus` the row the reader selected (`None` for
+/// the header). The same conversation already on screen only follows the
+/// list - new messages, changed flags, a different focus - instead of
+/// starting over.
+fn open_conversation(ctx: &ConversationContext, id: ThreadId, listed: Vec<EmailSummary>, focus: Option<(MailboxId, Uid)>) {
+    let state = &ctx.state;
+    let Some(ui) = state.borrow().conversation_ui.clone() else { return };
+    let same = state.borrow().rendered_conversation.as_ref().is_some_and(|pane| pane.id == id);
+    if same {
+        follow_conversation(ctx, &ui, listed, focus);
+        return;
+    }
+    leave_conversation(state);
+    clear_single_message_state(state);
+    let dark = state.borrow().settings.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK);
+    let subject = crate::message_list::newest_message(&listed)
+        .and_then(|m| m.subject)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "(no subject)".to_string());
+    ui.subject_label.set_label(&subject);
+    ui.suppress_theme.set(true);
+    ui.theme_button.set_active(dark);
+    ui.suppress_theme.set(false);
+    state.borrow_mut().rendered_conversation = Some(ConversationPane {
+        id,
+        listed,
+        cards: Vec::new(),
+        focus,
+        generation: 0,
+        ready: false,
+        queued: Vec::new(),
+        restore_scroll: None,
+        load_once: HashSet::new(),
+        dark,
+        mark_pending: Vec::new(),
+        mark_timer: None,
+    });
+    // Fade the previous content out; the conversation fades in once its
+    // document has loaded (the WebView's `Finished`).
+    ui.reading_stack.set_visible_child_name("empty");
+    build_conversation(ctx, None);
+}
+
+/// The same conversation is still selected: rebuild it if its messages
+/// changed, otherwise refresh the cards whose state changed and follow a new
+/// focus.
+fn follow_conversation(ctx: &ConversationContext, ui: &Rc<ConversationUi>, listed: Vec<EmailSummary>, focus: Option<(MailboxId, Uid)>) {
+    let state = &ctx.state;
+    let key = |m: &EmailSummary| (m.mailbox.clone(), m.uid);
+    let (members_changed, focus_changed) = {
+        let st = state.borrow();
+        let Some(pane) = st.rendered_conversation.as_ref() else { return };
+        let old: HashSet<(MailboxId, Uid)> = pane.listed.iter().map(key).collect();
+        let new: HashSet<(MailboxId, Uid)> = listed.iter().map(key).collect();
+        (old != new, focus.is_some() && focus != pane.focus)
+    };
+    // The reader picked another message of the conversation while one was
+    // open on its own ("Show details"): back to the conversation.
+    if focus_changed && ui.reading_stack.visible_child_name().as_deref() == Some("message") {
+        clear_single_message_state(state);
+        ui.reading_stack.set_visible_child_name("conversation");
+    }
+    if members_changed {
+        let keep: HashSet<(MailboxId, Uid)> = {
+            let mut st = state.borrow_mut();
+            let Some(pane) = st.rendered_conversation.as_mut() else { return };
+            pane.listed = listed;
+            if focus.is_some() {
+                pane.focus = focus;
+            }
+            pane.cards.iter().filter(|c| c.expanded).map(|c| c.key()).collect()
+        };
+        rebuild_conversation_keeping_scroll(ctx, ui, keep);
+        return;
+    }
+    // Same messages: refresh any card whose state changed.
+    let mut updates = Vec::new();
+    {
+        let mut st = state.borrow_mut();
+        let Some(pane) = st.rendered_conversation.as_mut() else { return };
+        for summary in &listed {
+            let Some(index) = pane.cards.iter().position(|c| c.key() == key(summary)) else { continue };
+            let card = &mut pane.cards[index];
+            let old = &card.member.summary;
+            if old.flags != summary.flags || old.keywords != summary.keywords || old.importance != summary.importance || old.preview != summary.preview {
+                card.member.summary = summary.clone();
+                updates.push(crate::conversation_view::js_update_card(
+                    index,
+                    &crate::conversation_view::card_html(index, card, chrono::Utc::now()),
+                ));
+            }
+        }
+        pane.listed = listed;
+    }
+    for script in updates {
+        run_conversation_script(state, script);
+    }
+    if focus_changed {
+        let index = {
+            let mut st = state.borrow_mut();
+            let Some(pane) = st.rendered_conversation.as_mut() else { return };
+            pane.focus = focus.clone();
+            focus.as_ref().and_then(|f| pane.cards.iter().position(|c| &c.key() == f))
+        };
+        if let Some(index) = index {
+            expand_conversation_card(ctx, index, true);
+            run_conversation_script(state, crate::conversation_view::js_scroll_to(index));
+        }
+    }
+}
+
+/// Lays the conversation on screen out again after a setting it depends on
+/// changed (its order, whether Sent Items joins it), keeping the open cards
+/// and the scroll position.
+fn relayout_conversation(ctx: &ConversationContext) {
+    let Some(ui) = ctx.state.borrow().conversation_ui.clone() else { return };
+    let keep: HashSet<(MailboxId, Uid)> = {
+        let st = ctx.state.borrow();
+        let Some(pane) = st.rendered_conversation.as_ref() else { return };
+        pane.cards.iter().filter(|c| c.expanded).map(|c| c.key()).collect()
+    };
+    rebuild_conversation_keeping_scroll(ctx, &ui, keep);
+}
+
+/// Rebuilds the conversation document (new messages, the theme toggle),
+/// keeping the cards in `keep` open and the reader's scroll position.
+fn rebuild_conversation_keeping_scroll(ctx: &ConversationContext, ui: &Rc<ConversationUi>, keep: HashSet<(MailboxId, Uid)>) {
+    let ctx = ctx.clone();
+    let ready = ctx.state.borrow().rendered_conversation.as_ref().is_some_and(|pane| pane.ready);
+    if !ready {
+        build_conversation(&ctx, Some(keep));
+        return;
+    }
+    ui.web_view.evaluate_javascript(
+        crate::conversation_view::JS_SCROLL_Y,
+        Some(crate::conversation_view::SCRIPT_WORLD),
+        None,
+        None::<&gio::Cancellable>,
+        move |result| {
+            let scroll = result.ok().map(|value| value.to_double());
+            if let Some(pane) = ctx.state.borrow_mut().rendered_conversation.as_mut() {
+                pane.restore_scroll = scroll;
+            }
+            build_conversation(&ctx, Some(keep));
+        },
+    );
+}
+
+/// Builds (or rebuilds) the rendered conversation's document: looks up its
+/// Sent Items members when the setting asks for them, then lays out the
+/// cards. `keep` carries the open cards over a rebuild.
+fn build_conversation(ctx: &ConversationContext, keep: Option<HashSet<(MailboxId, Uid)>>) {
+    let state = &ctx.state;
+    let generation = next_conversation_generation();
+    let (listed, sent) = {
+        let mut st = state.borrow_mut();
+        let Some(pane) = st.rendered_conversation.as_mut() else { return };
+        pane.generation = generation;
+        let listed = pane.listed.clone();
+        let include_sent = st.settings.get_bool(crate::settings::MAIL_CONVERSATION_INCLUDE_SENT);
+        let sent = include_sent
+            .then(|| listed.first().and_then(|m| mailbox_account_id(&m.mailbox)))
+            .flatten()
+            .and_then(|account| {
+                let handle = st.accounts.get(&account)?;
+                let sent = handle.folders.iter().find(|f| f.role == MailboxRole::Sent)?.id.clone();
+                Some((sent, handle.address_cache.clone()?))
+            })
+            .filter(|(sent, _)| listed.iter().all(|m| &m.mailbox != sent));
+        (listed, sent)
+    };
+    let Some((sent, cache)) = sent else {
+        lay_out_conversation(ctx, generation, Vec::new(), keep);
+        return;
+    };
+    let ids = crate::conversation_view::conversation_ids(&listed);
+    let reply_rx = spawn_cache_read(&ctx.worker, cache, move |c| c.conversation_members_in(&sent, &ids).unwrap_or_default());
+    let ctx = ctx.clone();
+    glib::spawn_future_local(async move {
+        let others = reply_rx.recv().await.unwrap_or_default();
+        lay_out_conversation(&ctx, generation, others, keep);
+    });
+}
+
+/// The attachment tiles for a message: its fetched body's parts once
+/// loaded, else the parts its cached structure lists.
+fn conversation_attachment_tiles(summary: &EmailSummary, body: Option<&EmailBody>) -> Vec<crate::conversation_view::AttachmentTile> {
+    let parts: Vec<&BodyPart> = match body {
+        Some(body) => body.parts.iter().filter(|p| p.is_attachment).collect(),
+        None => summary.structure.iter().flatten().filter(|p| p.is_attachment).collect(),
+    };
+    parts
+        .into_iter()
+        .map(|part| crate::conversation_view::AttachmentTile {
+            part_number: part.part_number.clone(),
+            name: attachment_display_name(part),
+            size_label: human_size(part.size),
+        })
+        .collect()
+}
+
+/// Fills card `index` from its loaded body: the frame's document under the
+/// sender's remote-content policy, the blocked-content note, attachments,
+/// and the inline parts its `cid:` images resolve against.
+fn fill_conversation_card(state: &Rc<RefCell<UiState>>, index: usize, card: &mut crate::conversation_view::Card, body: &EmailBody, load_once: bool, dark: bool) -> Vec<BodyPart> {
+    let summary = &card.member.summary;
+    let trust_sender = mailbox_account_id(&summary.mailbox).zip(summary.from.first().map(|a| a.address.trim().to_lowercase()));
+    let (images_allowed, all_allowed) = remote_content_policy(state, trust_sender.as_ref(), load_once);
+    let scan = body.html_body.as_deref().map(lookout_core::html_remote_content_scan).unwrap_or_default();
+    card.remote_blocked = (scan.has_images && !images_allowed) || (scan.has_other && !all_allowed);
+    card.wants_receipt = !lookout_core::parse_disposition_notification_to(&body.headers).is_empty();
+    card.attachments = conversation_attachment_tiles(summary, Some(body));
+    card.srcdoc = Some(crate::conversation_view::body_srcdoc(body, index, images_allowed, all_allowed, dark));
+    body.parts.iter().filter(|p| p.cid.is_some()).cloned().collect()
+}
+
+/// Lays out the conversation's cards (its listed messages plus `others`
+/// from Sent Items) and loads the document, unless a newer build has
+/// started since.
+fn lay_out_conversation(ctx: &ConversationContext, generation: u64, others: Vec<EmailSummary>, keep: Option<HashSet<(MailboxId, Uid)>>) {
+    use crate::conversation_view as view;
+    let state = &ctx.state;
+    let Some(ui) = state.borrow().conversation_ui.clone() else { return };
+    let (listed, focus, dark, load_once) = {
+        let st = state.borrow();
+        let Some(pane) = st.rendered_conversation.as_ref().filter(|p| p.generation == generation) else { return };
+        (pane.listed.clone(), pane.focus.clone(), pane.dark, pane.load_once.clone())
+    };
+    let order = crate::settings::conversation_order(&state.borrow().settings.get_string(crate::settings::MAIL_CONVERSATION_ORDER));
+    let members = view::merge_members(listed, others, "Sent Items");
+    let mut expanded = view::initially_expanded(&members, focus.as_ref());
+    if let Some(keep) = &keep {
+        // A rebuild keeps what the reader had open, and opens only what's
+        // new and unread (or newest).
+        let known: HashSet<(MailboxId, Uid)> = {
+            let st = state.borrow();
+            st.rendered_conversation.as_ref().map(|p| p.cards.iter().map(|c| c.key()).collect()).unwrap_or_default()
+        };
+        expanded.retain(|key| !known.contains(key) || keep.contains(key));
+        expanded.extend(keep.iter().cloned());
+    }
+    let members = view::display_order(members, order);
+    let mut cards: Vec<view::Card> = members
+        .into_iter()
+        .map(|member| {
+            let expanded = expanded.contains(&member.key());
+            let attachments = conversation_attachment_tiles(&member.summary, None);
+            view::Card {
+                member,
+                expanded,
+                srcdoc: None,
+                remote_blocked: false,
+                wants_receipt: false,
+                attachments,
+            }
+        })
+        .collect();
+    // Bodies already in memory go straight into the document; the rest are
+    // fetched for the open cards and arrive through `conversation_body_arrived`.
+    let mut inline_parts = HashMap::new();
+    let mut missing = Vec::new();
+    for (index, card) in cards.iter_mut().enumerate() {
+        let key = card.key();
+        let body = state.borrow_mut().body_cache.get(&key.0, &key.1);
+        match body {
+            Some(body) => {
+                let parts = fill_conversation_card(state, index, card, &body, load_once.contains(&key), dark);
+                inline_parts.insert(key, parts);
+            }
+            None if card.expanded => missing.push(key),
+            None => {}
+        }
+    }
+    let opened: Vec<(MailboxId, Uid)> = cards.iter().filter(|c| c.expanded && c.member.summary.is_unread()).map(|c| c.key()).collect();
+    let html = view::build_document(&cards, chrono::Utc::now(), dark);
+    {
+        let mut st = state.borrow_mut();
+        st.conversation_inline_parts = inline_parts;
+        let Some(pane) = st.rendered_conversation.as_mut() else { return };
+        pane.cards = cards;
+        pane.ready = false;
+        pane.queued.clear();
+    }
+    drop_pending_cid(state);
+    ui.web_view.load_html(&html, None);
+    request_conversation_bodies(ctx, missing);
+    conversation_mark_read(ctx, opened);
+}
+
+/// Fetches the bodies of the conversation cards `keys`: from the disk cache
+/// at once, and from the server (`FetchBody`, which the session coalesces
+/// per folder). Whichever lands first fills the card; a body that never
+/// comes shows "couldn't be loaded" after the usual grace period.
+fn request_conversation_bodies(ctx: &ConversationContext, keys: Vec<(MailboxId, Uid)>) {
+    let state = &ctx.state;
+    let mut by_mailbox: HashMap<MailboxId, Vec<Uid>> = HashMap::new();
+    for (mailbox, uid) in keys {
+        by_mailbox.entry(mailbox).or_default().push(uid);
+    }
+    let network_available = gio::NetworkMonitor::default().is_network_available();
+    for (mailbox, uids) in by_mailbox {
+        let target = {
+            let st = state.borrow();
+            mailbox_account_id(&mailbox).and_then(|account| st.accounts.get(&account)).map(|handle| {
+                let uidvalidity = handle.folders.iter().find(|f| f.id == mailbox).map(|f| f.uidvalidity).unwrap_or(UidValidity(0));
+                (handle.interactive_cmd_tx.clone(), handle.address_cache.clone(), uidvalidity)
+            })
+        };
+        let Some((cmd_tx, cache, uidvalidity)) = target else {
+            for uid in &uids {
+                conversation_body_failed(state, &mailbox, *uid);
+            }
+            continue;
+        };
+        for uid in &uids {
+            let _ = cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox.clone(), uid: *uid });
+        }
+        if let Some(cache) = cache {
+            let reply_rx = spawn_cache_read(&ctx.worker, cache, {
+                let mailbox = mailbox.clone();
+                let uids = uids.clone();
+                move |c| c.load_bodies(&mailbox, &uids, uidvalidity)
+            });
+            let state = state.clone();
+            let mailbox = mailbox.clone();
+            glib::spawn_future_local(async move {
+                let Ok(Ok(bodies)) = reply_rx.recv().await else { return };
+                for (uid, body) in bodies {
+                    state.borrow_mut().body_cache.insert(mailbox.clone(), uid, body.clone());
+                    conversation_body_arrived(&state, &mailbox, uid, body);
+                }
+            });
+        }
+        let state = state.clone();
+        let timeout = if network_available { BODY_FETCH_TIMEOUT_MS } else { BODY_FETCH_OFFLINE_TIMEOUT_MS };
+        glib::timeout_add_local_once(std::time::Duration::from_millis(timeout), move || {
+            for uid in uids {
+                conversation_body_failed(&state, &mailbox, uid);
+            }
+        });
+    }
+}
+
+/// A body arrived (from the server or the disk cache): fill its card if the
+/// conversation on screen is still waiting for it. Called for every
+/// `BodyFetched`, so it is a cheap no-op for anything else.
+fn conversation_body_arrived(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, body: EmailBody) {
+    let key = (mailbox.clone(), uid);
+    let (index, mut card, load_once, dark) = {
+        let st = state.borrow();
+        let Some(pane) = st.rendered_conversation.as_ref() else { return };
+        let Some(index) = pane.cards.iter().position(|c| c.key() == key && c.srcdoc.is_none()) else { return };
+        (index, pane.cards[index].clone(), pane.load_once.contains(&key), pane.dark)
+    };
+    let parts = fill_conversation_card(state, index, &mut card, &body, load_once, dark);
+    let script = crate::conversation_view::js_set_body(&card, index);
+    {
+        let mut st = state.borrow_mut();
+        st.conversation_inline_parts.insert(key.clone(), parts);
+        let Some(pane) = st.rendered_conversation.as_mut() else { return };
+        match pane.cards.get_mut(index) {
+            Some(slot) if slot.key() == key => *slot = card,
+            _ => return,
+        }
+    }
+    run_conversation_script(state, script);
+}
+
+/// A card's body didn't arrive in time.
+fn conversation_body_failed(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid) {
+    let index = {
+        let st = state.borrow();
+        st.rendered_conversation
+            .as_ref()
+            .and_then(|pane| pane.cards.iter().position(|c| c.key() == (mailbox.clone(), uid) && c.srcdoc.is_none()))
+    };
+    if let Some(index) = index {
+        run_conversation_script(state, crate::conversation_view::js_body_failed(index));
+    }
+}
+
+/// Opens card `index` (the reader's click, or the list selecting it):
+/// fetches its body if need be and counts it as read per the mark-as-read
+/// setting. `tell_script` also opens it in the document, for an opening the
+/// script didn't start.
+fn expand_conversation_card(ctx: &ConversationContext, index: usize, tell_script: bool) {
+    let state = &ctx.state;
+    let (key, unread, has_body, was_expanded) = {
+        let mut st = state.borrow_mut();
+        let Some(card) = st.rendered_conversation.as_mut().and_then(|pane| pane.cards.get_mut(index)) else { return };
+        let was_expanded = card.expanded;
+        card.expanded = true;
+        (card.key(), card.member.summary.is_unread(), card.srcdoc.is_some(), was_expanded)
+    };
+    if tell_script && !was_expanded {
+        run_conversation_script(state, crate::conversation_view::js_set_expanded(index, true));
+    }
+    if !has_body {
+        let cached = state.borrow_mut().body_cache.get(&key.0, &key.1);
+        match cached {
+            Some(body) => conversation_body_arrived(state, &key.0, key.1, body),
+            None => request_conversation_bodies(ctx, vec![key.clone()]),
+        }
+    }
+    if unread && !was_expanded {
+        conversation_mark_read(ctx, vec![key]);
+    }
+}
+
+/// Counts the opened unread cards `keys` as read, per the mark-as-read
+/// setting (item 1.8) - when opened, after the delay (if the conversation is
+/// still on screen), or once the reader leaves the conversation.
+fn conversation_mark_read(ctx: &ConversationContext, keys: Vec<(MailboxId, Uid)>) {
+    if keys.is_empty() {
+        return;
+    }
+    let state = &ctx.state;
+    let mode = crate::settings::mark_as_read_mode(&state.borrow().settings.get_string(crate::settings::MARK_AS_READ_MODE));
+    match mode {
+        crate::settings::MarkAsReadMode::WhenOpened => {
+            for (mailbox, uid) in keys {
+                mark_message_read(state, &mailbox, uid);
+            }
+        }
+        crate::settings::MarkAsReadMode::OnSelectionChange => {
+            let mut st = state.borrow_mut();
+            for key in keys {
+                if !st.conversation_mark_on_leave.contains(&key) {
+                    st.conversation_mark_on_leave.push(key);
+                }
+            }
+        }
+        crate::settings::MarkAsReadMode::AfterDelay => {
+            let delay = crate::settings::mark_as_read_delay(state.borrow().settings.get_int(crate::settings::MARK_AS_READ_DELAY));
+            let id = {
+                let mut st = state.borrow_mut();
+                let Some(pane) = st.rendered_conversation.as_mut() else { return };
+                pane.mark_pending.extend(keys);
+                if let Some(timer) = pane.mark_timer.take() {
+                    timer.remove();
+                }
+                pane.id.clone()
+            };
+            let state_for_timer = state.clone();
+            let timer = glib::timeout_add_local_once(std::time::Duration::from_secs(u64::from(delay.max(1) as u32)), move || {
+                let pending = {
+                    let mut st = state_for_timer.borrow_mut();
+                    let Some(pane) = st.rendered_conversation.as_mut().filter(|pane| pane.id == id) else { return };
+                    pane.mark_timer = None;
+                    std::mem::take(&mut pane.mark_pending)
+                };
+                for (mailbox, uid) in pending {
+                    mark_message_read(&state_for_timer, &mailbox, uid);
+                }
+            });
+            if let Some(pane) = state.borrow_mut().rendered_conversation.as_mut() {
+                pane.mark_timer = Some(timer);
+            }
+        }
+        crate::settings::MarkAsReadMode::Never => {}
+    }
+}
+
+/// The message on conversation card `index`.
+fn conversation_card_summary(state: &Rc<RefCell<UiState>>, index: usize) -> Option<EmailSummary> {
+    let st = state.borrow();
+    st.rendered_conversation.as_ref()?.cards.get(index).map(|card| card.member.summary.clone())
+}
+
+/// Acts on a message posted by the conversation script.
+fn handle_conversation_message(ctx: &ConversationContext, ui: &Rc<ConversationUi>, message: crate::conversation_view::ScriptMessage) {
+    use crate::conversation_view::ScriptMessage;
+    let state = &ctx.state;
+    match message {
+        ScriptMessage::Expand(index) => expand_conversation_card(ctx, index, false),
+        ScriptMessage::Collapse(index) => {
+            if let Some(card) = state.borrow_mut().rendered_conversation.as_mut().and_then(|pane| pane.cards.get_mut(index)) {
+                card.expanded = false;
+            }
+        }
+        ScriptMessage::Reply(index) | ScriptMessage::ReplyAll(index) | ScriptMessage::Forward(index) => {
+            let Some(summary) = conversation_card_summary(state, index) else { return };
+            let mode = match message {
+                ScriptMessage::Reply(_) => Some(crate::compose::ReplyMode::Reply),
+                ScriptMessage::ReplyAll(_) => Some(crate::compose::ReplyMode::ReplyAll),
+                _ => None,
+            };
+            reply_to_message(state, &ctx.worker, &ui.reading_stack, summary, mode);
+        }
+        ScriptMessage::Menu { card, x, y } => {
+            let Some(summary) = conversation_card_summary(state, card) else { return };
+            open_message_menu(&ctx.menu, ui.web_view.upcast_ref(), Some((x, y)), MessageMenuTarget::Message(Box::new(summary)));
+        }
+        ScriptMessage::Attachment { card, part, x, y } => {
+            let Some(summary) = conversation_card_summary(state, card) else { return };
+            let body = state.borrow_mut().body_cache.get(&summary.mailbox, &summary.uid);
+            let parts: Vec<BodyPart> = match &body {
+                Some(body) => body.parts.clone(),
+                None => summary.structure.clone().unwrap_or_default(),
+            };
+            let Some(part) = parts.into_iter().find(|p| p.part_number == part) else { return };
+            present_conversation_attachment_menu(state, ui, &summary, part, x, y);
+        }
+        ScriptMessage::ShowBlocked(index) => {
+            let Some(summary) = conversation_card_summary(state, index) else { return };
+            let key = (summary.mailbox.clone(), summary.uid);
+            let body = state.borrow_mut().body_cache.get(&key.0, &key.1);
+            let Some(body) = body else { return };
+            let (mut card, dark) = {
+                let mut st = state.borrow_mut();
+                let Some(pane) = st.rendered_conversation.as_mut() else { return };
+                pane.load_once.insert(key.clone());
+                let Some(card) = pane.cards.get(index) else { return };
+                (card.clone(), pane.dark)
+            };
+            fill_conversation_card(state, index, &mut card, &body, true, dark);
+            let script = crate::conversation_view::js_set_body(&card, index);
+            if let Some(slot) = state.borrow_mut().rendered_conversation.as_mut().and_then(|pane| pane.cards.get_mut(index)) {
+                *slot = card;
+            }
+            run_conversation_script(state, script);
+        }
+        ScriptMessage::OpenDetails(index) => {
+            let Some(summary) = conversation_card_summary(state, index) else { return };
+            show_conversation_message_alone(ctx, ui, summary);
+        }
+    }
+}
+
+/// "Show details" on a card: the message on the single-message page, with
+/// every banner it has (invitation, read receipt, unsubscribe) and a way
+/// back to the conversation.
+fn show_conversation_message_alone(ctx: &ConversationContext, ui: &Rc<ConversationUi>, summary: EmailSummary) {
+    let state = &ctx.state;
+    clear_single_message_state(state);
+    let (mailbox, uid) = (summary.mailbox.clone(), summary.uid);
+    state.borrow_mut().pending_header = Some(summary);
+    let cached = state.borrow_mut().body_cache.get(&mailbox, &uid);
+    match cached {
+        Some(body) => {
+            ui.reading_stack.set_visible_child_name("empty");
+            render_body(state, &ui.reading_stack, &ctx.message_header, mailbox, uid, body);
+        }
+        None => request_body_fetch(state, &ctx.worker, &ui.reading_stack, &ctx.message_header, mailbox, uid),
+    }
+}
+
+/// The Open / Open With… / Save… menu for an attachment tile on a card,
+/// pointing at the tile.
+fn present_conversation_attachment_menu(state: &Rc<RefCell<UiState>>, ui: &Rc<ConversationUi>, summary: &EmailSummary, part: BodyPart, x: f64, y: f64) {
+    // The fetch disables a button while it runs; a tile has none, so it
+    // gets a stand-in that nothing shows.
+    let stand_in = gtk::MenuButton::new();
+    let popover = gtk::Popover::new();
+    popover.set_parent(&ui.web_view);
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    popover.set_position(gtk::PositionType::Bottom);
+    let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    items.set_margin_top(6);
+    items.set_margin_bottom(6);
+    items.set_margin_start(6);
+    items.set_margin_end(6);
+    for (label, action) in [
+        ("Open", PendingAttachmentAction::Open),
+        ("Open With…", PendingAttachmentAction::OpenWith),
+        ("Save…", PendingAttachmentAction::Save),
+    ] {
+        let item = gtk::Button::with_label(label);
+        item.add_css_class("flat");
+        item.set_halign(gtk::Align::Start);
+        let state = state.clone();
+        let mailbox = summary.mailbox.clone();
+        let uid = summary.uid;
+        let part = part.clone();
+        let stand_in = stand_in.clone();
+        let popover_for_item = popover.clone();
+        item.connect_clicked(move |_| {
+            popover_for_item.popdown();
+            start_attachment_fetch(&state, &mailbox, uid, &part, &stand_in, action);
+        });
+        items.append(&item);
+    }
+    popover.set_child(Some(&items));
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
+    });
+    popover.popup();
+}
+
+/// Builds the reading pane's conversation page (item 1.7): the subject and
+/// the message-theme toggle over the conversation WebView, with its script,
+/// message handler and navigation policy.
+fn build_conversation_ui(ctx: &ConversationContext, reading_stack: &gtk::Stack) -> (Rc<ConversationUi>, gtk::Box) {
+    use crate::conversation_view as view;
+    let settings = webkit::Settings::new();
+    // The trusted script needs JavaScript on; markup JavaScript stays off,
+    // so nothing in the page itself - `<script>`, `on…=` handlers,
+    // `javascript:` links - ever runs. Hardware acceleration is left at the
+    // default, as on the single-message view: this view is long-lived,
+    // reloaded and scrolled in place (see that view's comment).
+    settings.set_enable_javascript(true);
+    settings.set_enable_javascript_markup(false);
+    settings.set_enable_developer_extras(false);
+    let user_content_manager = webkit::UserContentManager::new();
+    user_content_manager.add_script(&webkit::UserScript::for_world(
+        view::SCRIPT,
+        webkit::UserContentInjectedFrames::AllFrames,
+        webkit::UserScriptInjectionTime::End,
+        view::SCRIPT_WORLD,
+        &[],
+        &[],
+    ));
+    user_content_manager.register_script_message_handler(view::SCRIPT_HANDLER, Some(view::SCRIPT_WORLD));
+    let web_view = webkit::WebView::builder()
+        .settings(&settings)
+        .user_content_manager(&user_content_manager)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+
+    let subject_label = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .css_classes(["title-3"])
+        .build();
+    subject_label.set_selectable(true);
+    let theme_button = gtk::ToggleButton::builder()
+        .icon_name(themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"]))
+        .tooltip_text("View in Dark Mode")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .build();
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(16)
+        .margin_end(12)
+        .margin_top(10)
+        .margin_bottom(4)
+        .build();
+    header.append(&subject_label);
+    header.append(&theme_button);
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&header);
+    page.append(&web_view);
+
+    let ui = Rc::new(ConversationUi {
+        subject_label,
+        theme_button: theme_button.clone(),
+        web_view: web_view.clone(),
+        reading_stack: reading_stack.clone(),
+        suppress_theme: Cell::new(false),
+    });
+
+    {
+        let ctx = ctx.clone();
+        let ui = ui.clone();
+        user_content_manager.connect_script_message_received(Some(view::SCRIPT_HANDLER), move |_, value| {
+            match view::parse_script_message(&value.to_str()) {
+                Some(message) => handle_conversation_message(&ctx, &ui, message),
+                None => tracing::debug!("ignoring malformed conversation script message"),
+            }
+        });
+    }
+    // The document loaded: run what was queued for it, restore the scroll
+    // a rebuild saved (or bring the selected card into view), and fade the
+    // page in if it isn't showing yet.
+    {
+        let state = ctx.state.clone();
+        let ui_for_load = ui.clone();
+        web_view.connect_load_changed(move |_, event| {
+            if event != webkit::LoadEvent::Finished {
+                return;
+            }
+            let (queued, restore, focus) = {
+                let mut st = state.borrow_mut();
+                let Some(pane) = st.rendered_conversation.as_mut() else { return };
+                if pane.ready {
+                    return;
+                }
+                pane.ready = true;
+                let focus = pane.focus.as_ref().and_then(|f| pane.cards.iter().position(|c| &c.key() == f));
+                (std::mem::take(&mut pane.queued), pane.restore_scroll.take(), focus)
+            };
+            if matches!(ui_for_load.reading_stack.visible_child_name().as_deref(), Some("empty") | Some("loading")) {
+                ui_for_load.reading_stack.set_visible_child_name("conversation");
+            }
+            for script in queued {
+                run_conversation_script(&state, script);
+            }
+            match (restore, focus) {
+                (Some(y), _) => run_conversation_script(&state, view::js_restore_scroll(y)),
+                (None, Some(index)) => run_conversation_script(&state, view::js_scroll_to(index)),
+                (None, None) => {}
+            }
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        let ui_for_theme = ui.clone();
+        theme_button.connect_toggled(move |button| {
+            // A moon while off, a sun while on, as on the single-message
+            // header; the tooltip names what a click does next.
+            button.set_icon_name(if button.is_active() {
+                themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"])
+            } else {
+                themed_icon_name(&["weather-clear-night-symbolic", "night-light-symbolic", "weather-clear-symbolic"])
+            });
+            button.set_tooltip_text(Some(if button.is_active() { "View in Light Mode" } else { "View in Dark Mode" }));
+            if ui_for_theme.suppress_theme.get() {
+                return;
+            }
+            let keep = {
+                let mut st = ctx.state.borrow_mut();
+                let Some(pane) = st.rendered_conversation.as_mut() else { return };
+                pane.dark = button.is_active();
+                pane.cards.iter().filter(|c| c.expanded).map(|c| c.key()).collect()
+            };
+            rebuild_conversation_keeping_scroll(&ctx, &ui_for_theme, keep);
+        });
+    }
+    // Navigation: the document and its body frames load in place (they're
+    // `about:` documents); a link - retargeted to a new window by the script
+    // - goes to the browser through `create`; nothing else may load. Remote
+    // subresources are held by each frame's CSP.
+    web_view.connect_decide_policy(|_view, decision, decision_type| {
+        if decision_type != webkit::PolicyDecisionType::NavigationAction {
+            return false;
+        }
+        let Some(navigation) = decision.downcast_ref::<webkit::NavigationPolicyDecision>().and_then(|d| d.navigation_action()) else {
+            return false;
+        };
+        let Some(uri) = navigation.request().and_then(|r| r.uri()) else { return false };
+        let scheme = uri.split(':').next().unwrap_or("");
+        if scheme == "about" {
+            return false;
+        }
+        if navigation.navigation_type() == webkit::NavigationType::LinkClicked || navigation.is_user_gesture() {
+            open_uri_in_default_browser(&uri);
+        }
+        decision.ignore();
+        true
+    });
+    web_view.connect_create(|_view, navigation_action| {
+        let is_link_click = navigation_action.navigation_type() == webkit::NavigationType::LinkClicked;
+        if is_link_click || navigation_action.is_user_gesture() {
+            if let Some(uri) = navigation_action.request().and_then(|r| r.uri()) {
+                open_uri_in_default_browser(&uri);
+            }
+        }
+        None
+    });
+    (ui, page)
 }
 
 fn render_body(
@@ -20740,6 +21876,9 @@ fn render_body(
     let mut rendered_follow_up = None;
     {
         let mut st = state.borrow_mut();
+        // A message opened on its own from the conversation view (item
+        // 1.7) offers the way back; any other render hides it.
+        message_header.back_button.set_visible(st.rendered_conversation.is_some());
         if let Some(summary) = st.pending_header.take() {
             message_header.update(&summary);
             rendered_follow_up = summary.follow_up().map(|flag| (mailbox.clone(), uid, flag));
@@ -22365,6 +23504,10 @@ mod tests {
             read_receipts_sent: HashSet::new(),
             read_receipt_context: None,
             pending_cid: HashMap::new(),
+            rendered_conversation: None,
+            conversation_inline_parts: HashMap::new(),
+            conversation_ui: None,
+            conversation_mark_on_leave: Vec::new(),
             rendered_inline_parts: Vec::new(),
             temp_attachment_files: HashSet::new(),
             toast_overlay: None,
@@ -23783,6 +24926,26 @@ mod tests {
         let (targets, primary) = message_menu_targets(&message_list, MessageMenuTarget::Thread(thread));
         assert_eq!(uids(&targets), HashSet::from([1, 2, 3]), "a conversation header acts on every message in it");
         assert_eq!(primary.map(|s| s.uid), Some(Uid(3)), "its newest message answers Reply");
+
+        // A selected header (item 1.7): Shift+F10 acts like a right-click on it.
+        let is_header = |position: u32| {
+            let row = message_list.selection.item(position).and_downcast::<gtk::TreeListRow>();
+            let Some(boxed) = row.and_then(|r| r.item()).and_downcast::<glib::BoxedAnyObject>() else { return false };
+            let is_thread = matches!(&*boxed.borrow::<MessageItem>(), MessageItem::Thread(_));
+            is_thread
+        };
+        let header = (0..message_list.selection.n_items()).find(|&p| is_header(p)).expect("a conversation header");
+        message_list.selection.select_item(header, true);
+        let (targets, primary) = message_menu_targets(&message_list, MessageMenuTarget::Selection);
+        assert_eq!(uids(&targets), HashSet::from([1, 2, 3]));
+        assert_eq!(primary.map(|s| s.uid), Some(Uid(3)));
+
+        // A conversation card's More actions acts on its message alone,
+        // leaving the selection be.
+        let (targets, primary) = message_menu_targets(&message_list, MessageMenuTarget::Message(Box::new(one.clone())));
+        assert_eq!(uids(&targets), HashSet::from([1]));
+        assert_eq!(primary.map(|s| s.uid), Some(Uid(1)));
+        assert!(matches!(message_list.selection_kind(), SelectionKind::Thread(..)), "the header stays selected");
     }
 
     /// Categorize's checks over several messages: checked when all carry the

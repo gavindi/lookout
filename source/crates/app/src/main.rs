@@ -17,6 +17,7 @@ mod contact_picker;
 mod contacts_editor;
 mod contacts_view;
 mod context_menu;
+mod conversation_view;
 mod datetime_picker;
 mod event_editor;
 mod folder_menu;

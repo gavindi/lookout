@@ -87,6 +87,13 @@ pub const MAIL_FAVORITES_CUSTOM_ORDER: &str = "mail-favorites-custom-order";
 /// Accounts; everything else is enabled by default.
 pub const ACCOUNTS_DISABLED: &str = "accounts-disabled";
 pub const MAIL_THREADED: &str = "mail-threaded";
+/// Order of the stacked messages when the reading pane shows a whole
+/// conversation (item 1.7): one of [`CONVERSATION_ORDERS`], "newest-top"
+/// (Outlook's default) or "newest-bottom". See [`conversation_order`].
+pub const MAIL_CONVERSATION_ORDER: &str = "mail-conversation-order";
+/// Whether the reading pane's conversation view also shows the user's own
+/// replies from Sent Items (Outlook's "Show messages from other folders").
+pub const MAIL_CONVERSATION_INCLUDE_SENT: &str = "mail-conversation-include-sent";
 /// The independent filters narrowing the message list (see
 /// `message_list::FilterSet`): any subset of unread, flagged, has-attachments,
 /// high-importance, categorised, to-me. Empty shows every message.
@@ -267,6 +274,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_FAVORITES_CUSTOM_ORDER, Value::Bool(false));
     map.insert(ACCOUNTS_DISABLED, Value::Strv(Vec::new()));
     map.insert(MAIL_THREADED, Value::Bool(true));
+    map.insert(MAIL_CONVERSATION_ORDER, Value::String("newest-top".into()));
+    map.insert(MAIL_CONVERSATION_INCLUDE_SENT, Value::Bool(true));
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
@@ -594,6 +603,42 @@ pub fn reading_pane_position(name: &str) -> ReadingPanePosition {
     }
 }
 
+/// The stored `mail-conversation-order` values, in UI order.
+pub const CONVERSATION_ORDERS: [&str; 2] = ["newest-top", "newest-bottom"];
+
+/// The labels matching [`CONVERSATION_ORDERS`] by index (Outlook's wording).
+pub const CONVERSATION_ORDER_LABELS: [&str; 2] = ["Newest message on top", "Newest message on bottom"];
+
+/// Order of the reading pane's stacked conversation, resolved from the
+/// `mail-conversation-order` setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ConversationOrder {
+    #[default]
+    NewestOnTop,
+    NewestOnBottom,
+}
+
+/// Resolves a stored order value; anything unknown falls back to newest on
+/// top, Outlook's default.
+pub fn conversation_order(name: &str) -> ConversationOrder {
+    match name {
+        "newest-bottom" => ConversationOrder::NewestOnBottom,
+        _ => ConversationOrder::NewestOnTop,
+    }
+}
+
+/// Index of a stored order value (for the config `ComboRow`); unknown values
+/// fall back to newest on top.
+pub fn conversation_order_index(name: &str) -> u32 {
+    CONVERSATION_ORDERS.iter().position(|value| *value == name).unwrap_or(0) as u32
+}
+
+/// The order value at a [`CONVERSATION_ORDERS`] index; out-of-range indexes
+/// fall back to newest on top.
+pub fn conversation_order_at(index: u32) -> &'static str {
+    CONVERSATION_ORDERS.get(index as usize).copied().unwrap_or(CONVERSATION_ORDERS[0])
+}
+
 /// Upper bound on the configurable message-preview line count.
 pub const MAX_PREVIEW_LINES: i32 = 3;
 
@@ -888,6 +933,21 @@ mod tests {
         assert_eq!(reading_pane_position("bottom"), ReadingPanePosition::Bottom);
         assert_eq!(reading_pane_position("no-such-position"), ReadingPanePosition::Right, "unknown values land on the default");
         assert_eq!(reading_pane_position(""), ReadingPanePosition::Right);
+    }
+
+    #[test]
+    fn conversation_order_helpers_resolve_known_and_unknown_values() {
+        assert_eq!(conversation_order("newest-top"), ConversationOrder::NewestOnTop);
+        assert_eq!(conversation_order("newest-bottom"), ConversationOrder::NewestOnBottom);
+        assert_eq!(conversation_order("sideways"), ConversationOrder::NewestOnTop, "unknown values land on Outlook's default");
+        assert_eq!(conversation_order_index("newest-bottom"), 1);
+        assert_eq!(conversation_order_index("sideways"), 0);
+        assert_eq!(conversation_order_at(1), "newest-bottom");
+        assert_eq!(conversation_order_at(9), "newest-top");
+        assert_eq!(CONVERSATION_ORDERS.len(), CONVERSATION_ORDER_LABELS.len());
+        let store = resolve();
+        assert_eq!(conversation_order(&store.get_string(MAIL_CONVERSATION_ORDER)), ConversationOrder::NewestOnTop);
+        assert!(store.get_bool(MAIL_CONVERSATION_INCLUDE_SENT));
     }
 
     #[test]

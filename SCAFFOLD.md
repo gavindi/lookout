@@ -843,7 +843,14 @@ declarative `MenuDescription` compiled to a `gio::Menu` plus a `SimpleActionGrou
 one dispatch closure, used by `folder_menu.rs`, `message_menu.rs` and the event/contact menus to
 come; `message_menu.rs` — the message context menu (item 1.17): Outlook's entries and order, the
 enable rules (`message_menu_state`) and the item → `MessageMenuAction` mapping, with `window.rs`'s
-`open_message_menu`/`run_message_menu_action` running each action through the ribbon's helpers.
+`open_message_menu`/`run_message_menu_action` running each action through the ribbon's helpers;
+`conversation_view.rs` (+ `conversation_view.js`) — the reading pane's conversation view (item
+1.7): a selected conversation header, or a message inside a conversation, shows every message as a
+card in one WebView, beside the single-message "message" page. Each body is a sandboxed `srcdoc`
+iframe carrying its sender's CSP; the only script is a trusted user script in its own world
+(markup JavaScript stays off), which sizes the frames, toggles cards and posts clicks to
+`window.rs`'s `handle_conversation_message`. `MessageListModel::reading_target` decides between the
+two pages, and `Cache::conversation_members_in` adds the user's replies from Sent Items.
 `window.rs`'s `UiState.undo_stack` holds the reversible-action
 history (item 0.4): each destructive action records an `UndoEntry { id, description, inverse }`,
 shows a bottom-left toast whose Undo button reverses exactly that entry, and is also undoable with
