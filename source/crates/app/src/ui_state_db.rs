@@ -195,6 +195,10 @@ impl UiStateDb {
                 mailbox_id TEXT NOT NULL,
                 PRIMARY KEY (account, position)
             );
+            CREATE TABLE IF NOT EXISTS recent_searches (
+                position INTEGER PRIMARY KEY,
+                query TEXT NOT NULL
+            );
             ",
         )?;
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
@@ -372,6 +376,30 @@ impl UiStateDb {
                 "INSERT INTO recent_folders (account, position, mailbox_id) VALUES (?1, ?2, ?3)",
                 rusqlite::params![account.0, position as i64, mailbox.0],
             )?;
+        }
+        tx.commit()
+    }
+
+    /// The recently searched queries (M-18, roadmap 2.3), newest first - shown
+    /// in the search box's history popover. Persisted as a preference: the
+    /// version wipe leaves it alone. There is one global list, not one per
+    /// account.
+    pub fn load_recent_searches(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT query FROM recent_searches ORDER BY position")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Replaces the recent-search history wholesale with `queries` (newest
+    /// first). The app caps the list before calling.
+    pub fn set_recent_searches(&self, queries: &[String]) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM recent_searches", [])?;
+        {
+            let mut stmt = tx.prepare("INSERT INTO recent_searches (position, query) VALUES (?1, ?2)")?;
+            for (position, query) in queries.iter().enumerate() {
+                stmt.execute(rusqlite::params![position as i64, query])?;
+            }
         }
         tx.commit()
     }
@@ -784,6 +812,31 @@ mod tests {
         drop(db);
         let upgraded = UiStateDb::open().unwrap();
         assert_eq!(upgraded.load_recent_folders().unwrap()[&work], vec![projects]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recent_searches_round_trip_replace_and_wipe_survival() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("recent-searches");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_recent_searches().unwrap().is_empty());
+        db.set_recent_searches(&["from:ada".to_string(), "has:attachment report".to_string()]).unwrap();
+        assert_eq!(db.load_recent_searches().unwrap(), vec!["from:ada".to_string(), "has:attachment report".to_string()]);
+
+        // Replace semantics.
+        db.set_recent_searches(&["is:unread".to_string()]).unwrap();
+        assert_eq!(db.load_recent_searches().unwrap(), vec!["is:unread".to_string()]);
+
+        // A preference: the version wipe leaves it alone.
+        db.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
+        drop(db);
+        let upgraded = UiStateDb::open().unwrap();
+        assert_eq!(upgraded.load_recent_searches().unwrap(), vec!["is:unread".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

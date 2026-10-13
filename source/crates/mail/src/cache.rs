@@ -11,6 +11,7 @@ use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailBody, EmailSu
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
+use crate::search_query::SearchQuery;
 
 /// A per-account local SQLite cache of mailbox/message metadata, used for a
 /// fast first paint on startup before the live IMAP fetch completes. Never
@@ -1585,6 +1586,92 @@ impl Cache {
             }
         }
 
+        for (mailbox, uid, data) in data_by_key {
+            if snoozed.contains(&(mailbox, uid)) {
+                continue;
+            }
+            out.push(serde_json::from_str(&data)?);
+        }
+        overlay_local_follow_ups(&conn, &mut out)?;
+        Ok(out)
+    }
+
+    /// Structured search (M-18, roadmap 2.2) over this account's local index:
+    /// the parsed query's text component runs through FTS5 and its remaining
+    /// operators become `json_extract` predicates over `messages.data` (see
+    /// [`crate::search_query::SearchQuery`]). `mailbox_scope` restricts the
+    /// result to those mailboxes (`None` covers every folder of the account),
+    /// letting the app's scope dropdown and `folder:` token narrow the sweep.
+    /// Snoozed messages stay excluded, exactly as in [`Cache::search`].
+    pub fn search_query(&self, query: &SearchQuery, mailbox_scope: Option<&[MailboxId]>, limit: usize) -> Result<Vec<EmailSummary>> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if mailbox_scope.is_some_and(<[MailboxId]>::is_empty) {
+            return Ok(Vec::new());
+        }
+        let fts = query.fts_match();
+        let (predicates, predicate_params) = query.sql_predicates();
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = String::from("SELECT messages.data FROM messages");
+        if fts.is_some() {
+            sql.push_str(
+                " JOIN search_fts ON messages.mailbox_id = search_fts.mailbox_id \
+                  AND messages.uid = search_fts.uid",
+            );
+        }
+        let mut wheres: Vec<String> = Vec::new();
+        if fts.is_some() {
+            wheres.push("search_fts MATCH ?".to_string());
+        }
+        wheres.extend(predicates);
+        if let Some(scope) = mailbox_scope {
+            let placeholders = vec!["?"; scope.len()].join(", ");
+            wheres.push(format!("messages.mailbox_id IN ({placeholders})"));
+        }
+        sql.push_str(" WHERE ");
+        sql.push_str(&wheres.join(" AND "));
+        if fts.is_some() {
+            sql.push_str(" ORDER BY rank LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY json_extract(messages.data, '$.date') DESC LIMIT ?");
+        }
+
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(fts) = &fts {
+            values.push(rusqlite::types::Value::Text(fts.clone()));
+        }
+        values.extend(predicate_params);
+        if let Some(scope) = mailbox_scope {
+            for id in scope {
+                values.push(rusqlite::types::Value::Text(id.0.clone()));
+            }
+        }
+        values.push(rusqlite::types::Value::Integer(limit as i64));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| row.get::<_, String>(0))?;
+        let mut data_by_key: Vec<(String, u32, String)> = Vec::new();
+        for row in rows {
+            let data = row?;
+            let Ok(msg) = serde_json::from_str::<EmailSummary>(&data) else {
+                continue;
+            };
+            data_by_key.push((msg.mailbox.0.clone(), msg.uid.0, data));
+        }
+
+        let now = Utc::now().timestamp();
+        let mut snoozed: HashSet<(String, u32)> = HashSet::new();
+        {
+            let mut stmt = conn.prepare("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
+            let rows = stmt.query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
+            for row in rows {
+                snoozed.insert(row?);
+            }
+        }
+
+        let mut out = Vec::new();
         for (mailbox, uid, data) in data_by_key {
             if snoozed.contains(&(mailbox, uid)) {
                 continue;
@@ -3772,6 +3859,61 @@ mod tests {
         assert!(cache.search("no-such-term", 10).unwrap().is_empty());
         // A whitespace-only query is not even sent to the index.
         assert!(cache.search("   ", 10).unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `SearchQuery` operators compile to the right SQL predicates: free text
+    /// and `from:`/`subject:` go through FTS, the rest through `json_extract`,
+    /// and `mailbox_scope` narrows the folders.
+    #[test]
+    fn search_query_filters_by_operators_and_scope() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let inbox = MailboxId::new(&account_id, "INBOX");
+        let archive = MailboxId::new(&account_id, "Archive");
+
+        let mut a = searchable_summary(&inbox, 1, "Quarterly report", "ada@example.com", Some("The numbers are attached"));
+        a.to = vec![lookout_core::EmailAddress::new("team@example.com")];
+        a.date = "2026-06-15T10:00:00Z".parse().unwrap();
+        a.keywords = std::collections::BTreeSet::from([lookout_core::tag_keyword("work")]);
+
+        let mut b = searchable_summary(&inbox, 2, "Big file", "bob@elsewhere.org", Some("Pizza at noon"));
+        b.flags = std::collections::BTreeSet::from([SystemFlagBit::Seen]);
+        b.has_attachment = true;
+        b.size = 2 * 1024 * 1024;
+        b.date = "2026-01-10T10:00:00Z".parse().unwrap();
+
+        let mut c = searchable_summary(&archive, 9, "Archived quarterly", "carol@example.com", None);
+        c.date = "2025-01-01T10:00:00Z".parse().unwrap();
+
+        cache.replace_messages(&inbox, UidValidity(1), &[a, b]).unwrap();
+        cache.replace_messages(&archive, UidValidity(1), &[c]).unwrap();
+
+        let query = |text: &str| crate::search_query::parse(text);
+        let uids = |text: &str, scope: Option<&[MailboxId]>| {
+            let mut found: Vec<u32> = cache.search_query(&query(text), scope, 50).unwrap().iter().map(|m| m.uid.0).collect();
+            found.sort();
+            found
+        };
+        let all: Vec<MailboxId> = vec![inbox.clone(), archive.clone()];
+
+        assert_eq!(uids("from:ada", Some(&all)), vec![1]);
+        assert_eq!(uids("subject:report", Some(&all)), vec![1]);
+        assert_eq!(uids("to:team", Some(&all)), vec![1]);
+        assert_eq!(uids("is:unread", Some(&all)), vec![1, 9]);
+        assert_eq!(uids("has:attachment", Some(&all)), vec![2]);
+        assert_eq!(uids("size:>1MB", Some(&all)), vec![2]);
+        assert_eq!(uids("category:work", Some(&all)), vec![1]);
+        assert_eq!(uids("received:>=2026-06-01", Some(&all)), vec![1]);
+        // A filter-only query with no text component still works.
+        assert_eq!(uids("is:unread has:attachment", Some(&all)), Vec::<u32>::new());
+        // Scope restricts the sweep.
+        assert_eq!(uids("quarterly", Some(std::slice::from_ref(&archive))), vec![9]);
+        assert_eq!(uids("quarterly", Some(std::slice::from_ref(&inbox))), vec![1]);
+        // An empty scope is an empty result, not "every folder".
+        assert!(uids("quarterly", Some(&[])).is_empty());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

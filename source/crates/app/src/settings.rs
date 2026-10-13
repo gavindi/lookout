@@ -98,6 +98,11 @@ pub const MAIL_CONVERSATION_INCLUDE_SENT: &str = "mail-conversation-include-sent
 /// `message_list::FilterSet`): any subset of unread, flagged, has-attachments,
 /// high-importance, categorised, to-me. Empty shows every message.
 pub const MAIL_FILTERS: &str = "mail-filters";
+/// Config → Mail → search scope: which folders a title-bar search sweeps, one
+/// of `lookout_mail::SearchScope`'s strings (folder / subfolders / account /
+/// all). Defaults to "all", the pre-scope behaviour of searching every
+/// account's cache.
+pub const MAIL_SEARCH_SCOPE: &str = "mail-search-scope";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
@@ -281,6 +286,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_CONVERSATION_ORDER, Value::String("newest-top".into()));
     map.insert(MAIL_CONVERSATION_INCLUDE_SENT, Value::Bool(true));
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
+    map.insert(MAIL_SEARCH_SCOPE, Value::String("all".into()));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));

@@ -42,7 +42,7 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 24 | 8 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
+| Mail (5.1) | 25 | 7 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 12 | 4 | 6 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop and an attachment reminder. No forwarding with attachments. |
 | Calendar (5.3) | 15 | 9 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
@@ -50,7 +50,7 @@ Counts are tallied from the §5 tables.
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **66** | **35** | **51** | **5** | ~42% at parity, ~22% partial |
+| **Total** | **67** | **34** | **51** | **5** | ~42% at parity, ~22% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -251,7 +251,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-15 | Quick Steps | — | ❌ | User-defined action chains |
 | M-16 | Sweep | — | ❌ | Delete/move all from sender, keep latest, older than N days |
 | M-17 | Junk: safe / blocked senders | "Report" moves to Junk and sets RFC 5788 `$Junk` (1.24); "Not junk" moves back to the Inbox and sets `$NotJunk`; Empty Junk | 🟡 | No safe/blocked lists; no "Not junk" in the ribbon's Report split button (UX-05, 2.9) |
-| M-18 | Search syntax and refiners | Local FTS5 (`mail/src/cache.rs` `sanitize_fts_query`) plus server `UID SEARCH TEXT` | 🟡 | No `from:`/`to:`/`subject:`/`has:attachment`/`received:`/`is:`/`category:`; no refiners, scope picker or search history |
+| M-18 | Search syntax and refiners | `mail/src/search_query.rs` query language (`from:`/`to:`/`cc:`/`subject:`/`body:`/`has:attachment`/`is:`/`category:`/`received:`/`size:`/`folder:`) compiled to local FTS5 + JSON predicates (`Cache::search_query`) and IMAP `SEARCH` keys; title-bar scope dropdown, refiner chips, advanced-search form and recent-search history (2.2–2.3) | ✅ | — |
 | M-19 | Search Folders (saved searches) | — | ❌ | |
 | M-20 | Ignore conversation / Clean up conversation | — | ❌ | |
 | M-21 | Undo (move, delete, flag, archive) | "… / Undo" toast and Ctrl+Z for delete, archive, junk, drag-move, pin, read/unread, categorize and snooze; moves are reverted by `RevertMove` via the COPYUID map (or Message-ID) | ✅ | Follow-up flags are undone too (1.16) |
@@ -632,8 +632,8 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
 | 2.1 | ✅ ~~Category master list~~ | M-09, CAL-07, T-08 | Editor (name, preset colour, shortcut key Ctrl+F2…F12 *classic*); stored in `settings.json`; synced with Graph `masterCategories` on Microsoft 365; shared by mail, events and tasks | M |
-| 2.2 | Search query language | M-18 | Parser in `mail/src/search_query.rs`: `from: to: cc: subject: body: has:attachment is:unread is:read is:flagged is:pinned category: received:>=2026-01-01 received:lastweek size:>1MB folder:`; compile to FTS5 `MATCH` plus SQL predicates locally and IMAP `SEARCH` keys remotely; keep `sanitize_fts_query` for free text | M |
-| 2.3 | Search UI: refiners, scope, history | M-18 | Scope dropdown (current folder / subfolders / account / all); refiner chips; recent searches in `ui_state_db` | M |
+| 2.2 | ✅ ~~Search query language~~ | M-18 | Parser in `mail/src/search_query.rs`: `from: to: cc: subject: body: has:attachment is:unread is:read is:flagged is:pinned category: received:>=2026-01-01 received:lastweek size:>1MB folder:`; compile to FTS5 `MATCH` plus SQL predicates locally and IMAP `SEARCH` keys remotely; keep `sanitize_fts_query` for free text | M |
+| 2.3 | ✅ ~~Search UI: refiners, scope, history~~ | M-18 | Scope dropdown (current folder / subfolders / account / all); refiner chips; recent searches in `ui_state_db`; advanced-search form; contextual Search ribbon row | M |
 | 2.4 | Search Folders | M-19 | Saved queries as virtual folders in the tree (unread mail, flagged, from VIPs, large mail, custom) | M |
 | 2.5 | Rules engine | M-14 | One model, `Rule { conditions: [From/To/Subject/Body/Header/HasAttachment/Importance/Size/SentOnlyToMe/List-Id], exceptions, actions: [Move/Copy/Delete/Flag/Categorise/MarkRead/Forward/Redirect/StopProcessing] }`, executed by three backends: (a) **client**, run on `NewMessages` in the session; (b) **Sieve** via ManageSieve (§4.5) when the server advertises it; (c) **Graph** `messageRules`. Rules UI shows where each rule runs; "Run rules now" on a folder; "Create rule…" from a message (and the context menu's Rules ▸, `message_menu.rs`). | L |
 | 2.6 | Quick Steps | M-15 | Named action chains (reuses rule actions) in the ribbon and a shortcut slot | M |

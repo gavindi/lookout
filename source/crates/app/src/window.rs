@@ -19,7 +19,7 @@ use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
-use lookout_mail::{AccountConfig, EndpointConfig};
+use lookout_mail::{AccountConfig, EndpointConfig, SearchQuery, SearchScope};
 use webkit::prelude::*;
 
 use crate::calendar_colors;
@@ -582,6 +582,10 @@ const SEARCH_DEBOUNCE_MS: u32 = 300;
 /// doesn't hand the list an unbounded set to rebuild from. Generous - the
 /// user can refine the query to narrow further.
 const SEARCH_RESULT_LIMIT: usize = 300;
+
+/// How many recent queries the search box remembers (roadmap 2.3), shown in its
+/// history popover and persisted in the UI-state database.
+const SEARCH_HISTORY_LIMIT: usize = 10;
 
 /// How many color-tag dots one message row renders. A message can carry any
 /// number of tags; past this the row draws the first few and leaves the rest
@@ -1284,6 +1288,12 @@ pub(crate) struct UiState {
     /// first - the message context menu's Move ▸ / Copy ▸ shortcuts (item
     /// 1.17). Persisted in the UI-state database.
     recent_folders: HashMap<AccountId, Vec<MailboxId>>,
+    /// The recent search queries (M-18, roadmap 2.3), newest first - shown in
+    /// the search box's history popover and persisted in the UI-state database.
+    recent_searches: Vec<String>,
+    /// Which folders a title-bar search sweeps (M-18, roadmap 2.3), persisted
+    /// via the `mail-search-scope` GSettings key.
+    search_scope: SearchScope,
     /// A message-menu action waiting for a message's body (Reply, Forward,
     /// Print on a message not read yet): run by the `BodyFetched` handler when
     /// that body lands. One at a time - a newer request replaces it.
@@ -1436,6 +1446,16 @@ pub(crate) struct UiState {
     /// (always, even for an empty match set - see the session docs), removing
     /// its entry; an empty set means the live pass is done.
     search_pending: HashSet<(AccountId, MailboxId)>,
+    /// The title-bar search entry (M-18, roadmap 2.3), so search helpers can
+    /// rewrite its text (chip removal, the Refine form) and rebuild the
+    /// refiner-chip row. `None` only before `build_window` sets it.
+    search_entry: Option<gtk::SearchEntry>,
+    /// The ribbon stack, so an active search can reveal its contextual
+    /// "Search" row and restore the previous row on exit.
+    search_ribbon: Option<gtk::Stack>,
+    /// The ribbon stack's visible child before the search row was shown, kept
+    /// so `exit_search` restores exactly what the user was looking at.
+    search_ribbon_prev: Option<String>,
 }
 
 impl UiState {
@@ -2027,6 +2047,19 @@ fn install_paned_css() {
         }
         entry.header-search-entry {
             background-color: @lookout-header-search-bg;
+        }
+        .search-refiner-chip {
+            background-color: @lookout-thread-count-bg;
+            border-radius: 9999px;
+            padding: 1px 4px 1px 10px;
+        }
+        .search-refiner-chip label {
+            font-size: 0.9em;
+        }
+        .search-refiner-chip button {
+            min-width: 18px;
+            min-height: 18px;
+            padding: 0;
         }",
     );
     // The folder rows' "⋯" menu: per-folder icon colours and the menu's
@@ -2515,6 +2548,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let (expanded_folders, collapsed_groups) = ui_db.as_ref().and_then(|db| db.load_folder_expansion().ok()).unwrap_or_default();
     let folder_prefs = ui_db.as_ref().and_then(|db| db.load_folder_prefs().ok()).unwrap_or_default();
     let recent_folders = ui_db.as_ref().and_then(|db| db.load_recent_folders().ok()).unwrap_or_default();
+    let recent_searches = ui_db.as_ref().and_then(|db| db.load_recent_searches().ok()).unwrap_or_default();
     // Shared keyring handle for manually-added ("other") IMAP/SMTP accounts -
     // see `other_accounts.rs`. Cloned into the add-account dialog, the
     // startup connect loop, and the Config view's edit/remove actions.
@@ -2598,6 +2632,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         favorite_display_order: Vec::new(),
         folder_prefs,
         recent_folders,
+        recent_searches,
+        search_scope: SearchScope::from_setting(&settings.get_string(crate::settings::MAIL_SEARCH_SCOPE)),
         body_waiter: None,
         load_remote_images: settings.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES),
         rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
@@ -2623,6 +2659,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         search_query: String::new(),
         search_results: Vec::new(),
         search_pending: HashSet::new(),
+        search_entry: None,
+        search_ribbon: None,
+        search_ribbon_prev: None,
     }));
     // The folder rows' drop targets reach `state` through this slot (they
     // were built before it existed).
@@ -2646,7 +2685,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // at startup. Mutated by the Manage-categories editor and the Microsoft
     // 365 Graph sync, read by the Categorize menu, the row context menu and
     // every row's category dots.
-    let tags = Rc::new(RefCell::new(crate::categories::CategorySet::from_defs(state.borrow().app_config.borrow().categories.clone())));
+    let tags = Rc::new(RefCell::new(crate::categories::CategorySet::from_defs(
+        state.borrow().app_config.borrow().categories.clone(),
+    )));
     // Publish the same set on `UiState` so the Microsoft 365 Graph sync and
     // the Config editor can reach it without threading it through every call.
     state.borrow_mut().categories = tags.clone();
@@ -3792,11 +3833,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_header_row.append(&sort_direction_button);
     message_header_row.append(&sort_key_button);
 
+    // The active search's refiner chips (roadmap 2.3): one removable pill per
+    // operator in the query, shown above the list only while searching. Filled
+    // by `refresh_search_refiners` from the parsed query.
+    let search_refiner_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(10)
+        .margin_end(10)
+        .margin_bottom(4)
+        .build();
+    search_refiner_row.set_visible(false);
+
     let list_header = ListHeader {
         folder_label: folder_title_label,
         account_label: account_title_label,
         favorite_button: favorite_button.clone(),
         favorite_suppress: favorite_suppress.clone(),
+        refiner_row: search_refiner_row.clone(),
     };
     refresh_list_header(&state, &list_header);
 
@@ -3842,6 +3896,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // typed again and its query is superseded (the newer keystroke armed a
     // newer timeout).
     let search_debounce: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    state.borrow_mut().search_entry = Some(search_entry.clone());
 
     // The outbox banner (item 1.14): "N scheduled messages" (or waiting /
     // failed ones) above the list, opening the "Scheduled messages" dialog.
@@ -3859,6 +3914,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_box.append(&message_header_row);
     message_box.append(&outbox_banner);
     message_box.append(&column_header_row);
+    message_box.append(&search_refiner_row);
     message_box.append(&message_list_stack);
     let message_card = card_section(&message_box);
     message_card.add_css_class("card-flush-start");
@@ -4938,7 +4994,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `root_stack` are explicitly told not to show these (see
     // `card_section`), so there's exactly one set, not four.
     let window_header = adw::HeaderBar::new();
-    window_header.set_title_widget(Some(&adw::WindowTitle::new("Lookout", "")));
+    // The centred search cluster (UX-11): a scope dropdown, the search entry,
+    // and a "Refine" button that opens the advanced-search form. The title
+    // widget is the header bar's centre slot, so this replaces the redundant
+    // window title text.
+    let scope_dropdown = gtk::DropDown::from_strings(&[
+        SearchScope::Folder.label(),
+        SearchScope::Subfolders.label(),
+        SearchScope::Account.label(),
+        SearchScope::All.label(),
+    ]);
+    scope_dropdown.set_selected(search_scope_index(state.borrow().search_scope));
+    scope_dropdown.set_tooltip_text(Some("Search scope"));
+    let search_refine_button = gtk::MenuButton::builder()
+        .icon_name(themed_icon_name(&["view-list-symbolic", "view-continuous-symbolic"]))
+        .tooltip_text("Refine search")
+        .css_classes(["flat"])
+        .build();
+    let search_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    search_box.append(&scope_dropdown);
+    search_box.append(&search_entry);
+    search_box.append(&search_refine_button);
+    window_header.set_title_widget(Some(&search_box));
     // The Lookout tab lives in the header's top-left corner rather than the
     // nav rail (it's the app's own dashboard, and its Observatorium icon
     // reads like a logo), with the permanent mail-search entry to its
@@ -4954,11 +5031,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .tooltip_text("Lookout")
         .build();
     window_header.pack_start(&lookout_view_button);
-    // The old 62px margin existed to line the search up with the menu bar
-    // below (which the rail shifts right); the header icon now owns that
-    // corner, so the search sits directly beside it.
-    search_entry.set_margin_start(12);
-    window_header.pack_start(&search_entry);
+    // The search cluster is the header's centred title widget (built above);
+    // nothing to pack here.
     // A second home for the View tab's Calendar overview toggle, docked at
     // the header's right end. Wired to `overview_pane_toggle` below, so
     // either button flips both - they can never disagree about the pane's
@@ -5245,6 +5319,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     view_toolbar_stack.add_named(&view_toolbar, Some("mail-view"));
     view_toolbar_stack.add_named(&calendar_command_toolbar, Some("calendar"));
     view_toolbar_stack.add_named(&tasks_command_toolbar, Some("tasks"));
+
+    // The contextual "Search" ribbon row (UX-11, roadmap 2.3): revealed while a
+    // search is active (see `start_search`), it mirrors the title-bar scope
+    // dropdown plus the Refine form and a Clear action.
+    let search_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
+    let search_toolbar_label = gtk::Label::builder().label("Search").xalign(0.0).css_classes(["dim-label"]).build();
+    let ribbon_scope_label = gtk::Label::builder().label("Scope:").xalign(0.0).build();
+    let ribbon_scope_dropdown = gtk::DropDown::from_strings(&[
+        SearchScope::Folder.label(),
+        SearchScope::Subfolders.label(),
+        SearchScope::Account.label(),
+        SearchScope::All.label(),
+    ]);
+    ribbon_scope_dropdown.set_selected(search_scope_index(state.borrow().search_scope));
+    ribbon_scope_dropdown.set_tooltip_text(Some("Search scope"));
+    let ribbon_refine_button = gtk::MenuButton::builder().label("Refine").css_classes(["flat"]).build();
+    let search_clear_button = gtk::Button::with_label("Clear search");
+    search_toolbar.append(&search_toolbar_label);
+    search_toolbar.append(&ribbon_scope_label);
+    search_toolbar.append(&ribbon_scope_dropdown);
+    search_toolbar.append(&ribbon_refine_button);
+    search_toolbar.append(&search_clear_button);
+    view_toolbar_stack.add_named(&search_toolbar, Some("search"));
+    state.borrow_mut().search_ribbon = Some(view_toolbar_stack.clone());
 
     let contacts_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     let contacts_toolbar_label = gtk::Label::builder().label("People").xalign(0.0).css_classes(["dim-label"]).build();
@@ -5603,11 +5701,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
+        let state = state.clone();
         mail_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("mail");
                 root_stack.set_visible_child_name(current_mail_page.get());
-                view_toolbar_stack.set_visible_child_name(ribbon_stack_name("mail", active_ribbon_tab.get()));
+                // Keep the contextual Search row on screen when a search is
+                // running (a search started from another module activates this
+                // button, which must not clobber the row).
+                let child = if state.borrow().search_active {
+                    "search".to_string()
+                } else {
+                    ribbon_stack_name("mail", active_ribbon_tab.get()).to_string()
+                };
+                view_toolbar_stack.set_visible_child_name(&child);
                 // Respect the View tab's toggle rather than forcing the
                 // overview pane back on after a Calendar round-trip -
                 // and the width-based auto-hide while the window is narrow.
@@ -5855,6 +5962,124 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
             exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, entry);
         });
+    }
+
+    // --- Search scope, Refine form and history (roadmap 2.3): the scope
+    // dropdowns (header and Search ribbon) stay in sync, the Refine buttons
+    // open the advanced-search form, and focusing the empty entry offers the
+    // recent-search history. Any of these rewrites the entry's text, which
+    // re-runs the search through `search-changed`. ---
+    {
+        let rerun: Rc<dyn Fn(&str)> = {
+            let state = state.clone();
+            let worker = worker.clone();
+            let message_list = message_list.clone();
+            let list_header = list_header.clone();
+            Rc::new(move |query: &str| {
+                if !query.trim().is_empty() {
+                    start_search(&state, &worker, &message_list, &list_header, query);
+                }
+            })
+        };
+        let on_scope: Rc<dyn Fn(u32)> = {
+            let state = state.clone();
+            let entry = search_entry.clone();
+            let header_dropdown = scope_dropdown.clone();
+            let ribbon_dropdown = ribbon_scope_dropdown.clone();
+            let rerun = rerun.clone();
+            Rc::new(move |index: u32| {
+                let scope = search_scope_at(index);
+                {
+                    let mut st = state.borrow_mut();
+                    if st.search_scope == scope {
+                        return;
+                    }
+                    st.search_scope = scope;
+                    st.settings.set_string(crate::settings::MAIL_SEARCH_SCOPE, scope.as_str());
+                }
+                header_dropdown.set_selected(index);
+                ribbon_dropdown.set_selected(index);
+                let active = state.borrow().search_active;
+                if active {
+                    rerun(&entry.text());
+                }
+            })
+        };
+        scope_dropdown.connect_selected_notify({
+            let on_scope = on_scope.clone();
+            move |dropdown| on_scope(dropdown.selected())
+        });
+        ribbon_scope_dropdown.connect_selected_notify({
+            let on_scope = on_scope.clone();
+            move |dropdown| on_scope(dropdown.selected())
+        });
+
+        let header_refine = build_refine_popover(&state);
+        search_refine_button.set_popover(Some(&header_refine));
+        let ribbon_refine = build_refine_popover(&state);
+        ribbon_refine_button.set_popover(Some(&ribbon_refine));
+
+        {
+            let entry = search_entry.clone();
+            search_clear_button.connect_clicked(move |_| entry.set_text(""));
+        }
+
+        // The history popover, anchored to the entry and shown on focus while
+        // the entry is empty (Outlook's recent-search list).
+        let history_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        let history_popover = gtk::Popover::new();
+        history_popover.set_child(Some(&history_box));
+        history_popover.set_parent(&search_entry);
+        let refresh_history: Rc<dyn Fn()> = {
+            let state = state.clone();
+            let entry = search_entry.clone();
+            let history_box = history_box.clone();
+            let popover = history_popover.clone();
+            Rc::new(move || {
+                while let Some(child) = history_box.first_child() {
+                    history_box.remove(&child);
+                }
+                let recent = state.borrow().recent_searches.clone();
+                if recent.is_empty() {
+                    history_box.append(&gtk::Label::builder().label("No recent searches").xalign(0.0).css_classes(["dim-label"]).build());
+                    return;
+                }
+                for query in recent {
+                    let button = gtk::Button::with_label(&query);
+                    button.add_css_class("flat");
+                    button.set_halign(gtk::Align::Start);
+                    {
+                        let entry = entry.clone();
+                        let popover = popover.clone();
+                        button.connect_clicked(move |_| {
+                            entry.set_text(&query);
+                            popover.popdown();
+                        });
+                    }
+                    history_box.append(&button);
+                }
+            })
+        };
+        let focus = gtk::EventControllerFocus::new();
+        {
+            let popover = history_popover.clone();
+            let entry = search_entry.clone();
+            let refresh_history = refresh_history.clone();
+            focus.connect_enter(move |_| {
+                if entry.text().is_empty() {
+                    refresh_history();
+                    popover.popup();
+                }
+            });
+        }
+        search_entry.add_controller(focus);
     }
 
     // The nav rail runs the full height *below the title bar* - it sits
@@ -15599,6 +15824,9 @@ struct ListHeader {
     /// Set while the star's state is being written programmatically, so the
     /// `toggled` handler can tell a refresh apart from a real user click.
     favorite_suppress: Rc<Cell<bool>>,
+    /// The removable refiner chips shown above the list during a search
+    /// (M-18, roadmap 2.3). Empty and hidden otherwise.
+    refiner_row: gtk::Box,
 }
 
 /// The header's two title lines for the active view: the open folder's display
@@ -16374,12 +16602,7 @@ fn save_categories(state: &Rc<RefCell<UiState>>, set: &crate::categories::Catego
 /// all at once; none (nothing selected) renders the toggles disabled. The
 /// caller owns showing it - for the toolbar it's the popover child (rebuilt on
 /// every `show`), for the context menu a custom slot.
-fn build_tag_menu(
-    tags: &Rc<RefCell<crate::categories::CategorySet>>,
-    state: &Rc<RefCell<UiState>>,
-    targets: Vec<EmailSummary>,
-    message_list: &MessageListModel,
-) -> gtk::Box {
+fn build_tag_menu(tags: &Rc<RefCell<crate::categories::CategorySet>>, state: &Rc<RefCell<UiState>>, targets: Vec<EmailSummary>, message_list: &MessageListModel) -> gtk::Box {
     let set = tags.borrow();
     let boxed = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -16502,12 +16725,7 @@ fn category_function_key(key: gtk::gdk::Key) -> Option<u8> {
 /// Deleting a category is non-destructive: only the definition is removed. The
 /// `$Lookout-tag-*` keywords already stored on messages stay on the server and
 /// simply stop displaying.
-pub(crate) fn show_manage_categories_dialog(
-    anchor: &gtk::Widget,
-    state: Rc<RefCell<UiState>>,
-    tags: Rc<RefCell<crate::categories::CategorySet>>,
-    message_list: MessageListModel,
-) {
+pub(crate) fn show_manage_categories_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, tags: Rc<RefCell<crate::categories::CategorySet>>, message_list: MessageListModel) {
     let window = anchor.root().and_downcast::<gtk::Window>();
     let dialog = {
         let mut builder = gtk::Window::builder().modal(true).title("Categories").default_width(500).default_height(560);
@@ -16760,7 +16978,14 @@ fn build_preset_picker(current: u8, on_pick: Rc<dyn Fn(u8)>) -> gtk::MenuButton 
     let preset = lookout_core::preset_by_index(current).unwrap_or(&lookout_core::OUTLOOK_CATEGORY_PRESETS[0]);
     button.set_child(Some(&preset_dot_area(preset.rgb, 18)));
 
-    let grid = gtk::Grid::builder().row_spacing(4).column_spacing(4).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
+    let grid = gtk::Grid::builder()
+        .row_spacing(4)
+        .column_spacing(4)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
     for (i, p) in lookout_core::OUTLOOK_CATEGORY_PRESETS.iter().enumerate() {
         let swatch = gtk::Button::builder().css_classes(["flat", "circular"]).tooltip_text(p.name).build();
         swatch.set_child(Some(&preset_dot_area(p.rgb, 16)));
@@ -16783,7 +17008,11 @@ fn build_preset_picker(current: u8, on_pick: Rc<dyn Fn(u8)>) -> gtk::MenuButton 
 /// lists "None" plus every function key; picking one calls `on_pick`.
 fn build_shortcut_picker(current: Option<u8>, on_pick: Rc<dyn Fn(Option<u8>)>) -> gtk::MenuButton {
     let label = current.map(|n| format!("Ctrl+F{n}")).unwrap_or_else(|| "Shortcut".into());
-    let button = gtk::MenuButton::builder().label(label).tooltip_text("Classic category shortcut").css_classes(["flat"]).build();
+    let button = gtk::MenuButton::builder()
+        .label(label)
+        .tooltip_text("Classic category shortcut")
+        .css_classes(["flat"])
+        .build();
     let list = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(0)
@@ -17203,26 +17432,78 @@ fn request_account_refresh(state: &Rc<RefCell<UiState>>, account_id: &AccountId)
     sync_follow_ups_from_graph(state, account_id);
 }
 
-/// The FTS cache pass of a search: query every connected account's read-side
-/// cache handle and merge the hits, deduplicated by `(mailbox, uid)` so a
-/// message that matches on both subject and body still appears once. Runs on
-/// the UI thread against the on-disk index (the same read-side handles the
-/// composer's autocomplete uses) - no IMAP round trip, so this is what makes
-/// results feel instant.
-/// Fires one off-thread FTS query per connected account's cache and returns
-/// a receiver for each - the caller joins them (see `start_search`) rather
-/// than this function blocking the GTK thread until every account answers.
+/// The local-index pass of a search (M-18, roadmap 2.2/2.3): query the
+/// read-side cache of every account in scope, with each account's folder set
+/// narrowed by the scope dropdown and any `folder:` token, and merge the hits
+/// (deduplicated by `(mailbox, uid)` in the caller). Fires one off-thread query
+/// per account and returns a receiver for each - the caller joins them (see
+/// `start_search`) rather than blocking the GTK thread.
 fn search_cached_results(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, query: &str) -> Vec<async_channel::Receiver<Vec<EmailSummary>>> {
-    state
-        .borrow()
-        .accounts
-        .values()
-        .filter_map(|h| h.address_cache.clone())
-        .map(|cache| {
-            let query = query.to_string();
-            spawn_cache_read(worker, cache, move |cache| cache.search(&query, SEARCH_RESULT_LIMIT).unwrap_or_default())
+    let parsed = SearchQuery::parse(query);
+    let (scope, current_account, current_mailbox) = {
+        let st = state.borrow();
+        (st.search_scope, st.current_account.clone(), st.current_mailbox.clone())
+    };
+    let folder_token = parsed.folder.clone();
+    let jobs: Vec<(std::sync::Arc<lookout_mail::Cache>, Option<Vec<MailboxId>>)> = {
+        let st = state.borrow();
+        st.accounts
+            .iter()
+            .filter(|(id, _)| match scope {
+                SearchScope::Folder | SearchScope::Subfolders | SearchScope::Account => current_account.as_ref() == Some(id),
+                SearchScope::All => true,
+            })
+            .filter_map(|(_, handle)| {
+                let cache = handle.address_cache.clone()?;
+                let mailbox_scope = resolve_search_mailboxes(&handle.folders, scope, current_mailbox.as_ref(), folder_token.as_deref());
+                Some((cache, mailbox_scope))
+            })
+            .collect()
+    };
+    jobs.into_iter()
+        .map(|(cache, mailbox_scope)| {
+            let parsed = parsed.clone();
+            spawn_cache_read(worker, cache, move |cache| {
+                cache.search_query(&parsed, mailbox_scope.as_deref(), SEARCH_RESULT_LIMIT).unwrap_or_default()
+            })
         })
         .collect()
+}
+
+/// The mailboxes a search covers in one account: `None` means every folder of
+/// the account (the `Account`/`All` scopes with no `folder:` token), `Some(ids)`
+/// restricts to those folders, and `Some(empty)` matches nothing (e.g. on a
+/// folder scope with no open mailbox, or a `folder:` token that names no
+/// folder). A `folder:` token wins over the scope dropdown and resolves by
+/// path or display name.
+fn resolve_search_mailboxes(folders: &[lookout_core::Mailbox], scope: SearchScope, current: Option<&MailboxId>, folder_token: Option<&str>) -> Option<Vec<MailboxId>> {
+    if let Some(token) = folder_token {
+        let needle = token.to_lowercase();
+        let ids: Vec<MailboxId> = folders
+            .iter()
+            .filter(|mailbox| mailbox.name.to_lowercase() == needle || display_name(&mailbox.name).to_lowercase() == needle)
+            .map(|mailbox| mailbox.id.clone())
+            .collect();
+        return Some(ids);
+    }
+    match scope {
+        SearchScope::Folder => Some(current.map(|mailbox| vec![mailbox.clone()]).unwrap_or_default()),
+        SearchScope::Subfolders => {
+            let Some(current) = current else {
+                return Some(Vec::new());
+            };
+            // A child's MailboxId is `<account>:<parent path>/<child>`, so the
+            // parent's id plus the delimiter is the subtree prefix.
+            let prefix = format!("{}/", current.0);
+            let ids: Vec<MailboxId> = folders
+                .iter()
+                .filter(|mailbox| &mailbox.id == current || mailbox.id.0.starts_with(&prefix))
+                .map(|mailbox| mailbox.id.clone())
+                .collect();
+            Some(ids)
+        }
+        SearchScope::Account | SearchScope::All => None,
+    }
 }
 
 /// Repopulates the message list from the accumulated search results, under the
@@ -17326,7 +17607,264 @@ fn dispatch_search_fallbacks(state: &Rc<RefCell<UiState>>, query: &str) {
     }
 }
 
-/// Enters (or re-enters) full-text search for `query`: flips the list into
+/// The dropdown index for a [`SearchScope`], matching the order the header and
+/// ribbon scope dropdowns are built with.
+fn search_scope_index(scope: SearchScope) -> u32 {
+    match scope {
+        SearchScope::Folder => 0,
+        SearchScope::Subfolders => 1,
+        SearchScope::Account => 2,
+        SearchScope::All => 3,
+    }
+}
+
+/// The [`SearchScope`] a dropdown index selects.
+fn search_scope_at(index: u32) -> SearchScope {
+    match index {
+        0 => SearchScope::Folder,
+        1 => SearchScope::Subfolders,
+        2 => SearchScope::Account,
+        _ => SearchScope::All,
+    }
+}
+
+/// One refiner chip: an operator drawn from the parsed query, so a chip's ✕ can
+/// remove exactly that operator and rebuild the query string.
+#[derive(Clone, PartialEq)]
+enum Refiner {
+    From(String),
+    To(String),
+    Cc(String),
+    Subject(String),
+    Body(String),
+    HasAttachment,
+    Unread,
+    Read,
+    Flagged,
+    Pinned,
+    Category(String),
+    Received(String),
+    Size(String),
+    Folder(String),
+}
+
+/// Every chip a parsed query should show, in a stable order.
+fn refiners_of(query: &SearchQuery) -> Vec<Refiner> {
+    let mut out = Vec::new();
+    out.extend(query.from.iter().cloned().map(Refiner::From));
+    out.extend(query.to.iter().cloned().map(Refiner::To));
+    out.extend(query.cc.iter().cloned().map(Refiner::Cc));
+    out.extend(query.subject.iter().cloned().map(Refiner::Subject));
+    out.extend(query.body.iter().cloned().map(Refiner::Body));
+    if query.has_attachment {
+        out.push(Refiner::HasAttachment);
+    }
+    match query.is_unread {
+        Some(true) => out.push(Refiner::Unread),
+        Some(false) => out.push(Refiner::Read),
+        None => {}
+    }
+    if query.is_flagged {
+        out.push(Refiner::Flagged);
+    }
+    if query.is_pinned {
+        out.push(Refiner::Pinned);
+    }
+    out.extend(query.category.iter().cloned().map(Refiner::Category));
+    if let Some(received) = &query.received {
+        out.push(Refiner::Received(received.label.clone()));
+    }
+    if let Some(size) = &query.size {
+        out.push(Refiner::Size(size.label.clone()));
+    }
+    if let Some(folder) = &query.folder {
+        out.push(Refiner::Folder(folder.clone()));
+    }
+    out
+}
+
+/// The chip's label, using Outlook's wording (UX-02, UX-03).
+fn refiner_label(refiner: &Refiner) -> String {
+    match refiner {
+        Refiner::From(value) => format!("From: {value}"),
+        Refiner::To(value) => format!("To: {value}"),
+        Refiner::Cc(value) => format!("Cc: {value}"),
+        Refiner::Subject(value) => format!("Subject: {value}"),
+        Refiner::Body(value) => format!("Body: {value}"),
+        Refiner::HasAttachment => "Has files".to_string(),
+        Refiner::Unread => "Unread".to_string(),
+        Refiner::Read => "Read".to_string(),
+        Refiner::Flagged => "Flagged".to_string(),
+        Refiner::Pinned => "Pinned".to_string(),
+        Refiner::Category(value) => format!("Category: {value}"),
+        Refiner::Received(value) => format!("Received: {value}"),
+        Refiner::Size(value) => format!("Size: {value}"),
+        Refiner::Folder(value) => format!("Folder: {value}"),
+    }
+}
+
+/// A copy of `query` with `refiner`'s operator removed.
+fn remove_refiner(query: &SearchQuery, refiner: &Refiner) -> SearchQuery {
+    let mut next = query.clone();
+    match refiner {
+        Refiner::From(value) => next.from.retain(|item| item != value),
+        Refiner::To(value) => next.to.retain(|item| item != value),
+        Refiner::Cc(value) => next.cc.retain(|item| item != value),
+        Refiner::Subject(value) => next.subject.retain(|item| item != value),
+        Refiner::Body(value) => next.body.retain(|item| item != value),
+        Refiner::HasAttachment => next.has_attachment = false,
+        Refiner::Unread | Refiner::Read => next.is_unread = None,
+        Refiner::Flagged => next.is_flagged = false,
+        Refiner::Pinned => next.is_pinned = false,
+        Refiner::Category(value) => next.category.retain(|item| item != value),
+        Refiner::Received(_) => next.received = None,
+        Refiner::Size(_) => next.size = None,
+        Refiner::Folder(_) => next.folder = None,
+    }
+    next
+}
+
+/// Rebuilds the refiner-chip row from the active query. Each chip's ✕ rewrites
+/// the search entry's text, which re-runs the search through the entry's own
+/// `search-changed` path (or exits it when the last operator is gone).
+fn refresh_search_refiners(state: &Rc<RefCell<UiState>>, header: &ListHeader) {
+    while let Some(child) = header.refiner_row.first_child() {
+        header.refiner_row.remove(&child);
+    }
+    let (active, query, entry) = {
+        let st = state.borrow();
+        (st.search_active, st.search_query.clone(), st.search_entry.clone())
+    };
+    let Some(entry) = entry else {
+        return;
+    };
+    if active {
+        for refiner in refiners_of(&SearchQuery::parse(&query)) {
+            let chip = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(2)
+                .css_classes(["search-refiner-chip"])
+                .build();
+            chip.append(&gtk::Label::new(Some(&refiner_label(&refiner))));
+            let remove = gtk::Button::from_icon_name("window-close-symbolic");
+            remove.add_css_class("flat");
+            remove.set_tooltip_text(Some("Remove"));
+            {
+                let entry = entry.clone();
+                let refiner = refiner.clone();
+                remove.connect_clicked(move |_| {
+                    let next = remove_refiner(&SearchQuery::parse(&entry.text()), &refiner);
+                    entry.set_text(next.to_string().trim());
+                });
+            }
+            chip.append(&remove);
+            header.refiner_row.append(&chip);
+        }
+    }
+    header.refiner_row.set_visible(header.refiner_row.first_child().is_some());
+}
+
+/// The advanced-search form behind both "Refine" buttons (UX-11, roadmap 2.3):
+/// fields for the operators the query language supports. Applying it merges the
+/// filled fields into whatever is already typed and rewrites the entry, which
+/// re-runs the search.
+fn build_refine_popover(state: &Rc<RefCell<UiState>>) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(true);
+    let grid = gtk::Grid::builder()
+        .row_spacing(6)
+        .column_spacing(8)
+        .margin_top(10)
+        .margin_bottom(10)
+        .margin_start(10)
+        .margin_end(10)
+        .build();
+
+    let from = gtk::Entry::new();
+    let to = gtk::Entry::new();
+    let subject = gtk::Entry::new();
+    let body = gtk::Entry::new();
+    let category = gtk::Entry::new();
+    let size = gtk::Entry::new();
+    let has_files = gtk::CheckButton::with_label("Has files");
+    let unread = gtk::CheckButton::with_label("Unread");
+    let flagged = gtk::CheckButton::with_label("Flagged");
+    let received = gtk::DropDown::from_strings(&["Any time", "Today", "Last 7 days", "This month", "Last month", "This year"]);
+
+    let fields: [(&str, &gtk::Widget); 6] = [
+        ("From", from.upcast_ref()),
+        ("To", to.upcast_ref()),
+        ("Subject", subject.upcast_ref()),
+        ("Keywords", body.upcast_ref()),
+        ("Category", category.upcast_ref()),
+        ("Size", size.upcast_ref()),
+    ];
+    for (row, (label, widget)) in fields.iter().enumerate() {
+        grid.attach(&gtk::Label::builder().label(*label).xalign(1.0).build(), 0, row as i32, 1, 1);
+        grid.attach(*widget, 1, row as i32, 1, 1);
+    }
+    let row = fields.len() as i32;
+    grid.attach(&gtk::Label::builder().label("Received").xalign(1.0).build(), 0, row, 1, 1);
+    grid.attach(&received, 1, row, 1, 1);
+    grid.attach(&has_files, 0, row + 1, 1, 1);
+    grid.attach(&unread, 1, row + 1, 1, 1);
+    grid.attach(&flagged, 0, row + 2, 1, 1);
+
+    let apply = gtk::Button::with_label("Search");
+    apply.add_css_class("suggested-action");
+    apply.set_halign(gtk::Align::End);
+    grid.attach(&apply, 1, row + 2, 1, 1);
+    popover.set_child(Some(&grid));
+
+    {
+        let popover = popover.clone();
+        let state = state.clone();
+        apply.connect_clicked(move |_| {
+            let Some(entry) = state.borrow().search_entry.clone() else {
+                return;
+            };
+            let mut query = SearchQuery::parse(&entry.text());
+            // Field values append to whatever the query already carries.
+            for (slot, value) in [
+                (&mut query.from, &from),
+                (&mut query.to, &to),
+                (&mut query.subject, &subject),
+                (&mut query.body, &body),
+                (&mut query.category, &category),
+            ] {
+                let text = value.text().trim().to_string();
+                if !text.is_empty() && !slot.contains(&text) {
+                    slot.push(text);
+                }
+            }
+            let size_text = size.text().trim().to_string();
+            if !size_text.is_empty() {
+                query.size = SearchQuery::parse(&format!("size:{size_text}")).size;
+            }
+            match received.selected() {
+                1 => query.received = SearchQuery::parse("received:today").received,
+                2 => query.received = SearchQuery::parse("received:last7days").received,
+                3 => query.received = SearchQuery::parse("received:thismonth").received,
+                4 => query.received = SearchQuery::parse("received:lastmonth").received,
+                5 => query.received = SearchQuery::parse("received:thisyear").received,
+                _ => {}
+            }
+            if has_files.is_active() {
+                query.has_attachment = true;
+            }
+            if unread.is_active() {
+                query.is_unread = Some(true);
+            }
+            if flagged.is_active() {
+                query.is_flagged = true;
+            }
+            entry.set_text(query.to_string().trim());
+            popover.popdown();
+        });
+    }
+    popover
+}
+
 /// search mode, dispatches the live IMAP pass on the open view, and repopulates
 /// from the local FTS index across every account as each one's off-thread
 /// query answers (an empty list paints immediately in the meantime). An empty
@@ -17335,6 +17873,7 @@ fn dispatch_search_fallbacks(state: &Rc<RefCell<UiState>>, query: &str) {
 fn start_search(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, message_list: &MessageListModel, list_header: &ListHeader, query: &str) {
     let query = query.trim().to_string();
     debug_assert!(!query.is_empty(), "start_search is only called with a non-empty query; empty text takes the exit path");
+    let scope = state.borrow().search_scope;
     {
         let mut st = state.borrow_mut();
         st.search_active = true;
@@ -17346,7 +17885,29 @@ fn start_search(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, message_list:
         // query, so it's discarded either way.
         st.search_pending.clear();
         st.search_results.clear();
+        // Recent-search history (roadmap 2.3): newest first, de-duplicated and
+        // capped.
+        st.recent_searches.retain(|existing| existing != &query);
+        st.recent_searches.insert(0, query.clone());
+        st.recent_searches.truncate(SEARCH_HISTORY_LIMIT);
+        // Reveal the contextual Search ribbon row, remembering what to restore.
+        if let Some(stack) = st.search_ribbon.clone() {
+            if st.search_ribbon_prev.is_none() {
+                st.search_ribbon_prev = Some(stack.visible_child_name().map(|name| name.to_string()).unwrap_or_default());
+            }
+            stack.set_visible_child_name("search");
+        }
     }
+    {
+        let db = state.borrow().ui_db.clone();
+        let recent = state.borrow().recent_searches.clone();
+        if let Some(db) = db {
+            if let Err(e) = db.set_recent_searches(&recent) {
+                tracing::warn!("failed to persist recent searches: {e}");
+            }
+        }
+    }
+    refresh_search_refiners(state, list_header);
     dispatch_search_fallbacks(state, &query);
     repopulate_search_results(state, message_list);
     refresh_list_header(state, list_header);
@@ -17366,9 +17927,9 @@ fn start_search(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, message_list:
                 }
             }
         }
-        // The query changed (or search was left entirely) while these were
-        // in flight - the reply is for a search that's no longer current.
-        if state.borrow().search_query != query {
+        // The query or scope changed (or search was left entirely) while these
+        // were in flight - the reply is for a search that's no longer current.
+        if state.borrow().search_query != query || state.borrow().search_scope != scope {
             return;
         }
         state.borrow_mut().search_results = results;
@@ -17406,8 +17967,20 @@ fn exit_search(
         }
     };
     state.borrow_mut().mail_view = restored_view;
+    // Restore the ribbon row the search replaced, and clear the refiner chips.
+    {
+        let stack = state.borrow().search_ribbon.clone();
+        let previous = state.borrow_mut().search_ribbon_prev.take();
+        if let Some(stack) = stack {
+            match previous.filter(|name| !name.is_empty()) {
+                Some(name) => stack.set_visible_child_name(&name),
+                None => stack.set_visible_child_name(ribbon_stack_name("mail", "home")),
+            }
+        }
+    }
     search_entry.set_text("");
     refresh_list_header(state, list_header);
+    refresh_search_refiners(state, list_header);
     if restored_view == MailView::UnifiedInbox {
         for (account_id, inbox_id) in account_inboxes(state) {
             request_mailbox_sync(state, &account_id, &inbox_id);
@@ -24590,6 +25163,8 @@ mod tests {
             favorite_display_order: Vec::new(),
             folder_prefs: HashMap::new(),
             recent_folders: HashMap::new(),
+            recent_searches: Vec::new(),
+            search_scope: SearchScope::All,
             body_waiter: None,
             load_remote_images: false,
             rich_text_default: true,
@@ -24615,6 +25190,9 @@ mod tests {
             search_query: String::new(),
             search_results: Vec::new(),
             search_pending: HashSet::new(),
+            search_entry: None,
+            search_ribbon: None,
+            search_ribbon_prev: None,
         }))
     }
 

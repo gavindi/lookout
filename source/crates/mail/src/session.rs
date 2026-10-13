@@ -16,6 +16,7 @@ use crate::config::{AccountConfig, Credential};
 use crate::connection::{connect_tls, SessionStream};
 use crate::envelope::{flags_from_fetch, summary_from_fetch};
 use crate::error::{Error, Result};
+use crate::search_query::{imap_quote, SearchQuery};
 use crate::send::{build_draft_raw_message, send_smtp, ComposedMessage, OutboxMessage};
 
 /// How many of the most recent messages the background body prefetch queues
@@ -656,14 +657,15 @@ pub enum AccountCommand {
         msg: Box<ComposedMessage>,
         replace: DraftReplace,
     },
-    /// The IMAP `SEARCH` fallback for full-text search: run `UID SEARCH TEXT
-    /// "<query>"` against `mailbox` (SELECTing it on demand, like
-    /// `StoreFlags`), fetch the matching messages' envelopes, and answer with
-    /// an `AccountEvent::SearchResults` - always emitted, even for an empty
-    /// match set, so the UI knows the live pass is complete. One round trip
-    /// per folder, which is why the app only sends it for the mailbox the
+    /// The IMAP `SEARCH` fallback for full-text search: translate the query's
+    /// operators into `UID SEARCH` criteria (M-18, see
+    /// [`SearchQuery::to_imap_criteria`]) against `mailbox` (SELECTing it on
+    /// demand, like `StoreFlags`), fetch the matching messages' envelopes, and
+    /// answer with an `AccountEvent::SearchResults` - always emitted, even for
+    /// an empty match set, so the UI knows the live pass is complete. One round
+    /// trip per folder, which is why the app only sends it for the mailbox the
     /// user is actually viewing; everything already synced is covered
-    /// instantly by the local FTS index (`Cache::search`).
+    /// instantly by the local index (`Cache::search_query`).
     SearchMailbox {
         mailbox: MailboxId,
         query: String,
@@ -5782,29 +5784,23 @@ async fn refresh_folders_targeted(
     open_changed
 }
 
-/// Quotes an IMAP search criterion's argument per RFC 3501 §9 (quoted string):
-/// the value is wrapped in double quotes and any embedded `"` or `\` escaped
-/// with a backslash, so arbitrary user text can never break out of the string
-/// and inject search grammar.
-fn imap_quote(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
-/// The IMAP `SEARCH` fallback for one mailbox: `UID SEARCH TEXT "<query>"`
-/// returns the matching uids, then a `UID FETCH` of those uids' envelopes
-/// yields the same `EmailSummary` shape the local index produces. `TEXT`
-/// searches headers and body together (subject, addresses, message text) -
-/// the same surface the FTS index covers. An empty match set is a valid
-/// answer; `sync_mailbox`'s whole-folder strategy is not used here because
-/// the server already did the filtering (and re-fetching a whole folder to
-/// filter locally would defeat the fallback's purpose).
-/// Runs the server-side `UID SEARCH TEXT` fallback for `mailbox` and fetches
-/// the matching envelopes. Yields to the interactive command queue between
-/// envelope-fetch chunks: a large match set is many round trips, and the
-/// user can click a message while the search runs (the local FTS results are
-/// already on screen), so the search stops fetching further chunks the moment
-/// an interactive command arrives and returns the partial match set - the UI
+/// The IMAP `SEARCH` fallback for one mailbox: it translates the query's
+/// operators into `UID SEARCH` criteria ([`SearchQuery::to_imap_criteria`]) -
+/// `TEXT` for free text, plus `FROM`/`TO`/`CC`/`SUBJECT`/`BODY`, `UNSEEN`/
+/// `SEEN`, `FLAGGED`, `KEYWORD`, `SINCE`/`BEFORE` and `LARGER`/`SMALLER` - then
+/// a `UID FETCH` of the matching uids yields the same `EmailSummary` shape the
+/// local index produces. The server can't express `has:attachment` or
+/// `category:`, so each fetched summary is re-checked with
+/// [`SearchQuery::matches_summary`] before it's returned. An empty match set is
+/// a valid answer; `sync_mailbox`'s whole-folder strategy is not used here
+/// because the server already did the filtering (and re-fetching a whole
+/// folder to filter locally would defeat the fallback's purpose).
+/// Runs the server-side search fallback for `mailbox` and fetches the matching
+/// envelopes. Yields to the interactive command queue between envelope-fetch
+/// chunks: a large match set is many round trips, and the user can click a
+/// message while the search runs (the local FTS results are already on
+/// screen), so the search stops fetching further chunks the moment an
+/// interactive command arrives and returns the partial match set - the UI
 /// merges the answer into its accumulated results, so a partial answer is a
 /// degraded search, never a broken one.
 async fn search_mailbox(
@@ -5814,8 +5810,14 @@ async fn search_mailbox(
     query: &str,
     interactive_commands: &async_channel::Receiver<AccountCommand>,
 ) -> Result<Vec<EmailSummary>> {
-    let search_query = format!("TEXT {}", imap_quote(query));
-    let uids = session.uid_search(&search_query).await?;
+    let parsed = SearchQuery::parse(query);
+    let criteria = parsed.to_imap_criteria();
+    // A filter-only query whose operators IMAP can't express (e.g. just
+    // `has:attachment`) has nothing to send; the local index handles it.
+    if criteria.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let uids = session.uid_search(&criteria).await?;
     if uids.is_empty() {
         return Ok(Vec::new());
     }
@@ -5838,6 +5840,10 @@ async fn search_mailbox(
         fetches.extend(chunk);
     }
     let mut messages: Vec<EmailSummary> = fetches.iter().filter_map(|f| summary_from_fetch(mailbox, f)).collect();
+    // Enforce the operators IMAP has no key for (attachment, category,
+    // exact to/cc) - otherwise the server answer would include false
+    // positives the local pass would never have produced.
+    messages.retain(|message| parsed.matches_summary(message));
     let keys = lookout_core::thread::compute_thread_keys(&messages);
     for msg in &mut messages {
         if let Some(key) = keys.get(&msg.uid) {

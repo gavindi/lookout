@@ -193,6 +193,11 @@
       <summary>Active message-list filters</summary>
       <description>The independent filters narrowing the message list (unread, flagged, has-attachments, high-importance, categorized, to-me). Empty shows every message.</description>
     </key>
+    <key name="mail-search-scope" type="s">
+      <default>'all'</default>
+      <summary>Search scope</summary>
+      <description>Which folders a search sweeps: folder, subfolders, account or all mailboxes.</description>
+    </key>
 
     <!-- Mail settings -->
     <key name="mail-load-remote-images" type="b">
