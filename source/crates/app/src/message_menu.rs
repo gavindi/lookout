@@ -11,7 +11,7 @@
 //!
 //! Entries whose features haven't landed yet are left out rather than shown
 //! greyed: Ignore (2.8), Block ▸ (2.9), Rules ▸ Create rule (2.5), and Report
-//! ▸ Report phishing / Not junk (1.24). Each adds itself here when it lands.
+//! ▸ Report phishing (6.7). Each adds itself here when it lands.
 //!
 //! Copyright (C) <2026>  <Gavin Graham & Contributors>
 //! Software released under the GPL3 license
@@ -54,6 +54,9 @@ pub enum MessageMenuAction {
     SnoozeCustom,
     Unsnooze,
     ReportJunk,
+    /// Mark the targets as not junk (move back to the Inbox and set RFC 5788
+    /// `$NotJunk`, item 1.24); offered inside the Junk folder.
+    NotJunk,
     ViewDetails,
     ViewSource,
     OpenWindow,
@@ -87,6 +90,8 @@ pub struct MessageMenuState {
     pub snoozed: bool,
     /// Report ▸ Report junk (not from the Junk folder itself).
     pub can_report_junk: bool,
+    /// Report ▸ Not junk (every target is in the Junk folder).
+    pub can_not_junk: bool,
 }
 
 /// The facts [`message_menu_state`] needs about one target message.
@@ -119,6 +124,7 @@ pub fn message_menu_state(targets: &[TargetFacts], single: bool, has_archive: bo
         can_snooze: !any_draft,
         snoozed: targets.iter().any(|t| t.snoozed),
         can_report_junk: targets.iter().all(|t| t.role != Some(MailboxRole::Junk)),
+        can_not_junk: targets.iter().all(|t| t.role == Some(MailboxRole::Junk)),
     }
 }
 
@@ -166,6 +172,7 @@ pub fn action_specs() -> Vec<ActionSpec> {
         "snooze-custom",
         "unsnooze",
         "report-junk",
+        "not-junk",
         "view-details",
         "view-source",
         "open-window",
@@ -196,6 +203,7 @@ pub fn enabled_actions(state: &MessageMenuState) -> Vec<(&'static str, bool)> {
         ("snooze", state.can_snooze),
         ("snooze-custom", state.can_snooze),
         ("report-junk", state.can_report_junk),
+        ("not-junk", state.can_not_junk),
         ("view-details", state.single),
         ("view-source", state.single),
         ("open-window", state.single),
@@ -263,7 +271,10 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
     };
     menu.submenu("Categorize", MenuDescription::new().section().custom(CATEGORIZE_SLOT))
         .section()
-        .submenu("Report", MenuDescription::new().section().action("Report junk", ns("report-junk")))
+        .submenu(
+            "Report",
+            MenuDescription::new().section().action("Report junk", ns("report-junk")).action("Not junk", ns("not-junk")),
+        )
         .section()
         .submenu(
             "View",
@@ -311,6 +322,7 @@ pub fn message_action_for(name: &str, param: Option<&glib::Variant>) -> Option<M
         "snooze-custom" => MessageMenuAction::SnoozeCustom,
         "unsnooze" => MessageMenuAction::Unsnooze,
         "report-junk" => MessageMenuAction::ReportJunk,
+        "not-junk" => MessageMenuAction::NotJunk,
         "view-details" => MessageMenuAction::ViewDetails,
         "view-source" => MessageMenuAction::ViewSource,
         "open-window" => MessageMenuAction::OpenWindow,
@@ -387,7 +399,7 @@ mod tests {
                 vec!["Open in new window", "Print"],
             ]
         );
-        assert_eq!(labels(submenu(&menu, "Report")), vec![vec!["Report junk"]]);
+        assert_eq!(labels(submenu(&menu, "Report")), vec![vec!["Report junk", "Not junk"]]);
         assert_eq!(labels(submenu(&menu, "View")), vec![vec!["View message details", "View message source"]]);
         assert_eq!(labels(submenu(&menu, "Categorize")), vec![vec![format!("[{CATEGORIZE_SLOT}]")]]);
     }
@@ -418,6 +430,7 @@ mod tests {
         let inbox = facts(Some(MailboxRole::Inbox));
         let single = message_menu_state(std::slice::from_ref(&inbox), true, true);
         assert!(single.single && single.can_reply && single.can_archive && single.can_move && single.can_snooze && single.can_report_junk);
+        assert!(!single.can_not_junk, "Not junk is only offered inside Junk");
 
         let several = message_menu_state(&[inbox.clone(), inbox.clone()], false, true);
         assert!(!several.single && !several.can_reply, "single-message verbs need one message");
@@ -430,6 +443,7 @@ mod tests {
         assert!(!message_menu_state(&[flagged_draft], true, true).can_reply, "\\Draft outside Drafts too");
 
         assert!(!message_menu_state(&[facts(Some(MailboxRole::Junk))], true, true).can_report_junk);
+        assert!(message_menu_state(&[facts(Some(MailboxRole::Junk))], true, true).can_not_junk);
         assert!(!message_menu_state(&[facts(Some(MailboxRole::Archive))], true, true).can_archive);
         assert!(!message_menu_state(std::slice::from_ref(&inbox), true, false).can_archive, "no Archive folder");
 
@@ -447,6 +461,7 @@ mod tests {
         let enabled: std::collections::HashMap<_, _> = enabled_actions(&state).into_iter().collect();
         assert!(!enabled["reply"] && !enabled["print"] && !enabled["view-source"]);
         assert!(!enabled["report-junk"]);
+        assert!(enabled["not-junk"], "Not junk is enabled inside Junk");
         assert!(enabled["move"] && enabled["copy-other"] && enabled["archive"]);
         // Every name it toggles is a declared action.
         let declared: Vec<&str> = action_specs().iter().map(|spec| spec.name).collect();
@@ -522,6 +537,7 @@ mod tests {
             ("snooze-custom", MessageMenuAction::SnoozeCustom),
             ("unsnooze", MessageMenuAction::Unsnooze),
             ("report-junk", MessageMenuAction::ReportJunk),
+            ("not-junk", MessageMenuAction::NotJunk),
             ("view-details", MessageMenuAction::ViewDetails),
             ("view-source", MessageMenuAction::ViewSource),
             ("open-window", MessageMenuAction::OpenWindow),

@@ -246,6 +246,11 @@
       <summary>Undo send delay in seconds</summary>
       <description>Seconds a sent message waits in the outbox before it goes out, during which the "Sending" notification offers Undo. 0 sends immediately with no Undo.</description>
     </key>
+    <key name="mail-warn-no-attachment" type="b">
+      <default>true</default>
+      <summary>Warn if a message looks like it is missing an attachment</summary>
+      <description>Before sending, look for words like "attached" or "enclosure" in the subject and body; if the message has no attachments, ask whether to send it anyway.</description>
+    </key>
     <key name="mail-notifications-enabled" type="b">
       <default>true</default>
       <summary>Mail notifications</summary>

@@ -680,6 +680,32 @@ struct PendingAttachment {
     button: gtk::MenuButton,
 }
 
+/// What a batch of fetched attachments is for (item 1.23 / M-33).
+enum AttachmentBatchAction {
+    /// Write each attachment into this folder, one file per part.
+    SaveAll(gio::File),
+    /// Write the attachments as a single zip archive at this file.
+    Zip(gio::File),
+}
+
+/// A "Save all" / "Download as zip" run in flight, tracked in
+/// `UiState::pending_attachment_batch`: the attachments' bytes are fetched one
+/// part at a time (the session serves one `FetchAttachment` per command), then
+/// written once the queue drains.
+struct AttachmentBatch {
+    mailbox: MailboxId,
+    uid: Uid,
+    /// The `BodyPart::part_number` currently being fetched, matched against a
+    /// late `PartFetched` so a response for a different part (or an inline
+    /// `cid:` request racing the batch) isn't mistaken for the next in line.
+    current: String,
+    /// Parts still to fetch, in the order they were listed.
+    queue: VecDeque<BodyPart>,
+    /// Bytes already fetched, paired with a de-duplicated save name.
+    collected: Vec<(String, Vec<u8>)>,
+    action: AttachmentBatchAction,
+}
+
 /// One .eml export in flight for the reading pane's "More" menu, tracked in
 /// `UiState::pending_raw_message`. `initial_name` is the save dialog's
 /// suggested filename (built from the message's subject at request time, so
@@ -958,6 +984,10 @@ pub(crate) struct UiState {
     /// user navigates away first). One at a time; the strip's buttons ignore
     /// a click while one is outstanding. See `PendingAttachment`.
     pending_attachment: Option<PendingAttachment>,
+    /// A "Save all" / "Download as zip" run currently in flight (item 1.23) -
+    /// the attachments' parts are fetched one at a time, then written together
+    /// once the queue drains. One at a time; see `AttachmentBatch`.
+    pending_attachment_batch: Option<AttachmentBatch>,
     /// A whole-message .eml export currently in flight for the "More" menu -
     /// one at a time, cleared when `AccountEvent::RawMessageFetched`/
     /// `RawMessageFetchFailed` lands (or discarded if the user navigates
@@ -2502,6 +2532,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         body_fetch_error: None,
         body_fetch_generation: 0,
         pending_attachment: None,
+        pending_attachment_batch: None,
         pending_raw_message: None,
         message_windows: HashMap::new(),
         message_details: None,
@@ -3993,6 +4024,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .hexpand(true)
         .vexpand(true)
         .build();
+    install_web_view_zoom(&web_view);
     // Inline `cid:` image resolution: register a custom URI scheme so WebKit
     // asks us for the bytes behind `<img src="cid:...">` references instead
     // of failing the load. The handler callback fires on a WebKit worker
@@ -4343,7 +4375,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let message_list = message_list.clone();
         follow_up_banner.connect_button_clicked(move |_| {
-            let Some((mailbox, uid, flag)) = state.borrow().rendered_follow_up.clone() else { return };
+            let Some((mailbox, uid, flag)) = state.borrow().rendered_follow_up.clone() else {
+                return;
+            };
             let Some(summary) = message_list.all_messages().into_iter().find(|m| m.mailbox == mailbox && m.uid == uid) else {
                 return;
             };
@@ -4631,7 +4665,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 send_account_command(&state, &account_id, AccountCommand::CancelOutbox { id: item.id });
                 return;
             }
-            let Some(summary) = message_list.selected_summary().filter(|s| s.mailbox == mailbox && s.uid == uid) else { return };
+            let Some(summary) = message_list.selected_summary().filter(|s| s.mailbox == mailbox && s.uid == uid) else {
+                return;
+            };
             // The banner stays revealed: the message page (and with it the
             // banner) is simply hidden while the loading page or composer
             // takes over, and shows again if the composer is cancelled.
@@ -5512,7 +5548,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let persisted = state.borrow().settings.clone();
         apply_threaded(persisted.get_bool(crate::settings::MAIL_THREADED), false);
         apply_order(&persisted.get_string(crate::settings::MAIL_CONVERSATION_ORDER), false);
-        config_view.conversation_include_sent_row.set_active(persisted.get_bool(crate::settings::MAIL_CONVERSATION_INCLUDE_SENT));
+        config_view
+            .conversation_include_sent_row
+            .set_active(persisted.get_bool(crate::settings::MAIL_CONVERSATION_INCLUDE_SENT));
     }
     // Phase 5: apply the persisted Layout toggles now that their handlers are
     // wired (each `set_active` fires `toggled`, which sets the card's
@@ -7476,6 +7514,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → attachment reminder (item 1.19 / C-16): read at each
+    // Send, so it applies to the next composer.
+    {
+        let state = state.clone();
+        config_view.warn_no_attachment_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::MAIL_WARN_NO_ATTACHMENT, row.is_active());
+        });
+    }
+
     // Config → Mail → "Mail notifications": gates the new-mail/send-failure
     // desktop notifications. Read straight off the setting at the point each
     // event fires (see `connect_account`), so nothing needs re-arming here.
@@ -7782,6 +7829,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .undo_send_row
             .set_selected(crate::settings::undo_send_index(persisted.get_int(crate::settings::MAIL_UNDO_SEND_SECONDS)));
+        config_view.warn_no_attachment_row.set_active(persisted.get_bool(crate::settings::MAIL_WARN_NO_ATTACHMENT));
         config_view
             .mail_notifications_row
             .set_active(persisted.get_bool(crate::settings::MAIL_NOTIFICATIONS_ENABLED));
@@ -8051,9 +8099,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let window = window.clone();
             let flag_button = flag_button.clone();
             move || {
-                let typing = gtk::prelude::GtkWindowExt::focus(&window).is_some_and(|focus| {
-                    focus.is::<gtk::Text>() || focus.is::<gtk::TextView>() || focus.downcast_ref::<webkit::WebView>().is_some_and(|view| view.is_editable())
-                });
+                let typing = gtk::prelude::GtkWindowExt::focus(&window)
+                    .is_some_and(|focus| focus.is::<gtk::Text>() || focus.is::<gtk::TextView>() || focus.downcast_ref::<webkit::WebView>().is_some_and(|view| view.is_editable()));
                 if !typing {
                     flag_button.emit_clicked();
                 }
@@ -10005,14 +10052,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // mailbox in the selection (see `command_targets_for`) -
     // for today's ordinary single-selection case that's exactly one command,
     // same as before.
-    for (button, role) in [
-        (&delete_button, MailboxRole::Trash),
-        (&archive_button, MailboxRole::Archive),
-        (&report_button, MailboxRole::Junk),
-    ] {
+    for (button, role) in [(&delete_button, MailboxRole::Trash), (&archive_button, MailboxRole::Archive)] {
         let message_list = message_list.clone();
         let state = state.clone();
         button.connect_clicked(move |_| move_messages_to_role(&state, &message_list, &message_list.selected_summaries(), role));
+    }
+    // Report junk also sets the RFC 5788 `$Junk` keyword, so it goes through
+    // `set_junk_selection` rather than the plain role move (item 1.24).
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        report_button.connect_clicked(move |_| set_junk_selection(&state, &message_list, &message_list.selected_summaries(), true));
     }
     // --- Pin/Unpin -> AccountCommand::StoreFlagsMany toggling `\Flagged`
     // on every selected message. The direction is computed once over the
@@ -11400,47 +11450,53 @@ fn spawn_account_event_loop(
                         // after the user moved on (or for a different part of the
                         // same message) is stale and dropped with its in-flight
                         // bookkeeping.
-                        let pending = {
-                            let mut st = state.borrow_mut();
-                            let on_screen = message_is_visible(&st, &mailbox, uid);
-                            if !on_screen {
-                                st.pending_attachment = None;
-                                None
-                            } else {
-                                st.pending_attachment.take()
-                            }
-                        };
-                        if let Some(p) = pending {
-                            if p.mailbox == mailbox && p.uid == uid && p.part_number == part.part_number {
-                                p.button.set_sensitive(true);
-                                match p.action {
-                                    PendingAttachmentAction::Open => {
-                                        let window_for_open = window.clone();
-                                        let state_for_open = state.clone();
-                                        let toast_for_open = toast_overlay.clone();
-                                        glib::spawn_future_local(async move {
-                                            open_attachment_temp(&window_for_open, &state_for_open, toast_for_open, &part, &bytes).await;
-                                        });
-                                    }
-                                    PendingAttachmentAction::OpenWith => {
-                                        let state_for_open_with = state.clone();
-                                        let toast_for_open_with = toast_overlay.clone();
-                                        glib::spawn_future_local(async move {
-                                            open_attachment_with(&state_for_open_with, toast_for_open_with, &part, &bytes).await;
-                                        });
-                                    }
-                                    PendingAttachmentAction::Save => {
-                                        let window_for_save = window.clone();
-                                        let toast_for_save = toast_overlay.clone();
-                                        glib::spawn_future_local(async move {
-                                            save_attachment_to_disk(&window_for_save, toast_for_save, &part, &bytes).await;
-                                        });
-                                    }
+                        // A "Save all" / "Download as zip" run (item 1.23) may
+                        // be collecting this part instead of a single-row
+                        // action; it takes precedence and consumes the bytes
+                        // when it does.
+                        if !advance_attachment_batch(&state, &mailbox, uid, &part, &bytes) {
+                            let pending = {
+                                let mut st = state.borrow_mut();
+                                let on_screen = message_is_visible(&st, &mailbox, uid);
+                                if !on_screen {
+                                    st.pending_attachment = None;
+                                    None
+                                } else {
+                                    st.pending_attachment.take()
                                 }
-                            } else {
-                                // Mismatched request (shouldn't happen with the
-                                // one-at-a-time guard, but be safe).
-                                state.borrow_mut().pending_attachment = Some(p);
+                            };
+                            if let Some(p) = pending {
+                                if p.mailbox == mailbox && p.uid == uid && p.part_number == part.part_number {
+                                    p.button.set_sensitive(true);
+                                    match p.action {
+                                        PendingAttachmentAction::Open => {
+                                            let window_for_open = window.clone();
+                                            let state_for_open = state.clone();
+                                            let toast_for_open = toast_overlay.clone();
+                                            glib::spawn_future_local(async move {
+                                                open_attachment_temp(&window_for_open, &state_for_open, toast_for_open, &part, &bytes).await;
+                                            });
+                                        }
+                                        PendingAttachmentAction::OpenWith => {
+                                            let state_for_open_with = state.clone();
+                                            let toast_for_open_with = toast_overlay.clone();
+                                            glib::spawn_future_local(async move {
+                                                open_attachment_with(&state_for_open_with, toast_for_open_with, &part, &bytes).await;
+                                            });
+                                        }
+                                        PendingAttachmentAction::Save => {
+                                            let window_for_save = window.clone();
+                                            let toast_for_save = toast_overlay.clone();
+                                            glib::spawn_future_local(async move {
+                                                save_attachment_to_disk(&window_for_save, toast_for_save, &part, &bytes).await;
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    // Mismatched request (shouldn't happen with the
+                                    // one-at-a-time guard, but be safe).
+                                    state.borrow_mut().pending_attachment = Some(p);
+                                }
                             }
                         }
                     }
@@ -11471,6 +11527,22 @@ fn spawn_account_event_loop(
                             } else {
                                 state.borrow_mut().pending_attachment = Some(p);
                             }
+                        }
+                        // A "Save all" / "Download as zip" run (item 1.23)
+                        // waiting on this part gives up as a whole.
+                        let batch_failed = {
+                            let mut st = state.borrow_mut();
+                            let failed = st
+                                .pending_attachment_batch
+                                .as_ref()
+                                .is_some_and(|b| b.mailbox == mailbox && b.uid == uid && b.current == part_number);
+                            if failed {
+                                st.pending_attachment_batch = None;
+                            }
+                            failed
+                        };
+                        if batch_failed {
+                            toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't save attachments: {message}"))));
                         }
                         // The same failure for an inline `cid:` image request:
                         // finish the WebKit request with an error so the browser
@@ -13899,7 +13971,9 @@ fn apply_flag_indicator(icon: &gtk::Image, label: Option<&gtk::Label>, flag: Opt
         icon.remove_css_class("error");
     }
     if let Some(label) = label {
-        let text = due.filter(|_| status == lookout_core::FlagStatus::Flagged).map(|due| crate::follow_up::due_label(due, today));
+        let text = due
+            .filter(|_| status == lookout_core::FlagStatus::Flagged)
+            .map(|due| crate::follow_up::due_label(due, today));
         label.set_label(text.as_deref().unwrap_or(""));
         label.set_visible(text.is_some());
         if overdue {
@@ -13947,7 +14021,11 @@ fn set_follow_up(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, 
             continue;
         };
         optimistic_set_follow_up(state, message_list, &mailbox, &uids, &flag);
-        let _ = cmd_tx.send_blocking(AccountCommand::SetFollowUp { mailbox, uids, flag: flag.clone() });
+        let _ = cmd_tx.send_blocking(AccountCommand::SetFollowUp {
+            mailbox,
+            uids,
+            flag: flag.clone(),
+        });
     }
     let inverse = previous
         .into_iter()
@@ -14031,7 +14109,11 @@ fn mirror_follow_up_to_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountI
 /// account and hands it to the session (item 1.16), so flags set in Outlook
 /// show here. A no-op for other accounts and before Graph access is granted.
 fn sync_follow_ups_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
-    let target = state.borrow().accounts.get(account_id).and_then(|h| h.graph_mail.clone().map(|client| (client, h.cmd_tx.clone())));
+    let target = state
+        .borrow()
+        .accounts
+        .get(account_id)
+        .and_then(|h| h.graph_mail.clone().map(|client| (client, h.cmd_tx.clone())));
     let Some((client, cmd_tx)) = target else {
         return;
     };
@@ -14930,7 +15012,13 @@ pub(crate) fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
 /// paths inline this same `folders.iter().find(...)` walk.
 fn mailbox_role(state: &UiState, mailbox: &MailboxId) -> Option<MailboxRole> {
     let account_id = mailbox_account_id(mailbox)?;
-    state.accounts.get(&account_id)?.folders.iter().find(|folder| &folder.id == mailbox).map(|folder| folder.role)
+    state
+        .accounts
+        .get(&account_id)?
+        .folders
+        .iter()
+        .find(|folder| &folder.id == mailbox)
+        .map(|folder| folder.role)
 }
 
 /// Whether a message-list summary is a saved draft (item 1.12): an explicit
@@ -15540,7 +15628,8 @@ fn run_message_menu_action(
         }
         A::Delete => move_messages_to_role(state, message_list, targets, MailboxRole::Trash),
         A::Archive => move_messages_to_role(state, message_list, targets, MailboxRole::Archive),
-        A::ReportJunk => move_messages_to_role(state, message_list, targets, MailboxRole::Junk),
+        A::ReportJunk => set_junk_selection(state, message_list, targets, true),
+        A::NotJunk => set_junk_selection(state, message_list, targets, false),
         A::MoveTo(folder) => move_messages_to_folder(state, message_list, targets, &folder),
         A::CopyTo(folder) => copy_messages_to_folder(state, targets, &folder),
         A::MoveOther | A::CopyOther => {
@@ -15642,7 +15731,14 @@ fn snooze_time_dialog() -> crate::datetime_picker::TimeDialog {
 /// the visible body through WebKit's print pipeline. Rebuilt on every popover
 /// `show` (like the categorize menu) so each item's sensitivity tracks
 /// whether a message is selected when the menu opens.
-fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, popover: &gtk::Popover) -> gtk::Box {
+fn build_more_menu(
+    has_selection: bool,
+    message_list: &MessageListModel,
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    reading_stack: &gtk::Stack,
+    popover: &gtk::Popover,
+) -> gtk::Box {
     let boxed = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -15661,13 +15757,19 @@ fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: 
         let popover = popover.clone();
         open_window.connect_clicked(move |_| {
             popover.popdown();
-            let Some(parent) = popover.root().and_downcast::<adw::ApplicationWindow>() else { return };
+            let Some(parent) = popover.root().and_downcast::<adw::ApplicationWindow>() else {
+                return;
+            };
             let Some(summary) = message_list.selected_summary() else { return };
             crate::message_window::open_message_window(&parent, &state, &worker, &reading_stack, &summary);
         });
     }
     boxed.append(&open_window);
-    let details_button = gtk::Button::builder().label("View message details…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    let details_button = gtk::Button::builder()
+        .label("View message details…")
+        .css_classes(["flat"])
+        .halign(gtk::Align::Start)
+        .build();
     details_button.set_sensitive(has_selection);
     {
         let message_list = message_list.clone();
@@ -15675,7 +15777,9 @@ fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: 
         let popover = popover.clone();
         details_button.connect_clicked(move |_| {
             popover.popdown();
-            let Some(parent) = popover.root().and_downcast::<adw::ApplicationWindow>() else { return };
+            let Some(parent) = popover.root().and_downcast::<adw::ApplicationWindow>() else {
+                return;
+            };
             let Some(summary) = message_list.selected_summary() else { return };
             show_message_details_dialog(&state, &parent, &summary, DetailsPage::Details);
         });
@@ -15683,7 +15787,11 @@ fn build_more_menu(has_selection: bool, message_list: &MessageListModel, state: 
     boxed.append(&details_button);
     // "Create task from message…" (the Follow-up button's old job, before
     // item 1.16 made Flag a message-level follow-up flag).
-    let create_task = gtk::Button::builder().label("Create task from message…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    let create_task = gtk::Button::builder()
+        .label("Create task from message…")
+        .css_classes(["flat"])
+        .halign(gtk::Align::Start)
+        .build();
     create_task.set_sensitive(has_selection);
     {
         let message_list = message_list.clone();
@@ -16929,11 +17037,11 @@ fn snooze_messages(state: &Rc<RefCell<UiState>>, summaries: &[EmailSummary], unt
     record_undo(state, &format!("Snoozed until {when}"), inverse);
 }
 
-/// Moves `summaries` to their accounts' `role` folder (Delete, Archive,
-/// Report junk) - the ribbon buttons' and the message context menu's shared
-/// path. Rows go at once, one `MoveMessages` per source mailbox, and one undo
-/// entry covers the whole action, even across accounts: its inverse moves
-/// each group back from the role folder it landed in (item 0.4).
+/// Moves `summaries` to their accounts' `role` folder (Delete, Archive) - the
+/// ribbon buttons' and the message context menu's shared path. Rows go at
+/// once, one `MoveMessages` per source mailbox, and one undo entry covers the
+/// whole action, even across accounts: its inverse moves each group back from
+/// the role folder it landed in (item 0.4).
 fn move_messages_to_role(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: &[EmailSummary], role: MailboxRole) {
     let mut inverse = Vec::new();
     let mut count = 0usize;
@@ -16950,6 +17058,44 @@ fn move_messages_to_role(state: &Rc<RefCell<UiState>>, message_list: &MessageLis
         let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages { mailbox, uids, role });
     }
     record_undo(state, &undo_move_description(role, count), inverse);
+}
+
+/// Reports `summaries` as junk (`junk == true`) or marks them not junk (item
+/// 1.24 / M-17): sets the RFC 5788 `$Junk` / `$NotJunk` keyword so server
+/// spam filters learn from the decision, and moves the messages to the Junk
+/// folder - or back to the Inbox for "not junk". The `SetJunk` and
+/// `MoveMessages` commands race in order through the same session, so the
+/// keyword is on the message before it moves. One undo entry covers the whole
+/// action; its `RevertMove` clears the junk keyword as it moves the messages
+/// back.
+fn set_junk_selection(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: &[EmailSummary], junk: bool) {
+    let role = if junk { MailboxRole::Junk } else { MailboxRole::Inbox };
+    let mut inverse = Vec::new();
+    let mut count = 0usize;
+    for (cmd_tx, mailbox, uids) in command_targets_for(state, summaries) {
+        optimistic_remove_messages(state, message_list, &mailbox, &uids);
+        if let Some(destination) = mailbox_account_id(&mailbox).and_then(|account_id| role_mailbox_id(state, &account_id, role)) {
+            inverse.push(AccountCommand::RevertMove {
+                moved_from: mailbox.clone(),
+                moved_to: destination,
+                uids: uids.clone(),
+            });
+        }
+        count += uids.len();
+        let _ = cmd_tx.send_blocking(AccountCommand::SetJunk {
+            mailbox: mailbox.clone(),
+            uids: uids.clone(),
+            junk,
+        });
+        let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages { mailbox, uids, role });
+    }
+    let description = if junk {
+        undo_move_description(MailboxRole::Junk, count)
+    } else {
+        let noun = if count == 1 { "item" } else { "items" };
+        format!("{count} {noun} marked as not junk")
+    };
+    record_undo(state, &description, inverse);
 }
 
 /// Moves `summaries` into the folder `target` (the message context menu's
@@ -19760,6 +19906,71 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
 
     let attachments: Vec<&BodyPart> = parts.iter().filter(|p| p.is_attachment).collect();
     strip.set_visible(!attachments.is_empty());
+    // "Save all" / "Download as zip" (item 1.23 / M-33): a header row above
+    // the individual attachments, shown once there's more than one to gather.
+    if attachments.len() >= 2 {
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.add_css_class("attachment-row");
+        let label = gtk::Label::new(Some(&format!("{} attachments", attachments.len())));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        let menu_button = gtk::MenuButton::new();
+        menu_button.set_label("Save all");
+        menu_button.add_css_class("flat");
+        menu_button.set_tooltip_text(Some("Save or download every attachment"));
+        let popover = gtk::Popover::new();
+        let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        items.set_margin_top(6);
+        items.set_margin_bottom(6);
+        items.set_margin_start(6);
+        items.set_margin_end(6);
+        let save_all_item = gtk::Button::with_label("Save all…");
+        save_all_item.add_css_class("flat");
+        save_all_item.set_halign(gtk::Align::Start);
+        let zip_item = gtk::Button::with_label("Download as zip…");
+        zip_item.add_css_class("flat");
+        zip_item.set_halign(gtk::Align::Start);
+        items.append(&save_all_item);
+        items.append(&zip_item);
+        popover.set_child(Some(&items));
+        menu_button.set_popover(Some(&popover));
+        header.append(&label);
+        header.append(&menu_button);
+        let batch_parts: Vec<BodyPart> = attachments.iter().map(|p| (*p).clone()).collect();
+        {
+            let state = state.clone();
+            let mailbox = mailbox.clone();
+            let parts = batch_parts.clone();
+            save_all_item.connect_clicked(move |button| {
+                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                let state = state.clone();
+                let mailbox = mailbox.clone();
+                let parts = parts.clone();
+                glib::spawn_future_local(async move {
+                    let dialog = gtk::FileDialog::builder().title("Save all attachments").build();
+                    let Ok(folder) = dialog.select_folder_future(Some(&window)).await else { return };
+                    start_attachment_batch(&state, &mailbox, uid, parts, AttachmentBatchAction::SaveAll(folder));
+                });
+            });
+        }
+        {
+            let state = state.clone();
+            let mailbox = mailbox.clone();
+            let parts = batch_parts;
+            zip_item.connect_clicked(move |button| {
+                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                let state = state.clone();
+                let mailbox = mailbox.clone();
+                let parts = parts.clone();
+                glib::spawn_future_local(async move {
+                    let dialog = gtk::FileDialog::builder().title("Download attachments").initial_name("attachments.zip").build();
+                    let Ok(file) = dialog.save_future(Some(&window)).await else { return };
+                    start_attachment_batch(&state, &mailbox, uid, parts, AttachmentBatchAction::Zip(file));
+                });
+            });
+        }
+        strip.append(&header);
+    }
     for part in attachments {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         row.add_css_class("attachment-row");
@@ -19858,9 +20069,13 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
 /// loses the command to the reconnect) - a resolved or superseded request is
 /// left alone.
 fn start_attachment_fetch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, part: &BodyPart, button: &gtk::MenuButton, action: PendingAttachmentAction) {
-    // One in-flight fetch at a time; ignore a click while one is outstanding.
-    if state.borrow().pending_attachment.is_some() {
-        return;
+    // One in-flight fetch at a time; ignore a click while one (or a
+    // save-all/zip batch) is outstanding.
+    {
+        let st = state.borrow();
+        if st.pending_attachment.is_some() || st.pending_attachment_batch.is_some() {
+            return;
+        }
     }
     let cmd_tx = match mailbox_account_id(mailbox) {
         Some(id) => {
@@ -19907,6 +20122,179 @@ fn start_attachment_fetch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid
         }
         glib::ControlFlow::Break
     });
+}
+
+/// Picks a save name for `part` that doesn't collide with a name already in
+/// `used`: the part's display name, or "name (2).ext" style when it does.
+fn unique_attachment_name(part: &BodyPart, used: &mut HashSet<String>) -> String {
+    let base = attachment_display_name(part);
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let (stem, ext) = match base.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (base.clone(), String::new()),
+    };
+    let mut n = 2;
+    loop {
+        let candidate = format!("{stem} ({n}){ext}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Starts a "Save all" / "Download as zip" run (item 1.23 / M-33): records the
+/// batch, then asks the session for the first attachment's bytes. The rest
+/// follow as each `PartFetched` lands (`advance_attachment_batch`), and the
+/// whole set is written once the queue drains (`finish_attachment_batch`).
+fn start_attachment_batch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, parts: Vec<BodyPart>, action: AttachmentBatchAction) {
+    if parts.is_empty() {
+        return;
+    }
+    // One batch - or single-row fetch - at a time.
+    {
+        let st = state.borrow();
+        if st.pending_attachment_batch.is_some() || st.pending_attachment.is_some() {
+            return;
+        }
+    }
+    let cmd_tx = mailbox_account_id(mailbox).and_then(|id| state.borrow().accounts.get(&id).map(|h| h.interactive_cmd_tx.clone()));
+    let Some(cmd_tx) = cmd_tx else { return };
+    let mut queue: VecDeque<BodyPart> = parts.into();
+    let first = queue.pop_front().expect("parts is non-empty");
+    let current = first.part_number.clone();
+    state.borrow_mut().pending_attachment_batch = Some(AttachmentBatch {
+        mailbox: mailbox.clone(),
+        uid,
+        current,
+        queue,
+        collected: Vec::new(),
+        action,
+    });
+    let _ = cmd_tx.send_blocking(AccountCommand::FetchAttachment {
+        mailbox: mailbox.clone(),
+        uid,
+        part: first,
+    });
+    arm_attachment_batch_timeout(state, mailbox, uid);
+}
+
+/// The 60-second backstop for a batch: a session that dies mid-run would
+/// otherwise leave the batch stuck (blocking later runs). Only fires if this
+/// exact batch is still outstanding.
+fn arm_attachment_batch_timeout(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid) {
+    let timeout_state = state.clone();
+    let timeout_mailbox = mailbox.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+        let active = timeout_state
+            .borrow()
+            .pending_attachment_batch
+            .as_ref()
+            .is_some_and(|b| b.mailbox == timeout_mailbox && b.uid == uid);
+        if active {
+            timeout_state.borrow_mut().pending_attachment_batch = None;
+            if let Some(toast_overlay) = &timeout_state.borrow().toast_overlay {
+                toast_overlay.add_toast(adw::Toast::new("Attachment download timed out"));
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// Feeds one fetched part into the in-flight batch (item 1.23): stores the
+/// bytes under a de-duplicated name, requests the next part, or finishes the
+/// run once the queue drains. Returns `true` when the part belonged to the
+/// batch, so the single-row path is skipped.
+fn advance_attachment_batch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, part: &BodyPart, bytes: &[u8]) -> bool {
+    let next = {
+        let mut st = state.borrow_mut();
+        let Some(batch) = st.pending_attachment_batch.as_mut() else {
+            return false;
+        };
+        if batch.mailbox != *mailbox || batch.uid != uid || batch.current != part.part_number {
+            return false;
+        }
+        let mut used: HashSet<String> = batch.collected.iter().map(|(name, _)| name.clone()).collect();
+        let name = unique_attachment_name(part, &mut used);
+        batch.collected.push((name, bytes.to_vec()));
+        let next = batch.queue.pop_front();
+        if let Some(next_part) = &next {
+            batch.current = next_part.part_number.clone();
+        }
+        next
+    };
+    match next {
+        Some(next_part) => {
+            let cmd_tx = mailbox_account_id(mailbox).and_then(|id| state.borrow().accounts.get(&id).map(|h| h.interactive_cmd_tx.clone()));
+            if let Some(cmd_tx) = cmd_tx {
+                let _ = cmd_tx.send_blocking(AccountCommand::FetchAttachment {
+                    mailbox: mailbox.clone(),
+                    uid,
+                    part: next_part,
+                });
+            }
+        }
+        None => finish_attachment_batch(state),
+    }
+    true
+}
+
+/// Writes a drained batch's attachments into the chosen folder, or as a zip
+/// archive, then toasts the result (item 1.23).
+fn finish_attachment_batch(state: &Rc<RefCell<UiState>>) {
+    let Some(batch) = state.borrow_mut().pending_attachment_batch.take() else {
+        return;
+    };
+    let toast_overlay = state.borrow().toast_overlay.clone();
+    let AttachmentBatch { action, collected, .. } = batch;
+    glib::spawn_future_local(async move {
+        let result = match action {
+            AttachmentBatchAction::SaveAll(folder) => save_batch_to_folder(&folder, &collected).await,
+            AttachmentBatchAction::Zip(file) => save_batch_as_zip(&file, &collected).await,
+        };
+        if let Some(toast_overlay) = toast_overlay {
+            match result {
+                Ok(message) => toast_overlay.add_toast(adw::Toast::new(&message)),
+                Err(e) => toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't save attachments: {e}")))),
+            }
+        }
+    });
+}
+
+/// Writes each `(name, bytes)` into `folder` (item 1.23's "Save all").
+async fn save_batch_to_folder(folder: &gio::File, collected: &[(String, Vec<u8>)]) -> Result<String, String> {
+    for (name, bytes) in collected {
+        folder
+            .child(name.as_str())
+            .replace_contents_bytes_future(&glib::Bytes::from(bytes.as_slice()), None, false, gio::FileCreateFlags::REPLACE_DESTINATION)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let noun = if collected.len() == 1 { "attachment" } else { "attachments" };
+    Ok(format!("Saved {} {noun}", collected.len()))
+}
+
+/// Builds a zip archive of `collected` in memory and writes it to `file`
+/// (item 1.23's "Download as zip").
+async fn save_batch_as_zip(file: &gio::File, collected: &[(String, Vec<u8>)]) -> Result<String, String> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in collected {
+            writer.start_file(name.clone(), options).map_err(|e| e.to_string())?;
+            writer.write_all(bytes).map_err(|e| e.to_string())?;
+        }
+        writer.finish().map_err(|e| e.to_string())?;
+    }
+    let data = cursor.into_inner();
+    file.replace_contents_bytes_future(&glib::Bytes::from(data.as_slice()), None, false, gio::FileCreateFlags::REPLACE_DESTINATION)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("Saved {} attachments as a zip", collected.len()))
 }
 
 /// Starts the .eml export for the currently-selected message: records it as
@@ -20305,18 +20693,12 @@ fn deliver_raw_error_to_details_dialog(state: &Rc<RefCell<UiState>>, mailbox: &M
 /// may still be in flight.
 fn message_detail_fields(summary: &EmailSummary) -> Vec<(String, String)> {
     let addresses = |list: &[EmailAddress]| list.iter().map(|a| a.display_label()).collect::<Vec<_>>().join(", ");
-    let mut fields = vec![
-        ("From".to_string(), addresses(&summary.from)),
-        ("To".to_string(), addresses(&summary.to)),
-    ];
+    let mut fields = vec![("From".to_string(), addresses(&summary.from)), ("To".to_string(), addresses(&summary.to))];
     if !summary.cc.is_empty() {
         fields.push(("Cc".to_string(), addresses(&summary.cc)));
     }
     fields.push(("Subject".to_string(), summary.subject.clone().unwrap_or_else(|| "(no subject)".to_string())));
-    fields.push((
-        "Date".to_string(),
-        summary.date.with_timezone(&chrono::Local).format("%a %d/%m/%Y %I:%M %p").to_string(),
-    ));
+    fields.push(("Date".to_string(), summary.date.with_timezone(&chrono::Local).format("%a %d/%m/%Y %I:%M %p").to_string()));
     if let Some(message_id) = &summary.message_id {
         fields.push(("Message ID".to_string(), message_id.clone()));
     }
@@ -20622,6 +21004,53 @@ async fn open_attachment_with(state: &Rc<RefCell<UiState>>, toast_overlay: adw::
     }
 }
 
+/// The zoom limits and step for Ctrl+scroll / Ctrl+± on a WebKit view.
+const WEB_VIEW_MIN_ZOOM: f64 = 0.5;
+const WEB_VIEW_MAX_ZOOM: f64 = 3.0;
+const WEB_VIEW_ZOOM_STEP: f64 = 0.1;
+
+/// Ctrl+scroll and Ctrl+= / Ctrl+- / Ctrl+0 zoom on a WebKit view (item 1.20 /
+/// M-37). Attached to the view itself rather than the main window's shortcut
+/// controller, so it works in the reading pane, the popped-out message window
+/// and the composer - and only while that view has focus.
+pub(crate) fn install_web_view_zoom(web_view: &webkit::WebView) {
+    let key = gtk::EventControllerKey::new();
+    {
+        let web_view = web_view.clone();
+        key.connect_key_pressed(move |_controller, keyval, _keycode, state| {
+            use gtk::gdk::Key;
+            if !state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            let current = web_view.zoom_level();
+            let next = match keyval {
+                Key::equal | Key::plus | Key::KP_Add => current + WEB_VIEW_ZOOM_STEP,
+                Key::minus | Key::KP_Subtract => current - WEB_VIEW_ZOOM_STEP,
+                Key::_0 | Key::KP_0 => 1.0,
+                _ => return glib::Propagation::Proceed,
+            };
+            web_view.set_zoom_level(next.clamp(WEB_VIEW_MIN_ZOOM, WEB_VIEW_MAX_ZOOM));
+            glib::Propagation::Stop
+        });
+    }
+    web_view.add_controller(key);
+
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    {
+        let web_view = web_view.clone();
+        scroll.connect_scroll(move |controller, _dx, dy| {
+            if dy == 0.0 || !controller.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            let current = web_view.zoom_level();
+            let next = if dy < 0.0 { current + WEB_VIEW_ZOOM_STEP } else { current - WEB_VIEW_ZOOM_STEP };
+            web_view.set_zoom_level(next.clamp(WEB_VIEW_MIN_ZOOM, WEB_VIEW_MAX_ZOOM));
+            glib::Propagation::Stop
+        });
+    }
+    web_view.add_controller(scroll);
+}
+
 /// Arms or disarms the "Switch message theme" override's *physical* state on
 /// the reading pane's WebView: the user stylesheet that strips the message's
 /// backgrounds and inverts its colours, plus the canvas colour (transparent
@@ -20878,12 +21307,7 @@ pub(crate) fn send_fetch_raw_message(state: &Rc<RefCell<UiState>>, mailbox: &Mai
     let Some(account_id) = mailbox_account_id(mailbox) else { return false };
     let cmd_tx = state.borrow().accounts.get(&account_id).map(|h| h.interactive_cmd_tx.clone());
     match cmd_tx {
-        Some(cmd_tx) => cmd_tx
-            .send_blocking(AccountCommand::FetchRawMessage {
-                mailbox: mailbox.clone(),
-                uid,
-            })
-            .is_ok(),
+        Some(cmd_tx) => cmd_tx.send_blocking(AccountCommand::FetchRawMessage { mailbox: mailbox.clone(), uid }).is_ok(),
         None => false,
     }
 }
@@ -20983,17 +21407,12 @@ fn run_conversation_script(state: &Rc<RefCell<UiState>>, script: String) {
         st.conversation_ui.clone()
     };
     let Some(ui) = ui else { return };
-    ui.web_view.evaluate_javascript(
-        &script,
-        Some(crate::conversation_view::SCRIPT_WORLD),
-        None,
-        None::<&gio::Cancellable>,
-        |result| {
+    ui.web_view
+        .evaluate_javascript(&script, Some(crate::conversation_view::SCRIPT_WORLD), None, None::<&gio::Cancellable>, |result| {
             if let Err(e) = result {
                 tracing::debug!("conversation script call failed: {e}");
             }
-        },
-    );
+        });
 }
 
 /// Resets the single-message view's per-message state when the pane moves
@@ -21133,7 +21552,9 @@ fn follow_conversation(ctx: &ConversationContext, ui: &Rc<ConversationUi>, liste
         let mut st = state.borrow_mut();
         let Some(pane) = st.rendered_conversation.as_mut() else { return };
         for summary in &listed {
-            let Some(index) = pane.cards.iter().position(|c| c.key() == key(summary)) else { continue };
+            let Some(index) = pane.cards.iter().position(|c| c.key() == key(summary)) else {
+                continue;
+            };
             let card = &mut pane.cards[index];
             let old = &card.member.summary;
             if old.flags != summary.flags || old.keywords != summary.keywords || old.importance != summary.importance || old.preview != summary.preview {
@@ -21277,7 +21698,9 @@ fn lay_out_conversation(ctx: &ConversationContext, generation: u64, others: Vec<
     let Some(ui) = state.borrow().conversation_ui.clone() else { return };
     let (listed, focus, dark, load_once) = {
         let st = state.borrow();
-        let Some(pane) = st.rendered_conversation.as_ref().filter(|p| p.generation == generation) else { return };
+        let Some(pane) = st.rendered_conversation.as_ref().filter(|p| p.generation == generation) else {
+            return;
+        };
         (pane.listed.clone(), pane.focus.clone(), pane.dark, pane.load_once.clone())
     };
     let order = crate::settings::conversation_order(&state.borrow().settings.get_string(crate::settings::MAIL_CONVERSATION_ORDER));
@@ -21367,7 +21790,10 @@ fn request_conversation_bodies(ctx: &ConversationContext, keys: Vec<(MailboxId, 
             continue;
         };
         for uid in &uids {
-            let _ = cmd_tx.send_blocking(AccountCommand::FetchBody { mailbox: mailbox.clone(), uid: *uid });
+            let _ = cmd_tx.send_blocking(AccountCommand::FetchBody {
+                mailbox: mailbox.clone(),
+                uid: *uid,
+            });
         }
         if let Some(cache) = cache {
             let reply_rx = spawn_cache_read(&ctx.worker, cache, {
@@ -21403,7 +21829,9 @@ fn conversation_body_arrived(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, 
     let (index, mut card, load_once, dark) = {
         let st = state.borrow();
         let Some(pane) = st.rendered_conversation.as_ref() else { return };
-        let Some(index) = pane.cards.iter().position(|c| c.key() == key && c.srcdoc.is_none()) else { return };
+        let Some(index) = pane.cards.iter().position(|c| c.key() == key && c.srcdoc.is_none()) else {
+            return;
+        };
         (index, pane.cards[index].clone(), pane.load_once.contains(&key), pane.dark)
     };
     let parts = fill_conversation_card(state, index, &mut card, &body, load_once, dark);
@@ -21441,7 +21869,9 @@ fn expand_conversation_card(ctx: &ConversationContext, index: usize, tell_script
     let state = &ctx.state;
     let (key, unread, has_body, was_expanded) = {
         let mut st = state.borrow_mut();
-        let Some(card) = st.rendered_conversation.as_mut().and_then(|pane| pane.cards.get_mut(index)) else { return };
+        let Some(card) = st.rendered_conversation.as_mut().and_then(|pane| pane.cards.get_mut(index)) else {
+            return;
+        };
         let was_expanded = card.expanded;
         card.expanded = true;
         (card.key(), card.member.summary.is_unread(), card.srcdoc.is_some(), was_expanded)
@@ -21499,7 +21929,9 @@ fn conversation_mark_read(ctx: &ConversationContext, keys: Vec<(MailboxId, Uid)>
             let timer = glib::timeout_add_local_once(std::time::Duration::from_secs(u64::from(delay.max(1) as u32)), move || {
                 let pending = {
                     let mut st = state_for_timer.borrow_mut();
-                    let Some(pane) = st.rendered_conversation.as_mut().filter(|pane| pane.id == id) else { return };
+                    let Some(pane) = st.rendered_conversation.as_mut().filter(|pane| pane.id == id) else {
+                        return;
+                    };
                     pane.mark_timer = None;
                     std::mem::take(&mut pane.mark_pending)
                 };
@@ -21634,6 +22066,43 @@ fn present_conversation_attachment_menu(state: &Rc<RefCell<UiState>>, ui: &Rc<Co
         });
         items.append(&item);
     }
+    // "Save all" / "Download as zip" (item 1.23 / M-33), when the card has
+    // more than one attachment. The dialog anchors to the reading pane's
+    // WebView, which the popover is parented to.
+    let batch_parts: Vec<BodyPart> = summary.structure.iter().flatten().filter(|p| p.is_attachment).cloned().collect();
+    if batch_parts.len() >= 2 {
+        for (label, zip) in [("Save all…", false), ("Download as zip…", true)] {
+            let item = gtk::Button::with_label(label);
+            item.add_css_class("flat");
+            item.set_halign(gtk::Align::Start);
+            let state = state.clone();
+            let mailbox = summary.mailbox.clone();
+            let uid = summary.uid;
+            let parts = batch_parts.clone();
+            let popover_for_item = popover.clone();
+            let anchor = ui.web_view.clone();
+            item.connect_clicked(move |_| {
+                popover_for_item.popdown();
+                let state = state.clone();
+                let mailbox = mailbox.clone();
+                let parts = parts.clone();
+                let anchor = anchor.clone();
+                glib::spawn_future_local(async move {
+                    let Some(window) = anchor.root().and_downcast::<gtk::Window>() else { return };
+                    if zip {
+                        let dialog = gtk::FileDialog::builder().title("Download attachments").initial_name("attachments.zip").build();
+                        let Ok(file) = dialog.save_future(Some(&window)).await else { return };
+                        start_attachment_batch(&state, &mailbox, uid, parts, AttachmentBatchAction::Zip(file));
+                    } else {
+                        let dialog = gtk::FileDialog::builder().title("Save all attachments").build();
+                        let Ok(folder) = dialog.select_folder_future(Some(&window)).await else { return };
+                        start_attachment_batch(&state, &mailbox, uid, parts, AttachmentBatchAction::SaveAll(folder));
+                    }
+                });
+            });
+            items.append(&item);
+        }
+    }
     popover.set_child(Some(&items));
     popover.connect_closed(|popover| {
         let popover = popover.clone();
@@ -21673,6 +22142,7 @@ fn build_conversation_ui(ctx: &ConversationContext, reading_stack: &gtk::Stack) 
         .vexpand(true)
         .build();
     web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+    install_web_view_zoom(&web_view);
 
     let subject_label = gtk::Label::builder()
         .xalign(0.0)
@@ -21713,11 +22183,9 @@ fn build_conversation_ui(ctx: &ConversationContext, reading_stack: &gtk::Stack) 
     {
         let ctx = ctx.clone();
         let ui = ui.clone();
-        user_content_manager.connect_script_message_received(Some(view::SCRIPT_HANDLER), move |_, value| {
-            match view::parse_script_message(&value.to_str()) {
-                Some(message) => handle_conversation_message(&ctx, &ui, message),
-                None => tracing::debug!("ignoring malformed conversation script message"),
-            }
+        user_content_manager.connect_script_message_received(Some(view::SCRIPT_HANDLER), move |_, value| match view::parse_script_message(&value.to_str()) {
+            Some(message) => handle_conversation_message(&ctx, &ui, message),
+            None => tracing::debug!("ignoring malformed conversation script message"),
         });
     }
     // The document loaded: run what was queued for it, restore the scroll
@@ -22737,6 +23205,7 @@ pub(crate) fn show_composer_in_reading_pane(
         rich_text_default,
         state.borrow().settings.get_bool(crate::settings::MAIL_SPELL_CHECK),
         state.borrow().settings.get_strv(crate::settings::MAIL_SPELL_CHECK_LANGUAGES),
+        state.borrow().settings.get_bool(crate::settings::MAIL_WARN_NO_ATTACHMENT),
         suggestions,
         open_contact_picker,
         on_pop_out,
@@ -23017,6 +23486,16 @@ mod tests {
         assert_eq!(attachment_display_name(&attachment("1.3", None)), "attachment-1.3");
     }
 
+    #[test]
+    fn duplicate_attachment_names_are_made_unique() {
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(unique_attachment_name(&attachment("1", Some("report.pdf")), &mut used), "report.pdf");
+        assert_eq!(unique_attachment_name(&attachment("2", Some("report.pdf")), &mut used), "report (2).pdf");
+        assert_eq!(unique_attachment_name(&attachment("3", Some("report.pdf")), &mut used), "report (3).pdf");
+        assert_eq!(unique_attachment_name(&attachment("4", Some("notes")), &mut used), "notes");
+        assert_eq!(unique_attachment_name(&attachment("5", Some("notes")), &mut used), "notes (2)");
+    }
+
     /// The .eml export dialog's suggested name comes from the message's
     /// subject, with a path-free placeholder for empty or hostile subjects -
     /// the raw subject is untrusted header data and must not reach the dialog
@@ -23066,10 +23545,7 @@ mod tests {
     /// The header block renders one `Name: value` line per parsed header.
     #[test]
     fn format_header_block_renders_name_value_lines() {
-        let headers = vec![
-            ("From".to_string(), "Ada <ada@example.com>".to_string()),
-            ("Subject".to_string(), "Hi".to_string()),
-        ];
+        let headers = vec![("From".to_string(), "Ada <ada@example.com>".to_string()), ("Subject".to_string(), "Hi".to_string())];
         assert_eq!(format_header_block(&headers), "From: Ada <ada@example.com>\nSubject: Hi");
     }
 
@@ -23483,6 +23959,7 @@ mod tests {
             body_fetch_error: None,
             body_fetch_generation: 0,
             pending_attachment: None,
+            pending_attachment_batch: None,
             pending_raw_message: None,
             message_windows: HashMap::new(),
             message_details: None,
@@ -23521,9 +23998,9 @@ mod tests {
             reveal_generation: 0,
             last_selection: None,
             restore_pending: false,
-        rendered_message: None,
-        pending_mark_read: None,
-        mark_read_on_leave: None,
+            rendered_message: None,
+            pending_mark_read: None,
+            mark_read_on_leave: None,
             syncing: HashSet::new(),
             prefetching: HashSet::new(),
             folder_row_spinners: HashMap::new(),
@@ -24685,7 +25162,10 @@ mod tests {
 
         let due = crate::follow_up::flagged(chrono::NaiveDate::from_ymd_opt(2026, 10, 16));
         set_follow_up(&state, &message_list, vec![plain, done], due.clone());
-        assert!(message_list.all_messages().iter().all(|m| m.follow_up() == Some(due.clone())), "shown before the server answers");
+        assert!(
+            message_list.all_messages().iter().all(|m| m.follow_up() == Some(due.clone())),
+            "shown before the server answers"
+        );
         match cmd_rx.try_recv() {
             Ok(AccountCommand::SetFollowUp { mailbox: sent, mut uids, flag }) => {
                 uids.sort();
@@ -24930,7 +25410,9 @@ mod tests {
         // A selected header (item 1.7): Shift+F10 acts like a right-click on it.
         let is_header = |position: u32| {
             let row = message_list.selection.item(position).and_downcast::<gtk::TreeListRow>();
-            let Some(boxed) = row.and_then(|r| r.item()).and_downcast::<glib::BoxedAnyObject>() else { return false };
+            let Some(boxed) = row.and_then(|r| r.item()).and_downcast::<glib::BoxedAnyObject>() else {
+                return false;
+            };
             let is_thread = matches!(&*boxed.borrow::<MessageItem>(), MessageItem::Thread(_));
             is_thread
         };

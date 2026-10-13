@@ -42,15 +42,15 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 21 | 10 | 13 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No winmail.dat or `.msg`. |
-| Compose (5.2) | 9 | 5 | 8 | 1 | Good rich editor and identities, with undo send and schedule send. No emoji, or forwarding with attachments. |
+| Mail (5.1) | 22 | 9 | 13 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No winmail.dat or `.msg`. |
+| Compose (5.2) | 12 | 4 | 6 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop and an attachment reminder. No forwarding with attachments. |
 | Calendar (5.3) | 11 | 13 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours and a second time zone apply live. Meetings as organizer are missing: invitations aren't sent, there is no response tracking and no free/busy. No per-event time zone yet. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 3 | 3 | 5 | 1 | VTODO and Google Tasks CRUD. No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **55** | **43** | **54** | **5** | ~35% at parity, ~27% partial |
+| **Total** | **59** | **41** | **52** | **5** | ~38% at parity, ~26% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -250,7 +250,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-14 | Rules | — | ❌ | Client engine plus Sieve plus Graph `messageRules` |
 | M-15 | Quick Steps | — | ❌ | User-defined action chains |
 | M-16 | Sweep | — | ❌ | Delete/move all from sender, keep latest, older than N days |
-| M-17 | Junk: safe / blocked senders | "Report" moves to Junk; Empty Junk | 🟡 | No lists; no `$Junk`/`$NotJunk`; no "Not junk" action |
+| M-17 | Junk: safe / blocked senders | "Report" moves to Junk and sets RFC 5788 `$Junk` (1.24); "Not junk" moves back to the Inbox and sets `$NotJunk`; Empty Junk | 🟡 | No safe/blocked lists; no "Not junk" in the ribbon's Report split button (UX-05, 2.9) |
 | M-18 | Search syntax and refiners | Local FTS5 (`mail/src/cache.rs` `sanitize_fts_query`) plus server `UID SEARCH TEXT` | 🟡 | No `from:`/`to:`/`subject:`/`has:attachment`/`received:`/`is:`/`category:`; no refiners, scope picker or search history |
 | M-19 | Search Folders (saved searches) | — | ❌ | |
 | M-20 | Ignore conversation / Clean up conversation | — | ❌ | |
@@ -266,11 +266,11 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-30 | View source / message headers | "View message details…" dialog (`window.rs`): parsed key fields, full header block, raw source via `FetchRawMessage`; debug `.eml` viewer retained | ✅ | — |
 | M-31 | Open message in new window | Double-click/Enter or ⋯ "Open in new window": standalone read-only `adw::Window` (`message_window.rs`), raw-based render, theme toggle, attachment strip, remote-content banner | ✅ | — |
 | M-32 | Attachment preview | Inline `cid:` images; Open / Open with / Save | 🟡 | In-app preview for PDF, images, text (Office via LibreOffice conversion, optional) |
-| M-33 | Download / save all attachments, zip | Per-attachment save | 🟡 | "Save all", "Download as zip" (the retired `TODO.md` noted the zip variant was missing) |
+| M-33 | Download / save all attachments, zip | Per-attachment save; "Save all" (folder) and "Download as zip" on the strip header and the conversation card menu (1.23) | ✅ | — |
 | M-34 | Remote content / trusted senders | `core/src/trust.rs`, `app/src/trusted_senders.rs` | ✅ | — |
 | M-35 | Phishing / unverified-sender / external banners | `EmailBody.auth_results` exists, never filled | ❌ | §4.1 |
 | M-36 | Translate | — | ❌ | Pluggable provider (LibreTranslate, or the assistant endpoint) |
-| M-37 | Immersive Reader / zoom | Dark message theme toggle | 🟡 | Ctrl+scroll / Ctrl+± zoom on the WebKit view; reader mode |
+| M-37 | Immersive Reader / zoom | Dark message theme toggle; Ctrl+scroll and Ctrl+± zoom on the reading pane, popped-out message window and composer (1.20) | 🟡 | Reader mode (7.5) |
 | M-38 | Message context menu | Right-click (or Shift+F10 / Menu) on a row or conversation header: Reply, Reply all, Forward · Delete, Archive, Move ▸, Copy ▸ (recent folders, Other folder…) · Mark as read/unread, Flag ▸, Pin, Snooze ▸, Categorize ▸ · Report ▸ · View ▸ details / source · Open in new window, Print (`message_menu.rs`, 1.17) | ✅ | Ignore (2.8), Block ▸ (2.9), Rules ▸ Create rule (2.5) and Report phishing / Not junk (1.24) join it as those land |
 | M-39 | Notifications | `mail_notifications.rs`, tray, badge | ✅ | Add per-folder / VIP-only options |
 | M-40 | Work offline / outbox | Cache-first reads; NetworkMonitor-aware errors; sends queue in the local outbox, and a banner above the message list lists waiting, scheduled and failed ones (Send now / Retry / Edit) | 🟡 | "Work offline" toggle; an Outbox folder in the folder pane |
@@ -298,9 +298,9 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | C-11 | Drafts autosave | 5 s autosave to IMAP Drafts | ✅ | — |
 | C-12 | Reopen a draft | "Edit" banner on a Drafts preview (or Enter/double-click) opens the composer prefilled from the parsed MIME: identity, To/Cc/Bcc, subject, HTML/text, inline images, attachments, importance, receipt, threading; saving replaces the stored draft (UID on first, Message-ID after) | ✅ | — |
 | C-13 | Forward with attachments / as attachment | Forward quotes text and drops attachments | 🟡 | Re-attach original parts; "Forward as attachment" (`message/rfc822`) |
-| C-14 | Emoji picker | — | ❌ | `gtk::EmojiChooser` |
-| C-15 | Paste / drop images and files | Paste images works; file drop blocked (`compose.rs:722`) | 🟡 | Drop files → attachments |
-| C-16 | Attachment reminder | — | ❌ | Scan body for "attached / attachment" on send |
+| C-14 | Emoji picker | `gtk::EmojiChooser` in the format toolbar (1.20) | ✅ | — |
+| C-15 | Paste / drop images and files | Paste images works; file drop onto the composer attaches (1.20) | ✅ | — |
+| C-16 | Attachment reminder | Body/subject scan on send → "Send without an attachment?" dialog, toggle in Settings → Mail (1.19) | ✅ | — |
 | C-17 | My Templates | — | ❌ | |
 | C-18 | Check names / resolve recipients | Autocomplete plus picker (`recipient_entry.rs`, `contact_picker.rs`) | 🟡 | Expand contact lists (P-05); GAL lookup (P-11) |
 | C-19 | @mention insertion | — | ❌ | `@` → contact picker → adds to To |
@@ -620,12 +620,12 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.16 | ✅ ~~Follow-up flags~~ | M-10, T-03 | Message-level flag state (keyword `$Lookout-flag-due-<date>` / `$Lookout-flag-done`; Graph `followupFlag` on Microsoft 365); presets; due column; tasks view shows flagged mail; Pin stays separate | L |
 | 1.17 | ✅ ~~Message context menu~~ | M-38 | 0.5; full Outlook item menu | M |
 | 1.18 | Outlook keyboard preset | UI-04 | §4.7 table as a second defaults set; picker in Settings; new actions (move to folder, next/previous, mark unread, new event/task/contact, F9) | M |
-| 1.19 | Attachment reminder | C-16 | Regex over body (localisable word list) on send → dialog | S |
-| 1.20 | Emoji, file drop, zoom | C-14, C-15, M-37 | `gtk::EmojiChooser`; drop target on composer; WebKit zoom level plus Ctrl+±/scroll | S |
+| 1.19 | ✅ ~~Attachment reminder~~ | C-16 | Regex over body (localisable word list) on send → dialog | S |
+| 1.20 | ✅ ~~Emoji, file drop, zoom~~ | C-14, C-15, M-37 | `gtk::EmojiChooser`; drop target on composer; WebKit zoom level plus Ctrl+±/scroll | S |
 | 1.21 | TNEF decode | M-45 | §4.6 in `core/src/interop/tnef.rs`, hooked into `mail/src/structure.rs` | M |
 | 1.22 | Open `.msg` | M-29 | `cfb` plus a property mapper → `EmailBody` for the viewer; drag-in to APPEND | M |
-| 1.23 | Save all / zip | M-33 | Folder chooser plus `zip` crate | S |
-| 1.24 | Junk keywords and Not Junk | M-17 | `$Junk`/`$NotJunk`; "Not junk" in the Junk folder, also under the context menu's Report ▸ (`message_menu.rs`) | S |
+| 1.23 | ✅ ~~Save all / zip~~ | M-33 | Folder chooser plus `zip` crate | S |
+| 1.24 | ✅ ~~Junk keywords and Not Junk~~ | M-17 | `$Junk`/`$NotJunk`; "Not junk" in the Junk folder, also under the context menu's Report ▸ (`message_menu.rs`) | S |
 
 ### Phase 2: Organise and search
 

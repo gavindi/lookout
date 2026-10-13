@@ -36,6 +36,10 @@ sha2.workspace = true
 getrandom.workspace = true
 uuid.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+# "Download all attachments as zip" (item 1.23 / M-33): builds the archive in
+# memory before the save dialog's write. Deflate-only, to keep the dependency
+# tree small.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }

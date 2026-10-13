@@ -607,6 +607,18 @@ pub enum AccountCommand {
         add: Vec<String>,
         remove: Vec<String>,
     },
+    /// Marks `uids` as junk (`junk == true`) or not junk (`junk == false`) by
+    /// setting the RFC 5788 `$Junk` / `$NotJunk` keyword - one `STORE` that
+    /// adds one atom and removes the other, so they stay mutually exclusive
+    /// and server-side spam filters learn from the user's decision (item 1.24
+    /// / M-17). Same folder-handling contract as `StoreKeywords`. The move to
+    /// the Junk (or back to the Inbox) folder is a separate `MoveMessages` the
+    /// caller queues alongside this one.
+    SetJunk {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        junk: bool,
+    },
     /// Sets the follow-up flag (item 1.16 / M-10) on `uids`, replacing
     /// whatever flag state they had; `FlagStatus::NotFlagged` clears it.
     /// Stored as `$Lookout-flagged` / `$Lookout-flag-due-<unix>` /
@@ -2763,12 +2775,12 @@ async fn connect_and_run(
                         Ok(found) if found.is_empty() => Err("the messages are no longer there".to_string()),
                         Ok(found) => move_uids_to_path(&mut session, &found, &from_path, has_move, has_uidplus)
                             .await
-                            .map(|_| found)
+                            .map(|pairs| (found, pairs))
                             .map_err(|e| e.to_string()),
                         Err(e) => Err(e.to_string()),
                     };
                     match reverted {
-                        Ok(found) => {
+                        Ok((found, pairs)) => {
                             if let Some(Err(e)) = cache_op(cache, {
                                 let moved_to = moved_to.clone();
                                 move |c| c.delete_messages(&moved_to, &found)
@@ -2778,6 +2790,40 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop un-moved messages from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &moved_to, events).await;
+                            // Clear the junk keywords the undone report set:
+                            // reporting junk writes `$Junk` (and "not junk"
+                            // `$NotJunk`), and a moved message carries its
+                            // keywords, so undoing the move strips them from the
+                            // messages that came back (item 1.24). Best-effort:
+                            // without UIDPLUS there are no destination-to-source
+                            // UID pairs to target, so it's skipped.
+                            let back: Vec<Uid> = pairs.iter().map(|(_, to)| *to).collect();
+                            if !back.is_empty() {
+                                let prefix = format!("{}:", account_id.0);
+                                if session_selected != moved_from {
+                                    if let Some(path) = moved_from.0.strip_prefix(&prefix) {
+                                        match session.select(path).await {
+                                            Ok(_) => session_selected = moved_from.clone(),
+                                            Err(e) => tracing::warn!(%moved_from, "SELECT before clearing junk keywords failed: {e}"),
+                                        }
+                                    }
+                                }
+                                if session_selected == moved_from {
+                                    let junk_atoms: Vec<String> = lookout_core::junk_keywords().into_iter().map(str::to_string).collect();
+                                    if let Err(e) = store_raw_flags(&mut session, &back, &[], &junk_atoms).await {
+                                        tracing::warn!("couldn't clear junk keywords after undo: {e}");
+                                    } else if let Some(Err(e)) = cache_op(cache, {
+                                        let moved_from = moved_from.clone();
+                                        let back = back.clone();
+                                        let junk_atoms = junk_atoms.clone();
+                                        move |c| c.update_keywords_many(&moved_from, &back, &[], &junk_atoms)
+                                    })
+                                    .await
+                                    {
+                                        tracing::warn!("failed to cache junk keyword removal: {e}");
+                                    }
+                                }
+                            }
                             refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
@@ -3763,6 +3809,59 @@ async fn connect_and_run(
                         }
                         Err(e) => {
                             let _ = events.send(AccountEvent::Error(format!("Couldn't update message tags: {e}"))).await;
+                        }
+                    }
+                }
+                AccountCommand::SetJunk { mailbox, uids, junk } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
+                        continue;
+                    };
+                    // Same folder contract as `StoreKeywords`.
+                    if session_selected != mailbox {
+                        session.select(&path).await?;
+                        session_selected = mailbox.clone();
+                    }
+                    let (add, remove) = lookout_core::junk_keyword_change(junk);
+                    let add = vec![add.to_string()];
+                    let remove = vec![remove.to_string()];
+                    match store_raw_flags(&mut session, &uids, &add, &remove).await {
+                        Ok(()) => {
+                            let all_patched = matches!(
+                                cache_op(cache, {
+                                    let mailbox = mailbox.clone();
+                                    let uids = uids.clone();
+                                    let add = add.clone();
+                                    let remove = remove.clone();
+                                    move |c| c.update_keywords_many(&mailbox, &uids, &add, &remove)
+                                })
+                                .await,
+                                Some(Ok(true))
+                            );
+                            if all_patched {
+                                emit_cached_messages(cache, &mailbox, events).await;
+                            } else if mailbox == current_mailbox_id {
+                                sync_mailbox(
+                                    &mut session,
+                                    &account_id,
+                                    &current_mailbox_name,
+                                    &current_mailbox_id,
+                                    events,
+                                    cache,
+                                    &mut folders,
+                                    interactive_commands,
+                                    Some(&session_selected),
+                                    condstore,
+                                    qresync,
+                                )
+                                .await?;
+                                session_selected = current_mailbox_id.clone();
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::Error(format!("Couldn't update the junk state: {e}"))).await;
                         }
                     }
                 }
@@ -4778,11 +4877,7 @@ async fn flag_keywords_by_uid(session: &mut Session<SessionStream>, uids: &[Uid]
 }
 
 /// The keywords `pick` selects from each of `uids` in the SELECTed mailbox.
-async fn keywords_by_uid(
-    session: &mut Session<SessionStream>,
-    uids: &[Uid],
-    pick: impl Fn(&std::collections::BTreeSet<String>) -> Vec<String>,
-) -> Result<Vec<(Uid, Vec<String>)>> {
+async fn keywords_by_uid(session: &mut Session<SessionStream>, uids: &[Uid], pick: impl Fn(&std::collections::BTreeSet<String>) -> Vec<String>) -> Result<Vec<(Uid, Vec<String>)>> {
     let mut found = Vec::new();
     for uid_set in uid_set_chunks(uids) {
         let fetches: Vec<Fetch> = session.uid_fetch(uid_set, "FLAGS").await?.try_collect().await?;
@@ -5114,7 +5209,14 @@ async fn purge_uids(session: &mut Session<SessionStream>, uids: &[Uid], has_uidp
 /// such an account would be a worse surprise than a new folder. Leaves the
 /// session SELECTed on the Drafts mailbox; the caller re-selects the
 /// user's folder. Returns the draft's `Message-ID`.
-async fn save_draft(session: &mut Session<SessionStream>, folders: &[Mailbox], account_id: &AccountId, msg: ComposedMessage, replace: DraftReplace, has_uidplus: bool) -> Result<String> {
+async fn save_draft(
+    session: &mut Session<SessionStream>,
+    folders: &[Mailbox],
+    account_id: &AccountId,
+    msg: ComposedMessage,
+    replace: DraftReplace,
+    has_uidplus: bool,
+) -> Result<String> {
     let path = match drafts_path(folders, account_id) {
         Some(path) => path.to_string(),
         None => {

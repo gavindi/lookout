@@ -301,12 +301,7 @@ pub fn build_draft_prefill(summary: &EmailSummary, content: &DraftPrefillContent
         attachments: content.attachments.clone(),
         // Defensive bracket strip: envelope-parsed ids are usually bare, but
         // a pre-parse fallback could carry the brackets.
-        draft_message_id: summary
-            .message_id
-            .as_deref()
-            .map(strip_angle_brackets)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string),
+        draft_message_id: summary.message_id.as_deref().map(strip_angle_brackets).filter(|id| !id.is_empty()).map(str::to_string),
         draft_source: Some((summary.mailbox.clone(), summary.uid)),
         draft_saved: false,
         in_reply_to: content.in_reply_to.clone(),
@@ -948,6 +943,27 @@ fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
         && snap.inline_images.is_empty()
 }
 
+/// Word stems that suggest the sender meant to attach something (item 1.19 /
+/// C-16). Matched against whole tokens, so "attach" catches "attached",
+/// "attachment" and "attachments" but not "detached". Localisable: add each
+/// language's stems here.
+const ATTACHMENT_REMINDER_STEMS: &[&str] = &["attach", "enclos"];
+
+/// Whether `text` mentions an attachment, per [`ATTACHMENT_REMINDER_STEMS`].
+fn mentions_attachment(text: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|token| !token.is_empty()).any(|token| {
+        let token = token.to_ascii_lowercase();
+        ATTACHMENT_REMINDER_STEMS.iter().any(|stem| token.starts_with(stem))
+    })
+}
+
+/// Whether sending a message with `subject` and `body` but no attachments
+/// should prompt first (item 1.19 / C-16): the text mentions an attachment
+/// and none is attached. Pure, so it's unit-tested.
+fn looks_like_missing_attachment(subject: &str, body: &str) -> bool {
+    mentions_attachment(subject) || mentions_attachment(body)
+}
+
 thread_local! {
     /// The composer's own WebKit context, kept separate from the process-wide
     /// default so enabling spellchecking here never affects the reading pane,
@@ -1006,6 +1022,8 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
         .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
         .build();
     let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).web_context(&compose_web_context()).build());
+    // Ctrl+scroll / Ctrl+± zoom on the composer (item 1.20 / M-37).
+    crate::window::install_web_view_zoom(&web_view);
 
     {
         let web_view = web_view.clone();
@@ -1152,6 +1170,22 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
     link_button.connect_clicked(move |button| link_dialog.present(Some(button)));
     toolbar.append(&link_button);
 
+    // Emoji picker (item 1.20 / C-14): a MenuButton wrapping a
+    // `gtk::EmojiChooser`; picking inserts the emoji at the caret.
+    let emoji_button = gtk::MenuButton::builder().icon_name("face-smile-symbolic").tooltip_text("Insert emoji").build();
+    let emoji_chooser = gtk::EmojiChooser::new();
+    {
+        let web_view = web_view.clone();
+        emoji_chooser.connect_emoji_picked(move |_chooser, emoji| {
+            // The picker held focus; hand it back before inserting so the
+            // emoji lands at the caret rather than nowhere.
+            web_view.grab_focus();
+            web_view.execute_editing_command_with_argument("InsertText", emoji);
+        });
+    }
+    emoji_button.set_popover(Some(&emoji_chooser));
+    toolbar.append(&emoji_button);
+
     toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
     toolbar_command_button(&toolbar, "format-justify-left-symbolic", "Align left", "JustifyLeft", &web_view);
     toolbar_command_button(&toolbar, "format-justify-center-symbolic", "Center", "JustifyCenter", &web_view);
@@ -1284,6 +1318,55 @@ fn rebuild_attachment_chips(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, f
     flow.set_visible(!attachments.borrow().is_empty());
 }
 
+/// Reads `file` and appends it to `attachments` as a pending outgoing
+/// attachment - the shared body of the Attach button and the composer's file
+/// drop target (item 1.20 / C-15). A file whose info or contents can't be read
+/// is skipped.
+async fn add_attachment_from_file(file: &gio::File, attachments: &Rc<RefCell<Vec<PendingAttachment>>>) {
+    let Ok(info) = file
+        .query_info_future("standard::display-name,standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
+        .await
+    else {
+        return;
+    };
+    let content_type = info
+        .content_type()
+        .and_then(|ct| gio::functions::content_type_get_mime_type(&ct))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let Ok((bytes, _etag)) = file.load_contents_future().await else {
+        return;
+    };
+    attachments.borrow_mut().push(PendingAttachment {
+        filename: info.display_name().to_string(),
+        content_type,
+        bytes: Rc::new(bytes.to_vec()),
+    });
+}
+
+/// Installs a drop target on `widget` that turns dropped files into
+/// attachments through the same [`add_attachment_from_file`] path as the
+/// Attach button (item 1.20 / C-15). Dropping a file from the file manager
+/// onto the composer body is Outlook's drag-in gesture.
+fn install_file_drop_target(widget: &impl IsA<gtk::Widget>, attachments: Rc<RefCell<Vec<PendingAttachment>>>, flow: gtk::FlowBox) {
+    let target = gtk::DropTarget::new(gtk::gdk::FileList::static_type(), gtk::gdk::DragAction::COPY);
+    target.connect_drop(move |_target, value, _x, _y| {
+        let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+            return false;
+        };
+        let attachments = attachments.clone();
+        let flow = flow.clone();
+        glib::spawn_future_local(async move {
+            for file in files.files() {
+                add_attachment_from_file(&file, &attachments).await;
+            }
+            rebuild_attachment_chips(&attachments, &flow);
+        });
+        true
+    });
+    widget.add_controller(target);
+}
+
 fn build_attachment_chip(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, flow: &gtk::FlowBox, index: usize, item: &PendingAttachment) -> gtk::Box {
     let label = gtk::Label::builder()
         .label(format!("{}  ·  {}", item.filename, crate::window::human_size(item.bytes.len() as u32)))
@@ -1387,6 +1470,9 @@ pub fn build_compose_view(
     // composer's shared WebKit context (see `apply_spell_check`).
     spell_check: bool,
     spell_languages: Vec<String>,
+    // Whether sending a message that mentions an attachment, but has none,
+    // prompts first (item 1.19 / C-16).
+    warn_no_attachment: bool,
     suggestions: SuggestionSource,
     open_contact_picker: crate::contact_picker::ContactPickerOpener,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
@@ -1740,23 +1826,7 @@ pub fn build_compose_view(
                 let Ok(files) = dialog.open_multiple_future(Some(&window)).await else { return };
                 for i in 0..files.n_items() {
                     let Some(file) = files.item(i).and_downcast::<gio::File>() else { continue };
-                    let Ok(info) = file
-                        .query_info_future("standard::display-name,standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
-                        .await
-                    else {
-                        continue;
-                    };
-                    let content_type = info
-                        .content_type()
-                        .and_then(|ct| gio::functions::content_type_get_mime_type(&ct))
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "application/octet-stream".to_string());
-                    let Ok((bytes, _etag)) = file.load_contents_future().await else { continue };
-                    attachments.borrow_mut().push(PendingAttachment {
-                        filename: info.display_name().to_string(),
-                        content_type,
-                        bytes: Rc::new(bytes.to_vec()),
-                    });
+                    add_attachment_from_file(&file, &attachments).await;
                 }
                 rebuild_attachment_chips(&attachments, &attachment_flow);
             });
@@ -2092,6 +2162,13 @@ pub fn build_compose_view(
     content.append(&editor_toolbar);
     content.append(&body_stack);
 
+    // File drop (item 1.20 / C-15): dropping files onto the composer body
+    // attaches them - on the plain-text and rich editors and the column
+    // around them, so a drop anywhere in the message area is caught.
+    install_file_drop_target(&content, attachments.clone(), attachment_flow.clone());
+    install_file_drop_target(&body_view, attachments.clone(), attachment_flow.clone());
+    install_file_drop_target(&*rich_web_view, attachments.clone(), attachment_flow.clone());
+
     {
         let on_done = on_done.clone();
         let autosave = autosave.clone();
@@ -2122,6 +2199,9 @@ pub fn build_compose_view(
         let high_importance_toggle = high_importance_toggle.clone();
         let low_importance_toggle = low_importance_toggle.clone();
         let on_send_started = on_send_started.clone();
+        // The Send button anchors the attachment-reminder dialog (item 1.19);
+        // cloned before the closure captures it by move.
+        let send_button_for_reminder = send_button.clone();
         // Shared by Send (`None`: now) and the schedule-send menu (`Some`:
         // the picked time, item 1.14).
         let send_composed: Rc<dyn Fn(Option<chrono::DateTime<chrono::Utc>>)> = Rc::new(move |schedule| {
@@ -2160,6 +2240,9 @@ pub fn build_compose_view(
             let closed = closed.clone();
             let on_done = on_done.clone();
             let on_send_started = on_send_started.clone();
+            // The Send button anchors the attachment-reminder dialog (item
+            // 1.19); cloned because the async block captures it by move.
+            let send_button_for_dialog = send_button_for_reminder.clone();
             glib::spawn_future_local(async move {
                 // A scheduled message waits in Drafts until it goes out, as
                 // in new Outlook (UX-45): save it now so the Drafts copy is
@@ -2196,6 +2279,31 @@ pub fn build_compose_view(
                     let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
                     (text, None, vec![])
                 };
+                // Attachment reminder (item 1.19 / C-16): if the message
+                // mentions an attachment but has none, ask before sending. A
+                // "Don't Send" answer returns here, leaving the composer open
+                // so the user can attach the file; nothing is queued (and
+                // `closed`/`on_done` stay unset).
+                if warn_no_attachment && attachments.borrow().is_empty() && looks_like_missing_attachment(&subject, &text_body) {
+                    let (respond_tx, respond_rx) = async_channel::bounded(1);
+                    let dialog = adw::AlertDialog::builder()
+                        .heading("Send this message without an attachment?")
+                        .body("Your message mentions an attachment, but none is attached.")
+                        .default_response("cancel")
+                        .close_response("cancel")
+                        .build();
+                    dialog.add_response("cancel", "Don't Send");
+                    dialog.add_response("send", "Send Anyway");
+                    dialog.set_response_appearance("cancel", adw::ResponseAppearance::Suggested);
+                    dialog.connect_response(None, move |_dialog, response| {
+                        let _ = respond_tx.send_blocking(response == "send");
+                    });
+                    let anchor = send_button_for_dialog.root().and_downcast::<gtk::Window>();
+                    dialog.present(anchor.as_ref());
+                    if !matches!(respond_rx.recv().await, Ok(true)) {
+                        return;
+                    }
+                }
                 // If this message was draft-autosaved, reuse the draft's
                 // stable `Message-ID` on the sent copy and let the account
                 // session's outbox delete the Drafts copy *after* the message
@@ -2786,5 +2894,15 @@ mod tests {
             inline_images: vec![],
         };
         assert!(draft_is_trivial(&snap));
+    }
+
+    #[test]
+    fn attachment_reminder_matches_mention_but_not_detached_files() {
+        assert!(looks_like_missing_attachment("", "Please see the attached report."));
+        assert!(looks_like_missing_attachment("", "As per the attachment, ..."));
+        assert!(looks_like_missing_attachment("Docs enclosed", ""));
+        assert!(looks_like_missing_attachment("", "RE-ATTACHED for reference"));
+        assert!(!looks_like_missing_attachment("", "I detached the cable."));
+        assert!(!looks_like_missing_attachment("Meeting notes", "No files here."));
     }
 }

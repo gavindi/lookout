@@ -81,13 +81,7 @@ pub(crate) struct MessageWindowState {
 /// Opens (or re-presents) the message window for `summary`. A no-op when the
 /// message's account isn't connected - same convention as the reading pane's
 /// reply handlers.
-pub(crate) fn open_message_window(
-    parent: &adw::ApplicationWindow,
-    state: &Rc<RefCell<UiState>>,
-    worker: &Rc<Worker>,
-    main_reading_stack: &gtk::Stack,
-    summary: &EmailSummary,
-) {
+pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, main_reading_stack: &gtk::Stack, summary: &EmailSummary) {
     let key = (summary.mailbox.clone(), summary.uid);
     if let Some(existing) = state.borrow().message_windows.get(&key).cloned() {
         existing.borrow().window.present();
@@ -130,6 +124,7 @@ pub(crate) fn open_message_window(
         .hexpand(true)
         .vexpand(true)
         .build();
+    crate::window::install_web_view_zoom(&web_view);
     let allow_images: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let allow_all: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     {
@@ -141,9 +136,7 @@ pub(crate) fn open_message_window(
         let allow_images = allow_images.clone();
         let allow_all = allow_all.clone();
         web_view.connect_decide_policy(move |_view, decision, decision_type| {
-            let uri_is_local = |uri: &str| -> bool {
-                matches!(uri.split(':').next().unwrap_or(""), "data" | "cid" | "about" | "file")
-            };
+            let uri_is_local = |uri: &str| -> bool { matches!(uri.split(':').next().unwrap_or(""), "data" | "cid" | "about" | "file") };
             match decision_type {
                 webkit::PolicyDecisionType::NavigationAction => {
                     let navigation = decision.downcast_ref::<webkit::NavigationPolicyDecision>().and_then(|d| d.navigation_action());
@@ -626,7 +619,9 @@ fn wire_reply_button(
     let parent = parent.clone();
     button.connect_clicked(move |_| {
         let summary = entry.borrow().summary.clone();
-        let Some((own_email, cmd_tx)) = crate::window::reply_send_context(&state, &summary) else { return };
+        let Some((own_email, cmd_tx)) = crate::window::reply_send_context(&state, &summary) else {
+            return;
+        };
         let body = entry.borrow().last_body.clone().or_else(|| state.borrow_mut().cached_body(&summary.mailbox, summary.uid));
         let Some(body) = body else { return };
         let prefill = crate::compose::build_reply_prefill(&summary, &body, &own_email, mode);
@@ -662,7 +657,9 @@ fn wire_forward_button(
     let parent = parent.clone();
     button.connect_clicked(move |_| {
         let summary = entry.borrow().summary.clone();
-        let Some((_own_email, cmd_tx)) = crate::window::reply_send_context(&state, &summary) else { return };
+        let Some((_own_email, cmd_tx)) = crate::window::reply_send_context(&state, &summary) else {
+            return;
+        };
         let body = entry.borrow().last_body.clone().or_else(|| state.borrow_mut().cached_body(&summary.mailbox, summary.uid));
         let Some(body) = body else { return };
         let prefill = crate::compose::build_forward_prefill(&summary, &body);

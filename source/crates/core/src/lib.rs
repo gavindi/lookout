@@ -28,11 +28,11 @@ pub use email::{
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
 pub use interop::{
-    flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers, follow_up_keywords, graph_preset,
-    is_flag_keyword, importance_from_headers, importance_headers, nearest_preset_for_rgb,
-    preset_by_graph, sensitivity_from_headers, sensitivity_header, BusyStatus, CategoryPreset, FlagStatus, FollowUpFlag, Importance, MessageSensitivity, FLAG_DONE_KEYWORD,
-    FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD, OUTLOOK_CATEGORY_PRESETS,
+    flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers, follow_up_keywords,
+    graph_preset, importance_from_headers, importance_headers, is_flag_keyword, nearest_preset_for_rgb, preset_by_graph, sensitivity_from_headers, sensitivity_header, BusyStatus,
+    CategoryPreset, FlagStatus, FollowUpFlag, Importance, MessageSensitivity, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD, OUTLOOK_CATEGORY_PRESETS,
 };
+pub use interop::{junk_keyword, junk_keyword_change, junk_keywords, JUNK_KEYWORD, NOT_JUNK_KEYWORD};
 pub use interop::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
 pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use signature::Signature;

@@ -11,6 +11,7 @@
 //! - [`cdo`] — the `X-MICROSOFT-CDO-*` calendar properties (§4.3).
 //! - [`categories`] — Outlook's 25 category colour presets (§4.4, UX-85).
 //! - [`flags`] — follow-up flag semantics (§4.1, §4.4, M-10).
+//! - [`junk`] — the RFC 5788 `$Junk` / `$NotJunk` keywords (§4.2, M-17).
 //! - [`snooze`] — the snooze folder and wake-time keyword (§4.2, M-11).
 //!
 //! Decoders for Outlook's file formats (TNEF, `.msg`, PST) are a later roadmap
@@ -22,13 +23,15 @@ pub mod categories;
 pub mod cdo;
 pub mod flags;
 pub mod headers;
+pub mod junk;
 pub mod snooze;
 
 pub use categories::{graph_preset, nearest_preset_for_rgb, preset_by_graph, CategoryPreset, OUTLOOK_CATEGORY_PRESETS};
 pub use cdo::BusyStatus;
 pub use flags::{
-    flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers, follow_up_keywords, is_flag_keyword,
-    FlagStatus, FollowUpFlag, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD,
+    flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers, follow_up_keywords,
+    is_flag_keyword, FlagStatus, FollowUpFlag, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD,
 };
 pub use headers::{importance_from_headers, importance_headers, sensitivity_from_headers, sensitivity_header, Importance, MessageSensitivity};
+pub use junk::{junk_keyword, junk_keyword_change, junk_keywords, JUNK_KEYWORD, NOT_JUNK_KEYWORD};
 pub use snooze::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};

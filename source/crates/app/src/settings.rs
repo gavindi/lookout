@@ -129,6 +129,10 @@ pub const MARK_AS_READ_DELAY: &str = "mark-as-read-delay";
 /// before it goes out, while the "Sending" toast offers Undo (item 1.13).
 /// One of [`UNDO_SEND_DELAYS`]; 0 sends at once with no Undo.
 pub const MAIL_UNDO_SEND_SECONDS: &str = "mail-undo-send-seconds";
+/// Config → Mail → "Warn if a message looks like it is missing an attachment":
+/// whether sending a message whose subject or body mentions an attachment, but
+/// which has none, prompts first (item 1.19 / C-16).
+pub const MAIL_WARN_NO_ATTACHMENT: &str = "mail-warn-no-attachment";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
 /// Calendar → "Week starts on": first day of the week, as 0=Sunday .. 6=Saturday.
 pub const CALENDAR_WEEK_START: &str = "calendar-week-start";
@@ -287,6 +291,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MARK_AS_READ_MODE, Value::String("on-selection-change".into()));
     map.insert(MARK_AS_READ_DELAY, Value::Int(5));
     map.insert(MAIL_UNDO_SEND_SECONDS, Value::Int(5));
+    map.insert(MAIL_WARN_NO_ATTACHMENT, Value::Bool(true));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(CALENDAR_WEEK_START, Value::Int(0));
     map.insert(CALENDAR_WORK_DAYS, Value::Strv(vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()]));

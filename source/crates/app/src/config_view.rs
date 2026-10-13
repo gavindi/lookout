@@ -309,6 +309,10 @@ pub struct ConfigView {
     /// "Undo send" combo (Config → Mail); its selected index maps to
     /// `UNDO_SEND_DELAYS`.
     pub undo_send_row: adw::ComboRow,
+    /// "Warn if a message looks like it is missing an attachment" switch
+    /// (Config → Mail), exposed so the caller can persist it and gate the
+    /// pre-send attachment reminder (item 1.19).
+    pub warn_no_attachment_row: adw::SwitchRow,
     /// "Mail notifications" switch (Config → Mail), exposed so the caller can
     /// wire its `active` state into the `Gio::Notification` new-mail/send-
     /// failure notifications.
@@ -638,6 +642,12 @@ pub fn build() -> ConfigView {
         .model(&gtk::StringList::new(&crate::settings::UNDO_SEND_LABELS))
         .build();
     mail_settings_group.add(&undo_send_row);
+    let warn_no_attachment_row = adw::SwitchRow::builder()
+        .title("Warn if a message looks like it is missing an attachment")
+        .subtitle("Ask before sending when the subject or body mentions an attachment but none is attached")
+        .active(true)
+        .build();
+    mail_settings_group.add(&warn_no_attachment_row);
     let mail_notifications_row = adw::SwitchRow::builder()
         .title("Mail notifications")
         .subtitle("Show a desktop notification when new mail arrives or a send fails")
@@ -1031,6 +1041,7 @@ pub fn build() -> ConfigView {
         mark_as_read_row,
         mark_as_read_delay_row,
         undo_send_row,
+        warn_no_attachment_row,
         mail_notifications_row,
         dock_badge_row,
         calendar_alerts_row,
