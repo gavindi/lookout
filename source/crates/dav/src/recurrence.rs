@@ -138,7 +138,7 @@ fn expand_set(set: RRuleSet, event: &CalendarEvent, window_start: DateTime<Utc>,
                 organizer: event.organizer.clone(),
                 categories: event.categories.clone(),
                 sensitivity: event.sensitivity,
-                transparency: event.transparency,
+                show_as: event.show_as,
                 reminder_minutes_before: event.reminder_minutes_before,
                 conference_url: event.conference_url.clone(),
             }
@@ -184,7 +184,7 @@ fn single_occurrence_if_overlapping(event: &CalendarEvent, window_start: DateTim
             organizer: event.organizer.clone(),
             categories: event.categories.clone(),
             sensitivity: event.sensitivity,
-            transparency: event.transparency,
+            show_as: event.show_as,
             reminder_minutes_before: event.reminder_minutes_before,
             conference_url: event.conference_url.clone(),
         }]
@@ -219,7 +219,7 @@ mod tests {
             organizer: None,
             categories: Vec::new(),
             sensitivity: lookout_core::EventSensitivity::default(),
-            transparency: lookout_core::EventTransparency::default(),
+            show_as: lookout_core::BusyStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }

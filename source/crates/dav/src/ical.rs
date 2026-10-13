@@ -4,8 +4,9 @@ use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use icalendar::{
     Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, PartStat, Property, Role, TodoStatus, Trigger,
 };
+use lookout_core::interop::cdo;
 use lookout_core::{
-    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventTransparency, EventUid, ImipInvitation, ImipMethod,
+    Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventUid, ImipInvitation, ImipMethod,
     RecurrenceRange, TaskPriority, TaskStatus, TaskUid,
 };
 
@@ -102,10 +103,7 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         organizer: parse_organizer(event),
         categories: parse_categories(event),
         sensitivity: event.get_class().map(from_ical_class).unwrap_or_default(),
-        transparency: match event.property_value("TRANSP") {
-            Some("TRANSPARENT") => EventTransparency::Free,
-            _ => EventTransparency::Busy,
-        },
+        show_as: parse_show_as(event),
         conference_url: event.property_value("CONFERENCE").or_else(|| event.get_url()).map(str::to_string),
         reminder_minutes_before: parse_reminder(event),
     })
@@ -222,6 +220,22 @@ fn from_ical_class(class: Class) -> EventSensitivity {
         Class::Private => EventSensitivity::Private,
         Class::Confidential => EventSensitivity::Confidential,
     }
+}
+
+/// The event's "Show as" state (CAL-05). Outlook's `X-MICROSOFT-CDO-BUSYSTATUS`
+/// is read first, then the invite-only `-INTENDEDSTATUS` an Outlook invite may
+/// carry instead, and finally RFC 5545's binary `TRANSP` - the only form a
+/// non-Outlook source writes. An unrecognised CDO value falls through to
+/// `TRANSP` rather than guessing.
+fn parse_show_as(event: &icalendar::Event) -> BusyStatus {
+    event
+        .property_value(cdo::X_MICROSOFT_CDO_BUSYSTATUS)
+        .and_then(BusyStatus::from_cdo)
+        .or_else(|| event.property_value(cdo::X_MICROSOFT_CDO_INTENDEDSTATUS).and_then(BusyStatus::from_cdo))
+        .unwrap_or_else(|| match event.property_value("TRANSP") {
+            Some("TRANSPARENT") => BusyStatus::Free,
+            _ => BusyStatus::Busy,
+        })
 }
 
 fn to_ical_class(sensitivity: EventSensitivity) -> Class {
@@ -356,7 +370,20 @@ pub fn build_imip_vcalendar(event: &CalendarEvent, method: ImipMethod) -> String
         ImipMethod::Cancel => "CANCEL",
     };
     calendar.append_property(icalendar::Property::new("METHOD", method));
-    calendar.push(build_vevent(event).done());
+    let mut vevent = build_vevent(event);
+    // Outlook's iMIP form states show-as explicitly in both forms (§4.3): the
+    // five-state CDO property and the binary TRANSP (`TRANSPARENT` is already
+    // there for Free), plus the intended status on an organizer's REQUEST.
+    if vevent.property_value(cdo::X_MICROSOFT_CDO_BUSYSTATUS).is_none() {
+        vevent.append_property(Property::new(cdo::X_MICROSOFT_CDO_BUSYSTATUS, event.show_as.as_cdo()));
+    }
+    if method == "REQUEST" {
+        vevent.append_property(Property::new(cdo::X_MICROSOFT_CDO_INTENDEDSTATUS, event.show_as.as_cdo()));
+    }
+    if vevent.property_value("TRANSP").is_none() {
+        vevent.append_property(Property::new("TRANSP", "OPAQUE"));
+    }
+    calendar.push(vevent);
     format!("{calendar}")
 }
 
@@ -610,7 +637,15 @@ fn build_vevent(event: &CalendarEvent) -> icalendar::Event {
     if event.sensitivity != EventSensitivity::Public {
         vevent.class(to_ical_class(event.sensitivity));
     }
-    if event.transparency == EventTransparency::Free {
+    // "Show as" (CAL-05, §4.3): Outlook's five-state property for every state
+    // a non-Outlook client can't see, plus the binary TRANSP it does
+    // understand. Busy is both RFC defaults (OPAQUE, BUSY), so a plain event
+    // grows no noise; `build_imip_vcalendar` states them explicitly anyway,
+    // matching Outlook's iMIP form.
+    if event.show_as != BusyStatus::Busy {
+        vevent.append_property(Property::new(cdo::X_MICROSOFT_CDO_BUSYSTATUS, event.show_as.as_cdo()));
+    }
+    if event.show_as == BusyStatus::Free {
         vevent.append_property(Property::new("TRANSP", "TRANSPARENT"));
     }
     if let Some(conference_url) = &event.conference_url {
@@ -753,7 +788,7 @@ mod tests {
             organizer: None,
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
-            transparency: EventTransparency::default(),
+            show_as: BusyStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }
@@ -875,16 +910,80 @@ mod tests {
     }
 
     #[test]
-    fn parses_class_and_transp() {
+    fn parses_class_and_transp_as_show_as() {
         let ics_absent = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:cls-1@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Sync\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let events = parse_vevents(&cal_id(), ics_absent);
         assert_eq!(events[0].sensitivity, EventSensitivity::Public);
-        assert_eq!(events[0].transparency, EventTransparency::Busy);
+        assert_eq!(events[0].show_as, BusyStatus::Busy);
 
         let ics_set = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:cls-2@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Sync\r\nCLASS:CONFIDENTIAL\r\nTRANSP:TRANSPARENT\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let events = parse_vevents(&cal_id(), ics_set);
         assert_eq!(events[0].sensitivity, EventSensitivity::Confidential);
-        assert_eq!(events[0].transparency, EventTransparency::Free);
+        assert_eq!(events[0].show_as, BusyStatus::Free);
+    }
+
+    /// CAL-05: Outlook's five show-as states come from
+    /// `X-MICROSOFT-CDO-BUSYSTATUS`, which wins over the binary `TRANSP`. The
+    /// invite-only `-INTENDEDSTATUS` is the fallback for a CDO value, and an
+    /// unrecognised CDO value falls through to `TRANSP` rather than guessing.
+    #[test]
+    fn parses_the_five_outlook_show_as_states() {
+        for (cdo, expected) in [
+            ("FREE", BusyStatus::Free),
+            ("TENTATIVE", BusyStatus::Tentative),
+            ("BUSY", BusyStatus::Busy),
+            ("OOF", BusyStatus::Oof),
+            ("WORKINGELSEWHERE", BusyStatus::WorkingElsewhere),
+        ] {
+            // A BUSYSTATUS that contradicts TRANSP still wins.
+            let ics = format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:cdo-{cdo}@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Sync\r\nTRANSP:TRANSPARENT\r\nX-MICROSOFT-CDO-BUSYSTATUS:{cdo}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            );
+            let events = parse_vevents(&cal_id(), &ics);
+            assert_eq!(events[0].show_as, expected, "BUSYSTATUS:{cdo}");
+        }
+
+        // INTENDEDSTATUS is read when BUSYSTATUS is absent...
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:cdo-intended@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Sync\r\nX-MICROSOFT-CDO-INTENDEDSTATUS:TENTATIVE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_vevents(&cal_id(), ics)[0].show_as, BusyStatus::Tentative);
+
+        // ...but an unrecognised CDO value doesn't override TRANSP.
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:cdo-bad@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Sync\r\nTRANSP:TRANSPARENT\r\nX-MICROSOFT-CDO-BUSYSTATUS:NONSENSE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(parse_vevents(&cal_id(), ics)[0].show_as, BusyStatus::Free);
+    }
+
+    /// Every non-default state round-trips through CalDAV as its CDO property
+    /// (plus `TRANSP` for Free), and the iMIP form states all three properties
+    /// explicitly the way Outlook does, with `INTENDEDSTATUS` only on REQUEST.
+    #[test]
+    fn build_writes_cdo_show_as_and_imip_states_it_explicitly() {
+        for (show_as, cdo_value) in [
+            (BusyStatus::Free, "FREE"),
+            (BusyStatus::Tentative, "TENTATIVE"),
+            (BusyStatus::Oof, "OOF"),
+            (BusyStatus::WorkingElsewhere, "WORKINGELSEWHERE"),
+        ] {
+            let mut event = full_event();
+            event.show_as = show_as;
+            let ics = build_vcalendar(&event);
+            assert!(ics.contains(&format!("X-MICROSOFT-CDO-BUSYSTATUS:{cdo_value}")), "expected CDO {cdo_value} in:\n{ics}");
+            assert_eq!(parse_vevents(&cal_id(), &ics)[0].show_as, show_as);
+        }
+
+        let mut event = full_event();
+        event.show_as = BusyStatus::Oof;
+        let request = build_imip_vcalendar(&event, ImipMethod::Request);
+        assert!(request.contains("X-MICROSOFT-CDO-BUSYSTATUS:OOF"), "{request}");
+        assert!(request.contains("X-MICROSOFT-CDO-INTENDEDSTATUS:OOF"), "{request}");
+        assert!(request.contains("TRANSP:OPAQUE"), "{request}");
+        let reply = build_imip_vcalendar(&event, ImipMethod::Reply);
+        assert!(reply.contains("X-MICROSOFT-CDO-BUSYSTATUS:OOF"), "{reply}");
+        assert!(!reply.contains("INTENDEDSTATUS"), "INTENDEDSTATUS is an organizer-only property:\n{reply}");
+
+        // The default Busy state is still stated explicitly on iMIP.
+        let busy = build_imip_vcalendar(&full_event(), ImipMethod::Request);
+        assert!(busy.contains("X-MICROSOFT-CDO-BUSYSTATUS:BUSY"), "{busy}");
+        assert!(busy.contains("TRANSP:OPAQUE"), "{busy}");
     }
 
     #[test]
@@ -902,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn build_vcalendar_round_trips_attendees_categories_sensitivity_transparency_conference_and_reminder() {
+    fn build_vcalendar_round_trips_attendees_categories_sensitivity_show_as_conference_and_reminder() {
         let mut event = full_event();
         event.attendees = vec![
             Attendee {
@@ -922,7 +1021,7 @@ mod tests {
         event.organizer = Some(EmailAddress::new("organizer@example.com"));
         event.categories = vec!["Work".to_string(), "Important".to_string()];
         event.sensitivity = EventSensitivity::Private;
-        event.transparency = EventTransparency::Free;
+        event.show_as = BusyStatus::Free;
         event.conference_url = Some("https://example.com/join/abc".to_string());
         event.reminder_minutes_before = Some(15);
 
@@ -939,7 +1038,7 @@ mod tests {
         assert_eq!(round.organizer.as_ref().map(|o| o.address.as_str()), Some("organizer@example.com"));
         assert_eq!(round.categories, event.categories);
         assert_eq!(round.sensitivity, EventSensitivity::Private);
-        assert_eq!(round.transparency, EventTransparency::Free);
+        assert_eq!(round.show_as, BusyStatus::Free);
         assert_eq!(round.conference_url, event.conference_url);
         assert_eq!(round.reminder_minutes_before, Some(15));
     }
@@ -953,10 +1052,11 @@ mod tests {
     }
 
     #[test]
-    fn build_vcalendar_writes_default_class_and_transp_only_when_non_default() {
+    fn build_vcalendar_writes_default_class_and_show_as_only_when_non_default() {
         let ics = build_vcalendar(&full_event());
         assert!(!ics.contains("CLASS"), "default Public sensitivity shouldn't add a CLASS line: {ics}");
-        assert!(!ics.contains("TRANSP"), "default Busy transparency shouldn't add a TRANSP line: {ics}");
+        assert!(!ics.contains("TRANSP"), "default Busy show-as shouldn't add a TRANSP line: {ics}");
+        assert!(!ics.contains("X-MICROSOFT-CDO-BUSYSTATUS"), "default Busy show-as shouldn't add a CDO line: {ics}");
     }
 
     /// The CalDAV PUT body must never carry `METHOD` (it's an iMIP-only

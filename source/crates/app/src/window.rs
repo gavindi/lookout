@@ -13624,7 +13624,7 @@ fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar
             organizer: occ.organizer.clone(),
             categories: occ.categories.clone(),
             sensitivity: occ.sensitivity,
-            transparency: occ.transparency,
+            show_as: occ.show_as,
             reminder_minutes_before: occ.reminder_minutes_before,
             conference_url: occ.conference_url.clone(),
         };
@@ -24883,7 +24883,7 @@ mod tests {
             organizer: None,
             categories: vec![],
             sensitivity: Default::default(),
-            transparency: Default::default(),
+            show_as: Default::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }

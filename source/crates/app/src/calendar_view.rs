@@ -7,7 +7,7 @@ use std::rc::Rc;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::prelude::*;
-use lookout_core::{CalendarId, CalendarInfo, EventOccurrence};
+use lookout_core::{BusyStatus, CalendarId, CalendarInfo, EventOccurrence};
 use lookout_dav::session::ConnectionState as CalendarConnectionState;
 
 use crate::calendar_colors;
@@ -1867,13 +1867,23 @@ fn paint_all_day_band(cr: &gtk::cairo::Context, width: f64, height: f64, data: &
             if dragged == Some(i) {
                 continue;
             }
-            paint_chip(cr, gutter, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92);
+            paint_chip(cr, gutter, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92, fg);
         }
     }
     if let Some(drag) = *data.drag.borrow() {
         if drag.all_day {
             let occurrence = chips[drag.chip].occurrence;
-            paint_chip(cr, gutter, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
+            paint_chip(
+                cr,
+                gutter,
+                &drag_ghost_chip(&drag, occurrence),
+                &occurrences[occurrence],
+                &colors,
+                col_width,
+                false,
+                0.45,
+                fg,
+            );
         }
     }
 }
@@ -1980,13 +1990,23 @@ fn paint_time_grid(cr: &gtk::cairo::Context, width: f64, height: f64, data: &Tim
             if dragged == Some(i) {
                 continue;
             }
-            paint_chip(cr, gutter, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92);
+            paint_chip(cr, gutter, chip, &occurrences[chip.occurrence], &colors, col_width, Some(i) == hover, 0.92, fg);
         }
     }
     if let Some(drag) = *data.drag.borrow() {
         if !drag.all_day {
             let occurrence = chips[drag.chip].occurrence;
-            paint_chip(cr, gutter, &drag_ghost_chip(&drag, occurrence), &occurrences[occurrence], &colors, col_width, false, 0.45);
+            paint_chip(
+                cr,
+                gutter,
+                &drag_ghost_chip(&drag, occurrence),
+                &occurrences[occurrence],
+                &colors,
+                col_width,
+                false,
+                0.45,
+                fg,
+            );
         }
     }
 }
@@ -2009,42 +2029,172 @@ fn foreground_rgb(widget: &impl IsA<gtk::Widget>) -> (f64, f64, f64) {
     (color.red() as f64, color.green() as f64, color.blue() as f64)
 }
 
-/// Paints one event chip (fill, hairline border, hover ring, and its label).
-/// `alpha` scales the fill opacity - the drag ghost paints at a lower alpha
-/// so the grid stays readable under it.
+/// How `paint_chip` fills and outlines an event chip for one "Show as" state
+/// (CAL-05, UX-57): Outlook reserves a distinct look for every state so the
+/// grid reads at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipStyle {
+    /// Busy: the pre-3.3 look - the calendar colour, solid.
+    Solid,
+    /// Free: outline only, no fill.
+    Hollow,
+    /// Tentative: a light fill under diagonal hatching.
+    Hatched,
+    /// Away / out of office: solid, tinted Outlook's OOF purple.
+    Oof,
+    /// Working elsewhere: a translucent fill with a dotted outline.
+    Dotted,
+}
+
+/// The chip style for one show-as state.
+pub fn chip_style(show_as: BusyStatus) -> ChipStyle {
+    match show_as {
+        BusyStatus::Busy => ChipStyle::Solid,
+        BusyStatus::Free => ChipStyle::Hollow,
+        BusyStatus::Tentative => ChipStyle::Hatched,
+        BusyStatus::Oof => ChipStyle::Oof,
+        BusyStatus::WorkingElsewhere => ChipStyle::Dotted,
+    }
+}
+
+/// Outlook's out-of-office purple (`#7B2CBF`), the tint an Away chip shifts
+/// towards so it stays recognisable whatever the calendar's own colour is.
+const OOF_PURPLE: (f64, f64, f64) = (0.482, 0.173, 0.749);
+
+/// The fill colour an Away chip paints with: 55% of Outlook's OOF purple over
+/// the calendar's own colour, keeping some of the calendar's identity.
+fn oof_fill(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    (0.45 * r + 0.55 * OOF_PURPLE.0, 0.45 * g + 0.55 * OOF_PURPLE.1, 0.45 * b + 0.55 * OOF_PURPLE.2)
+}
+
+fn fill_rect(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: (f64, f64, f64), alpha: f64) {
+    let (x, y, w, h) = rect;
+    cr.rectangle(x, y, w, h);
+    cr.set_source_rgba(color.0, color.1, color.2, alpha);
+    let _ = cr.fill();
+}
+
+fn stroke_rect(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: (f64, f64, f64), alpha: f64, width: f64) {
+    let (x, y, w, h) = rect;
+    cr.rectangle(x, y, w, h);
+    cr.set_source_rgba(color.0, color.1, color.2, alpha);
+    cr.set_line_width(width);
+    let _ = cr.stroke();
+}
+
+/// Diagonal hatching across the chip: the tentative fill, clipped to the
+/// chip's rectangle so no line escapes it.
+fn hatch_rect(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: (f64, f64, f64), alpha: f64) {
+    let (x, y, w, h) = rect;
+    let _ = cr.save();
+    cr.rectangle(x, y, w, h);
+    cr.clip();
+    cr.set_source_rgba(color.0, color.1, color.2, alpha);
+    cr.set_line_width(1.0);
+    let step = 6.0;
+    let mut offset = -h;
+    while offset < w + h {
+        cr.move_to(x + offset, y + h);
+        cr.line_to(x + offset + h, y);
+        offset += step;
+    }
+    let _ = cr.stroke();
+    let _ = cr.restore();
+}
+
+/// Paints one event chip (fill, outline, hover ring, and its label). `alpha`
+/// scales the fill opacity - the drag ghost paints at a lower alpha so the
+/// grid stays readable under it. `fg` is the canvas's theme foreground, used
+/// as the text colour on the light-filled styles where a white/dark-on-colour
+/// choice doesn't apply.
 #[allow(clippy::too_many_arguments)]
-fn paint_chip(cr: &gtk::cairo::Context, gutter: f64, chip: &TimeChip, occ: &EventOccurrence, colors: &HashMap<CalendarId, String>, col_width: f64, hovered: bool, alpha: f64) {
+fn paint_chip(
+    cr: &gtk::cairo::Context,
+    gutter: f64,
+    chip: &TimeChip,
+    occ: &EventOccurrence,
+    colors: &HashMap<CalendarId, String>,
+    col_width: f64,
+    hovered: bool,
+    alpha: f64,
+    fg: (f64, f64, f64),
+) {
     let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
     let (r, g, b) = css_color_rgb(color);
     let (cx, cy, cw, ch) = chip_geometry(gutter, chip, col_width);
     if cw < 2.0 || ch < 2.0 {
         return;
     }
-    cr.rectangle(cx, cy, cw, ch);
-    cr.set_source_rgba(r, g, b, 0.92 * alpha);
-    let _ = cr.fill();
-    cr.rectangle(cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0);
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
-    cr.set_line_width(1.0);
-    let _ = cr.stroke();
+    let style = chip_style(occ.show_as);
+    let chip_color = (r, g, b);
+    let rect = (cx, cy, cw, ch);
+    let inset = (cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0);
+    match style {
+        // Busy: the original solid fill with its dark hairline border.
+        ChipStyle::Solid => {
+            fill_rect(cr, rect, chip_color, 0.92 * alpha);
+            stroke_rect(cr, inset, (0.0, 0.0, 0.0), 0.35, 1.0);
+        }
+        // Away: solid, purple-tinted.
+        ChipStyle::Oof => {
+            fill_rect(cr, rect, oof_fill(r, g, b), 0.92 * alpha);
+            stroke_rect(cr, inset, (0.0, 0.0, 0.0), 0.35, 1.0);
+        }
+        // Tentative: a light wash under diagonal hatching.
+        ChipStyle::Hatched => {
+            fill_rect(cr, rect, chip_color, 0.30 * alpha);
+            hatch_rect(cr, rect, chip_color, 0.85 * alpha);
+            stroke_rect(cr, inset, (0.0, 0.0, 0.0), 0.35, 1.0);
+        }
+        // Free: outline only, in the calendar's own colour.
+        ChipStyle::Hollow => {
+            stroke_rect(cr, (cx + 0.75, cy + 0.75, cw - 1.5, ch - 1.5), chip_color, 0.9 * alpha, 1.5);
+        }
+        // Working elsewhere: a translucent fill with a dotted outline.
+        ChipStyle::Dotted => {
+            fill_rect(cr, rect, chip_color, 0.55 * alpha);
+            let _ = cr.save();
+            cr.set_dash(&[3.0, 3.0], 0.0);
+            stroke_rect(cr, (cx + 0.75, cy + 0.75, cw - 1.5, ch - 1.5), chip_color, 0.95 * alpha, 1.2);
+            cr.set_dash(&[], 0.0);
+            let _ = cr.restore();
+        }
+    }
     if hovered {
         cr.rectangle(cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0);
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.55);
         let _ = cr.stroke();
     }
-    let fg = if calendar_colors::readable_foreground(color) == "white" {
-        (1.0, 1.0, 1.0, 0.95)
-    } else {
-        (0.0, 0.0, 0.0, 0.85)
+    // On the solid styles the text contrast is decided by the fill colour; on
+    // the light-filled/hollow styles it follows the theme's foreground.
+    let text_color = match style {
+        ChipStyle::Solid => readable_chip_color(color),
+        ChipStyle::Oof => readable_chip_color(&css_color_to_hex(oof_fill(r, g, b))),
+        ChipStyle::Dotted => readable_chip_color(color),
+        ChipStyle::Hatched | ChipStyle::Hollow => (fg.0, fg.1, fg.2, 0.95),
     };
     let text = ellipsize_text(cr, &chip_text(occ, chip, ch), (cw - 8.0).max(4.0));
     if !text.is_empty() {
-        cr.set_source_rgba(fg.0, fg.1, fg.2, fg.3);
+        cr.set_source_rgba(text_color.0, text_color.1, text_color.2, text_color.3);
         cr.select_font_face("Sans", FontSlant::Normal, FontWeight::Normal);
         cr.set_font_size(10.0);
         cr.move_to(cx + 4.0, cy + ch / 2.0 + 10.0 * CHIP_TEXT_BASELINE_OFFSET);
         let _ = cr.show_text(&text);
     }
+}
+
+/// White or near-black text for a chip fill, by luminance (the old inline
+/// choice, now shared by the tinted Away fill).
+fn readable_chip_color(hex: &str) -> (f64, f64, f64, f64) {
+    if calendar_colors::readable_foreground(hex) == "white" {
+        (1.0, 1.0, 1.0, 0.95)
+    } else {
+        (0.0, 0.0, 0.0, 0.85)
+    }
+}
+
+fn css_color_to_hex((r, g, b): (f64, f64, f64)) -> String {
+    format!("#{:02x}{:02x}{:02x}", (r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8)
 }
 
 /// Draws `text` right-aligned so its right edge lands on `right_x`, with `y`
@@ -3164,6 +3314,30 @@ mod tests {
         assert_eq!(business_columns(&week, &[chrono::Weekday::Sun]), vec![0]);
     }
 
+    /// CAL-05/UX-57: every show-as state gets its own chip look.
+    #[test]
+    fn chip_styles_map_every_show_as_state() {
+        assert_eq!(chip_style(BusyStatus::Busy), ChipStyle::Solid);
+        assert_eq!(chip_style(BusyStatus::Free), ChipStyle::Hollow);
+        assert_eq!(chip_style(BusyStatus::Tentative), ChipStyle::Hatched);
+        assert_eq!(chip_style(BusyStatus::Oof), ChipStyle::Oof);
+        assert_eq!(chip_style(BusyStatus::WorkingElsewhere), ChipStyle::Dotted);
+    }
+
+    /// An Away chip is 55% Outlook's OOF purple over the calendar's colour:
+    /// black shifts to the purple tint, and a coloured calendar still shows
+    /// through.
+    #[test]
+    fn away_chips_shift_towards_outlooks_oof_purple() {
+        let (r, g, b) = oof_fill(0.0, 0.0, 0.0);
+        assert!((r - 0.265).abs() < 0.01, "{r}");
+        assert!((g - 0.095).abs() < 0.01, "{g}");
+        assert!((b - 0.412).abs() < 0.01, "{b}");
+        let (red_r, _, red_b) = oof_fill(1.0, 0.0, 0.0);
+        assert!(red_r > r, "a red calendar keeps more red");
+        assert!((red_b - b).abs() < 1e-9, "the purple's blue channel is fixed");
+    }
+
     /// Live preference changes (item 3.1): a Work week change rebuilds the
     /// column headers to the new count, and a week-start change relabels the
     /// mini month's weekday row.
@@ -3311,7 +3485,7 @@ mod tests {
             organizer: None,
             categories: Vec::new(),
             sensitivity: lookout_core::EventSensitivity::default(),
-            transparency: lookout_core::EventTransparency::default(),
+            show_as: lookout_core::BusyStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }

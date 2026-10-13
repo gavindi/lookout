@@ -592,7 +592,7 @@ mod tests {
             organizer: None,
             categories: Vec::new(),
             sensitivity: Default::default(),
-            transparency: Default::default(),
+            show_as: Default::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }

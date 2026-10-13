@@ -20,14 +20,37 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
-use lookout_core::{
-    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventTransparency, EventUid, RecurrenceRange,
-};
+use lookout_core::{Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventUid, RecurrenceRange};
 
 use crate::calendar_colors::CalendarColorMap;
 use crate::datetime_picker::{set_calendar_date, time_cluster, wire_calendar};
 use crate::recipient_entry::{address_of, RecipientEntry, SuggestionSource};
 use crate::recurrence;
+
+/// The editor's "Show as" choices in new Outlook's order (CAL-05). The
+/// index↔state mapping is explicit - never the enum's own discriminant - so
+/// reordering `BusyStatus` can't silently change what a picker index means.
+/// Outlook calls the OOF state "Away" in new Outlook.
+const SHOW_AS_CHOICES: [(BusyStatus, &str); 5] = [
+    (BusyStatus::Free, "Free"),
+    (BusyStatus::WorkingElsewhere, "Working elsewhere"),
+    (BusyStatus::Tentative, "Tentative"),
+    (BusyStatus::Busy, "Busy"),
+    (BusyStatus::Oof, "Away"),
+];
+
+/// The dropdown index showing `show_as` (unknown states fall back to Busy).
+fn show_as_index(show_as: BusyStatus) -> u32 {
+    match SHOW_AS_CHOICES.iter().position(|(choice, _)| *choice == show_as) {
+        Some(index) => index as u32,
+        None => SHOW_AS_CHOICES.iter().position(|(choice, _)| *choice == BusyStatus::Busy).expect("Busy is always offered") as u32,
+    }
+}
+
+/// The state a dropdown index means (defaulting to Busy outside the list).
+fn show_as_from_index(index: u32) -> BusyStatus {
+    SHOW_AS_CHOICES.get(index as usize).map(|(choice, _)| *choice).unwrap_or(BusyStatus::Busy)
+}
 
 /// The save callback's target: the picked calendar plus the finished event.
 pub type SaveCallback = Rc<dyn Fn(CalendarId, CalendarEvent)>;
@@ -388,9 +411,9 @@ pub fn show_event_editor(
     let series = recurrence::build_series_control(existing.as_ref().and_then(|occ| occ.rrule.as_deref()), prefill.calendar_prefs.week_start);
     series.button.set_tooltip_text(Some("Series"));
 
-    let busy_model = gtk::StringList::new(&["Busy", "Free"]);
+    let busy_model = gtk::StringList::new(&SHOW_AS_CHOICES.iter().map(|(_, label)| *label).collect::<Vec<_>>());
     let busy_dropdown = gtk::DropDown::builder().model(&busy_model).tooltip_text("Show as").build();
-    busy_dropdown.set_selected(existing.as_ref().map(|occ| occ.transparency).unwrap_or_default() as u32);
+    busy_dropdown.set_selected(show_as_index(existing.as_ref().map(|occ| occ.show_as).unwrap_or_default()));
 
     let categorize_entry = gtk::Entry::builder().placeholder_text("Work, Personal, ...").build();
     if let Some(occ) = &existing {
@@ -633,11 +656,7 @@ pub fn show_event_editor(
                     2 => EventSensitivity::Confidential,
                     _ => EventSensitivity::Public,
                 },
-                transparency: if busy_dropdown.selected() == 1 {
-                    EventTransparency::Free
-                } else {
-                    EventTransparency::Busy
-                },
+                show_as: show_as_from_index(busy_dropdown.selected()),
                 reminder_minutes_before: reminder_choices.get(reminder_dropdown.selected() as usize).and_then(|(_, m)| *m),
                 video_enabled: video_toggle.is_active(),
                 conference_url_text: video_url_row.text().to_string(),
@@ -853,7 +872,7 @@ fn synthetic_occurrence(calendar_id: CalendarId, title: &str, start: DateTime<Ut
         organizer: None,
         categories: Vec::new(),
         sensitivity: EventSensitivity::default(),
-        transparency: EventTransparency::default(),
+        show_as: BusyStatus::default(),
         reminder_minutes_before: None,
         conference_url: None,
     }
@@ -1034,7 +1053,7 @@ struct FormInput {
     existing_attendees: Vec<Attendee>,
     categories: Vec<String>,
     sensitivity: EventSensitivity,
-    transparency: EventTransparency,
+    show_as: BusyStatus,
     reminder_minutes_before: Option<i64>,
     video_enabled: bool,
     conference_url_text: String,
@@ -1153,7 +1172,7 @@ pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveD
         organizer: occ.organizer.clone(),
         categories: occ.categories.clone(),
         sensitivity: occ.sensitivity,
-        transparency: occ.transparency,
+        show_as: occ.show_as,
         reminder_minutes_before: occ.reminder_minutes_before,
         conference_url: occ.conference_url.clone(),
     }
@@ -1219,7 +1238,7 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         organizer,
         categories: input.categories,
         sensitivity: input.sensitivity,
-        transparency: input.transparency,
+        show_as: input.show_as,
         reminder_minutes_before: input.reminder_minutes_before,
         conference_url,
     })
@@ -1242,7 +1261,7 @@ mod tests {
             existing_attendees: Vec::new(),
             categories: Vec::new(),
             sensitivity: EventSensitivity::Public,
-            transparency: EventTransparency::Busy,
+            show_as: BusyStatus::Busy,
             reminder_minutes_before: None,
             video_enabled: false,
             conference_url_text: String::new(),
@@ -1298,7 +1317,7 @@ mod tests {
             organizer: None,
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
-            transparency: EventTransparency::default(),
+            show_as: BusyStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }
@@ -1431,7 +1450,7 @@ mod tests {
             organizer: Some(EmailAddress::new("me@example.com")),
             categories: vec!["team".to_string()],
             sensitivity: EventSensitivity::Private,
-            transparency: EventTransparency::Free,
+            show_as: BusyStatus::Free,
             reminder_minutes_before: Some(10),
             conference_url: Some("https://meet.example.com/x".to_string()),
         };
@@ -1449,7 +1468,7 @@ mod tests {
         assert_eq!(event.organizer, occ.organizer);
         assert_eq!(event.categories, occ.categories);
         assert_eq!(event.sensitivity, EventSensitivity::Private);
-        assert_eq!(event.transparency, EventTransparency::Free);
+        assert_eq!(event.show_as, BusyStatus::Free);
         assert_eq!(event.reminder_minutes_before, Some(10));
         assert_eq!(event.conference_url.as_deref(), Some("https://meet.example.com/x"));
         assert_eq!(event.start, local_to_utc(moved));
@@ -1466,6 +1485,19 @@ mod tests {
         assert_eq!(initial_reminder_index(Some(None), Some(15)), index_of(None), "an edit keeps no reminder");
         assert_eq!(initial_reminder_index(Some(Some(60)), Some(15)), index_of(Some(60)));
         assert_eq!(initial_reminder_index(Some(Some(7)), None), 0, "an unoffered lead time shows as none");
+    }
+
+    /// CAL-05: the "Show as" dropdown offers Outlook's five states in its
+    /// order, and every state round-trips through the index mapping.
+    #[test]
+    fn show_as_choices_cover_outlooks_order() {
+        let labels: Vec<&str> = SHOW_AS_CHOICES.iter().map(|(_, label)| *label).collect();
+        assert_eq!(labels, vec!["Free", "Working elsewhere", "Tentative", "Busy", "Away"]);
+        for (index, (state, _)) in SHOW_AS_CHOICES.iter().enumerate() {
+            assert_eq!(show_as_index(*state), index as u32);
+            assert_eq!(show_as_from_index(index as u32), *state);
+        }
+        assert_eq!(show_as_from_index(99), BusyStatus::Busy, "an out-of-range index falls back to Busy");
     }
 
     /// Dragging a one-day all-day event two days later keeps it one day long
@@ -1515,7 +1547,7 @@ mod tests {
             organizer: None,
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
-            transparency: EventTransparency::default(),
+            show_as: BusyStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         };
@@ -1556,7 +1588,7 @@ mod tests {
             organizer: None,
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
-            transparency: EventTransparency::default(),
+            show_as: BusyStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         };

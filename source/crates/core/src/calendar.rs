@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 
 use crate::email::EmailAddress;
 use crate::ids::{AccountId, CalendarId, EventUid, TaskUid};
+use crate::interop::cdo::BusyStatus;
 
 /// One invitee on an event. Structured (not a raw `ATTENDEE` string) since
 /// the editor needs each address individually to render/edit attendee chips,
@@ -70,7 +71,11 @@ pub enum RecurrenceRange {
     ThisAndFuture,
 }
 
-/// RFC 5545 `TRANSP`: whether this event blocks other bookings at the same time.
+/// RFC 5545 `TRANSP`: the binary form of an event's "Show as" state - whether
+/// it blocks other bookings at the same time. Since 3.3 the model stores the
+/// full five-state [`BusyStatus`] instead; this type survives only as the
+/// wire-level bridge `cdo.rs` uses to derive the `TRANSP` line non-Outlook
+/// clients understand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum EventTransparency {
     #[default]
@@ -165,8 +170,12 @@ pub struct CalendarEvent {
     pub categories: Vec<String>,
     #[serde(default)]
     pub sensitivity: EventSensitivity,
-    #[serde(default)]
-    pub transparency: EventTransparency,
+    /// The item's "Show as" state (CAL-05): the full five-state Outlook/CDO
+    /// form of RFC 5545's binary `TRANSP` (see [`BusyStatus`]). Serialized as
+    /// `show_as`; the `transparency` alias keeps DAV-cache JSON written before
+    /// 3.3 readable.
+    #[serde(default, rename = "show_as", alias = "transparency")]
+    pub show_as: BusyStatus,
     /// Minutes before `start` a `VALARM` (DISPLAY) should fire. `None` means
     /// no reminder. Only a single alarm is modeled - multiple/repeating
     /// `VALARM`s are out of scope for this pass.
@@ -252,8 +261,9 @@ pub struct EventOccurrence {
     pub categories: Vec<String>,
     #[serde(default)]
     pub sensitivity: EventSensitivity,
-    #[serde(default)]
-    pub transparency: EventTransparency,
+    /// The occurrence's "Show as" state (see [`CalendarEvent::show_as`]).
+    #[serde(default, rename = "show_as", alias = "transparency")]
+    pub show_as: BusyStatus,
     #[serde(default)]
     pub reminder_minutes_before: Option<i64>,
     #[serde(default)]

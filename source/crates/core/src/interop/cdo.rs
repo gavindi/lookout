@@ -1,10 +1,11 @@
 //! The `X-MICROSOFT-CDO-*` calendar properties Outlook writes into iCalendar
 //! data (OUTLOOK_PARITY.md §4.3).
 //!
-//! This pass maps the one property the calendar's "Show as" control needs:
-//! `X-MICROSOFT-CDO-BUSYSTATUS` (and its invite-only twin
-//! `X-MICROSOFT-CDO-INTENDEDSTATUS`), whose five values are richer than the
-//! RFC 5545 `TRANSP` binary. `to_transparency`/`from_transparency` are the
+//! This module owns the five-state show-as model the calendar stores as
+//! `CalendarEvent::show_as` / `EventOccurrence::show_as` (CAL-05): the richer
+//! form of `X-MICROSOFT-CDO-BUSYSTATUS` (and its invite-only twin
+//! `X-MICROSOFT-CDO-INTENDEDSTATUS`), whose five values RFC 5545's binary
+//! `TRANSP` can't express. `to_transparency`/`from_transparency` are the
 //! bridge that lets non-Outlook clients see a faithful Busy/Free while Outlook
 //! sees the full status.
 //!
