@@ -250,10 +250,14 @@ mod tests {
         assert_eq!(next_month(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()), NaiveDate::from_ymd_opt(2027, 1, 1).unwrap());
     }
 
+    /// The feed's one event, on `day` of the *current* month: the session
+    /// syncs the month `Utc::now()` lands in, so a hard-coded month would
+    /// make this test drift out of its window the month after it was written.
     fn ics_for(day: u32) -> String {
+        let month = first_of_month(chrono::Utc::now().date_naive());
+        let (year, month) = (month.year(), month.month());
         format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:feed-event-1\r\nDTSTAMP:20260801T000000Z\r\nDTSTART:202608{:02}T090000Z\r\nDTEND:202608{:02}T100000Z\r\nSUMMARY:Feed event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-            day, day,
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:feed-event-1\r\nDTSTAMP:{year}{month:02}01T000000Z\r\nDTSTART:{year}{month:02}{day:02}T090000Z\r\nDTEND:{year}{month:02}{day:02}T100000Z\r\nSUMMARY:Feed event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         )
     }
 
