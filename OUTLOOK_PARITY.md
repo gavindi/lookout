@@ -45,12 +45,12 @@ Counts are tallied from the §5 tables.
 | Mail (5.1) | 25 | 7 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 13 | 4 | 5 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder and sensitivity. No forwarding with attachments. |
 | Calendar (5.3) | 15 | 9 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
-| People (5.4) | 5 | 4 | 3 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine. No profile card, CSV, directory, or contact lists in compose. |
+| People (5.4) | 6 | 3 | 3 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). No CSV, directory, or contact lists in compose. |
 | Tasks (5.5) | 4 | 2 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **74** | **31** | **47** | **5** | ~47% at parity, ~20% partial |
+| **Total** | **75** | **30** | **47** | **5** | ~48% at parity, ~19% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -362,7 +362,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | P-07 | Sort / File as | Display name only | ❌ | First/Last, Last/First, Company |
 | P-08 | Import/export CSV | `.vcf` only | 🟡 | Outlook CSV (§4.6) |
 | P-09 | Link / merge duplicates | Exact-dupe skip on import | ❌ | Merge UI |
-| P-10 | Profile card | Header button opens editor | 🟡 | Hover/click card: email, phone, org, recent mail, shared files/events, "Schedule meeting" |
+| P-10 | Profile card | `app/src/profile_card.rs` (4.2): a popover on hover/click of a person reference (reading-pane header, message-list row, conversation card, attendee chip) showing photo/initials, name, title·org, phones, address, recent mail (FTS by address), upcoming shared events, and Send email / Schedule meeting / Add-or-Edit contact | ✅ | Invitation-card organizer and People-row triggers not yet wired; the UX-67 "Files" tab waits on attachment preview (M-32) |
 | P-11 | Directory (GAL / LDAP) | — | ❌ | Graph `/users`; LDAP |
 | P-12 | Recently deleted | Local Deleted bucket | ✅ | — |
 
@@ -534,7 +534,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 |---|---|---|---|---|---|
 | UX-65 | Layout | Left: **Favorites, Your contacts, Contact lists, Deleted, Directory/Groups**. Middle: alphabetical list with **letter headers**, avatars, Filter/Sort ▾. Right: **details pane** (photo, name, title/company, action buttons *Send email*, *Schedule meeting*, *Call*, tabs *Overview / Contact info / Files / Emails*) | Left bucket pane; list; edit in a dialog (`contacts_editor.rs`) | Letter headers; details pane with Outlook's actions and an Emails tab (recent mail via FTS, P-10); edit in place in the details pane, with dialog fallback for pop-out | M |
 | UX-66 | People ribbon | New contact ▾ (Contact, Contact list) · Edit · Delete · Add to favorites · Add to list · Import contacts · Export contacts · View ▸ sort / file-as | Text buttons: New contact, Import…, Export…, Manage groups… | Icon+label ribbon (UX-16), Outlook verbs, View tab (P-07) | S |
-| UX-67 | Profile card | Hover or click a person anywhere (reading pane, attendee list, chip) → card with contact info, recent emails, files, org, "Schedule meeting" | Header contact button opens the editor | 4.2 (P-10), triggered from every person reference | M |
+| UX-67 | Profile card | Hover or click a person anywhere (reading pane, attendee list, chip) → card with contact info, recent emails, files, org, "Schedule meeting" | Header contact button opens the editor | 4.2 (P-10) ✅: the card opens on hover/click of the reading-pane header, message-list row, conversation card and attendee chip, with contact info, recent emails, org, shared events and "Schedule meeting". "Files" waits on M-32; the invitation-card organizer and People-row triggers still to wire | M |
 
 ### 6.8 Tasks
 
@@ -675,7 +675,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
 | 4.1 | ✅ ~~Full contact field editing~~ | P-02, P-03 | Editor rows for anniversary, IM (`IMPP`), URL, custom; photo view and set (`PHOTO`) | M |
-| 4.2 | Profile card | P-10 | Popover on sender name/avatar click in reading pane and list: contact info, recent mail (FTS query by address), upcoming shared events, actions (email, schedule, add to contacts) | M |
+| 4.2 | ✅ ~~Profile card~~ | P-10 | `app/src/profile_card.rs`: one reusable popover (`attach_person_trigger` + `show_person_card_at`), opened on hover/click of the reading-pane header sender, a message-list row's sender/avatar, a conversation-WebView card's sender, and an event-editor attendee chip (`RecipientEntry::set_person_card_hook`). Shows photo/initials, name, title·org, phones, address, recent mail (`Cache::search_query` by `from:`), upcoming shared events (`shared_upcoming_events` over the in-memory calendar), and Send email / Schedule meeting / Add-or-Edit contact. `EventEditorPrefill.suggested_attendees` lands "Schedule meeting" | M |
 | 4.3 | Contact lists in compose | P-05, C-18 | Lists appear in autocomplete/picker; expand to members on insert; optional `+` expander chip | S |
 | 4.4 | People search and sort | P-06, P-07 | Search entry in the People tab; File-as setting; global search scope "People" | S |
 | 4.5 | Outlook CSV import/export | P-08 | Column map per §4.6; tolerant header matching | M |

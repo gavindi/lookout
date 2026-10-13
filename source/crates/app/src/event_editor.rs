@@ -115,6 +115,10 @@ pub struct EventEditorPrefill<'a> {
     /// The shared category master list (item 2.1 / CAL-07), offered by the
     /// editor's Categorize picker. Empty when the user has none yet.
     pub categories: &'a [crate::categories::CategoryDef],
+    /// Attendees to prefill on a *new* event - the profile card's "Schedule
+    /// meeting" action passes the person it is about. Ignored when editing an
+    /// existing occurrence (whose own attendees win).
+    pub suggested_attendees: &'a [EmailAddress],
 }
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
@@ -125,6 +129,7 @@ pub fn show_event_editor(
     window: &adw::ApplicationWindow,
     prefill: EventEditorPrefill,
     attendee_suggestions: SuggestionSource,
+    profile_card: crate::profile_card::ContextProvider,
     on_save: impl Fn(CalendarId, CalendarEvent) + 'static,
     on_delete: impl Fn(CalendarId, EventOccurrence) + 'static,
 ) {
@@ -178,6 +183,15 @@ pub fn show_event_editor(
     let title_row = adw::EntryRow::builder().title("Title").build();
     let attendees_field = RecipientEntry::new("Invite required attendees");
     attendees_field.set_suggestion_source(attendee_suggestions);
+    // Each attendee chip opens the person's profile card (Phase 4.2 / UX-67).
+    {
+        let provider = profile_card.clone();
+        attendees_field.set_person_card_hook(Rc::new(move |label, address| {
+            let address = address.clone();
+            let resolve: crate::profile_card::PersonResolver = Rc::new(move || Some((address.clone(), None)));
+            crate::profile_card::attach_person_trigger(provider.clone(), label, true, resolve);
+        }));
+    }
     let all_day_switch = gtk::Switch::new();
     all_day_switch.set_valign(gtk::Align::Center);
 
@@ -528,6 +542,18 @@ pub fn show_event_editor(
         video_toggle.set_active(occ.conference_url.is_some());
         video_url_row.set_text(occ.conference_url.as_deref().unwrap_or(""));
         video_url_row.set_visible(occ.conference_url.is_some());
+    } else if !prefill.suggested_attendees.is_empty() {
+        attendees_field.set_from_text(
+            &prefill
+                .suggested_attendees
+                .iter()
+                .map(|address| match &address.name {
+                    Some(name) if !name.trim().is_empty() => format!("{name} <{}>", address.address),
+                    _ => address.address.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
 
     // --- Right-hand preview wiring: re-renders the mini-calendar + day strip

@@ -27,8 +27,11 @@ pub struct MessageHeader {
     pub widget: gtk::Box,
     pub action_bar: gtk::Box,
     subject_label: gtk::Label,
-    avatar_label: gtk::Label,
-    sender_name_label: gtk::Label,
+    /// The sender avatar/name/address labels. `pub(crate)` so `window.rs` can
+    /// attach the profile-card trigger (Phase 4.2 / UX-67) to the avatar and
+    /// name after the header is built.
+    pub(crate) avatar_label: gtk::Label,
+    pub(crate) sender_name_label: gtk::Label,
     sender_email_label: gtk::Label,
     to_label: gtk::Label,
     date_label: gtk::Label,

@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.183" date="2026-10-14">
+      <description>
+        <p>A person's details are now one hover away. Resting on, or clicking, a sender's name or photo - in the reading pane, the message list, a stacked conversation or an event's attendee chip - opens a profile card with their photo, organization, phone, recent messages and upcoming shared events, plus buttons to email them, schedule a meeting, or add or edit them in your contacts.</p>
+      </description>
+    </release>
     <release version="0.9.182" date="2026-10-14">
       <description>
         <p>Contacts gain the fields Outlook's form has. The contact editor now has rows for an anniversary, instant-messaging addresses, websites and any custom property your address book carries, and it previews the contact's photo with buttons to set or remove it. The People list shows a contact's photo in place of their initials when the card has one, and the contact details view lists the new fields.</p>

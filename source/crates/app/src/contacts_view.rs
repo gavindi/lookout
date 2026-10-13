@@ -154,7 +154,7 @@ fn contacts_match_prefix(contact: &EmailAddress, prefix: &str) -> bool {
     contact.address.to_lowercase().starts_with(&needle) || contact.name.as_deref().is_some_and(|name| name.to_lowercase().starts_with(&needle))
 }
 
-fn vcard_display_name(card: &VCard) -> String {
+pub(crate) fn vcard_display_name(card: &VCard) -> String {
     if let Some(name) = card.full_name.as_deref().filter(|n| !n.trim().is_empty()) {
         return name.to_string();
     }
@@ -187,7 +187,7 @@ fn vcard_primary_email(card: &VCard) -> String {
 /// the image loader can decode. A URI-only photo yields `None` (remote images
 /// aren't fetched here), as does a decode failure - the caller falls back to
 /// coloured initials.
-fn contact_photo_texture(photo: &lookout_core::Photo) -> Option<gtk::gdk::Texture> {
+pub(crate) fn contact_photo_texture(photo: &lookout_core::Photo) -> Option<gtk::gdk::Texture> {
     let data = photo.data.clone()?;
     gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(data)).ok()
 }

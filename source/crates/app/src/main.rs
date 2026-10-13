@@ -45,6 +45,7 @@ mod message_window;
 mod microsoft_oauth;
 mod online_accounts;
 mod other_accounts;
+mod profile_card;
 mod recipient_entry;
 mod recurrence;
 mod reminders;

@@ -2701,6 +2701,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let state_clone = state.clone();
     let state_clone2 = state.clone();
     let reading_stack_clone = reading_stack.clone();
+    // The profile card (Phase 4.2 / P-10, UX-67): a single context is built
+    // once the calendar state exists further down and stored here, so every
+    // person reference - including the message-list rows built before it (the
+    // row factory only ever consults the provider at hover/click time, never
+    // during setup).
+    let profile_card_ctx: Rc<RefCell<Option<Rc<crate::profile_card::ProfileCardContext>>>> = Rc::new(RefCell::new(None));
+    let profile_card_provider: Rc<dyn Fn() -> Option<Rc<crate::profile_card::ProfileCardContext>>> = {
+        let holder = profile_card_ctx.clone();
+        Rc::new(move || holder.borrow().clone())
+    };
+    let profile_card_provider_for_rows = profile_card_provider.clone();
     // The shared category master list (item 2.1), read from `settings.json`
     // at startup. Mutated by the Manage-categories editor and the Microsoft
     // 365 Graph sync, read by the Categorize menu, the row context menu and
@@ -3016,6 +3027,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
         // The conversation this row heads, when it's a conversation header.
         let bound_thread: Rc<RefCell<Option<ThreadId>>> = Rc::new(RefCell::new(None));
+
+        // The profile card (Phase 4.2 / UX-67): hovering or clicking a row's
+        // sender name/avatar opens the person's card. Installed once per row
+        // (not per bind), resolving the row's message lazily from `bound`.
+        {
+            let provider = profile_card_provider_for_rows.clone();
+            let resolve: crate::profile_card::PersonResolver = {
+                let bound = bound.clone();
+                Rc::new(move || {
+                    bound
+                        .borrow()
+                        .as_ref()
+                        .and_then(|summary| summary.from.first().map(|sender| (sender.clone(), mailbox_account_id(&summary.mailbox))))
+                })
+            };
+            crate::profile_card::attach_person_trigger(provider.clone(), &sender_label, false, resolve.clone());
+            crate::profile_card::attach_person_trigger(provider, &avatar, false, resolve);
+        }
 
         let checkbox_suppress: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
@@ -4579,6 +4608,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         state: state.clone(),
         worker: worker.clone(),
         message_header: message_header.clone(),
+        profile_card: profile_card_provider.clone(),
         menu: MessageMenuContext {
             reading_stack: reading_stack.clone(),
             ..message_menu_context.clone()
@@ -7112,6 +7142,158 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     };
     calendar_state.borrow_mut().dashboard_refresh = Some(dashboard_refresh.clone());
 
+    // --- Profile card context (Phase 4.2 / P-10, UX-67). Built once the
+    // calendar state, the reading stack and the window all exist; the
+    // message-list rows read it lazily through `profile_card_provider`.
+    {
+        let window_for_card = window.clone();
+        let state_for_card = state.clone();
+        let worker_for_card = worker.clone();
+        let reading_stack_for_card = reading_stack.clone();
+        let calendar_state_for_card = calendar_state.clone();
+        let toast_overlay_for_card = toast_overlay.clone();
+
+        let send_email: crate::profile_card::SendEmailFn = {
+            let state = state_for_card.clone();
+            let worker = worker_for_card.clone();
+            let reading_stack = reading_stack_for_card.clone();
+            let toast_overlay = toast_overlay_for_card.clone();
+            Rc::new(move |address, preferred| {
+                let chosen = {
+                    let st = state.borrow();
+                    preferred.filter(|id| st.accounts.contains_key(id)).or_else(|| st.accounts.keys().next().cloned())
+                };
+                let Some(account_id) = chosen else {
+                    toast_overlay.add_toast(adw::Toast::new("Connect a mail account to send mail."));
+                    return;
+                };
+                let Some(cmd_tx) = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone()) else {
+                    return;
+                };
+                let prefill = crate::compose::ComposePrefill {
+                    to: Some(address.address.clone()),
+                    ..Default::default()
+                };
+                let rich_text_default = state.borrow().rich_text_default;
+                show_composer_in_reading_pane(
+                    &state,
+                    &worker,
+                    &reading_stack,
+                    "New message",
+                    cmd_tx,
+                    prefill,
+                    rich_text_default,
+                    Some(account_id),
+                    Some(crate::config_view::SignatureDefault::New),
+                );
+            })
+        };
+
+        let schedule_meeting: crate::profile_card::PersonActionFn = {
+            let window = window_for_card.clone();
+            let state = state_for_card.clone();
+            let worker = worker_for_card.clone();
+            let calendar_state = calendar_state_for_card.clone();
+            let toast_overlay = toast_overlay_for_card.clone();
+            let profile_card = profile_card_provider.clone();
+            Rc::new(move |address| {
+                let now = chrono::Local::now().naive_local();
+                let rounded = now + chrono::Duration::hours(1);
+                let start = rounded.with_minute(0).unwrap_or(rounded).with_second(0).unwrap_or(rounded);
+                show_new_event_editor(
+                    &window,
+                    &state,
+                    &worker,
+                    &calendar_state,
+                    &toast_overlay,
+                    start,
+                    None,
+                    std::slice::from_ref(address),
+                    &profile_card,
+                );
+            })
+        };
+
+        let add_contact: crate::profile_card::PersonActionFn = {
+            let window = window_for_card.clone();
+            let state = state_for_card.clone();
+            let toast_overlay = toast_overlay_for_card.clone();
+            Rc::new(move |address| show_create_contact_for(&window, &state, &toast_overlay, address, None))
+        };
+
+        let edit_contact: crate::profile_card::PersonActionFn = {
+            let window = window_for_card.clone();
+            let state = state_for_card.clone();
+            let toast_overlay = toast_overlay_for_card.clone();
+            Rc::new(move |address| match find_contact_by_address(&state, &address.address, None) {
+                Some((_, entry)) => show_contact_editor_for(&window, &state, &toast_overlay, &entry),
+                None => show_create_contact_for(&window, &state, &toast_overlay, address, None),
+            })
+        };
+
+        let open_message: crate::profile_card::OpenMessageFn = {
+            let window = window_for_card.clone();
+            let state = state_for_card.clone();
+            let worker = worker_for_card.clone();
+            let reading_stack = reading_stack_for_card.clone();
+            Rc::new(move |summary| crate::message_window::open_message_window(&window, &state, &worker, &reading_stack, summary))
+        };
+
+        let open_event: crate::profile_card::OpenEventFn = {
+            let window = window_for_card.clone();
+            let state = state_for_card.clone();
+            let worker = worker_for_card.clone();
+            let calendar_state = calendar_state_for_card.clone();
+            let toast_overlay = toast_overlay_for_card.clone();
+            let profile_card = profile_card_provider.clone();
+            Rc::new(move |occ| open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, occ))
+        };
+
+        let events_for_person: crate::profile_card::EventsForPersonFn = {
+            let calendar_state = calendar_state_for_card.clone();
+            Rc::new(move |address| {
+                calendar_state
+                    .borrow()
+                    .checked_occurrences_all_months()
+                    .into_iter()
+                    .filter(|occ| {
+                        occ.organizer.as_ref().is_some_and(|a| a.address.eq_ignore_ascii_case(address))
+                            || occ.attendees.iter().any(|a| a.address.address.eq_ignore_ascii_case(address))
+                    })
+                    .cloned()
+                    .collect()
+            })
+        };
+
+        let actions = crate::profile_card::ProfileCardActions {
+            send_email,
+            schedule_meeting,
+            add_contact,
+            edit_contact,
+            open_message,
+            open_event,
+            events_for_person,
+        };
+        let context = Rc::new(crate::profile_card::ProfileCardContext {
+            state: state_for_card.clone(),
+            worker: worker_for_card.clone(),
+            actions,
+        });
+        *profile_card_ctx.borrow_mut() = Some(context.clone());
+
+        // Reading-pane header: the sender avatar and name open the card.
+        let resolve: crate::profile_card::PersonResolver = {
+            let message_list = message_list.clone();
+            Rc::new(move || {
+                message_list
+                    .selected_summary()
+                    .and_then(|summary| summary.from.first().map(|sender| (sender.clone(), mailbox_account_id(&summary.mailbox))))
+            })
+        };
+        crate::profile_card::attach_person_trigger(profile_card_provider.clone(), &message_header.avatar_label, true, resolve.clone());
+        crate::profile_card::attach_person_trigger(profile_card_provider.clone(), &message_header.sender_name_label, true, resolve);
+    }
+
     // --- The More menu's "Create task from message…" (the old Follow-up
     // button's job before item 1.16 made Flag a message-level flag): opens
     // the task editor seeded from the message, defaulting into its own
@@ -7148,10 +7330,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_state = calendar_state.clone();
         let calendar_view_button = calendar_view_button.clone();
         let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
         Rc::new(move |occ: EventOccurrence| {
             window.present();
             calendar_view_button.set_active(true);
-            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &occ);
+            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
         })
     });
     // --- Mail notification actions. `app.raise-window` and `app.open-mailbox`
@@ -10651,6 +10834,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_state = calendar_state.clone();
         let calendar_main = calendar_main.clone();
         let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
         new_event_button.connect_clicked(move |_| {
             let anchor = calendar_view::anchor(&calendar_main);
             let suggested_start = {
@@ -10665,7 +10849,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     anchor.and_hms_opt(9, 0, 0).unwrap()
                 }
             };
-            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, suggested_start, None);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, suggested_start, None, &[], &profile_card);
         });
     }
     // Print: snapshots the currently-displayed month (checked calendars
@@ -10781,8 +10965,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
         calendar_view::connect_event_activated(&calendar_main, move |occ| {
-            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &occ);
+            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
         });
     }
     // --- Calendar drag-reschedule: dropping an event chip at a new position
@@ -10846,6 +11031,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
         calendar_view::connect_slot_activated(&calendar_main, move |start_date, start_minutes, end_date, end_minutes| {
             let Some(start) = start_date.and_hms_opt((start_minutes / 60) as u32, (start_minutes % 60) as u32, 0) else {
                 return;
@@ -10861,7 +11047,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             } else {
                 end_date.and_hms_opt(((end_minutes + 30) / 60) as u32, ((end_minutes + 30) % 60) as u32, 0)
             };
-            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, end);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, end, &[], &profile_card);
         });
     }
     {
@@ -10884,11 +11070,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let worker = worker.clone();
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
         calendar_view::connect_main_day_activated(&calendar_main, move |date| {
             let Some(start) = date.and_hms_opt(9, 0, 0) else {
                 return;
             };
-            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, None);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, None, &[], &profile_card);
         });
     }
 
@@ -13941,6 +14128,7 @@ fn open_event_editor_for(
     worker: &Rc<Worker>,
     calendar_state: &Rc<RefCell<CalendarUiState>>,
     toast_overlay: &adw::ToastOverlay,
+    profile_card: &crate::profile_card::ContextProvider,
     occ: &EventOccurrence,
 ) {
     let (read_only, read_only_note) = {
@@ -13981,8 +14169,10 @@ fn open_event_editor_for(
             read_only_note,
             calendar_prefs: &calendar_prefs,
             categories: &categories,
+            suggested_attendees: &[],
         },
         calendar_attendee_suggestions(state, worker),
+        profile_card.clone(),
         {
             let window = window.clone();
             let state = state.clone();
@@ -14010,6 +14200,7 @@ fn open_event_editor_for(
 /// button, the Day/Week grids' highlighted slot ranges, and month-grid day
 /// activation so every entry point behaves identically (a connect-a-calendar
 /// toast when nothing writable exists, the editor otherwise).
+#[allow(clippy::too_many_arguments)]
 fn show_new_event_editor(
     window: &adw::ApplicationWindow,
     state: &Rc<RefCell<UiState>>,
@@ -14018,6 +14209,8 @@ fn show_new_event_editor(
     toast_overlay: &adw::ToastOverlay,
     suggested_start: chrono::NaiveDateTime,
     suggested_end: Option<chrono::NaiveDateTime>,
+    attendees: &[EmailAddress],
+    profile_card: &crate::profile_card::ContextProvider,
 ) {
     let calendars = pickable_calendars(calendar_state);
     let Some(default_calendar) = default_pickable_calendar(calendar_state) else {
@@ -14044,8 +14237,10 @@ fn show_new_event_editor(
             read_only_note: "",
             calendar_prefs: &calendar_prefs,
             categories: &categories,
+            suggested_attendees: attendees,
         },
         calendar_attendee_suggestions(state, worker),
+        profile_card.clone(),
         {
             let window = window.clone();
             let state = state.clone();
@@ -22848,6 +23043,7 @@ struct ConversationContext {
     state: Rc<RefCell<UiState>>,
     worker: Rc<Worker>,
     message_header: crate::message_header::MessageHeader,
+    profile_card: crate::profile_card::ContextProvider,
     menu: MessageMenuContext,
 }
 
@@ -23476,6 +23672,18 @@ fn handle_conversation_message(ctx: &ConversationContext, ui: &Rc<ConversationUi
         ScriptMessage::OpenDetails(index) => {
             let Some(summary) = conversation_card_summary(state, index) else { return };
             show_conversation_message_alone(ctx, ui, summary);
+        }
+        ScriptMessage::Sender { card, x, y } => {
+            let Some(summary) = conversation_card_summary(state, card) else { return };
+            let Some(sender) = summary.from.first().cloned() else { return };
+            crate::profile_card::show_person_card_at(
+                ctx.profile_card.clone(),
+                ui.web_view.upcast_ref::<gtk::Widget>(),
+                &sender,
+                mailbox_account_id(&summary.mailbox),
+                x,
+                y,
+            );
         }
     }
 }

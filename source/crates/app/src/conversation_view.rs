@@ -118,6 +118,13 @@ pub enum ScriptMessage {
     /// "Show details" on a card whose message has an invitation, a
     /// read-receipt request or an unsubscribe link: open it on its own.
     OpenDetails(usize),
+    /// The card's sender name/avatar was clicked: open the profile card
+    /// (Phase 4.2 / UX-67) at window-relative `(x, y)` of the WebView.
+    Sender {
+        card: usize,
+        x: f64,
+        y: f64,
+    },
 }
 
 /// Parses a script message (`{"action": "...", "card": n, ...}`); `None`
@@ -142,6 +149,7 @@ pub fn parse_script_message(json: &str) -> Option<ScriptMessage> {
         },
         "show-blocked" => ScriptMessage::ShowBlocked(card),
         "open-details" => ScriptMessage::OpenDetails(card),
+        "sender" => ScriptMessage::Sender { card, x, y },
         _ => return None,
     })
 }
@@ -337,9 +345,16 @@ pub fn card_html(index: usize, card: &Card, now: DateTime<Utc>) -> String {
         "<header class=\"head\" data-action=\"toggle\" tabindex=\"0\" role=\"button\" aria-expanded=\"{}\">",
         card.expanded
     ));
-    out.push_str(&format!("<span class=\"avatar {color}\" aria-hidden=\"true\">{}</span>", escape_html(&initials)));
+    out.push_str(&format!(
+        "<span class=\"avatar {color}\" data-action=\"sender\" aria-hidden=\"true\">{}</span>",
+        escape_html(&initials)
+    ));
     out.push_str("<div class=\"who\"><div class=\"line\">");
-    out.push_str(&format!("<span class=\"sender\" title=\"{}\">{}</span>", escape_html(&address), escape_html(&name)));
+    out.push_str(&format!(
+        "<span class=\"sender\" data-action=\"sender\" title=\"{}\">{}</span>",
+        escape_html(&address),
+        escape_html(&name)
+    ));
     out.push_str("<span class=\"chips\">");
     for chip in chips(card, now) {
         out.push_str(&format!("<span class=\"chip {}\">{}</span>", chip.0, escape_html(&chip.1)));

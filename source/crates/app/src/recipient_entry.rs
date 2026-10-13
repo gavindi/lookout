@@ -162,7 +162,15 @@ pub struct RecipientEntry {
     /// its footer action label ("Save" / "Send") in step with whether the
     /// event has attendees; one slot is enough for its single consumer.
     changed: Rc<RefCell<Option<AddressesChangedCallback>>>,
+    /// Optional per-chip person hook (Phase 4.2 / UX-67): called with each
+    /// chip's name label and address so the caller can attach the profile-card
+    /// trigger. Unset by default (chip mode is otherwise inert).
+    person_card: Rc<RefCell<Option<PersonCardHook>>>,
 }
+
+/// Callback slot for [`RecipientEntry::set_person_card_hook`]: the chip's
+/// name label and the address behind it.
+pub type PersonCardHook = Rc<dyn Fn(&gtk::Label, &EmailAddress)>;
 
 /// Callback slot for [`RecipientEntry::connect_addresses_changed`] - named so
 /// the field's type reads as a sentence rather than four nested generics.
@@ -259,6 +267,7 @@ impl RecipientEntry {
             source: Rc::new(RefCell::new(None)),
             suggestion_generation: Rc::new(Cell::new(0)),
             changed: Rc::new(RefCell::new(None)),
+            person_card: Rc::new(RefCell::new(None)),
         };
         this.connect_handlers();
         this
@@ -267,6 +276,14 @@ impl RecipientEntry {
     /// The widget to pack into the composer.
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Installs a per-chip person hook (Phase 4.2 / UX-67): every chip built
+    /// from now on calls `hook` with its name label and address, so the caller
+    /// can attach the profile-card trigger. Set before any chips exist (the
+    /// field is created blank and prefilled afterwards) so every chip gets it.
+    pub fn set_person_card_hook(&self, hook: PersonCardHook) {
+        *self.person_card.borrow_mut() = Some(hook);
     }
 
     /// Appends a widget after the entry, right-aligned by the entry's
@@ -579,6 +596,19 @@ impl RecipientEntry {
         }
         chip.append(&label);
         chip.append(&remove);
+        // The profile-card trigger (Phase 4.2 / UX-67), when a caller installed
+        // one: hovering or clicking the chip's name opens the person's card.
+        if let Some(hook) = self.person_card.borrow().as_ref() {
+            if is_plausible_address(token) {
+                hook(
+                    &label,
+                    &EmailAddress {
+                        name: None,
+                        address: address_of(token).to_string(),
+                    },
+                );
+            }
+        }
         chip
     }
 
