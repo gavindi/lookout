@@ -37,6 +37,8 @@ pub enum GraphFeature {
     Mail,
     /// Automatic replies (Out of Office) and server-side rules.
     MailboxSettings,
+    /// The category master list (`/me/outlook/masterCategories`, item 2.1).
+    Categories,
     /// Server-side schedule send (`PidTagDeferredSendTime` extended property,
     /// then `send`).
     ScheduleSend,
@@ -64,6 +66,7 @@ impl GraphFeature {
         match self {
             GraphFeature::Mail => &[MAIL_READ_WRITE],
             GraphFeature::MailboxSettings => &[MAILBOX_SETTINGS_READ_WRITE],
+            GraphFeature::Categories => &[MAILBOX_SETTINGS_READ_WRITE],
             GraphFeature::ScheduleSend => &[MAIL_SEND],
             GraphFeature::Calendar => &[CALENDARS_READ_WRITE],
             GraphFeature::FreeBusy => &[CALENDARS_READ_SHARED],
@@ -103,6 +106,9 @@ mod tests {
 
         let directory = GraphFeature::Directory.consent_scopes();
         assert_eq!(directory, vec![MAIL_READ_WRITE, USER_READ_BASIC_ALL, PEOPLE_READ]);
+
+        let categories = GraphFeature::Categories.consent_scopes();
+        assert_eq!(categories, vec![MAIL_READ_WRITE, MAILBOX_SETTINGS_READ_WRITE]);
     }
 
     #[test]
@@ -110,6 +116,7 @@ mod tests {
         let features = [
             GraphFeature::Mail,
             GraphFeature::MailboxSettings,
+            GraphFeature::Categories,
             GraphFeature::ScheduleSend,
             GraphFeature::Calendar,
             GraphFeature::FreeBusy,

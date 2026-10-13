@@ -27,6 +27,7 @@ mod follow_up;
 mod goa_calendar_credentials;
 mod goa_credentials;
 mod google_tasks;
+mod graph_categories;
 mod graph_mail;
 mod graph_pin;
 #[cfg(test)]
@@ -51,7 +52,7 @@ mod settings;
 mod shortcuts;
 mod signatures;
 mod snooze;
-mod tags;
+mod categories;
 mod task_editor;
 mod tasks_view;
 mod theme;

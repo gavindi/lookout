@@ -1,0 +1,10 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('user%40example.com')/outlook/masterCategories",
+  "value": [
+    { "id": "AAAAAAAABBBBCCCCDDDDEEEE0001", "displayName": "Red Category", "color": "preset0" },
+    { "id": "AAAAAAAABBBBCCCCDDDDEEEE0002", "displayName": "Orange Category", "color": "preset1" },
+    { "id": "AAAAAAAABBBBCCCCDDDDEEEE0003", "displayName": "Work", "color": "preset7" },
+    { "id": "AAAAAAAABBBBCCCCDDDDEEEE0004", "displayName": "Project Xmas", "color": "preset24" },
+    { "id": "AAAAAAAABBBBCCCCDDDDEEEE0005", "displayName": "No colour" }
+  ]
+}

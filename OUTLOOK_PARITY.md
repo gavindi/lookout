@@ -42,15 +42,15 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 23 | 9 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, tags, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
+| Mail (5.1) | 24 | 8 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 12 | 4 | 6 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop and an attachment reminder. No forwarding with attachments. |
-| Calendar (5.3) | 14 | 10 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
+| Calendar (5.3) | 15 | 9 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
 | People (5.4) | 3 | 6 | 3 | 0 | CRUD and groups are fine. No profile card, CSV, directory, or contact lists in compose. |
-| Tasks (5.5) | 3 | 3 | 5 | 1 | VTODO and Google Tasks CRUD. No reminders, recurrence, subtasks or My Day. |
+| Tasks (5.5) | 4 | 2 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 2 | 1 | 5 | 1 | Remote-image blocking and a sandbox exist. No S/MIME/PGP, no authentication-results banners. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **63** | **38** | **51** | **5** | ~40% at parity, ~25% partial |
+| **Total** | **66** | **35** | **51** | **5** | ~42% at parity, ~22% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -242,7 +242,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-06 | Density and message preview lines | `layout-vertical-spacing` tight/medium/loose; `layout-message-preview-lines` 0–3; `mail-show-sender-images` (vCard photo, else initials) | ✅ | Density still uses Lookout's names (UX-83) |
 | M-07 | Sort / arrange by | `message_list.rs` `SortKey { Date, Sender, Subject, Size, Importance, Flag, Category, To, Attachments }`; group headers derived from every sort key (`GroupKey`) | 🟡 | No per-column sortable headers yet (U.4) |
 | M-08 | Filter menu | `FilterSet`: Unread, Flagged (open follow-up flags), Pinned, Has files, High importance, Categorized, To me (combinable check items) | 🟡 | @mentions me pending (M-25/2.13) |
-| M-09 | Categories (named, coloured, multiple) | `app/src/tags.rs` (`$Lookout-tag-*` keywords), Categorize menu, drop-on-tag | 🟡 | No master-list editor with Outlook's 25 colour presets; no Microsoft 365 sync |
+| M-09 | Categories (named, coloured, multiple) | `app/src/categories.rs` shared master list (`$Lookout-tag-*` keywords), Categorize menu with preset-colour dots, drop-on-category, editor (name, one of Outlook's 25 presets, classic shortcut); on Microsoft 365 synced with Graph `masterCategories`; stored in `settings.json` (2.1) | ✅ | — |
 | M-10 | Flag for follow-up with dates | Message-level flag state (keywords, local fallback, Graph `flag` on Microsoft 365, §4.2); Flag ▾ (Today, Tomorrow, This week, Next week, No date, Custom date…, Mark complete, Clear flag) following the calendar's week start and work days; Insert toggles; row flag icon and due label (red once overdue); Flag sort and groups by due (Overdue … Later, No date, Completed); "Follow up. Due by …" bar; Undo; Pin stays separate | ✅ | Incoming `X-Message-Flag`/`Reply-By` not shown yet (UX-33) |
 | M-11 | Snooze | Snooze ▾ presets (Later today, Tomorrow, This weekend, Next week, Choose a date…); synced via the server "Scheduled" folder plus a wake-time keyword, local fallback where keywords aren't stored (§4.2); wakes on time back to the Inbox, unread; "Snoozed until …" bar with Unsnooze; Undo | ✅ | Outlook's own snooze isn't visible over IMAP (⛔) |
 | M-12 | Importance display | `!`/`↓` list glyph from parsed headers | ✅ | — |
@@ -319,7 +319,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | CAL-04 | Multiple calendars: overlay / side-by-side | Overlay plus checklist | 🟡 | Side-by-side columns |
 | CAL-05 | Show as: Free/Tentative/Busy/OOF/Working elsewhere | Full five-state `BusyStatus` on `CalendarEvent`/`EventOccurrence` (`show_as`); reads `X-MICROSOFT-CDO-BUSYSTATUS`/`-INTENDEDSTATUS` with a `TRANSP` fallback and writes both forms; editor dropdown and per-state chip styles (3.3) | ✅ | — |
 | CAL-06 | Private / sensitivity | `EventSensitivity` | ✅ | — |
-| CAL-07 | Categories with colours | Free-text field | 🟡 | Share the mail category master list (M-09) |
+| CAL-07 | Categories with colours | The shared master list (M-09) as a toggle picker; the preset colour dot is shown per row (2.1) | ✅ | — |
 | CAL-08 | Week start | Settings → Calendar "Week starts on", applied live to the month grids, mini calendars, Week view, recurrence weekday order and the mail list's "This week / Last week" groups | ✅ | GTK date-picker popovers follow the locale's first weekday |
 | CAL-09 | Working hours and days | "Working days" (Work week view's columns) and "Working hours" (the business-hours band, drawn on work days only), applied live | ✅ | — |
 | CAL-10 | Second time zone in the grid | "Second time zone" picker adds an outer hour gutter to Day/Week/Work week, labelled with both zones; "Time zone" sets the zone the whole calendar is shown in (`app/src/calendar_tz.rs`) | ✅ | — |
@@ -377,7 +377,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | T-05 | Reminders | — | ❌ | `VALARM` in VTODO; Graph `reminderDateTime` |
 | T-06 | Recurrence | — | ❌ | `RRULE` in VTODO; Graph `recurrence` |
 | T-07 | Steps / subtasks | — | ❌ | `RELATED-TO;RELTYPE=PARENT`; Graph `checklistItems` |
-| T-08 | Categories | Stored, not editable | 🟡 | Share master list |
+| T-08 | Categories | The shared master list (M-09) as a toggle picker in the task editor (2.1) | ✅ | — |
 | T-09 | Sort / group options | Fixed buckets (`group_tasks`) | 🟡 | Sort by due/importance/title/created; group by list/category |
 | T-10 | Assign / task requests | — | ⛔ | Exchange-only (classic) |
 | T-11 | Google Tasks, CalDAV VTODO, local list | `app/src/google_tasks.rs`, `dav` VTODO, `ui_state_db` | ✅ | — |
@@ -631,7 +631,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
-| 2.1 | Category master list | M-09, CAL-07, T-08 | Editor (name, preset colour, shortcut key Ctrl+F2…F12 *classic*); stored in `settings.json`; synced with Graph `masterCategories` on Microsoft 365; shared by mail, events and tasks | M |
+| 2.1 | ✅ ~~Category master list~~ | M-09, CAL-07, T-08 | Editor (name, preset colour, shortcut key Ctrl+F2…F12 *classic*); stored in `settings.json`; synced with Graph `masterCategories` on Microsoft 365; shared by mail, events and tasks | M |
 | 2.2 | Search query language | M-18 | Parser in `mail/src/search_query.rs`: `from: to: cc: subject: body: has:attachment is:unread is:read is:flagged is:pinned category: received:>=2026-01-01 received:lastweek size:>1MB folder:`; compile to FTS5 `MATCH` plus SQL predicates locally and IMAP `SEARCH` keys remotely; keep `sanitize_fts_query` for free text | M |
 | 2.3 | Search UI: refiners, scope, history | M-18 | Scope dropdown (current folder / subfolders / account / all); refiner chips; recent searches in `ui_state_db` | M |
 | 2.4 | Search Folders | M-19 | Saved queries as virtual folders in the tree (unread mail, flagged, from VIPs, large mail, custom) | M |

@@ -202,6 +202,21 @@ pub fn graph_preset(index: u8) -> Option<&'static str> {
     OUTLOOK_CATEGORY_PRESETS.get(usize::from(index)).map(|preset| preset.graph)
 }
 
+/// The preset at `index` (`0`–`24`), or `None` when out of range. The
+/// on-disk category model stores this index rather than a raw colour, so a
+/// category always resolves to one of Outlook's 25 presets.
+pub fn preset_by_index(index: u8) -> Option<&'static CategoryPreset> {
+    OUTLOOK_CATEGORY_PRESETS.get(usize::from(index))
+}
+
+/// The preset whose official (Graph) name matches `name`, case-insensitively
+/// and ignoring surrounding whitespace. This is the bridge iCalendar needs:
+/// `CATEGORIES` carries the human name, not the `presetN` constant.
+pub fn preset_by_name(name: &str) -> Option<&'static CategoryPreset> {
+    let name = name.trim();
+    OUTLOOK_CATEGORY_PRESETS.iter().find(|preset| preset.name.eq_ignore_ascii_case(name))
+}
+
 /// The preset whose captured RGB is closest to `rgb` (Euclidean distance in
 /// RGB space). Accepts `#rrggbb` and bare `rrggbb`, upper- or lower-case.
 /// Unparseable input falls back to the first preset (`Red`) rather than
@@ -251,6 +266,18 @@ mod tests {
             assert_eq!(usize::from(preset.index), position);
             assert_eq!(preset.graph, format!("preset{position}"));
         }
+    }
+
+    #[test]
+    fn index_and_name_round_trip_through_lookup() {
+        for preset in &OUTLOOK_CATEGORY_PRESETS {
+            assert_eq!(preset_by_index(preset.index), Some(preset));
+            assert_eq!(preset_by_name(preset.name), Some(preset));
+            assert_eq!(preset_by_name(&preset.name.to_lowercase()), Some(preset));
+        }
+        assert_eq!(preset_by_index(25), None);
+        assert_eq!(preset_by_name(" Blue "), OUTLOOK_CATEGORY_PRESETS.get(7));
+        assert_eq!(preset_by_name("NoSuchName"), None);
     }
 
     #[test]

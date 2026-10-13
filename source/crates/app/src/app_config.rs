@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use lookout_core::{AccountId, Identity, MailboxRole, Signature, WebcalSubscription};
 use serde::{Deserialize, Serialize};
 
+use crate::categories::CategoryDef;
+
 /// The id prefix distinguishing manually-added accounts (stored here) from
 /// GOA accounts (whose ids are D-Bus object paths like
 /// `/org/gnome/OnlineAccounts/Accounts/account_1234`). Everything in the app
@@ -88,6 +90,13 @@ pub struct AppConfig {
     pub folder_role_overrides: Vec<FolderRoleOverride>,
     pub webcal_subscriptions: Vec<WebcalSubscription>,
     pub other_accounts: Vec<OtherAccount>,
+    /// The shared category master list (item 2.1 / M-09, CAL-07, T-08), used
+    /// by mail, events and tasks. Replaces the pre-2.1 `tags.json`; a legacy
+    /// file is migrated on first load (see `categories::migrate_legacy_tags`).
+    /// On Microsoft 365 accounts the list is synced with Graph's
+    /// `masterCategories`.
+    #[serde(default)]
+    pub categories: Vec<CategoryDef>,
 }
 
 impl AppConfig {
@@ -172,7 +181,17 @@ pub fn config_path() -> PathBuf {
 /// yields the default (empty) config - relational data is additive, so losing
 /// it only costs the not-yet-implemented features it would carry.
 pub fn load() -> AppConfig {
-    load_at(&config_path())
+    let mut config = load_at(&config_path());
+    // One-time migration: move a pre-2.1 `tags.json` into the shared category
+    // master list. Only when the user has no categories yet, so a later edit
+    // is never clobbered by a stale legacy file.
+    if config.categories.is_empty() {
+        if let Some(migrated) = crate::categories::migrate_legacy_tags() {
+            config.categories = migrated;
+            save(&config);
+        }
+    }
+    config
 }
 
 /// Writes the config out (creating the directory as needed). Best-effort: a
@@ -257,6 +276,7 @@ mod tests {
                 smtp_username: "work".into(),
                 use_same_password: true,
             }],
+            categories: Vec::new(),
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -284,6 +304,7 @@ mod tests {
             folder_role_overrides: Vec::new(),
             webcal_subscriptions: Vec::new(),
             other_accounts: Vec::new(),
+            categories: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");

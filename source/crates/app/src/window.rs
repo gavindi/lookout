@@ -97,6 +97,10 @@ pub(crate) struct AccountHandle {
     /// Outlook's own `flag` property through Graph (item 1.16), both ways,
     /// once the account has granted Graph access. See `graph_mail`.
     pub(crate) graph_mail: Option<Rc<crate::graph_mail::GraphMailClient>>,
+    /// Present only for Microsoft 365 accounts: syncs the shared category
+    /// master list with Outlook's `masterCategories` through Graph (item 2.1),
+    /// once the account has granted Graph access. See `graph_categories`.
+    pub(crate) graph_categories: Option<Rc<crate::graph_categories::GraphCategoriesClient>>,
 }
 
 /// One GNOME Online Accounts account as discovered at startup, keeping the
@@ -885,6 +889,11 @@ pub(crate) struct UiState {
     /// folder-role overrides. Loaded at startup, written through by the
     /// manage-identities dialog. See `app_config`.
     app_config: Rc<RefCell<crate::app_config::AppConfig>>,
+    /// The shared category master list (item 2.1 / M-09, CAL-07, T-08). The
+    /// same live set the message rows, Categorize menu and editors read; held
+    /// here too so the Graph category sync and settings can reach it. Persisted
+    /// through `AppConfig::categories`.
+    pub(crate) categories: Rc<RefCell<crate::categories::CategorySet>>,
     /// Contacts that were present in a previous CardDAV sync for an account
     /// but are missing from the latest one - the People screen's Deleted
     /// bucket. Filled by `contacts_view`'s sync diff; survives restarts
@@ -1937,10 +1946,8 @@ fn install_paned_css() {
         .message-row-icon {
             color: alpha(currentColor, 0.5);
         }
-        /* Color-tag dots. The circle shape is what makes one tag read as a
-           swatch at a glance; each tag's fill comes from the per-tag
-           `.message-tag-dot.tag-<key>` rules `apply_tag_colors` maintains,
-           not from this base rule. */
+        /* Color-tag dots are painted directly in their category's preset
+           colour (see `preset_dot_area`), so no per-category CSS is needed. */
         .message-tag-dot {
             border-radius: 9999px;
             background-color: transparent;
@@ -2519,6 +2526,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         ui_db,
         settings: settings.clone(),
         app_config: Rc::new(RefCell::new(crate::app_config::load())),
+        categories: Rc::new(RefCell::new(crate::categories::CategorySet::default())),
         deleted_contacts: HashMap::new(),
         contact_cmd_tx: HashMap::new(),
         goa_accounts: HashMap::new(),
@@ -2634,18 +2642,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let state_clone = state.clone();
     let state_clone2 = state.clone();
     let reading_stack_clone = reading_stack.clone();
-    // The shared tag-definition set, loaded from disk at startup. Mutated by
-    // the Manage-tags dialog, read by the Categorize menu, the row context
-    // menu, and every row's tag dots.
-    let tags = Rc::new(RefCell::new(crate::tags::load()));
-    // One provider encoding every tag's color as a `.message-tag-dot.tag-<key>`
-    // rule, re-`load_from_string` whenever tags change (replacing the previous
-    // rules wholesale). Registered once for the display's whole lifetime.
-    let tag_colors = gtk::CssProvider::new();
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &tag_colors, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    }
-    apply_tag_colors(&tags, &tag_colors);
+    // The shared category master list (item 2.1), read from `settings.json`
+    // at startup. Mutated by the Manage-categories editor and the Microsoft
+    // 365 Graph sync, read by the Categorize menu, the row context menu and
+    // every row's category dots.
+    let tags = Rc::new(RefCell::new(crate::categories::CategorySet::from_defs(state.borrow().app_config.borrow().categories.clone())));
+    // Publish the same set on `UiState` so the Microsoft 365 Graph sync and
+    // the Config editor can reach it without threading it through every call.
+    state.borrow_mut().categories = tags.clone();
     let message_list_for_rows = message_list.clone();
     let tags_for_bind = tags.clone();
     // What the message context menu (item 1.17) works with; every row's
@@ -2656,7 +2660,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         reading_stack: reading_stack.clone(),
         message_list: message_list.clone(),
         tags: tags.clone(),
-        tag_colors: tag_colors.clone(),
     };
     let message_menu_context_for_rows = message_menu_context.clone();
     // Declared here, ahead of the row factory below, so each row's `setup`
@@ -3467,21 +3470,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 apply_flag_indicator(&widgets.flag_icon, Some(&widgets.flag_label), follow_up.as_ref());
                 set_flag_button_state(&widgets.follow_up_btn, follow_up.as_ref());
 
-                // Rebuild the color-tag dots for this message. Colored by the
-                // `.message-tag-dot.tag-<key>` rules `apply_tag_colors` keeps
-                // in sync with the tag definitions.
+                // Rebuild the category dots for this message, each painted
+                // directly in its category's preset colour.
                 while let Some(child) = widgets.tag_dots.first_child() {
                     widgets.tag_dots.remove(&child);
                 }
                 let tags_borrow = tags_for_bind.borrow();
-                let shown = crate::tags::tags_for_keywords(&tags_borrow, &summary.keywords);
+                let shown = crate::categories::categories_for_keywords(&tags_borrow, &summary.keywords);
                 for tag in shown.iter().take(MAX_TAG_DOTS) {
-                    let dot = gtk::Box::builder()
-                        .width_request(8)
-                        .height_request(8)
-                        .css_classes(["message-tag-dot", &format!("tag-{}", tag.key)])
-                        .build();
-                    widgets.tag_dots.append(&dot);
+                    widgets.tag_dots.append(&preset_dot_area(tag.color(), 8));
                 }
                 widgets.tag_dots.set_visible(!shown.is_empty());
 
@@ -5061,10 +5058,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let tags = tags.clone();
         let state = state.clone();
         let message_list = message_list.clone();
-        let tag_colors = tag_colors.clone();
         categorize_popover.connect_show(move |popover| {
             let targets = message_list.selected_summaries();
-            let boxed = build_tag_menu(&tags, &state, targets, &message_list, &tag_colors);
+            let boxed = build_tag_menu(&tags, &state, targets, &message_list);
             popover.set_child(Some(&boxed));
         });
     }
@@ -6794,7 +6790,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         state.borrow_mut().create_task_from_message = Some(Rc::new(move |summary: &EmailSummary| {
             let account_id = mailbox_account_id(&summary.mailbox);
             let account_email = account_id.as_ref().and_then(|id| state_for_hook.borrow().accounts.get(id).map(|h| h.email.clone()));
-            show_create_task_for_email(&window, &calendar_state, &tasks_view, summary, account_id, account_email);
+            show_create_task_for_email(&window, &state_for_hook, &calendar_state, &tasks_view, summary, account_id, account_email);
         }));
     }
 
@@ -7070,8 +7066,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mut st = calendar_state.borrow_mut();
         st.mail_overview_refresh = Some(mail_overview_refresh);
         let window_for_activate = window.clone();
+        let state_for_activate = state.clone();
         st.mail_overview_activate = Some(Rc::new(move |task| {
-            open_task_editor_for(&window_for_activate, &calendar_state_for_activate, &tasks_view_for_activate, &task)
+            open_task_editor_for(&window_for_activate, &state_for_activate, &calendar_state_for_activate, &tasks_view_for_activate, &task)
         }));
     }
 
@@ -7434,6 +7431,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let row = config_view.trusted_senders_row.clone();
         row.clone().connect_activated(move |_| {
             crate::trusted_senders::show_manage_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
+        });
+    }
+
+    // Config → Mail → "Categories…": opens the shared category master-list
+    // editor (item 2.1 / M-09, CAL-07, T-08). The same editor is reachable
+    // from the Categorize menu's "Manage categories…" row.
+    {
+        let state = state.clone();
+        let tags = tags.clone();
+        let message_list = message_list.clone();
+        let row = config_view.categories_row.clone();
+        row.clone().connect_activated(move |_| {
+            show_manage_categories_dialog(row.upcast_ref::<gtk::Widget>(), state.clone(), tags.clone(), message_list.clone());
         });
     }
 
@@ -8306,8 +8316,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let refresh_shortcut_rows = refresh_shortcut_rows.clone();
         let state = state.clone();
         let dispatch = dispatch.clone();
+        let message_list = message_list.clone();
         let controller = gtk::EventControllerKey::new();
-        controller.connect_key_pressed(move |_controller, _keyval, keycode, state_modifiers| {
+        controller.connect_key_pressed(move |_controller, keyval, keycode, state_modifiers| {
             if shortcuts.borrow().capturing {
                 if let Some(display) = &display {
                     if let Some((modifiers, keyval)) = crate::shortcuts::chord_from_key(display, keycode, state_modifiers) {
@@ -8343,6 +8354,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 return glib::Propagation::Stop;
             }
             let Some(action) = shortcuts.borrow().action_for(keycode, state_modifiers) else {
+                // Classic category shortcuts (item 2.1, Outlook keymap):
+                // Ctrl+F2 … Ctrl+F12 apply the Nth category to the selected
+                // messages. Checked after the registry so a user's own binding
+                // always wins.
+                if state_modifiers & crate::shortcuts::MODIFIER_MASK == gtk::gdk::ModifierType::CONTROL_MASK {
+                    if let Some(n) = category_function_key(keyval) {
+                        let key = state.borrow().categories.borrow().by_shortcut(n).map(|c| c.key.clone());
+                        if let Some(key) = key {
+                            let targets = message_list.selected_summaries();
+                            if !targets.is_empty() {
+                                send_keyword_store(&state, &targets, &lookout_core::tag_keyword(&key), true);
+                                return glib::Propagation::Stop;
+                            }
+                        }
+                    }
+                }
                 return glib::Propagation::Proceed;
             };
             if let Some(run) = dispatch.borrow().get(action) {
@@ -8693,6 +8720,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let state = state.clone();
                 let toast_overlay = toast_overlay.clone();
                 let refresh_hook = refresh_hook.clone();
+                let message_list = message_list.clone();
                 Rc::new(move |_anchor, account_id: &str| {
                     let Some(client) = state.borrow().accounts.get(&AccountId(account_id.to_string())).and_then(|h| h.graph_pin.clone()) else {
                         return;
@@ -8700,14 +8728,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let toast_overlay = toast_overlay.clone();
                     let refresh_hook = refresh_hook.clone();
                     let state = state.clone();
+                    let message_list = message_list.clone();
                     let account_id = AccountId(account_id.to_string());
                     glib::spawn_future_local(async move {
                         match client.ensure_consent().await {
                             Ok(()) => {
                                 toast_overlay.add_toast(adw::Toast::new("Outlook sync enabled"));
                                 // The same grant covers follow-up flags (item
-                                // 1.16): read Outlook's now.
+                                // 1.16) and the category master list (item
+                                // 2.1): sync both with Outlook now.
                                 sync_follow_ups_from_graph(&state, &account_id);
+                                sync_categories_from_graph(&state, &message_list, &account_id);
+                                push_categories_to_graph(&state);
                                 let refresh = refresh_hook.borrow().clone();
                                 refresh();
                             }
@@ -10287,14 +10319,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // list from every source so the view isn't stale between polls.
     {
         let window = window.clone();
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
         let tasks_view = tasks_view.clone();
         new_task_button.connect_clicked(move |_| {
-            show_new_task_editor(&window, &calendar_state, &tasks_view);
+            show_new_task_editor(&window, &state, &calendar_state, &tasks_view);
         });
     }
     {
         let window = window.clone();
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
         let calendar_state_for_activate = calendar_state.clone();
         let tasks_view_for_toggle = tasks_view.clone();
@@ -10302,7 +10336,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         crate::tasks_view::set_handlers(
             &tasks_view,
             Rc::new(move |task, completed| route_task_toggle(&calendar_state, &tasks_view_for_toggle, task, completed)),
-            Rc::new(move |task| open_task_editor_for(&window, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
+            Rc::new(move |task| open_task_editor_for(&window, &state, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
         );
     }
     {
@@ -10328,6 +10362,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // every save path funnels through.
     {
         let window = window.clone();
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
         let tasks_view = tasks_view.clone();
         let calendar_state_for_activate = calendar_state.clone();
@@ -10335,7 +10370,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         crate::lookout_view::set_handlers(
             &lookout_view,
             Rc::new(move |task, completed| route_task_toggle(&calendar_state, &tasks_view, task, completed)),
-            Rc::new(move |task| open_task_editor_for(&window, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
+            Rc::new(move |task| open_task_editor_for(&window, &state, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
         );
     }
     {
@@ -10965,15 +11000,22 @@ fn connect_account(
             // see the field's own doc comment on `AccountHandle`.
             graph_pin: is_microsoft_365.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
             graph_mail: is_microsoft_365.then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
+            graph_categories: is_microsoft_365.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     if is_microsoft_365 {
         // Read Outlook's flags once the session has had a moment to open its
         // cache (item 1.16); `GRAPH_FLAG_RESYNC` and F5 keep them fresh.
-        let state = state.clone();
-        let account_id = account_id.clone();
-        glib::timeout_add_seconds_local_once(10, move || sync_follow_ups_from_graph(&state, &account_id));
+        let flags_state = state.clone();
+        let flags_account = account_id.clone();
+        glib::timeout_add_seconds_local_once(10, move || sync_follow_ups_from_graph(&flags_state, &flags_account));
+        // Pull Outlook's category master list into the shared list (item 2.1),
+        // a little after the flags, so the message list has rendered first.
+        let categories_state = state.clone();
+        let categories_message_list = message_list.clone();
+        let categories_account = account_id.clone();
+        glib::timeout_add_seconds_local_once(11, move || sync_categories_from_graph(&categories_state, &categories_message_list, &categories_account));
     }
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
@@ -11940,6 +11982,7 @@ fn connect_other_account(
             // wired in `connect_account`.
             graph_pin: None,
             graph_mail: None,
+            graph_categories: None,
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
@@ -13496,6 +13539,7 @@ fn open_event_editor_for(
     let preview = event_editor_preview_data(calendar_state, calendar_view::local_span(occ).0.date());
     let owner_email = calendar_owner_email(state, calendar_state, &occ.calendar_id);
     let calendar_prefs = state.borrow().settings.calendar_preferences();
+    let categories = state.borrow().app_config.borrow().categories.clone();
     crate::event_editor::show_event_editor(
         window,
         crate::event_editor::EventEditorPrefill {
@@ -13511,6 +13555,7 @@ fn open_event_editor_for(
             read_only,
             read_only_note,
             calendar_prefs: &calendar_prefs,
+            categories: &categories,
         },
         calendar_attendee_suggestions(state, worker),
         {
@@ -13557,6 +13602,7 @@ fn show_new_event_editor(
     let preview = event_editor_preview_data(calendar_state, suggested_start.date());
     let owner_email = calendar_owner_email(state, calendar_state, &default_calendar);
     let calendar_prefs = state.borrow().settings.calendar_preferences();
+    let categories = state.borrow().app_config.borrow().categories.clone();
     crate::event_editor::show_event_editor(
         window,
         crate::event_editor::EventEditorPrefill {
@@ -13572,6 +13618,7 @@ fn show_new_event_editor(
             read_only: false,
             read_only_note: "",
             calendar_prefs: &calendar_prefs,
+            categories: &categories,
         },
         calendar_attendee_suggestions(state, worker),
         {
@@ -14198,12 +14245,18 @@ fn route_task_toggle(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: 
 /// Opens the task editor for a brand-new task. The picker lists every
 /// task-capable source; when none exists it falls back to a single "Local
 /// (this device)" entry, so New Task always has somewhere to go.
-fn show_new_task_editor(window: &adw::ApplicationWindow, calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>) {
+fn show_new_task_editor(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+) {
     let mut calendars = pickable_task_calendars(calendar_state);
     if calendars.is_empty() {
         calendars.push(("Local (this device)".to_string(), local_tasks_calendar_id()));
     }
     let default_calendar = default_pickable_task_calendar(calendar_state).unwrap_or_else(local_tasks_calendar_id);
+    let categories = state.borrow().app_config.borrow().categories.clone();
     let calendar_state = calendar_state.clone();
     let tasks_view = tasks_view.clone();
     crate::task_editor::show_task_editor(
@@ -14213,6 +14266,7 @@ fn show_new_task_editor(window: &adw::ApplicationWindow, calendar_state: &Rc<Ref
             default_calendar,
             existing: None,
             prefill: None,
+            categories: &categories,
         },
         move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
         move |_calendar_id, _uid, _href, _etag| {},
@@ -14443,6 +14497,91 @@ fn sync_follow_ups_from_graph(state: &Rc<RefCell<UiState>>, account_id: &Account
     });
 }
 
+/// Pushes local categories that Outlook doesn't have yet to every connected,
+/// consented Microsoft 365 account (item 2.1). Union semantics: a category is
+/// created remotely when its name is missing there, and nothing is ever renamed
+/// or deleted remotely here (so Outlook-only categories are never at risk).
+/// Best effort - a failure is logged and the next sync reconciles.
+fn push_categories_to_graph(state: &Rc<RefCell<UiState>>) {
+    let clients: Vec<Rc<crate::graph_categories::GraphCategoriesClient>> = {
+        let st = state.borrow();
+        st.accounts
+            .values()
+            .filter_map(|h| h.graph_categories.clone())
+            .filter(|client| client.consented())
+            .collect()
+    };
+    if clients.is_empty() {
+        return;
+    }
+    let set = state.borrow().categories.borrow().clone();
+    glib::spawn_future_local(async move {
+        for client in clients {
+            match client.list().await {
+                Ok(remote) => {
+                    for cat in &set.categories {
+                        match remote.iter().find(|r| r.name.eq_ignore_ascii_case(&cat.name)) {
+                            // A name Outlook already has: only push a colour
+                            // change, never rename or delete remotely.
+                            Some(r) if r.preset != cat.preset => {
+                                if let Err(e) = client.update(&r.id, &cat.name, cat.preset).await {
+                                    tracing::warn!("couldn't update Outlook category '{}': {e}", cat.name);
+                                }
+                            }
+                            Some(_) => {}
+                            None => {
+                                if let Err(e) = client.create(&cat.name, cat.preset).await {
+                                    tracing::warn!("couldn't create Outlook category '{}': {e}", cat.name);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("couldn't read Outlook's categories: {e}"),
+            }
+        }
+    });
+}
+
+/// Pulls a Microsoft 365 account's Outlook categories into the shared master
+/// list (item 2.1), adding any name the user doesn't have locally yet. A no-op
+/// for other accounts and before Graph access is granted. Union semantics: a
+/// local category is never overwritten by the remote preset here (an existing
+/// colour choice wins), and nothing local is removed.
+fn sync_categories_from_graph(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, account_id: &AccountId) {
+    let Some(client) = state.borrow().accounts.get(account_id).and_then(|h| h.graph_categories.clone()) else {
+        return;
+    };
+    if !client.consented() {
+        return;
+    }
+    let state = state.clone();
+    let message_list = message_list.clone();
+    glib::spawn_future_local(async move {
+        match client.list().await {
+            Ok(remote) => {
+                let tags = state.borrow().categories.clone();
+                let mut changed = false;
+                {
+                    let mut set = tags.borrow_mut();
+                    for r in remote {
+                        if !set.contains_name(&r.name) {
+                            let key = lookout_core::sanitize_tag_key(&r.name);
+                            set.categories.push(crate::categories::CategoryDef::new(key, r.name, r.preset));
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    save_categories(&state, &tags.borrow());
+                    message_list.refresh();
+                }
+            }
+            Err(e) => tracing::warn!("couldn't read Outlook's categories: {e}"),
+        }
+    });
+}
+
 /// Shows or hides the reading pane's "Follow up. Due by …" bar for the
 /// message on it, from that message's current summary in the list.
 fn refresh_follow_up_banner(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, reading_stack: &gtk::Stack) {
@@ -14612,6 +14751,7 @@ fn build_task_seed_for_email(
 /// toolbar's "Add as Task" button.
 fn show_create_task_for_email(
     window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
     calendar_state: &Rc<RefCell<CalendarUiState>>,
     tasks_view: &Rc<crate::tasks_view::TasksView>,
     summary: &EmailSummary,
@@ -14623,6 +14763,7 @@ fn show_create_task_for_email(
         calendars.push(("Local (this device)".to_string(), local_tasks_calendar_id()));
     }
     let (default_calendar, seed) = build_task_seed_for_email(calendar_state, summary, preferred_account, preferred_email);
+    let categories = state.borrow().app_config.borrow().categories.clone();
 
     let calendar_state = calendar_state.clone();
     let tasks_view = tasks_view.clone();
@@ -14633,6 +14774,7 @@ fn show_create_task_for_email(
             default_calendar,
             existing: None,
             prefill: Some(&seed),
+            categories: &categories,
         },
         move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
         move |_calendar_id, _uid, _href, _etag| {},
@@ -14640,7 +14782,13 @@ fn show_create_task_for_email(
 }
 
 /// Opens the editor for an existing task.
-fn open_task_editor_for(window: &adw::ApplicationWindow, calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>, task: &CalendarTask) {
+fn open_task_editor_for(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+    task: &CalendarTask,
+) {
     // The picker lists every task-capable source. The task's own store is
     // appended unconditionally too: the save handler stamps the form's
     // selected calendar onto the task, so an edit whose source fell out of
@@ -14670,6 +14818,7 @@ fn open_task_editor_for(window: &adw::ApplicationWindow, calendar_state: &Rc<Ref
     let calendar_state_for_delete = calendar_state.clone();
     let tasks_view = tasks_view.clone();
     let tasks_view_for_delete = tasks_view.clone();
+    let categories = state.borrow().app_config.borrow().categories.clone();
     crate::task_editor::show_task_editor(
         window,
         crate::task_editor::TaskEditorPrefill {
@@ -14677,6 +14826,7 @@ fn open_task_editor_for(window: &adw::ApplicationWindow, calendar_state: &Rc<Ref
             default_calendar: task.calendar_id.clone(),
             existing: Some(task),
             prefill: None,
+            categories: &categories,
         },
         move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
         move |calendar_id, uid, href, etag| route_task_delete(&calendar_state_for_delete, &tasks_view_for_delete, calendar_id, uid, href, etag),
@@ -15636,19 +15786,6 @@ pub(crate) fn themed_icon_name(candidates: &[&'static str]) -> &'static str {
     candidates.last().copied().unwrap_or("image-missing-symbolic")
 }
 
-/// (Re)loads the `.message-tag-dot.tag-<key>` color rules for the current tag
-/// set into `provider`. `load_from_string` replaces the provider's previous
-/// rules wholesale, so a rename/recolor/delete takes effect immediately and a
-/// deleted tag's old class stops matching. Registered once for the display's
-/// lifetime (see `build_window`); this is the only thing that writes it.
-fn apply_tag_colors(tags: &Rc<RefCell<crate::tags::TagSet>>, provider: &gtk::CssProvider) {
-    let mut css = String::new();
-    for tag in &tags.borrow().tags {
-        css.push_str(&format!(".message-tag-dot.tag-{} {{ background-color: {}; }}\n", tag.key, tag.color));
-    }
-    provider.load_from_string(&css);
-}
-
 /// Adds (`add`) or removes the category `keyword` on `summaries`: one
 /// `StoreKeywordsMany` per mailbox to its owning account's session, which
 /// `STORE`s the atom, patches the cache, and re-emits (repainting the rows'
@@ -15740,8 +15877,7 @@ struct MessageMenuContext {
     worker: Rc<Worker>,
     reading_stack: gtk::Stack,
     message_list: MessageListModel,
-    tags: Rc<RefCell<crate::tags::TagSet>>,
-    tag_colors: gtk::CssProvider,
+    tags: Rc<RefCell<crate::categories::CategorySet>>,
 }
 
 /// Where the message context menu was opened.
@@ -15884,7 +16020,7 @@ fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widget, point: 
     for (name, enabled) in crate::message_menu::enabled_actions(&menu_state) {
         menu.set_enabled(name, enabled);
     }
-    let categorize = build_tag_menu(&context.tags, state, targets, &context.message_list, &context.tag_colors);
+    let categorize = build_tag_menu(&context.tags, state, targets, &context.message_list);
     menu.add_child(&categorize, crate::message_menu::CATEGORIZE_SLOT);
 
     let popover = menu.popover.clone();
@@ -16221,20 +16357,28 @@ pub(crate) fn print_html_once<T: IsA<gtk::Window>>(html: &str, parent: &T) {
     web_view.load_html(html, None);
 }
 
-/// Builds the tag menu shown by both the toolbar Categorize popover and the
-/// message context menu's Categorize ▸: one toggle row per defined tag (a
-/// color dot plus a check button - checked when every target carries that
-/// tag's keyword, mixed when only some do), then a "Manage tags…" row.
-/// `targets` are the messages the toggles act on, all at once; none
-/// (nothing selected) renders the toggles disabled. The caller owns showing
-/// it - for the toolbar it's the popover child (rebuilt on every `show`), for
-/// the context menu a custom slot.
+/// Persists the live category set into `settings.json` (item 2.1). The live
+/// `CategorySet` is the working copy the whole UI reads; this mirrors it into
+/// `AppConfig::categories` and writes the file, so a change survives restart.
+fn save_categories(state: &Rc<RefCell<UiState>>, set: &crate::categories::CategorySet) {
+    let app_config = state.borrow().app_config.clone();
+    app_config.borrow_mut().categories = set.categories.clone();
+    crate::app_config::save(&app_config.borrow());
+}
+
+/// Builds the category menu shown by both the toolbar Categorize popover and
+/// the message context menu's Categorize ▸ (item 2.1 / M-09): one toggle row
+/// per defined category (a colour dot plus a check button - checked when every
+/// target carries that category's keyword, mixed when only some do), then a
+/// "Manage categories…" row. `targets` are the messages the toggles act on,
+/// all at once; none (nothing selected) renders the toggles disabled. The
+/// caller owns showing it - for the toolbar it's the popover child (rebuilt on
+/// every `show`), for the context menu a custom slot.
 fn build_tag_menu(
-    tags: &Rc<RefCell<crate::tags::TagSet>>,
+    tags: &Rc<RefCell<crate::categories::CategorySet>>,
     state: &Rc<RefCell<UiState>>,
     targets: Vec<EmailSummary>,
     message_list: &MessageListModel,
-    tag_colors: &gtk::CssProvider,
 ) -> gtk::Box {
     let set = tags.borrow();
     let boxed = gtk::Box::builder()
@@ -16246,9 +16390,9 @@ fn build_tag_menu(
         .margin_end(6)
         .build();
 
-    if set.tags.is_empty() {
+    if set.categories.is_empty() {
         let empty = gtk::Label::builder()
-            .label("No tags defined yet")
+            .label("No categories defined yet")
             .halign(gtk::Align::Start)
             .css_classes(["dim-label"])
             .margin_top(2)
@@ -16256,16 +16400,11 @@ fn build_tag_menu(
             .build();
         boxed.append(&empty);
     } else {
-        for tag in &set.tags {
+        for tag in &set.categories {
             let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-            let dot = gtk::Box::builder()
-                .width_request(10)
-                .height_request(10)
-                .css_classes(["message-tag-dot", &format!("tag-{}", tag.key)])
-                .valign(gtk::Align::Center)
-                .build();
+            let dot = preset_dot_area(tag.color(), 10);
             let toggle = gtk::CheckButton::builder().label(&tag.name).build();
-            let keyword = lookout_core::tag_keyword(&tag.key);
+            let keyword = tag.keyword();
             let (active, inconsistent) = tag_check_state(&targets, &keyword);
             toggle.set_active(active);
             toggle.set_inconsistent(inconsistent);
@@ -16277,13 +16416,13 @@ fn build_tag_menu(
             let state = state.clone();
             let state_for_toggle = state.clone();
             toggle.connect_toggled(move |t| {
-                // A mixed check applies the tag to every target on its
+                // A mixed check applies the category to every target on its
                 // first click, as Outlook does.
                 t.set_inconsistent(false);
                 send_keyword_store(&state_for_toggle, &targets, &keyword, t.is_active());
             });
-            // Dropping messages onto the tag row applies that tag to all of
-            // them - the batch counterpart of the toggles (one
+            // Dropping messages onto the category row applies that category to
+            // all of them - the batch counterpart of the toggles (one
             // `StoreKeywordsMany` per source mailbox).
             {
                 let drop_state = state.clone();
@@ -16308,13 +16447,15 @@ fn build_tag_menu(
         }
     }
 
-    let manage = gtk::Button::builder().label("Manage tags…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    let manage = gtk::Button::builder().label("Manage categories…").css_classes(["flat"]).halign(gtk::Align::Start).build();
     {
         let tags = tags.clone();
+        let state = state.clone();
         let message_list = message_list.clone();
-        let tag_colors = tag_colors.clone();
         let manage_button = manage.clone();
-        manage.connect_clicked(move |_| show_manage_tags_dialog(manage_button.upcast_ref::<gtk::Widget>(), tags.clone(), message_list.clone(), tag_colors.clone()));
+        manage.connect_clicked(move |_| {
+            show_manage_categories_dialog(manage_button.upcast_ref::<gtk::Widget>(), state.clone(), tags.clone(), message_list.clone());
+        });
     }
     boxed.append(&manage);
     boxed
@@ -16327,20 +16468,49 @@ fn tag_check_state(targets: &[EmailSummary], keyword: &str) -> (bool, bool) {
     (carrying > 0 && carrying == targets.len(), carrying > 0 && carrying < targets.len())
 }
 
-/// The tag-management dialog: list existing tags (color swatch + editable
-/// name + delete), with an "add" row for new ones. Mutates the shared
-/// `TagSet`, persists it via `crate::tags::save`, refreshes the row color
-/// rules (`apply_tag_colors`), and forces the message list to re-render -
-/// a recolor/rename doesn't change any message's keywords, so the list's
-/// no-op check would otherwise skip the rebuild.
+/// The classic category shortcut's function-key number for a pressed key:
+/// `F2`–`F12` map to `2`–`12` (rendered as `Ctrl+F2`…`Ctrl+F12`, item 2.1).
+/// Any other key is `None`.
+fn category_function_key(key: gtk::gdk::Key) -> Option<u8> {
+    use gtk::gdk::Key;
+    let n = match key {
+        Key::F2 => 2,
+        Key::F3 => 3,
+        Key::F4 => 4,
+        Key::F5 => 5,
+        Key::F6 => 6,
+        Key::F7 => 7,
+        Key::F8 => 8,
+        Key::F9 => 9,
+        Key::F10 => 10,
+        Key::F11 => 11,
+        Key::F12 => 12,
+        _ => return None,
+    };
+    Some(n)
+}
+
+/// The category-management editor (item 2.1 / M-09, CAL-07, T-08): lists the
+/// shared master list - a coloured preset swatch, an editable name, an
+/// optional classic shortcut (Ctrl+F2…F12) and a delete button per row - with
+/// an "add" row for new ones. Mutates the live `CategorySet`, persists it into
+/// `settings.json` (`save_categories`), pushes the change to any connected
+/// Microsoft 365 account (`push_categories_to_graph`), and forces the message
+/// list to re-render - a recolour/rename doesn't change any message's keywords,
+/// so the list's no-op check would otherwise skip the rebuild.
 ///
-/// Deleting a tag is non-destructive: only the definition is removed. The
-/// `$Lookout-tag-*` keywords already stored on messages stay on the server
-/// and simply stop displaying.
-fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::TagSet>>, message_list: MessageListModel, tag_colors: gtk::CssProvider) {
+/// Deleting a category is non-destructive: only the definition is removed. The
+/// `$Lookout-tag-*` keywords already stored on messages stay on the server and
+/// simply stop displaying.
+pub(crate) fn show_manage_categories_dialog(
+    anchor: &gtk::Widget,
+    state: Rc<RefCell<UiState>>,
+    tags: Rc<RefCell<crate::categories::CategorySet>>,
+    message_list: MessageListModel,
+) {
     let window = anchor.root().and_downcast::<gtk::Window>();
     let dialog = {
-        let mut builder = gtk::Window::builder().modal(true).title("Manage tags").default_width(440).default_height(520);
+        let mut builder = gtk::Window::builder().modal(true).title("Categories").default_width(500).default_height(560);
         if let Some(win) = window {
             builder = builder.transient_for(&win);
         }
@@ -16350,27 +16520,26 @@ fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::T
     let list = gtk::ListBox::builder().css_classes(["boxed-list"]).build();
     let scroller = gtk::ScrolledWindow::builder().child(&list).vexpand(true).build();
 
-    let color_dialog = gtk::ColorDialog::new();
-    // `rebuild` re-renders the tag list; its per-row handlers call it again
-    // after an edit. An `Rc<RefCell<Box<dyn Fn()>>>` so a handler created
-    // while it runs can still reach it. (The handlers clone the `Rc`, which
-    // forms a reference cycle that lives until the dialog's widgets drop -
-    // a bounded, one-off cost for a modal dialog.)
+    // `rebuild` re-renders the category list; its per-row handlers call it
+    // again after an edit. An `Rc<RefCell<Box<dyn Fn()>>>` so a handler
+    // created while it runs can still reach it. (The handlers clone the `Rc`,
+    // which forms a reference cycle that lives until the dialog's widgets
+    // drop - a bounded, one-off cost for a modal dialog.)
     let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
     let rebuild_handle = rebuild.clone();
     {
         let list = list.clone();
         let tags_rc = tags.clone();
-        let tag_colors_rc = tag_colors.clone();
-        let color_dialog = color_dialog.clone();
+        let state_rc = state.clone();
+        let message_list_rc = message_list.clone();
         *rebuild.borrow_mut() = Box::new(move || {
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
             let set = tags_rc.borrow();
-            if set.tags.is_empty() {
+            if set.categories.is_empty() {
                 let empty = gtk::Label::builder()
-                    .label("No tags yet - add one below.")
+                    .label("No categories yet - add one below.")
                     .halign(gtk::Align::Start)
                     .css_classes(["dim-label"])
                     .margin_top(12)
@@ -16378,7 +16547,7 @@ fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::T
                     .build();
                 list.append(&empty);
             }
-            for tag in &set.tags {
+            for tag in &set.categories {
                 let row = gtk::ListBoxRow::new();
                 let row_box = gtk::Box::builder()
                     .orientation(gtk::Orientation::Horizontal)
@@ -16389,64 +16558,100 @@ fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::T
                     .margin_end(10)
                     .build();
 
-                let swatch = gtk::ColorDialogButton::builder().dialog(&color_dialog).build();
-                swatch.set_rgba(&hex_to_rgba(&tag.color));
-                swatch.set_tooltip_text(Some("Change color"));
+                let key = tag.key.clone();
+                let preset_picker = build_preset_picker(tag.preset, {
+                    let tags = tags_rc.clone();
+                    let state = state_rc.clone();
+                    let message_list = message_list_rc.clone();
+                    let rebuild = rebuild_handle.clone();
+                    let key = key.clone();
+                    Rc::new(move |preset: u8| {
+                        if let Some(tag) = tags.borrow_mut().categories.iter_mut().find(|t| t.key == key) {
+                            tag.preset = preset;
+                        }
+                        save_categories(&state, &tags.borrow());
+                        push_categories_to_graph(&state);
+                        message_list.refresh();
+                        (rebuild.borrow())();
+                    })
+                });
 
-                let name = gtk::Entry::builder().text(&tag.name).build();
+                let name = gtk::Entry::builder().text(&tag.name).hexpand(true).build();
+
+                let shortcut_picker = build_shortcut_picker(tag.shortcut, {
+                    let tags = tags_rc.clone();
+                    let state = state_rc.clone();
+                    let message_list = message_list_rc.clone();
+                    let rebuild = rebuild_handle.clone();
+                    let key = key.clone();
+                    Rc::new(move |shortcut: Option<u8>| {
+                        let mut set = tags.borrow_mut();
+                        // A key can belong to only one category: clear it from
+                        // any other holder before assigning it.
+                        if let Some(n) = shortcut {
+                            for t in set.categories.iter_mut() {
+                                if t.shortcut == Some(n) && t.key != key {
+                                    t.shortcut = None;
+                                }
+                            }
+                        }
+                        if let Some(tag) = set.categories.iter_mut().find(|t| t.key == key) {
+                            tag.shortcut = shortcut;
+                        }
+                        drop(set);
+                        save_categories(&state, &tags.borrow());
+                        message_list.refresh();
+                        (rebuild.borrow())();
+                    })
+                });
 
                 let delete = gtk::Button::from_icon_name("user-trash-symbolic");
-                delete.set_tooltip_text(Some("Delete tag"));
+                delete.set_tooltip_text(Some("Delete category"));
                 delete.add_css_class("flat");
 
-                row_box.append(&swatch);
+                row_box.append(&preset_picker);
                 row_box.append(&name);
+                row_box.append(&shortcut_picker);
                 row_box.append(&delete);
                 row.set_child(Some(&row_box));
                 list.append(&row);
 
-                let key = tag.key.clone();
-                let tags = tags_rc.clone();
-                let tag_colors = tag_colors_rc.clone();
-                let rebuild = rebuild_handle.clone();
-                swatch.connect_rgba_notify(move |swatch| {
-                    let mut set = tags.borrow_mut();
-                    if let Some(tag) = set.tags.iter_mut().find(|t| t.key == key) {
-                        tag.color = rgba_to_hex(&swatch.rgba());
-                    }
-                    drop(set);
-                    crate::tags::save(&tags.borrow());
-                    apply_tag_colors(&tags, &tag_colors);
-                    (rebuild.borrow())();
-                });
+                {
+                    let tags = tags_rc.clone();
+                    let state = state_rc.clone();
+                    let message_list = message_list_rc.clone();
+                    let key = key.clone();
+                    name.connect_changed(move |entry| {
+                        let mut set = tags.borrow_mut();
+                        if let Some(tag) = set.categories.iter_mut().find(|t| t.key == key) {
+                            tag.name = entry.text().trim().to_string();
+                        }
+                        drop(set);
+                        save_categories(&state, &tags.borrow());
+                        message_list.refresh();
+                    });
+                }
 
-                let key = tag.key.clone();
-                let tags = tags_rc.clone();
-                name.connect_changed(move |entry| {
-                    let mut set = tags.borrow_mut();
-                    if let Some(tag) = set.tags.iter_mut().find(|t| t.key == key) {
-                        tag.name = entry.text().trim().to_string();
-                    }
-                    drop(set);
-                    crate::tags::save(&tags.borrow());
-                });
-
-                let key = tag.key.clone();
-                let tags = tags_rc.clone();
-                let tag_colors = tag_colors_rc.clone();
-                let rebuild = rebuild_handle.clone();
-                delete.connect_clicked(move |_| {
-                    tags.borrow_mut().tags.retain(|t| t.key != key);
-                    crate::tags::save(&tags.borrow());
-                    apply_tag_colors(&tags, &tag_colors);
-                    (rebuild.borrow())();
-                });
+                {
+                    let tags = tags_rc.clone();
+                    let state = state_rc.clone();
+                    let message_list = message_list_rc.clone();
+                    let rebuild = rebuild_handle.clone();
+                    let key = key.clone();
+                    delete.connect_clicked(move |_| {
+                        tags.borrow_mut().categories.retain(|t| t.key != key);
+                        save_categories(&state, &tags.borrow());
+                        push_categories_to_graph(&state);
+                        message_list.refresh();
+                        (rebuild.borrow())();
+                    });
+                }
             }
         });
     }
     (rebuild.borrow())();
 
-    // --- Add-a-tag row: name entry + color swatch + Add button ---
+    // --- Add-a-category row: name entry + preset picker + Add button ---
     let add_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(10)
@@ -16454,13 +16659,16 @@ fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::T
         .margin_start(10)
         .margin_end(10)
         .build();
-    let new_name = gtk::Entry::builder().placeholder_text("New tag name").hexpand(true).build();
-    let new_color = gtk::ColorDialogButton::builder().dialog(&color_dialog).build();
-    new_color.set_rgba(&hex_to_rgba(crate::tags::default_tag_color(tags.borrow().tags.len())));
+    let new_name = gtk::Entry::builder().placeholder_text("New category name").hexpand(true).build();
+    let new_preset = Rc::new(RefCell::new(crate::categories::default_preset(tags.borrow().categories.len())));
+    let new_preset_picker = build_preset_picker(*new_preset.borrow(), {
+        let new_preset = new_preset.clone();
+        Rc::new(move |preset: u8| *new_preset.borrow_mut() = preset)
+    });
     let add_button = gtk::Button::with_label("Add");
     add_button.add_css_class("suggested-action");
     add_row.append(&new_name);
-    add_row.append(&new_color);
+    add_row.append(&new_preset_picker);
     add_row.append(&add_button);
 
     let error_label = gtk::Label::builder()
@@ -16472,31 +16680,33 @@ fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::T
         .build();
     {
         let tags = tags.clone();
+        let state = state.clone();
         let new_name = new_name.clone();
-        let new_color = new_color.clone();
+        let new_preset = new_preset.clone();
         let error_label = error_label.clone();
-        let tag_colors = tag_colors.clone();
+        let message_list = message_list.clone();
         let rebuild = rebuild.clone();
         add_button.connect_clicked(move |_| {
             let key = lookout_core::sanitize_tag_key(new_name.text().trim());
             let name = new_name.text().trim().to_string();
             if name.is_empty() || key.is_empty() {
-                error_label.set_label("Enter a tag name.");
+                error_label.set_label("Enter a category name.");
                 error_label.set_visible(true);
                 return;
             }
-            if tags.borrow().contains_key(&key) {
-                error_label.set_label("A tag with this name already exists.");
+            if tags.borrow().contains_key(&key) || tags.borrow().contains_name(&name) {
+                error_label.set_label("A category with this name already exists.");
                 error_label.set_visible(true);
                 return;
             }
-            let color = rgba_to_hex(&new_color.rgba());
-            tags.borrow_mut().tags.push(crate::tags::TagDef { key, name, color });
-            crate::tags::save(&tags.borrow());
-            apply_tag_colors(&tags, &tag_colors);
+            let preset = *new_preset.borrow();
+            tags.borrow_mut().categories.push(crate::categories::CategoryDef::new(key, name, preset));
+            save_categories(&state, &tags.borrow());
+            push_categories_to_graph(&state);
             error_label.set_visible(false);
             new_name.set_text("");
-            new_color.set_rgba(&hex_to_rgba(crate::tags::default_tag_color(tags.borrow().tags.len())));
+            *new_preset.borrow_mut() = crate::categories::default_preset(tags.borrow().categories.len());
+            message_list.refresh();
             (rebuild.borrow())();
         });
     }
@@ -16521,14 +16731,88 @@ fn show_manage_tags_dialog(anchor: &gtk::Widget, tags: Rc<RefCell<crate::tags::T
     dialog.set_child(Some(&content));
     dialog.present();
 
-    // Opening the dialog is itself a tag-definition view change that can
-    // alter row colors if any were edited in an earlier session and then the
-    // file changed under us; a refresh is cheap and always correct.
+    // Opening the editor is itself a definition view change that can alter row
+    // colours if the file changed under us; a refresh is cheap and correct.
     message_list.refresh();
 }
 
+/// A filled colour dot for a preset, painted directly (no CSS classes needed).
+/// Shared with the event/task editors' category pickers.
+pub(crate) fn preset_dot_area(rgb: &str, size: i32) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder().width_request(size).height_request(size).build();
+    let rgba = hex_to_rgba(rgb);
+    area.set_draw_func(move |_, cr, w, h| {
+        cr.set_source_rgb(rgba.red() as f64, rgba.green() as f64, rgba.blue() as f64);
+        let radius = (w.min(h) as f64) / 2.0 - 1.0;
+        if radius > 0.0 {
+            cr.arc(w as f64 / 2.0, h as f64 / 2.0, radius, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+        }
+    });
+    area
+}
+
+/// A `MenuButton` showing the current category colour, whose popover is a 5×5
+/// grid of Outlook's 25 presets (UX-85). Picking one calls `on_pick` with the
+/// preset index and closes the popover.
+fn build_preset_picker(current: u8, on_pick: Rc<dyn Fn(u8)>) -> gtk::MenuButton {
+    let button = gtk::MenuButton::builder().tooltip_text("Category colour").css_classes(["flat"]).build();
+    let preset = lookout_core::preset_by_index(current).unwrap_or(&lookout_core::OUTLOOK_CATEGORY_PRESETS[0]);
+    button.set_child(Some(&preset_dot_area(preset.rgb, 18)));
+
+    let grid = gtk::Grid::builder().row_spacing(4).column_spacing(4).margin_top(6).margin_bottom(6).margin_start(6).margin_end(6).build();
+    for (i, p) in lookout_core::OUTLOOK_CATEGORY_PRESETS.iter().enumerate() {
+        let swatch = gtk::Button::builder().css_classes(["flat", "circular"]).tooltip_text(p.name).build();
+        swatch.set_child(Some(&preset_dot_area(p.rgb, 16)));
+        let on_pick = on_pick.clone();
+        let button_for_close = button.clone();
+        swatch.connect_clicked(move |_| {
+            on_pick(i as u8);
+            if let Some(pop) = button_for_close.popover() {
+                pop.popdown();
+            }
+        });
+        grid.attach(&swatch, (i % 5) as i32, (i / 5) as i32, 1, 1);
+    }
+    let popover = gtk::Popover::builder().child(&grid).build();
+    button.set_popover(Some(&popover));
+    button
+}
+
+/// A `MenuButton` for a category's classic shortcut (Ctrl+F2…F12). Its popover
+/// lists "None" plus every function key; picking one calls `on_pick`.
+fn build_shortcut_picker(current: Option<u8>, on_pick: Rc<dyn Fn(Option<u8>)>) -> gtk::MenuButton {
+    let label = current.map(|n| format!("Ctrl+F{n}")).unwrap_or_else(|| "Shortcut".into());
+    let button = gtk::MenuButton::builder().label(label).tooltip_text("Classic category shortcut").css_classes(["flat"]).build();
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(0)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(4)
+        .margin_end(4)
+        .build();
+    let mut options: Vec<(String, Option<u8>)> = vec![("None".to_string(), None)];
+    options.extend(crate::categories::SHORTCUT_KEYS.map(|n| (format!("Ctrl+F{n}"), Some(n))));
+    for (text, value) in options {
+        let b = gtk::Button::builder().label(&text).css_classes(["flat"]).halign(gtk::Align::Fill).build();
+        let on_pick = on_pick.clone();
+        let button_for_close = button.clone();
+        b.connect_clicked(move |_| {
+            on_pick(value);
+            if let Some(pop) = button_for_close.popover() {
+                pop.popdown();
+            }
+        });
+        list.append(&b);
+    }
+    let popover = gtk::Popover::builder().child(&list).build();
+    button.set_popover(Some(&popover));
+    button
+}
+
 /// `#rrggbb` -> `gdk::RGBA`. Any malformed input degrades to a mid-grey
-/// rather than failing, matching the "colors are cosmetic" spirit of
+/// rather than failing, matching the "colours are cosmetic" spirit of
 /// `calendar_colors::resolve_color`.
 fn hex_to_rgba(color: &str) -> gtk::gdk::RGBA {
     let body = color.strip_prefix('#').unwrap_or(color);
@@ -16538,16 +16822,6 @@ fn hex_to_rgba(color: &str) -> gtk::gdk::RGBA {
         _ => (128, 128, 128),
     };
     gtk::gdk::RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
-}
-
-/// `gdk::RGBA` -> `#rrggbb` (alpha dropped - tags are opaque).
-fn rgba_to_hex(rgba: &gtk::gdk::RGBA) -> String {
-    format!(
-        "#{:02x}{:02x}{:02x}",
-        (rgba.red() * 255.0).round() as u8,
-        (rgba.green() * 255.0).round() as u8,
-        (rgba.blue() * 255.0).round() as u8
-    )
 }
 
 /// The sort-direction toggle's icon for the current order.
@@ -24232,6 +24506,7 @@ mod tests {
                         address_cache: None,
                         graph_pin: None,
                         graph_mail: None,
+                        graph_categories: None,
                     },
                 )
             })
@@ -24243,6 +24518,7 @@ mod tests {
             ui_db: None,
             settings: Rc::new(crate::settings::resolve()),
             app_config: Rc::new(RefCell::new(crate::app_config::AppConfig::default())),
+            categories: Rc::new(RefCell::new(crate::categories::CategorySet::default())),
             deleted_contacts: HashMap::new(),
             contact_cmd_tx: HashMap::new(),
             goa_accounts: HashMap::new(),

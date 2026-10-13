@@ -88,6 +88,12 @@ impl GraphClient {
         self.send_json(Method::POST, path, Some(body)).await
     }
 
+    /// A `DELETE` (Graph returns `204 No Content`; the body surfaces as
+    /// `Value::Null`). Used to remove a `masterCategory` (item 2.1).
+    pub async fn delete(&self, path: &str) -> Result<Value> {
+        self.send_json(Method::DELETE, path, None).await
+    }
+
     /// Follows `@odata.nextLink` until the collection ends or `max_items` is
     /// reached, flattening every page's `value` array. This is the shape every
     /// list endpoint (`/me/messages`, `/me/contacts`, …) uses.
@@ -418,5 +424,17 @@ mod tests {
             .await;
         let response = client(&server).patch("me/messages/abc", &json!({ "importance": "high" })).await.unwrap();
         assert_eq!(response["importance"], Value::String("high".into()));
+    }
+
+    #[tokio::test]
+    async fn delete_accepts_an_empty_no_content_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1.0/me/outlook/masterCategories/cat-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let response = client(&server).delete("me/outlook/masterCategories/cat-1").await.unwrap();
+        assert_eq!(response, Value::Null);
     }
 }

@@ -16,11 +16,12 @@
 //! connect refreshes the access token silently. Access tokens are cached in
 //! memory and re-fetched only when near expiry.
 //!
-//! The app registration also carries a `Microsoft Graph` → `Mail.ReadWrite`
-//! delegated permission (alongside the Exchange Online IMAP/SMTP ones),
-//! requested only when a user explicitly opts a Microsoft 365 account into
-//! mirroring Lookout pins to Outlook's own MAPI-property pin (see
-//! `graph_pin.rs`) via `ensure_graph_consent`. AAD v2 access tokens are
+//! The app registration also carries `Microsoft Graph` → `Mail.ReadWrite` and
+//! `MailboxSettings.ReadWrite` delegated permissions (alongside the Exchange
+//! Online IMAP/SMTP ones), requested only when a user explicitly opts a
+//! Microsoft 365 account into Outlook sync (pin mirroring - see `graph_pin.rs`
+//! - and the category master list - see `graph_categories.rs`) via
+//! `ensure_graph_consent`. AAD v2 access tokens are
 //! single-resource, so a Graph-audience token is always minted separately
 //! from the Exchange-audience one - but the refresh token and the underlying
 //! consent grant aren't resource-scoped, so one combined-scope interactive
@@ -59,12 +60,15 @@ const EXCHANGE_SCOPES: &str = concat!(
     "https://outlook.office.com/SMTP.Send"
 );
 
-/// The Graph scope needed to write MAPI extended properties
-/// (`PR_RENEW_TIME`) on a message, so pinning in Lookout can mirror to
-/// Outlook's own pin - see `graph_pin.rs`. Only ever requested as part of
-/// `COMBINED_SCOPES` below, via the explicit, Config-triggered
-/// `ensure_graph_consent`.
-const GRAPH_SCOPES: &str = concat!("offline_access ", "https://graph.microsoft.com/Mail.ReadWrite");
+/// The Graph scopes Lookout requests for its Microsoft 365 features: writing
+/// MAPI extended properties (`PR_RENEW_TIME`) on a message so pinning mirrors
+/// to Outlook (`graph_pin.rs`), and the category master list
+/// (`/me/outlook/masterCategories`, item 2.1 - `MailboxSettings.ReadWrite`).
+/// Only ever requested as part of `COMBINED_SCOPES` below, via the explicit,
+/// Config-triggered `ensure_graph_consent`. An existing grant made before the
+/// category scope was added must be re-run from Config to cover it.
+const GRAPH_SCOPES: &str =
+    concat!("offline_access ", "https://graph.microsoft.com/Mail.ReadWrite ", "https://graph.microsoft.com/MailboxSettings.ReadWrite");
 
 /// Requested only by `ensure_graph_consent`: a single interactive consent
 /// covering both resources at once, so the resulting refresh token can mint
@@ -75,7 +79,8 @@ const COMBINED_SCOPES: &str = concat!(
     "offline_access ",
     "https://outlook.office.com/IMAP.AccessAsUser.All ",
     "https://outlook.office.com/SMTP.Send ",
-    "https://graph.microsoft.com/Mail.ReadWrite"
+    "https://graph.microsoft.com/Mail.ReadWrite ",
+    "https://graph.microsoft.com/MailboxSettings.ReadWrite"
 );
 
 /// Which resource a token is being requested for - AAD v2 access tokens are

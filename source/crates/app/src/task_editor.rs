@@ -27,6 +27,9 @@ pub struct TaskEditorPrefill<'a> {
     /// email). Ignored when `existing` is set - an edit always starts from
     /// the real task, never a caller-supplied seed.
     pub prefill: Option<&'a CalendarTask>,
+    /// The shared category master list (item 2.1 / T-08), offered by the
+    /// editor's Categorize picker. Empty when the user has none yet.
+    pub categories: &'a [crate::categories::CategoryDef],
 }
 
 /// The delete callback's target: the calendar plus the task's identity and
@@ -187,11 +190,18 @@ pub fn show_task_editor(
     let percent_row = adw::ActionRow::builder().title("% complete").build();
     percent_row.add_suffix(&percent_spin);
 
+    // Categorize (item 2.1 / T-08): the shared master list as toggle rows.
+    let (categorize_button, selected_categories) =
+        crate::event_editor::build_category_picker(prefill.categories, seed.as_ref().map(|t| t.categories.as_slice()).unwrap_or(&[]), false);
+    let categorize_row = adw::ActionRow::builder().title("Categorize").build();
+    categorize_row.add_suffix(&categorize_button);
+
     let fields_group = adw::PreferencesGroup::new();
     fields_group.add(&calendar_row);
     fields_group.add(&summary_row);
     fields_group.add(&priority_row);
     fields_group.add(&percent_row);
+    fields_group.add(&categorize_row);
 
     let error_label = gtk::Label::builder().wrap(true).xalign(0.0).halign(gtk::Align::Start).css_classes(["error"]).build();
     error_label.set_visible(false);
@@ -263,6 +273,7 @@ pub fn show_task_editor(
         let due_minute = due_minute.clone();
         let priority_dropdown = priority_dropdown.clone();
         let percent_spin = percent_spin.clone();
+        let selected_categories = selected_categories.clone();
         let existing_meta = existing_meta.clone();
         let on_save = on_save;
         move |_button: &gtk::Button| {
@@ -325,7 +336,7 @@ pub fn show_task_editor(
                 status,
                 priority: TaskPriority(priority_choices.get(priority_dropdown.selected() as usize).map(|(_, raw)| *raw).unwrap_or(0)),
                 percent_complete,
-                categories: existing.as_ref().map(|t| t.categories.clone()).unwrap_or_default(),
+                categories: selected_categories.borrow().clone(),
                 href,
                 etag,
             };

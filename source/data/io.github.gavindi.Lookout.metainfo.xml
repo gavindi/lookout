@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.179" date="2026-10-14">
+      <description>
+        <p>Categories are now one shared list for mail, events and tasks. Categorize a message from the menu or the toolbar, tag an event or a task from its editor, and manage them all together from Settings, Mail, Categories. Every category uses one of Outlook's 25 colours, so a list you already use looks the same here, and the classic Ctrl+F2 to Ctrl+F12 shortcuts apply a category to the selected messages. On a Microsoft 365 account, Lookout keeps the list in step with Outlook's own categories.</p>
+      </description>
+    </release>
     <release version="0.9.178" date="2026-10-13">
       <description>
         <p>Meetings now invite their attendees. When you save an event with people on it, Lookout sends the invitation for you, and editing it offers to send an update first; deleting a meeting offers to send a cancellation. Invitations use the same format Outlook does, so Accept, Tentative and Decline work in the recipient's mail app. On calendar servers that send invitations themselves, Lookout stays out of the way and lets the server do it. The event editor's Save button reads Send when the event has attendees, so it is clear when mail is about to go out.</p>

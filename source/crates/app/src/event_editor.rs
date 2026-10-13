@@ -15,6 +15,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -111,6 +112,9 @@ pub struct EventEditorPrefill<'a> {
     /// hours and second time zone, the recurrence weekday order, and the
     /// default reminder for a new event.
     pub calendar_prefs: &'a crate::settings::CalendarPreferences,
+    /// The shared category master list (item 2.1 / CAL-07), offered by the
+    /// editor's Categorize picker. Empty when the user has none yet.
+    pub categories: &'a [crate::categories::CategoryDef],
 }
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
@@ -447,18 +451,12 @@ pub fn show_event_editor(
     let busy_dropdown = gtk::DropDown::builder().model(&busy_model).tooltip_text("Show as").build();
     busy_dropdown.set_selected(show_as_index(existing.as_ref().map(|occ| occ.show_as).unwrap_or_default()));
 
-    let categorize_entry = gtk::Entry::builder().placeholder_text("Work, Personal, ...").build();
-    if let Some(occ) = &existing {
-        if !occ.categories.is_empty() {
-            categorize_entry.set_text(&occ.categories.join(", "));
-        }
-    }
-    let categorize_popover = gtk::Popover::builder().child(&categorize_entry).build();
-    let categorize_button = gtk::MenuButton::builder()
-        .icon_name(themed_icon("tag-symbolic", &["mail-mark-important-symbolic"]))
-        .tooltip_text("Categorize")
-        .popover(&categorize_popover)
-        .build();
+    // Categorize (item 2.1 / CAL-07): the shared master list as toggle rows,
+    // plus any category the event already carries that isn't in the list (a
+    // name written by another client), so nothing is silently dropped.
+    let (categorize_button, selected_categories) =
+        build_category_picker(prefill.categories, existing.as_ref().map(|occ| occ.categories.as_slice()).unwrap_or(&[]), read_only);
+    categorize_button.set_tooltip_text(Some("Categorize"));
 
     let reminder_choices = crate::settings::REMINDER_CHOICES;
     let reminder_model = gtk::StringList::new(&reminder_choices.iter().map(|(label, _)| *label).collect::<Vec<_>>());
@@ -655,7 +653,7 @@ pub fn show_event_editor(
         let zone_dropdown = zone_dropdown.clone();
         let video_toggle = video_toggle.clone();
         let video_url_row = video_url_row.clone();
-        let categorize_entry = categorize_entry.clone();
+        let selected_categories = selected_categories.clone();
         let busy_dropdown = busy_dropdown.clone();
         let sensitivity_dropdown = sensitivity_dropdown.clone();
         let reminder_dropdown = reminder_dropdown.clone();
@@ -690,7 +688,7 @@ pub fn show_event_editor(
                 end_local: date_time_from_form(&end_date, &end_hour, &end_minute, all_day_switch.is_active()),
                 attendee_tokens: attendees_field.addresses(),
                 existing_attendees: existing_attendees.clone(),
-                categories: categorize_entry.text().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                categories: selected_categories.borrow().clone(),
                 sensitivity: match sensitivity_dropdown.selected() {
                     1 => EventSensitivity::Private,
                     2 => EventSensitivity::Confidential,
@@ -769,13 +767,14 @@ pub fn show_event_editor(
         let end_minute = end_minute.clone();
         let video_toggle = video_toggle.clone();
         let video_url_row = video_url_row.clone();
-        let categorize_entry = categorize_entry.clone();
+        let selected_categories = selected_categories.clone();
         let busy_dropdown = busy_dropdown.clone();
         let sensitivity_dropdown = sensitivity_dropdown.clone();
         let reminder_dropdown = reminder_dropdown.clone();
         let description_buffer = description_buffer.clone();
         let series = series.clone();
         print_button.connect_clicked(move |_| {
+            let categories = selected_categories.borrow().clone();
             let html = printable_event_html(
                 &calendar_labels,
                 &calendar_dropdown,
@@ -791,7 +790,7 @@ pub fn show_event_editor(
                 &end_minute,
                 &video_toggle,
                 &video_url_row,
-                &categorize_entry,
+                &categories,
                 &busy_dropdown,
                 &sensitivity_dropdown,
                 &reminder_dropdown,
@@ -1032,6 +1031,78 @@ fn selected_zone_name(dropdown: &gtk::DropDown) -> Option<String> {
     zone_name_at(dropdown.selected()).map(str::to_string)
 }
 
+/// Builds the editor's Categorize picker (item 2.1 / CAL-07): a menu button
+/// whose popover lists a check row per shared category, each with its preset
+/// colour dot. Any category the event already carries that isn't in the master
+/// list (a name written by another client) gets a row too, so it survives an
+/// edit rather than being dropped. Returns the button and the working
+/// selection (names), read back on save/print. Shared with the task editor.
+pub(crate) fn build_category_picker(
+    master: &[crate::categories::CategoryDef],
+    selected: &[String],
+    read_only: bool,
+) -> (gtk::MenuButton, Rc<RefCell<Vec<String>>>) {
+    let chosen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(selected.to_vec()));
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+
+    // Master categories first (in list order), then any selected name not in
+    // the master list, preserving the event's own values.
+    let mut names: Vec<String> = master.iter().map(|c| c.name.clone()).collect();
+    for name in selected {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            names.push(name.clone());
+        }
+    }
+
+    if names.is_empty() {
+        list.append(
+            &gtk::Label::builder()
+                .label("No categories defined yet")
+                .halign(gtk::Align::Start)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+    }
+    for name in names {
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+        if let Some(cat) = master.iter().find(|c| c.name.eq_ignore_ascii_case(&name)) {
+            row.append(&crate::window::preset_dot_area(cat.color(), 12));
+        }
+        let check = gtk::CheckButton::builder().label(&name).sensitive(!read_only).build();
+        check.set_active(chosen.borrow().iter().any(|n| n.eq_ignore_ascii_case(&name)));
+        let chosen_for = chosen.clone();
+        let name_for = name.clone();
+        check.connect_toggled(move |c| {
+            let mut set = chosen_for.borrow_mut();
+            if c.is_active() {
+                if !set.iter().any(|n| n.eq_ignore_ascii_case(&name_for)) {
+                    set.push(name_for.clone());
+                }
+            } else {
+                set.retain(|n| !n.eq_ignore_ascii_case(&name_for));
+            }
+        });
+        row.append(&check);
+        list.append(&row);
+    }
+
+    let popover = gtk::Popover::builder().child(&list).build();
+    let button = gtk::MenuButton::builder()
+        .icon_name(themed_icon("tag-symbolic", &["mail-mark-important-symbolic"]))
+        .tooltip_text("Categorize")
+        .sensitive(!read_only)
+        .popover(&popover)
+        .build();
+    (button, chosen)
+}
+
 /// Renders the editor's current form state as a self-contained HTML document
 /// for the Print action - a snapshot of exactly what the user is looking at,
 /// so printing an event never depends on the dialog staying open (and works
@@ -1053,7 +1124,7 @@ fn printable_event_html(
     end_minute: &gtk::SpinButton,
     video_toggle: &adw::SwitchRow,
     video_url_row: &adw::EntryRow,
-    categorize_entry: &gtk::Entry,
+    categories: &[String],
     busy_dropdown: &gtk::DropDown,
     sensitivity_dropdown: &gtk::DropDown,
     reminder_dropdown: &gtk::DropDown,
@@ -1092,7 +1163,7 @@ fn printable_event_html(
         let url = video_url_row.text().to_string();
         rows.push(("Video call", if url.is_empty() { "Yes".to_string() } else { url }));
     }
-    let categories = categorize_entry.text().to_string();
+    let categories = categories.join(", ");
     if !categories.is_empty() {
         rows.push(("Categories", categories));
     }

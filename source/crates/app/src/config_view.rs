@@ -287,6 +287,9 @@ pub struct ConfigView {
     /// its `activated` signal to the external-content trust manage dialog
     /// (and refresh the subtitle after a change).
     pub trusted_senders_row: adw::ActionRow,
+    /// "Categories…" row (Config → Mail), exposed so the caller can open the
+    /// shared category master-list editor (item 2.1 / M-09).
+    pub categories_row: adw::ActionRow,
     /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
     /// `active` state into the composer's default body mode.
     pub rich_text_row: adw::SwitchRow,
@@ -603,6 +606,12 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     mail_settings_group.add(&trusted_senders_row);
+    let categories_row = adw::ActionRow::builder()
+        .title("Categories…")
+        .subtitle("Manage the categories shared by mail, events and tasks")
+        .activatable(true)
+        .build();
+    mail_settings_group.add(&categories_row);
     let rich_text_row = adw::SwitchRow::builder()
         .title("Rich text")
         .subtitle("Start new messages in the formatted editor")
@@ -1034,6 +1043,7 @@ pub fn build() -> ConfigView {
         restore_background_row,
         remote_images_row,
         trusted_senders_row,
+        categories_row,
         rich_text_row,
         spell_check_row,
         spell_languages_row,
