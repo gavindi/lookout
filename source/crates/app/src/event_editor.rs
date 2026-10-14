@@ -161,6 +161,11 @@ pub struct EventEditorPrefill<'a> {
     /// highlighted time range the user selected in the main grid. `None`
     /// defaults to one hour after `suggested_start`.
     pub suggested_end: Option<NaiveDateTime>,
+    /// For a new event, a subject to prefill - the message menu's "Reply with
+    /// meeting" (item 3.19 / C-20) passes the conversation's subject. Ignored
+    /// when editing an existing occurrence (whose own summary wins), and when
+    /// blank.
+    pub suggested_subject: Option<&'a str>,
     /// Every currently-cached occurrence (from checked calendars) for
     /// whatever month the caller had loaded - used only to populate the
     /// read-only preview panel, re-sliced by day locally as the user
@@ -680,18 +685,23 @@ pub fn show_event_editor(
         video_toggle.set_active(occ.conference_url.is_some());
         video_url_row.set_text(occ.conference_url.as_deref().unwrap_or(""));
         video_url_row.set_visible(occ.conference_url.is_some());
-    } else if !prefill.suggested_attendees.is_empty() {
-        attendees_field.set_from_text(
-            &prefill
-                .suggested_attendees
-                .iter()
-                .map(|address| match &address.name {
-                    Some(name) if !name.trim().is_empty() => format!("{name} <{}>", address.address),
-                    _ => address.address.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+    } else {
+        if let Some(subject) = prefill.suggested_subject.map(str::trim).filter(|subject| !subject.is_empty()) {
+            title_row.set_text(subject);
+        }
+        if !prefill.suggested_attendees.is_empty() {
+            attendees_field.set_from_text(
+                &prefill
+                    .suggested_attendees
+                    .iter()
+                    .map(|address| match &address.name {
+                        Some(name) if !name.trim().is_empty() => format!("{name} <{}>", address.address),
+                        _ => address.address.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
     }
 
     // --- Right-hand preview wiring: re-renders the mini-calendar + day strip

@@ -35,6 +35,7 @@ mod graph_rules;
 #[cfg(test)]
 mod gtk_test;
 mod identities;
+mod invite_conflicts;
 mod last_view;
 mod launcher_entry;
 mod link_safety;
@@ -51,6 +52,7 @@ mod profile_card;
 mod recipient_entry;
 mod recurrence;
 mod reminders;
+mod reply_with_meeting;
 mod resources;
 mod rules;
 mod rules_view;

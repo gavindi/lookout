@@ -703,6 +703,9 @@ pub struct ImipInvitation {
     pub method: ImipMethod,
     /// The decoded iCalendar document from the message's `text/calendar` part.
     pub ics: String,
+    /// The invited event's `UID` (RFC 5545) - lets the reading pane's conflict
+    /// check (CAL-35) exclude the event itself from the overlap scan.
+    pub uid: String,
     /// The invited event's summary, for the banner's label.
     pub summary: Option<String>,
     /// The organizer's address (from `ORGANIZER`) - the reply's recipient.

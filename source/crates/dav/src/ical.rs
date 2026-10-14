@@ -669,6 +669,7 @@ pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
     Some(ImipInvitation {
         method,
         ics: ics.to_string(),
+        uid: event.uid.0,
         summary: event.summary,
         organizer: event.organizer,
         in_reply_to: None,

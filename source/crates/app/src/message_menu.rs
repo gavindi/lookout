@@ -40,6 +40,9 @@ pub enum MessageMenuAction {
     Reply,
     ReplyAll,
     Forward,
+    /// Open a new calendar event prefilled with the conversation's participants
+    /// and subject (item 3.19 / C-20): Outlook's "Reply with meeting".
+    ReplyWithMeeting,
     Delete,
     Archive,
     MoveTo(MailboxId),
@@ -186,6 +189,7 @@ pub fn action_specs() -> Vec<ActionSpec> {
         "reply",
         "reply-all",
         "forward",
+        "reply-with-meeting",
         "delete",
         "archive",
         "move-other",
@@ -228,6 +232,7 @@ pub fn enabled_actions(state: &MessageMenuState) -> Vec<(&'static str, bool)> {
         ("reply", state.can_reply),
         ("reply-all", state.can_reply),
         ("forward", state.can_reply),
+        ("reply-with-meeting", state.can_reply),
         ("archive", state.can_archive),
         ("move", state.can_move),
         ("move-other", state.can_move),
@@ -280,6 +285,7 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
         .action("Reply", ns("reply"))
         .action("Reply all", ns("reply-all"))
         .action("Forward", ns("forward"))
+        .action("Reply with meeting", ns("reply-with-meeting"))
         .section()
         .action("Delete", ns("delete"))
         .action("Archive", ns("archive"))
@@ -346,6 +352,7 @@ pub fn message_action_for(name: &str, param: Option<&glib::Variant>) -> Option<M
         "reply" => MessageMenuAction::Reply,
         "reply-all" => MessageMenuAction::ReplyAll,
         "forward" => MessageMenuAction::Forward,
+        "reply-with-meeting" => MessageMenuAction::ReplyWithMeeting,
         "delete" => MessageMenuAction::Delete,
         "archive" => MessageMenuAction::Archive,
         "move" => MessageMenuAction::MoveTo(MailboxId(string().filter(|id| !id.is_empty())?)),
@@ -446,7 +453,7 @@ mod tests {
         assert_eq!(
             labels(&menu),
             vec![
-                vec!["Reply", "Reply all", "Forward"],
+                vec!["Reply", "Reply all", "Forward", "Reply with meeting"],
                 vec!["Delete", "Archive", "Move ▸", "Copy ▸"],
                 vec!["Mark as unread", "Flag ▸", "Pin", "Snooze ▸", "Categorize ▸"],
                 vec!["Report ▸"],
@@ -600,6 +607,7 @@ mod tests {
             ("reply", MessageMenuAction::Reply),
             ("reply-all", MessageMenuAction::ReplyAll),
             ("forward", MessageMenuAction::Forward),
+            ("reply-with-meeting", MessageMenuAction::ReplyWithMeeting),
             ("delete", MessageMenuAction::Delete),
             ("archive", MessageMenuAction::Archive),
             ("move-other", MessageMenuAction::MoveOther),

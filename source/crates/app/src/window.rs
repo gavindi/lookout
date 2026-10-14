@@ -889,6 +889,12 @@ impl BodyCache {
 /// A late-bound action on one message (`UiState::create_task_from_message`).
 type MessageActionFn = Rc<dyn Fn(&EmailSummary)>;
 
+/// A late-bound action on a conversation's messages
+/// (`UiState::reply_with_meeting`): opens a new event prefilled with their
+/// participants and subject (item 3.19 / C-20). Takes the messages the menu
+/// acted on (a thread's, or the selection's).
+type ReplyWithMeetingFn = Rc<dyn Fn(&[EmailSummary])>;
+
 /// Mutable UI-thread state the various signal handlers close over. Plain
 /// `Rc<RefCell<_>>` is fine here - GTK is single-threaded, so there's no
 /// need for `Arc<Mutex<_>>` on this side of the worker-thread boundary.
@@ -1459,6 +1465,10 @@ pub(crate) struct UiState {
     /// menu is built before `calendar_state`/`tasks_view` exist, so this hook
     /// is filled in once they do. `None` until then.
     create_task_from_message: Option<MessageActionFn>,
+    /// The message menu's "Reply with meeting" (item 3.19 / C-20): opens a
+    /// new event prefilled with the conversation's participants and subject.
+    /// Late-bound like `create_task_from_message`; `None` until then.
+    reply_with_meeting: Option<ReplyWithMeetingFn>,
     /// Repaints every surface listing flagged mail (the Tasks view's
     /// "Flagged email" section, the dashboard) from `flagged_mail` (item
     /// 1.16). Late-bound like `create_task_from_message`; `None` until then.
@@ -2758,6 +2768,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         manage_signatures: None,
         manage_templates: None,
         create_task_from_message: None,
+        reply_with_meeting: None,
         flagged_mail_refresh: None,
         composer_relay_generation: 0,
         compose_popout_window: None,
@@ -4500,6 +4511,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     imip_invite_card.append(&invite_detail_row("imip-where-row", "imip-where", "Where"));
     imip_invite_card.append(&invite_detail_row("imip-organizer-row", "imip-organizer", "Organizer"));
     imip_invite_card.append(&invite_detail_row("imip-description-row", "imip-description", "Description"));
+    // CAL-35 / 3.18: a "Conflicts with …" row and a mini day timeline, both
+    // filled by `render_invite_card` from the cached calendar and hidden when
+    // the invite's day clashes with nothing (or isn't loaded).
+    imip_invite_card.append(&invite_detail_row("imip-conflict-row", "imip-conflict", "Conflicts with"));
+    let imip_timeline = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    imip_timeline.set_widget_name("imip-timeline");
+    imip_timeline.set_visible(false);
+    imip_invite_card.append(&imip_timeline);
     // CAL-20 / 3.17: a Join button for an online meeting (Teams/Zoom/Meet).
     // `render_invite_card` sets its URL/label from the detected join URL and
     // hides it for an in-person event.
@@ -7392,6 +7411,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     start,
                     None,
                     std::slice::from_ref(address),
+                    None,
                     &profile_card,
                 );
             })
@@ -7490,6 +7510,45 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let account_id = mailbox_account_id(&summary.mailbox);
             let account_email = account_id.as_ref().and_then(|id| state_for_hook.borrow().accounts.get(id).map(|h| h.email.clone()));
             show_create_task_for_email(&window, &state_for_hook, &calendar_state, &tasks_view, summary, account_id, account_email);
+        }));
+    }
+
+    // --- The message menu's "Reply with meeting" (item 3.19 / C-20): opens a
+    // new event prefilled with the conversation's participants (the user's own
+    // addresses removed) and its subject, defaulting to the next whole hour.
+    // Late-bound like the hook above, since the context menu is built before
+    // `calendar_state` exists.
+    {
+        let window = window.clone();
+        let state_for_hook = state.clone();
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
+        state.borrow_mut().reply_with_meeting = Some(Rc::new(move |messages: &[EmailSummary]| {
+            let now = chrono::Local::now().naive_local();
+            let rounded = now + chrono::Duration::hours(1);
+            let start = rounded.with_minute(0).unwrap_or(rounded).with_second(0).unwrap_or(rounded);
+            let self_addresses = {
+                let st = state_for_hook.borrow();
+                let mut addresses: Vec<String> = st.accounts.values().map(|handle| handle.email.clone()).collect();
+                addresses.extend(st.app_config.borrow().identities.iter().map(|identity| identity.email.clone()));
+                addresses
+            };
+            let participants = crate::reply_with_meeting::meeting_participants(messages, &self_addresses);
+            let subject = crate::reply_with_meeting::meeting_subject(messages);
+            show_new_event_editor(
+                &window,
+                &state_for_hook,
+                &worker,
+                &calendar_state,
+                &toast_overlay,
+                start,
+                None,
+                &participants,
+                Some(&subject),
+                &profile_card,
+            );
         }));
     }
 
@@ -11209,7 +11268,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     anchor.and_hms_opt(9, 0, 0).unwrap()
                 }
             };
-            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, suggested_start, None, &[], &profile_card);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, suggested_start, None, &[], None, &profile_card);
         });
     }
     // Print: snapshots the currently-displayed month (checked calendars
@@ -11488,7 +11547,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             } else {
                 end_date.and_hms_opt(((end_minutes + 30) / 60) as u32, ((end_minutes + 30) % 60) as u32, 0)
             };
-            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, end, &[], &profile_card);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, end, &[], None, &profile_card);
         });
     }
     {
@@ -11516,7 +11575,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let Some(start) = date.and_hms_opt(9, 0, 0) else {
                 return;
             };
-            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, None, &[], &profile_card);
+            show_new_event_editor(&window, &state, &worker, &calendar_state, &toast_overlay, start, None, &[], None, &profile_card);
         });
     }
 
@@ -13646,6 +13705,21 @@ fn connect_google_tasks_account(
     });
 }
 
+/// One handle's occurrences for `first_of_month`: the dashboard cache's month
+/// bucket when present, else the handle's last-synced month, else nothing.
+fn month_occurrences_from<'a>(
+    by_month: &'a HashMap<chrono::NaiveDate, Vec<EventOccurrence>>,
+    last_synced_month: Option<chrono::NaiveDate>,
+    last_occurrences: &'a [EventOccurrence],
+    first_of_month: chrono::NaiveDate,
+) -> Vec<&'a EventOccurrence> {
+    match by_month.get(&first_of_month) {
+        Some(occurrences) => occurrences.iter().collect(),
+        None if last_synced_month == Some(first_of_month) => last_occurrences.iter().collect(),
+        None => Vec::new(),
+    }
+}
+
 impl CalendarUiState {
     /// Every checked calendar's latest occurrences for `month`, unioned
     /// across accounts, webcal feeds, and the birthdays calendar - the one
@@ -13672,6 +13746,26 @@ impl CalendarUiState {
             )
             .filter(|occ| self.checked_calendar_ids.contains(&occ.calendar_id))
             .collect()
+    }
+
+    /// Every checked calendar's occurrences for `month`, preferring the
+    /// dashboard's multi-month cache (`occurrences_by_month`) over a handle's
+    /// single `last_occurrences` - so the invite card's conflict check
+    /// (CAL-35) sees the month even when it isn't the one a handle last
+    /// synced. Falls back to nothing when the month isn't loaded.
+    fn checked_occurrences_for_month(&self, month: chrono::NaiveDate) -> Vec<&EventOccurrence> {
+        let first = month.with_day(1).unwrap_or(month);
+        let mut out: Vec<&EventOccurrence> = Vec::new();
+        for handle in self.accounts.values() {
+            out.extend(month_occurrences_from(&handle.occurrences_by_month, handle.last_synced_month, &handle.last_occurrences, first));
+        }
+        for handle in self.webcal_handles.values() {
+            out.extend(month_occurrences_from(&handle.occurrences_by_month, handle.last_synced_month, &handle.last_occurrences, first));
+        }
+        if let Some(handle) = &self.birthdays {
+            out.extend(month_occurrences_from(&handle.occurrences_by_month, handle.last_synced_month, &handle.last_occurrences, first));
+        }
+        out.into_iter().filter(|occ| self.checked_calendar_ids.contains(&occ.calendar_id)).collect()
     }
 
     /// Like [`Self::checked_occurrences`], but across every synced month -
@@ -14665,6 +14759,7 @@ fn open_event_editor_for(
             existing: Some(occ),
             suggested_start: None,
             suggested_end: None,
+            suggested_subject: None,
             month_occurrences: &preview.occurrences,
             month_event_days: &preview.month_event_days,
             calendar_colors: &preview.colors,
@@ -14775,6 +14870,7 @@ fn show_new_event_editor(
     suggested_start: chrono::NaiveDateTime,
     suggested_end: Option<chrono::NaiveDateTime>,
     attendees: &[EmailAddress],
+    subject: Option<&str>,
     profile_card: &crate::profile_card::ContextProvider,
 ) {
     let calendars = pickable_calendars(calendar_state);
@@ -14795,6 +14891,7 @@ fn show_new_event_editor(
             existing: None,
             suggested_start: Some(suggested_start),
             suggested_end,
+            suggested_subject: subject,
             month_occurrences: &preview.occurrences,
             month_event_days: &preview.month_event_days,
             calendar_colors: &preview.colors,
@@ -16485,7 +16582,7 @@ fn dismiss_imip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, mailbo
     if let Some(banner) = find_named_child(reading_stack, "imip-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
         banner.set_revealed(false);
     }
-    render_invite_card(reading_stack, None);
+    render_invite_card(reading_stack, None, &[], None);
 }
 
 /// Applies an incoming iMIP REPLY to the stored organizer event (item 3.6 /
@@ -17432,34 +17529,16 @@ fn show_calendar_dialog(
         }
     }));
 
-    subscribe_button.connect_clicked({
-        let url_entry = url_entry.clone();
-        let name_entry = name_entry.clone();
+    // Persists one new subscription (a manual feed URL or a bundled holiday
+    // feed) and hands the authoritative list to the webcal session. Shared by
+    // the Subscribe button and the Holidays picker so both paths stay in step.
+    let add_subscription: Rc<dyn Fn(WebcalSubscription)> = Rc::new({
         let app_config = app_config.clone();
         let calendar_state = calendar_state.clone();
         let reload_session = reload_session.clone();
         let refresh_ui = refresh_ui.clone();
         let rebuild_manage = rebuild_manage.clone();
-        let toast_overlay = toast_overlay.clone();
-        move |_| {
-            let url_text = url_entry.text().trim().to_string();
-            let Ok(url) = lookout_dav::normalize_webcal_url(&url_text) else {
-                toast_overlay.add_toast(adw::Toast::new("That doesn't look like a calendar feed URL."));
-                return;
-            };
-            let name = {
-                let typed = name_entry.text().trim().to_string();
-                if typed.is_empty() {
-                    url.host_str().unwrap_or(&url_text).to_string()
-                } else {
-                    typed
-                }
-            };
-            let subscription = WebcalSubscription {
-                id: uuid::Uuid::new_v4().to_string(),
-                display_name: name,
-                url: url_text,
-            };
+        move |subscription: WebcalSubscription| {
             {
                 let mut config = app_config.borrow_mut();
                 config.webcal_subscriptions.push(subscription.clone());
@@ -17485,9 +17564,75 @@ fn show_calendar_dialog(
             if let Some(rebuild) = rebuild_manage.borrow().clone() {
                 rebuild();
             }
+        }
+    });
+
+    subscribe_button.connect_clicked({
+        let url_entry = url_entry.clone();
+        let name_entry = name_entry.clone();
+        let add_subscription = add_subscription.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            let url_text = url_entry.text().trim().to_string();
+            let Ok(url) = lookout_dav::normalize_webcal_url(&url_text) else {
+                toast_overlay.add_toast(adw::Toast::new("That doesn't look like a calendar feed URL."));
+                return;
+            };
+            let name = {
+                let typed = name_entry.text().trim().to_string();
+                if typed.is_empty() {
+                    url.host_str().unwrap_or(&url_text).to_string()
+                } else {
+                    typed
+                }
+            };
+            let subscription = WebcalSubscription {
+                id: uuid::Uuid::new_v4().to_string(),
+                display_name: name,
+                url: url_text,
+            };
+            add_subscription(subscription);
             url_entry.set_text("");
             name_entry.set_text("");
             toast_overlay.add_toast(adw::Toast::new("Subscribed - fetching events…"));
+        }
+    });
+
+    // --- Holidays section (item 3.15 / CAL-28): a country picker that
+    // subscribes to that country's bundled public-holiday feed, reusing the
+    // webcal path above. The table lives in `lookout_core::holidays`.
+    let holiday_dropdown = gtk::DropDown::builder().build();
+    let holiday_countries = lookout_core::holiday_countries();
+    let holiday_labels: Vec<&str> = holiday_countries.iter().map(|country| country.name.as_str()).collect();
+    holiday_dropdown.set_model(Some(&gtk::StringList::new(&holiday_labels)));
+    holiday_dropdown.set_selected(0);
+    holiday_dropdown.set_tooltip_text(Some("Country"));
+    holiday_dropdown.set_hexpand(true);
+    let holiday_button = gtk::Button::with_label("Subscribe");
+    holiday_button.add_css_class("suggested-action");
+    holiday_button.set_halign(gtk::Align::End);
+    holiday_button.set_sensitive(!holiday_countries.is_empty());
+    let holiday_group = adw::PreferencesGroup::builder().title("Holidays").build();
+    holiday_group.add(&holiday_dropdown);
+    holiday_group.add(&holiday_button);
+    holiday_button.connect_clicked({
+        let holiday_dropdown = holiday_dropdown.clone();
+        let add_subscription = add_subscription.clone();
+        let app_config = app_config.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            let countries = lookout_core::holiday_countries();
+            let Some(country) = countries.get(holiday_dropdown.selected() as usize) else {
+                return;
+            };
+            let subscription = country.to_subscription();
+            if lookout_core::is_holiday_subscribed(&subscription.url, &app_config.borrow().webcal_subscriptions) {
+                toast_overlay.add_toast(adw::Toast::new(&format!("{} is already subscribed", subscription.display_name)));
+                return;
+            }
+            let name = subscription.display_name.clone();
+            add_subscription(subscription);
+            toast_overlay.add_toast(adw::Toast::new(&format!("Subscribed to {name} - fetching events…")));
         }
     });
 
@@ -17578,6 +17723,7 @@ fn show_calendar_dialog(
 
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     content.append(&subscribe_group);
+    content.append(&holiday_group);
     content.append(&import_group);
     content.append(&manage_group);
     let scroller = gtk::ScrolledWindow::builder()
@@ -18216,6 +18362,16 @@ fn run_message_menu_action(
             };
             reply_to_message(state, &context.worker, &context.reading_stack, summary, mode);
         }
+        A::ReplyWithMeeting => {
+            // Open a new event prefilled with the conversation's participants
+            // and subject (item 3.19 / C-20). Late-bound like the More menu's
+            // "Create task from message…", since the menu is built before
+            // `calendar_state` exists.
+            let hook = state.borrow().reply_with_meeting.clone();
+            if let Some(hook) = hook {
+                hook(targets);
+            }
+        }
         A::Delete => move_messages_to_role(state, message_list, targets, MailboxRole::Trash),
         A::Archive => move_messages_to_role(state, message_list, targets, MailboxRole::Archive),
         A::ReportJunk => set_junk_selection(state, message_list, targets, true),
@@ -18355,6 +18511,31 @@ fn build_more_menu(
         .margin_start(6)
         .margin_end(6)
         .build();
+    // "Reply with meeting…" (item 3.19 / C-20): a new event prefilled with
+    // the conversation's participants and subject.
+    let reply_meeting = gtk::Button::builder()
+        .label("Reply with meeting…")
+        .css_classes(["flat"])
+        .halign(gtk::Align::Start)
+        .build();
+    reply_meeting.set_sensitive(has_selection);
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        reply_meeting.connect_clicked(move |_| {
+            popover.popdown();
+            let messages = message_list.selected_summaries();
+            if messages.is_empty() {
+                return;
+            }
+            let hook = state.borrow().reply_with_meeting.clone();
+            if let Some(hook) = hook {
+                hook(&messages);
+            }
+        });
+    }
+    boxed.append(&reply_meeting);
     let open_window = gtk::Button::builder().label("Open in new window").css_classes(["flat"]).halign(gtk::Align::Start).build();
     open_window.set_sensitive(has_selection);
     {
@@ -23096,11 +23277,66 @@ fn format_imip_organizer(organizer: &lookout_core::EmailAddress) -> String {
     }
 }
 
+/// The invite card's "Conflicts with …" value: the conflicting events' names,
+/// or `None` when nothing overlaps (which hides the row).
+fn conflict_summary(conflicts: &[EventOccurrence]) -> Option<String> {
+    if conflicts.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = conflicts
+        .iter()
+        .map(|occurrence| {
+            occurrence
+                .summary
+                .clone()
+                .filter(|summary| !summary.trim().is_empty())
+                .unwrap_or_else(|| if occurrence.all_day { "an all-day event".to_string() } else { "an event".to_string() })
+        })
+        .collect();
+    Some(names.join(", "))
+}
+
+/// The invite card's CAL-35 data: the user's cached occurrences that clash
+/// with the invitation, plus a mini day timeline of the invite's first day.
+/// Empty/`None` when there's no calendar state, or the invite's month isn't in
+/// the in-memory window (the card then just omits both).
+fn invite_card_extras(
+    calendar_state: &Option<Rc<RefCell<CalendarUiState>>>,
+    prefs: &crate::settings::CalendarPreferences,
+    invitation: &lookout_core::ImipInvitation,
+) -> (Vec<EventOccurrence>, Option<gtk::Widget>) {
+    let Some(calendar_state) = calendar_state else {
+        return (Vec::new(), None);
+    };
+    let zone = crate::calendar_tz::display_zone();
+    let (start_local, _) = crate::calendar_tz::occurrence_span(zone, invitation.start, invitation.end, invitation.all_day);
+    let day = start_local.date();
+    let (conflicts, intervals) = {
+        let st = calendar_state.borrow();
+        let occurrences = st.checked_occurrences_for_month(day);
+        let conflicts: Vec<EventOccurrence> = crate::invite_conflicts::conflicting_occurrences(&occurrences, invitation.start, invitation.end, &invitation.uid)
+            .into_iter()
+            .cloned()
+            .collect();
+        let intervals = crate::invite_conflicts::busy_intervals(&occurrences, &invitation.uid);
+        (conflicts, intervals)
+    };
+    // An all-day invite has no meaningful time span to outline; a timed one
+    // gets its proposed slot.
+    let proposed = (!invitation.all_day).then(|| crate::calendar_tz::occurrence_span(zone, invitation.start, invitation.end, false));
+    let timeline = if intervals.is_empty() && proposed.is_none() {
+        None
+    } else {
+        Some(crate::schedule_grid::build_day_timeline(prefs, day, zone, intervals, proposed))
+    };
+    (conflicts, timeline)
+}
+
 /// Repopulates the reading pane's invite-details card for the invitation
 /// being rendered, hiding it when the message carries none (or the user
 /// dismissed it). Complements the `adw::Banner` at the bottom of the page,
 /// which only fits a title and a button.
-fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<&lookout_core::ImipInvitation>) {
+fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<&lookout_core::ImipInvitation>, conflicts: &[EventOccurrence], timeline: Option<gtk::Widget>) {
     let Some(card) = find_named_child(reading_stack, "imip-invite-card").and_then(|c| c.downcast::<gtk::Box>().ok()) else {
         return;
     };
@@ -23110,6 +23346,21 @@ fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<&lookout_co
     set_invite_row(&card, "imip-where-row", "imip-where", invitation.location.clone());
     set_invite_row(&card, "imip-organizer-row", "imip-organizer", invitation.organizer.as_ref().map(format_imip_organizer));
     set_invite_row(&card, "imip-description-row", "imip-description", invitation.description.clone());
+    // CAL-35 / 3.18: the conflict line ("Conflicts with Standup, 1:1") and the
+    // mini day timeline, both from `invite_card_extras`.
+    set_invite_row(&card, "imip-conflict-row", "imip-conflict", conflict_summary(conflicts));
+    if let Some(container) = find_named_descendant(&card, "imip-timeline").and_then(|w| w.downcast::<gtk::Box>().ok()) {
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+        match timeline {
+            Some(widget) => {
+                container.append(&widget);
+                container.set_visible(true);
+            }
+            None => container.set_visible(false),
+        }
+    }
     // CAL-20 / 3.17: the online-meeting Join button, shown only when the
     // invitation carries a join URL, labelled by provider ("Join Teams").
     if let Some(join) = find_named_descendant(&card, "imip-join-button").and_then(|w| w.downcast::<gtk::LinkButton>().ok()) {
@@ -25809,7 +26060,15 @@ fn render_body(
             // for the same payload, hidden once the user dismisses it (or
             // when the message carries no invitation at all - `st.imip` was
             // set from this message's `text/calendar` part above).
-            render_invite_card(reading_stack, st.imip.as_ref().filter(|_| !dismissed));
+            let invitation = st.imip.clone().filter(|_| !dismissed);
+            let (conflicts, timeline) = match &invitation {
+                Some(invitation) => {
+                    let prefs = st.settings.calendar_preferences();
+                    invite_card_extras(&st.calendar_state, &prefs, invitation)
+                }
+                None => (Vec::new(), None),
+            };
+            render_invite_card(reading_stack, invitation.as_ref(), &conflicts, timeline);
         }
     }
     // An incoming REPLY (METHOD:REPLY) updates the organizer's stored event
@@ -27546,6 +27805,7 @@ mod tests {
             manage_signatures: None,
             manage_templates: None,
             create_task_from_message: None,
+            reply_with_meeting: None,
             flagged_mail_refresh: None,
             composer_relay_generation: 0,
             compose_popout_window: None,

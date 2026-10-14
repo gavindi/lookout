@@ -8,6 +8,7 @@
 pub mod calendar;
 pub mod email;
 pub mod freebusy;
+pub mod holidays;
 pub mod identity;
 pub mod ids;
 pub mod interop;
@@ -29,6 +30,7 @@ pub use email::{
     DmarcResult, EmailAddress, EmailBody, EmailSummary, ImipInvitation, ImipMethod, ListUnsubscribe, SpfResult, SystemFlagBit, TAG_KEYWORD_PREFIX,
 };
 pub use freebusy::{all_free, AttendeeAvailability, FreeBusyInterval, ScheduleStatus};
+pub use holidays::{holiday_countries, is_holiday_subscribed, HolidayCountry};
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
 pub use interop::{

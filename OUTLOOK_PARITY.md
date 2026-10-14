@@ -43,14 +43,14 @@ Counts are tallied from the §5 tables.
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
 | Mail (5.1) | 27 | 6 | 11 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, and rules across client, Graph and Sieve backends). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
-| Compose (5.2) | 14 | 4 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder and sensitivity. No forwarding with attachments. |
-| Calendar (5.3) | 18 | 9 | 7 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, or the organizer's own cache as a fallback) with Suggested times; Graph `getSchedule` and rooms wait on 5.1. |
+| Compose (5.2) | 15 | 4 | 3 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder and sensitivity. No forwarding with attachments. |
+| Calendar (5.3) | 19 | 9 | 6 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, or the organizer's own cache as a fallback) with Suggested times; Graph `getSchedule` and rooms wait on 5.1. |
 | People (5.4) | 7 | 2 | 3 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). No CSV or directory. |
 | Tasks (5.5) | 4 | 2 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **83** | **27** | **39** | **5** | ~54% at parity, ~18% partial |
+| **Total** | **85** | **27** | **37** | **5** | ~55% at parity, ~18% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -303,7 +303,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | C-17 | My Templates | `app/src/templates.rs` (2.10): `AppConfig.templates` (`MailTemplate { id, name, html, text }`, mirroring `Signature`); Settings → Mail → My Templates (new/edit/delete via the rich editor); the composer's **My Templates** menu inserts the HTML (rich) or text (plain) at the cursor, with "Manage Templates…" | ✅ | — |
 | C-18 | Check names / resolve recipients | Autocomplete plus picker (`recipient_entry.rs`, `contact_picker.rs`); contact lists expand to their members (4.3) | 🟡 | GAL lookup (P-11) |
 | C-19 | @mention insertion | — | ❌ | `@` → contact picker → adds to To |
-| C-20 | Reply with meeting | — | ❌ | Prefill event editor with thread participants |
+| C-20 | Reply with meeting | Message menu and reading-pane More menu action opens a new event prefilled with the thread's participants (From/To/Cc, the user's own addresses removed) and its subject (3.19) | ✅ | — |
 | C-21 | Encrypt / sign | — | ❌ | Phase 6 |
 | C-22 | Voting buttons, expiration | — | ⛔ | Exchange-only |
 | C-23 | Mail merge | — | ❌ | Phase 7 |
@@ -339,14 +339,14 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | CAL-25 | Open someone else's calendar | Only calendars already in the account | 🟡 | Graph `/users/{id}/calendars`; CalDAV principal browse |
 | CAL-26 | Internet calendar subscriptions | `dav/src/subscription.rs` | ✅ | — |
 | CAL-27 | Birthdays | `dav/src/birthdays.rs` | ✅ | — |
-| CAL-28 | Holidays | — | ❌ | Bundled country `.ics` list, subscribed via CAL-26 |
+| CAL-28 | Holidays | "Add calendar" dialog country picker subscribes to a bundled public holiday feed (`core/src/holidays.rs`, `data/holidays.json`, ~50 countries) via CAL-26 (3.15) | ✅ | — |
 | CAL-29 | Weather in calendar header | — | ❌ | Optional (Open-Meteo); low priority |
 | CAL-30 | Drag to move / resize | `DragMode`, `attach_month_drag` | ✅ | Ctrl-drag to copy |
 | CAL-31 | Event context menu (copy, duplicate, delete, categorise, show as, private) | — | ❌ | |
 | CAL-32 | Calendar colour picker | Server colour or palette (`app/src/calendar_colors.rs`) | 🟡 | Picker; write back `calendar-color` |
 | CAL-33 | Calendar groups | Grouped by account | 🟡 | User-defined groups |
 | CAL-34 | My Day / calendar peek in Mail | `refresh_mail_overview_day_list` | ✅ | — |
-| CAL-35 | Incoming invitation card | `render_invite_card` | ✅ | Add conflict indicator ("Conflicts with …") |
+| CAL-35 | Incoming invitation card | `render_invite_card`, plus a conflict indicator ("Conflicts with …") and a mini day timeline of the invited day (`invite_conflicts.rs`; `schedule_grid.rs` `build_day_timeline`) (3.18) | ✅ | — |
 
 ### 5.4 People
 
@@ -524,7 +524,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 | UX-57 | Event chips | Calendar-colour fill with a darker **left stripe**; title, location; icons for recurring ↻, private 🔒, online meeting, reminder; **show-as styling**: tentative = hatched, free = outline only, OOF = purple, working elsewhere = dotted | Coloured chips at 92% opacity; the show-as styling landed with 3.3 (CAL-05): free hollow, tentative hatched, away purple-tinted, working elsewhere dotted | Left stripe and the icon set (Track U.7) | S |
 | UX-58 | Month view overflow | "+N more" opens a day popover listing everything | "+N more" label, no popover (`calendar_view.rs` comment ~439) | Day popover | S |
 | UX-59 | Event form | Title · Attendees (Required / Optional; "Response options" ▾) · date/time row with All day, **time zone**, **Repeat** · Location (room suggestions) · **Teams meeting** toggle · Reminder ▾ · Show as ▾ · Categorize ▾ · Private · **Scheduling assistant** · **rich-text** description · footer button reads **Save** with no attendees and **Send** with attendees | Editor has most fields, the date/time row's **time zone** picker (CAL-11, 3.2), the Save/Send footer switch (3.4) and a **Scheduling assistant** tab (3.8); plain-text Notes | Field order per Outlook; rich-text notes (reuse the composer's WebKit editor) | M |
-| UX-60 | Invitation card in mail | Accept ▾ / Tentative ▾ / Decline ▾ (each: *Edit response before sending* / *Send response now* / *Don't send a response*), **Propose new time ▾**, and a **mini day timeline** showing the slot against your other events with conflicts highlighted | The card's Accept ▾ / Tentative ▾ / Decline ▾ split buttons offer Send response now / Edit response before sending / Don't send a response (`render_invite_card`, 3.5); **Propose new time…** (hidden by `X-MICROSOFT-DISALLOW-COUNTER`) and **Forward** follow them (3.7), a counter's card swaps in Accept proposal / Decline proposal, and the banner dialog also says Tentative | The mini day timeline with conflict highlight (CAL-35) | M |
+| UX-60 | Invitation card in mail | Accept ▾ / Tentative ▾ / Decline ▾ (each: *Edit response before sending* / *Send response now* / *Don't send a response*), **Propose new time ▾**, and a **mini day timeline** showing the slot against your other events with conflicts highlighted | The card's Accept ▾ / Tentative ▾ / Decline ▾ split buttons offer Send response now / Edit response before sending / Don't send a response (`render_invite_card`, 3.5); **Propose new time…** (hidden by `X-MICROSOFT-DISALLOW-COUNTER`) and **Forward** follow them (3.7), a counter's card swaps in Accept proposal / Decline proposal, and the banner dialog also says Tentative. A **Conflicts with …** line and a mini day timeline (`invite_conflicts.rs`, `schedule_grid.rs`) show the slot against the cached events (3.18) | — | M |
 | UX-61 | Reminders window | Separate always-on-top window: list of due items, "Dismiss all", Snooze ▾ duration, Join (online meetings), Open | Desktop notifications only | 3.9 (CAL-12) | M |
 
 ### 6.7 People
@@ -662,11 +662,11 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 3.12 | Event context menu, copy, duplicate | CAL-30, CAL-31 | 0.5; Ctrl-drag copies; "Duplicate", "Copy to calendar", "Save as .ics" | S |
 | 3.13 | Calendar colour picker and groups | CAL-32, CAL-33 | `gtk::ColorDialog`; PROPPATCH `calendar-color` when writable; user groups persisted in `settings.json` | M |
 | 3.14 | Event search | CAL-22 | Search over the `dav` cache (title, location, notes, attendees); results list; global search scope "Calendar" | M |
-| 3.15 | Holidays | CAL-28 | Country picker → subscribe to a bundled public `.ics` URL via CAL-26 | S |
+| 3.15 | ✅ ~~Holidays~~ | CAL-28 | Country picker → subscribe to a bundled public `.ics` URL via CAL-26 | S |
 | 3.16 | Event attachments | CAL-21 | RFC 8607 managed attachments (`ATTACH;MANAGED-ID`) where supported; inline `ATTACH;VALUE=BINARY` fallback for iMIP; Graph attachments | M |
 | 3.17 | 🟡 ~~Online meetings~~ | CAL-20 | Detect Teams/Zoom/Meet URLs → "Join" button in card, reminder and peek (`interop/onlinemeeting` + parser fills `conference_url`); Microsoft 365 "Teams meeting" toggle → Graph `isOnlineMeeting` lands with the Graph calendar backend (5.1) | M |
-| 3.18 | Conflict indicator on invites | CAL-35 | Overlap check against the cache in `render_invite_card` | S |
-| 3.19 | Reply with meeting | C-20 | Context action: new event with thread participants plus subject | S |
+| 3.18 | ✅ ~~Conflict indicator on invites~~ | CAL-35 | Overlap check against the cache in `render_invite_card` | S |
+| 3.19 | ✅ ~~Reply with meeting~~ | C-20 | Context action: new event with thread participants plus subject | S |
 | 3.20 | Print styles | CAL-23 | Day / Week / Month grid / Agenda HTML templates through the existing WebKit print path | M |
 
 ### Phase 4: People and tasks

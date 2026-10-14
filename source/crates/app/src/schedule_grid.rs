@@ -534,6 +534,111 @@ pub fn suggest_times(
     out
 }
 
+/// A compact single-row "your day" timeline for the reading pane's invite card
+/// (CAL-35 / UX-60): the day's busy blocks over an hour axis, the proposed span
+/// outlined in the conflict colour, and a now-line when the day is today. No
+/// label column or header - simpler than [`ScheduleGrid`], which it shares its
+/// painters with.
+pub fn build_day_timeline(
+    prefs: &CalendarPreferences,
+    date: NaiveDate,
+    zone: DisplayZone,
+    intervals: Vec<FreeBusyInterval>,
+    proposed: Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>,
+) -> gtk::Widget {
+    let state = Rc::new(RefCell::new(GridState {
+        rows: vec![ScheduleRow {
+            intervals,
+            ..ScheduleRow::default()
+        }],
+        date,
+        zone,
+        work_days: prefs.work_days.clone(),
+        work_start: prefs.work_start,
+        work_end: prefs.work_end,
+        proposed,
+    }));
+    let canvas = gtk::DrawingArea::new();
+    canvas.set_hexpand(true);
+    canvas.set_content_height(44);
+    canvas.set_widget_name("imip-timeline-canvas");
+    let draw_state = state.clone();
+    canvas.set_draw_func(move |_, cr, width, height| {
+        paint_day_timeline(cr, width as f64, height as f64, &draw_state.borrow());
+    });
+    canvas.upcast()
+}
+
+/// Paints [`build_day_timeline`]'s single row: no label column, so the time
+/// plot spans the widget's full width.
+fn paint_day_timeline(cr: &gtk::cairo::Context, width: f64, height: f64, state: &GridState) {
+    let top = 4.0;
+    let row_height = (height - 8.0).max(20.0);
+    cr.select_font_face("Sans", gtk::cairo::FontSlant::Normal, gtk::cairo::FontWeight::Normal);
+
+    // Working-hours shading on work days.
+    if state.work_days.contains(&state.date.weekday()) {
+        let start = (f64::from(state.work_start) / 24.0) * width;
+        let end = (f64::from(state.work_end) / 24.0) * width;
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.08);
+        cr.rectangle(start, top, (end - start).max(0.0), row_height);
+        let _ = cr.fill();
+    }
+
+    // Hour ticks every three hours.
+    for hour in (0..24).step_by(3) {
+        let x = (hour as f64 / 24.0) * width;
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.2);
+        cr.set_line_width(0.5);
+        cr.move_to(x, top);
+        cr.line_to(x, top + row_height);
+        let _ = cr.stroke();
+    }
+
+    // The day's busy blocks, clipped to the widget (cross-day intervals are cut
+    // at midnight).
+    if let Some(row) = state.rows.first() {
+        for interval in &row.intervals {
+            let start = minutes_on(state.date, state.zone.to_local(interval.start));
+            let end = minutes_on(state.date, state.zone.to_local(interval.end));
+            if end <= 0 || start >= 1440 {
+                continue;
+            }
+            let start = start.max(0);
+            let end = end.min(1440);
+            let x0 = (start as f64 / 1440.0) * width;
+            let x1 = (end as f64 / 1440.0) * width;
+            paint_interval(cr, x0, top, (x1 - x0).max(1.0), row_height, interval.status);
+        }
+    }
+
+    // The invited span, outlined in the conflict colour.
+    if let Some((start, end)) = state.proposed {
+        let start = minutes_on(state.date, start).max(0);
+        let end = minutes_on(state.date, end).min(1440);
+        if end > start {
+            let x0 = (start as f64 / 1440.0) * width;
+            let x1 = (end as f64 / 1440.0) * width;
+            cr.set_source_rgba(CONFLICT_RGB.0, CONFLICT_RGB.1, CONFLICT_RGB.2, 0.95);
+            cr.set_line_width(2.0);
+            cr.rectangle(x0, top, (x1 - x0).max(1.0), row_height);
+            let _ = cr.stroke();
+        }
+    }
+
+    // Current-time line.
+    if state.date == state.zone.today() {
+        let now = state.zone.now();
+        let minutes = i64::from(now.hour()) * 60 + i64::from(now.minute());
+        let x = (minutes as f64 / 1440.0) * width;
+        cr.set_source_rgba(0.85, 0.2, 0.2, 0.8);
+        cr.set_line_width(1.0);
+        cr.move_to(x, top);
+        cr.line_to(x, top + row_height);
+        let _ = cr.stroke();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
