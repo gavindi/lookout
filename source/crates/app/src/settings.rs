@@ -160,6 +160,17 @@ pub const CALENDAR_PRIMARY_TZ: &str = "calendar-primary-tz";
 pub const CALENDAR_SECONDARY_TZ: &str = "calendar-secondary-tz";
 /// Calendar → "Default reminder" (minutes before a new event; -1 = none).
 pub const CALENDAR_DEFAULT_REMINDER: &str = "calendar-default-reminder";
+/// People → "File contacts as": how a contact with no per-contact `file_as`
+/// is listed and sorted (P-07). One of [`lookout_core::FileAs`]'s strings.
+pub const CONTACTS_FILE_AS: &str = "contacts-file-as";
+/// Tasks → "Sort by": how tasks are ordered within their group (T-09). One of
+/// [`TASK_SORT_KEYS`].
+pub const TASKS_SORT_KEY: &str = "tasks-sort-key";
+/// Tasks → "Group by": how tasks are sectioned (T-09). One of
+/// [`TASK_GROUP_BYS`].
+pub const TASKS_GROUP_BY: &str = "tasks-group-by";
+/// Tasks → "Show completed": whether completed tasks appear in the list.
+pub const TASKS_SHOW_COMPLETED: &str = "tasks-show-completed";
 pub const MAIL_NOTIFICATIONS_ENABLED: &str = "mail-notifications-enabled";
 /// Config → Assistant → "API URL": the base URL of the OpenAI-compatible
 /// API the assistant talks to. The API token itself is kept in the GNOME
@@ -315,6 +326,10 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(CALENDAR_PRIMARY_TZ, Value::String(String::new()));
     map.insert(CALENDAR_SECONDARY_TZ, Value::String(String::new()));
     map.insert(CALENDAR_DEFAULT_REMINDER, Value::Int(-1));
+    map.insert(CONTACTS_FILE_AS, Value::String("last-first".into()));
+    map.insert(TASKS_SORT_KEY, Value::String("due".into()));
+    map.insert(TASKS_GROUP_BY, Value::String("due".into()));
+    map.insert(TASKS_SHOW_COMPLETED, Value::Bool(true));
     map.insert(MAIL_NOTIFICATIONS_ENABLED, Value::Bool(true));
     map.insert(ASSISTANT_API_URL, Value::String(String::new()));
     map.insert(ASSISTANT_AGENT, Value::String(String::new()));
@@ -659,6 +674,44 @@ pub fn conversation_order_at(index: u32) -> &'static str {
     CONVERSATION_ORDERS.get(index as usize).copied().unwrap_or(CONVERSATION_ORDERS[0])
 }
 
+/// The stored `contacts-file-as` values (P-07), in UI (Config → People
+/// `ComboRow`) order. "last-first" is Outlook's default.
+pub const CONTACT_FILE_AS: [&str; 3] = ["last-first", "first-last", "company"];
+
+/// The labels matching [`CONTACT_FILE_AS`] by index.
+pub const CONTACT_FILE_AS_LABELS: [&str; 3] = ["Last, First", "First Last", "Company"];
+
+/// The `FileAs` preference a stored value names; anything unknown falls back
+/// to `LastFirst`, Outlook's default.
+pub fn contact_file_as(name: &str) -> lookout_core::FileAs {
+    lookout_core::FileAs::from_setting(name)
+}
+
+/// Index of a stored `contacts-file-as` value (for the config `ComboRow`);
+/// unknown values fall back to the default's index.
+pub fn contact_file_as_index(name: &str) -> u32 {
+    CONTACT_FILE_AS.iter().position(|value| *value == name).unwrap_or(0) as u32
+}
+
+/// The `contacts-file-as` value at an index; out-of-range indexes fall back to
+/// the default.
+pub fn contact_file_as_at(index: u32) -> &'static str {
+    CONTACT_FILE_AS.get(index as usize).copied().unwrap_or(CONTACT_FILE_AS[0])
+}
+
+/// The stored `tasks-sort-key` values (T-09), in UI order.
+pub const TASK_SORT_KEYS: [&str; 4] = ["due", "importance", "title", "created"];
+
+/// The labels matching [`TASK_SORT_KEYS`] by index.
+pub const TASK_SORT_KEY_LABELS: [&str; 4] = ["Due date", "Importance", "Title", "Creation date"];
+
+/// The stored `tasks-group-by` values (T-09), in UI order. "due" is the
+/// default due-date bucket grouping.
+pub const TASK_GROUP_BYS: [&str; 4] = ["due", "list", "category", "none"];
+
+/// The labels matching [`TASK_GROUP_BYS`] by index.
+pub const TASK_GROUP_BY_LABELS: [&str; 4] = ["Due date", "List", "Category", "None"];
+
 /// Upper bound on the configurable message-preview line count.
 pub const MAX_PREVIEW_LINES: i32 = 3;
 
@@ -855,7 +908,10 @@ mod tests {
 
     #[test]
     fn domain_list_parses_separators_case_and_duplicates() {
-        assert_eq!(parse_domain_list("Example.com, @example.org; example.com\ncorp.test"), vec!["example.com", "example.org", "corp.test"]);
+        assert_eq!(
+            parse_domain_list("Example.com, @example.org; example.com\ncorp.test"),
+            vec!["example.com", "example.org", "corp.test"]
+        );
         assert!(parse_domain_list("   ").is_empty());
         assert_eq!(format_domain_list(&parse_domain_list("a.com,b.com")), "a.com, b.com");
     }

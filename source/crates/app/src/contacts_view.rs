@@ -57,10 +57,7 @@ pub struct ContactsAccountSnapshot {
 /// card with no `EMAIL`) are skipped; `mailto:` members are used verbatim and
 /// duplicates are dropped.
 pub(crate) fn resolve_contact_lists(contacts: &[lookout_dav::ContactRecord]) -> Vec<ContactList> {
-    let by_uid: HashMap<&str, &VCard> = contacts
-        .iter()
-        .filter_map(|record| record.card.uid.as_deref().map(|uid| (uid, &record.card)))
-        .collect();
+    let by_uid: HashMap<&str, &VCard> = contacts.iter().filter_map(|record| record.card.uid.as_deref().map(|uid| (uid, &record.card))).collect();
     let mut lists = Vec::new();
     for record in contacts.iter().filter(|record| record.card.is_contact_list()) {
         let mut members = Vec::new();
@@ -199,6 +196,22 @@ fn contacts_match_prefix(contact: &EmailAddress, prefix: &str) -> bool {
 /// no address of its own, only its members.
 pub(crate) fn contact_list_matches_prefix(list: &ContactList, prefix: &str) -> bool {
     prefix.is_empty() || list.name.to_lowercase().starts_with(&prefix.to_lowercase())
+}
+
+/// Whether a contact matches the People pane's search box (P-06): the query
+/// is matched case-insensitively as a substring of the display name, any
+/// email address, or the organisation. `query` is expected pre-lowercased.
+pub(crate) fn contact_matches_filter(card: &VCard, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    if vcard_display_name(card).to_lowercase().contains(query) {
+        return true;
+    }
+    if card.emails.iter().any(|email| email.address.to_lowercase().contains(query)) {
+        return true;
+    }
+    card.organization.as_ref().is_some_and(|org| org.iter().any(|part| part.to_lowercase().contains(query)))
 }
 
 pub(crate) fn vcard_display_name(card: &VCard) -> String {
@@ -698,6 +711,7 @@ pub fn show_create_contact_for(
         name: None,
         organization: None,
         title: None,
+        file_as: None,
         photo: None,
         emails: vec![EmailField {
             types: vec!["work".to_string()],
@@ -1015,10 +1029,7 @@ pub fn merge_contact_suggestions(
     let mut addresses = Vec::new();
     addresses.extend(mail_history);
     addresses.extend(carddav.iter().filter(|c| contacts_match_prefix(c, prefix)).cloned());
-    let mut merged: Vec<crate::recipient_entry::Suggestion> = dedupe_addresses(addresses, limit)
-        .into_iter()
-        .map(crate::recipient_entry::Suggestion::Address)
-        .collect();
+    let mut merged: Vec<crate::recipient_entry::Suggestion> = dedupe_addresses(addresses, limit).into_iter().map(crate::recipient_entry::Suggestion::Address).collect();
     for list in lists.iter().filter(|list| contact_list_matches_prefix(list, prefix)) {
         if merged.len() >= limit {
             break;
@@ -1193,8 +1204,7 @@ pub fn refresh_contacts_category_ui(
 
             // vCard v4's KIND:group cards (Apple's X-ADDRESSBOOKSERVER-KIND)
             // represent a named contact list rather than a person.
-            let contact_lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> =
-                all_contacts.iter().filter(|(_, _, record)| record.card.is_contact_list()).cloned().collect();
+            let contact_lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> = all_contacts.iter().filter(|(_, _, record)| record.card.is_contact_list()).cloned().collect();
             let deleted: Vec<(AccountId, String, lookout_dav::ContactRecord)> = st
                 .deleted_contacts
                 .get(account_id)
@@ -1328,12 +1338,23 @@ pub fn rebuild_contacts_list_ui(
     let favourites_only = matches!(choice.kind, ContactsBucketKind::Favourites);
     let contact_lists_only = matches!(choice.kind, ContactsBucketKind::ContactLists);
 
+    // The People pane's own search box (P-06) narrows the list; the query and
+    // the "File as" preference both live on the shared state, so the row
+    // callbacks that trigger a rebuild don't each have to thread them through.
+    let (filter, file_as) = {
+        let st = state.borrow();
+        let query = st.contacts_filter.trim().to_lowercase();
+        let pref = crate::settings::contact_file_as(&st.settings.get_string(crate::settings::CONTACTS_FILE_AS));
+        (query, pref)
+    };
+
     let mut entries: Vec<ContactsListEntry> = {
         let st = state.borrow();
         choice
             .contacts
             .into_iter()
             .filter(|(account_id, _, record)| !favourites_only || st.starred_contacts.contains(&(account_id.clone(), contact_identity(&record.card))))
+            .filter(|(_, _, record)| filter.is_empty() || contact_matches_filter(&record.card, &filter))
             .map(|(account_id, account_label, record)| ContactsListEntry {
                 account_id,
                 account_label,
@@ -1344,7 +1365,7 @@ pub fn rebuild_contacts_list_ui(
             })
             .collect()
     };
-    entries.sort_by_key(|entry| vcard_display_name(&entry.card).to_lowercase());
+    entries.sort_by_key(|entry| entry.card.file_as_key(file_as).to_lowercase());
 
     // Drop any selection whose contact isn't in this list - a category
     // switch, or an unstar removing a contact from Favourites - so the
@@ -2213,11 +2234,24 @@ mod tests {
 
     fn group_card(uid: &str, name: &str, members: &[&str]) -> VCard {
         let member_lines = members.iter().map(|m| format!("X-ADDRESSBOOKSERVER-MEMBER:{m}\r\n")).collect::<String>();
-        VCard::parse(&format!("BEGIN:VCARD\r\nVERSION:4.0\r\nKIND:group\r\nUID:{uid}\r\nFN:{name}\r\n{member_lines}END:VCARD\r\n")).unwrap()
+        VCard::parse(&format!(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nKIND:group\r\nUID:{uid}\r\nFN:{name}\r\n{member_lines}END:VCARD\r\n"
+        ))
+        .unwrap()
     }
 
     fn person_card(uid: &str, email: &str) -> VCard {
         VCard::parse(&format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:{uid}\r\nFN:{uid}\r\nEMAIL:{email}\r\nEND:VCARD\r\n")).unwrap()
+    }
+
+    #[test]
+    fn contact_filter_matches_name_email_and_organization() {
+        let card = VCard::parse("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Jane Doe\r\nN:Doe;Jane;;;\r\nORG:Acme Corp\r\nEMAIL:jane@example.com\r\nEND:VCARD\r\n").unwrap();
+        assert!(contact_matches_filter(&card, "jane"));
+        assert!(contact_matches_filter(&card, "doe"));
+        assert!(contact_matches_filter(&card, "example.com"));
+        assert!(contact_matches_filter(&card, "acme"));
+        assert!(!contact_matches_filter(&card, "spock"));
     }
 
     #[test]

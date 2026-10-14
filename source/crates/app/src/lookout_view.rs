@@ -306,7 +306,7 @@ pub fn set_data(view: &LookoutView, data: &LookoutData) {
     } else {
         for task in outstanding {
             view.tasks_list
-                .append(&tasks_view::task_row(&task, &data.colors, toggle.clone(), activate.clone(), &[], true));
+                .append(&tasks_view::task_row(&task, &data.colors, toggle.clone(), activate.clone(), &[], true, &[]));
         }
         let open = tasks_view::open_message_through_app();
         for message in &flagged {
@@ -977,6 +977,7 @@ mod tests {
             description: None,
             due: Some(Local.with_ymd_and_hms(2026, 8, due_day, 9, 0, 0).unwrap().with_timezone(&Utc)),
             start: None,
+            created: None,
             completed: None,
             status,
             priority: Default::default(),

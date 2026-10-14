@@ -332,6 +332,9 @@ pub fn show_task_editor(
                 },
                 due,
                 start: existing.as_ref().and_then(|t| t.start),
+                // A new task is stamped now so it can be sorted by creation;
+                // an edit keeps whatever the server gave us (never over-write).
+                created: existing.as_ref().and_then(|t| t.created).or_else(|| existing.is_none().then(chrono::Utc::now)),
                 completed,
                 status,
                 priority: TaskPriority(priority_choices.get(priority_dropdown.selected() as usize).map(|(_, raw)| *raw).unwrap_or(0)),

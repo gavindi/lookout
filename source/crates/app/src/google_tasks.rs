@@ -491,6 +491,7 @@ pub fn convert_task(list_id: &str, gt: &GoogleTask) -> Option<CalendarTask> {
         description: gt.notes.clone(),
         due: gt.due.as_deref().and_then(parse_rfc3339),
         start: None,
+        created: None,
         completed: gt.completed.as_deref().and_then(parse_rfc3339),
         status: if completed { TaskStatus::Completed } else { TaskStatus::NeedsAction },
         priority: TaskPriority(0),

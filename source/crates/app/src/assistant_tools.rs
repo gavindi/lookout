@@ -499,6 +499,7 @@ mod tests {
             description: None,
             due,
             start: None,
+            created: None,
             completed: if completed { Some(Utc::now()) } else { None },
             status: if completed { TaskStatus::Completed } else { TaskStatus::NeedsAction },
             priority: TaskPriority(0),
@@ -642,6 +643,7 @@ mod tests {
             name: None,
             organization: None,
             title: None,
+            file_as: None,
             photo: None,
             emails: vec![EmailField {
                 types: vec!["work".to_string()],

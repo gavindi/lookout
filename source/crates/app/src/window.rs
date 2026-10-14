@@ -882,6 +882,15 @@ pub(crate) struct UiState {
     /// Persisted in the UI-state database (`ui_state_db`), loaded at startup
     /// and written through on every star toggle.
     pub(crate) starred_contacts: HashSet<(AccountId, String)>,
+    /// The People pane's search query (P-06), typed into the pane's own
+    /// search box or the title-bar search while People is active. Session
+    /// state only - not persisted - and read by `rebuild_contacts_list_ui`
+    /// to filter the visible bucket.
+    pub(crate) contacts_filter: String,
+    /// Repaints the People screen when `contacts_filter` changes - set once
+    /// the contacts widgets exist, and called by both the pane's own search
+    /// box and the module-aware title-bar search. A no-op until wired.
+    pub(crate) contacts_refresh: Option<Rc<dyn Fn()>>,
     /// The UI-state database backing `starred_contacts`, opened best-effort
     /// at startup. `None` when the database couldn't be opened - favourites
     /// then fall back to session-only, never an error.
@@ -2574,6 +2583,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         accounts: HashMap::new(),
         contacts_by_account: HashMap::new(),
         starred_contacts,
+        contacts_filter: String::new(),
+        contacts_refresh: None,
         ui_db,
         settings: settings.clone(),
         app_config: Rc::new(RefCell::new(crate::app_config::load())),
@@ -5016,7 +5027,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .title("No Calendar Accounts")
         .description("Add an account with Calendar enabled in GNOME Online Accounts to see tasks here.")
         .build();
-    let tasks_view = Rc::new(crate::tasks_view::build_tasks_view());
+    let tasks_view = Rc::new(crate::tasks_view::build_tasks_view(state.borrow().categories.clone()));
     let tasks_card = card_section(&tasks_view.root);
     tasks_card.add_css_class("folder-pane");
     root_stack.add_named(&tasks_status_page, Some("tasks-empty"));
@@ -5070,6 +5081,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_right_box.set_margin_bottom(8);
     let contacts_heading_label = gtk::Label::builder().label("People").xalign(0.0).css_classes(["heading"]).build();
     contacts_right_box.append(&contacts_heading_label);
+    // The People pane's search box (P-06): filters the visible bucket by
+    // name, email or organisation. Wired once `refresh_contacts_ui` exists,
+    // below.
+    let contacts_search_entry = gtk::SearchEntry::builder()
+        .placeholder_text("Search contacts")
+        .tooltip_text("Search contacts")
+        .css_classes(["contacts-search-entry"])
+        .build();
+    contacts_right_box.append(&contacts_search_entry);
     contacts_right_box.append(&contacts_scroller);
 
     let contacts_left_card = card_section(&contacts_left_box);
@@ -5383,6 +5403,42 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let tasks_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     tasks_command_toolbar.append(&new_task_button);
+    // Sort/Group/Show-completed (T-09, UX-74): a menu of stateful `win.`
+    // actions whose handlers (wired once `calendar_state` exists) persist to
+    // GSettings and repaint the list.
+    let tasks_arrange_menu = gio::Menu::new();
+    let tasks_sort_section = gio::Menu::new();
+    for (value, label) in crate::settings::TASK_SORT_KEYS.iter().zip(crate::settings::TASK_SORT_KEY_LABELS) {
+        tasks_sort_section.append(Some(label), Some(&format!("win.task-sort('{value}')")));
+    }
+    tasks_arrange_menu.append_section(Some("Sort by"), &tasks_sort_section);
+    let tasks_group_section = gio::Menu::new();
+    for (value, label) in crate::settings::TASK_GROUP_BYS.iter().zip(crate::settings::TASK_GROUP_BY_LABELS) {
+        tasks_group_section.append(Some(label), Some(&format!("win.task-group('{value}')")));
+    }
+    tasks_arrange_menu.append_section(Some("Group by"), &tasks_group_section);
+    let tasks_completed_section = gio::Menu::new();
+    tasks_completed_section.append(Some("Show completed"), Some("win.task-show-completed"));
+    tasks_arrange_menu.append_section(None, &tasks_completed_section);
+    let tasks_arrange_button = gtk::MenuButton::builder()
+        .icon_name(themed_icon_name(&["view-sort-ascending-symbolic", "view-list-symbolic"]))
+        .tooltip_text("Sort and group")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .menu_model(&tasks_arrange_menu)
+        .build();
+    tasks_command_toolbar.append(&tasks_arrange_button);
+    let task_sort_action = gio::SimpleAction::new_stateful(
+        "task-sort",
+        Some(glib::VariantTy::STRING),
+        &settings.get_string(crate::settings::TASKS_SORT_KEY).to_variant(),
+    );
+    let task_group_action = gio::SimpleAction::new_stateful(
+        "task-group",
+        Some(glib::VariantTy::STRING),
+        &settings.get_string(crate::settings::TASKS_GROUP_BY).to_variant(),
+    );
+    let task_show_completed_action = gio::SimpleAction::new_stateful("task-show-completed", None, &settings.get_bool(crate::settings::TASKS_SHOW_COMPLETED).to_variant());
     tasks_command_toolbar.append(&connect_google_tasks_button);
 
     // --- View tab's ribbon content (Mail module): a "Layout" group of
@@ -5841,9 +5897,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_button = view_button.clone();
         let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         let state = state.clone();
+        let search_entry = search_entry.clone();
         mail_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("mail");
+                search_entry.set_placeholder_text(Some("Search mail"));
                 root_stack.set_visible_child_name(current_mail_page.get());
                 // Keep the contextual Search row on screen when a search is
                 // running (a search started from another module activates this
@@ -5873,9 +5931,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
+        let search_entry = search_entry.clone();
         calendar_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("calendar");
+                search_entry.set_placeholder_text(Some("Search mail"));
                 root_stack.set_visible_child_name(current_calendar_page.get());
                 view_toolbar_stack.set_visible_child_name("calendar");
                 mail_calendar_overview_card.set_visible(false);
@@ -5895,9 +5955,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_button = view_button.clone();
         let contacts_window = contacts_window.clone();
         let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
+        let search_entry = search_entry.clone();
         contacts_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("contacts");
+                search_entry.set_placeholder_text(Some("Search contacts"));
                 root_stack.set_visible_child_name(current_contacts_page.get());
                 view_toolbar_stack.set_visible_child_name("contacts");
                 mail_calendar_overview_card.set_visible(false);
@@ -5921,9 +5983,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
+        let search_entry = search_entry.clone();
         tasks_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("tasks");
+                search_entry.set_placeholder_text(Some("Search mail"));
                 root_stack.set_visible_child_name(current_tasks_page.get());
                 view_toolbar_stack.set_visible_child_name("tasks");
                 mail_calendar_overview_card.set_visible(false);
@@ -5942,9 +6006,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
+        let search_entry = search_entry.clone();
         lookout_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("lookout");
+                search_entry.set_placeholder_text(Some("Search mail"));
                 root_stack.set_visible_child_name(current_lookout_page.get());
                 view_toolbar_stack.set_visible_child_name("lookout");
                 mail_calendar_overview_card.set_visible(false);
@@ -6049,8 +6115,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let list_header = list_header.clone();
         let search_debounce = search_debounce.clone();
         let mail_view_button = mail_view_button.clone();
+        let current_module = current_module.clone();
         search_entry.connect_search_changed(move |entry| {
             let query = entry.text();
+            // While the People module is active the title-bar search becomes
+            // the People search (UX-12, P-06): filter the contacts list in
+            // place rather than switching to Mail. An emptied box clears the
+            // filter the same way.
+            if current_module.get() == "contacts" {
+                search_debounce.set(search_debounce.get() + 1);
+                state.borrow_mut().contacts_filter = query.to_string();
+                if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                    refresh();
+                }
+                return;
+            }
             if query.trim().is_empty() {
                 // Clearing the field (its X, or a programmatic `set_text("")`
                 // from `exit_search`) ends the search right away - no debounce
@@ -6365,6 +6444,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window.add_action(&reading_pane_action);
     window.add_action(&message_organization_action);
     window.add_action(&conversation_order_action);
+    window.add_action(&task_sort_action);
+    window.add_action(&task_group_action);
+    window.add_action(&task_show_completed_action);
 
     // --- Close-to-background: the window's close button hides the window
     // instead of exiting (Config → General → "Keep running when the window
@@ -7691,6 +7773,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         }
     });
+    // The contacts repaint hook (P-06): reads the current bucket selection so
+    // a filter change repaints the list in place instead of jumping back to
+    // the first bucket. Stored on the shared state so the module-aware
+    // title-bar search can drive it too.
+    {
+        let contacts_category_list = contacts_category_list.clone();
+        let refresh_contacts_ui = refresh_contacts_ui.clone();
+        state.borrow_mut().contacts_refresh = Some(Rc::new(move || {
+            let idx = contacts_category_list
+                .selected_row()
+                .and_then(|row| unsafe { row.data::<usize>("contacts-choice-index") })
+                .map(|idx| unsafe { *idx.as_ref() } as i32);
+            refresh_contacts_ui(idx);
+        }));
+    }
+    {
+        let state = state.clone();
+        contacts_search_entry.connect_search_changed(move |entry| {
+            state.borrow_mut().contacts_filter = entry.text().to_string();
+            if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                refresh();
+            }
+        });
+    }
     refresh_contacts_ui(None);
     {
         let window = window.clone();
@@ -8199,6 +8305,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .set_int(crate::settings::CALENDAR_DEFAULT_REMINDER, crate::settings::default_reminder_at(row.selected()));
         });
     }
+    // Config → People → "File contacts as" (P-07): persists the preference and
+    // repaints the People list so a re-file is visible immediately.
+    {
+        let state = state.clone();
+        config_view.contacts_file_as_row.connect_selected_notify(move |row| {
+            let value = crate::settings::contact_file_as_at(row.selected());
+            state.borrow().settings.set_string(crate::settings::CONTACTS_FILE_AS, value);
+            if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                refresh();
+            }
+        });
+    }
 
     // Config → General → "Start Lookout at login": registers login
     // autostart with the session's Background portal when available (the
@@ -8362,10 +8480,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.animations_row.set_active(persisted.get_bool(crate::settings::ANIMATE_TRANSITIONS));
         config_view.message_theme_dark_row.set_active(persisted.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK));
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
-        config_view.internal_domains_entry.set_text(&crate::settings::format_domain_list(
-            &persisted.get_strv(crate::settings::MAIL_INTERNAL_DOMAINS),
-        ));
-        config_view.report_phishing_entry.set_text(&persisted.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS));
+        config_view
+            .internal_domains_entry
+            .set_text(&crate::settings::format_domain_list(&persisted.get_strv(crate::settings::MAIL_INTERNAL_DOMAINS)));
+        config_view
+            .report_phishing_entry
+            .set_text(&persisted.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS));
         config_view.rich_text_row.set_active(persisted.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT));
         config_view.spell_check_row.set_active(persisted.get_bool(crate::settings::MAIL_SPELL_CHECK));
         {
@@ -8416,6 +8536,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .calendar_default_reminder_row
             .set_selected(crate::settings::default_reminder_index(persisted.get_int(crate::settings::CALENDAR_DEFAULT_REMINDER)));
+        config_view
+            .contacts_file_as_row
+            .set_selected(crate::settings::contact_file_as_index(&persisted.get_string(crate::settings::CONTACTS_FILE_AS)));
         // "Start Lookout at login": the setting is the source of truth for
         // the portal path; the managed XDG file is the fallback, so an
         // entry left over (or written while the portal was absent) counts
@@ -10888,6 +11011,72 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             Rc::new(move |task, completed| route_task_toggle(&calendar_state, &tasks_view_for_toggle, task, completed)),
             Rc::new(move |task| open_task_editor_for(&window, &state, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
         );
+    }
+    // Tasks view arrangement (T-09): seed the view's options from the
+    // persisted settings, then keep them in sync from the toolbar menu.
+    // Reading all three back from settings after each write keeps the setters
+    // free of partial-update bookkeeping.
+    let apply_task_options = {
+        let state = state.clone();
+        let tasks_view = tasks_view.clone();
+        Rc::new(move || {
+            let (sort, group, show) = {
+                let st = state.borrow();
+                (
+                    st.settings.get_string(crate::settings::TASKS_SORT_KEY),
+                    st.settings.get_string(crate::settings::TASKS_GROUP_BY),
+                    st.settings.get_bool(crate::settings::TASKS_SHOW_COMPLETED),
+                )
+            };
+            crate::tasks_view::set_view_options(
+                &tasks_view,
+                crate::tasks_view::TaskSortKey::from_setting(&sort),
+                crate::tasks_view::TaskGroupBy::from_setting(&group),
+                show,
+            );
+        })
+    };
+    apply_task_options();
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        let apply_task_options = apply_task_options.clone();
+        task_sort_action.connect_activate(move |action, parameter| {
+            let Some(value) = parameter.and_then(|p| p.get::<String>()) else { return };
+            action.set_state(&value.to_variant());
+            state.borrow().settings.set_string(crate::settings::TASKS_SORT_KEY, &value);
+            apply_task_options();
+            refresh_tasks_view(&calendar_state, &tasks_view);
+        });
+    }
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        let apply_task_options = apply_task_options.clone();
+        task_group_action.connect_activate(move |action, parameter| {
+            let Some(value) = parameter.and_then(|p| p.get::<String>()) else { return };
+            action.set_state(&value.to_variant());
+            state.borrow().settings.set_string(crate::settings::TASKS_GROUP_BY, &value);
+            apply_task_options();
+            refresh_tasks_view(&calendar_state, &tasks_view);
+        });
+    }
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        let apply_task_options = apply_task_options.clone();
+        // A boolean stateful action renders as a check item and is toggled
+        // through `change-state`, not `activate` (same as the mail filters).
+        task_show_completed_action.connect_change_state(move |action, requested| {
+            let on = requested.and_then(|value| value.get::<bool>()).unwrap_or(false);
+            action.set_state(&on.to_variant());
+            state.borrow().settings.set_bool(crate::settings::TASKS_SHOW_COMPLETED, on);
+            apply_task_options();
+            refresh_tasks_view(&calendar_state, &tasks_view);
+        });
     }
     {
         let calendar_state = calendar_state.clone();
@@ -13643,7 +13832,15 @@ fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<CalendarUiState>>,
         day_list_box.append(&placeholder);
     } else {
         for task in outstanding {
-            day_list_box.append(&crate::tasks_view::task_row(&task, &colors, Rc::new(|_t, _c| {}), activate.clone(), &["caption"], false));
+            day_list_box.append(&crate::tasks_view::task_row(
+                &task,
+                &colors,
+                Rc::new(|_t, _c| {}),
+                activate.clone(),
+                &["caption"],
+                false,
+                &[],
+            ));
         }
     }
     // Open follow-up flags (item 1.16), as the Tasks view lists them.
@@ -14667,6 +14864,17 @@ fn merged_tasks(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<CalendarTa
 fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>) {
     let colors = calendar_state.borrow().calendar_colors.clone();
     let tasks = merged_tasks(calendar_state);
+    // List display names for the "group by list" mode (T-09): every account's
+    // calendar id → its display name. Unlisted sources (a Google list, the
+    // local store) fall back to the id in `arrange_tasks`.
+    let list_names: HashMap<CalendarId, String> = {
+        let st = calendar_state.borrow();
+        st.accounts
+            .values()
+            .flat_map(|handle| handle.calendars.iter())
+            .map(|cal| (cal.id.clone(), cal.display_name.clone()))
+            .collect()
+    };
     let st = calendar_state.borrow();
     let has_caldav_tasks = st.accounts.values().flat_map(|h| h.calendars.iter()).any(|c| c.supports_tasks);
     let has_google_tasks = !st.google_tasks.is_empty();
@@ -14677,7 +14885,7 @@ fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view:
         "No connected calendar supports tasks, so new tasks are saved on this device only. To sync tasks, use Connect Google Tasks or connect a calendar that supports them (Nextcloud, iCloud).".to_string()
     };
     crate::tasks_view::set_empty_message(tasks_view, &message);
-    crate::tasks_view::set_tasks(tasks_view, &tasks, &colors);
+    crate::tasks_view::set_tasks(tasks_view, &tasks, &colors, &list_names);
     // Every task change funnels through here (CalDAV and Google Tasks
     // `TasksUpdated` events, local saves, checkbox flips), so this is the
     // single point that keeps the Lookout dashboard's task section and the
@@ -15356,6 +15564,7 @@ fn build_task_seed_for_email(
         description: Some(description),
         due: None,
         start: None,
+        created: Some(chrono::Utc::now()),
         completed: None,
         status: TaskStatus::NeedsAction,
         priority: TaskPriority(0),
@@ -16623,8 +16832,7 @@ fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widget, point: 
                 at: preset.at.with_timezone(&chrono::Utc),
             })
             .collect(),
-        report_phishing: targets.len() == 1
-            && !state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().is_empty(),
+        report_phishing: targets.len() == 1 && !state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().is_empty(),
     };
 
     let description = crate::message_menu::message_menu_description(&menu_state, &choices);
@@ -18653,13 +18861,7 @@ fn set_junk_selection(state: &Rc<RefCell<UiState>>, message_list: &MessageListMo
 /// no target.
 fn report_phishing_selection(state: &Rc<RefCell<UiState>>, targets: &[EmailSummary]) {
     let Some(summary) = targets.first() else { return };
-    if state
-        .borrow()
-        .settings
-        .get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS)
-        .trim()
-        .is_empty()
-    {
+    if state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().is_empty() {
         return;
     }
     state.borrow_mut().pending_report_phishing = Some((summary.mailbox.clone(), summary.uid));
@@ -25554,6 +25756,7 @@ mod tests {
             name: None,
             organization: None,
             title: None,
+            file_as: None,
             photo: None,
             emails: vec![lookout_core::EmailField {
                 types: vec!["work".into()],
@@ -25698,6 +25901,8 @@ mod tests {
             accounts,
             contacts_by_account: HashMap::new(),
             starred_contacts: HashSet::new(),
+            contacts_filter: String::new(),
+            contacts_refresh: None,
             ui_db: None,
             settings: Rc::new(crate::settings::resolve()),
             app_config: Rc::new(RefCell::new(crate::app_config::AppConfig::default())),

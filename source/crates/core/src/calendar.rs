@@ -381,6 +381,11 @@ pub struct CalendarTask {
     /// has a `DURATION` instead of a `DUE` - the editor always writes `DUE`.
     #[serde(default)]
     pub start: Option<DateTime<Utc>>,
+    /// RFC 5545 §3.8.7.1 (`CREATED`): when the task was created, as recorded
+    /// by the originating client/server. Used by the Tasks view's "created"
+    /// sort (T-09). `None` when the server didn't supply it.
+    #[serde(default)]
+    pub created: Option<DateTime<Utc>>,
     /// RFC 5545 §3.8.2.1: UTC timestamp of when the task was completed. Set
     /// alongside `status == Completed`; cleared on reopen.
     #[serde(default)]

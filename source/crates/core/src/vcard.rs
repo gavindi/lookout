@@ -16,6 +16,12 @@ pub struct VCard {
     pub name: Option<Name>,
     pub organization: Option<Vec<String>>,
     pub title: Option<String>,
+    /// The contact's "File as" override (P-07): how Outlook lists and sorts
+    /// the card, stored as `X-MS-FILEAS` (Outlook's property) or the RFC 6350
+    /// `SORT-AS` parameter on `N`. `None` means the card is filed by the
+    /// global [`FileAs`] preference instead.
+    #[serde(default)]
+    pub file_as: Option<String>,
     /// The contact's photo (`PHOTO`): inline image bytes when embedded, or a
     /// URI to fetch otherwise. Used for sender avatars in the message list.
     pub photo: Option<Photo>,
@@ -59,6 +65,38 @@ pub struct Name {
     pub additional: String,
     pub prefix: String,
     pub suffix: String,
+}
+
+/// How a contact is filed and sorted when it has no per-contact "File as"
+/// override (P-07). The default, [`FileAs::LastFirst`], matches Outlook's
+/// "Last, First" filing. Kept in `lookout-core` so the settings layer and the
+/// People list share one definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FileAs {
+    #[default]
+    LastFirst,
+    FirstLast,
+    Company,
+}
+
+impl FileAs {
+    /// The stable string stored in GSettings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileAs::LastFirst => "last-first",
+            FileAs::FirstLast => "first-last",
+            FileAs::Company => "company",
+        }
+    }
+
+    /// Parses a stored value, falling back to [`FileAs::LastFirst`].
+    pub fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "first-last" | "firstlast" => FileAs::FirstLast,
+            "company" => FileAs::Company,
+            _ => FileAs::LastFirst,
+        }
+    }
 }
 
 /// A contact's `PHOTO` value. Both forms RFC 6350 allows are covered: inline
@@ -160,6 +198,7 @@ impl VCard {
             name: None,
             organization: None,
             title: None,
+            file_as: None,
             photo: None,
             emails: Vec::new(),
             telephones: Vec::new(),
@@ -199,7 +238,21 @@ impl VCard {
                 "KIND" => card.kind = Some(value),
                 "UID" => card.uid = Some(value),
                 "FN" => card.full_name = Some(value),
-                "N" => card.name = Some(parse_name(&value)),
+                "N" => {
+                    // RFC 6350 §5.1: an optional `SORT-AS` parameter on `N`
+                    // carries the card's filing/sort string, equivalent to
+                    // Outlook's `X-MS-FILEAS` property handled below.
+                    if let Some(sort_as) = param_values(&params, "SORT-AS").into_iter().next() {
+                        card.file_as = Some(sort_as);
+                    }
+                    card.name = Some(parse_name(&value));
+                }
+                "X-MS-FILEAS" => {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        card.file_as = Some(trimmed.to_string());
+                    }
+                }
                 "ORG" => card.organization = Some(value.split(';').map(|part| part.to_string()).collect()),
                 "TITLE" => card.title = Some(value),
                 "PHOTO" => card.photo = Some(parse_photo(&params, &value)),
@@ -273,14 +326,28 @@ impl VCard {
             lines.push(format!("FN:{}", escape_value(fn_value)));
         }
         if let Some(name) = &self.name {
+            // Write the file-as string both as RFC 6350's `SORT-AS` parameter
+            // (portable) and Outlook's `X-MS-FILEAS` property (below), so the
+            // value round-trips through either kind of server.
+            let sort_as = self
+                .file_as
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(";SORT-AS={}", quote_param_value(s)))
+                .unwrap_or_default();
             lines.push(format!(
-                "N:{};{};{};{};{}",
+                "N{}:{};{};{};{};{}",
+                sort_as,
                 escape_value(&name.family),
                 escape_value(&name.given),
                 escape_value(&name.additional),
                 escape_value(&name.prefix),
                 escape_value(&name.suffix)
             ));
+        }
+        if let Some(file_as) = self.file_as.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push(format!("X-MS-FILEAS:{}", escape_value(file_as)));
         }
         if let Some(org) = &self.organization {
             lines.push(format!("ORG:{}", org.iter().map(|part| escape_value(part)).collect::<Vec<_>>().join(";")));
@@ -406,6 +473,41 @@ impl VCard {
             .collect()
     }
 
+    /// The string this card is filed and sorted under (P-07): the per-contact
+    /// `file_as` override when present, otherwise the structured name (or
+    /// `FN`/`ORG`) arranged per the global [`FileAs`] preference. Always
+    /// non-empty, so it can be used as a sort key directly.
+    pub fn file_as_key(&self, pref: FileAs) -> String {
+        if let Some(file_as) = self.file_as.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return file_as.to_string();
+        }
+        let org = self.organization.as_ref().and_then(|org| org.first()).map(|s| s.trim()).filter(|s| !s.is_empty());
+        let family = self.name.as_ref().map(|n| n.family.trim()).filter(|s| !s.is_empty());
+        let given = self.name.as_ref().map(|n| n.given.trim()).filter(|s| !s.is_empty());
+        let full_name = self.full_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let fallback = || {
+            full_name
+                .map(str::to_string)
+                .or_else(|| org.map(str::to_string))
+                .unwrap_or_else(|| "(unnamed contact)".to_string())
+        };
+        match pref {
+            FileAs::LastFirst => match (family, given) {
+                (Some(family), Some(given)) => format!("{family}, {given}"),
+                (Some(family), None) => family.to_string(),
+                (None, Some(given)) => given.to_string(),
+                (None, None) => fallback(),
+            },
+            FileAs::FirstLast => match (given, family) {
+                (Some(given), Some(family)) => format!("{given} {family}"),
+                (Some(given), None) => given.to_string(),
+                (None, Some(family)) => family.to_string(),
+                (None, None) => fallback(),
+            },
+            FileAs::Company => org.map(str::to_string).unwrap_or_else(fallback),
+        }
+    }
+
     /// Whether this card is a contact list / distribution list rather than an
     /// individual contact. RFC 6350 marks these with `KIND:group`; older
     /// CardDAV servers (and Apple's own exports) still use
@@ -414,9 +516,9 @@ impl VCard {
         if self.kind.as_deref().is_some_and(|kind| kind.eq_ignore_ascii_case("group")) {
             return true;
         }
-        self.other.iter().any(|prop| {
-            prop.name.eq_ignore_ascii_case("X-ADDRESSBOOKSERVER-KIND") && prop.value.trim().eq_ignore_ascii_case("group")
-        })
+        self.other
+            .iter()
+            .any(|prop| prop.name.eq_ignore_ascii_case("X-ADDRESSBOOKSERVER-KIND") && prop.value.trim().eq_ignore_ascii_case("group"))
     }
 
     /// The list's display name: its `FN`, falling back to the first `ORG`
@@ -504,12 +606,14 @@ fn parse_params(raw: &str) -> Vec<Parameter> {
 
 fn split_param_values(value: &str) -> Vec<String> {
     let value = value.trim();
-    let unquoted = if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        &value[1..value.len() - 1]
-    } else {
-        value
-    };
-    unquoted.split(',').map(|s| unescape_value(s.trim())).filter(|s| !s.is_empty()).collect()
+    // A quoted parameter value is one value even if it contains commas
+    // (RFC 6350 §3.4), e.g. `SORT-AS="Doe, Jane"`; only unquoted params hold
+    // the comma-separated multi-value list `TYPE=work,voice` uses.
+    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        let unquoted = unescape_value(&value[1..value.len() - 1]);
+        return if unquoted.is_empty() { Vec::new() } else { vec![unquoted] };
+    }
+    value.split(',').map(|s| unescape_value(s.trim())).filter(|s| !s.is_empty()).collect()
 }
 
 fn parse_name(value: &str) -> Name {
@@ -758,6 +862,7 @@ mod tests {
             }),
             organization: Some(vec!["Example Corp".to_string()]),
             title: Some("Engineer".to_string()),
+            file_as: None,
             photo: None,
             emails: vec![EmailField {
                 types: vec!["work".to_string()],
@@ -1058,6 +1163,7 @@ mod tests {
             }),
             organization: None,
             title: None,
+            file_as: None,
             photo: None,
             emails: vec![EmailField {
                 types: vec!["work".to_string()],
@@ -1122,5 +1228,46 @@ mod tests {
         assert!(card.is_contact_list());
         assert_eq!(card.contact_list_name(), "Bridge Crew");
         assert_eq!(card.contact_list_member_refs().len(), 3);
+    }
+
+    #[test]
+    fn parses_and_round_trips_x_ms_fileas() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Jane Doe\r\nN:Doe;Jane;;;\r\nX-MS-FILEAS:Acme, Jane\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert_eq!(card.file_as.as_deref(), Some("Acme, Jane"));
+        let reparsed = VCard::parse(&card.serialize()).unwrap();
+        assert_eq!(reparsed.file_as.as_deref(), Some("Acme, Jane"));
+    }
+
+    #[test]
+    fn parses_the_sort_as_parameter_on_n() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Jane Doe\r\nN;SORT-AS=\"Doe, Jane\":Doe;Jane;;;\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert_eq!(card.file_as.as_deref(), Some("Doe, Jane"));
+        // The structured name is still read with the parameter stripped.
+        assert_eq!(card.name.as_ref().unwrap().family, "Doe");
+        // Re-serialised, the value is carried as Outlook's property.
+        let reparsed = VCard::parse(&card.serialize()).unwrap();
+        assert_eq!(reparsed.file_as.as_deref(), Some("Doe, Jane"));
+    }
+
+    #[test]
+    fn file_as_key_prefers_the_override_then_the_preference() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Jane Doe\r\nN:Doe;Jane;;;\r\nORG:Acme Corp\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert_eq!(card.file_as_key(FileAs::LastFirst), "Doe, Jane");
+        assert_eq!(card.file_as_key(FileAs::FirstLast), "Jane Doe");
+        assert_eq!(card.file_as_key(FileAs::Company), "Acme Corp");
+
+        let with_override = VCard::parse("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Jane Doe\r\nN:Doe;Jane;;;\r\nX-MS-FILEAS:Zeta\r\nEND:VCARD\r\n").unwrap();
+        assert_eq!(with_override.file_as_key(FileAs::FirstLast), "Zeta");
+    }
+
+    #[test]
+    fn file_as_key_falls_back_when_the_name_is_missing() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Acme Helpdesk\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert_eq!(card.file_as_key(FileAs::LastFirst), "Acme Helpdesk");
+        assert_eq!(card.file_as_key(FileAs::Company), "Acme Helpdesk");
     }
 }

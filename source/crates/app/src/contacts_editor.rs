@@ -233,6 +233,10 @@ pub fn show_contact_editor(
     org_row.set_title("Organization");
     let title_row = adw::EntryRow::new();
     title_row.set_title("Title");
+    // P-07: the per-contact "File as" override. Empty means the contact is
+    // filed by the global preference (Settings → People).
+    let file_as_row = adw::EntryRow::new();
+    file_as_row.set_title("File as");
     let birthday_row = adw::EntryRow::new();
     birthday_row.set_title("Birthday");
     let anniversary_row = adw::EntryRow::new();
@@ -306,6 +310,7 @@ pub fn show_contact_editor(
         name_row.set_text(card.full_name.as_deref().unwrap_or(""));
         org_row.set_text(card.organization.as_ref().and_then(|org| org.first()).map(String::as_str).unwrap_or(""));
         title_row.set_text(card.title.as_deref().unwrap_or(""));
+        file_as_row.set_text(card.file_as.as_deref().unwrap_or(""));
         if let Some(birthday) = card.birthday {
             if birthday.omit_year {
                 birthday_row.set_text(&birthday.date.format("%m-%d").to_string());
@@ -495,11 +500,7 @@ pub fn show_contact_editor(
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     content.append(&scroller);
 
-    let photo_buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .valign(gtk::Align::Center)
-        .build();
+    let photo_buttons = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).valign(gtk::Align::Center).build();
     photo_buttons.append(&set_photo_button);
     photo_buttons.append(&remove_photo_button);
     let photo_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
@@ -512,6 +513,7 @@ pub fn show_contact_editor(
     content_box.append(&name_row);
     content_box.append(&org_row);
     content_box.append(&title_row);
+    content_box.append(&file_as_row);
     content_box.append(&birthday_row);
     content_box.append(&anniversary_row);
     content_box.append(&section_header("Emails"));
@@ -577,6 +579,7 @@ pub fn show_contact_editor(
             name: None,
             organization: None,
             title: None,
+            file_as: None,
             photo: None,
             emails: Vec::new(),
             telephones: Vec::new(),
@@ -600,6 +603,9 @@ pub fn show_contact_editor(
         card.organization = if org.is_empty() { None } else { Some(vec![org]) };
         let title = title_row.text().trim().to_string();
         card.title = if title.is_empty() { None } else { Some(title) };
+
+        let file_as = file_as_row.text().trim().to_string();
+        card.file_as = if file_as.is_empty() { None } else { Some(file_as) };
 
         let mut emails_out = Vec::new();
         for row in emails.borrow().iter() {

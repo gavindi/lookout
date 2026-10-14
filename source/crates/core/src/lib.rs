@@ -42,4 +42,4 @@ pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use signature::Signature;
 pub use thread::{ThreadGroup, ThreadKey};
 pub use trust::{html_remote_content_scan, normalize_trust_entry, sender_matches_trust_entry, RemoteContentScan, TrustLevel};
-pub use vcard::{AddressField, Birthday, EmailField, ImppField, Name, OtherProperty, Parameter, Photo, TelephoneField, VCard, VCardError};
+pub use vcard::{AddressField, Birthday, EmailField, FileAs, ImppField, Name, OtherProperty, Parameter, Photo, TelephoneField, VCard, VCardError};

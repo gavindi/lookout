@@ -357,8 +357,8 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | P-03 | Photo | Shown in the People list avatar (over the initials) and previewed/set/removed in the editor; Mail sender avatars already use it (4.1) | ✅ | Graph photo via 5.2 |
 | P-04 | Groups / favourites | Groups, starred contacts | ✅ | — |
 | P-05 | Contact lists in compose | `KIND:group` cards (with `X-ADDRESSBOOKSERVER-MEMBER`) appear in autocomplete and the address-book picker; picking one inserts a list chip with a `+` expander (4.3) | ✅ | — |
-| P-06 | Search in People | Only in picker/autocomplete | 🟡 | Search entry in People tab; global search scope |
-| P-07 | Sort / File as | Display name only | ❌ | First/Last, Last/First, Company |
+| P-06 | Search in People | `contacts_view.rs` search box (name/email/org) plus a module-aware title-bar search: searching while People is active filters the contacts list in place (UX-12) | ✅ | — |
+| P-07 | Sort / File as | A global "File contacts as" preference (Last, First / First Last / Company) sorts and labels the list; a per-contact `file_as` override (`X-MS-FILEAS` / `SORT-AS`) is edited in the contact editor (4.4) | ✅ | — |
 | P-08 | Import/export CSV | `.vcf` only | 🟡 | Outlook CSV (§4.6) |
 | P-09 | Link / merge duplicates | Exact-dupe skip on import | ❌ | Merge UI |
 | P-10 | Profile card | `app/src/profile_card.rs` (4.2): a popover on hover/click of a person reference (reading-pane header, message-list row, conversation card, attendee chip) showing photo/initials, name, title·org, phones, address, recent mail (FTS by address), upcoming shared events, and Send email / Schedule meeting / Add-or-Edit contact | ✅ | Invitation-card organizer and People-row triggers not yet wired; the UX-67 "Files" tab waits on attachment preview (M-32) |
@@ -377,7 +377,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | T-06 | Recurrence | — | ❌ | `RRULE` in VTODO; Graph `recurrence` |
 | T-07 | Steps / subtasks | — | ❌ | `RELATED-TO;RELTYPE=PARENT`; Graph `checklistItems` |
 | T-08 | Categories | The shared master list (M-09) as a toggle picker in the task editor (2.1) | ✅ | — |
-| T-09 | Sort / group options | Fixed buckets (`group_tasks`) | 🟡 | Sort by due/importance/title/created; group by list/category |
+| T-09 | Sort / group options | The Tasks view's "Sort and group" menu: sort by due/importance/title/created, group by due bucket/list/category/none, plus "Show completed"; persisted in GSettings, with pure tested functions (4.12) | ✅ | — |
 | T-10 | Assign / task requests | — | ⛔ | Exchange-only (classic) |
 | T-11 | Google Tasks, CalDAV VTODO, local list | `app/src/google_tasks.rs`, `dav` VTODO, `ui_state_db` | ✅ | — |
 | T-12 | Microsoft To Do | — | ❌ | Graph (A-05) |
@@ -676,7 +676,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 4.1 | ✅ ~~Full contact field editing~~ | P-02, P-03 | Editor rows for anniversary, IM (`IMPP`), URL, custom; photo view and set (`PHOTO`) | M |
 | 4.2 | ✅ ~~Profile card~~ | P-10 | `app/src/profile_card.rs`: one reusable popover (`attach_person_trigger` + `show_person_card_at`), opened on hover/click of the reading-pane header sender, a message-list row's sender/avatar, a conversation-WebView card's sender, and an event-editor attendee chip (`RecipientEntry::set_person_card_hook`). Shows photo/initials, name, title·org, phones, address, recent mail (`Cache::search_query` by `from:`), upcoming shared events (`shared_upcoming_events` over the in-memory calendar), and Send email / Schedule meeting / Add-or-Edit contact. `EventEditorPrefill.suggested_attendees` lands "Schedule meeting" | M |
 | 4.3 | ✅ ~~Contact lists in compose~~ | P-05, C-18 | `KIND:group`/`X-ADDRESSBOOKSERVER-MEMBER` parsed (`core/vcard.rs`); snapshot resolves members (`contacts_view.rs`); `Suggestion::List` offered in autocomplete and the picker; a list inserts one chip with a `+` expander (compose switched to chip mode, UX-42) | S |
-| 4.4 | People search and sort | P-06, P-07 | Search entry in the People tab; File-as setting; global search scope "People" | S |
+| 4.4 | ✅ ~~People search and sort~~ | P-06, P-07 | Search box in the People pane (name/email/org) plus a module-aware title-bar search; a global "File contacts as" preference and a per-contact `file_as` override (`X-MS-FILEAS`/`SORT-AS`) | S |
 | 4.5 | Outlook CSV import/export | P-08 | Column map per §4.6; tolerant header matching | M |
 | 4.6 | Merge duplicates | P-09 | Match by email/phone/name; merge UI with field-level choice | M |
 | 4.7 | Directory lookup | P-11 | Graph `/users` (Microsoft 365) and LDAP (`ldap3`, server configured per account) as an extra provider in `merge_contact_suggestions` | M |
@@ -684,7 +684,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 4.9 | My Day | T-02 | Local pin set per date in `ui_state_db`; suggestions (due today/overdue) | S |
 | 4.10 | Task reminders and recurrence | T-05, T-06 | `VALARM`/`RRULE` in `build_vtodo`; roll forward on complete; reminders via 3.9 | M |
 | 4.11 | Steps / subtasks | T-07 | `RELATED-TO;RELTYPE=PARENT` children (CalDAV); Google Tasks `parent`; Graph `checklistItems` | M |
-| 4.12 | Task sort/group and categories | T-08, T-09 | Sort and group options; category chips from 2.1 | S |
+| 4.12 | ✅ ~~Task sort/group and categories~~ | T-08, T-09 | "Sort and group" toolbar menu (due/importance/title/created; group by due/list/category/none; show completed) persisted in GSettings; `CalendarTask.created` (RFC 5545 `CREATED`); category chips from the 2.1 master list | S |
 
 ### Phase 5: Microsoft 365 native (Graph)
 

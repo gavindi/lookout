@@ -349,6 +349,9 @@ pub struct ConfigView {
     pub calendar_secondary_tz_row: adw::ComboRow,
     /// "Default reminder" preset combo (Config → Calendar).
     pub calendar_default_reminder_row: adw::ComboRow,
+    /// "File contacts as" combo (Config → People, P-07); its selected index
+    /// maps to `CONTACT_FILE_AS`.
+    pub contacts_file_as_row: adw::ComboRow,
     /// "OAuth client id" row (Config → Google Tasks), exposed so the caller
     /// can wire its `activated` signal to the client-id dialog (and update
     /// the subtitle after a save).
@@ -739,6 +742,16 @@ pub fn build() -> ConfigView {
         .build();
     calendar_settings_group.add(&calendar_default_reminder_row);
 
+    // People (P-07): how a contact with no per-contact "File as" value is
+    // listed and sorted in the People screen.
+    let contacts_settings_group = adw::PreferencesGroup::builder().title("People").build();
+    let contacts_file_as_row = adw::ComboRow::builder()
+        .title("File contacts as")
+        .subtitle("How a contact with no \"File as\" of its own is listed and sorted")
+        .model(&gtk::StringList::new(&crate::settings::CONTACT_FILE_AS_LABELS))
+        .build();
+    contacts_settings_group.add(&contacts_file_as_row);
+
     // The real "Google Tasks" group (in the "Apps" section's place): the
     // OAuth client id the Tasks integration needs - Google has no public
     // client id, so the user's own registered id is configured here.
@@ -980,6 +993,7 @@ pub fn build() -> ConfigView {
     add_section(&section_stack, &mut sections, "General", "general", &[&general_group, &keyboard_group]);
     add_section(&section_stack, &mut sections, "Mail", "mail", &[&mail_settings_group]);
     add_section(&section_stack, &mut sections, "Calendar", "calendar", &[&calendar_settings_group]);
+    add_section(&section_stack, &mut sections, "People", "people", &[&contacts_settings_group]);
     add_section(&section_stack, &mut sections, "Privacy", "privacy", &[&privacy_group]);
     add_section(&section_stack, &mut sections, "Apps", "apps", &[&google_tasks_group]);
     add_section(&section_stack, &mut sections, "Assistant", "assistant", &[&assistant_group]);
@@ -1089,6 +1103,7 @@ pub fn build() -> ConfigView {
         calendar_primary_tz_row,
         calendar_secondary_tz_row,
         calendar_default_reminder_row,
+        contacts_file_as_row,
         google_tasks_client_row,
         assistant_url_entry,
         assistant_token_row,

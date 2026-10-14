@@ -8,13 +8,69 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use chrono::{Duration, Local, NaiveDate, NaiveDateTime, Weekday};
 use gtk::prelude::*;
-use lookout_core::{CalendarTask, EmailSummary, TaskStatus};
+use lookout_core::{CalendarId, CalendarTask, EmailSummary, TaskStatus};
 
 use crate::calendar_colors::CalendarColorMap;
+use crate::categories::{CategoryDef, CategorySet};
+
+/// How tasks are ordered within their group (T-09). Set from the
+/// `tasks-sort-key` GSettings string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskSortKey {
+    /// Soonest due first, undated last (the default).
+    #[default]
+    Due,
+    /// Most important first (RFC 5545 priority; unset sorts last).
+    Importance,
+    /// Title A→Z.
+    Title,
+    /// Newest created first.
+    Created,
+}
+
+impl TaskSortKey {
+    /// Parses a stored `tasks-sort-key` value; unknown falls back to `Due`.
+    pub fn from_setting(value: &str) -> Self {
+        match value {
+            "importance" => TaskSortKey::Importance,
+            "title" => TaskSortKey::Title,
+            "created" => TaskSortKey::Created,
+            _ => TaskSortKey::Due,
+        }
+    }
+}
+
+/// How tasks are sectioned (T-09). Set from the `tasks-group-by` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskGroupBy {
+    /// Due-date buckets (Overdue/Today/This week/Later/Completed), Outlook's
+    /// default and the app's original behaviour.
+    #[default]
+    Due,
+    /// One section per task list (calendar).
+    List,
+    /// One section per category; a task with several appears under each.
+    Category,
+    /// A single ungrouped list.
+    None,
+}
+
+impl TaskGroupBy {
+    /// Parses a stored `tasks-group-by` value; unknown falls back to `Due`.
+    pub fn from_setting(value: &str) -> Self {
+        match value {
+            "list" => TaskGroupBy::List,
+            "category" => TaskGroupBy::Category,
+            "none" => TaskGroupBy::None,
+            _ => TaskGroupBy::Due,
+        }
+    }
+}
 
 /// The sections the list renders, in render order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,17 +111,37 @@ pub fn bucket_for(task: &CalendarTask, today: NaiveDate) -> TaskBucket {
     }
 }
 
-/// Sorts the tasks *within* one bucket: due first (undated last, via
-/// `NaiveDate::MAX` - `Option`'s own ordering would put them first), then by
-/// RFC 5545 priority (1 is the most urgent, 0 = unset sorts last), then by
-/// summary. Stable so equal keys keep fetch order.
+/// Sorts the tasks *within* one bucket by due date then priority then summary
+/// - the original ordering, kept for the dashboard's due-bucketed list.
 pub fn sort_bucket(tasks: &mut [CalendarTask]) {
-    tasks.sort_by_key(|t| {
-        (
-            t.due.map(|d| d.with_timezone(&Local).date_naive()).unwrap_or(NaiveDate::MAX),
-            priority_rank(t.priority.0),
-            t.summary.clone().unwrap_or_default(),
-        )
+    sort_tasks(tasks, TaskSortKey::Due);
+}
+
+/// A task's due date in local time, undated sorting last.
+fn due_key(task: &CalendarTask) -> NaiveDate {
+    task.due.map(|d| d.with_timezone(&Local).date_naive()).unwrap_or(NaiveDate::MAX)
+}
+
+/// Sorts tasks within one group by the chosen key (T-09). Every key falls
+/// back to a stable tie-break so equal tasks keep fetch order.
+pub fn sort_tasks(tasks: &mut [CalendarTask], key: TaskSortKey) {
+    tasks.sort_by(|a, b| {
+        let by_due = due_key(a).cmp(&due_key(b));
+        let by_priority = priority_rank(a.priority.0).cmp(&priority_rank(b.priority.0));
+        let by_title = a
+            .summary
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase()
+            .cmp(&b.summary.clone().unwrap_or_default().to_lowercase());
+        match key {
+            TaskSortKey::Due => by_due.then(by_priority).then(by_title),
+            TaskSortKey::Importance => by_priority.then(by_due).then(by_title),
+            TaskSortKey::Title => by_title.then(by_due).then(by_priority),
+            // Newest first; `Option`'s `None < Some` reversed puts undated
+            // (created-less) tasks last.
+            TaskSortKey::Created => b.created.cmp(&a.created).then(by_title).then(by_due),
+        }
     });
 }
 
@@ -76,6 +152,82 @@ fn priority_rank(raw: u8) -> u8 {
     } else {
         raw
     }
+}
+
+/// Arranges tasks into render sections per the chosen grouping (T-09), each
+/// section's tasks ordered by `sort`. Returns `(label, tasks)` pairs in render
+/// order; an empty label means the group is ungrouped (`TaskGroupBy::None`)
+/// and renders without a header. `list_names` maps a task's list (calendar)
+/// id to its display name for the `List` grouping.
+pub fn arrange_tasks(
+    tasks: &[CalendarTask],
+    sort: TaskSortKey,
+    group: TaskGroupBy,
+    now: NaiveDateTime,
+    list_names: &HashMap<CalendarId, String>,
+) -> Vec<(String, Vec<CalendarTask>)> {
+    if group == TaskGroupBy::Due {
+        let today = now.date();
+        let mut buckets: Vec<(TaskBucket, Vec<CalendarTask>)> = vec![
+            (TaskBucket::Overdue, Vec::new()),
+            (TaskBucket::Today, Vec::new()),
+            (TaskBucket::ThisWeek, Vec::new()),
+            (TaskBucket::Later, Vec::new()),
+            (TaskBucket::Completed, Vec::new()),
+        ];
+        for task in tasks {
+            let bucket = bucket_for(task, today);
+            buckets.iter_mut().find(|(b, _)| *b == bucket).expect("every bucket is pre-seeded").1.push(task.clone());
+        }
+        let mut groups = Vec::new();
+        for (bucket, mut bucket_tasks) in buckets {
+            if bucket_tasks.is_empty() {
+                continue;
+            }
+            sort_tasks(&mut bucket_tasks, sort);
+            groups.push((bucket.label().to_string(), bucket_tasks));
+        }
+        return groups;
+    }
+
+    let mut map: HashMap<String, Vec<CalendarTask>> = HashMap::new();
+    for task in tasks {
+        match group {
+            TaskGroupBy::List => {
+                let label = list_names.get(&task.calendar_id).cloned().unwrap_or_else(|| task.calendar_id.0.clone());
+                map.entry(label).or_default().push(task.clone());
+            }
+            TaskGroupBy::Category => {
+                if task.categories.is_empty() {
+                    map.entry("No category".to_string()).or_default().push(task.clone());
+                } else {
+                    let mut seen = std::collections::HashSet::new();
+                    for name in &task.categories {
+                        if seen.insert(name.to_lowercase()) {
+                            map.entry(name.clone()).or_default().push(task.clone());
+                        }
+                    }
+                }
+            }
+            TaskGroupBy::None => map.entry(String::new()).or_default().push(task.clone()),
+            TaskGroupBy::Due => unreachable!("handled above"),
+        }
+    }
+
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    if group == TaskGroupBy::Category {
+        // "No category" is the catch-all and sorts last.
+        keys.sort_by(|a, b| (a == "No category").cmp(&(b == "No category")).then_with(|| a.to_lowercase().cmp(&b.to_lowercase())));
+    } else {
+        keys.sort_by_key(|key| key.to_lowercase());
+    }
+    let mut groups = Vec::new();
+    for key in keys {
+        let mut group_tasks = map.remove(&key).unwrap_or_default();
+        sort_tasks(&mut group_tasks, sort);
+        groups.push((key, group_tasks));
+    }
+    groups
 }
 
 /// Groups the full task list into render sections, in
@@ -120,6 +272,16 @@ pub struct TasksView {
     /// reflect what task sources exist (see `window::refresh_tasks_view`),
     /// defaulting to a plain "no tasks yet" hint.
     empty_message: RefCell<String>,
+    /// The current sort key (T-09), set from the toolbar/settings.
+    sort: RefCell<TaskSortKey>,
+    /// The current grouping (T-09).
+    group: RefCell<TaskGroupBy>,
+    /// Whether completed tasks are shown.
+    show_completed: RefCell<bool>,
+    /// The live shared category master list (2.1), read to colour the task
+    /// rows' category chips. Held as the same `Rc` the rest of the app
+    /// mutates, so a category colour change needs no repaint bookkeeping.
+    categories: Rc<RefCell<CategorySet>>,
 }
 
 /// One task row's checkbox flip: the caller should send the task (with
@@ -134,8 +296,9 @@ pub(crate) type FlagCompleteHandler = Rc<dyn Fn(EmailSummary) + 'static>;
 pub(crate) type FlagOpenHandler = Rc<dyn Fn(EmailSummary) + 'static>;
 
 /// Builds a fresh Tasks view: a scrolled list inside a card, with an empty
-/// placeholder for the no-tasks state.
-pub fn build_tasks_view() -> TasksView {
+/// placeholder for the no-tasks state. `categories` is the shared category
+/// master list (2.1), kept live for the rows' category chips.
+pub fn build_tasks_view(categories: Rc<RefCell<CategorySet>>) -> TasksView {
     install_tasks_css();
     let list = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -170,7 +333,20 @@ pub fn build_tasks_view() -> TasksView {
         flag_complete: RefCell::new(None),
         flag_open: RefCell::new(None),
         empty_message: RefCell::new("No tasks yet - use New task to create one.".to_string()),
+        sort: RefCell::new(TaskSortKey::default()),
+        group: RefCell::new(TaskGroupBy::default()),
+        show_completed: RefCell::new(true),
+        categories,
     }
+}
+
+/// Stores the sort/group/show-completed options the next `set_tasks` uses
+/// (T-09). Called at startup from the persisted settings and on every
+/// toolbar/settings change.
+pub fn set_view_options(view: &TasksView, sort: TaskSortKey, group: TaskGroupBy, show_completed: bool) {
+    *view.sort.borrow_mut() = sort;
+    *view.group.borrow_mut() = group;
+    *view.show_completed.borrow_mut() = show_completed;
 }
 
 /// Stores the row-action callbacks. Called once at startup; every later
@@ -332,18 +508,30 @@ fn install_tasks_css() {
     });
 }
 
-/// Repaints the whole list from `tasks`, grouped by due-date bucket, with a
-/// colour dot per calendar. Rebuilds rows from scratch on every call - the
+/// Repaints the whole list from `tasks`, arranged by the view's current
+/// sort/group options (T-09), with a colour dot per calendar and a chip per
+/// category. `list_names` maps a list (calendar) id to its display name for
+/// the "group by list" mode. Rebuilds rows from scratch on every call - the
 /// same repaint-from-scratch convention as the calendar checklist.
-pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColorMap) {
+pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColorMap, list_names: &HashMap<CalendarId, String>) {
     let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _c| {}));
     let activate = view.activate.borrow().clone().unwrap_or_else(|| Rc::new(|_t| {}));
+    let sort = *view.sort.borrow();
+    let group = *view.group.borrow();
+    let show_completed = *view.show_completed.borrow();
+    let categories: Vec<CategoryDef> = view.categories.borrow().categories.clone();
 
     while let Some(child) = view.list.first_child() {
         view.list.remove(&child);
     }
 
-    if tasks.is_empty() {
+    let visible: Vec<CalendarTask> = if show_completed {
+        tasks.to_vec()
+    } else {
+        tasks.iter().filter(|task| !task_completed(task)).cloned().collect()
+    };
+
+    if visible.is_empty() {
         let message = view.empty_message.borrow().clone();
         let placeholder = gtk::Label::builder()
             .label(&message)
@@ -357,18 +545,21 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
     }
 
     let now = Local::now().naive_local();
-    for (bucket, bucket_tasks) in group_tasks(tasks, now) {
-        let header = gtk::Label::builder()
-            .label(bucket.label())
-            .css_classes(["dim-label", "caption-heading"])
-            .xalign(0.0)
-            .hexpand(true)
-            .margin_top(8)
-            .margin_bottom(2)
-            .build();
-        view.list.append(&header);
-        for task in bucket_tasks {
-            view.list.append(&task_row(&task, colors, toggle.clone(), activate.clone(), &[], true));
+    for (label, group_tasks) in arrange_tasks(&visible, sort, group, now, list_names) {
+        // An empty label is the ungrouped mode - no header.
+        if !label.is_empty() {
+            let header = gtk::Label::builder()
+                .label(&label)
+                .css_classes(["dim-label", "caption-heading"])
+                .xalign(0.0)
+                .hexpand(true)
+                .margin_top(8)
+                .margin_bottom(2)
+                .build();
+            view.list.append(&header);
+        }
+        for task in group_tasks {
+            view.list.append(&task_row(&task, colors, toggle.clone(), activate.clone(), &[], true, &categories));
         }
     }
 }
@@ -382,7 +573,9 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
 /// pass none. `show_check` omits the completion checkbox - the Mail-screen
 /// overview pane hides it, leaving click-to-edit as the row's only action.
 /// `pub(crate)` for the Lookout dashboard, whose outstanding-tasks section
-/// reuses the same row.
+/// reuses the same row. `categories` is the shared master list used to colour
+/// the row's category chips (T-08); pass an empty slice where chips aren't
+/// wanted (the dashboard and Mail overview rows).
 pub(crate) fn task_row(
     task: &CalendarTask,
     colors: &CalendarColorMap,
@@ -390,6 +583,7 @@ pub(crate) fn task_row(
     activate: ActivateHandler,
     summary_classes: &[&str],
     show_check: bool,
+    categories: &[CategoryDef],
 ) -> gtk::Button {
     let task = task.clone();
     let completed = task.status == TaskStatus::Completed || task.percent_complete == Some(100);
@@ -455,6 +649,9 @@ pub(crate) fn task_row(
     }
     row_box.append(&dot);
     row_box.append(&summary);
+    if let Some(chips) = category_chips(&task, categories) {
+        row_box.append(&chips);
+    }
     row_box.append(&due);
 
     if completed {
@@ -486,6 +683,43 @@ fn task_completed(task: &CalendarTask) -> bool {
     task.status == TaskStatus::Completed || task.percent_complete == Some(100)
 }
 
+/// The row's category chips (T-08): a small colour dot (the master list's
+/// preset colour, grey when unmatched) plus the name, up to three so a
+/// heavily-tagged task can't crowd out the due date. `None` when the task has
+/// no categories or the caller passed no master list.
+fn category_chips(task: &CalendarTask, categories: &[CategoryDef]) -> Option<gtk::Box> {
+    if task.categories.is_empty() {
+        return None;
+    }
+    let boxed = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).valign(gtk::Align::Center).build();
+    for (shown, name) in task.categories.iter().enumerate() {
+        if shown >= 3 {
+            break;
+        }
+        let color = categories
+            .iter()
+            .find(|def| def.name.eq_ignore_ascii_case(name))
+            .map(|def| def.color())
+            .unwrap_or("#808080")
+            .to_string();
+        let dot = gtk::DrawingArea::builder().width_request(8).height_request(8).valign(gtk::Align::Center).build();
+        dot.set_draw_func(move |_, cr, width, height| {
+            let (r, g, b) = parse_css_color(&color);
+            let radius = width.min(height) as f64 / 2.0 - 0.5;
+            cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius.max(1.0), 0.0, 2.0 * std::f64::consts::PI);
+            cr.set_source_rgba(r, g, b, 1.0);
+            let _ = cr.fill();
+        });
+        let label = gtk::Label::builder().label(name).css_classes(["dim-label", "caption"]).build();
+        let chip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).build();
+        chip.append(&dot);
+        chip.append(&label);
+        chip.set_tooltip_text(Some(name));
+        boxed.append(&chip);
+    }
+    Some(boxed)
+}
+
 /// Parses a `#rgb`/`#rrggbb` hex colour to an `(r, g, b)` tuple in 0..=1 for
 /// Cairo, falling back to a neutral grey on anything unparseable.
 /// `pub(crate)` for the Lookout dashboard's event rows.
@@ -504,7 +738,7 @@ pub(crate) fn parse_css_color(color: &str) -> (f64, f64, f64) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use lookout_core::{CalendarId, TaskPriority};
+    use lookout_core::TaskPriority;
 
     fn cal() -> CalendarId {
         CalendarId("test:cal".to_string())
@@ -518,6 +752,7 @@ mod tests {
             description: None,
             due: due.map(|d| Local.from_local_datetime(&d).unwrap().with_timezone(&chrono::Utc)),
             start: None,
+            created: None,
             completed: None,
             status,
             priority: TaskPriority(priority),
@@ -580,6 +815,83 @@ mod tests {
         sort_bucket(&mut tasks);
         let order: Vec<&str> = tasks.iter().map(|t| t.summary.as_deref().unwrap()).collect();
         assert_eq!(order, vec!["c-prio1", "c-prio9", "c-prio0", "b-later", "a-undated"]);
+    }
+
+    fn titles(tasks: &[CalendarTask]) -> Vec<&str> {
+        tasks.iter().map(|t| t.summary.as_deref().unwrap()).collect()
+    }
+
+    #[test]
+    fn sort_tasks_orders_by_each_key() {
+        let at = |day: u32| NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, day).unwrap(), chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        let mk = |summary: &str, due: Option<NaiveDateTime>, priority: u8, created_day: u32| {
+            let mut t = task(summary, due, TaskStatus::NeedsAction, None, priority);
+            t.created = Some(chrono::Utc.with_ymd_and_hms(2026, 8, created_day, 9, 0, 0).unwrap());
+            t
+        };
+        let base = vec![mk("zzz", Some(at(11)), 9, 3), mk("aaa", Some(at(13)), 1, 1), mk("mmm", None, 5, 2)];
+
+        let mut due = base.clone();
+        sort_tasks(&mut due, TaskSortKey::Due);
+        assert_eq!(titles(&due), ["zzz", "aaa", "mmm"], "soonest first, undated last");
+
+        let mut importance = base.clone();
+        sort_tasks(&mut importance, TaskSortKey::Importance);
+        assert_eq!(titles(&importance), ["aaa", "mmm", "zzz"], "priority 1 first, 9 last");
+
+        let mut title = base.clone();
+        sort_tasks(&mut title, TaskSortKey::Title);
+        assert_eq!(titles(&title), ["aaa", "mmm", "zzz"], "alphabetical");
+
+        let mut created = base.clone();
+        sort_tasks(&mut created, TaskSortKey::Created);
+        assert_eq!(titles(&created), ["zzz", "mmm", "aaa"], "newest created first");
+    }
+
+    #[test]
+    fn arrange_tasks_groups_by_list_category_and_none() {
+        let now = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(), chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap());
+        let list_a = CalendarId("list-a".to_string());
+        let list_b = CalendarId("list-b".to_string());
+        let mut one = task("one", None, TaskStatus::NeedsAction, None, 5);
+        one.calendar_id = list_a.clone();
+        one.categories = vec!["Work".to_string()];
+        let mut two = task("two", None, TaskStatus::NeedsAction, None, 5);
+        two.calendar_id = list_b.clone();
+        two.categories = vec!["Home".to_string(), "Work".to_string()];
+        let three = task("three", None, TaskStatus::NeedsAction, None, 5);
+        let tasks = vec![one, two, three];
+        let names: HashMap<CalendarId, String> = [(list_a, "Alpha".to_string()), (list_b, "Beta".to_string())].into_iter().collect();
+
+        let by_list = arrange_tasks(&tasks, TaskSortKey::Title, TaskGroupBy::List, now, &names);
+        let labels: Vec<&str> = by_list.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, vec!["Alpha", "Beta", "test:cal"], "named lists sort; the unmapped one falls back to its id");
+
+        let by_category = arrange_tasks(&tasks, TaskSortKey::Title, TaskGroupBy::Category, now, &names);
+        let labels: Vec<&str> = by_category.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, vec!["Home", "Work", "No category"], "\"No category\" is last");
+        // "two" carries both Work and Home, so it appears under each.
+        let work = by_category.iter().find(|(label, _)| label == "Work").unwrap();
+        assert_eq!(titles(&work.1), ["one", "two"]);
+
+        let flat = arrange_tasks(&tasks, TaskSortKey::Title, TaskGroupBy::None, now, &names);
+        assert_eq!(flat.len(), 1);
+        assert!(flat[0].0.is_empty(), "ungrouped has no header label");
+        assert_eq!(titles(&flat[0].1), ["one", "three", "two"]);
+    }
+
+    #[test]
+    fn arrange_tasks_due_keeps_bucket_order_and_applies_sort() {
+        let now = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(), chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap());
+        let at = |day: u32| NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, day).unwrap(), chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        let tasks = vec![
+            task("later", Some(at(25)), TaskStatus::NeedsAction, None, 5),
+            task("overdue", Some(at(2)), TaskStatus::NeedsAction, None, 5),
+            task("today", Some(at(10)), TaskStatus::NeedsAction, None, 5),
+        ];
+        let groups = arrange_tasks(&tasks, TaskSortKey::Due, TaskGroupBy::Due, now, &HashMap::new());
+        let labels: Vec<&str> = groups.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, vec!["Overdue", "Today", "Later"]);
     }
 
     fn flagged_message(uid: u32, flag: lookout_core::FollowUpFlag) -> EmailSummary {

@@ -1085,6 +1085,7 @@ mod tests {
             name: None,
             organization: None,
             title: None,
+            file_as: None,
             photo: None,
             emails: vec![lookout_core::EmailField {
                 types: vec!["work".to_string()],

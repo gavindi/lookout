@@ -534,6 +534,7 @@ fn convert_todo(calendar_id: &CalendarId, todo: &icalendar::Todo) -> Option<Cale
         description: todo.get_description().map(str::to_string),
         due,
         start,
+        created: todo.get_created(),
         completed: todo.get_completed(),
         status: match todo.get_status() {
             Some(TodoStatus::NeedsAction) | None => TaskStatus::NeedsAction,
@@ -584,6 +585,9 @@ fn build_vtodo(task: &CalendarTask) -> icalendar::Todo {
     }
     if let Some(start) = task.start {
         vtodo.starts(start);
+    }
+    if let Some(created) = task.created {
+        vtodo.created(created);
     }
     match task.status {
         TaskStatus::NeedsAction => {}
@@ -1640,6 +1644,7 @@ END:VCALENDAR\r\n";
             description: Some("Call and confirm".to_string()),
             due: Some("2026-07-20T17:00:00Z".parse().unwrap()),
             start: Some("2026-07-15T09:00:00Z".parse().unwrap()),
+            created: Some("2026-07-01T08:30:00Z".parse().unwrap()),
             completed: None,
             status: TaskStatus::NeedsAction,
             priority: TaskPriority(3),
@@ -1663,6 +1668,7 @@ END:VCALENDAR\r\n";
         assert_eq!(round.description, full_task().description);
         assert_eq!(round.due, full_task().due);
         assert_eq!(round.start, full_task().start);
+        assert_eq!(round.created, full_task().created);
         assert_eq!(round.priority, full_task().priority);
         assert_eq!(round.percent_complete, full_task().percent_complete);
         assert_eq!(round.categories, full_task().categories);

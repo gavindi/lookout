@@ -693,6 +693,7 @@ mod tests {
             description: None,
             due: None,
             start: None,
+            created: None,
             completed: None,
             status: lookout_core::TaskStatus::default(),
             priority: lookout_core::TaskPriority::default(),

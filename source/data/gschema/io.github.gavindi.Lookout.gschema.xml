@@ -19,6 +19,26 @@
     <value nick="never" value="3"/>
   </enum>
 
+  <enum id="io.github.gavindi.Lookout.ContactFileAs">
+    <value nick="last-first" value="0"/>
+    <value nick="first-last" value="1"/>
+    <value nick="company" value="2"/>
+  </enum>
+
+  <enum id="io.github.gavindi.Lookout.TaskSortKey">
+    <value nick="due" value="0"/>
+    <value nick="importance" value="1"/>
+    <value nick="title" value="2"/>
+    <value nick="created" value="3"/>
+  </enum>
+
+  <enum id="io.github.gavindi.Lookout.TaskGroupBy">
+    <value nick="due" value="0"/>
+    <value nick="list" value="1"/>
+    <value nick="category" value="2"/>
+    <value nick="none" value="3"/>
+  </enum>
+
   <schema id="io.github.gavindi.Lookout" path="/io/github/gavindi/Lookout/">
 
     <!-- General -->
@@ -326,6 +346,30 @@
       <default>-1</default>
       <summary>Default reminder</summary>
       <description>Minutes before a new event its reminder defaults to; -1 means no default reminder.</description>
+    </key>
+
+    <!-- People -->
+    <key name="contacts-file-as" enum="io.github.gavindi.Lookout.ContactFileAs">
+      <default>'last-first'</default>
+      <summary>File contacts as</summary>
+      <description>How a contact with no per-contact "File as" value is listed and sorted in the People screen: last-first ("Doe, Jane", Outlook's default), first-last ("Jane Doe") or company (the organisation name).</description>
+    </key>
+
+    <!-- Tasks -->
+    <key name="tasks-sort-key" enum="io.github.gavindi.Lookout.TaskSortKey">
+      <default>'due'</default>
+      <summary>Task sort key</summary>
+      <description>How tasks are ordered within their group in the Tasks view: due date, importance, title or creation date.</description>
+    </key>
+    <key name="tasks-group-by" enum="io.github.gavindi.Lookout.TaskGroupBy">
+      <default>'due'</default>
+      <summary>Task grouping</summary>
+      <description>How tasks are grouped into sections: by due-date bucket (Overdue/Today/This week/Later/Completed, the default), by task list, by category, or ungrouped.</description>
+    </key>
+    <key name="tasks-show-completed" type="b">
+      <default>true</default>
+      <summary>Show completed tasks</summary>
+      <description>Whether completed tasks are shown in the Tasks view.</description>
     </key>
 
     <!-- Assistant -->

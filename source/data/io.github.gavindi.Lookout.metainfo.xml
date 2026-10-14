@@ -75,6 +75,15 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.185" date="2026-10-14">
+      <description>
+        <p>People gains a search box and Outlook's "File as" filing, and the Tasks view its sort and group options.</p>
+        <ul>
+          <li>The People pane has a search box that filters by name, email or company, and searching from the People tab no longer jumps to Mail. A new "File contacts as" setting (Last, First / First Last / Company) controls sorting and labelling, and each contact can carry its own "File as" value.</li>
+          <li>The Tasks view has a Sort and group menu: order by due date, importance, title or creation date, and group by due date, list, category or not at all, with an option to hide completed tasks. Task rows now show coloured category chips.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.9.184" date="2026-10-14">
       <description>
         <p>Contact lists now appear as you address a message. A list from your address book is offered in the recipient autocomplete and the address-book picker, and picking one inserts a single chip bearing the list's name - a plus button expands it to its members, and sending always delivers to everyone on the list. The composer's To, Cc and Bcc fields are now Outlook-style recipient pills.</p>
