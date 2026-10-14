@@ -449,6 +449,8 @@ pub fn build_imip_vcalendar(event: &CalendarEvent, method: ImipMethod) -> String
         ImipMethod::Request => "REQUEST",
         ImipMethod::Reply => "REPLY",
         ImipMethod::Cancel => "CANCEL",
+        ImipMethod::Counter => "COUNTER",
+        ImipMethod::DeclineCounter => "DECLINECOUNTER",
     };
     calendar.append_property(icalendar::Property::new("METHOD", method_name));
     let mut vevent = build_vevent_form(event, Some(method));
@@ -624,7 +626,8 @@ fn build_vtodo(task: &CalendarTask) -> icalendar::Todo {
 /// The method comes from the raw document via [`lookout_core::parse_imip_method`];
 /// the event's summary, organizer and the details the reading pane's invite
 /// card shows (start/end/all-day/location/description/recurrence) come from
-/// the parsed VEVENT.
+/// the parsed VEVENT, as do the proposal controls
+/// (`X-MICROSOFT-DISALLOW-COUNTER`, and the `COUNTER` proposer).
 pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
     let method = lookout_core::parse_imip_method(ics);
     // The CalendarId is purely the parsed event's ownership stamp and never
@@ -632,6 +635,22 @@ pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
     // it saves into.
     let events = parse_vevents(&CalendarId("iMIP".to_string()), ics);
     let event = events.into_iter().next()?;
+    // A COUNTER names the proposing attendee - the ATTENDEE that isn't the
+    // organizer (CAL-17). The DECLINECOUNTER is addressed back to them.
+    let proposer = (method == ImipMethod::Counter)
+        .then(|| {
+            event
+                .attendees
+                .iter()
+                .find(|attendee| {
+                    event
+                        .organizer
+                        .as_ref()
+                        .is_none_or(|organizer| !attendee.address.address.eq_ignore_ascii_case(&organizer.address))
+                })
+                .map(|attendee| attendee.address.clone())
+        })
+        .flatten();
     Some(ImipInvitation {
         method,
         ics: ics.to_string(),
@@ -644,6 +663,8 @@ pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
         location: event.location,
         description: event.description,
         rrule: event.rrule,
+        disallow_counter: cdo::disallow_counter(ics),
+        proposer,
     })
 }
 
@@ -1307,7 +1328,13 @@ mod tests {
         let stored = build_vcalendar(&event);
         assert!(!stored.to_uppercase().contains("METHOD:"), "CalDAV body must not carry METHOD: {stored}");
 
-        for (method, expected) in [(ImipMethod::Request, "REQUEST"), (ImipMethod::Reply, "REPLY"), (ImipMethod::Cancel, "CANCEL")] {
+        for (method, expected) in [
+            (ImipMethod::Request, "REQUEST"),
+            (ImipMethod::Reply, "REPLY"),
+            (ImipMethod::Cancel, "CANCEL"),
+            (ImipMethod::Counter, "COUNTER"),
+            (ImipMethod::DeclineCounter, "DECLINECOUNTER"),
+        ] {
             let ics = build_imip_vcalendar(&event, method);
             assert!(ics.contains(&format!("METHOD:{expected}")), "expected METHOD:{expected} in:\n{ics}");
             assert_eq!(parse_imip_method(&ics), method);
@@ -1382,6 +1409,34 @@ mod tests {
         assert_eq!(parse_vevents(&cal_id(), &cancel)[0].sequence, 2);
     }
 
+    /// CAL-17: the COUNTER/DECLINECOUNTER iMIP forms carry the revision like
+    /// every other iTIP verb, but never ask for a response or mark the event
+    /// cancelled - a proposal is neither.
+    #[test]
+    fn imip_counter_forms_carry_the_revision_without_rsvp_or_status() {
+        let mut event = full_event();
+        event.sequence = 2;
+        event.attendees = vec![Attendee {
+            address: EmailAddress::new("bob@example.com"),
+            role: AttendeeRole::Required,
+            status: AttendeeStatus::NeedsAction,
+        }];
+        event.organizer = Some(EmailAddress::new("ada@example.com"));
+
+        let counter = build_imip_vcalendar(&event, ImipMethod::Counter);
+        assert!(counter.contains("METHOD:COUNTER"), "{counter}");
+        assert!(counter.contains("SEQUENCE:2"), "{counter}");
+        assert!(counter.contains("X-MICROSOFT-CDO-APPT-SEQUENCE:2"), "{counter}");
+        assert!(!counter.contains("RSVP=TRUE"), "a proposal doesn't ask for a response: {counter}");
+        assert!(!counter.contains("STATUS:CANCELLED"), "{counter}");
+
+        let decline = build_imip_vcalendar(&event, ImipMethod::DeclineCounter);
+        assert!(decline.contains("METHOD:DECLINECOUNTER"), "{decline}");
+        assert!(decline.contains("SEQUENCE:2"), "{decline}");
+        assert!(!decline.contains("RSVP=TRUE"), "{decline}");
+        assert!(!decline.contains("STATUS:CANCELLED"), "{decline}");
+    }
+
     /// RFC 6638 §7.1: `SCHEDULE-AGENT` on `ORGANIZER` round-trips, so a
     /// `CLIENT` override another scheduling client stored isn't erased by
     /// this app's next PUT. An absent parameter stays absent.
@@ -1448,6 +1503,41 @@ mod tests {
         let invitation = parse_imip_invitation(cancel).expect("parses");
         assert_eq!(invitation.method, ImipMethod::Cancel);
         assert_eq!(invitation.summary.as_deref(), Some("Planning"));
+    }
+
+    /// CAL-17: a `COUNTER` surfaces the proposed time (the VEVENT's own
+    /// DTSTART/DTEND), the proposing attendee as `proposer`, and Outlook's
+    /// `X-MICROSOFT-DISALLOW-COUNTER` flag; a REQUEST without the property
+    /// has neither a flag nor a proposer.
+    #[test]
+    fn parse_imip_invitation_reads_the_counter_proposer_and_disallow_flag() {
+        let counter = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:COUNTER\r\nBEGIN:VEVENT\r\nORGANIZER;CN=Ada Lovelace:mailto:ada@contoso.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;CN=Bob Example:mailto:bob@example.com\r\nUID:inv-3@example.com\r\nSUMMARY:Project kickoff\r\nDTSTART:20260810T140000Z\r\nDTEND:20260810T150000Z\r\nX-MICROSOFT-DISALLOW-COUNTER:TRUE\r\nSEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let invitation = parse_imip_invitation(counter).expect("parses");
+        assert_eq!(invitation.method, ImipMethod::Counter);
+        assert_eq!(
+            invitation.start,
+            "2026-08-10T14:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "the proposal's time is the VEVENT's own"
+        );
+        assert_eq!(invitation.proposer.as_ref().map(|p| p.address.as_str()), Some("bob@example.com"));
+        assert!(invitation.disallow_counter, "X-MICROSOFT-DISALLOW-COUNTER:TRUE is honoured case-insensitively");
+
+        let request = counter.replace("METHOD:COUNTER", "METHOD:REQUEST").replace("X-MICROSOFT-DISALLOW-COUNTER:TRUE\r\n", "");
+        let invitation = parse_imip_invitation(&request).expect("parses");
+        assert_eq!(invitation.method, ImipMethod::Request);
+        assert!(invitation.proposer.is_none(), "only a COUNTER names a proposer");
+        assert!(!invitation.disallow_counter);
+    }
+
+    /// The disallow scan skips RFC 5545 folded continuation lines, so a
+    /// free-text value can't spoof the property, and requires `TRUE`.
+    #[test]
+    fn disallow_counter_scan_ignores_folded_text_and_non_true_values() {
+        let folded = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:x@y\r\nDTSTART:20260715T140000Z\r\nDESCRIPTION:line one\r\n X-MICROSOFT-DISALLOW-COUNTER:TRUE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(!parse_imip_invitation(folded).expect("parses").disallow_counter);
+
+        let falsy = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:x@y\r\nDTSTART:20260715T140000Z\r\nX-MICROSOFT-DISALLOW-COUNTER:FALSE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(!parse_imip_invitation(falsy).expect("parses").disallow_counter);
     }
 
     #[test]

@@ -64,8 +64,12 @@ fn invitations_carry_their_itip_method() {
     assert_eq!(parse_imip_method(&ics("invite-update.eml")), ImipMethod::Request);
     assert_eq!(parse_imip_method(&ics("cancel.eml")), ImipMethod::Cancel);
     assert_eq!(parse_imip_method(&ics("teams-invite.eml")), ImipMethod::Request);
-    // COUNTER isn't modelled yet (CAL-17), so pin the raw property it must keep.
-    assert!(ics("counter.eml").contains("METHOD:COUNTER"));
+    // CAL-17: an attendee's new-time proposal is a COUNTER.
+    assert_eq!(parse_imip_method(&ics("counter.eml")), ImipMethod::Counter);
+
+    // CAL-17: Outlook's "disallow time proposals" flag is read off the invite.
+    assert!(lookout_core::disallow_counter(&ics("disallow-counter.eml")));
+    assert!(!lookout_core::disallow_counter(&ics("invite.eml")));
 }
 
 #[test]

@@ -60,6 +60,10 @@ pub type SaveCallback = Rc<dyn Fn(CalendarId, CalendarEvent)>;
 /// delete the resource outright (an override) or EXDATE the instance out of
 /// its master (a plain expansion of a recurring series).
 type DeleteCallback = Rc<dyn Fn(CalendarId, EventOccurrence)>;
+/// The forward callback (CAL-18): no arguments - the caller closed over the
+/// occurrence it builds the forward from. Fired by the top bar's Forward
+/// button, shown only for a meeting someone else organizes.
+pub type ForwardCallback = Rc<dyn Fn()>;
 /// The edited occurrence's identity + write target, threaded through the form.
 type EventMeta = (EventUid, Option<String>, Option<String>);
 
@@ -123,8 +127,10 @@ pub struct EventEditorPrefill<'a> {
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
 /// calendar and the finished event (new or edited); `on_delete` fires with the
-/// delete target. Both are responsible for routing to the owning account's
-/// session - the dialog only builds and validates the event.
+/// delete target; `on_forward` - when the edited event is a meeting someone
+/// else organizes (CAL-18) - fires from the top bar's Forward button. All are
+/// responsible for routing to the owning account's session - the dialog only
+/// builds and validates the event.
 pub fn show_event_editor(
     window: &adw::ApplicationWindow,
     prefill: EventEditorPrefill,
@@ -132,6 +138,7 @@ pub fn show_event_editor(
     profile_card: crate::profile_card::ContextProvider,
     on_save: impl Fn(CalendarId, CalendarEvent) + 'static,
     on_delete: impl Fn(CalendarId, EventOccurrence) + 'static,
+    on_forward: Option<ForwardCallback>,
 ) {
     // Boxed as trait objects: a closure capturing a generic `impl Fn`
     // parameter can't implement `Fn` itself (its own `call` needs the captured
@@ -520,6 +527,24 @@ pub fn show_event_editor(
     delete_button.set_tooltip_text(Some("Delete"));
     delete_button.set_visible(has_existing);
 
+    // Forward (CAL-18): a meeting someone else organizes can be forwarded to
+    // new recipients, exactly as Outlook's meeting window offers. Shown only
+    // when there are attendees, an organizer to notify, and the callback -
+    // the writeable-calendar case; a read-only feed has no sender.
+    let forward_visible = !read_only
+        && existing.as_ref().is_some_and(|occ| {
+            !occ.attendees.is_empty()
+                && occ
+                    .organizer
+                    .as_ref()
+                    .is_some_and(|organizer| prefill.owner_email.as_deref().is_none_or(|owner| !owner.eq_ignore_ascii_case(&organizer.address)))
+        });
+    let forward_button = gtk::Button::builder().label("Forward").tooltip_text("Forward meeting").valign(gtk::Align::Center).build();
+    forward_button.set_visible(forward_visible && on_forward.is_some());
+    if let Some(on_forward) = on_forward {
+        forward_button.connect_clicked(move |_| on_forward());
+    }
+
     let top_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     top_bar.append(&cancel_button);
     top_bar.append(&save_button);
@@ -542,6 +567,7 @@ pub fn show_event_editor(
     top_bar.append(&sensitivity_dropdown);
     top_bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     top_bar.append(&tracking_button);
+    top_bar.append(&forward_button);
     top_bar.append(&options_button);
     top_bar.append(&print_button);
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);

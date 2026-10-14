@@ -245,6 +245,120 @@ pub fn invite_message(event: &CalendarEvent, kind: InviteKind, identity: &Organi
     )
 }
 
+/// The event's display summary with the shared "(No subject)" fallback.
+fn summary_or_no_subject(event: &CalendarEvent) -> &str {
+    event.summary.as_deref().map(str::trim).filter(|summary| !summary.is_empty()).unwrap_or("(No subject)")
+}
+
+/// The display name (or address) the proposal/forward text bodies name.
+fn sender_label(identity: &OrganizerIdentity) -> &str {
+    identity.display_name.as_deref().map(str::trim).filter(|name| !name.is_empty()).unwrap_or(&identity.email)
+}
+
+/// The attendee's time proposal (CAL-17): a `METHOD:COUNTER` email to the
+/// organizer whose calendar document carries the proposed times on the
+/// invitation's own event, and whose plain text names the proposer and the
+/// proposed slot. `when` is the caller's preformatted slot label (the app
+/// renders it in the calendar's display zone).
+pub fn counter_message(
+    event: &CalendarEvent,
+    proposed_start: chrono::DateTime<chrono::Utc>,
+    proposed_end: chrono::DateTime<chrono::Utc>,
+    identity: &OrganizerIdentity,
+    organizer: &EmailAddress,
+    when: &str,
+    in_reply_to: Option<String>,
+) -> ComposedMessage {
+    let mut proposal = event.clone();
+    proposal.start = proposed_start;
+    proposal.end = proposed_end;
+    let summary = summary_or_no_subject(&proposal);
+    let subject = format!("New time proposed: {summary}");
+    let text_body = format!("{} proposed a new time for this meeting.\n\n{summary}\n{when}", sender_label(identity));
+    build_imip_message(&proposal, ImipMethod::Counter, identity, vec![organizer.address.clone()], subject, text_body, in_reply_to)
+}
+
+/// The organizer's refusal of a proposal (CAL-17): a `METHOD:DECLINECOUNTER`
+/// to the proposing attendee carrying the originally scheduled times (the
+/// stored event), so their client can say the proposal was turned down.
+pub fn decline_counter_message(event: &CalendarEvent, identity: &OrganizerIdentity, proposer: &EmailAddress) -> ComposedMessage {
+    let summary = summary_or_no_subject(event);
+    let subject = format!("Declined: {summary}");
+    let text_body = format!("{summary} will stay at the originally scheduled time.");
+    build_imip_message(event, ImipMethod::DeclineCounter, identity, vec![proposer.address.clone()], subject, text_body, None)
+}
+
+/// The attendee's forwarded meeting (CAL-18): the meeting REQUEST goes to the
+/// new recipients with them added to the calendar document's attendee list
+/// (deduplicated, the sender's own address skipped), and - unless the sender
+/// *is* the organizer or no organizer address is known - a plain notification
+/// mail tells the organizer their meeting was forwarded. The local stored
+/// copy is deliberately untouched: forwarding doesn't add invitees.
+pub fn forward_messages(event: &CalendarEvent, identity: &OrganizerIdentity, recipients: &[EmailAddress]) -> (ComposedMessage, Option<ComposedMessage>) {
+    let mut forwarded = event.clone();
+    for recipient in recipients {
+        let known =
+            forwarded.attendees.iter().any(|attendee| attendee.address.address.eq_ignore_ascii_case(&recipient.address)) || recipient.address.eq_ignore_ascii_case(&identity.email);
+        if !known {
+            forwarded.attendees.push(Attendee {
+                address: recipient.clone(),
+                role: AttendeeRole::Required,
+                status: AttendeeStatus::NeedsAction,
+            });
+        }
+    }
+    let summary = summary_or_no_subject(event);
+    let to: Vec<String> = recipients.iter().map(|recipient| recipient.address.clone()).collect();
+    let subject = format!("FW: {summary}");
+    let text_body = format!("{} forwarded this meeting to you.", sender_label(identity));
+    let forward = build_imip_message(&forwarded, ImipMethod::Request, identity, to, subject, text_body, None);
+
+    let notification = event
+        .organizer
+        .as_ref()
+        .filter(|organizer| !organizer.address.eq_ignore_ascii_case(&identity.email))
+        .map(|organizer| {
+            let body = format!(
+                "\"{summary}\" was forwarded to {}.",
+                recipients.iter().map(|r| r.address.as_str()).collect::<Vec<_>>().join(", ")
+            );
+            ComposedMessage {
+                from: identity.email.clone(),
+                display_name: identity.display_name.clone(),
+                to: vec![organizer.address.clone()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                reply_to: Vec::new(),
+                subject: "Your meeting was forwarded".to_string(),
+                importance: lookout_core::Importance::default(),
+                sensitivity: lookout_core::MessageSensitivity::Normal,
+                text_body: body,
+                html_body: None,
+                attachments: Vec::new(),
+                inline_images: Vec::new(),
+                calendar_part: None,
+                read_receipt: None,
+                request_read_receipt: false,
+                in_reply_to: None,
+                references: Vec::new(),
+                message_id: None,
+            }
+        });
+    (forward, notification)
+}
+
+/// Applies an accepted proposal to the stored organizer event (CAL-17): the
+/// proposed times replace the stored ones and `SEQUENCE` moves past the last
+/// REQUEST, so the update that follows sorts after the invitation. Everything
+/// else (attendees, organizer, categories, the series rule) is preserved.
+pub fn apply_counter(stored: &mut CalendarEvent, proposal: &CalendarEvent) {
+    stored.start = proposal.start;
+    stored.end = proposal.end;
+    stored.all_day = proposal.all_day;
+    stored.time_zone = proposal.time_zone.clone();
+    stored.sequence += 1;
+}
+
 /// Whether this account is the event's organizer, and so may send
 /// invitations for it: an absent `ORGANIZER` counts as ours (an event created
 /// here before the owner address could be resolved), while a different
@@ -530,6 +644,131 @@ mod tests {
         let mut untitled = event("Untitled", vec![attendee("alice@example.com")]);
         untitled.summary = Some("   ".to_string());
         assert_eq!(invite_message(&untitled, InviteKind::Request, &identity).subject, "Invitation: (No subject)");
+    }
+
+    #[test]
+    fn counter_message_carries_the_proposal_to_the_organizer() {
+        let identity = OrganizerIdentity {
+            email: "bob@example.com".to_string(),
+            display_name: Some("Bob Example".to_string()),
+        };
+        let organizer = EmailAddress::new("ada@contoso.com".to_string());
+        let invitation = event("Planning", vec![attendee("bob@example.com")]);
+        let proposed_start: chrono::DateTime<chrono::Utc> = "2026-08-10T16:00:00Z".parse().unwrap();
+        let proposed_end: chrono::DateTime<chrono::Utc> = "2026-08-10T17:00:00Z".parse().unwrap();
+
+        let counter = counter_message(
+            &invitation,
+            proposed_start,
+            proposed_end,
+            &identity,
+            &organizer,
+            "Monday, August 10, 2026 4:00 PM - 5:00 PM",
+            Some("<invite-1@contoso.com>".to_string()),
+        );
+        assert_eq!(counter.from, "bob@example.com");
+        assert_eq!(counter.to, vec!["ada@contoso.com".to_string()], "a counter goes to the organizer");
+        assert_eq!(counter.subject, "New time proposed: Planning");
+        assert!(counter.text_body.contains("Bob Example proposed a new time"), "{}", counter.text_body);
+        assert!(counter.text_body.contains("4:00 PM - 5:00 PM"), "{}", counter.text_body);
+        assert_eq!(counter.in_reply_to.as_deref(), Some("<invite-1@contoso.com>"));
+
+        let ics = counter.calendar_part.as_deref().unwrap();
+        assert_eq!(lookout_core::parse_imip_method(ics), ImipMethod::Counter);
+        let parsed = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), ics);
+        assert_eq!(parsed[0].start, proposed_start, "the calendar document carries the proposed time");
+        assert_eq!(parsed[0].end, proposed_end);
+        assert_eq!(
+            invitation.start,
+            "2026-08-12T09:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap(),
+            "the original event is untouched"
+        );
+    }
+
+    #[test]
+    fn decline_counter_message_tells_the_proposer_the_time_stands() {
+        let identity = OrganizerIdentity {
+            email: "me@example.com".to_string(),
+            display_name: Some("Me".to_string()),
+        };
+        let proposer = EmailAddress::new("bob@example.com".to_string());
+        let stored = event("Planning", vec![attendee("bob@example.com")]);
+
+        let decline = decline_counter_message(&stored, &identity, &proposer);
+        assert_eq!(decline.to, vec!["bob@example.com".to_string()]);
+        assert_eq!(decline.subject, "Declined: Planning");
+        let ics = decline.calendar_part.as_deref().unwrap();
+        assert_eq!(lookout_core::parse_imip_method(ics), ImipMethod::DeclineCounter);
+        let parsed = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), ics);
+        assert_eq!(parsed[0].start, stored.start, "a declined proposal carries the original time");
+    }
+
+    #[test]
+    fn forward_messages_add_the_recipient_and_notify_the_organizer() {
+        let identity = OrganizerIdentity {
+            email: "bob@example.com".to_string(),
+            display_name: Some("Bob Example".to_string()),
+        };
+        let carol = EmailAddress::new("carol@example.com".to_string());
+        let invitation = event("Planning", vec![attendee("bob@example.com")]);
+
+        let (forward, notification) = forward_messages(&invitation, &identity, std::slice::from_ref(&carol));
+        assert_eq!(forward.to, vec!["carol@example.com".to_string()]);
+        assert_eq!(forward.subject, "FW: Planning");
+        let ics = forward.calendar_part.as_deref().unwrap();
+        assert_eq!(lookout_core::parse_imip_method(ics), ImipMethod::Request, "a forward is a fresh meeting request");
+        let parsed = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), ics);
+        assert!(
+            parsed[0].attendees.iter().any(|attendee| attendee.address.address == "carol@example.com"),
+            "the new recipient rides on the calendar document"
+        );
+        assert_eq!(invitation.attendees.len(), 1, "the local copy isn't touched");
+
+        let notification = notification.expect("the organizer is notified");
+        assert_eq!(notification.to, vec!["me@example.com".to_string()]);
+        assert_eq!(notification.subject, "Your meeting was forwarded");
+        assert!(notification.calendar_part.is_none(), "the notification is plain mail");
+        assert!(notification.text_body.contains("carol@example.com"), "{}", notification.text_body);
+    }
+
+    #[test]
+    fn forward_from_the_organizer_skips_the_notification_and_deduplicates_recipients() {
+        let identity = OrganizerIdentity {
+            email: "me@example.com".to_string(),
+            display_name: Some("Me".to_string()),
+        };
+        let alice = EmailAddress::new("alice@example.com".to_string());
+        let carol = EmailAddress::new("carol@example.com".to_string());
+        let meeting = event("Planning", vec![attendee("alice@example.com")]);
+
+        let (forward, notification) = forward_messages(&meeting, &identity, &[alice.clone(), carol.clone(), alice]);
+        assert!(notification.is_none(), "the organizer doesn't notify themselves");
+        let ics = forward.calendar_part.as_deref().unwrap();
+        let parsed = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), ics);
+        assert_eq!(
+            parsed[0].attendees.iter().filter(|a| a.address.address == "alice@example.com").count(),
+            1,
+            "an existing attendee isn't duplicated"
+        );
+        assert_eq!(parsed[0].attendees.iter().filter(|a| a.address.address == "carol@example.com").count(), 1);
+    }
+
+    #[test]
+    fn apply_counter_replaces_the_times_and_moves_the_sequence() {
+        let mut stored = event("Planning", vec![attendee("alice@example.com"), attendee("bob@example.com")]);
+        stored.sequence = 4;
+        let mut proposal = stored.clone();
+        proposal.start = "2026-08-14T15:00:00Z".parse().unwrap();
+        proposal.end = "2026-08-14T16:00:00Z".parse().unwrap();
+        proposal.time_zone = Some("Europe/Berlin".to_string());
+
+        apply_counter(&mut stored, &proposal);
+        assert_eq!(stored.start, proposal.start);
+        assert_eq!(stored.end, proposal.end);
+        assert_eq!(stored.time_zone.as_deref(), Some("Europe/Berlin"));
+        assert_eq!(stored.sequence, 5, "the update that follows sorts after the invitation");
+        assert_eq!(stored.attendees.len(), 2, "attendees are untouched");
+        assert_eq!(stored.organizer.as_ref().map(|o| o.address.as_str()), Some("me@example.com"));
     }
 
     #[test]

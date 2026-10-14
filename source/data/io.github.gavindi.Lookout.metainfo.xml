@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.191" date="2026-10-15">
+      <description>
+        <p>Meeting time proposals round-trip: propose a new time from an invitation with the new "Propose new time" button, and if you organize the meeting, a proposed time can be accepted in one click (everyone gets the update) or declined. Invitations and meetings in the calendar can also be forwarded to new people, who receive the meeting request while the organizer is notified.</p>
+      </description>
+    </release>
     <release version="0.9.190" date="2026-10-14">
       <description>
         <p>Deleting, archiving or snoozing a message now updates the folder pane's unread counts immediately, in step with the message list, instead of catching up a moment later. The server's own count is still checked right after, so the number stays correct.</p>

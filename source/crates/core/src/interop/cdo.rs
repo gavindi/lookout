@@ -11,8 +11,7 @@
 //!
 //! The remaining CDO property names are declared here so no feature code
 //! hard-codes them, but their parse/emit lands with the calendar items that
-//! consume them (all-day in 3.x, importance/sequence, and
-//! `X-MICROSOFT-DISALLOW-COUNTER` in CAL-17).
+//! consume them (all-day in 3.x and importance/sequence).
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -30,6 +29,26 @@ pub const X_MICROSOFT_CDO_IMPORTANCE: &str = "X-MICROSOFT-CDO-IMPORTANCE";
 pub const X_MICROSOFT_CDO_APPT_SEQUENCE: &str = "X-MICROSOFT-CDO-APPT-SEQUENCE";
 /// `X-MICROSOFT-DISALLOW-COUNTER` — `TRUE` hides "Propose new time" (CAL-17).
 pub const X_MICROSOFT_DISALLOW_COUNTER: &str = "X-MICROSOFT-DISALLOW-COUNTER";
+
+/// Whether an iCalendar document forbids time proposals
+/// (`X-MICROSOFT-DISALLOW-COUNTER:TRUE`, CAL-17). A plain line scan (the
+/// property line is short enough that RFC 5545 folding never touches it):
+/// unfolded continuation lines - which begin with a space or tab - are
+/// skipped so a folded free-text value can't spoof the property, parameters
+/// after the name are tolerated, and both the name and the `TRUE` value
+/// compare case-insensitively.
+pub fn disallow_counter(ics: &str) -> bool {
+    ics.lines().any(|line| {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return false;
+        }
+        let Some((before, value)) = line.split_once(':') else {
+            return false;
+        };
+        let name = before.split(';').next().unwrap_or(before);
+        name.trim().eq_ignore_ascii_case(X_MICROSOFT_DISALLOW_COUNTER) && value.trim().eq_ignore_ascii_case("TRUE")
+    })
+}
 
 /// A calendar item's full show-as state (Graph `showAs`). Richer than RFC
 /// 5545's `TRANSP`: `Tentative`, `Oof` and `WorkingElsewhere` all collapse to
@@ -152,5 +171,23 @@ mod tests {
     fn transparency_maps_back_to_the_binary_states() {
         assert_eq!(BusyStatus::from_transparency(EventTransparency::Busy), BusyStatus::Busy);
         assert_eq!(BusyStatus::from_transparency(EventTransparency::Free), BusyStatus::Free);
+    }
+
+    #[test]
+    fn disallow_counter_reads_the_true_value_case_insensitively() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nX-MICROSOFT-DISALLOW-COUNTER:true\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(disallow_counter(ics));
+        let parameterised = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nX-MICROSOFT-DISALLOW-COUNTER;X-PARAM=1: TRUE \r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(disallow_counter(parameterised));
+    }
+
+    #[test]
+    fn disallow_counter_ignores_absent_false_and_folded_text() {
+        let absent = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x@y\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(!disallow_counter(absent));
+        let falsy = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nX-MICROSOFT-DISALLOW-COUNTER:FALSE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(!disallow_counter(falsy));
+        let folded = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDESCRIPTION:line one\r\n X-MICROSOFT-DISALLOW-COUNTER:TRUE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(!disallow_counter(folded), "a folded continuation line can't spoof the property");
     }
 }

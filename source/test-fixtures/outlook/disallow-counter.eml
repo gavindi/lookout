@@ -1,0 +1,63 @@
+From: Ada Lovelace <ada@contoso.com>
+To: Bob Example <bob@example.com>
+Subject: Project kickoff
+Date: Mon, 03 Aug 2026 09:05:00 +0000
+Message-ID: <outlook-invite-disallow-counter-20260810@contoso.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="ol-invite-5"
+
+--ol-invite-5
+Content-Type: text/plain; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+You have been invited to the following event.
+
+Project kickoff
+Monday, August 10, 2026 10:00 AM - 11:00 AM
+Location: Meeting Room 3
+
+--ol-invite-5
+Content-Type: text/calendar; method=REQUEST; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+BEGIN:VCALENDAR
+METHOD:REQUEST
+PRODID:Microsoft Exchange Server 2019
+VERSION:2.0
+BEGIN:VTIMEZONE
+TZID:W. Europe Standard Time
+BEGIN:STANDARD
+DTSTART:16011001T030000
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:16010301T020000
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3
+END:DAYLIGHT
+END:VTIMEZONE
+BEGIN:VEVENT
+ORGANIZER;CN=Ada Lovelace:mailto:ada@contoso.com
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Bob Example:mailto:bob@example.com
+DESCRIPTION;LANGUAGE=en-US:You have been invited to the following event.
+UID:040000008200E00074C5B7101A82E00800000000A1B2C3D4E5F6A7B8
+SUMMARY;LANGUAGE=en-US:Project kickoff
+DTSTART;TZID=W. Europe Standard Time:20260810T100000
+DTEND;TZID=W. Europe Standard Time:20260810T110000
+LOCATION;LANGUAGE=en-US:Meeting Room 3
+X-MICROSOFT-CDO-BUSYSTATUS:BUSY
+X-MICROSOFT-CDO-INTENDEDSTATUS:BUSY
+X-MICROSOFT-CDO-ALLDAYEVENT:FALSE
+X-MICROSOFT-CDO-IMPORTANCE:1
+X-MICROSOFT-CDO-APPT-SEQUENCE:0
+X-MICROSOFT-DISALLOW-COUNTER:TRUE
+TRANSP:OPAQUE
+STATUS:CONFIRMED
+DTSTAMP:20260803T090500Z
+END:VEVENT
+END:VCALENDAR
+
+--ol-invite-5--

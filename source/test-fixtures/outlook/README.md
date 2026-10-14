@@ -13,6 +13,7 @@ behaviour rather than an interpretation of the specs.
 | `invite-update.eml` | An updated invitation: `SEQUENCE:1` / `X-MICROSOFT-CDO-APPT-SEQUENCE:1`, moved time and location. |
 | `cancel.eml` | iMIP `METHOD:CANCEL` with `STATUS:CANCELLED` and an incremented `SEQUENCE`. |
 | `counter.eml` | An attendee's iTIP `METHOD:COUNTER` proposing a new time (CAL-17). |
+| `disallow-counter.eml` | An invitation with `X-MICROSOFT-DISALLOW-COUNTER:TRUE`, which must hide "Propose new time" (CAL-17). |
 | `teams-invite.eml` | A Teams meeting: `X-MICROSOFT-SKYPETEAMSMEETINGURL`, `X-MICROSOFT-ONLINEMEETINGCONFLINK`, and the join link in `DESCRIPTION`/`LOCATION`. |
 | `importance-high.eml` | `Importance: High` + `X-Priority: 1 (Highest)` + `X-MSMail-Priority: High`, a `Sensitivity: Private`, and a `List-Id`. |
 | `sensitivity-private.eml` | RFC 2156 `Sensitivity: Company-Confidential`. |

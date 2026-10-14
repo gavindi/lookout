@@ -646,13 +646,16 @@ pub fn is_report_message(headers: &[(String, String)]) -> bool {
 /// The iMIP `METHOD` property (RFC 5546 §3.2): what an email carrying a
 /// `text/calendar` part asks the recipient to do. `REQUEST` is an invitation
 /// (or re-invitation), `REPLY` carries an attendee's RSVP back to the
-/// organizer, and `CANCEL` withdraws an event. The banner and its reply
-/// actions are keyed on this.
+/// organizer, `CANCEL` withdraws an event, `COUNTER` proposes a new time, and
+/// `DECLINECOUNTER` declines such a proposal (CAL-17). The banner and its
+/// reply actions are keyed on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ImipMethod {
     Request,
     Reply,
     Cancel,
+    Counter,
+    DeclineCounter,
 }
 
 /// Reads the `METHOD` property off an iCalendar document as
@@ -680,6 +683,8 @@ pub fn parse_imip_method(ics: &str) -> ImipMethod {
                 return match value {
                     "REPLY" => ImipMethod::Reply,
                     "CANCEL" => ImipMethod::Cancel,
+                    "COUNTER" => ImipMethod::Counter,
+                    "DECLINECOUNTER" => ImipMethod::DeclineCounter,
                     _ => ImipMethod::Request,
                 };
             }
@@ -722,6 +727,12 @@ pub struct ImipInvitation {
     /// The raw `RRULE` value (RFC 5545 `RECUR`) when the invitation is for a
     /// recurring event - the details card shows a "recurring" hint for it.
     pub rrule: Option<String>,
+    /// Outlook's `X-MICROSOFT-DISALLOW-COUNTER:TRUE` (CAL-17): the organizer
+    /// forbids time proposals, so the invite card hides "Propose new time".
+    pub disallow_counter: bool,
+    /// On a `COUNTER` (a proposed new time): the attendee who proposed - the
+    /// non-organizer `ATTENDEE` line, used as the `DECLINECOUNTER` recipient.
+    pub proposer: Option<EmailAddress>,
 }
 
 #[cfg(test)]
@@ -1016,6 +1027,12 @@ mod tests {
 
         let cancel = ics.replace("METHOD:REQUEST", "METHOD:CANCEL");
         assert_eq!(parse_imip_method(&cancel), ImipMethod::Cancel);
+
+        let counter = ics.replace("METHOD:REQUEST", "METHOD:COUNTER");
+        assert_eq!(parse_imip_method(&counter), ImipMethod::Counter);
+
+        let decline = ics.replace("METHOD:REQUEST", "METHOD:DECLINECOUNTER");
+        assert_eq!(parse_imip_method(&decline), ImipMethod::DeclineCounter);
     }
 
     #[test]

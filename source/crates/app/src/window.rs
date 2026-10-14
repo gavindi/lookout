@@ -7612,6 +7612,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let calendar_state = calendar_state.clone();
         let toast_overlay = toast_overlay.clone();
+        let reading_stack_for_banner = reading_stack.clone();
         imip_banner.connect_button_clicked(move |banner| {
             let (mailbox, uid, invitation, from_email, display_name, cmd_tx) = {
                 let st = state.borrow();
@@ -7705,6 +7706,51 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 lookout_core::ImipMethod::Reply => {
                     dismiss(&state, banner, &mailbox, uid);
+                }
+                lookout_core::ImipMethod::Counter => {
+                    // CAL-17: an attendee proposed a new time. Accepting
+                    // updates the meeting and mails everyone the update;
+                    // declining answers with a DECLINECOUNTER - the same two
+                    // decisions as the invite card's buttons.
+                    let dialog = adw::AlertDialog::builder()
+                        .heading(format!("New time proposed: {}", invitation.summary.as_deref().unwrap_or("an event")))
+                        .body("Accepting updates the meeting to the proposed time and sends it to everyone.")
+                        .default_response("accept")
+                        .close_response("cancel")
+                        .build();
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("decline", "Decline proposal");
+                    dialog.add_response("accept", "Accept proposal");
+                    dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
+                    dialog.set_response_appearance("decline", adw::ResponseAppearance::Destructive);
+                    let state_for_dialog = state.clone();
+                    let calendar_state_for_dialog = calendar_state.clone();
+                    let toast_overlay_for_dialog = toast_overlay.clone();
+                    let invitation_for_dialog = invitation.clone();
+                    let mailbox_for_dialog = mailbox.clone();
+                    let banner_for_dialog = banner.clone();
+                    let reading_stack_for_dialog = reading_stack_for_banner.clone();
+                    dialog.connect_response(None, move |_dialog, response| {
+                        let accepted = match response {
+                            "accept" => true,
+                            "decline" => false,
+                            _ => return,
+                        };
+                        let acted = if accepted {
+                            accept_counter_proposal(&state_for_dialog, &calendar_state_for_dialog, &toast_overlay_for_dialog, &invitation_for_dialog)
+                        } else {
+                            decline_counter_proposal(&state_for_dialog, &calendar_state_for_dialog, &toast_overlay_for_dialog, &invitation_for_dialog)
+                        };
+                        if acted {
+                            dismiss_imip(&state_for_dialog, &reading_stack_for_dialog, &mailbox_for_dialog, uid);
+                            banner_for_dialog.set_revealed(false);
+                        }
+                    });
+                    dialog.present(Some(banner));
+                }
+                lookout_core::ImipMethod::DeclineCounter => {
+                    // Informational: the organizer turned down our proposal.
+                    dismiss_imip(&state, &reading_stack_for_banner, &mailbox, uid);
                 }
             }
         });
@@ -14602,6 +14648,21 @@ fn open_event_editor_for(
                 delete_event_with_invites(&window, &state, &calendar_state, &toast_overlay, calendar_id, occ);
             }
         },
+        {
+            let window = window.clone();
+            let state = state.clone();
+            let calendar_state = calendar_state.clone();
+            let toast_overlay = toast_overlay.clone();
+            let forward_occ = occ.clone();
+            Some(Rc::new(move || {
+                let Some((identity, cmd_tx)) = invite_identity(&state, &calendar_state, &forward_occ.calendar_id) else {
+                    no_invite_sender_toast(&toast_overlay, "Meeting not forwarded");
+                    return;
+                };
+                let event = crate::calendar_invites::stored_event_from_occurrence(&forward_occ);
+                show_forward_meeting_dialog(window.upcast_ref(), &toast_overlay, &identity, &cmd_tx, &event);
+            }) as crate::event_editor::ForwardCallback)
+        },
     );
 }
 
@@ -14669,6 +14730,8 @@ fn show_new_event_editor(
                 delete_event_with_invites(&window, &state, &calendar_state, &toast_overlay, calendar_id, occ);
             }
         },
+        // A brand-new event isn't a received meeting - nothing to forward.
+        None,
     );
 }
 
@@ -16400,6 +16463,324 @@ fn open_imip_reply_composer(
     );
 }
 
+/// The rendered message's account as the iMIP sender identity.
+fn imip_identity(context: &ImipReplyContext) -> crate::calendar_invites::OrganizerIdentity {
+    crate::calendar_invites::OrganizerIdentity {
+        email: context.from_email.clone(),
+        display_name: (!context.display_name.trim().is_empty()).then(|| context.display_name.clone()),
+    }
+}
+
+/// Parses a rendered invitation's calendar payload into its event (the
+/// invitation, the proposal or the forwarded copy - the method lives in the
+/// document's `METHOD`, not the VEVENT).
+fn imip_event(invitation: &lookout_core::ImipInvitation) -> Option<CalendarEvent> {
+    lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), &invitation.ics).into_iter().next()
+}
+
+/// Applies an attendee's accepted time proposal (CAL-17): the stored
+/// organizer event takes the proposed time (`SEQUENCE++` via `apply_counter`)
+/// and is PUT back, and - where this client owns iTIP delivery - the update
+/// goes out to every attendee straight away, as Outlook does. An RFC 6638
+/// server-scheduled account just PUTs; the server schedules the update
+/// itself. Returns whether the proposal was applied (so the card retires).
+fn accept_counter_proposal(
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    invitation: &lookout_core::ImipInvitation,
+) -> bool {
+    let Some(proposal) = imip_event(invitation) else {
+        toast_overlay.add_toast(adw::Toast::new("Couldn't parse this proposal's calendar data."));
+        return false;
+    };
+    let Some(existing) = find_calendar_occurrence(calendar_state, &proposal.uid) else {
+        toast_overlay.add_toast(adw::Toast::new("This event isn't in your calendar."));
+        return false;
+    };
+    let identity = invite_identity(state, calendar_state, &existing.calendar_id);
+    if let Some((identity, _)) = &identity {
+        // Only the organizer may accept: a counter that reached someone else
+        // must not rewrite the meeting's times.
+        if !crate::calendar_invites::is_organizer(existing.organizer.as_ref(), &identity.email) {
+            toast_overlay.add_toast(adw::Toast::new("Only the organizer can accept a time proposal."));
+            return false;
+        }
+    }
+    let mut stored = crate::calendar_invites::stored_event_from_occurrence(&existing);
+    crate::calendar_invites::apply_counter(&mut stored, &proposal);
+    let delivery = crate::calendar_invites::delivery_for(&calendar_scheduling(calendar_state, &stored.calendar_id), stored.schedule_agent);
+    let Some(handle) = calendar_handle_for_id(calendar_state, &stored.calendar_id) else {
+        toast_overlay.add_toast(adw::Toast::new("Couldn't update the event in your calendar."));
+        return false;
+    };
+    let _ = handle.send_blocking(CalendarCommand::UpdateEvent { event: Box::new(stored.clone()) });
+    match (delivery, identity) {
+        (crate::calendar_invites::Delivery::Client, Some((identity, cmd_tx))) => {
+            send_invite(&cmd_tx, &identity, &stored, crate::calendar_invites::InviteKind::Update, toast_overlay, "New time accepted");
+        }
+        (crate::calendar_invites::Delivery::Client, None) => {
+            toast_overlay.add_toast(adw::Toast::new("New time accepted"));
+            no_invite_sender_toast(toast_overlay, "Update not sent");
+        }
+        (crate::calendar_invites::Delivery::Server, _) => {
+            toast_overlay.add_toast(adw::Toast::new("New time accepted"));
+        }
+    }
+    true
+}
+
+/// Turns down an attendee's time proposal (CAL-17): a `DECLINECOUNTER`
+/// carries the originally scheduled times back to the proposing attendee.
+/// The calendar itself is untouched - the meeting stays where it was.
+fn decline_counter_proposal(
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    invitation: &lookout_core::ImipInvitation,
+) -> bool {
+    let Some(proposal) = imip_event(invitation) else {
+        toast_overlay.add_toast(adw::Toast::new("Couldn't parse this proposal's calendar data."));
+        return false;
+    };
+    let Some(proposer) = invitation.proposer.clone() else {
+        toast_overlay.add_toast(adw::Toast::new("This proposal names no attendee to answer."));
+        return false;
+    };
+    let Some(existing) = find_calendar_occurrence(calendar_state, &proposal.uid) else {
+        toast_overlay.add_toast(adw::Toast::new("This event isn't in your calendar."));
+        return false;
+    };
+    let Some((identity, cmd_tx)) = invite_identity(state, calendar_state, &existing.calendar_id) else {
+        no_invite_sender_toast(toast_overlay, "Proposal not declined");
+        return false;
+    };
+    if !crate::calendar_invites::is_organizer(existing.organizer.as_ref(), &identity.email) {
+        toast_overlay.add_toast(adw::Toast::new("Only the organizer can decline a time proposal."));
+        return false;
+    }
+    let stored = crate::calendar_invites::stored_event_from_occurrence(&existing);
+    let message = crate::calendar_invites::decline_counter_message(&stored, &identity, &proposer);
+    let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+        message: Box::new(message),
+        not_before: None,
+        client_token: None,
+    });
+    toast_overlay.add_toast(adw::Toast::new("Proposal declined"));
+    true
+}
+
+/// A proposed slot as the plain-text proposal body names it ("Monday, August
+/// 10, 2026 4:00 PM - 5:00 PM"), rendered in the calendar's display zone.
+fn format_proposal_when(start: chrono::DateTime<chrono::Utc>, end: chrono::DateTime<chrono::Utc>) -> String {
+    let (start_local, end_local) = crate::calendar_tz::occurrence_span(crate::calendar_tz::display_zone(), start, end, false);
+    format!(
+        "{} {} - {}",
+        start_local.format("%A, %B %-d, %Y"),
+        start_local.format("%-I:%M %p"),
+        end_local.format("%-I:%M %p")
+    )
+}
+
+/// A proposed slot - the start and end instants in UTC - as the time-proposal
+/// dialog produces it.
+type ProposalSpan = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
+
+/// The attendee's "Propose new time" dialog (CAL-17): a date plus start/end
+/// times prefilled from the invited slot, accepted only while the span is
+/// valid. Sending builds the `METHOD:COUNTER` message (see
+/// `calendar_invites::counter_message`) and puts it in the outbox; the
+/// invitation card stays put - the meeting isn't in the calendar yet, and the
+/// organizer's update will settle it.
+fn show_propose_new_time_dialog(parent: &gtk::Widget, toast_overlay: &adw::ToastOverlay, context: &ImipReplyContext) {
+    let Some(organizer) = context.invitation.organizer.clone() else {
+        toast_overlay.add_toast(adw::Toast::new("This invitation names no organizer - can't propose a time."));
+        return;
+    };
+    let zone = crate::calendar_tz::display_zone();
+    let (invited_start, invited_end) = crate::calendar_tz::occurrence_span(zone, context.invitation.start, context.invitation.end, context.invitation.all_day);
+    // An all-day invitation has no wall-clock slots to prefill from; suggest
+    // a morning hour rather than midnight.
+    let (prefill_start, prefill_end) = if context.invitation.all_day {
+        let date = invited_start.date();
+        (date.and_hms_opt(9, 0, 0).unwrap(), date.and_hms_opt(10, 0, 0).unwrap())
+    } else {
+        (invited_start, invited_end)
+    };
+
+    let date = Rc::new(Cell::new(prefill_start.date()));
+    let calendar = gtk::Calendar::new();
+    crate::datetime_picker::set_calendar_date(&calendar, &date, prefill_start.date());
+    crate::datetime_picker::wire_calendar(&calendar, &date);
+    let start_hour = gtk::SpinButton::with_range(0.0, 23.0, 1.0);
+    let start_minute = gtk::SpinButton::with_range(0.0, 59.0, 1.0);
+    let end_hour = gtk::SpinButton::with_range(0.0, 23.0, 1.0);
+    let end_minute = gtk::SpinButton::with_range(0.0, 59.0, 1.0);
+    for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
+        spin.set_digits(0);
+        spin.set_width_chars(2);
+    }
+    start_hour.set_value(f64::from(prefill_start.hour()));
+    start_minute.set_value(f64::from(prefill_start.minute()));
+    end_hour.set_value(f64::from(prefill_end.hour()));
+    end_minute.set_value(f64::from(prefill_end.minute()));
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.append(&crate::datetime_picker::time_cluster("New time", &calendar, &start_hour, &start_minute));
+    let end_cluster = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+    end_cluster.append(&gtk::Label::builder().label("Ends").css_classes(["dim-label", "caption"]).xalign(0.0).build());
+    let end_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).build();
+    end_row.append(&end_hour);
+    end_row.append(&gtk::Label::builder().label(":").css_classes(["dim-label"]).build());
+    end_row.append(&end_minute);
+    end_cluster.append(&end_row);
+    content.append(&end_cluster);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Propose new time")
+        .body(format!(
+            "Propose a different time for \"{}\" to the organizer.",
+            context.invitation.summary.as_deref().unwrap_or("this event")
+        ))
+        .default_response("propose")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("propose", "Propose time");
+    dialog.set_response_appearance("propose", adw::ResponseAppearance::Suggested);
+    dialog.set_extra_child(Some(&content));
+
+    let chosen: Rc<dyn Fn() -> Option<ProposalSpan>> = {
+        let date = date.clone();
+        let start_hour = start_hour.clone();
+        let start_minute = start_minute.clone();
+        let end_hour = end_hour.clone();
+        let end_minute = end_minute.clone();
+        Rc::new(move || {
+            let start_time = chrono::NaiveTime::from_hms_opt(start_hour.value() as u32, start_minute.value() as u32, 0)?;
+            let end_time = chrono::NaiveTime::from_hms_opt(end_hour.value() as u32, end_minute.value() as u32, 0)?;
+            let start_naive = date.get().and_time(start_time);
+            let end_naive = date.get().and_time(end_time);
+            (end_naive > start_naive).then(|| (zone.resolve_local(start_naive), zone.resolve_local(end_naive)))
+        })
+    };
+    let refresh: Rc<dyn Fn()> = {
+        let dialog = dialog.clone();
+        let chosen = chosen.clone();
+        Rc::new(move || dialog.set_response_enabled("propose", chosen().is_some()))
+    };
+    refresh();
+    {
+        let refresh = refresh.clone();
+        calendar.connect_day_selected(move |_| refresh());
+    }
+    for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
+        let refresh = refresh.clone();
+        spin.connect_value_changed(move |_| refresh());
+    }
+    {
+        let invitation = context.invitation.clone();
+        let identity = imip_identity(context);
+        let cmd_tx = context.cmd_tx.clone();
+        let toast_overlay = toast_overlay.clone();
+        let chosen = chosen.clone();
+        dialog.connect_response(None, move |_dialog, response| {
+            if response != "propose" {
+                return;
+            }
+            let Some((start, end)) = chosen() else { return };
+            let Some(event) = imip_event(&invitation) else {
+                toast_overlay.add_toast(adw::Toast::new("Couldn't parse this invitation's calendar data."));
+                return;
+            };
+            let message = crate::calendar_invites::counter_message(&event, start, end, &identity, &organizer, &format_proposal_when(start, end), invitation.in_reply_to.clone());
+            let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+                message: Box::new(message),
+                not_before: None,
+                client_token: None,
+            });
+            toast_overlay.add_toast(adw::Toast::new("New time proposed"));
+        });
+    }
+    dialog.present(Some(parent));
+}
+
+/// The meeting-forward dialog (CAL-18): recipient chips, then a fresh
+/// `METHOD:REQUEST` to them and - unless the sender is the organizer - a
+/// plain notification to the organizer. The local copy is untouched; the
+/// forward is a mail, not an edit.
+fn show_forward_meeting_dialog(
+    parent: &gtk::Widget,
+    toast_overlay: &adw::ToastOverlay,
+    identity: &crate::calendar_invites::OrganizerIdentity,
+    cmd_tx: &async_channel::Sender<AccountCommand>,
+    event: &CalendarEvent,
+) {
+    let to_field = crate::recipient_entry::RecipientEntry::new("To");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.append(to_field.widget());
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Forward meeting")
+        .body(format!(
+            "Forward \"{}\" to new recipients. The organizer is told the meeting was forwarded.",
+            event.summary.as_deref().unwrap_or("this meeting")
+        ))
+        .default_response("forward")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("forward", "Forward");
+    dialog.set_response_appearance("forward", adw::ResponseAppearance::Suggested);
+    dialog.set_extra_child(Some(&content));
+    dialog.set_response_enabled("forward", false);
+    {
+        let dialog = dialog.clone();
+        let field = to_field.clone();
+        to_field.connect_addresses_changed(move || {
+            dialog.set_response_enabled("forward", !field.addresses().is_empty());
+        });
+    }
+    {
+        let to_field = to_field.clone();
+        let identity = identity.clone();
+        let cmd_tx = cmd_tx.clone();
+        let event = event.clone();
+        let toast_overlay = toast_overlay.clone();
+        dialog.connect_response(None, move |_dialog, response| {
+            if response != "forward" {
+                return;
+            }
+            to_field.commit_pending();
+            let recipients: Vec<EmailAddress> = to_field
+                .addresses()
+                .iter()
+                .filter(|token| crate::recipient_entry::is_plausible_address(token))
+                .map(|token| EmailAddress::new(crate::recipient_entry::address_of(token).to_string()))
+                .collect();
+            if recipients.is_empty() {
+                toast_overlay.add_toast(adw::Toast::new("Enter at least one valid address to forward the meeting."));
+                return;
+            }
+            let (forward, notification) = crate::calendar_invites::forward_messages(&event, &identity, &recipients);
+            let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+                message: Box::new(forward),
+                not_before: None,
+                client_token: None,
+            });
+            if let Some(notification) = notification {
+                let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+                    message: Box::new(notification),
+                    not_before: None,
+                    client_token: None,
+                });
+            }
+            toast_overlay.add_toast(adw::Toast::new("Meeting forwarded"));
+        });
+    }
+    dialog.present(Some(parent));
+}
+
 /// Builds and wires the invite card's response buttons (CAL-15 / UX-60):
 /// Accept, Tentative and Decline split buttons whose arrows each offer
 /// "Send response now", "Edit response before sending" and "Don't send a
@@ -16494,6 +16875,36 @@ fn build_imip_response_actions(
         });
     }
     group.add_action(&dont_send);
+    // CAL-17: the attendee's "Propose new time…" (hidden by the card when
+    // `X-MICROSOFT-DISALLOW-COUNTER` or no organizer is named).
+    let propose_time = gio::SimpleAction::new("propose-time", None);
+    {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        let toast_overlay = toast_overlay.clone();
+        propose_time.connect_activate(move |_, _| {
+            let Some(context) = imip_reply_context(&state) else { return };
+            show_propose_new_time_dialog(reading_stack.upcast_ref(), &toast_overlay, &context);
+        });
+    }
+    group.add_action(&propose_time);
+    // CAL-18: forward the meeting to new recipients (a fresh REQUEST plus a
+    // notification to the organizer).
+    let forward_meeting = gio::SimpleAction::new("forward-meeting", None);
+    {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        let toast_overlay = toast_overlay.clone();
+        forward_meeting.connect_activate(move |_, _| {
+            let Some(context) = imip_reply_context(&state) else { return };
+            let Some(event) = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), &context.invitation.ics).into_iter().next() else {
+                toast_overlay.add_toast(adw::Toast::new("Couldn't parse this invitation's calendar data."));
+                return;
+            };
+            show_forward_meeting_dialog(reading_stack.upcast_ref(), &toast_overlay, &imip_identity(&context), &context.cmd_tx, &event);
+        });
+    }
+    group.add_action(&forward_meeting);
     row.insert_action_group("respond", Some(&group));
 
     for (status, label, css) in [
@@ -16526,7 +16937,90 @@ fn build_imip_response_actions(
         }
         row.append(&button);
     }
+    // The Propose new time / Forward extras sit after the three responses,
+    // the way Outlook's Respond group trails its Accept/Tentative/Decline.
+    let propose_button = gtk::Button::builder().label("Propose new time").css_classes(["flat"]).build();
+    propose_button.set_widget_name("imip-propose-button");
+    propose_button.set_tooltip_text(Some("Propose new time"));
+    {
+        let group = group.clone();
+        propose_button.connect_clicked(move |_| {
+            group.activate_action("propose-time", None);
+        });
+    }
+    let forward_button = gtk::Button::builder().label("Forward").css_classes(["flat"]).build();
+    forward_button.set_widget_name("imip-forward-button");
+    forward_button.set_tooltip_text(Some("Forward meeting"));
+    {
+        let group = group.clone();
+        forward_button.connect_clicked(move |_| {
+            group.activate_action("forward-meeting", None);
+        });
+    }
+    row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    row.append(&propose_button);
+    row.append(&forward_button);
     card.append(&row);
+
+    // CAL-17: the organizer's decision on a proposed new time. A row of its
+    // own (the respond row is for invitations), shown only for a COUNTER.
+    let counter_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::Start)
+        .margin_top(2)
+        .build();
+    counter_row.set_widget_name("imip-counter-actions");
+    counter_row.set_visible(false);
+    let counter_group = gio::SimpleActionGroup::new();
+    let accept_proposal = gio::SimpleAction::new("accept-proposal", None);
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let reading_stack = reading_stack.clone();
+        accept_proposal.connect_activate(move |_, _| {
+            let Some(context) = imip_reply_context(&state) else { return };
+            if accept_counter_proposal(&state, &calendar_state, &toast_overlay, &context.invitation) {
+                dismiss_imip(&state, &reading_stack, &context.mailbox, context.uid);
+            }
+        });
+    }
+    counter_group.add_action(&accept_proposal);
+    let decline_proposal = gio::SimpleAction::new("decline-proposal", None);
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let reading_stack = reading_stack.clone();
+        decline_proposal.connect_activate(move |_, _| {
+            let Some(context) = imip_reply_context(&state) else { return };
+            if decline_counter_proposal(&state, &calendar_state, &toast_overlay, &context.invitation) {
+                dismiss_imip(&state, &reading_stack, &context.mailbox, context.uid);
+            }
+        });
+    }
+    counter_group.add_action(&decline_proposal);
+    counter_row.insert_action_group("counter", Some(&counter_group));
+    let accept_button = gtk::Button::with_label("Accept proposal");
+    accept_button.add_css_class("suggested-action");
+    {
+        let counter_group = counter_group.clone();
+        accept_button.connect_clicked(move |_| {
+            counter_group.activate_action("accept-proposal", None);
+        });
+    }
+    let decline_button = gtk::Button::with_label("Decline proposal");
+    decline_button.add_css_class("destructive-action");
+    {
+        let counter_group = counter_group.clone();
+        decline_button.connect_clicked(move |_| {
+            counter_group.activate_action("decline-proposal", None);
+        });
+    }
+    counter_row.append(&accept_button);
+    counter_row.append(&decline_button);
+    card.append(&counter_row);
 }
 
 /// The organizer cancelled an event (iMIP `METHOD:CANCEL`): removes the
@@ -22468,9 +22962,22 @@ fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<&lookout_co
     set_invite_row(&card, "imip-organizer-row", "imip-organizer", invitation.organizer.as_ref().map(format_imip_organizer));
     set_invite_row(&card, "imip-description-row", "imip-description", invitation.description.clone());
     // The response buttons (CAL-15) are for an invitation the user can
-    // answer - a REQUEST. CANCEL and REPLY keep the details-only card.
+    // answer - a REQUEST. CANCEL and REPLY keep the details-only card, while
+    // a COUNTER (a proposed new time, CAL-17) swaps the respond row for the
+    // organizer's accept/decline pair. The Propose/Forward extras follow the
+    // invitation's own constraints: no organizer means nothing to send to,
+    // and `X-MICROSOFT-DISALLOW-COUNTER` hides the proposal.
     if let Some(actions) = named_child_of(&card, "imip-respond-actions") {
         actions.set_visible(matches!(invitation.method, lookout_core::ImipMethod::Request));
+        if let Some(propose) = find_named_descendant(&actions, "imip-propose-button") {
+            propose.set_visible(!invitation.disallow_counter && invitation.organizer.is_some());
+        }
+        if let Some(forward) = find_named_descendant(&actions, "imip-forward-button") {
+            forward.set_visible(invitation.organizer.is_some());
+        }
+    }
+    if let Some(counter_actions) = named_child_of(&card, "imip-counter-actions") {
+        counter_actions.set_visible(matches!(invitation.method, lookout_core::ImipMethod::Counter));
     }
 }
 
@@ -25125,6 +25632,8 @@ fn render_body(
                         "Remove from calendar".to_string(),
                     ),
                     lookout_core::ImipMethod::Reply => (format!("RSVP update: {}", invitation.summary.as_deref().unwrap_or("an event")), "Dismiss".to_string()),
+                    lookout_core::ImipMethod::Counter => (format!("New time proposed: {}", invitation.summary.as_deref().unwrap_or("an event")), "Review…".to_string()),
+                    lookout_core::ImipMethod::DeclineCounter => (format!("Proposal declined: {}", invitation.summary.as_deref().unwrap_or("an event")), "Dismiss".to_string()),
                 },
                 _ => (String::new(), String::new()),
             };

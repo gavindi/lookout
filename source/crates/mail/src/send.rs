@@ -270,6 +270,8 @@ fn build_raw_message_inner(msg: &ComposedMessage, include_bcc: bool) -> (Vec<u8>
             lookout_core::ImipMethod::Request => "REQUEST",
             lookout_core::ImipMethod::Reply => "REPLY",
             lookout_core::ImipMethod::Cancel => "CANCEL",
+            lookout_core::ImipMethod::Counter => "COUNTER",
+            lookout_core::ImipMethod::DeclineCounter => "DECLINECOUNTER",
         };
         let calendar_type = ContentType::new("text/calendar").attribute("method", method);
         let text_part = MimePart::new("text/plain", MimeBodyPart::Text(msg.text_body.clone().into()));
