@@ -19,8 +19,8 @@
 //! The app registration also carries `Microsoft Graph` → `Mail.ReadWrite` and
 //! `MailboxSettings.ReadWrite` delegated permissions (alongside the Exchange
 //! Online IMAP/SMTP ones), requested only when a user explicitly opts a
-//! Microsoft 365 account into Outlook sync (pin mirroring - see `graph_pin.rs`
-//! - and the category master list - see `graph_categories.rs`) via
+//! Microsoft 365 account into Outlook sync (pin mirroring - see `graph_pin.rs` -
+//! and the category master list - see `graph_categories.rs`) via
 //! `ensure_graph_consent`. AAD v2 access tokens are
 //! single-resource, so a Graph-audience token is always minted separately
 //! from the Exchange-audience one - but the refresh token and the underlying

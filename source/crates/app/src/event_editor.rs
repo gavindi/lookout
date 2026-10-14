@@ -439,6 +439,18 @@ pub fn show_event_editor(
         .css_classes(["seamless-paned"])
         .build();
 
+    // --- The Tracking page (item 3.6 / CAL-16): Outlook's per-attendee
+    // response list, swapped in by the top bar's Tracking toggle. Only a
+    // meeting that already has invitees has anything to track.
+    let editor_stack = gtk::Stack::new();
+    editor_stack.add_named(&main_paned, Some("form"));
+    let has_tracking = existing.as_ref().is_some_and(|occ| !occ.attendees.is_empty());
+    if let Some(occ) = existing.as_ref().filter(|occ| !occ.attendees.is_empty()) {
+        let tracking_page = build_tracking_page(occ, prefill.owner_email.as_deref());
+        editor_stack.add_named(&tracking_page, Some("tracking"));
+    }
+    editor_stack.set_visible_child_name("form");
+
     // --- Top action row: Cancel/Save plus the toolbar-style controls the
     // reference layout groups above the fields (Series, Busy, Categorize,
     // Reminder, Sensitivity), with Print/Options as disabled placeholders -
@@ -491,6 +503,18 @@ pub fn show_event_editor(
     let print_button = gtk::Button::from_icon_name("printer-symbolic");
     print_button.set_tooltip_text(Some("Print"));
 
+    // Tracking (item 3.6 / CAL-16): a toggle that swaps the form/preview for
+    // the per-attendee response list. Display-only, so it stays usable on a
+    // read-only event; hidden when there are no invitees to track.
+    let tracking_button = gtk::ToggleButton::builder().label("Tracking").tooltip_text("Tracking").valign(gtk::Align::Center).build();
+    tracking_button.set_visible(has_tracking);
+    {
+        let editor_stack = editor_stack.clone();
+        tracking_button.connect_toggled(move |button| {
+            editor_stack.set_visible_child_name(if button.is_active() { "tracking" } else { "form" });
+        });
+    }
+
     let delete_button = gtk::Button::from_icon_name(themed_icon("user-trash-symbolic", &["edit-delete-symbolic"]));
     delete_button.add_css_class("destructive-action");
     delete_button.set_tooltip_text(Some("Delete"));
@@ -517,6 +541,7 @@ pub fn show_event_editor(
     top_bar.append(&reminder_dropdown);
     top_bar.append(&sensitivity_dropdown);
     top_bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    top_bar.append(&tracking_button);
     top_bar.append(&options_button);
     top_bar.append(&print_button);
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -526,7 +551,7 @@ pub fn show_event_editor(
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&top_bar);
-    toolbar_view.set_content(Some(&main_paned));
+    toolbar_view.set_content(Some(&editor_stack));
     dialog.set_content(Some(&toolbar_view));
 
     // --- Prefill text fields from the edited occurrence.
@@ -892,6 +917,132 @@ fn name_of(token: &str) -> Option<String> {
     let open = token.find('<')?;
     let name = token[..open].trim().trim_matches('"').trim();
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Response counts for a meeting's attendee list (item 3.6 / CAL-16), the
+/// summary line above Outlook's Tracking list.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AttendeeResponses {
+    accepted: usize,
+    tentative: usize,
+    declined: usize,
+    no_response: usize,
+}
+
+fn attendee_responses(attendees: &[Attendee]) -> AttendeeResponses {
+    let mut counts = AttendeeResponses::default();
+    for attendee in attendees {
+        match attendee.status {
+            AttendeeStatus::Accepted => counts.accepted += 1,
+            AttendeeStatus::Tentative => counts.tentative += 1,
+            AttendeeStatus::Declined => counts.declined += 1,
+            AttendeeStatus::NeedsAction => counts.no_response += 1,
+        }
+    }
+    counts
+}
+
+fn attendee_responses_summary(counts: &AttendeeResponses) -> String {
+    format!(
+        "{} accepted · {} tentative · {} declined · {} no response",
+        counts.accepted, counts.tentative, counts.declined, counts.no_response
+    )
+}
+
+fn attendee_status_label(status: AttendeeStatus) -> &'static str {
+    match status {
+        AttendeeStatus::Accepted => "Accepted",
+        AttendeeStatus::Tentative => "Tentative",
+        AttendeeStatus::Declined => "Declined",
+        AttendeeStatus::NeedsAction => "No response",
+    }
+}
+
+fn attendee_status_icon(status: AttendeeStatus) -> (&'static str, &'static [&'static str]) {
+    match status {
+        AttendeeStatus::Accepted => ("emblem-ok-symbolic", &["object-select-symbolic"]),
+        AttendeeStatus::Tentative => ("dialog-question-symbolic", &["help-about-symbolic"]),
+        AttendeeStatus::Declined => ("window-close-symbolic", &["process-stop-symbolic"]),
+        AttendeeStatus::NeedsAction => ("appointment-soon-symbolic", &["alarm-symbolic"]),
+    }
+}
+
+/// The editor's Tracking page (item 3.6 / CAL-16): the organizer row, one row
+/// per attendee carrying their stored `PARTSTAT`, and the response counts
+/// above. The statuses are the occurrence snapshot the editor opened with; a
+/// later server resync is reflected by reopening the editor.
+fn build_tracking_page(occurrence: &EventOccurrence, owner_email: Option<&str>) -> gtk::ScrolledWindow {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let heading = gtk::Label::builder().label("Tracking").xalign(0.0).css_classes(["title-4"]).build();
+    content.append(&heading);
+    let counts = attendee_responses(&occurrence.attendees);
+    content.append(
+        &gtk::Label::builder()
+            .label(attendee_responses_summary(&counts))
+            .xalign(0.0)
+            .css_classes(["dim-label"])
+            .build(),
+    );
+
+    let group = adw::PreferencesGroup::new();
+    if let Some(organizer) = occurrence.organizer.as_ref() {
+        let title = organizer.name.as_deref().map(str::trim).filter(|name| !name.is_empty()).unwrap_or(&organizer.address);
+        let row = adw::ActionRow::builder()
+            .title(gtk::glib::markup_escape_text(title))
+            .subtitle(gtk::glib::markup_escape_text(&organizer.address))
+            .build();
+        row.add_suffix(&gtk::Label::builder().label("Organizer").css_classes(["dim-label"]).build());
+        group.add(&row);
+    }
+    for attendee in &occurrence.attendees {
+        let named = attendee.address.name.as_deref().map(str::trim).is_some_and(|name| !name.is_empty());
+        let title = if named {
+            attendee.address.name.as_deref().unwrap_or_default().trim()
+        } else {
+            &attendee.address.address
+        };
+        let mut subtitle_parts = Vec::new();
+        if named {
+            subtitle_parts.push(attendee.address.address.clone());
+        }
+        if attendee.role == AttendeeRole::Optional {
+            subtitle_parts.push("Optional".to_string());
+        }
+        if owner_email.is_some_and(|owner| owner.eq_ignore_ascii_case(&attendee.address.address)) {
+            subtitle_parts.push("You".to_string());
+        }
+        let row = adw::ActionRow::builder().title(gtk::glib::markup_escape_text(title)).build();
+        if !subtitle_parts.is_empty() {
+            row.set_subtitle(&gtk::glib::markup_escape_text(&subtitle_parts.join(" · ")));
+        }
+        row.add_suffix(&tracking_status_widget(attendee.status));
+        group.add(&row);
+    }
+    content.append(&group);
+
+    gtk::ScrolledWindow::builder()
+        .child(&content)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build()
+}
+
+/// The suffix widget for one attendee's response: a status icon plus the
+/// Outlook wording (UX-60's terms, no "Maybe").
+fn tracking_status_widget(status: AttendeeStatus) -> gtk::Widget {
+    let (icon_name, fallbacks) = attendee_status_icon(status);
+    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).valign(gtk::Align::Center).build();
+    row.append(&gtk::Image::from_icon_name(themed_icon(icon_name, fallbacks)));
+    row.append(&gtk::Label::builder().label(attendee_status_label(status)).css_classes(["dim-label"]).build());
+    row.upcast()
 }
 
 /// `month_occurrences` filtered to whatever touches `day`, with the entry
@@ -1399,15 +1550,15 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         .iter()
         .map(|token| {
             let address = address_of(token).to_string();
-            let status = input
-                .existing_attendees
-                .iter()
-                .find(|a| a.address.address.eq_ignore_ascii_case(&address))
-                .map(|a| a.status)
-                .unwrap_or(AttendeeStatus::NeedsAction);
+            // An attendee that survives the edit keeps both its role and its
+            // response (CAL-16's tracking would otherwise be rewritten by any
+            // save: an Optional guest was being promoted to Required).
+            let existing = input.existing_attendees.iter().find(|a| a.address.address.eq_ignore_ascii_case(&address));
+            let status = existing.map(|a| a.status).unwrap_or(AttendeeStatus::NeedsAction);
+            let role = existing.map(|a| a.role).unwrap_or(AttendeeRole::Required);
             Attendee {
                 address: EmailAddress { name: name_of(token), address },
-                role: AttendeeRole::Required,
+                role,
                 status,
             }
         })
@@ -1647,6 +1798,59 @@ mod tests {
         }];
         let event = build_event_from_input(input).unwrap();
         assert_eq!(event.attendees[0].status, AttendeeStatus::Accepted);
+    }
+
+    #[test]
+    fn preserves_existing_attendee_role() {
+        // CAL-16: tracking shows who's Required and who's Optional, so a save
+        // must not silently promote an optional guest.
+        let mut input = base_input();
+        input.attendee_tokens = vec!["bob@example.com".to_string(), "carol@example.com".to_string()];
+        input.existing_attendees = vec![Attendee {
+            address: EmailAddress::new("bob@example.com"),
+            role: AttendeeRole::Optional,
+            status: AttendeeStatus::Tentative,
+        }];
+        let event = build_event_from_input(input).unwrap();
+        assert_eq!(event.attendees[0].role, AttendeeRole::Optional);
+        assert_eq!(event.attendees[1].role, AttendeeRole::Required, "a new attendee is Required by default");
+    }
+
+    #[test]
+    fn attendee_responses_count_and_summarise_every_status() {
+        let attendee = |status| Attendee {
+            address: EmailAddress::new("someone@example.com".to_string()),
+            role: AttendeeRole::Required,
+            status,
+        };
+        let attendees = vec![
+            attendee(AttendeeStatus::Accepted),
+            attendee(AttendeeStatus::Accepted),
+            attendee(AttendeeStatus::Tentative),
+            attendee(AttendeeStatus::Declined),
+            attendee(AttendeeStatus::NeedsAction),
+            attendee(AttendeeStatus::NeedsAction),
+        ];
+        let counts = attendee_responses(&attendees);
+        assert_eq!(
+            counts,
+            AttendeeResponses {
+                accepted: 2,
+                tentative: 1,
+                declined: 1,
+                no_response: 2
+            }
+        );
+        assert_eq!(attendee_responses_summary(&counts), "2 accepted · 1 tentative · 1 declined · 2 no response");
+        assert_eq!(attendee_responses(&[]), AttendeeResponses::default(), "an empty list summarises to zeroes");
+    }
+
+    #[test]
+    fn attendee_status_labels_use_outlook_wording() {
+        assert_eq!(attendee_status_label(AttendeeStatus::NeedsAction), "No response");
+        assert_eq!(attendee_status_label(AttendeeStatus::Tentative), "Tentative", "never the old \"Maybe\"");
+        assert_eq!(attendee_status_label(AttendeeStatus::Accepted), "Accepted");
+        assert_eq!(attendee_status_label(AttendeeStatus::Declined), "Declined");
     }
 
     #[test]

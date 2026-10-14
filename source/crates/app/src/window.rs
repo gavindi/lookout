@@ -10,9 +10,8 @@ use adw::prelude::*;
 use chrono::{Datelike, Timelike};
 use gtk::{gio, glib};
 use lookout_core::{
-    display_name, AccountId, Attendee, AttendeeRole, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody,
-    EmailSummary, EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SchedulingInfo, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, UidValidity, VCard,
-    WebcalSubscription,
+    display_name, AccountId, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody, EmailSummary,
+    EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SchedulingInfo, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, UidValidity, VCard, WebcalSubscription,
 };
 use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
@@ -1249,6 +1248,17 @@ pub(crate) struct UiState {
     /// Cleared on every navigation, so returning to the message later shows
     /// the banner again.
     imip_dismissed: Option<(MailboxId, Uid)>,
+    /// The `(mailbox, uid)` of every REPLY message whose `PARTSTAT`s have
+    /// already been applied to the stored organizer event (item 3.6 /
+    /// CAL-16). `render_body` re-runs on navigation, so without this the
+    /// same reply would be merged and PUT again before the resync lands.
+    imip_replies_applied: HashSet<(MailboxId, Uid)>,
+    /// A back-reference to the shared calendar state, filled once
+    /// `build_window` has built it. `render_body` applies incoming iMIP
+    /// replies to the stored organizer event through here, without every
+    /// render path having to thread the calendar handle through (the same
+    /// shape as `toast_overlay`).
+    calendar_state: Option<Rc<RefCell<CalendarUiState>>>,
     /// The addresses a read receipt for the message currently on the reading
     /// pane should go to - parsed from its `Disposition-Notification-To`
     /// header by `render_body`, read by the banner's button handler and the
@@ -2684,6 +2694,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         unsubscribe_dismissed: None,
         imip: None,
         imip_dismissed: None,
+        imip_replies_applied: HashSet::new(),
+        calendar_state: None,
         read_receipt_request: None,
         read_receipt_dismissed: None,
         read_receipts_sent: HashSet::new(),
@@ -4496,9 +4508,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `text/calendar` parts), between the header and the body like the
     // unsubscribe banner: revealed by `render_body` when the message carries
     // an iMIP payload the user hasn't dismissed, hidden otherwise. Its button
-    // opens the per-method action dialog (REQUEST: Accept/Maybe/Decline,
+    // opens the per-method action dialog (REQUEST: Accept/Tentative/Decline,
     // CANCEL: remove-from-calendar confirm, REPLY: plain dismiss) - see the
-    // handler registered once `calendar_state` exists below.
+    // handler registered once `calendar_state` exists below. The invite card
+    // above carries the same three responses as split buttons with
+    // "Edit response before sending" / "Don't send a response" variants
+    // (CAL-15).
     let imip_banner = adw::Banner::new("Invitation");
     imip_banner.set_widget_name("imip-banner");
     imip_banner.set_button_label(Some("Respond…"));
@@ -7242,6 +7257,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mail_overview_activate: None,
         mail_overview_refresh: None,
     }));
+    // The calendar handle `render_body` reaches for when an incoming iMIP
+    // REPLY arrives (item 3.6): stored on `UiState` so the reply can be
+    // applied without every render path carrying a calendar reference.
+    state.borrow_mut().calendar_state = Some(calendar_state.clone());
 
     // --- Lookout dashboard refresh hook: the window registers one closure
     // that repaints the whole dashboard, and hands it to the mail sessions
@@ -7623,7 +7642,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         .build();
                     dialog.add_response("cancel", "Cancel");
                     dialog.add_response("decline", "Decline");
-                    dialog.add_response("tentative", "Maybe");
+                    dialog.add_response("tentative", "Tentative");
                     dialog.add_response("accept", "Accept");
                     dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
                     dialog.set_response_appearance("decline", adw::ResponseAppearance::Destructive);
@@ -7652,6 +7671,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             Some(display_name_for_dialog.as_str()),
                             &cmd_tx_for_dialog,
                             status,
+                            true,
+                            None,
                         );
                         state_for_dialog.borrow_mut().imip_dismissed = Some((mailbox_for_dialog.clone(), uid));
                         banner_for_dialog.set_revealed(false);
@@ -7688,6 +7709,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
+    // The invite card's own response buttons (CAL-15 / UX-60): wired here,
+    // where the calendar state exists, with the same per-message lookups the
+    // banner dialog above uses. `render_invite_card` shows the row for an
+    // un-dismissed REQUEST only.
+    build_imip_response_actions(&state, &calendar_state, &toast_overlay, &worker, &reading_stack);
     // Which single day the Mail-screen overview pane's day list is
     // currently showing - separate from `calendar_state.displayed_month`
     // (that's the main Calendar view's own concern).
@@ -16130,11 +16156,14 @@ fn find_calendar_occurrence(calendar_state: &Rc<RefCell<CalendarUiState>>, uid: 
 }
 
 /// The user's answer to an iMIP invitation (REQUEST): sends the RFC 6047
-/// `METHOD:REPLY` email back to the organizer with the chosen `PARTSTAT`, and
-/// best-effort saves the event into the account's default calendar, upserting
-/// by UID so accepting a re-invitation updates the existing booking rather
-/// than duplicating it. The reply is the primary action: a missing or busy
-/// calendar setup is a toast, not a blocked send.
+/// `METHOD:REPLY` email back to the organizer with the chosen `PARTSTAT` and
+/// an optional comment (CAL-15), and best-effort saves the event into the
+/// account's default calendar, upserting by UID so accepting a re-invitation
+/// updates the existing booking rather than duplicating it. With
+/// `send_response: false` (the card's "Don't send a response") the calendar
+/// answer still applies but no mail goes out. The reply is the primary
+/// action: a missing or busy calendar setup is a toast, not a blocked send.
+#[allow(clippy::too_many_arguments)]
 fn respond_to_imip_invitation(
     calendar_state: &Rc<RefCell<CalendarUiState>>,
     toast_overlay: &adw::ToastOverlay,
@@ -16143,58 +16172,46 @@ fn respond_to_imip_invitation(
     display_name: Option<&str>,
     cmd_tx: &async_channel::Sender<AccountCommand>,
     status: AttendeeStatus,
+    send_response: bool,
+    comment: Option<&str>,
 ) {
-    let Some(organizer) = &invitation.organizer else {
-        toast_overlay.add_toast(adw::Toast::new("This invitation names no organizer - can't send a reply."));
-        return;
-    };
-    let Some(mut event) = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), &invitation.ics).into_iter().next() else {
+    let Some(event) = crate::calendar_invites::reply_event(&invitation.ics, from_email, status) else {
         toast_overlay.add_toast(adw::Toast::new("Couldn't parse this invitation's calendar data."));
         return;
     };
-    // Stamp the user's own PARTSTAT onto their ATTENDEE line (the organizer's
-    // client reads the reply from exactly this); a self-signed invitation
-    // that omitted the recipient entirely gets an ATTENDEE added.
-    match event.attendees.iter_mut().find(|attendee| attendee.address.address.eq_ignore_ascii_case(from_email)) {
-        Some(attendee) => attendee.status = status,
-        None => event.attendees.push(Attendee {
-            address: EmailAddress::new(from_email.to_string()),
-            role: AttendeeRole::Required,
-            status,
-        }),
+    if send_response {
+        let Some(organizer) = &invitation.organizer else {
+            toast_overlay.add_toast(adw::Toast::new("This invitation names no organizer - can't send a reply."));
+            return;
+        };
+        let identity = crate::calendar_invites::OrganizerIdentity {
+            email: from_email.to_string(),
+            display_name: display_name.map(str::to_string).filter(|name| !name.trim().is_empty()),
+        };
+        let message = crate::calendar_invites::build_imip_message(
+            &event,
+            lookout_core::ImipMethod::Reply,
+            &identity,
+            vec![organizer.address.clone()],
+            crate::calendar_invites::reply_subject(status, invitation.summary.as_deref()),
+            crate::calendar_invites::reply_text_body(status, comment),
+            invitation.in_reply_to.clone(),
+        );
+        let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
+            message: Box::new(message),
+            not_before: None,
+            client_token: None,
+        });
     }
-    let (subject_prefix, toast) = match status {
-        AttendeeStatus::Accepted => ("Accepted", "Invitation accepted"),
-        AttendeeStatus::Tentative => ("Tentatively accepted", "Marked as tentative"),
-        AttendeeStatus::Declined => ("Declined", "Invitation declined"),
-        AttendeeStatus::NeedsAction => ("Replied", "Reply sent"),
-    };
-    let subject = match &invitation.summary {
-        Some(summary) => format!("{subject_prefix}: {summary}"),
-        None => subject_prefix.to_string(),
-    };
-    let identity = crate::calendar_invites::OrganizerIdentity {
-        email: from_email.to_string(),
-        display_name: display_name.map(str::to_string).filter(|name| !name.trim().is_empty()),
-    };
-    let message = crate::calendar_invites::build_imip_message(
-        &event,
-        lookout_core::ImipMethod::Reply,
-        &identity,
-        vec![organizer.address.clone()],
-        subject,
-        format!("{subject_prefix}."),
-        invitation.in_reply_to.clone(),
-    );
-    let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
-        message: Box::new(message),
-        not_before: None,
-        client_token: None,
-    });
-    toast_overlay.add_toast(adw::Toast::new(toast));
+    toast_overlay.add_toast(adw::Toast::new(crate::calendar_invites::reply_toast(status, send_response)));
+    save_replied_event(calendar_state, toast_overlay, event);
+}
 
-    // Best-effort calendar write: the reply already went out, so a missing
-    // calendar (or a failed save) is a warning, never a blocker.
+/// Best-effort save of a responded-to invitation: writes over the stored
+/// object when one exists under the same UID, otherwise creates it in the
+/// default calendar. The reply mail (when one was sent) already went out, so
+/// a missing or busy calendar is a warning, never a blocker.
+fn save_replied_event(calendar_state: &Rc<RefCell<CalendarUiState>>, toast_overlay: &adw::ToastOverlay, mut event: CalendarEvent) {
     let Some(default_calendar) = default_pickable_calendar(calendar_state) else {
         toast_overlay.add_toast(adw::Toast::new("Connect a calendar account to save the event."));
         return;
@@ -16214,6 +16231,302 @@ fn respond_to_imip_invitation(
             route_calendar_save(calendar_state, event.calendar_id.clone(), event);
         }
     }
+}
+
+/// Everything a card response action needs from the rendered message: the
+/// parsed invitation, the receiving identity and its mail session, and the
+/// message key used to retire the card/banner once answered.
+struct ImipReplyContext {
+    invitation: lookout_core::ImipInvitation,
+    from_email: String,
+    display_name: String,
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    account_id: AccountId,
+    mailbox: MailboxId,
+    uid: Uid,
+}
+
+/// Resolves the rendered message's iMIP context at the moment a card action
+/// fires - the same per-message state the banner handler reads on click.
+fn imip_reply_context(state: &Rc<RefCell<UiState>>) -> Option<ImipReplyContext> {
+    let st = state.borrow();
+    let (mailbox, uid) = st.rendered_message.clone()?;
+    let invitation = st.imip.clone()?;
+    let account_id = mailbox_account_id(&mailbox)?;
+    let handle = st.accounts.get(&account_id)?;
+    Some(ImipReplyContext {
+        invitation,
+        from_email: handle.email.clone(),
+        display_name: handle.display_name.clone(),
+        cmd_tx: handle.cmd_tx.clone(),
+        account_id,
+        mailbox,
+        uid,
+    })
+}
+
+/// Retires the invitation surfaces for one message: the banner and card hide
+/// now, and the message stays dismissed across re-renders, exactly as when
+/// the banner's response dialog was answered.
+fn dismiss_imip(state: &Rc<RefCell<UiState>>, reading_stack: &gtk::Stack, mailbox: &MailboxId, uid: Uid) {
+    state.borrow_mut().imip_dismissed = Some((mailbox.clone(), uid));
+    if let Some(banner) = find_named_child(reading_stack, "imip-banner").and_then(|child| child.downcast::<adw::Banner>().ok()) {
+        banner.set_revealed(false);
+    }
+    render_invite_card(reading_stack, None);
+}
+
+/// Applies an incoming iMIP REPLY to the stored organizer event (item 3.6 /
+/// CAL-16): the replying attendees' `PARTSTAT`s are merged onto the calendar
+/// object and PUT back. Only an organizer's own copy is updated, and only
+/// when this client owns iTIP delivery - on an RFC 6638-scheduled account the
+/// server applies responses itself (the mail is informational there). Runs
+/// when a REPLY message is rendered (its body is only fetched when opened),
+/// and `UiState::imip_replies_applied` keeps a re-render from writing twice.
+fn apply_incoming_imip_reply(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, invitation: &lookout_core::ImipInvitation) {
+    let Some(reply_event) = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), &invitation.ics).into_iter().next() else {
+        return;
+    };
+    let Some(existing) = find_calendar_occurrence(calendar_state, &reply_event.uid) else {
+        return;
+    };
+    // A reply only changes the organizer's copy.
+    let Some((identity, _)) = invite_identity(state, calendar_state, &existing.calendar_id) else {
+        return;
+    };
+    if !crate::calendar_invites::is_organizer(existing.organizer.as_ref(), &identity.email) {
+        return;
+    }
+    // With server-side scheduling the calendar server applies replies itself
+    // (RFC 6638); writing the same change from here would race it.
+    let scheduling = calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .find(|handle| handle.calendars.iter().any(|calendar| calendar.id == existing.calendar_id))
+        .map(|handle| handle.scheduling.clone());
+    if scheduling.is_some_and(|scheduling| crate::calendar_invites::delivery_for(&scheduling, existing.schedule_agent) == crate::calendar_invites::Delivery::Server) {
+        return;
+    }
+    // Rebuild the master and merge just the PARTSTATs; a reply that repeats
+    // what the stored event already says changes nothing and skips the PUT.
+    let mut stored = crate::calendar_invites::stored_event_from_occurrence(&existing);
+    if !crate::calendar_invites::merge_reply_statuses(&mut stored, &reply_event) {
+        return;
+    }
+    let handle = calendar_handle_for_id(calendar_state, &stored.calendar_id);
+    let _ = handle.map(|handle| handle.send_blocking(CalendarCommand::UpdateEvent { event: Box::new(stored) }));
+}
+
+/// The card actions' stable string parameter for one answer.
+fn response_status_param(status: AttendeeStatus) -> &'static str {
+    match status {
+        AttendeeStatus::Accepted => "accepted",
+        AttendeeStatus::Tentative => "tentative",
+        AttendeeStatus::Declined => "declined",
+        AttendeeStatus::NeedsAction => "needs-action",
+    }
+}
+
+fn response_status_from_param(param: &str) -> Option<AttendeeStatus> {
+    match param {
+        "accepted" => Some(AttendeeStatus::Accepted),
+        "tentative" => Some(AttendeeStatus::Tentative),
+        "declined" => Some(AttendeeStatus::Declined),
+        _ => None,
+    }
+}
+
+/// Opens the full-window composer for an invitation response (CAL-15): prefilled
+/// with the organizer, the status line and the RFC 6047 REPLY's calendar part,
+/// so the user can add a comment before sending. The local calendar answer is
+/// saved when Send fires (see `ImipReplySend`), not when the composer opens -
+/// cancelling the composer must leave the calendar untouched.
+fn open_imip_reply_composer(
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    worker: &Rc<Worker>,
+    reading_stack: &gtk::Stack,
+    context: &ImipReplyContext,
+    status: AttendeeStatus,
+) {
+    let Some(organizer) = context.invitation.organizer.clone() else {
+        toast_overlay.add_toast(adw::Toast::new("This invitation names no organizer - can't send a reply."));
+        return;
+    };
+    let Some(event) = crate::calendar_invites::reply_event(&context.invitation.ics, &context.from_email, status) else {
+        toast_overlay.add_toast(adw::Toast::new("Couldn't parse this invitation's calendar data."));
+        return;
+    };
+    let recipient = match organizer.name.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{name} <{}>", organizer.address),
+        None => organizer.address.clone(),
+    };
+    let prefill = crate::compose::ComposePrefill {
+        to: Some(recipient),
+        subject: Some(crate::calendar_invites::reply_subject(status, context.invitation.summary.as_deref())),
+        body: Some(crate::calendar_invites::reply_text_body(status, None)),
+        calendar_part: Some(lookout_dav::build_imip_vcalendar(&event, lookout_core::ImipMethod::Reply)),
+        in_reply_to: context.invitation.in_reply_to.clone(),
+        ..Default::default()
+    };
+    let on_applied = {
+        let state = state.clone();
+        let reading_stack = reading_stack.clone();
+        let mailbox = context.mailbox.clone();
+        let uid = context.uid;
+        Rc::new(move || dismiss_imip(&state, &reading_stack, &mailbox, uid))
+    };
+    show_composer_in_reading_pane_full(
+        state,
+        worker,
+        reading_stack,
+        "Reply to invitation",
+        context.cmd_tx.clone(),
+        prefill,
+        // The calendar part replaces any HTML at send time, so plain text is
+        // the one body the user can actually verify before sending.
+        false,
+        Some(context.account_id.clone()),
+        None,
+        Some(ImipReplySend {
+            calendar_state: calendar_state.clone(),
+            toast_overlay: toast_overlay.clone(),
+            event,
+            on_applied,
+        }),
+        true,
+    );
+}
+
+/// Builds and wires the invite card's response buttons (CAL-15 / UX-60):
+/// Accept, Tentative and Decline split buttons whose arrows each offer
+/// "Send response now", "Edit response before sending" and "Don't send a
+/// response". One action group carries the nine menu items, with the answer
+/// as the action's string parameter; `render_invite_card` shows the row only
+/// for an un-dismissed REQUEST.
+fn build_imip_response_actions(
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    worker: &Rc<Worker>,
+    reading_stack: &gtk::Stack,
+) {
+    let Some(card) = find_named_child(reading_stack, "imip-invite-card").and_then(|child| child.downcast::<gtk::Box>().ok()) else {
+        return;
+    };
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::Start)
+        .margin_top(2)
+        .build();
+    row.set_widget_name("imip-respond-actions");
+    row.set_visible(false);
+
+    let group = gio::SimpleActionGroup::new();
+    let send_now = gio::SimpleAction::new("send-now", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let reading_stack = reading_stack.clone();
+        send_now.connect_activate(move |_, parameter| {
+            let Some(status) = parameter.and_then(|value| value.str()).and_then(response_status_from_param) else {
+                return;
+            };
+            let Some(context) = imip_reply_context(&state) else { return };
+            respond_to_imip_invitation(
+                &calendar_state,
+                &toast_overlay,
+                &context.invitation,
+                &context.from_email,
+                Some(context.display_name.as_str()),
+                &context.cmd_tx,
+                status,
+                true,
+                None,
+            );
+            dismiss_imip(&state, &reading_stack, &context.mailbox, context.uid);
+        });
+    }
+    group.add_action(&send_now);
+    let edit_response = gio::SimpleAction::new("edit-response", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let worker = worker.clone();
+        let reading_stack = reading_stack.clone();
+        edit_response.connect_activate(move |_, parameter| {
+            let Some(status) = parameter.and_then(|value| value.str()).and_then(response_status_from_param) else {
+                return;
+            };
+            let Some(context) = imip_reply_context(&state) else { return };
+            open_imip_reply_composer(&state, &calendar_state, &toast_overlay, &worker, &reading_stack, &context, status);
+        });
+    }
+    group.add_action(&edit_response);
+    let dont_send = gio::SimpleAction::new("dont-send", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let reading_stack = reading_stack.clone();
+        dont_send.connect_activate(move |_, parameter| {
+            let Some(status) = parameter.and_then(|value| value.str()).and_then(response_status_from_param) else {
+                return;
+            };
+            let Some(context) = imip_reply_context(&state) else { return };
+            respond_to_imip_invitation(
+                &calendar_state,
+                &toast_overlay,
+                &context.invitation,
+                &context.from_email,
+                Some(context.display_name.as_str()),
+                &context.cmd_tx,
+                status,
+                false,
+                None,
+            );
+            dismiss_imip(&state, &reading_stack, &context.mailbox, context.uid);
+        });
+    }
+    group.add_action(&dont_send);
+    row.insert_action_group("respond", Some(&group));
+
+    for (status, label, css) in [
+        (AttendeeStatus::Accepted, "Accept", Some("suggested-action")),
+        (AttendeeStatus::Tentative, "Tentative", None),
+        (AttendeeStatus::Declined, "Decline", Some("destructive-action")),
+    ] {
+        let button = adw::SplitButton::builder().label(label).dropdown_tooltip(format!("{label} options")).build();
+        button.set_tooltip_text(Some(label));
+        if let Some(css) = css {
+            button.add_css_class(css);
+        }
+        let menu = gio::Menu::new();
+        for (item_label, action_name) in [
+            ("Send response now", "send-now"),
+            ("Edit response before sending", "edit-response"),
+            ("Don't send a response", "dont-send"),
+        ] {
+            let item = gio::MenuItem::new(Some(item_label), None);
+            item.set_action_and_target_value(Some(&format!("respond.{action_name}")), Some(&response_status_param(status).to_variant()));
+            menu.append_item(&item);
+        }
+        button.set_menu_model(Some(&menu));
+        {
+            let group = group.clone();
+            button.connect_clicked(move |_| {
+                // The main part is Outlook's "Send response now".
+                group.activate_action("send-now", Some(&response_status_param(status).to_variant()));
+            });
+        }
+        row.append(&button);
+    }
+    card.append(&row);
 }
 
 /// The organizer cancelled an event (iMIP `METHOD:CANCEL`): removes the
@@ -19316,10 +19629,10 @@ fn unblock_sender_selection(state: &Rc<RefCell<UiState>>, summary: &EmailSummary
 }
 
 /// Starts a Report phishing run (item 6.7 / S-09) for the single target: the
-/// message's raw bytes are fetched, then - in the `RawMessageFetched` handler
-/// - forwarded as a `.eml` attachment to the configured address and the
-/// message moved to Junk. A no-op when no reporting address is set or there is
-/// no target.
+/// message's raw bytes are fetched, then (in the `RawMessageFetched` handler)
+/// forwarded as a `.eml` attachment to the configured address and the message
+/// moved to Junk. A no-op when no reporting address is set or there is no
+/// target.
 fn report_phishing_selection(state: &Rc<RefCell<UiState>>, targets: &[EmailSummary]) {
     let Some(summary) = targets.first() else { return };
     if state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().is_empty() {
@@ -22154,6 +22467,11 @@ fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<&lookout_co
     set_invite_row(&card, "imip-where-row", "imip-where", invitation.location.clone());
     set_invite_row(&card, "imip-organizer-row", "imip-organizer", invitation.organizer.as_ref().map(format_imip_organizer));
     set_invite_row(&card, "imip-description-row", "imip-description", invitation.description.clone());
+    // The response buttons (CAL-15) are for an invitation the user can
+    // answer - a REQUEST. CANCEL and REPLY keep the details-only card.
+    if let Some(actions) = named_child_of(&card, "imip-respond-actions") {
+        actions.set_visible(matches!(invitation.method, lookout_core::ImipMethod::Request));
+    }
 }
 
 /// Renders an attachment's size as a human-readable string (e.g. `"12.3 KB"`),
@@ -24820,6 +25138,26 @@ fn render_body(
             render_invite_card(reading_stack, st.imip.as_ref().filter(|_| !dismissed));
         }
     }
+    // An incoming REPLY (METHOD:REPLY) updates the organizer's stored event
+    // the first time its message is rendered (item 3.6 / CAL-16). Runs after
+    // the block above so its `RefCell` borrow is released; the applied set
+    // keeps a re-render from merging and PUTting the same reply twice.
+    {
+        let reply = state
+            .borrow()
+            .imip
+            .as_ref()
+            .filter(|invitation| invitation.method == lookout_core::ImipMethod::Reply)
+            .cloned();
+        if let Some(invitation) = reply {
+            let first = state.borrow_mut().imip_replies_applied.insert((mailbox.clone(), uid));
+            if first {
+                if let Some(calendar_state) = state.borrow().calendar_state.clone() {
+                    apply_incoming_imip_reply(state, &calendar_state, &invitation);
+                }
+            }
+        }
+    }
     // External-content load policy for this render: whether the message's
     // remote content may load is decided once here, from the same inputs the
     // reading pane's decide-policy handler uses - the rendered sender's
@@ -25260,6 +25598,19 @@ fn open_draft_composer_with_raw(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker
     );
 }
 
+/// The local calendar answer an "Edit response before sending" composer
+/// carries (CAL-15): the invitation event with the attendee's chosen
+/// `PARTSTAT`, saved through `save_replied_event` the moment Send fires -
+/// the same best-effort upsert the immediate-response path runs.
+struct ImipReplySend {
+    calendar_state: Rc<RefCell<CalendarUiState>>,
+    toast_overlay: adw::ToastOverlay,
+    event: CalendarEvent,
+    /// Runs after the answer is saved: the invitation surfaces for the
+    /// message retire, like the immediate-response paths.
+    on_applied: Rc<dyn Fn()>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show_composer_in_reading_pane(
     state: &Rc<RefCell<UiState>>,
@@ -25276,6 +25627,38 @@ pub(crate) fn show_composer_in_reading_pane(
     // `None` skips signature appending entirely - a reopened draft already
     // contains whatever signature it was written with.
     signature_kind: Option<crate::config_view::SignatureDefault>,
+) {
+    show_composer_in_reading_pane_full(
+        state,
+        worker,
+        reading_stack,
+        title,
+        cmd_tx,
+        prefill,
+        rich_text_default,
+        account_id,
+        signature_kind,
+        None,
+        false,
+    );
+}
+
+/// `show_composer_in_reading_pane` with the two settings only the invitation
+/// flow needs (CAL-15): a local calendar answer applied when Send fires, and
+/// opening straight into the pop-out window ("Edit response before sending").
+#[allow(clippy::too_many_arguments)]
+fn show_composer_in_reading_pane_full(
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    reading_stack: &gtk::Stack,
+    title: &str,
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    prefill: crate::compose::ComposePrefill,
+    rich_text_default: bool,
+    account_id: Option<AccountId>,
+    signature_kind: Option<crate::config_view::SignatureDefault>,
+    imip_reply: Option<ImipReplySend>,
+    pop_out_on_open: bool,
 ) {
     if let Some(existing) = reading_stack.child_by_name("compose") {
         reading_stack.remove(&existing);
@@ -25563,7 +25946,19 @@ pub(crate) fn show_composer_in_reading_pane(
     let on_send_started: crate::compose::SendStarted = {
         let state = state.clone();
         let account_id = account_id.clone();
-        Rc::new(move |message: &lookout_mail::ComposedMessage, schedule| start_send_feedback(&state, account_id.clone(), message, schedule))
+        // The answer is applied once, on the first Send - a second Send
+        // click would be a no-op anyway, but the flag keeps it from writing
+        // the same PARTSTAT twice.
+        let reply_applied = Rc::new(Cell::new(false));
+        Rc::new(move |message: &lookout_mail::ComposedMessage, schedule| {
+            if let Some(reply) = &imip_reply {
+                if !reply_applied.replace(true) {
+                    save_replied_event(&reply.calendar_state, &reply.toast_overlay, reply.event.clone());
+                    (reply.on_applied)();
+                }
+            }
+            start_send_feedback(&state, account_id.clone(), message, schedule)
+        })
     };
     // Backs the To row's address-book button: opens `contact_picker` over
     // whichever window currently hosts the composer (main window or a
@@ -25642,6 +26037,7 @@ pub(crate) fn show_composer_in_reading_pane(
         open_contact_picker,
         on_pop_out,
         on_send_started,
+        pop_out_on_open,
     );
     // Replacing any previous composer's relay (dropped sender = its consumer
     // exits), and hooking the Config manage-identities dialog into the new
@@ -26420,6 +26816,8 @@ mod tests {
             unsubscribe_dismissed: None,
             imip: None,
             imip_dismissed: None,
+            imip_replies_applied: HashSet::new(),
+            calendar_state: None,
             read_receipt_request: None,
             read_receipt_dismissed: None,
             read_receipts_sent: HashSet::new(),

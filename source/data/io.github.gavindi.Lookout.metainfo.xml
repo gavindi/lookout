@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.189" date="2026-10-14">
+      <description>
+        <p>Meeting invitations in the reading pane now have Accept, Tentative and Decline buttons with the full Outlook options: send the response right away, edit it in a compose window first, or answer your own calendar without emailing the organizer. When someone replies to an invitation you organized, opening their reply updates the event, and the event editor's new Tracking view shows who has accepted, tentatively accepted, declined or not answered yet.</p>
+      </description>
+    </release>
     <release version="0.9.188" date="2026-10-14">
       <description>
         <p>Junk mail gets proper lists, and the composer gets re-usable snippets. Settings, Mail now has a "Junk email" group where you can keep safe senders and blocked senders; blocking can also be done from a message's right-click menu (Block sender, Block domain or Unblock sender), and new mail from a blocked sender goes straight to Junk. The composer gains a "My Templates" menu that inserts a saved rich-text snippet at the cursor, managed from Settings, Mail, My Templates.</p>

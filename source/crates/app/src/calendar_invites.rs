@@ -9,7 +9,7 @@
 // advertises RFC 6638 scheduling (`schedule-outbox-URL`) delivers iTIP
 // itself, so this client stands down; otherwise the organizer's own mail
 // account sends iMIP REQUEST/CANCEL through the normal outbox.
-use lookout_core::{Attendee, CalendarEvent, EmailAddress, EventOccurrence, ImipMethod, RecurrenceRange, ScheduleAgent, SchedulingInfo};
+use lookout_core::{Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, ImipMethod, RecurrenceRange, ScheduleAgent, SchedulingInfo};
 use lookout_mail::ComposedMessage;
 
 /// Who delivers a meeting's iTIP messages.
@@ -157,6 +157,77 @@ pub fn build_imip_message(
     }
 }
 
+/// The attendee-side response verbs (CAL-15), with Outlook's subject
+/// prefixes. Pure text so the banner dialog, the invite card's buttons and
+/// the composer path share exactly one wording.
+fn reply_prefix(status: AttendeeStatus) -> &'static str {
+    match status {
+        AttendeeStatus::Accepted => "Accepted",
+        AttendeeStatus::Tentative => "Tentatively accepted",
+        AttendeeStatus::Declined => "Declined",
+        AttendeeStatus::NeedsAction => "Replied",
+    }
+}
+
+/// The iMIP REPLY's subject: "Accepted: Planning", or the bare verb for an
+/// untitled event.
+pub fn reply_subject(status: AttendeeStatus, summary: Option<&str>) -> String {
+    let prefix = reply_prefix(status);
+    match summary.map(str::trim).filter(|summary| !summary.is_empty()) {
+        Some(summary) => format!("{prefix}: {summary}"),
+        None => prefix.to_string(),
+    }
+}
+
+/// The plain-text body of the iMIP REPLY: the attendee's optional comment
+/// ahead of the status line, blank-line separated.
+pub fn reply_text_body(status: AttendeeStatus, comment: Option<&str>) -> String {
+    let status_line = format!("{}.", reply_prefix(status));
+    match comment.map(str::trim).filter(|comment| !comment.is_empty()) {
+        Some(comment) => format!("{comment}\n\n{status_line}"),
+        None => status_line,
+    }
+}
+
+/// The toast after a response. The "without sending" variants make it
+/// explicit that no mail went to the organizer (the invite card's
+/// "Don't send a response").
+pub fn reply_toast(status: AttendeeStatus, sent: bool) -> &'static str {
+    match (status, sent) {
+        (AttendeeStatus::Accepted, true) => "Invitation accepted",
+        (AttendeeStatus::Tentative, true) => "Marked as tentative",
+        (AttendeeStatus::Declined, true) => "Invitation declined",
+        (AttendeeStatus::NeedsAction, true) => "Reply sent",
+        (AttendeeStatus::Accepted, false) => "Accepted without sending a response",
+        (AttendeeStatus::Tentative, false) => "Marked as tentative without sending a response",
+        (AttendeeStatus::Declined, false) => "Declined without sending a response",
+        (AttendeeStatus::NeedsAction, false) => "Marked without sending a response",
+    }
+}
+
+/// Stamps the user's own `PARTSTAT` onto their ATTENDEE line (the organizer's
+/// client reads the reply from exactly this); a self-signed invitation that
+/// omitted the recipient entirely gets an ATTENDEE added.
+pub fn stamp_attendee_status(event: &mut CalendarEvent, from_email: &str, status: AttendeeStatus) {
+    match event.attendees.iter_mut().find(|attendee| attendee.address.address.eq_ignore_ascii_case(from_email)) {
+        Some(attendee) => attendee.status = status,
+        None => event.attendees.push(Attendee {
+            address: EmailAddress::new(from_email.to_string()),
+            role: AttendeeRole::Required,
+            status,
+        }),
+    }
+}
+
+/// Parses an invitation's `VEVENT` and stamps the user's answer onto their
+/// ATTENDEE line: the event both the immediate reply and the edited-in-the-
+/// composer reply send back.
+pub fn reply_event(invitation_ics: &str, from_email: &str, status: AttendeeStatus) -> Option<CalendarEvent> {
+    let mut event = lookout_dav::parse_vevents(&CalendarId("iMIP".to_string()), invitation_ics).into_iter().next()?;
+    stamp_attendee_status(&mut event, from_email, status);
+    Some(event)
+}
+
 /// The organizer's outgoing invitation/update/cancellation. Recipients are
 /// the attendee list with the organizer's own address removed (a user can be
 /// on their own attendee list; iMIP doesn't need to mail you yourself).
@@ -226,6 +297,63 @@ pub fn cancellation_event(occ: &EventOccurrence, organizer: Option<EmailAddress>
         reminder_minutes_before: None,
         conference_url: occ.conference_url.clone(),
     }
+}
+
+/// Rebuilds the stored master event from a cached occurrence (item 3.6): the
+/// inverse of the expansion for a whole-object rewrite such as applying an
+/// attendee REPLY. Unlike `cancellation_event`, the series' `RRULE` and the
+/// master's anchor times/href are kept - the object written back is the
+/// master itself, not a withdrawn instance.
+pub fn stored_event_from_occurrence(occ: &EventOccurrence) -> CalendarEvent {
+    CalendarEvent {
+        uid: occ.uid.clone(),
+        calendar_id: occ.calendar_id.clone(),
+        summary: occ.summary.clone(),
+        description: occ.description.clone(),
+        location: occ.location.clone(),
+        start: occ.master_start.unwrap_or(occ.start),
+        end: occ.master_end.unwrap_or(occ.end),
+        all_day: occ.all_day,
+        time_zone: occ.time_zone.clone(),
+        rrule: occ.rrule.clone(),
+        recurrence_id: None,
+        recurrence_range: RecurrenceRange::default(),
+        exdates: occ.exdates.clone(),
+        rdates: Vec::new(),
+        href: occ.master_href.clone().or_else(|| occ.href.clone()),
+        etag: occ.master_etag.clone().or_else(|| occ.etag.clone()),
+        sequence: occ.sequence,
+        attendees: occ.attendees.clone(),
+        organizer: occ.organizer.clone(),
+        schedule_agent: occ.schedule_agent,
+        categories: occ.categories.clone(),
+        sensitivity: occ.sensitivity,
+        show_as: occ.show_as,
+        reminder_minutes_before: occ.reminder_minutes_before,
+        conference_url: occ.conference_url.clone(),
+    }
+}
+
+/// Merges an incoming REPLY's attendee responses onto the stored event
+/// (item 3.6): only attendees the stored event already knows are updated
+/// (a reply can't add invitees), matched case-insensitively by address.
+/// Returns whether anything actually changed, so the caller can skip the PUT
+/// when a message is rendered again.
+pub fn merge_reply_statuses(stored: &mut CalendarEvent, reply: &CalendarEvent) -> bool {
+    let mut changed = false;
+    for incoming in &reply.attendees {
+        if let Some(existing) = stored
+            .attendees
+            .iter_mut()
+            .find(|attendee| attendee.address.address.eq_ignore_ascii_case(&incoming.address.address))
+        {
+            if existing.status != incoming.status {
+                existing.status = incoming.status;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -402,6 +530,67 @@ mod tests {
         let mut untitled = event("Untitled", vec![attendee("alice@example.com")]);
         untitled.summary = Some("   ".to_string());
         assert_eq!(invite_message(&untitled, InviteKind::Request, &identity).subject, "Invitation: (No subject)");
+    }
+
+    #[test]
+    fn reply_wording_follows_the_status_and_the_send_choice() {
+        assert_eq!(reply_subject(AttendeeStatus::Accepted, Some("Planning")), "Accepted: Planning");
+        assert_eq!(reply_subject(AttendeeStatus::Tentative, None), "Tentatively accepted");
+        assert_eq!(reply_subject(AttendeeStatus::Declined, Some("   ")), "Declined", "a blank summary falls back to the verb");
+        assert_eq!(reply_text_body(AttendeeStatus::Accepted, None), "Accepted.");
+        assert_eq!(reply_text_body(AttendeeStatus::Declined, Some("Can't make it")), "Can't make it\n\nDeclined.");
+        assert_eq!(
+            reply_text_body(AttendeeStatus::Accepted, Some("  ")),
+            "Accepted.",
+            "a blank comment leaves just the status line"
+        );
+        assert_eq!(reply_toast(AttendeeStatus::Accepted, true), "Invitation accepted");
+        assert_eq!(reply_toast(AttendeeStatus::Accepted, false), "Accepted without sending a response");
+    }
+
+    #[test]
+    fn reply_event_stamps_the_users_partstat_and_adds_a_missing_attendee() {
+        let ics = lookout_dav::build_imip_vcalendar(&event("Planning", vec![attendee("alice@example.com")]), ImipMethod::Request);
+
+        let replied = reply_event(&ics, "ALICE@example.com", AttendeeStatus::Accepted).expect("invitation parses");
+        assert_eq!(replied.attendees.len(), 1);
+        assert_eq!(replied.attendees[0].status, AttendeeStatus::Accepted, "the address match ignores case");
+
+        let added = reply_event(&ics, "carol@example.com", AttendeeStatus::Tentative).expect("invitation parses");
+        assert_eq!(added.attendees.len(), 2, "a missing recipient gets an ATTENDEE line");
+        assert_eq!(added.attendees[1].address.address, "carol@example.com");
+        assert_eq!(added.attendees[1].status, AttendeeStatus::Tentative);
+    }
+
+    #[test]
+    fn merge_reply_statuses_updates_known_attendees_only_and_reports_changes() {
+        let mut stored = event("Planning", vec![attendee("alice@example.com"), attendee("bob@example.com")]);
+        let mut reply = event("Planning", vec![attendee("alice@example.com"), attendee("mallory@example.com")]);
+        reply.attendees[0].status = AttendeeStatus::Accepted;
+        reply.attendees[1].status = AttendeeStatus::Accepted;
+
+        assert!(merge_reply_statuses(&mut stored, &reply));
+        assert_eq!(stored.attendees[0].status, AttendeeStatus::Accepted);
+        assert_eq!(stored.attendees[1].status, AttendeeStatus::NeedsAction, "untouched attendees keep their status");
+        assert_eq!(stored.attendees.len(), 2, "a reply never adds invitees");
+        assert!(!merge_reply_statuses(&mut stored, &reply), "an already-applied reply reports no change");
+    }
+
+    #[test]
+    fn stored_event_from_occurrence_keeps_the_master_anchor_and_rule() {
+        let mut occ = occurrence(vec![attendee("alice@example.com")], Some("FREQ=WEEKLY"));
+        occ.master_start = Some("2026-08-01T09:00:00Z".parse().unwrap());
+        occ.master_end = Some("2026-08-01T10:00:00Z".parse().unwrap());
+        occ.master_href = Some("/cal/master.ics".to_string());
+        occ.master_etag = Some("\"v2\"".to_string());
+
+        let stored = stored_event_from_occurrence(&occ);
+        assert_eq!(stored.rrule.as_deref(), Some("FREQ=WEEKLY"));
+        assert!(stored.recurrence_id.is_none(), "the master object is what gets written back");
+        assert_eq!(stored.href.as_deref(), Some("/cal/master.ics"));
+        assert_eq!(stored.etag.as_deref(), Some("\"v2\""));
+        assert_eq!(stored.start, occ.master_start.unwrap(), "the expanded instance time is not written to the master");
+        assert_eq!(stored.sequence, occ.sequence);
     }
 
     #[test]

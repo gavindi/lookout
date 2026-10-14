@@ -145,6 +145,13 @@ pub struct ComposePrefill {
     pub in_reply_to: Option<String>,
     /// RFC 5322 `References` - bare Message-Ids (no `<>`), oldest first.
     pub references: Vec<String>,
+    /// The iMIP part sent alongside the body (CAL-15): a full
+    /// `text/calendar` document, set when the attendee edits their
+    /// invitation response in the composer. `None` for every other message.
+    /// `mail/src/send.rs` emits it as the second part of a
+    /// `multipart/alternative` [text/plain, text/calendar] and ignores the
+    /// HTML body, so this flow opens the composer in plain-text mode.
+    pub calendar_part: Option<String>,
 }
 
 /// Runs as Send is clicked (or a schedule-send time is picked, item 1.14),
@@ -310,6 +317,7 @@ pub fn build_draft_prefill(summary: &EmailSummary, content: &DraftPrefillContent
         draft_saved: false,
         in_reply_to: content.in_reply_to.clone(),
         references: content.references.clone(),
+        calendar_part: None,
     }
 }
 
@@ -347,6 +355,7 @@ pub fn build_resend_prefill(msg: &ComposedMessage) -> ComposePrefill {
         draft_source: None,
         in_reply_to: msg.in_reply_to.clone(),
         references: msg.references.clone(),
+        calendar_part: None,
     }
 }
 
@@ -380,6 +389,9 @@ pub fn build_outbox_prefill(message: &lookout_mail::send::OutboxMessage) -> Opti
         draft_source: None,
         in_reply_to: content.in_reply_to,
         references: content.references,
+        // An outbox-withdrawn iMIP message loses its calendar part: the raw
+        // parse (`parse_draft_prefill`) deliberately excludes `text/calendar`.
+        calendar_part: None,
     })
 }
 
@@ -854,6 +866,9 @@ struct AutosaveCtx {
     from_dropdown: gtk::DropDown,
     in_reply_to: Option<String>,
     references: Vec<String>,
+    /// The iMIP part an invitation reply carries (CAL-15); autosaved drafts
+    /// keep it so a saved-then-sent reply is still a `METHOD:REPLY` part.
+    calendar_part: Option<String>,
     status_label: gtk::Label,
 }
 
@@ -949,7 +964,7 @@ impl AutosaveCtx {
             html_body: snap.rich.then(|| snap.body.clone()),
             attachments: snap.attachments.iter().map(PendingAttachment::to_mail_attachment).collect(),
             inline_images: snap.inline_images.clone(),
-            calendar_part: None,
+            calendar_part: self.calendar_part.clone(),
             read_receipt: None,
             request_read_receipt: snap.read_receipt,
             importance: snap.importance,
@@ -1517,6 +1532,11 @@ pub fn build_compose_view(
     open_contact_picker: crate::contact_picker::ContactPickerOpener,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
     on_send_started: SendStarted,
+    // Whether to move the composer into its own window straight away
+    // (CAL-15's "Edit response before sending"): the same pop-out path the
+    // header button runs, scheduled on the next main-loop turn so the
+    // composer is rooted in its reading-pane page first.
+    pop_out_on_open: bool,
 ) -> (gtk::Box, gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
     // Chip-mode fields (UX-42): each recipient is a removable pill, so a
     // contact list picked from the address book can render as a single
@@ -2236,6 +2256,7 @@ pub fn build_compose_view(
         from_dropdown: from_dropdown.clone(),
         in_reply_to: prefill.in_reply_to.clone(),
         references: prefill.references.clone(),
+        calendar_part: prefill.calendar_part.clone(),
         status_label: status_label.clone(),
     };
 
@@ -2364,6 +2385,7 @@ pub fn build_compose_view(
     {
         let in_reply_to = prefill.in_reply_to;
         let references = prefill.references;
+        let calendar_part = prefill.calendar_part.clone();
         let prefill_body_text = prefill.body.clone().unwrap_or_default();
         let autosave = autosave.clone();
         let draft_message_id = draft_message_id.clone();
@@ -2412,6 +2434,7 @@ pub fn build_compose_view(
             let attachments = attachments.clone();
             let in_reply_to = in_reply_to.clone();
             let references = references.clone();
+            let calendar_part = calendar_part.clone();
             let closed = closed.clone();
             let on_done = on_done.clone();
             let on_send_started = on_send_started.clone();
@@ -2499,7 +2522,7 @@ pub fn build_compose_view(
                     html_body,
                     attachments: attachments.borrow().iter().map(PendingAttachment::to_mail_attachment).collect(),
                     inline_images,
-                    calendar_part: None,
+                    calendar_part,
                     read_receipt: None,
                     request_read_receipt: read_receipt_toggle.is_active(),
                     importance: selected_importance(&high_importance_toggle, &low_importance_toggle),
@@ -2569,6 +2592,14 @@ pub fn build_compose_view(
             });
             moving.set(false);
         });
+        // "Edit response before sending" (CAL-15) opens straight into the
+        // window: run the exact pop-out path once the composer has been
+        // embedded, without waiting for a click on a button the user would
+        // never see.
+        if pop_out_on_open {
+            let pop_out_button = pop_out_button.clone();
+            glib::idle_add_local_once(move || pop_out_button.emit_clicked());
+        }
     }
 
     // Belt and braces for the autosave timer: Cancel and Send set `closed`
