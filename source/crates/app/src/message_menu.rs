@@ -62,6 +62,8 @@ pub enum MessageMenuAction {
     /// address, then move it to Junk (item 6.7 / S-09). Offered only when a
     /// report-phishing address is set.
     ReportPhishing,
+    /// Create a rule prefilled from the target message (item 2.5 / M-14).
+    CreateRule,
     ViewDetails,
     ViewSource,
     OpenWindow,
@@ -183,6 +185,7 @@ pub fn action_specs() -> Vec<ActionSpec> {
         "report-junk",
         "not-junk",
         "report-phishing",
+        "create-rule",
         "view-details",
         "view-source",
         "open-window",
@@ -214,6 +217,7 @@ pub fn enabled_actions(state: &MessageMenuState) -> Vec<(&'static str, bool)> {
         ("snooze-custom", state.can_snooze),
         ("report-junk", state.can_report_junk),
         ("not-junk", state.can_not_junk),
+        ("create-rule", state.single),
         ("view-details", state.single),
         ("view-source", state.single),
         ("open-window", state.single),
@@ -286,6 +290,7 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
     }
     report = report.action("Not junk", ns("not-junk"));
     menu = menu.submenu("Report", report).section();
+    menu = menu.submenu("Rules", MenuDescription::new().section().action("Create rule…", ns("create-rule"))).section();
     menu.submenu(
         "View",
         MenuDescription::new()
@@ -334,6 +339,7 @@ pub fn message_action_for(name: &str, param: Option<&glib::Variant>) -> Option<M
         "report-junk" => MessageMenuAction::ReportJunk,
         "not-junk" => MessageMenuAction::NotJunk,
         "report-phishing" => MessageMenuAction::ReportPhishing,
+        "create-rule" => MessageMenuAction::CreateRule,
         "view-details" => MessageMenuAction::ViewDetails,
         "view-source" => MessageMenuAction::ViewSource,
         "open-window" => MessageMenuAction::OpenWindow,
@@ -406,6 +412,7 @@ mod tests {
                 vec!["Delete", "Archive", "Move ▸", "Copy ▸"],
                 vec!["Mark as unread", "Flag ▸", "Pin", "Snooze ▸", "Categorize ▸"],
                 vec!["Report ▸"],
+                vec!["Rules ▸"],
                 vec!["View ▸"],
                 vec!["Open in new window", "Print"],
             ]

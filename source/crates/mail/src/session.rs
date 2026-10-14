@@ -730,6 +730,18 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         messages: Vec<EmailSummary>,
     },
+    /// Every genuinely new arrival this sync, read or unread, for the rules
+    /// engine (item 2.5 / M-14). Unlike `NewMessages` - the unread-only
+    /// desktop-notification subset - this carries the whole new-arrival set so
+    /// a rule can match read mail too. Emitted only when the mailbox already
+    /// had a cache baseline (never on a first sync or after a UIDVALIDITY
+    /// change), so connecting an account doesn't replay its whole history
+    /// through the rules. The app applies rules only to arriving Inbox mail
+    /// (Outlook's scope); `mailbox` is carried so it can check the folder.
+    NewMailArrived {
+        mailbox: MailboxId,
+        messages: Vec<EmailSummary>,
+    },
     /// A subset of a `MessagesUpdated` sync: just the up-to-`PREVIEW_FETCH_LIMIT`
     /// list-row snippets `fetch_previews` fetched this round, keyed by uid.
     /// Replaces a second whole-mailbox `MessagesUpdated` that changed nothing
@@ -6128,6 +6140,19 @@ async fn sync_mailbox(
                 .send(AccountEvent::NewMessages {
                     mailbox: mailbox_id.clone(),
                     messages: notify,
+                })
+                .await;
+        }
+
+        // The full new-arrival set for the rules engine (item 2.5). Only when
+        // the mailbox had a prior cache baseline, so a first sync (or a
+        // UIDVALIDITY-change re-fetch, which empties the cache) doesn't replay
+        // the whole folder through the rules.
+        if !cached.is_empty() && !new_messages.is_empty() {
+            let _ = events
+                .send(AccountEvent::NewMailArrived {
+                    mailbox: mailbox_id.clone(),
+                    messages: new_messages.clone(),
                 })
                 .await;
         }

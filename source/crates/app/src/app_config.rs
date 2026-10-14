@@ -16,7 +16,7 @@
 /// Software released under the GPL3 license
 use std::path::PathBuf;
 
-use lookout_core::{AccountId, Identity, MailboxRole, Signature, WebcalSubscription};
+use lookout_core::{AccountId, Identity, MailboxRole, Rule, Signature, WebcalSubscription};
 use serde::{Deserialize, Serialize};
 
 use crate::categories::CategoryDef;
@@ -97,6 +97,12 @@ pub struct AppConfig {
     /// `masterCategories`.
     #[serde(default)]
     pub categories: Vec<CategoryDef>,
+    /// The user's rules (item 2.5 / M-14), evaluated in list order. Each rule
+    /// names the backend it runs on (`This device`, Sieve or Graph); a rule
+    /// whose backend is unavailable degrades to the client engine. See
+    /// `lookout_core::Rule` and `app/src/rules.rs`.
+    #[serde(default)]
+    pub rules: Vec<Rule>,
 }
 
 impl AppConfig {
@@ -146,6 +152,31 @@ impl AppConfig {
         } else {
             self.signatures.push(signature);
         }
+    }
+
+    /// Inserts `rule`, replacing any existing entry with the same id (the edit
+    /// path) or appending it (the add path).
+    pub fn upsert_rule(&mut self, rule: Rule) {
+        if let Some(existing) = self.rules.iter_mut().find(|r| r.id == rule.id) {
+            *existing = rule;
+        } else {
+            self.rules.push(rule);
+        }
+    }
+
+    /// Removes the rule with `id`, if any.
+    pub fn remove_rule(&mut self, id: &str) {
+        self.rules.retain(|r| r.id != id);
+    }
+
+    /// Moves the rule at `from` to `to`, clamping both to the list's bounds -
+    /// the editor's reorder controls.
+    pub fn move_rule(&mut self, from: usize, to: usize) {
+        if from >= self.rules.len() || to >= self.rules.len() || from == to {
+            return;
+        }
+        let rule = self.rules.remove(from);
+        self.rules.insert(to, rule);
     }
 
     /// Removes the signature with `id`, if any - and clears every account
@@ -277,6 +308,7 @@ mod tests {
                 use_same_password: true,
             }],
             categories: Vec::new(),
+            rules: Vec::new(),
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -305,6 +337,7 @@ mod tests {
             webcal_subscriptions: Vec::new(),
             other_accounts: Vec::new(),
             categories: Vec::new(),
+            rules: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -417,6 +450,49 @@ mod tests {
         assert_eq!(loaded.signature_defaults.len(), 1);
         assert_eq!(loaded.signature_defaults[&AccountId("account_1".into())].new, Some(signature.id));
         assert_eq!(loaded.signature_defaults[&AccountId("account_1".into())].reply, Some(signature.id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rules_round_trip_upsert_move_and_remove() {
+        let dir = std::env::temp_dir().join(format!("lookout-rules-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `rules` loads as an empty list.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        assert!(load_at(&path).rules.is_empty());
+
+        let mut config = AppConfig::default();
+        let mut a = lookout_core::Rule::new("r1", "Archive newsletters");
+        a.conditions = vec![lookout_core::RuleCondition::ListId("news.example.com".into())];
+        a.actions = vec![lookout_core::RuleAction::Move(lookout_core::RuleTarget::Role(MailboxRole::Archive))];
+        let b = lookout_core::Rule::new("r2", "Flag VIPs");
+        config.upsert_rule(a.clone());
+        config.upsert_rule(b.clone());
+        assert_eq!(config.rules.len(), 2);
+
+        // Upsert replaces in place.
+        let mut edited = a.clone();
+        edited.name = "Archive news".into();
+        config.upsert_rule(edited.clone());
+        assert_eq!(config.rules.len(), 2);
+        assert_eq!(config.rules[0].name, "Archive news");
+
+        // Reorder, then remove.
+        config.move_rule(0, 1);
+        assert_eq!(config.rules[0].id, "r2");
+        config.remove_rule("r2");
+        assert_eq!(config.rules.len(), 1);
+
+        save_at(&path, &config);
+        let loaded = load_at(&path);
+        assert_eq!(loaded.rules, config.rules);
+        // An out-of-range move is a no-op, never a panic.
+        let mut loaded = loaded;
+        loaded.move_rule(9, 0);
+        assert_eq!(loaded.rules.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -291,6 +291,11 @@
       <summary>Mail notifications</summary>
       <description>Show a desktop notification when new mail arrives or a send fails.</description>
     </key>
+    <key name="mail-rules-enabled" type="b">
+      <default>true</default>
+      <summary>Rules</summary>
+      <description>Master switch for the rules engine. Off pauses every rule (client- and server-side) without deleting it.</description>
+    </key>
     <key name="dock-badge-enabled" type="b">
       <default>true</default>
       <summary>Dock badge</summary>

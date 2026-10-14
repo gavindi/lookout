@@ -11,6 +11,7 @@ pub mod identity;
 pub mod ids;
 pub mod interop;
 pub mod mailbox;
+pub mod rules;
 pub mod signature;
 pub mod thread;
 pub mod trust;
@@ -39,6 +40,7 @@ pub use interop::{
 };
 pub use interop::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
 pub use mailbox::{display_name, Mailbox, MailboxRole};
+pub use rules::{Rule, RuleAction, RuleBackend, RuleCondition, RuleContext, RuleTarget, SizeComparison};
 pub use signature::Signature;
 pub use thread::{ThreadGroup, ThreadKey};
 pub use trust::{html_remote_content_scan, normalize_trust_entry, sender_matches_trust_entry, RemoteContentScan, TrustLevel};

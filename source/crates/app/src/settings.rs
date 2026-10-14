@@ -145,6 +145,9 @@ pub const MAIL_UNDO_SEND_SECONDS: &str = "mail-undo-send-seconds";
 /// whether sending a message whose subject or body mentions an attachment, but
 /// which has none, prompts first (item 1.19 / C-16).
 pub const MAIL_WARN_NO_ATTACHMENT: &str = "mail-warn-no-attachment";
+/// Config → Mail → "Rules": master switch for the rules engine (item 2.5 /
+/// M-14). Off pauses every client- and server-side rule without deleting it.
+pub const MAIL_RULES_ENABLED: &str = "mail-rules-enabled";
 pub const CALENDAR_ALERTS_ENABLED: &str = "calendar-alerts-enabled";
 /// Calendar → "Week starts on": first day of the week, as 0=Sunday .. 6=Saturday.
 pub const CALENDAR_WEEK_START: &str = "calendar-week-start";
@@ -318,6 +321,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MARK_AS_READ_DELAY, Value::Int(5));
     map.insert(MAIL_UNDO_SEND_SECONDS, Value::Int(5));
     map.insert(MAIL_WARN_NO_ATTACHMENT, Value::Bool(true));
+    map.insert(MAIL_RULES_ENABLED, Value::Bool(true));
     map.insert(CALENDAR_ALERTS_ENABLED, Value::Bool(true));
     map.insert(CALENDAR_WEEK_START, Value::Int(0));
     map.insert(CALENDAR_WORK_DAYS, Value::Strv(vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()]));

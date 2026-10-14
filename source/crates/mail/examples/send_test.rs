@@ -158,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::MailboxSyncStarted { .. } => {}
                     AccountEvent::PrefetchStarted { .. } | AccountEvent::PrefetchFinished { .. } => {}
                     AccountEvent::NewMessages { .. } => {}
+                    AccountEvent::NewMailArrived { .. } => {}
                     AccountEvent::BodyFetched { .. } => {}
                     AccountEvent::DraftSaved { .. } => {}
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}

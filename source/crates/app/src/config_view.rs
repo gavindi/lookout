@@ -290,6 +290,9 @@ pub struct ConfigView {
     /// "Categories…" row (Config → Mail), exposed so the caller can open the
     /// shared category master-list editor (item 2.1 / M-09).
     pub categories_row: adw::ActionRow,
+    /// "Rules…" row (Config → Mail), exposed so the caller can open the rules
+    /// manager (item 2.5 / M-14).
+    pub rules_row: adw::ActionRow,
     /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
     /// `active` state into the composer's default body mode.
     pub rich_text_row: adw::SwitchRow,
@@ -621,6 +624,12 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     mail_settings_group.add(&categories_row);
+    let rules_row = adw::ActionRow::builder()
+        .title("Rules…")
+        .subtitle("Organise incoming mail automatically")
+        .activatable(true)
+        .build();
+    mail_settings_group.add(&rules_row);
     let rich_text_row = adw::SwitchRow::builder()
         .title("Rich text")
         .subtitle("Start new messages in the formatted editor")
@@ -1083,6 +1092,7 @@ pub fn build() -> ConfigView {
         remote_images_row,
         trusted_senders_row,
         categories_row,
+        rules_row,
         rich_text_row,
         spell_check_row,
         spell_languages_row,

@@ -69,7 +69,7 @@ pub(crate) struct AccountHandle {
     imap_port: u16,
     smtp_host: String,
     smtp_port: u16,
-    folders: Vec<Mailbox>,
+    pub(crate) folders: Vec<Mailbox>,
     /// Read-side handle on this account's cache, used for folder-switch/
     /// search/composer-autocomplete reads. Deliberately a second connection
     /// to the file the session writes: routing a lookup through
@@ -792,6 +792,28 @@ struct PendingDraftOpen {
     summary: EmailSummary,
 }
 
+/// A rule-initiated Forward/Redirect (item 2.5 / M-14) waiting on the
+/// message's raw bytes: when `AccountEvent::RawMessageFetched` lands for the
+/// `(mailbox, uid)`, the message is sent on to `to`. A queue rather than a
+/// single slot, since several rules can forward different arrivals at once;
+/// see `rules::deliver_rule_forwards`.
+pub(crate) struct PendingRuleForward {
+    pub(crate) mailbox: MailboxId,
+    pub(crate) uid: Uid,
+    pub(crate) to: Vec<String>,
+    pub(crate) subject: Option<String>,
+    pub(crate) kind: RuleForwardKind,
+}
+
+/// Whether a pending rule send is a forward (a new `Fwd:` message with the
+/// original attached) or a redirect (the original resent to the new
+/// recipients).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleForwardKind {
+    Forward,
+    Redirect,
+}
+
 /// Marks a value as `Send` so it can cross from WebKit's scheme-handler
 /// thread to the main loop. `webkit::URISchemeRequest` is a ref-counted
 /// GObject whose `finish`/`finish_error` are documented thread-safe; the
@@ -900,8 +922,10 @@ pub(crate) struct UiState {
     pub(crate) settings: Rc<crate::settings::SettingsStore>,
     /// The relational-data config (`settings.json`): sending identities and
     /// folder-role overrides. Loaded at startup, written through by the
-    /// manage-identities dialog. See `app_config`.
-    app_config: Rc<RefCell<crate::app_config::AppConfig>>,
+    /// manage-identities dialog. `pub(crate)` so the rules engine
+    /// (`rules.rs`) can read the user's rules and identities; writes go
+    /// through `save_app_config`.
+    pub(crate) app_config: Rc<RefCell<crate::app_config::AppConfig>>,
     /// The shared category master list (item 2.1 / M-09, CAL-07, T-08). The
     /// same live set the message rows, Categorize menu and editors read; held
     /// here too so the Graph category sync and settings can reach it. Persisted
@@ -1023,6 +1047,15 @@ pub(crate) struct UiState {
     /// and then moved to Junk. Only ever one in flight; cleared on delivery or
     /// failure.
     pending_report_phishing: Option<(MailboxId, Uid)>,
+    /// Rule-initiated forwards/redirects (item 2.5 / M-14) waiting on their
+    /// raw bytes. See `PendingRuleForward`.
+    pub(crate) pending_rule_forwards: Vec<PendingRuleForward>,
+    /// Arriving messages whose rule evaluation is deferred until their body
+    /// (and headers) are fetched, because an enabled rule has a Body or
+    /// Header condition (item 2.5 / M-14, A5b). The summary rides along so
+    /// the rule's other conditions can still be checked on delivery; capped
+    /// so a body that never arrives can't grow the queue without bound.
+    pub(crate) pending_rule_evals: Vec<EmailSummary>,
     /// Open "message in new window" pop-outs (item 1.9 / M-31), keyed by
     /// `(mailbox, uid)` - one window per message; `open_message_window`
     /// re-presents an existing window instead of opening a second. The stored
@@ -2611,6 +2644,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         pending_attachment_batch: None,
         pending_raw_message: None,
         pending_report_phishing: None,
+        pending_rule_forwards: Vec::new(),
+        pending_rule_evals: Vec::new(),
         message_windows: HashMap::new(),
         message_details: None,
         rendered_draft: None,
@@ -8091,6 +8126,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Rules…": opens the rules manager (item 2.5 / M-14).
+    {
+        let state = state.clone();
+        let row = config_view.rules_row.clone();
+        row.clone().connect_activated(move |_| {
+            crate::rules_view::show_manage_rules_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
+        });
+    }
+
     // Config → Mail → "Rich text": sets the default body mode for future
     // compose sessions. Read at composer-open time, so an already-open
     // composer is untouched.
@@ -12181,7 +12225,15 @@ fn spawn_account_event_loop(
                             }
                         }
                     }
+                    AccountEvent::NewMailArrived { mailbox, messages } => {
+                        // Client rules (item 2.5 / M-14) run on genuinely-new
+                        // arriving Inbox mail. See `rules::run_client_rules`.
+                        crate::rules::run_client_rules(&state, &account_id, &mailbox, &messages);
+                    }
                     AccountEvent::BodyFetched { mailbox, uid, body } => {
+                        // A rules-engine evaluation (item 2.5 / M-14, A5b)
+                        // waiting on this body now has what it needs.
+                        crate::rules::evaluate_deferred_rules(&state, &account_id, &mailbox, uid, &body);
                         let should_render = {
                             let mut st = state.borrow_mut();
                             // Render if this is the request still in flight, or
@@ -12418,6 +12470,9 @@ fn spawn_account_event_loop(
                                 }
                             }
                         }
+                        // A rule-initiated Forward/Redirect (item 2.5 / M-14)
+                        // waiting on this message's raw bytes sends it on now.
+                        crate::rules::deliver_rule_forwards(&state, &mailbox, uid, &bytes);
                         // The .eml export's whole raw message arrived. Only act if
                         // it belongs to the outstanding export request; a response
                         // that lands after the user selected a different message
@@ -12462,6 +12517,9 @@ fn spawn_account_event_loop(
                         if report_failed {
                             toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't report the message: {message}"))));
                         }
+                        // A rule-initiated Forward/Redirect waiting on the same
+                        // fetch fails with it.
+                        crate::rules::fail_rule_forwards(&state, &mailbox, uid, &message);
                         // A draft "Edit" action (item 1.12) waiting on the
                         // same fetch: drop back to the empty pane and say why.
                         let draft_pending = {
@@ -16903,6 +16961,14 @@ fn run_message_menu_action(
         A::ReportJunk => set_junk_selection(state, message_list, targets, true),
         A::NotJunk => set_junk_selection(state, message_list, targets, false),
         A::ReportPhishing => report_phishing_selection(state, targets),
+        A::CreateRule => {
+            // Prefill a rule from the single target and open the editor
+            // (item 2.5 / M-14): Rules ▸ Create rule in the message menu.
+            if let Some(summary) = primary.cloned() {
+                let rule = crate::rules_view::rule_from_message(&summary);
+                crate::rules_view::show_rule_editor(anchor, state.clone(), rule, || {});
+            }
+        }
         A::MoveTo(folder) => move_messages_to_folder(state, message_list, targets, &folder),
         A::CopyTo(folder) => copy_messages_to_folder(state, targets, &folder),
         A::MoveOther | A::CopyOther => {
@@ -20619,6 +20685,7 @@ fn install_folder_menu_handler(
                 present_empty_dialog(&anchor, &mailbox, move || send(AccountCommand::EmptyMailbox { mailbox: target.clone() }));
             }
             FolderMenuAction::MarkAllRead => send(AccountCommand::MarkMailboxRead { mailbox: mailbox.id.clone() }),
+            FolderMenuAction::RunRules => crate::rules::run_rules_now(&state, &account_id, &mailbox.id),
             FolderMenuAction::AddFavorite | FolderMenuAction::RemoveFavorite => {
                 set_folder_favorite(&state, &mailbox.id, action == FolderMenuAction::AddFavorite);
                 // The header's star follows when this is the open folder.
@@ -25929,6 +25996,8 @@ mod tests {
             pending_attachment_batch: None,
             pending_raw_message: None,
             pending_report_phishing: None,
+            pending_rule_forwards: Vec::new(),
+            pending_rule_evals: Vec::new(),
             message_windows: HashMap::new(),
             message_details: None,
             rendered_draft: None,

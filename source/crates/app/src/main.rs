@@ -49,6 +49,8 @@ mod profile_card;
 mod recipient_entry;
 mod recurrence;
 mod reminders;
+mod rules;
+mod rules_view;
 mod resources;
 mod settings;
 mod shortcuts;

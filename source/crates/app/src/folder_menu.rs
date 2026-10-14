@@ -38,6 +38,9 @@ pub enum FolderMenuAction {
     Delete,
     Empty,
     MarkAllRead,
+    /// Apply the account's client rules to this folder's cached messages now
+    /// (item 2.5 / M-14).
+    RunRules,
     AddFavorite,
     RemoveFavorite,
     MoveFavoriteUp,
@@ -60,6 +63,7 @@ pub struct FolderMenuState {
     pub delete: bool,
     pub empty: bool,
     pub mark_read: bool,
+    pub run_rules: bool,
     pub is_favorite: bool,
     pub move_up: bool,
     pub move_down: bool,
@@ -80,6 +84,7 @@ pub fn folder_menu_state(mailbox: &Mailbox, favorite_pos: Option<(usize, usize)>
         delete: custom,
         empty: matches!(mailbox.role, MailboxRole::Trash | MailboxRole::Junk),
         mark_read: mailbox.unread > 0,
+        run_rules: true,
         is_favorite: favorite_pos.is_some(),
         move_up: favorite_pos.is_some_and(|(index, _)| index > 0),
         move_down: favorite_pos.is_some_and(|(index, count)| index + 1 < count),
@@ -178,6 +183,7 @@ fn folder_action_for(name: &str, param: Option<&glib::Variant>) -> Option<Folder
         "delete" => FolderMenuAction::Delete,
         "empty" => FolderMenuAction::Empty,
         "mark-read" => FolderMenuAction::MarkAllRead,
+        "run-rules" => FolderMenuAction::RunRules,
         "favorite-add" => FolderMenuAction::AddFavorite,
         "favorite-remove" => FolderMenuAction::RemoveFavorite,
         "favorite-up" => FolderMenuAction::MoveFavoriteUp,
@@ -246,6 +252,7 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
         .action("Delete", "folder.delete")
         .action("Empty", "folder.empty")
         .action("Mark all as read", "folder.mark-read")
+        .action("Run rules now", "folder.run-rules")
         .section()
         .hidden_action("Add to Favorites", "folder.favorite-add")
         .hidden_action("Remove from Favorites", "folder.favorite-remove")
@@ -259,6 +266,7 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
         ActionSpec::simple("delete"),
         ActionSpec::simple("empty"),
         ActionSpec::simple("mark-read"),
+        ActionSpec::simple("run-rules"),
         ActionSpec::simple("favorite-add"),
         ActionSpec::simple("favorite-remove"),
         ActionSpec::simple("favorite-up"),
@@ -320,6 +328,7 @@ impl RowMenu {
         self.menu.set_enabled("delete", state.delete);
         self.menu.set_enabled("empty", state.empty);
         self.menu.set_enabled("mark-read", state.mark_read);
+        self.menu.set_enabled("run-rules", state.run_rules);
         self.menu.set_enabled("favorite-add", !state.is_favorite);
         self.menu.set_enabled("favorite-remove", state.is_favorite);
         self.menu.set_enabled("favorite-up", state.move_up);
