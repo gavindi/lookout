@@ -13,7 +13,7 @@ use lookout_mail::session::{AccountCommand, DraftReplace};
 use lookout_mail::{new_message_id, Attachment, ComposedMessage, InlineImage};
 use webkit::prelude::*;
 
-use crate::recipient_entry::{RecipientEntry, SuggestionSource};
+use crate::recipient_entry::{RecipientEntry, Suggestion, SuggestionSource};
 
 /// How long the composer waits after the last check before autosaving the
 /// draft again. The autosave runs on a fixed tick and compares the current
@@ -1513,21 +1513,23 @@ pub fn build_compose_view(
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
     on_send_started: SendStarted,
 ) -> (gtk::Box, gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
-    // Plain single-line fields (no chips) - see `RecipientEntry::new_plain`.
-    // The To row has no caption label of its own: the To button beside it
-    // (below) both labels the row and opens the address-book picker.
-    let to_row = RecipientEntry::new_plain("");
+    // Chip-mode fields (UX-42): each recipient is a removable pill, so a
+    // contact list picked from the address book can render as a single
+    // expandable list chip (P-05). The To row has no caption label of its
+    // own: the To button in its header row (below) both labels the row and
+    // opens the address-book picker.
+    let to_row = RecipientEntry::new("");
     if let Some(to) = &prefill.to {
         to_row.set_from_text(to);
     }
-    let cc_row = RecipientEntry::new_plain("Cc");
+    let cc_row = RecipientEntry::new("Cc");
     let cc_prefilled = prefill.cc.as_ref().is_some_and(|cc| !cc.trim().is_empty());
     if let Some(cc) = &prefill.cc {
         cc_row.set_from_text(cc);
     }
     // Bcc is only ever prefilled when reopening a saved draft; Reply and
     // Forward can't know a blind-copy list by definition.
-    let bcc_row = RecipientEntry::new_plain("Bcc");
+    let bcc_row = RecipientEntry::new("Bcc");
     let bcc_prefilled = prefill.bcc.as_ref().is_some_and(|bcc| !bcc.trim().is_empty());
     if let Some(bcc) = &prefill.bcc {
         bcc_row.set_from_text(bcc);
@@ -1550,7 +1552,7 @@ pub fn build_compose_view(
         .build();
     let cc_button = gtk::Button::builder().label("Cc").css_classes(["flat", "caption"]).tooltip_text("Show Cc").build();
     let bcc_button = gtk::Button::builder().label("Bcc").css_classes(["flat", "caption"]).tooltip_text("Show Bcc").build();
-    to_row.widget().prepend(&to_button);
+    to_row.add_header_suffix(&to_button);
     to_row.add_header_suffix(&cc_button);
     to_row.add_header_suffix(&bcc_button);
     {
@@ -1558,7 +1560,7 @@ pub fn build_compose_view(
         to_button.connect_clicked(move |button| {
             let on_add = {
                 let to_row = to_row.clone();
-                Rc::new(move |addrs: Vec<EmailAddress>| to_row.append_addresses(&addrs))
+                Rc::new(move |picked: Vec<Suggestion>| to_row.append_suggestions(&picked))
             };
             open_contact_picker(button.clone().upcast(), on_add);
         });

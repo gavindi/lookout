@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.184" date="2026-10-14">
+      <description>
+        <p>Contact lists now appear as you address a message. A list from your address book is offered in the recipient autocomplete and the address-book picker, and picking one inserts a single chip bearing the list's name - a plus button expands it to its members, and sending always delivers to everyone on the list. The composer's To, Cc and Bcc fields are now Outlook-style recipient pills.</p>
+      </description>
+    </release>
     <release version="0.9.183" date="2026-10-14">
       <description>
         <p>A person's details are now one hover away. Resting on, or clicking, a sender's name or photo - in the reading pane, the message list, a stacked conversation or an event's attendee chip - opens a profile card with their photo, organization, phone, recent messages and upcoming shared events, plus buttons to email them, schedule a meeting, or add or edit them in your contacts.</p>

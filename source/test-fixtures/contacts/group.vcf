@@ -1,0 +1,9 @@
+BEGIN:VCARD
+VERSION:4.0
+KIND:group
+UID:bridge-crew
+FN:Bridge Crew
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:card-kirk
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:card-spock
+X-ADDRESSBOOKSERVER-MEMBER:mailto:uhura@example.com
+END:VCARD

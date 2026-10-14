@@ -45,12 +45,12 @@ Counts are tallied from the §5 tables.
 | Mail (5.1) | 25 | 7 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: rules, Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 13 | 4 | 5 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder and sensitivity. No forwarding with attachments. |
 | Calendar (5.3) | 15 | 9 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
-| People (5.4) | 6 | 3 | 3 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). No CSV, directory, or contact lists in compose. |
+| People (5.4) | 7 | 2 | 3 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). No CSV or directory. |
 | Tasks (5.5) | 4 | 2 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **75** | **30** | **47** | **5** | ~48% at parity, ~19% partial |
+| **Total** | **76** | **29** | **47** | **5** | ~48% at parity, ~18% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -73,7 +73,6 @@ Lookout's shell already follows new Outlook's layout: app rail, File/Home/View/H
 - The subject **squeezed onto the sender line** in the message list, and column headers shown over multi-line rows.
 - **Folder order** that's alphabetical rather than Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive.
 - **Calendar clicks open the full editor** instead of Outlook's quick-create and peek popovers; Today/arrows sit on the wrong side.
-- **Plain-text recipient fields** in compose, where Outlook uses pills.
 - Settings grouped differently from Outlook's Accounts / General / Mail / Calendar / People.
 
 ### 2.4 Three strategic decisions
@@ -302,7 +301,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | C-15 | Paste / drop images and files | Paste images works; file drop onto the composer attaches (1.20) | ✅ | — |
 | C-16 | Attachment reminder | Body/subject scan on send → "Send without an attachment?" dialog, toggle in Settings → Mail (1.19) | ✅ | — |
 | C-17 | My Templates | — | ❌ | |
-| C-18 | Check names / resolve recipients | Autocomplete plus picker (`recipient_entry.rs`, `contact_picker.rs`) | 🟡 | Expand contact lists (P-05); GAL lookup (P-11) |
+| C-18 | Check names / resolve recipients | Autocomplete plus picker (`recipient_entry.rs`, `contact_picker.rs`); contact lists expand to their members (4.3) | 🟡 | GAL lookup (P-11) |
 | C-19 | @mention insertion | — | ❌ | `@` → contact picker → adds to To |
 | C-20 | Reply with meeting | — | ❌ | Prefill event editor with thread participants |
 | C-21 | Encrypt / sign | — | ❌ | Phase 6 |
@@ -357,7 +356,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | P-02 | Anniversary, IM, website, custom fields | Editor rows for anniversary (`ANNIVERSARY`), IM (`IMPP`), website (`URL`) and custom properties, each property's original parameters preserved (4.1) | ✅ | — |
 | P-03 | Photo | Shown in the People list avatar (over the initials) and previewed/set/removed in the editor; Mail sender avatars already use it (4.1) | ✅ | Graph photo via 5.2 |
 | P-04 | Groups / favourites | Groups, starred contacts | ✅ | — |
-| P-05 | Contact lists in compose | Lists shown, not expandable in picker/autocomplete | 🟡 | Expand on insert (Outlook "+" expansion) |
+| P-05 | Contact lists in compose | `KIND:group` cards (with `X-ADDRESSBOOKSERVER-MEMBER`) appear in autocomplete and the address-book picker; picking one inserts a list chip with a `+` expander (4.3) | ✅ | — |
 | P-06 | Search in People | Only in picker/autocomplete | 🟡 | Search entry in People tab; global search scope |
 | P-07 | Sort / File as | Display name only | ❌ | First/Last, Last/First, Company |
 | P-08 | Import/export CSV | `.vcf` only | 🟡 | Outlook CSV (§4.6) |
@@ -505,7 +504,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 |---|---|---|---|---|---|
 | UX-40 | Compose ribbon | Contextual tabs replace Home: **Message** (Attach file ▾, Signature ▾, Importance, Dictate), **Insert** (File, Picture, Table, Link, Emoji, Signature, My Templates, Meeting), **Format text** (font, size, B I U S, highlight, colour, bullets, numbering, indent, align, styles, clear), **Draw**, **Options** (Importance, Sensitivity, Receipts, Delay delivery, Encrypt, Switch to plain text, Spelling language) | Formatting toolbar takes over the action bar (one strip) | Split into Message / Insert / Format text / Options tabs on the shared ribbon component (UX-16). Draw is out of scope | M |
 | UX-41 | Field order | Top bar: **Send ▾** (Schedule send), Discard, Pop out. Then **From** (shown with multiple identities), **To** (Cc / Bcc links at the right end), Cc, Bcc, **Subject**, attachments strip, body. Tab order To → Cc → Subject → body | Send, From dropdown, then To / Cc / Bcc / Subject (`compose.rs` `fields_group`) ✅. The older `mail_compose_pop_in_1.png` screenshot shows Subject above To and should be refreshed | Keep the order; check Tab order To → Cc → Bcc → Subject → body. Send is a split button with Schedule send ✅ (C-08) | S |
-| UX-42 | Recipient pills | Resolved recipients are **pills** (name, presence/avatar, ✕), external recipients flagged, contact lists show a "+" to expand, invalid addresses underlined in red; autocomplete rows show name, address and an ✕ to forget the suggestion | Compose uses `recipient_entry.rs` **plain** comma-separated mode; chip mode exists only in the event editor | Switch compose to chip mode with Outlook's pill behaviour. Expand lists (P-05). Add "Remove from suggestions" (deletes from the `addresses` table) | M |
+| UX-42 | Recipient pills | Resolved recipients are **pills** (name, presence/avatar, ✕), external recipients flagged, contact lists show a "+" to expand, invalid addresses underlined in red; autocomplete rows show name, address and an ✕ to forget the suggestion | Compose uses `recipient_entry.rs` chip mode (4.3), with a list chip that expands to members; external recipients aren't flagged yet and there's no "Remove from suggestions" | Flag external recipients; add "Remove from suggestions" (deletes from the `addresses` table) | M |
 | UX-43 | Attachments while composing | Tiles under the subject line; attach via Insert ▸ File ▸ *Browse this computer* / *Recent attachments*; drag-in; tile ▾: Open, Remove, (Share as link) | Attach button; file drop blocked (`compose.rs:722`) | Tiles, a recent-attachments list, drag-in (C-15) | S |
 | UX-44 | Missing icons | — | Compose toolbar shows red "missing image" placeholders on several buttons (`assets/screenshots/mail_compose_pop_in_1.png`) | **verify** on a current build; bundle or rename any missing symbolic icons | S |
 | UX-45 | Send feedback | Toast "Sending…" with **Undo** for N seconds, then sent; schedule send shows a "Scheduled for …" info bar on the draft | "Sending: <subject>" toast with Undo for the undo-send delay, then "Message sent"; failure toast; schedule send shows "Scheduled for …" with Undo, and the draft's bar reads "Scheduled to send …" with Cancel send ✅ | — | S |
@@ -676,7 +675,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 |---|---|---|---|---|
 | 4.1 | ✅ ~~Full contact field editing~~ | P-02, P-03 | Editor rows for anniversary, IM (`IMPP`), URL, custom; photo view and set (`PHOTO`) | M |
 | 4.2 | ✅ ~~Profile card~~ | P-10 | `app/src/profile_card.rs`: one reusable popover (`attach_person_trigger` + `show_person_card_at`), opened on hover/click of the reading-pane header sender, a message-list row's sender/avatar, a conversation-WebView card's sender, and an event-editor attendee chip (`RecipientEntry::set_person_card_hook`). Shows photo/initials, name, title·org, phones, address, recent mail (`Cache::search_query` by `from:`), upcoming shared events (`shared_upcoming_events` over the in-memory calendar), and Send email / Schedule meeting / Add-or-Edit contact. `EventEditorPrefill.suggested_attendees` lands "Schedule meeting" | M |
-| 4.3 | Contact lists in compose | P-05, C-18 | Lists appear in autocomplete/picker; expand to members on insert; optional `+` expander chip | S |
+| 4.3 | ✅ ~~Contact lists in compose~~ | P-05, C-18 | `KIND:group`/`X-ADDRESSBOOKSERVER-MEMBER` parsed (`core/vcard.rs`); snapshot resolves members (`contacts_view.rs`); `Suggestion::List` offered in autocomplete and the picker; a list inserts one chip with a `+` expander (compose switched to chip mode, UX-42) | S |
 | 4.4 | People search and sort | P-06, P-07 | Search entry in the People tab; File-as setting; global search scope "People" | S |
 | 4.5 | Outlook CSV import/export | P-08 | Column map per §4.6; tolerant header matching | M |
 | 4.6 | Merge duplicates | P-09 | Match by email/phone/name; merge UI with field-level choice | M |
@@ -735,7 +734,7 @@ Shell-level work from §6 that isn't owned by a single feature. Feature-specific
 | U.3 | Title bar and shell | UX-11, UX-13, UX-14, UX-19, UX-25 | Centred search with scope dropdown; Settings gear to the title bar; rail tooltips and selected state; F6 pane cycling; folder-pane collapse | M | Phase 1 (scope and advanced search finish in 2.3) |
 | U.4 | Message list redesign | UX-26…UX-31, UX-39, UX-84 | Three-line row; status icons and category chips; merged Filter/Sort menu; single-line columnar layout with configurable headers; Outlook folder order and counts (UX-23, UX-24); [Draft] marker; hover checkbox | L | Phase 1 (1.4–1.6) |
 | U.5 | Reading pane polish | UX-32…UX-34, UX-37, UX-86 | Info-bar stack component; ⋯ menu contents; attachment tiles; double-click/Enter opens a window; per-message dark toggle; "After moving or deleting" setting | M | Phase 1 |
-| U.6 | Compose layout | UX-40…UX-45 | Compose contextual ribbon tabs on U.1; chip-mode recipients in compose; attachment tiles and drag-in; icon audit | M | Phase 1 |
+| U.6 | Compose layout | UX-40…UX-45 | Compose contextual ribbon tabs on U.1; chip-mode recipients in compose; attachment tiles and drag-in; icon audit | M | Phase 1 (chip-mode recipients landed with 4.3) |
 | U.7 | Calendar interaction model | UX-51…UX-58 | Today/arrows on the left plus title picker; coloured calendar checkboxes; now-line; quick-create popover; event peek popover; chip styling; month "+N more" popover; Calendar View tab | M | Phase 3 |
 | U.8 | My Day pane | UX-18 | Tabbed Calendar/To Do pane with drop targets | M | Phase 4 |
 | U.9 | People and Tasks layouts | UX-65, UX-67, UX-71…UX-74 | People details pane with letter headers; Tasks smart lists, quick-add row and details pane | M | Phase 4 |

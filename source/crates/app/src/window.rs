@@ -24864,10 +24864,21 @@ pub(crate) fn show_composer_in_reading_pane(
         account: account_id.clone(),
     };
     let worker_for_suggestions = worker.clone();
-    let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str, complete: Box<dyn FnOnce(Vec<lookout_core::EmailAddress>)>| {
+    let state_for_suggestions = state.clone();
+    let account_for_suggestions = account_id.clone();
+    let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str, complete: Box<dyn FnOnce(Vec<crate::recipient_entry::Suggestion>)>| {
         let carddav = carddav_provider.search_contacts(prefix, 8);
+        // Contact lists (P-05) live on the same account snapshots the picker
+        // reads; collect the ones whose name matches the typed prefix.
+        let carddav_lists: Vec<lookout_core::ContactList> = {
+            let st = state_for_suggestions.borrow();
+            match &account_for_suggestions {
+                Some(id) => st.contacts_by_account.get(id).map(|snapshot| snapshot.contact_lists.clone()).unwrap_or_default(),
+                None => st.contacts_by_account.values().flat_map(|snapshot| snapshot.contact_lists.clone()).collect(),
+            }
+        };
         let Some(cache) = address_cache.clone() else {
-            complete(merge_contact_suggestions(Vec::new(), &carddav, prefix.trim(), 8));
+            complete(merge_contact_suggestions(Vec::new(), &carddav, &carddav_lists, prefix.trim(), 8));
             return;
         };
         let reply_rx = spawn_cache_read(&worker_for_suggestions, cache, {
@@ -24877,7 +24888,7 @@ pub(crate) fn show_composer_in_reading_pane(
         let prefix = prefix.trim().to_string();
         glib::spawn_future_local(async move {
             let mail_history = reply_rx.recv().await.unwrap_or_default();
-            complete(merge_contact_suggestions(mail_history, &carddav, &prefix, 8));
+            complete(merge_contact_suggestions(mail_history, &carddav, &carddav_lists, &prefix, 8));
         });
     });
     // Shows the "Sending: <subject>" toast the instant Send is clicked - with

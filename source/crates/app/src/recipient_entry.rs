@@ -8,10 +8,15 @@
 //! Chips are recreated from the canonical address list on every change, the
 //! same repopulate-from-truth approach the message list uses.
 //!
+//! A contact list picked from the address book lands as a single chip showing
+//! the list's name, with a `+` toggle that expands it to its member chips
+//! (P-05); sending always expands a list to its members.
+//!
 //! A second "plain" mode (`new_plain`) drops the chips entirely in favour of
 //! a single line of comma-separated text, still backed by the same
-//! autocomplete popover - used by the compose window's To/Cc/Bcc fields. The
-//! calendar event editor's attendees field keeps the original chip mode.
+//! autocomplete popover. It predates the composer's move to chip mode (UX-42)
+//! and is retained only for compatibility; contact lists expand to their
+//! members inline when picked in this mode.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -20,11 +25,28 @@ use std::rc::Rc;
 
 use gtk::glib;
 use gtk::prelude::*;
-use lookout_core::EmailAddress;
+use lookout_core::{ContactList, EmailAddress};
 
 /// How many completions the popover offers at once. Enough to be useful,
 /// short enough that the list never covers the body editor below it.
 const MAX_SUGGESTIONS: usize = 8;
+
+/// One entry the autocomplete/address-book picker can offer: a single address,
+/// or a contact list (P-05) that expands to its members when inserted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Suggestion {
+    Address(EmailAddress),
+    List(ContactList),
+}
+
+/// A committed recipient. A [`Chip::List`] carries the list's name and its
+/// members as address tokens, plus whether the member chips are currently
+/// shown; `addresses()`/`text_value()` always expand it to the members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Chip {
+    Address(String),
+    List { name: String, members: Vec<String>, expanded: bool },
+}
 
 /// Splits a recipient field's text into individual address tokens.
 ///
@@ -124,7 +146,7 @@ pub fn is_plausible_address(token: &str) -> bool {
 /// so results don't arrive on the same call stack. Supplied by the window,
 /// which owns the per-account cache handle the addresses come from - this
 /// module never touches storage itself.
-pub type SuggestionSource = Rc<dyn Fn(&str, Box<dyn FnOnce(Vec<EmailAddress>)>)>;
+pub type SuggestionSource = Rc<dyn Fn(&str, Box<dyn FnOnce(Vec<Suggestion>)>)>;
 
 /// A recipient field. Cheap to clone; clones share the same chips and entry.
 #[derive(Clone)]
@@ -144,13 +166,14 @@ pub struct RecipientEntry {
     /// canonical committed list. Plain mode: a single line of raw text -
     /// `entry`'s text is the only state, `tokens` stays empty and unused.
     plain: bool,
-    /// The canonical contents - full tokens (`Ada <ada@example.com>` or a
-    /// bare address), in the order the user entered them. The chip widgets
-    /// are rebuilt from this, never read back out of. Unused in plain mode.
-    tokens: Rc<RefCell<Vec<String>>>,
+    /// The canonical contents, in the order the user entered them. The chip
+    /// widgets are rebuilt from this, never read back out of. `Chip::List`
+    /// members are stored as address tokens and expanded on send. Unused in
+    /// plain mode.
+    tokens: Rc<RefCell<Vec<Chip>>>,
     popover: gtk::Popover,
     suggestion_list: gtk::ListBox,
-    suggestions: Rc<RefCell<Vec<EmailAddress>>>,
+    suggestions: Rc<RefCell<Vec<Suggestion>>>,
     source: Rc<RefCell<Option<SuggestionSource>>>,
     /// Bumped on every `refresh_suggestions` call; a `source` reply is
     /// applied only if it's still the most recent request when it lands, so
@@ -184,10 +207,10 @@ impl RecipientEntry {
     }
 
     /// A plain-line field: recipients are raw comma-separated text, no
-    /// chips. Used by the compose window's To/Cc/Bcc. An empty `title`
-    /// omits the caption label (the compose window's To field instead
-    /// labels itself via the To button placed as a suffix, plus a
-    /// placeholder string).
+    /// chips. An empty `title` omits the caption label. Kept for test
+    /// coverage of the plain path; the composer and event editor both use
+    /// chip mode now (UX-42).
+    #[allow(dead_code)]
     pub fn new_plain(title: &str) -> Self {
         Self::build(title, true)
     }
@@ -211,9 +234,13 @@ impl RecipientEntry {
             let header = root.clone();
             (root, header, None)
         } else {
-            let title_label = gtk::Label::builder().label(title).xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
             let header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-            header.append(&title_label);
+            // An empty title is omitted: the compose To row labels itself via
+            // the To button placed in this header with `add_header_suffix`.
+            if !title.is_empty() {
+                let title_label = gtk::Label::builder().label(title).xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+                header.append(&title_label);
+            }
 
             let flow = gtk::FlowBox::builder()
                 .selection_mode(gtk::SelectionMode::None)
@@ -299,19 +326,26 @@ impl RecipientEntry {
             self.entry.set_text(text);
             return;
         }
-        *self.tokens.borrow_mut() = parse_address_tokens(text);
+        *self.tokens.borrow_mut() = parse_address_tokens(text).into_iter().map(Chip::Address).collect();
         self.rebuild_chips();
         self.notify_changed();
     }
 
     /// Every recipient, including anything still being typed but not yet
     /// committed to a chip - a Send click must not silently drop a
-    /// half-entered address just because the user didn't press Enter.
+    /// half-entered address just because the user didn't press Enter. Contact
+    /// list chips expand to their members.
     pub fn addresses(&self) -> Vec<String> {
         if self.plain {
             return parse_address_tokens(&self.entry.text());
         }
-        let mut out: Vec<String> = self.tokens.borrow().clone();
+        let mut out: Vec<String> = Vec::new();
+        for chip in self.tokens.borrow().iter() {
+            match chip {
+                Chip::Address(token) => out.push(token.clone()),
+                Chip::List { members, .. } => out.extend(members.iter().cloned()),
+            }
+        }
         let pending = self.entry.text().trim().to_string();
         if !pending.is_empty() {
             out.extend(parse_address_tokens(&pending));
@@ -376,14 +410,59 @@ impl RecipientEntry {
             self.popover.popdown();
             return;
         }
-        let existing: Vec<String> = self.tokens.borrow().iter().map(|t| address_of(t).to_lowercase()).collect();
+        let existing: Vec<String> = self.addresses().iter().map(|t| address_of(t).to_lowercase()).collect();
         {
             let mut tokens = self.tokens.borrow_mut();
             for addr in addrs {
                 if existing.contains(&addr.address.to_lowercase()) {
                     continue;
                 }
-                tokens.push(token_for(addr));
+                tokens.push(Chip::Address(token_for(addr)));
+            }
+        }
+        self.rebuild_chips();
+        self.notify_changed();
+    }
+
+    /// Appends whatever the address-book picker returned - addresses as chips,
+    /// contact lists as a single list chip (or, in plain mode, as their
+    /// expanded member addresses). Deduplicates addresses case-insensitively.
+    pub fn append_suggestions(&self, suggestions: &[Suggestion]) {
+        if suggestions.is_empty() {
+            return;
+        }
+        let addresses: Vec<EmailAddress> = suggestions
+            .iter()
+            .filter_map(|suggestion| match suggestion {
+                Suggestion::Address(address) => Some(address.clone()),
+                Suggestion::List(_) => None,
+            })
+            .collect();
+        self.append_addresses(&addresses);
+
+        let lists: Vec<&ContactList> = suggestions
+            .iter()
+            .filter_map(|suggestion| match suggestion {
+                Suggestion::List(list) => Some(list),
+                Suggestion::Address(_) => None,
+            })
+            .collect();
+        if lists.is_empty() {
+            return;
+        }
+        if self.plain {
+            let members: Vec<EmailAddress> = lists.iter().flat_map(|list| list.members.iter().cloned()).collect();
+            self.append_addresses(&members);
+            return;
+        }
+        {
+            let mut tokens = self.tokens.borrow_mut();
+            for list in lists {
+                tokens.push(Chip::List {
+                    name: list.name.clone(),
+                    members: list.members.iter().map(token_for).collect(),
+                    expanded: false,
+                });
             }
         }
         self.rebuild_chips();
@@ -511,7 +590,7 @@ impl RecipientEntry {
             }
             return;
         }
-        self.tokens.borrow_mut().extend(tokens);
+        self.tokens.borrow_mut().extend(tokens.into_iter().map(Chip::Address));
         self.entry.set_text("");
         self.popover.popdown();
         self.rebuild_chips();
@@ -552,13 +631,34 @@ impl RecipientEntry {
             child = next;
         }
         // Everything except the entry is gone; re-insert chips ahead of it.
-        for (index, token) in self.tokens.borrow().iter().enumerate() {
-            let chip = self.build_chip(index, token);
-            flow.insert(&chip, index as i32);
+        // An expanded list contributes its member chips right after its own
+        // list chip.
+        let chips = self.tokens.borrow().clone();
+        let mut position = 0i32;
+        for (index, chip) in chips.iter().enumerate() {
+            match chip {
+                Chip::Address(token) => {
+                    let widget = self.build_address_chip(index, token);
+                    flow.insert(&widget, position);
+                    position += 1;
+                }
+                Chip::List { name, members, expanded } => {
+                    let widget = self.build_list_chip(index, name, members, *expanded);
+                    flow.insert(&widget, position);
+                    position += 1;
+                    if *expanded {
+                        for (member_index, member) in members.iter().enumerate() {
+                            let widget = self.build_list_member_chip(index, member_index, member);
+                            flow.insert(&widget, position);
+                            position += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
-    fn build_chip(&self, index: usize, token: &str) -> gtk::Box {
+    fn build_address_chip(&self, index: usize, token: &str) -> gtk::Box {
         let label = gtk::Label::builder()
             .label(chip_label(token))
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
@@ -612,6 +712,96 @@ impl RecipientEntry {
         chip
     }
 
+    /// The chip for a contact list: the list's name and member count, a `+`/`−`
+    /// toggle that expands the member chips, and a remove button that drops the
+    /// whole list.
+    fn build_list_chip(&self, index: usize, name: &str, members: &[String], expanded: bool) -> gtk::Box {
+        let label = gtk::Label::builder()
+            .label(format!("{name} ({})", members.len()))
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .max_width_chars(32)
+            .build();
+        let toggle = gtk::Button::builder()
+            .icon_name(if expanded { "pan-down-symbolic" } else { "pan-end-symbolic" })
+            .css_classes(["flat", "circular", "recipient-chip-toggle"])
+            .tooltip_text(if expanded { "Collapse contact list" } else { "Expand contact list" })
+            .build();
+        {
+            let this = self.clone();
+            toggle.connect_clicked(move |_| {
+                let mut tokens = this.tokens.borrow_mut();
+                if let Some(Chip::List { expanded, .. }) = tokens.get_mut(index) {
+                    *expanded = !*expanded;
+                }
+                drop(tokens);
+                this.rebuild_chips();
+            });
+        }
+        let remove = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .css_classes(["flat", "circular", "recipient-chip-remove"])
+            .tooltip_text("Remove contact list")
+            .build();
+        {
+            let this = self.clone();
+            remove.connect_clicked(move |_| {
+                let mut tokens = this.tokens.borrow_mut();
+                if index < tokens.len() {
+                    tokens.remove(index);
+                }
+                drop(tokens);
+                this.rebuild_chips();
+                this.notify_changed();
+            });
+        }
+
+        let chip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).build();
+        chip.add_css_class("recipient-chip");
+        chip.add_css_class("recipient-chip-list");
+        chip.set_tooltip_text(Some(name));
+        chip.append(&label);
+        chip.append(&toggle);
+        chip.append(&remove);
+        chip
+    }
+
+    /// A member chip shown under an expanded contact list. Removing it drops
+    /// that member from the list (not the list itself).
+    fn build_list_member_chip(&self, list_index: usize, member_index: usize, token: &str) -> gtk::Box {
+        let label = gtk::Label::builder()
+            .label(chip_label(token))
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .max_width_chars(28)
+            .build();
+        let remove = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .css_classes(["flat", "circular", "recipient-chip-remove"])
+            .tooltip_text("Remove from list")
+            .build();
+        {
+            let this = self.clone();
+            remove.connect_clicked(move |_| {
+                let mut tokens = this.tokens.borrow_mut();
+                if let Some(Chip::List { members, .. }) = tokens.get_mut(list_index) {
+                    if member_index < members.len() {
+                        members.remove(member_index);
+                    }
+                }
+                drop(tokens);
+                this.rebuild_chips();
+                this.notify_changed();
+            });
+        }
+
+        let chip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).build();
+        chip.add_css_class("recipient-chip");
+        chip.add_css_class("recipient-chip-member");
+        chip.set_tooltip_text(Some(address_of(token)));
+        chip.append(&label);
+        chip.append(&remove);
+        chip
+    }
+
     /// Dispatches a suggestion lookup for `prefix` and, once it answers,
     /// applies the result - unless a later keystroke has since dispatched a
     /// newer one, per `suggestion_generation`.
@@ -639,7 +829,7 @@ impl RecipientEntry {
     /// separated from `refresh_suggestions` so it can run either immediately
     /// (empty prefix, no source) or later, once an async `source` reply
     /// lands.
-    fn apply_suggestions(&self, generation: u64, matches: Vec<EmailAddress>) {
+    fn apply_suggestions(&self, generation: u64, matches: Vec<Suggestion>) {
         // A keystroke since this lookup started has already dispatched (and
         // possibly already applied) a newer one - this reply is stale.
         if self.suggestion_generation.get() != generation {
@@ -648,11 +838,15 @@ impl RecipientEntry {
 
         // Anything already entered is not a useful suggestion. `addresses()`
         // covers both modes: chip mode's committed tokens plus any pending
-        // text, and plain mode's whole entry.
+        // text, and plain mode's whole entry. Lists carry no address of their
+        // own, so they are never filtered out here.
         let existing: Vec<String> = self.addresses().iter().map(|t| address_of(t).to_lowercase()).collect();
-        let matches: Vec<EmailAddress> = matches
+        let matches: Vec<Suggestion> = matches
             .into_iter()
-            .filter(|m| !existing.contains(&m.address.to_lowercase()))
+            .filter(|m| match m {
+                Suggestion::Address(address) => !existing.contains(&address.address.to_lowercase()),
+                Suggestion::List(_) => true,
+            })
             .take(MAX_SUGGESTIONS)
             .collect();
 
@@ -711,12 +905,30 @@ impl RecipientEntry {
         let Some(candidate) = self.suggestions.borrow().get(index.max(0) as usize).cloned() else {
             return false;
         };
-        if self.plain {
-            self.replace_current_segment(&token_for(&candidate));
-        } else {
-            self.tokens.borrow_mut().push(token_for(&candidate));
-            self.entry.set_text("");
-            self.rebuild_chips();
+        match candidate {
+            Suggestion::Address(address) => {
+                if self.plain {
+                    self.replace_current_segment(&token_for(&address));
+                } else {
+                    self.tokens.borrow_mut().push(Chip::Address(token_for(&address)));
+                    self.entry.set_text("");
+                    self.rebuild_chips();
+                }
+            }
+            Suggestion::List(list) => {
+                let members: Vec<String> = list.members.iter().map(token_for).collect();
+                if self.plain {
+                    self.replace_current_segment(&members.join(", "));
+                } else {
+                    self.tokens.borrow_mut().push(Chip::List {
+                        name: list.name,
+                        members,
+                        expanded: false,
+                    });
+                    self.entry.set_text("");
+                    self.rebuild_chips();
+                }
+            }
         }
         self.popover.popdown();
         true
@@ -759,10 +971,13 @@ fn chip_label(token: &str) -> &str {
     }
 }
 
-fn suggestion_label(candidate: &EmailAddress) -> String {
-    match &candidate.name {
-        Some(name) if !name.trim().is_empty() => format!("{name} <{}>", candidate.address),
-        _ => candidate.address.clone(),
+fn suggestion_label(candidate: &Suggestion) -> String {
+    match candidate {
+        Suggestion::Address(address) => match &address.name {
+            Some(name) if !name.trim().is_empty() => format!("{name} <{}>", address.address),
+            _ => address.address.clone(),
+        },
+        Suggestion::List(list) => format!("{} ({})", list.name, list.members.len()),
     }
 }
 
@@ -884,5 +1099,59 @@ mod tests {
         field.set_from_text("ada@x.com");
         field.append_addresses(&[EmailAddress::new("ada@x.com"), EmailAddress::new("bob@y.com")]);
         assert_eq!(field.addresses(), vec!["ada@x.com", "bob@y.com"]);
+    }
+
+    fn sample_list() -> ContactList {
+        ContactList {
+            name: "Bridge Crew".to_string(),
+            members: vec![EmailAddress::new("kirk@x.com"), EmailAddress::new("spock@x.com")],
+        }
+    }
+
+    #[test]
+    fn a_list_chip_expands_to_its_members_in_addresses() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new("To");
+        field.append_suggestions(&[Suggestion::List(sample_list())]);
+        assert_eq!(field.addresses(), vec!["kirk@x.com", "spock@x.com"]);
+        assert_eq!(field.text_value(), "kirk@x.com, spock@x.com");
+    }
+
+    #[test]
+    fn append_suggestions_adds_addresses_and_lists() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new("To");
+        field.append_suggestions(&[
+            Suggestion::Address(EmailAddress::new("ada@x.com")),
+            Suggestion::List(sample_list()),
+        ]);
+        assert_eq!(field.addresses(), vec!["ada@x.com", "kirk@x.com", "spock@x.com"]);
+    }
+
+    #[test]
+    fn a_list_chip_can_be_collapsed_and_expanded() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new("To");
+        field.append_suggestions(&[Suggestion::List(sample_list())]);
+        assert_eq!(field.tokens.borrow().len(), 1);
+        let expanded = {
+            let mut tokens = field.tokens.borrow_mut();
+            match tokens.get_mut(0) {
+                Some(Chip::List { expanded, .. }) => {
+                    *expanded = !*expanded;
+                    *expanded
+                }
+                _ => false,
+            }
+        };
+        assert!(expanded);
+        // Expansion never changes what would be sent.
+        assert_eq!(field.addresses(), vec!["kirk@x.com", "spock@x.com"]);
     }
 }

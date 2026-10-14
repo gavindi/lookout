@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailField, VCard};
+use lookout_core::{AccountId, ContactList, ContactListMember, ContactsProvider, EmailAddress, EmailField, VCard};
 use lookout_dav::{CardDavAccountConfig, ContactsCache, Credential, DavClient};
 use lookout_goa::{ContactsAuthMethod, GoaClient, GoaContactsAccount};
 
@@ -44,17 +44,58 @@ pub struct ContactsAccountSnapshot {
     /// `pub(crate)` so the compose window's contact picker can list every
     /// known address without re-deriving it from `contacts`/vCards itself.
     pub(crate) suggestions: Vec<EmailAddress>,
+    /// Every contact list (`KIND:group` vCard) in this account's address
+    /// books, with its members already resolved to addresses. Offered in the
+    /// composer's recipient autocomplete/picker (P-05) so a list can be
+    /// inserted and expanded.
+    pub(crate) contact_lists: Vec<ContactList>,
+}
+
+/// Resolves every contact list in `contacts` to a [`ContactList`] with member
+/// addresses, following `urn:uuid:` member references to the referenced card's
+/// primary address. Unresolved members (a card the server didn't send, or a
+/// card with no `EMAIL`) are skipped; `mailto:` members are used verbatim and
+/// duplicates are dropped.
+pub(crate) fn resolve_contact_lists(contacts: &[lookout_dav::ContactRecord]) -> Vec<ContactList> {
+    let by_uid: HashMap<&str, &VCard> = contacts
+        .iter()
+        .filter_map(|record| record.card.uid.as_deref().map(|uid| (uid, &record.card)))
+        .collect();
+    let mut lists = Vec::new();
+    for record in contacts.iter().filter(|record| record.card.is_contact_list()) {
+        let mut members = Vec::new();
+        let mut seen = HashSet::new();
+        for member in record.card.contact_list_member_refs() {
+            let address = match member {
+                ContactListMember::Uid(uid) => by_uid.get(uid.as_str()).and_then(|card| card.email_addresses().into_iter().next()),
+                ContactListMember::Address(address) => Some(EmailAddress { name: None, address }),
+            };
+            let Some(address) = address else { continue };
+            let key = address.address.trim().to_lowercase();
+            if key.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            members.push(address);
+        }
+        lists.push(ContactList {
+            name: record.card.contact_list_name(),
+            members,
+        });
+    }
+    lists
 }
 
 /// A bare snapshot for tests: no books (the write path's pickers aren't
 /// exercised), just the display name and the given contact records.
 #[cfg(test)]
 pub(crate) fn test_snapshot(display_name: &str, contacts: Vec<lookout_dav::ContactRecord>) -> ContactsAccountSnapshot {
+    let contact_lists = resolve_contact_lists(&contacts);
     ContactsAccountSnapshot {
         display_name: display_name.to_string(),
         books: Vec::new(),
         contacts,
         suggestions: Vec::new(),
+        contact_lists,
     }
 }
 
@@ -152,6 +193,12 @@ fn contacts_match_prefix(contact: &EmailAddress, prefix: &str) -> bool {
     }
     let needle = prefix.to_lowercase();
     contact.address.to_lowercase().starts_with(&needle) || contact.name.as_deref().is_some_and(|name| name.to_lowercase().starts_with(&needle))
+}
+
+/// A contact list matches a completion prefix on its name alone - it carries
+/// no address of its own, only its members.
+pub(crate) fn contact_list_matches_prefix(list: &ContactList, prefix: &str) -> bool {
+    prefix.is_empty() || list.name.to_lowercase().starts_with(&prefix.to_lowercase())
 }
 
 pub(crate) fn vcard_display_name(card: &VCard) -> String {
@@ -958,11 +1005,27 @@ pub(crate) fn dedupe_addresses(addresses: Vec<EmailAddress>, limit: usize) -> Ve
     out
 }
 
-pub fn merge_contact_suggestions(mail_history: Vec<EmailAddress>, carddav: &[EmailAddress], prefix: &str, limit: usize) -> Vec<EmailAddress> {
-    let mut merged = Vec::new();
-    merged.extend(mail_history);
-    merged.extend(carddav.iter().filter(|c| contacts_match_prefix(c, prefix)).cloned());
-    dedupe_addresses(merged, limit)
+pub fn merge_contact_suggestions(
+    mail_history: Vec<EmailAddress>,
+    carddav: &[EmailAddress],
+    lists: &[ContactList],
+    prefix: &str,
+    limit: usize,
+) -> Vec<crate::recipient_entry::Suggestion> {
+    let mut addresses = Vec::new();
+    addresses.extend(mail_history);
+    addresses.extend(carddav.iter().filter(|c| contacts_match_prefix(c, prefix)).cloned());
+    let mut merged: Vec<crate::recipient_entry::Suggestion> = dedupe_addresses(addresses, limit)
+        .into_iter()
+        .map(crate::recipient_entry::Suggestion::Address)
+        .collect();
+    for list in lists.iter().filter(|list| contact_list_matches_prefix(list, prefix)) {
+        if merged.len() >= limit {
+            break;
+        }
+        merged.push(crate::recipient_entry::Suggestion::List(list.clone()));
+    }
+    merged
 }
 
 /// The shared `ContactsProvider` implementation: a live view over the
@@ -1006,7 +1069,7 @@ pub fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>, worker: &Rc<W
         state: state.clone(),
         account: None,
     };
-    Rc::new(move |prefix: &str, complete: Box<dyn FnOnce(Vec<EmailAddress>)>| {
+    Rc::new(move |prefix: &str, complete: Box<dyn FnOnce(Vec<crate::recipient_entry::Suggestion>)>| {
         let prefix = prefix.trim();
         let carddav = carddav_provider.search_contacts(prefix, 8);
         let caches: Vec<Arc<lookout_mail::Cache>> = state.borrow().accounts.values().filter_map(|h| h.address_cache.clone()).collect();
@@ -1025,7 +1088,7 @@ pub fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>, worker: &Rc<W
                     mail_history.extend(hits);
                 }
             }
-            complete(merge_contact_suggestions(mail_history, &carddav, &prefix, 8));
+            complete(merge_contact_suggestions(mail_history, &carddav, &[], &prefix, 8));
         });
     })
 }
@@ -1128,10 +1191,10 @@ pub fn refresh_contacts_category_ui(
                 }
             }
 
-            // vCard v4's KIND:group cards represent a named contact list
-            // rather than a person.
+            // vCard v4's KIND:group cards (Apple's X-ADDRESSBOOKSERVER-KIND)
+            // represent a named contact list rather than a person.
             let contact_lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> =
-                all_contacts.iter().filter(|(_, _, record)| record.card.kind.as_deref() == Some("group")).cloned().collect();
+                all_contacts.iter().filter(|(_, _, record)| record.card.is_contact_list()).cloned().collect();
             let deleted: Vec<(AccountId, String, lookout_dav::ContactRecord)> = st
                 .deleted_contacts
                 .get(account_id)
@@ -1807,11 +1870,13 @@ fn snapshot_from_cache(account: &GoaContactsAccount, cache: &ContactsCache) -> O
         })
         .collect();
     let addresses: Vec<EmailAddress> = contacts.iter().flat_map(|record| record.card.email_addresses()).collect();
+    let contact_lists = resolve_contact_lists(&contacts);
     Some(ContactsAccountSnapshot {
         display_name: account.display_name.clone(),
         books,
         contacts,
         suggestions: dedupe_addresses(addresses, usize::MAX),
+        contact_lists,
     })
 }
 
@@ -1938,11 +2003,13 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
     }
     tracing::debug!("CardDAV sync for {}: {} total vcard(s)", account.display_name, contacts.len());
 
+    let contact_lists = resolve_contact_lists(&contacts);
     Ok(ContactsAccountSnapshot {
         display_name: account.display_name,
         books,
         contacts,
         suggestions: dedupe_addresses(addresses, usize::MAX),
+        contact_lists,
     })
 }
 
@@ -2130,4 +2197,63 @@ fn toast_contact_batch(toast_overlay: adw::ToastOverlay, replies: Vec<async_chan
             toast_overlay.add_toast(adw::Toast::new(success));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(card: VCard) -> lookout_dav::ContactRecord {
+        lookout_dav::ContactRecord {
+            href: String::new(),
+            etag: None,
+            card,
+        }
+    }
+
+    fn group_card(uid: &str, name: &str, members: &[&str]) -> VCard {
+        let member_lines = members.iter().map(|m| format!("X-ADDRESSBOOKSERVER-MEMBER:{m}\r\n")).collect::<String>();
+        VCard::parse(&format!("BEGIN:VCARD\r\nVERSION:4.0\r\nKIND:group\r\nUID:{uid}\r\nFN:{name}\r\n{member_lines}END:VCARD\r\n")).unwrap()
+    }
+
+    fn person_card(uid: &str, email: &str) -> VCard {
+        VCard::parse(&format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:{uid}\r\nFN:{uid}\r\nEMAIL:{email}\r\nEND:VCARD\r\n")).unwrap()
+    }
+
+    #[test]
+    fn resolve_contact_lists_follows_uid_members_and_mailto_members() {
+        let contacts = vec![
+            record(person_card("card-a", "kirk@example.com")),
+            record(person_card("card-b", "spock@example.com")),
+            record(group_card("crew", "Bridge Crew", &["urn:uuid:card-a", "urn:uuid:card-b", "mailto:uhura@example.com"])),
+        ];
+        let lists = resolve_contact_lists(&contacts);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].name, "Bridge Crew");
+        let members: Vec<&str> = lists[0].members.iter().map(|m| m.address.as_str()).collect();
+        assert_eq!(members, ["kirk@example.com", "spock@example.com", "uhura@example.com"]);
+    }
+
+    #[test]
+    fn resolve_contact_lists_skips_unresolved_members_and_duplicates() {
+        let contacts = vec![
+            record(person_card("card-a", "kirk@example.com")),
+            record(group_card("crew", "Bridge Crew", &["urn:uuid:card-a", "urn:uuid:missing", "mailto:kirk@example.com"])),
+        ];
+        let lists = resolve_contact_lists(&contacts);
+        assert_eq!(lists[0].members.len(), 1);
+        assert_eq!(lists[0].members[0].address, "kirk@example.com");
+    }
+
+    #[test]
+    fn contact_list_prefix_matches_on_name() {
+        let list = ContactList {
+            name: "Bridge Crew".to_string(),
+            members: Vec::new(),
+        };
+        assert!(contact_list_matches_prefix(&list, ""));
+        assert!(contact_list_matches_prefix(&list, "brid"));
+        assert!(contact_list_matches_prefix(&list, "Bridge"));
+        assert!(!contact_list_matches_prefix(&list, "crew"));
+    }
 }

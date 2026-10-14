@@ -32,6 +32,28 @@ impl EmailAddress {
     }
 }
 
+/// One member reference inside a contact list / distribution list vCard
+/// (`KIND:group`). CardDAV stores membership as a reference rather than an
+/// inline address: either the `UID` of another contact card (Apple's
+/// `X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:<uid>`) or a direct `mailto:` address.
+/// The app resolves `Uid` against the address book's cards; `Address` is used
+/// as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContactListMember {
+    Uid(String),
+    Address(String),
+}
+
+/// A contact list / distribution list (a `KIND:group` vCard) with its members
+/// already resolved to addresses. Used to offer lists in the composer's
+/// recipient autocomplete and the address book picker, expanding to `members`
+/// when inserted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactList {
+    pub name: String,
+    pub members: Vec<EmailAddress>,
+}
+
 /// A generic source of contact-address completions.
 pub trait ContactsProvider {
     /// Returns matching addresses for `prefix`, in preference order.

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::fmt;
 
-use crate::email::EmailAddress;
+use crate::email::{ContactListMember, EmailAddress};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VCard {
@@ -404,6 +404,56 @@ impl VCard {
                 address: email.address.clone(),
             })
             .collect()
+    }
+
+    /// Whether this card is a contact list / distribution list rather than an
+    /// individual contact. RFC 6350 marks these with `KIND:group`; older
+    /// CardDAV servers (and Apple's own exports) still use
+    /// `X-ADDRESSBOOKSERVER-KIND:group` alone, so both are honoured.
+    pub fn is_contact_list(&self) -> bool {
+        if self.kind.as_deref().is_some_and(|kind| kind.eq_ignore_ascii_case("group")) {
+            return true;
+        }
+        self.other.iter().any(|prop| {
+            prop.name.eq_ignore_ascii_case("X-ADDRESSBOOKSERVER-KIND") && prop.value.trim().eq_ignore_ascii_case("group")
+        })
+    }
+
+    /// The list's display name: its `FN`, falling back to the first `ORG`
+    /// component, then the `UID`.
+    pub fn contact_list_name(&self) -> String {
+        if let Some(full_name) = self.full_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return full_name.to_string();
+        }
+        if let Some(org) = self.organization.as_ref().and_then(|org| org.first()).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return org.to_string();
+        }
+        self.uid.clone().unwrap_or_default()
+    }
+
+    /// The members of a contact list, as unresolved references. Reads both
+    /// RFC 6350's `MEMBER` and Apple's `X-ADDRESSBOOKSERVER-MEMBER`, since
+    /// real servers emit either. `urn:uuid:` values yield [`ContactListMember::Uid`]
+    /// (to be resolved against the address book's cards); `mailto:` values and
+    /// bare addresses yield [`ContactListMember::Address`].
+    pub fn contact_list_member_refs(&self) -> Vec<ContactListMember> {
+        let mut refs = Vec::new();
+        for prop in &self.other {
+            let is_member = prop.name.eq_ignore_ascii_case("MEMBER") || prop.name.eq_ignore_ascii_case("X-ADDRESSBOOKSERVER-MEMBER");
+            if !is_member {
+                continue;
+            }
+            let value = prop.value.trim();
+            if let Some(uid) = value.strip_prefix("urn:uuid:").map(str::trim).filter(|s| !s.is_empty()) {
+                refs.push(ContactListMember::Uid(uid.to_string()));
+            } else if let Some(address) = value.strip_prefix("mailto:").map(str::trim).filter(|s| !s.is_empty()) {
+                refs.push(ContactListMember::Address(address.to_string()));
+            } else if value.contains('@') && !value.contains(':') {
+                // Some servers write a bare address rather than a URI.
+                refs.push(ContactListMember::Address(value.to_string()));
+            }
+        }
+        refs
     }
 }
 
@@ -1031,5 +1081,46 @@ mod tests {
                 address: "ada@example.com".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn recognises_a_group_contact_list() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nKIND:group\r\nFN:Team\r\nUID:list-1\r\nMEMBER:mailto:ada@example.com\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert!(card.is_contact_list());
+        assert_eq!(card.contact_list_name(), "Team");
+        assert_eq!(card.contact_list_member_refs(), vec![ContactListMember::Address("ada@example.com".to_string())]);
+    }
+
+    #[test]
+    fn recognises_an_apple_style_contact_list_and_resolves_member_refs() {
+        // Apple omits KIND and marks the list with X-ADDRESSBOOKSERVER-KIND,
+        // referencing members by UID rather than by address.
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Team\r\nUID:list-1\r\nX-ADDRESSBOOKSERVER-KIND:group\r\nX-ADDRESSBOOKSERVER-MEMBER:urn:uuid:card-a\r\nX-ADDRESSBOOKSERVER-MEMBER:urn:uuid:card-b\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert!(card.is_contact_list());
+        assert_eq!(
+            card.contact_list_member_refs(),
+            vec![ContactListMember::Uid("card-a".to_string()), ContactListMember::Uid("card-b".to_string())]
+        );
+        let reparsed = VCard::parse(&card.serialize()).unwrap();
+        assert!(reparsed.is_contact_list());
+        assert_eq!(reparsed.contact_list_member_refs(), card.contact_list_member_refs());
+    }
+
+    #[test]
+    fn an_individual_card_is_not_a_contact_list() {
+        let text = "BEGIN:VCARD\r\nVERSION:4.0\r\nKIND:individual\r\nFN:Ada\r\nEMAIL:ada@example.com\r\nEND:VCARD\r\n";
+        let card = VCard::parse(text).unwrap();
+        assert!(!card.is_contact_list());
+        assert!(card.contact_list_member_refs().is_empty());
+    }
+
+    #[test]
+    fn parses_the_contact_list_fixture() {
+        let card = VCard::parse(include_str!("../../../test-fixtures/contacts/group.vcf")).expect("fixture parses");
+        assert!(card.is_contact_list());
+        assert_eq!(card.contact_list_name(), "Bridge Crew");
+        assert_eq!(card.contact_list_member_refs().len(), 3);
     }
 }
