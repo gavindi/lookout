@@ -100,6 +100,33 @@ fn root_cert_store() -> Result<RootCertStore> {
     Ok(store)
 }
 
+/// Builds the rustls connector used by every outbound TLS connection in this
+/// crate (IMAP, and ManageSieve's implicit TLS and STARTTLS upgrade).
+pub(crate) fn tls_connector() -> Result<TlsConnector> {
+    let root_store = root_cert_store()?;
+    let config = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Wraps an already-connected plain `TcpStream` in TLS (the STARTTLS upgrade
+/// path), reusing the same connector as [`connect_tls`].
+pub(crate) async fn tls_connect_over(tcp: TcpStream, host: &str) -> Result<ImapStream> {
+    ensure_crypto_provider_installed();
+    let connector = tls_connector()?;
+    let server_name = ServerName::try_from(host.to_string()).map_err(|_| Error::InvalidServerName(host.to_string()))?;
+    let tls = connector.connect(server_name, tcp).await?;
+    Ok(tls)
+}
+
+/// Opens a plain (unencrypted) TCP connection, applying the same keepalive
+/// tuning as the IMAP connection. Used for the STARTTLS handshake before the
+/// stream is upgraded.
+pub(crate) async fn connect_plain(host: &str, port: u16) -> Result<TcpStream> {
+    let tcp = TcpStream::connect((host, port)).await?;
+    enable_keepalive(&tcp);
+    Ok(tcp)
+}
+
 /// Opens a TLS connection to `host:port` suitable for wrapping in an
 /// `async_imap::Client` or driving an SMTP `AUTH`/submission session.
 pub async fn connect_tls(host: &str, port: u16) -> Result<ImapStream> {
@@ -120,17 +147,10 @@ pub async fn connect_tls(host: &str, port: u16) -> Result<ImapStream> {
         return connect_tls_insecure_for_tests(host, port).await;
     }
 
-    tracing::debug!("connect_tls: building root store");
-    let root_store = root_cert_store()?;
-    let config = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
-
     tracing::debug!("connect_tls: tcp connecting to {host}:{port}");
-    let tcp = TcpStream::connect((host, port)).await?;
-    enable_keepalive(&tcp);
+    let tcp = connect_plain(host, port).await?;
     tracing::debug!("connect_tls: tcp connected, starting tls handshake");
-    let server_name = ServerName::try_from(host.to_string()).map_err(|_| Error::InvalidServerName(host.to_string()))?;
-    let tls = connector.connect(server_name, tcp).await?;
+    let tls = tls_connect_over(tcp, host).await?;
     tracing::debug!("connect_tls: tls handshake complete");
     Ok(tls)
 }

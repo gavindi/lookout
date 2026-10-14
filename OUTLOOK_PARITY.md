@@ -42,7 +42,7 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 25 | 7 | 12 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode). Missing Outlook's organising layer: Sieve server rules (the client and Graph backends shipped, 2.5), Focused Inbox, Sweep, Quick Steps. No `.msg`. |
+| Mail (5.1) | 26 | 7 | 11 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, and rules across client, Graph and Sieve backends). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 13 | 4 | 5 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder and sensitivity. No forwarding with attachments. |
 | Calendar (5.3) | 15 | 9 | 11 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations now send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete. Response tracking and free/busy remain missing. |
 | People (5.4) | 7 | 2 | 3 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). No CSV or directory. |
@@ -50,13 +50,13 @@ Counts are tallied from the §5 tables.
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **76** | **29** | **47** | **5** | ~48% at parity, ~18% partial |
+| **Total** | **77** | **29** | **46** | **5** | ~49% at parity, ~18% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
 1. **Microsoft 365 calendar, contacts and To Do** (A-03…A-05). Accounts users "add from Outlook" show no calendar.
 2. ✅ ~~**Sending meeting invitations as organizer** (CAL-14) - done: client iMIP REQUEST/update/CANCEL, or RFC 6638 server scheduling.~~
-3. **Rules** (M-14): the client and Microsoft 365 (Graph) backends shipped (2.5); the Sieve backend remains.
+3. ✅ ~~**Rules** (M-14) — done across client, Microsoft 365 (Graph) and Sieve backends (2.5).~~
 4. **Undo send and undo actions** (M-21, C-09).
 5. **Spell check** (C-02). WebKit can do this; it's switched off.
 6. **Flags with due dates / follow-up**, and **importance** (M-10, M-12, C-05).
@@ -246,7 +246,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-11 | Snooze | Snooze ▾ presets (Later today, Tomorrow, This weekend, Next week, Choose a date…); synced via the server "Scheduled" folder plus a wake-time keyword, local fallback where keywords aren't stored (§4.2); wakes on time back to the Inbox, unread; "Snoozed until …" bar with Unsnooze; Undo | ✅ | Outlook's own snooze isn't visible over IMAP (⛔) |
 | M-12 | Importance display | `!`/`↓` list glyph from parsed headers | ✅ | — |
 | M-13 | Pin | Pinned section, Graph mirror (`graph_pin.rs`) | ✅ | — |
-| M-14 | Rules | Client engine (2.5): `core/src/rules.rs` model + matcher, `app/src/rules.rs` runner on arriving Inbox mail (move/copy/delete/flag/categorize/mark-read/forward/redirect, StopProcessing, body/header deferral); manager and editor (Config → Mail → Rules); message menu Rules ▸ Create rule; folder "Run rules now"; Microsoft 365 via Graph `messageRules` (`app/src/graph_rules.rs`, per-account, synced on connect/F5/consent) | 🟡 | Sieve (ManageSieve) server backend |
+| M-14 | Rules | Three backends (2.5): **client** (`core/src/rules.rs` model + matcher, `app/src/rules.rs` runner on arriving Inbox mail: move/copy/delete/flag/categorize/mark-read/forward/redirect, StopProcessing, body/header deferral); **Microsoft 365** (Graph `messageRules`, `app/src/graph_rules.rs`, per-account, synced on connect/F5/consent); **Sieve** (`mail/src/sieve.rs` compiler + `mail/src/managesieve.rs` RFC 5804 client, uploaded as Lookout's active script). Manager and editor (Config → Mail → Rules, per-rule "runs on" + account); message menu Rules ▸ Create rule; folder "Run rules now"; a rule Sieve/Graph can't express stays client-side | ✅ | — |
 | M-15 | Quick Steps | — | ❌ | User-defined action chains |
 | M-16 | Sweep | — | ❌ | Delete/move all from sender, keep latest, older than N days |
 | M-17 | Junk: safe / blocked senders | "Report" moves to Junk and sets RFC 5788 `$Junk` (1.24); "Not junk" moves back to the Inbox and sets `$NotJunk`; Empty Junk | 🟡 | No safe/blocked lists; no "Not junk" in the ribbon's Report split button (UX-05, 2.9) |
@@ -634,7 +634,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 2.2 | ✅ ~~Search query language~~ | M-18 | Parser in `mail/src/search_query.rs`: `from: to: cc: subject: body: has:attachment is:unread is:read is:flagged is:pinned category: received:>=2026-01-01 received:lastweek size:>1MB folder:`; compile to FTS5 `MATCH` plus SQL predicates locally and IMAP `SEARCH` keys remotely; keep `sanitize_fts_query` for free text | M |
 | 2.3 | ✅ ~~Search UI: refiners, scope, history~~ | M-18 | Scope dropdown (current folder / subfolders / account / all); refiner chips; recent searches in `ui_state_db`; advanced-search form; contextual Search ribbon row | M |
 | 2.4 | Search Folders | M-19 | Saved queries as virtual folders in the tree (unread mail, flagged, from VIPs, large mail, custom) | M |
-| 2.5 | 🟡 Rules engine (client + Graph backends done; Sieve remains) | M-14 | One model, `Rule { conditions: [From/To/Subject/Body/Header/HasAttachment/Importance/Size/SentOnlyToMe/List-Id], exceptions, actions: [Move/Copy/Delete/Flag/Categorise/MarkRead/Forward/Redirect/StopProcessing] }`, executed by three backends: (a) **client**, run on `NewMessages` in the session; (b) **Sieve** via ManageSieve (§4.5) when the server advertises it; (c) **Graph** `messageRules`. Rules UI shows where each rule runs; "Run rules now" on a folder; "Create rule…" from a message (and the context menu's Rules ▸, `message_menu.rs`). | L |
+| 2.5 | ✅ ~~Rules engine~~ | M-14 | One model, `Rule { conditions: [From/To/Subject/Body/Header/HasAttachment/Importance/Size/SentOnlyToMe/List-Id], exceptions, actions: [Move/Copy/Delete/Flag/Categorise/MarkRead/Forward/Redirect/StopProcessing] }`, executed by three backends: (a) **client**, run on `NewMessages` in the session; (b) **Sieve** via ManageSieve (§4.5) when the server advertises it; (c) **Graph** `messageRules`. Rules UI shows where each rule runs; "Run rules now" on a folder; "Create rule…" from a message (and the context menu's Rules ▸, `message_menu.rs`). | L |
 | 2.6 | Quick Steps | M-15 | Named action chains (reuses rule actions) in the ribbon and a shortcut slot | M |
 | 2.7 | Sweep | M-16 | Dialog from a message: delete/move all from sender, keep latest, delete older than 10 days; optional standing rule | M |
 | 2.8 | Ignore / Clean up conversation | M-20 | Ignore: thread-ID list, client rule moves new arrivals to Deleted; "Ignore" in the context menu (`message_menu.rs`). Clean up: delete messages whose text is wholly quoted in a later message | M |

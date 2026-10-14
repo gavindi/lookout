@@ -19,9 +19,11 @@ mod connection;
 mod envelope;
 mod error;
 pub mod mailbox_name;
+pub mod managesieve;
 pub mod search_query;
 pub mod send;
 pub mod session;
+pub mod sieve;
 mod structure;
 
 // `Cache` itself is public so the app crate can open a read-side handle for

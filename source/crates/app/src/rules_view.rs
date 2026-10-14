@@ -29,6 +29,8 @@ pub(crate) fn save_rules(state: &Rc<RefCell<UiState>>, rules: Vec<Rule>) {
     let app_config = state.borrow().app_config.clone();
     app_config.borrow_mut().rules = rules;
     crate::app_config::save(&app_config.borrow());
+    // A changed rule set may alter what the server should run (item 2.5).
+    crate::window::push_sieve_rules(state);
 }
 
 /// The label for a rule's backend, as the manager shows it ("runs on").
@@ -266,6 +268,7 @@ pub(crate) fn show_manage_rules_dialog(anchor: &gtk::Widget, state: Rc<RefCell<U
                                 let app_config = state.borrow().app_config.clone();
                                 app_config.borrow_mut().move_rule(index, target as usize);
                                 crate::app_config::save(&app_config.borrow());
+                                crate::window::push_sieve_rules(&state);
                             }
                             (rebuild_handle.borrow())();
                         }
@@ -307,6 +310,7 @@ pub(crate) fn show_manage_rules_dialog(anchor: &gtk::Widget, state: Rc<RefCell<U
                         let app_config = state.borrow().app_config.clone();
                         app_config.borrow_mut().remove_rule(&id);
                         crate::app_config::save(&app_config.borrow());
+                        crate::window::push_sieve_rules(&state);
                         (rebuild_handle.borrow())();
                     }
                 });
@@ -383,14 +387,13 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
     });
     root.append(&labeled_row("Name", &name_entry));
 
-    // Connected Microsoft 365 accounts, for the "Microsoft 365" backend - a
-    // Graph rule lives in one mailbox, so it needs an account.
-    let m365: Vec<(lookout_core::AccountId, String)> = {
+    // Connected accounts, for the server-side backends - a Sieve or Graph rule
+    // lives on one server, so it needs an account.
+    let accounts: Vec<(lookout_core::AccountId, String)> = {
         let st = state.borrow();
         let mut accounts: Vec<(lookout_core::AccountId, String)> = st
             .accounts
             .iter()
-            .filter(|(_, handle)| handle.graph_rules.is_some())
             .map(|(account_id, handle)| {
                 let label = if !handle.display_name.trim().is_empty() {
                     handle.display_name.clone()
@@ -412,19 +415,19 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
         RuleBackend::Sieve => 1,
         RuleBackend::Graph => 2,
     });
-    let account_row = if m365.is_empty() {
+    let account_row = if accounts.is_empty() {
         None
     } else {
-        let labels: Vec<&str> = m365.iter().map(|(_, label)| label.as_str()).collect();
+        let labels: Vec<&str> = accounts.iter().map(|(_, label)| label.as_str()).collect();
         let account = gtk::DropDown::from_strings(&labels);
-        if let Some(index) = m365.iter().position(|(id, _)| rule.borrow().account.as_ref() == Some(id)) {
+        if let Some(index) = accounts.iter().position(|(id, _)| rule.borrow().account.as_ref() == Some(id)) {
             account.set_selected(index as u32);
         }
         account.connect_selected_notify({
             let rule = rule.clone();
-            let m365 = m365.clone();
+            let accounts = accounts.clone();
             move |dropdown| {
-                if let Some((account_id, _)) = m365.get(dropdown.selected() as usize) {
+                if let Some((account_id, _)) = accounts.get(dropdown.selected() as usize) {
                     rule.borrow_mut().account = Some(account_id.clone());
                 }
             }
@@ -435,7 +438,7 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
     };
     backend.connect_selected_notify({
         let rule = rule.clone();
-        let m365 = m365.clone();
+        let accounts = accounts.clone();
         let account_row = account_row.clone();
         move |dropdown| {
             let selected = match dropdown.selected() {
@@ -446,15 +449,16 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
             {
                 let mut rule = rule.borrow_mut();
                 rule.backend = selected;
-                // A Graph rule must name its account; the first connected one
-                // is the default. Clearing the backend clears the scope.
+                // A server-side rule (Sieve or Graph) must name its account;
+                // the first connected one is the default. The client backend
+                // clears the scope.
                 match selected {
-                    RuleBackend::Graph => {
+                    RuleBackend::Sieve | RuleBackend::Graph => {
                         if rule.account.is_none() {
-                            rule.account = m365.first().map(|(account_id, _)| account_id.clone());
+                            rule.account = accounts.first().map(|(account_id, _)| account_id.clone());
                         }
                     }
-                    _ => rule.account = None,
+                    RuleBackend::Client => rule.account = None,
                 }
             }
             if let Some(row) = &account_row {
@@ -546,14 +550,15 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
             if saved.name.trim().is_empty() {
                 saved.name = "Untitled rule".to_string();
             }
-            // A Graph rule must name a connected account; pick the first when
-            // none was chosen.
-            if saved.backend == RuleBackend::Graph && saved.account.is_none() {
-                saved.account = m365.first().map(|(account_id, _)| account_id.clone());
+            // A server-side rule must name a connected account; pick the first
+            // when none was chosen.
+            if matches!(saved.backend, RuleBackend::Sieve | RuleBackend::Graph) && saved.account.is_none() {
+                saved.account = accounts.first().map(|(account_id, _)| account_id.clone());
             }
             let app_config = state.borrow().app_config.clone();
             app_config.borrow_mut().upsert_rule(saved);
             crate::app_config::save(&app_config.borrow());
+            crate::window::push_sieve_rules(&state);
             on_saved();
             dialog.close();
         });

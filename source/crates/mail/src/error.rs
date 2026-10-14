@@ -20,6 +20,8 @@ pub enum Error {
     LoginFailed(String),
     #[error("no {0:?} folder found")]
     NoSuchFolder(lookout_core::MailboxRole),
+    #[error("ManageSieve error: {0}")]
+    Sieve(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

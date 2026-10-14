@@ -105,6 +105,10 @@ pub(crate) struct AccountHandle {
     /// rules with Outlook's inbox `messageRules` (item 2.5), once Graph access
     /// is granted. See `graph_rules`.
     pub(crate) graph_rules: Option<Rc<crate::graph_rules::GraphRulesClient>>,
+    /// Whether this account's server advertised ManageSieve at login (item
+    /// 2.5), from `AccountEvent::SieveAdvertised`. Gates offering the Sieve
+    /// backend for the account.
+    pub(crate) sieve_advertised: bool,
 }
 
 /// One GNOME Online Accounts account as discovered at startup, keeping the
@@ -9844,6 +9848,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 sync_follow_ups_from_graph(&state, account_id);
                 sync_and_push_rules_from_graph(&state, account_id);
             }
+            push_sieve_rules(&state);
             for cmd_tx in state.borrow().contact_cmd_tx.values() {
                 let _ = cmd_tx.send_blocking(ContactCommand::Refresh);
             }
@@ -11794,6 +11799,7 @@ fn connect_account(
             graph_mail: is_microsoft_365.then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
             graph_categories: is_microsoft_365.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
             graph_rules: is_microsoft_365.then(|| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone()))),
+            sieve_advertised: false,
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
@@ -12241,6 +12247,24 @@ fn spawn_account_event_loop(
                         // Client rules (item 2.5 / M-14) run on genuinely-new
                         // arriving Inbox mail. See `rules::run_client_rules`.
                         crate::rules::run_client_rules(&state, &account_id, &mailbox, &messages);
+                    }
+                    AccountEvent::SieveAdvertised(advertised) => {
+                        // Remember whether this account's server offers
+                        // ManageSieve, so the rules UI can offer the Sieve
+                        // backend (item 2.5).
+                        if let Some(handle) = state.borrow_mut().accounts.get_mut(&account_id) {
+                            handle.sieve_advertised = advertised;
+                        }
+                        // Push any Sieve rules now that the server is reachable.
+                        if advertised {
+                            push_sieve_rules(&state);
+                        }
+                    }
+                    AccountEvent::SieveScriptUpdated => {
+                        toast_overlay.add_toast(adw::Toast::new("Server rules updated"));
+                    }
+                    AccountEvent::SieveFailed { message } => {
+                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't update server rules: {message}"))));
                     }
                     AccountEvent::BodyFetched { mailbox, uid, body } => {
                         // A rules-engine evaluation (item 2.5 / M-14, A5b)
@@ -12855,6 +12879,7 @@ fn connect_other_account(
             graph_mail: None,
             graph_categories: None,
             graph_rules: None,
+            sieve_advertised: false,
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
@@ -15598,6 +15623,36 @@ fn push_rules_to_graph(state: &Rc<RefCell<UiState>>) {
 fn sync_and_push_rules_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
     sync_rules_from_graph(state, account_id);
     push_rules_to_graph(state);
+}
+
+/// Compiles the enabled `Sieve`-backend rules and uploads the script to every
+/// account whose server advertises ManageSieve (item 2.5). A rule with no
+/// account applies to every such server; a scoped rule only to its own. Best
+/// effort: the session reports success or failure with a toast.
+pub(crate) fn push_sieve_rules(state: &Rc<RefCell<UiState>>) {
+    let targets: Vec<AccountId> = {
+        let st = state.borrow();
+        st.accounts
+            .iter()
+            .filter(|(_, handle)| handle.sieve_advertised)
+            .map(|(account_id, _)| account_id.clone())
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let rules = state.borrow().app_config.borrow().rules.clone();
+    for account_id in targets {
+        let scoped: Vec<lookout_core::Rule> = rules
+            .iter()
+            .filter(|rule| rule.account.as_ref().is_none_or(|account| account == &account_id))
+            .cloned()
+            .collect();
+        let script = lookout_mail::sieve::rules_to_sieve(&scoped);
+        if let Some(handle) = state.borrow().accounts.get(&account_id) {
+            let _ = handle.cmd_tx.send_blocking(AccountCommand::PutSieveScript { script });
+        }
+    }
 }
 
 /// Deletes a rule's Outlook copy (item 2.5) after the user removed it here.
@@ -26110,6 +26165,7 @@ mod tests {
                         graph_mail: None,
                         graph_categories: None,
                         graph_rules: None,
+                        sieve_advertised: false,
                     },
                 )
             })

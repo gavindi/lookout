@@ -677,6 +677,13 @@ pub enum AccountCommand {
     DeleteDraft {
         message_id: String,
     },
+    /// Upload `script` to the account's ManageSieve server as Lookout's own
+    /// script and make it active (item 2.5, the Sieve rules backend). The
+    /// script is compiled by the caller (`crate::sieve::rules_to_sieve`);
+    /// `SieveScriptUpdated`/`SieveFailed` reports the outcome.
+    PutSieveScript {
+        script: String,
+    },
     Shutdown,
 }
 
@@ -936,6 +943,17 @@ pub enum AccountEvent {
         mailbox: MailboxId,
         query: String,
         messages: Vec<EmailSummary>,
+    },
+    /// Whether this account's server advertises ManageSieve (item 2.5). Emitted
+    /// once at each login, so the rules UI can offer or hide the Sieve backend.
+    SieveAdvertised(bool),
+    /// The answer to `AccountCommand::PutSieveScript`: the script is uploaded
+    /// and active.
+    SieveScriptUpdated,
+    /// `PutSieveScript` failed (no ManageSieve server, a bad script, or an
+    /// authentication the Sieve port wouldn't accept).
+    SieveFailed {
+        message: String,
     },
     Error(String),
 }
@@ -1371,7 +1389,12 @@ async fn connect_and_run(
         qresync,
         has_uidplus,
         has_idle: _,
+        sieve,
     } = caps;
+
+    // Tell the app whether the Sieve rules backend is available for this
+    // account (item 2.5).
+    let _ = events.send(AccountEvent::SieveAdvertised(sieve)).await;
 
     let account_id = config.account_id.clone();
     let (mut folders, list_counts_supplied) = list_mailboxes(&mut session, &account_id, condstore, has_list_status).await?;
@@ -2535,6 +2558,38 @@ async fn connect_and_run(
                     }
                     session.select(&current_mailbox_name).await?;
                     session_selected = current_mailbox_id.clone();
+                }
+                // Sieve rules live on a separate ManageSieve connection, not
+                // this IMAP session (item 2.5): fetch a fresh credential and
+                // upload on a detached task so the IMAP connection isn't held
+                // while the Sieve port is talked to.
+                AccountCommand::PutSieveScript { script } => {
+                    let script_config = config.clone();
+                    let script_events = events.clone();
+                    match credentials.imap_credential().await {
+                        Ok(Credential::Password(password)) => {
+                            tokio::spawn(async move {
+                                match upload_sieve_script(&script_config.imap.host, &script_config.imap.username, &password, &script).await {
+                                    Ok(()) => {
+                                        let _ = script_events.send(AccountEvent::SieveScriptUpdated).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = script_events.send(AccountEvent::SieveFailed { message: e.to_string() }).await;
+                                    }
+                                }
+                            });
+                        }
+                        Ok(Credential::OAuth2AccessToken(_)) => {
+                            let _ = events
+                                .send(AccountEvent::SieveFailed {
+                                    message: "ManageSieve needs a password sign-in; the server doesn't accept OAuth2 tokens".to_string(),
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = events.send(AccountEvent::SieveFailed { message: e }).await;
+                        }
+                    }
                 }
                 // Already connected - nothing to reconnect. This variant
                 // only does something useful while backed off between
@@ -5287,6 +5342,29 @@ struct ServerCapabilities {
     /// dedicated IDLE-only connection (`run_idle_supervisor`) is worth
     /// attempting at all.
     has_idle: bool,
+    /// Whether the server advertises ManageSieve (an IMAP `SIEVE` / `SIEVE=`
+    /// capability), so the Sieve rules backend has something to talk to
+    /// (item 2.5). Advertised, not proven - the backend still degrades if the
+    /// connection fails.
+    sieve: bool,
+}
+
+/// Uploads a compiled Sieve script to the account's ManageSieve server
+/// (item 2.5), making it Lookout's own active script. Tries STARTTLS first
+/// (the RFC 5804 default on port 4190) and falls back to a plain connection
+/// for servers that don't offer the upgrade.
+async fn upload_sieve_script(host: &str, username: &str, password: &str, script: &str) -> Result<()> {
+    use crate::managesieve::{self, SieveSecurity};
+    let mut client = match managesieve::connect(host, managesieve::DEFAULT_PORT, SieveSecurity::StartTls).await {
+        Ok(client) => client,
+        Err(_) => managesieve::connect(host, managesieve::DEFAULT_PORT, SieveSecurity::Plain).await?,
+    };
+    client.authenticate_plain(username, password).await?;
+    client.check_script(script).await?;
+    client.put_script(crate::sieve::SCRIPT_NAME, script).await?;
+    client.set_active(crate::sieve::SCRIPT_NAME).await?;
+    let _ = client.logout().await;
+    Ok(())
 }
 
 async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {
@@ -5320,7 +5398,14 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     // sets `\Deleted` outside the uids it means to remove).
     let has_uidplus = capabilities.has_str("UIDPLUS");
     let has_idle = capabilities.has_str("IDLE");
-    tracing::debug!(has_move, has_list_status, has_uidplus, has_idle, "cached server capabilities after login");
+    // ManageSieve is advertised either as a bare `SIEVE` atom or as `SIEVE=`
+    // (with a value), depending on the server; `has_str` only matches the
+    // bare form, so the iterator catches the parameterised one too.
+    let sieve = capabilities.has_str("SIEVE")
+        || capabilities
+            .iter()
+            .any(|cap| matches!(cap, async_imap::types::Capability::Atom(atom) if atom.len() > 6 && atom[..6].eq_ignore_ascii_case("SIEVE=")));
+    tracing::debug!(has_move, has_list_status, has_uidplus, has_idle, sieve, "cached server capabilities after login");
 
     // CONDSTORE (RFC 7162): enables the per-mailbox `highest_modseq` bookkeeping
     // that incremental sync (`CHANGEDSINCE`) builds on. `ENABLE` applies to the
@@ -5395,6 +5480,7 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
             qresync,
             has_uidplus,
             has_idle,
+            sieve,
         },
     ))
 }

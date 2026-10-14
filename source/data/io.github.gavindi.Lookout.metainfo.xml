@@ -75,6 +75,16 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.187" date="2026-10-14">
+      <description>
+        <p>Rules can now run on the server, so they keep working while Lookout is closed. Besides the local engine, a rule can run on a ManageSieve server (Dovecot, Cyrus and similar) or, on a Microsoft 365 account, as an Outlook inbox rule synced both ways through Microsoft Graph. Manage them under Settings, Mail, Rules, or create one from a message's right-click menu; a folder's menu can also run the rules over its messages on demand.</p>
+      </description>
+    </release>
+    <release version="0.9.186" date="2026-10-14">
+      <description>
+        <p>New: rules. Filter incoming mail automatically - move, copy, delete, flag, categorize, mark read, forward or redirect, with conditions and exceptions - from Settings, Mail, Rules, or straight from a message's right-click menu. Lookout also syncs your rules with Microsoft 365 through Microsoft Graph.</p>
+      </description>
+    </release>
     <release version="0.9.185" date="2026-10-14">
       <description>
         <p>People gains a search box and Outlook's "File as" filing, and the Tasks view its sort and group options.</p>
