@@ -103,6 +103,12 @@ pub struct AppConfig {
     /// `lookout_core::Rule` and `app/src/rules.rs`.
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// The user-authored "My Templates" snippets (item 2.10 / C-17) inserted
+    /// into the composer. Global - not pinned to an account. `#[serde(default)]`
+    /// is required so an older `settings.json` without the key still
+    /// deserializes (the struct has no container-level default).
+    #[serde(default)]
+    pub templates: Vec<lookout_core::MailTemplate>,
 }
 
 impl AppConfig {
@@ -162,6 +168,21 @@ impl AppConfig {
         } else {
             self.rules.push(rule);
         }
+    }
+
+    /// Inserts `template`, replacing any existing entry with the same id (the
+    /// edit path) or appending it (the add path).
+    pub fn upsert_template(&mut self, template: lookout_core::MailTemplate) {
+        if let Some(existing) = self.templates.iter_mut().find(|t| t.id == template.id) {
+            *existing = template;
+        } else {
+            self.templates.push(template);
+        }
+    }
+
+    /// Removes the template with `id`, if any.
+    pub fn remove_template(&mut self, id: &uuid::Uuid) {
+        self.templates.retain(|t| &t.id != id);
     }
 
     /// Removes the rule with `id`, if any.
@@ -309,6 +330,7 @@ mod tests {
             }],
             categories: Vec::new(),
             rules: Vec::new(),
+            templates: Vec::new(),
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -338,6 +360,7 @@ mod tests {
             other_accounts: Vec::new(),
             categories: Vec::new(),
             rules: Vec::new(),
+            templates: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -450,6 +473,43 @@ mod tests {
         assert_eq!(loaded.signature_defaults.len(), 1);
         assert_eq!(loaded.signature_defaults[&AccountId("account_1".into())].new, Some(signature.id));
         assert_eq!(loaded.signature_defaults[&AccountId("account_1".into())].reply, Some(signature.id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn templates_round_trip_upsert_and_remove() {
+        let dir = std::env::temp_dir().join(format!("lookout-templates-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `templates` loads as an empty list rather than
+        // failing (the key carries `#[serde(default)]`).
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        assert!(load_at(&path).templates.is_empty());
+
+        let mut config = AppConfig::default();
+        let status = lookout_core::MailTemplate::new("Status update", "<p>Status: </p>", "Status: ");
+        let meeting = lookout_core::MailTemplate::new("Meeting notes", "<p>Notes</p>", "Notes");
+        config.upsert_template(status.clone());
+        config.upsert_template(meeting.clone());
+        assert_eq!(config.templates.len(), 2);
+
+        // Upsert replaces in place rather than appending a duplicate.
+        let mut edited = status.clone();
+        edited.html = "<p>Status: done</p>".into();
+        config.upsert_template(edited.clone());
+        assert_eq!(config.templates.len(), 2);
+        assert_eq!(config.templates[0].html, "<p>Status: done</p>");
+
+        config.remove_template(&meeting.id);
+        assert_eq!(config.templates.len(), 1);
+        // Removing an unknown id is a no-op.
+        config.remove_template(&uuid::Uuid::new_v4());
+        assert_eq!(config.templates.len(), 1);
+
+        save_at(&path, &config);
+        assert_eq!(load_at(&path).templates, vec![edited]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

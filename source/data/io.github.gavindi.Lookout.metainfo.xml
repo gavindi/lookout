@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.188" date="2026-10-14">
+      <description>
+        <p>Junk mail gets proper lists, and the composer gets re-usable snippets. Settings, Mail now has a "Junk email" group where you can keep safe senders and blocked senders; blocking can also be done from a message's right-click menu (Block sender, Block domain or Unblock sender), and new mail from a blocked sender goes straight to Junk. The composer gains a "My Templates" menu that inserts a saved rich-text snippet at the cursor, managed from Settings, Mail, My Templates.</p>
+      </description>
+    </release>
     <release version="0.9.187" date="2026-10-14">
       <description>
         <p>Rules can now run on the server, so they keep working while Lookout is closed. Besides the local engine, a rule can run on a ManageSieve server (Dovecot, Cyrus and similar) or, on a Microsoft 365 account, as an Outlook inbox rule synced both ways through Microsoft Graph. Manage them under Settings, Mail, Rules, or create one from a message's right-click menu; a folder's menu can also run the rules over its messages on demand.</p>

@@ -127,7 +127,7 @@ pub fn show_editor_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
 /// stored HTML. The round trip stays intact: the composer's paste handler
 /// renders `data:` images fine, and at send time `read_content` extracts
 /// them back into inline attachments again.
-fn embed_images(html: &str, images: &[lookout_mail::InlineImage]) -> String {
+pub(crate) fn embed_images(html: &str, images: &[lookout_mail::InlineImage]) -> String {
     if images.is_empty() {
         return html.to_string();
     }

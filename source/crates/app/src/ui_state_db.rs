@@ -179,6 +179,11 @@ impl UiStateDb {
                 level INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (account, entry)
             );
+            CREATE TABLE IF NOT EXISTS blocked_senders (
+                account TEXT NOT NULL,
+                entry TEXT NOT NULL,
+                PRIMARY KEY (account, entry)
+            );
             CREATE TABLE IF NOT EXISTS folder_expansion_state (
                 kind TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -269,6 +274,31 @@ impl UiStateDb {
     pub fn remove_trusted_sender(&self, account: &AccountId, entry: &str) -> rusqlite::Result<()> {
         self.conn
             .execute("DELETE FROM trusted_senders WHERE account = ?1 AND entry = ?2", rusqlite::params![account.0, entry])?;
+        Ok(())
+    }
+
+    /// Every persisted blocked-sender entry, ordered by account then entry -
+    /// the persisted shape of `UiState::blocked_senders`. Entries are
+    /// lowercased addresses (`spammer@example.com`) or `@domain` patterns.
+    pub fn load_blocked_senders(&self) -> rusqlite::Result<Vec<(AccountId, String)>> {
+        let mut stmt = self.conn.prepare("SELECT account, entry FROM blocked_senders ORDER BY account, entry")?;
+        let rows = stmt.query_map([], |row| Ok((AccountId(row.get::<_, String>(0)?), row.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
+    /// Adds or replaces a blocked-sender entry for `account`. Idempotent.
+    pub fn set_blocked_sender(&self, account: &AccountId, entry: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO blocked_senders (account, entry) VALUES (?1, ?2)",
+            rusqlite::params![account.0, entry],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets one blocked-sender entry. A missing row is not an error.
+    pub fn remove_blocked_sender(&self, account: &AccountId, entry: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM blocked_senders WHERE account = ?1 AND entry = ?2", rusqlite::params![account.0, entry])?;
         Ok(())
     }
 
@@ -778,6 +808,47 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, "@news.example");
         assert_eq!(loaded[0].2, lookout_core::TrustLevel::Images);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_senders_round_trip_and_wipe_survival() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("blocked-senders");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_blocked_senders().unwrap().is_empty());
+
+        let account = AccountId("/org/gnome/OnlineAccounts/Accounts/account_1".into());
+        db.set_blocked_sender(&account, "spammer@example.com").unwrap();
+        // Re-adding the same entry is idempotent (INSERT OR REPLACE).
+        db.set_blocked_sender(&account, "spammer@example.com").unwrap();
+        db.set_blocked_sender(&account, "@ads.example").unwrap();
+
+        let loaded = db.load_blocked_senders().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains(&(account.clone(), "spammer@example.com".to_string())));
+        assert!(loaded.contains(&(account.clone(), "@ads.example".to_string())));
+
+        // Removal drops exactly that entry; a missing row is not an error.
+        db.remove_blocked_sender(&account, "spammer@example.com").unwrap();
+        db.remove_blocked_sender(&account, "spammer@example.com").unwrap();
+        let loaded = db.load_blocked_senders().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, "@ads.example");
+
+        // Blocking is a preference: the version-wipe path must not touch it.
+        let reopened = UiStateDb::open().expect("existing database should reopen");
+        assert_eq!(reopened.load_blocked_senders().unwrap(), loaded);
+        reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
+        drop(reopened);
+        let upgraded = UiStateDb::open().unwrap();
+        let loaded = upgraded.load_blocked_senders().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, "@ads.example");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

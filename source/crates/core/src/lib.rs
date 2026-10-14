@@ -13,6 +13,7 @@ pub mod interop;
 pub mod mailbox;
 pub mod rules;
 pub mod signature;
+pub mod template;
 pub mod thread;
 pub mod trust;
 pub mod vcard;
@@ -42,6 +43,7 @@ pub use interop::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, sn
 pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use rules::{Rule, RuleAction, RuleBackend, RuleCondition, RuleContext, RuleTarget, SizeComparison};
 pub use signature::Signature;
+pub use template::MailTemplate;
 pub use thread::{ThreadGroup, ThreadKey};
 pub use trust::{html_remote_content_scan, normalize_trust_entry, sender_matches_trust_entry, RemoteContentScan, TrustLevel};
 pub use vcard::{AddressField, Birthday, EmailField, FileAs, ImppField, Name, OtherProperty, Parameter, Photo, TelephoneField, VCard, VCardError};

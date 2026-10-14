@@ -61,6 +61,58 @@ pub(crate) fn run_client_rules(state: &Rc<RefCell<UiState>>, account_id: &Accoun
     evaluate_batch(state, &run, messages);
 }
 
+/// Moves genuinely-new arriving mail whose sender is on the account's blocked
+/// list (item 2.9 / M-17) to Junk, setting the RFC 5788 `$Junk` keyword so the
+/// server learns. Unlike [`run_client_rules`] this is independent of the rules
+/// master switch (Outlook's blocked senders always apply) and of any
+/// user-defined rules, so it is a separate entry point called alongside it on
+/// `NewMailArrived`. Silent: like Outlook's automatic filtering, arrival-time
+/// blocking shows no toast and records no undo entry.
+pub(crate) fn enforce_blocked_senders(state: &Rc<RefCell<UiState>>, account_id: &AccountId, mailbox: &MailboxId, messages: &[EmailSummary]) {
+    if messages.is_empty() {
+        return;
+    }
+    let (blocked, cmd_tx) = {
+        let st = state.borrow();
+        let Some(handle) = st.accounts.get(account_id) else {
+            return;
+        };
+        let blocked: Vec<String> = st
+            .blocked_senders
+            .iter()
+            .filter(|(account, _)| account == account_id)
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        if blocked.is_empty() {
+            return;
+        }
+        (blocked, handle.cmd_tx.clone())
+    };
+    let uids: Vec<Uid> = messages
+        .iter()
+        .filter(|message| {
+            message
+                .from
+                .first()
+                .is_some_and(|sender| blocked.iter().any(|entry| lookout_core::sender_matches_trust_entry(&sender.address, entry)))
+        })
+        .map(|message| message.uid)
+        .collect();
+    if uids.is_empty() {
+        return;
+    }
+    let _ = cmd_tx.send_blocking(AccountCommand::SetJunk {
+        mailbox: mailbox.clone(),
+        uids: uids.clone(),
+        junk: true,
+    });
+    let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages {
+        mailbox: mailbox.clone(),
+        uids,
+        role: MailboxRole::Junk,
+    });
+}
+
 /// Applies the account's client rules to every cached message in `mailbox`,
 /// the folder menu's "Run rules now". Unlike automatic arrival, this runs on
 /// whatever folder the user chose, Inbox or not.

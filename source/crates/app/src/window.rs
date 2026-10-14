@@ -1371,6 +1371,13 @@ pub(crate) struct UiState {
     /// (`ui_state_db`), loaded at startup and written through on every
     /// trust/revoke action, like `starred_contacts`.
     pub(crate) trusted_senders: HashMap<(AccountId, String), lookout_core::TrustLevel>,
+    /// Blocked-sender entries (item 2.9 / M-17): normalized lowercase
+    /// addresses (`spammer@example.com`) or `@domain` patterns, keyed by the
+    /// receiving account. New mail whose `From` matches an entry is moved to
+    /// Junk with the RFC 5788 `$Junk` keyword; entered from the message menu's
+    /// Block ▸. Persisted in the UI-state database (`ui_state_db`), like
+    /// `trusted_senders`. The safe list is `trusted_senders` (S-01).
+    pub(crate) blocked_senders: HashSet<(AccountId, String)>,
     /// The `(account, normalized sender address)` of the message currently on
     /// the reading pane, re-stashed by `render_body` from the rendered
     /// summary's From address. The load-policy handler resolves this against
@@ -1433,6 +1440,10 @@ pub(crate) struct UiState {
     /// `build_window` fills it in once the settings window's open logic
     /// exists (same pattern as `composer_identities_refresh`).
     manage_signatures: Option<Rc<dyn Fn()>>,
+    /// Opens the Settings dialog to the Mail → My Templates section - the
+    /// composer's template menu "Manage Templates…" item (item 2.10 / C-17).
+    /// Late-bound, like `manage_signatures`.
+    manage_templates: Option<Rc<dyn Fn()>>,
     /// The More menu's "Create task from message…": opens the task editor
     /// seeded from a message (`show_create_task_for_email`). Late-bound: the
     /// menu is built before `calendar_state`/`tasks_view` exist, so this hook
@@ -2589,7 +2600,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // no schema is available, which is exactly these old values.
     let ui_db = crate::ui_state_db::UiStateDb::open()
         .map(Rc::new)
-        .inspect_err(|e| tracing::warn!("starred contacts and trusted senders won't persist: {e}"))
+        .inspect_err(|e| tracing::warn!("starred contacts and sender trust/block lists won't persist: {e}"))
         .ok();
     let starred_contacts: HashSet<(AccountId, String)> = ui_db
         .as_ref()
@@ -2608,6 +2619,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .flatten()
         .map(|(account, entry, level)| ((account, entry), level))
         .collect();
+    // The blocked-sender list (item 2.9 / M-17): addressed entered from the
+    // message menu's Block sender / Block domain. Enforced by the client rule
+    // path on arrival; the load-policy's safe list reuses `trusted_senders`.
+    let blocked_senders: HashSet<(AccountId, String)> = ui_db.as_ref().and_then(|db| db.load_blocked_senders().ok()).into_iter().flatten().collect();
     // The folder pane's expansion memory: which subfolders the user left
     // expanded and which account groups collapsed. Loaded from the same
     // UI-state database so the first `rebuild_folder_tree` of a fresh session
@@ -2710,6 +2725,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         load_remote_images: settings.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES),
         rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
         trusted_senders,
+        blocked_senders,
         rendered_trust_sender: None,
         rendered_from_mismatch: None,
         rendered_link_warnings: Vec::new(),
@@ -2720,6 +2736,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         draft_saved_tx: None,
         composer_identities_refresh: None,
         manage_signatures: None,
+        manage_templates: None,
         create_task_from_message: None,
         flagged_mail_refresh: None,
         composer_relay_generation: 0,
@@ -8108,16 +8125,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // Config → Mail → "Trusted senders…": opens the manage dialog for the
-    // external-content trust flow (add/remove sender entries, change trust
-    // levels). Every change writes through to the UI-state database and the
-    // in-memory `trusted_senders` mirror, so the reading pane's load policy
-    // picks it up on the next decision.
+    // Config → Mail → Junk email → "Safe senders…": opens the manage dialog
+    // for the external-content trust flow (add/remove sender entries, change
+    // trust levels; item 2.9 / M-17 reuses this list as the safe list). Every
+    // change writes through to the UI-state database and the in-memory
+    // `trusted_senders` mirror, so the reading pane's load policy picks it up
+    // on the next decision.
     {
         let state = state.clone();
         let row = config_view.trusted_senders_row.clone();
         row.clone().connect_activated(move |_| {
             crate::trusted_senders::show_manage_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
+        });
+    }
+
+    // Config → Mail → Junk email → "Blocked senders…": opens the manage dialog
+    // for the blocked-sender list (item 2.9 / M-17). New mail from a blocked
+    // sender is moved to Junk on arrival by `rules::enforce_blocked_senders`.
+    {
+        let state = state.clone();
+        let row = config_view.blocked_senders_row.clone();
+        row.clone().connect_activated(move |_| {
+            crate::blocked_senders::show_manage_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
         });
     }
 
@@ -9202,6 +9231,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let webcal_list = st.app_config.borrow().webcal_subscriptions.clone();
             let signatures_list = st.app_config.borrow().signatures.clone();
             let signature_defaults = st.app_config.borrow().signature_defaults.clone();
+            let templates_list = st.app_config.borrow().templates.clone();
             let goa_unavailable = st.goa_unavailable;
             drop(st);
             mail.sort_by_key(|a| a.email.to_lowercase());
@@ -9295,6 +9325,33 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let refresh_hook = refresh_hook.clone();
                 Rc::new(move |_anchor, id| {
                     state.borrow().app_config.borrow_mut().remove_signature(id);
+                    crate::app_config::save(&state.borrow().app_config.borrow());
+                    let refresh = refresh_hook.borrow().clone();
+                    refresh();
+                })
+            };
+            // Config → Mail → My Templates row actions (item 2.10 / C-17):
+            // edit reopens the template editor prefilled; remove deletes it.
+            let edit_template: crate::config_view::TemplatesAction = {
+                let state = state.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |anchor, id| {
+                    let Some(template) = state.borrow().app_config.borrow().templates.iter().find(|t| &t.id == id).cloned() else {
+                        return;
+                    };
+                    let app_config = state.borrow().app_config.clone();
+                    let on_changed = {
+                        let refresh_hook = refresh_hook.borrow().clone();
+                        Rc::new(move || refresh_hook())
+                    };
+                    crate::templates::show_editor_dialog(anchor, app_config, Some(template), on_changed);
+                })
+            };
+            let remove_template: crate::config_view::TemplatesAction = {
+                let state = state.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |_anchor, id| {
+                    state.borrow().app_config.borrow_mut().remove_template(id);
                     crate::app_config::save(&state.borrow().app_config.borrow());
                     let refresh = refresh_hook.borrow().clone();
                     refresh();
@@ -9598,10 +9655,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &contacts_cache_files,
                 &signatures_list,
                 &signature_defaults,
+                &templates_list,
                 &manage_identities,
                 &set_default_signature,
                 &edit_signature,
                 &remove_signature,
+                &edit_template,
+                &remove_template,
                 &edit_other,
                 &remove_other,
                 &enable_graph_pin,
@@ -9707,6 +9767,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → My Templates → "New template…" (item 2.10 / C-17): the
+    // rich-text template editor. Saving writes through to `app_config` and
+    // re-runs this closure (via `refresh_hook`) so the list below the button
+    // redraws with the new entry.
+    {
+        let new_template_row = config_view.new_template_row.clone();
+        let state = state.clone();
+        let refresh_hook = refresh_hook.clone();
+        new_template_row.connect_activated(move |row| {
+            let app_config = state.borrow().app_config.clone();
+            let on_changed = {
+                let refresh_hook = refresh_hook.borrow().clone();
+                Rc::new(move || refresh_hook())
+            };
+            crate::templates::show_editor_dialog(row.upcast_ref::<gtk::Widget>(), app_config, None, on_changed);
+        });
+    }
+
     // --- Settings window: the header bar's Settings button opens the Config
     // screen (the same sidebar/stack layout that used to live in the nav
     // rail) as a modal dialog over the main window. Single instance: while
@@ -9804,6 +9882,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             move || {
                 open_settings();
                 crate::config_view::show_section(&config_view, "accounts");
+            }
+        }));
+        // The composer's "Manage Templates…" hook jumps to the Mail section,
+        // where the My Templates list lives (item 2.10 / C-17).
+        state.borrow_mut().manage_templates = Some(Rc::new({
+            let open_settings = open_settings.clone();
+            let config_view = config_view.clone();
+            move || {
+                open_settings();
+                crate::config_view::show_section(&config_view, "mail");
             }
         }));
     }
@@ -12247,6 +12335,9 @@ fn spawn_account_event_loop(
                         // Client rules (item 2.5 / M-14) run on genuinely-new
                         // arriving Inbox mail. See `rules::run_client_rules`.
                         crate::rules::run_client_rules(&state, &account_id, &mailbox, &messages);
+                        // Blocked senders (item 2.9 / M-17) always apply, even
+                        // when the rules master switch is off.
+                        crate::rules::enforce_blocked_senders(&state, &account_id, &mailbox, &messages);
                     }
                     AccountEvent::SieveAdvertised(advertised) => {
                         // Remember whether this account's server offers
@@ -17040,7 +17131,7 @@ fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widget, point: 
     }
     let state = &context.state;
     let account = mailbox_account_id(&targets[0].mailbox);
-    let (menu_state, recent_folders) = {
+    let (menu_state, recent_folders, sender_blocked) = {
         let st = state.borrow();
         let facts: Vec<TargetFacts> = targets
             .iter()
@@ -17056,6 +17147,15 @@ fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widget, point: 
         let folders = account.as_ref().and_then(|id| st.accounts.get(id)).map(|handle| handle.folders.clone()).unwrap_or_default();
         let has_archive = folders.iter().any(|folder| folder.role == MailboxRole::Archive);
         let menu_state = crate::message_menu::message_menu_state(&facts, primary.is_some(), has_archive);
+        // Whether the target sender is already blocked, so Block ▸ reads
+        // "Unblock sender" (item 2.9 / M-17).
+        let sender_blocked = primary.as_ref().is_some_and(|summary| {
+            account.as_ref().is_some_and(|account_id| {
+                st.blocked_senders.iter().any(|(blocked_account, entry)| {
+                    blocked_account == account_id && summary.from.first().is_some_and(|sender| lookout_core::sender_matches_trust_entry(&sender.address, entry))
+                })
+            })
+        });
         // The account's recent folders that still exist, less the one every
         // target is already in.
         let current = targets.iter().all(|s| s.mailbox == targets[0].mailbox).then(|| targets[0].mailbox.clone());
@@ -17072,7 +17172,7 @@ fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widget, point: 
                     .map(|folder| (id.clone(), lookout_core::display_name(&folder.name)))
             })
             .collect();
-        (menu_state, recent)
+        (menu_state, recent, sender_blocked)
     };
     let today = crate::calendar_tz::display_zone().today();
     let prefs = state.borrow().settings.calendar_preferences();
@@ -17094,6 +17194,7 @@ fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widget, point: 
             })
             .collect(),
         report_phishing: targets.len() == 1 && !state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().is_empty(),
+        sender_blocked,
     };
 
     let description = crate::message_menu::message_menu_description(&menu_state, &choices);
@@ -17171,6 +17272,15 @@ fn run_message_menu_action(
                 let rule = crate::rules_view::rule_from_message(&summary);
                 crate::rules_view::show_rule_editor(anchor, state.clone(), rule, || {});
             }
+        }
+        A::BlockSender | A::BlockDomain => {
+            let Some(summary) = primary.cloned() else { return };
+            let domain = matches!(action, A::BlockDomain);
+            block_sender_selection(state, message_list, &summary, targets, domain);
+        }
+        A::UnblockSender => {
+            let Some(summary) = primary.cloned() else { return };
+            unblock_sender_selection(state, &summary);
         }
         A::MoveTo(folder) => move_messages_to_folder(state, message_list, targets, &folder),
         A::CopyTo(folder) => copy_messages_to_folder(state, targets, &folder),
@@ -19122,6 +19232,87 @@ fn set_junk_selection(state: &Rc<RefCell<UiState>>, message_list: &MessageListMo
         format!("{count} {noun} marked as not junk")
     };
     record_undo(state, &description, inverse);
+}
+
+/// Blocks the sender of `summary` (item 2.9 / M-17): adds the exact address -
+/// or, for `domain`, every address on its domain - to the receiving account's
+/// blocked list, drops any conflicting safe-sender entry (a sender is never
+/// both safe and blocked), then reports the selected `targets` as junk. Future
+/// arrivals from the sender are moved to Junk by
+/// `rules::enforce_blocked_senders`.
+fn block_sender_selection(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summary: &EmailSummary, targets: &[EmailSummary], domain: bool) {
+    let Some(account) = mailbox_account_id(&summary.mailbox) else { return };
+    let Some(sender) = summary.from.first() else { return };
+    let entry = if domain {
+        sender
+            .address
+            .rsplit_once('@')
+            .map(|(_, domain)| domain)
+            .and_then(|domain| lookout_core::normalize_trust_entry(&format!("@{domain}")))
+    } else {
+        lookout_core::normalize_trust_entry(&sender.address)
+    };
+    let Some(entry) = entry else {
+        if let Some(overlay) = &state.borrow().toast_overlay {
+            overlay.add_toast(adw::Toast::new("That sender can't be blocked."));
+        }
+        return;
+    };
+    {
+        let mut st = state.borrow_mut();
+        st.blocked_senders.insert((account.clone(), entry.clone()));
+        // Remove any safe-sender entry for the same address/domain so the two
+        // lists stay mutually exclusive.
+        let conflicting: Vec<String> = st
+            .trusted_senders
+            .keys()
+            .filter(|(trusted_account, trusted_entry)| trusted_account == &account && lookout_core::sender_matches_trust_entry(&sender.address, trusted_entry))
+            .map(|(_, trusted_entry)| trusted_entry.clone())
+            .collect();
+        for trusted_entry in conflicting {
+            st.trusted_senders.remove(&(account.clone(), trusted_entry.clone()));
+            if let Some(db) = &st.ui_db {
+                let _ = db.remove_trusted_sender(&account, &trusted_entry);
+            }
+        }
+        if let Some(db) = &st.ui_db {
+            let _ = db.set_blocked_sender(&account, &entry);
+        }
+    }
+    set_junk_selection(state, message_list, targets, true);
+    if let Some(overlay) = &state.borrow().toast_overlay {
+        let label = if domain { "Sender's domain blocked" } else { "Sender blocked" };
+        overlay.add_toast(adw::Toast::new(label));
+    }
+}
+
+/// Removes the sender of `summary` - exact or matching `@domain` entry - from
+/// the account's blocked list (item 2.9 / M-17).
+fn unblock_sender_selection(state: &Rc<RefCell<UiState>>, summary: &EmailSummary) {
+    let Some(account) = mailbox_account_id(&summary.mailbox) else { return };
+    let Some(sender) = summary.from.first() else { return };
+    let mut removed = false;
+    {
+        let mut st = state.borrow_mut();
+        let matches: Vec<String> = st
+            .blocked_senders
+            .iter()
+            .filter(|(blocked_account, entry)| blocked_account == &account && lookout_core::sender_matches_trust_entry(&sender.address, entry))
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        for entry in matches {
+            st.blocked_senders.remove(&(account.clone(), entry.clone()));
+            if let Some(db) = &st.ui_db {
+                let _ = db.remove_blocked_sender(&account, &entry);
+            }
+            removed = true;
+        }
+    }
+    if removed {
+        if let Some(overlay) = &state.borrow().toast_overlay {
+            overlay.add_toast(adw::Toast::new("Sender unblocked"));
+        }
+    }
 }
 
 /// Starts a Report phishing run (item 6.7 / S-09) for the single target: the
@@ -25415,6 +25606,16 @@ pub(crate) fn show_composer_in_reading_pane(
         // by `build_window` once the settings window exists (see
         // `UiState::manage_signatures`).
         state.borrow().manage_signatures.clone(),
+        // The composer's My Templates menu re-reads the global template list
+        // each time it opens (item 2.10 / C-17), like the signature menu.
+        {
+            let state = state.clone();
+            Rc::new(move || state.borrow().app_config.borrow().templates.clone())
+        },
+        // "Manage Templates…" opens Settings on the Mail section; set by
+        // `build_window` once the settings window exists (see
+        // `UiState::manage_templates`).
+        state.borrow().manage_templates.clone(),
         // The account's default signature for this compose kind, resolved
         // from the per-account defaults (falling back to the first
         // connected account when no explicit account was resolved, exactly
@@ -26260,6 +26461,7 @@ mod tests {
             load_remote_images: false,
             rich_text_default: true,
             trusted_senders: HashMap::new(),
+            blocked_senders: HashSet::new(),
             rendered_trust_sender: None,
             rendered_from_mismatch: None,
             rendered_link_warnings: Vec::new(),
@@ -26270,6 +26472,7 @@ mod tests {
             draft_saved_tx: None,
             composer_identities_refresh: None,
             manage_signatures: None,
+            manage_templates: None,
             create_task_from_message: None,
             flagged_mail_refresh: None,
             composer_relay_generation: 0,

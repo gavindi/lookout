@@ -59,7 +59,7 @@ fn account_label(account: &AccountId, display_name: &str, email: &str) -> String
 /// when one exists (tests have no window).
 pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
     let dialog = {
-        let mut builder = gtk::Window::builder().modal(true).title("Trusted senders").default_width(560).default_height(480);
+        let mut builder = gtk::Window::builder().modal(true).title("Safe senders").default_width(560).default_height(480);
         if let Some(win) = anchor.root().and_downcast::<gtk::Window>() {
             builder = builder.transient_for(&win);
         }
@@ -69,7 +69,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
     let page = adw::PreferencesPage::new();
     page.set_vexpand(true);
     let hint = gtk::Label::builder()
-        .label("Trusted senders may load remote images - or, at the higher level, every remote style, font and other content - that Lookout blocks by default.")
+        .label("Safe senders are never treated as junk, and may load remote images - or, at the higher level, every remote style, font and other content - that Lookout blocks by default.")
         .wrap(true)
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])

@@ -56,6 +56,12 @@ pub const SPELL_LANGUAGE_LABELS: &[&str] = &[
 /// which closure it registers.
 pub type SignaturesAction = Rc<dyn Fn(&gtk::Widget, &uuid::Uuid)>;
 
+/// The caller's hook for one template row's actions (item 2.10 / C-17): takes
+/// the anchoring widget and the template's id. Used for both editing (opens
+/// the template editor prefilled) and removing - the caller distinguishes the
+/// two by which closure it registers.
+pub type TemplatesAction = Rc<dyn Fn(&gtk::Widget, &uuid::Uuid)>;
+
 /// Which default-signature slot a dropdown writes (see `refresh`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SignatureDefault {
@@ -283,16 +289,24 @@ pub struct ConfigView {
     /// caller can wire its `active` state into the reading pane's remote-image
     /// policy.
     pub remote_images_row: adw::SwitchRow,
-    /// "Trusted senders…" row (Config → Mail), exposed so the caller can wire
-    /// its `activated` signal to the external-content trust manage dialog
-    /// (and refresh the subtitle after a change).
+    /// "Safe senders…" row (Config → Mail → Junk email), exposed so the caller
+    /// can wire its `activated` signal to the external-content trust manage
+    /// dialog (and refresh the subtitle after a change). This is the same list
+    /// the Junk filter treats as safe (item 2.9 / M-17).
     pub trusted_senders_row: adw::ActionRow,
+    /// "Blocked senders…" row (Config → Mail → Junk email), exposed so the
+    /// caller can wire its `activated` signal to the blocked-senders manage
+    /// dialog (item 2.9 / M-17).
+    pub blocked_senders_row: adw::ActionRow,
     /// "Categories…" row (Config → Mail), exposed so the caller can open the
     /// shared category master-list editor (item 2.1 / M-09).
     pub categories_row: adw::ActionRow,
     /// "Rules…" row (Config → Mail), exposed so the caller can open the rules
     /// manager (item 2.5 / M-14).
     pub rules_row: adw::ActionRow,
+    /// "New template…" row (Config → Mail → My Templates), exposed so the
+    /// caller can open the template editor (item 2.10 / C-17).
+    pub new_template_row: adw::ActionRow,
     /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
     /// `active` state into the composer's default body mode.
     pub rich_text_row: adw::SwitchRow,
@@ -442,6 +456,11 @@ pub struct ConfigView {
     /// The signature list rows rebuilt by `refresh_signatures`. The button
     /// row itself stays put; only these are cleared and re-added.
     signature_rows: RefCell<Vec<adw::ActionRow>>,
+    /// The user-authored "My Templates" group (item 2.10 / C-17) and its list
+    /// rows, rebuilt by `refresh_templates`; the "New template…" button row
+    /// stays put.
+    templates_group: adw::PreferencesGroup,
+    templates_rows: RefCell<Vec<adw::ActionRow>>,
     mail_cache_group: adw::PreferencesGroup,
     calendar_cache_group: adw::PreferencesGroup,
     contacts_cache_group: adw::PreferencesGroup,
@@ -520,6 +539,18 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     signatures_group.add(&new_signature_row);
+
+    // The user-authored "My Templates" list (item 2.10 / C-17): the "New
+    // template…" row opens the rich-text template editor; saved templates
+    // appear below it, rebuilt by `refresh_templates`, and are inserted into
+    // the composer from its "My Templates" menu.
+    let templates_group = adw::PreferencesGroup::builder().title("My Templates").build();
+    let new_template_row = adw::ActionRow::builder()
+        .title("New template…")
+        .subtitle("Create a reusable snippet to insert into messages")
+        .activatable(true)
+        .build();
+    templates_group.add(&new_template_row);
 
     let mail_group = adw::PreferencesGroup::builder().title("Mail accounts").build();
 
@@ -612,12 +643,22 @@ pub fn build() -> ConfigView {
         .subtitle("Display images hosted on remote servers in messages")
         .build();
     mail_settings_group.add(&remote_images_row);
+    // The "Junk email" group (item 2.9 / M-17): the safe senders (the same
+    // list the external-content trust flow uses, S-01) and the blocked
+    // senders, mirroring Outlook's Mail → Junk email page.
+    let junk_email_group = adw::PreferencesGroup::builder().title("Junk email").build();
     let trusted_senders_row = adw::ActionRow::builder()
-        .title("Trusted senders…")
-        .subtitle("Choose who may load remote images and other external content")
+        .title("Safe senders…")
+        .subtitle("Senders whose mail is never treated as junk and may load remote content")
         .activatable(true)
         .build();
-    mail_settings_group.add(&trusted_senders_row);
+    junk_email_group.add(&trusted_senders_row);
+    let blocked_senders_row = adw::ActionRow::builder()
+        .title("Blocked senders…")
+        .subtitle("Senders whose mail goes straight to Junk")
+        .activatable(true)
+        .build();
+    junk_email_group.add(&blocked_senders_row);
     let categories_row = adw::ActionRow::builder()
         .title("Categories…")
         .subtitle("Manage the categories shared by mail, events and tasks")
@@ -1000,7 +1041,7 @@ pub fn build() -> ConfigView {
     add_section(&section_stack, &mut sections, "Webcal subscriptions", "webcal", &[&webcal_group]);
     add_section(&section_stack, &mut sections, "Appearance", "appearance", &[&appearance_group]);
     add_section(&section_stack, &mut sections, "General", "general", &[&general_group, &keyboard_group]);
-    add_section(&section_stack, &mut sections, "Mail", "mail", &[&mail_settings_group]);
+    add_section(&section_stack, &mut sections, "Mail", "mail", &[&junk_email_group, &templates_group, &mail_settings_group]);
     add_section(&section_stack, &mut sections, "Calendar", "calendar", &[&calendar_settings_group]);
     add_section(&section_stack, &mut sections, "People", "people", &[&contacts_settings_group]);
     add_section(&section_stack, &mut sections, "Privacy", "privacy", &[&privacy_group]);
@@ -1067,9 +1108,12 @@ pub fn build() -> ConfigView {
         goa_group,
         goa_rows: RefCell::new(Vec::new()),
         new_signature_row,
+        new_template_row,
         signatures_group,
         signature_default_rows: RefCell::new(Vec::new()),
         signature_rows: RefCell::new(Vec::new()),
+        templates_group,
+        templates_rows: RefCell::new(Vec::new()),
         clear_cache_row,
         animations_row,
         theme_row,
@@ -1091,6 +1135,7 @@ pub fn build() -> ConfigView {
         restore_background_row,
         remote_images_row,
         trusted_senders_row,
+        blocked_senders_row,
         categories_row,
         rules_row,
         rich_text_row,
@@ -1173,10 +1218,13 @@ pub fn refresh(
     contacts_cache_files: &[CacheFile],
     signatures: &[lookout_core::Signature],
     signature_defaults: &std::collections::HashMap<AccountId, crate::app_config::AccountSignatureDefaults>,
+    templates: &[lookout_core::MailTemplate],
     manage_identities: &ManageIdentities,
     set_default_signature: &SetAccountSignatureDefault,
     edit_signature: &SignaturesAction,
     remove_signature: &SignaturesAction,
+    edit_template: &TemplatesAction,
+    remove_template: &TemplatesAction,
     edit_other: &OtherAccountAction,
     remove_other: &OtherAccountAction,
     enable_graph_pin: &OtherAccountAction,
@@ -1373,6 +1421,9 @@ pub fn refresh(
 
     // -- signatures --
     refresh_signatures(view, signatures, edit_signature, remove_signature);
+
+    // -- My Templates --
+    refresh_templates(view, templates, edit_template, remove_template);
 }
 
 fn account_row(title: &str, subtitle: &str) -> adw::ActionRow {
@@ -1452,6 +1503,44 @@ pub fn refresh_signatures(view: &ConfigView, signatures: &[lookout_core::Signatu
         row.add_suffix(&edit_button);
         row.add_suffix(&remove_button);
         push_row(&view.signatures_group, &view.signature_rows, row);
+    }
+}
+
+/// Rebuilds the template rows below the "New template…" button (Config →
+/// Mail → My Templates, item 2.10 / C-17). The button row itself stays put;
+/// only these rows are cleared and re-added. Each row's Edit/Delete suffix
+/// buttons invoke the caller's `edit`/`remove` hooks (which own the actual
+/// editor dialog and persistence).
+pub fn refresh_templates(view: &ConfigView, templates: &[lookout_core::MailTemplate], edit: &TemplatesAction, remove: &TemplatesAction) {
+    for row in view.templates_rows.borrow_mut().drain(..) {
+        view.templates_group.remove(&row);
+    }
+    if templates.is_empty() {
+        push_row(&view.templates_group, &view.templates_rows, empty_row("No templates yet"));
+        return;
+    }
+    for template in templates {
+        let row = account_row(&template.name, &signature_preview(&template.text));
+        let edit_button = gtk::Button::from_icon_name("document-edit-symbolic");
+        edit_button.set_tooltip_text(Some("Edit template"));
+        edit_button.add_css_class("flat");
+        let remove_button = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove_button.set_tooltip_text(Some("Delete template"));
+        remove_button.add_css_class("flat");
+        let id = template.id;
+        {
+            let edit = edit.clone();
+            let row_widget = row.clone();
+            edit_button.connect_clicked(move |_| edit(row_widget.upcast_ref::<gtk::Widget>(), &id));
+        }
+        {
+            let remove = remove.clone();
+            let row_widget = row.clone();
+            remove_button.connect_clicked(move |_| remove(row_widget.upcast_ref::<gtk::Widget>(), &id));
+        }
+        row.add_suffix(&edit_button);
+        row.add_suffix(&remove_button);
+        push_row(&view.templates_group, &view.templates_rows, row);
     }
 }
 

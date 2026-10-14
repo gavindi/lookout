@@ -10,9 +10,10 @@
 //! the same wherever it's invoked.
 //!
 //! Entries whose features haven't landed yet are left out rather than shown
-//! greyed: Ignore (2.8), Block ▸ (2.9) and Rules ▸ Create rule (2.5). Report ▸
-//! Report phishing (6.7) is included only when a reporting address is set.
-//! Each adds itself here when it lands.
+//! greyed: Ignore (2.8). Report ▸ Report phishing (6.7) is included only when a
+//! reporting address is set; Block ▸ (2.9) offers Block sender / Block domain,
+//! or Unblock sender when the sender is already blocked. Each adds itself here
+//! when it lands.
 //!
 //! Copyright (C) <2026>  <Gavin Graham & Contributors>
 //! Software released under the GPL3 license
@@ -64,6 +65,14 @@ pub enum MessageMenuAction {
     ReportPhishing,
     /// Create a rule prefilled from the target message (item 2.5 / M-14).
     CreateRule,
+    /// Block the target's sender (item 2.9 / M-17): add the exact address to
+    /// the account's blocked list, then move the target to Junk.
+    BlockSender,
+    /// Block every address on the target sender's domain, then move the target
+    /// to Junk.
+    BlockDomain,
+    /// Remove the target's sender from the account's blocked list.
+    UnblockSender,
     ViewDetails,
     ViewSource,
     OpenWindow,
@@ -80,6 +89,9 @@ pub struct MessageMenuState {
     pub single: bool,
     /// Reply / Reply all / Forward: a single message that isn't a draft.
     pub can_reply: bool,
+    /// Block ▸ (item 2.9 / M-17): a single message that isn't a draft (there
+    /// is no sender to block for a draft).
+    pub can_block: bool,
     /// The targets' account has an Archive folder and they aren't in it.
     pub can_archive: bool,
     /// Move ▸ / Copy ▸: every target lives in one account (folders can't
@@ -124,6 +136,7 @@ pub fn message_menu_state(targets: &[TargetFacts], single: bool, has_archive: bo
     MessageMenuState {
         single,
         can_reply: single && !any_draft,
+        can_block: single && !any_draft,
         can_archive: one_account && has_archive && targets.iter().all(|t| t.role != Some(MailboxRole::Archive)),
         can_move: one_account,
         any_unread: targets.iter().any(|t| t.unread),
@@ -161,6 +174,10 @@ pub struct MenuChoices {
     /// When false the Report ▸ Report phishing entry is left out entirely, as
     /// the module docs' "features not landed yet" rule does elsewhere.
     pub report_phishing: bool,
+    /// Whether the target sender is already on the account's blocked list
+    /// (item 2.9 / M-17): when true the Block ▸ submenu offers Unblock sender
+    /// instead of Block sender / Block domain.
+    pub sender_blocked: bool,
 }
 
 /// Every action the menu's group carries.
@@ -186,6 +203,9 @@ pub fn action_specs() -> Vec<ActionSpec> {
         "not-junk",
         "report-phishing",
         "create-rule",
+        "block-sender",
+        "block-domain",
+        "unblock-sender",
         "view-details",
         "view-source",
         "open-window",
@@ -217,6 +237,9 @@ pub fn enabled_actions(state: &MessageMenuState) -> Vec<(&'static str, bool)> {
         ("snooze-custom", state.can_snooze),
         ("report-junk", state.can_report_junk),
         ("not-junk", state.can_not_junk),
+        ("block-sender", state.can_block),
+        ("block-domain", state.can_block),
+        ("unblock-sender", state.can_block),
         ("create-rule", state.single),
         ("view-details", state.single),
         ("view-source", state.single),
@@ -290,6 +313,18 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
     }
     report = report.action("Not junk", ns("not-junk"));
     menu = menu.submenu("Report", report).section();
+    // Block ▸ (item 2.9 / M-17): add the sender (or its whole domain) to the
+    // account's blocked list, or - when the sender is already blocked - remove
+    // it. Sits between Report ▸ and Rules ▸ in Outlook's order (UX-36).
+    let block = if choices.sender_blocked {
+        MenuDescription::new().section().action("Unblock sender", ns("unblock-sender"))
+    } else {
+        MenuDescription::new()
+            .section()
+            .action("Block sender", ns("block-sender"))
+            .action("Block domain", ns("block-domain"))
+    };
+    menu = menu.submenu("Block", block).section();
     menu = menu.submenu("Rules", MenuDescription::new().section().action("Create rule…", ns("create-rule"))).section();
     menu.submenu(
         "View",
@@ -339,6 +374,9 @@ pub fn message_action_for(name: &str, param: Option<&glib::Variant>) -> Option<M
         "report-junk" => MessageMenuAction::ReportJunk,
         "not-junk" => MessageMenuAction::NotJunk,
         "report-phishing" => MessageMenuAction::ReportPhishing,
+        "block-sender" => MessageMenuAction::BlockSender,
+        "block-domain" => MessageMenuAction::BlockDomain,
+        "unblock-sender" => MessageMenuAction::UnblockSender,
         "create-rule" => MessageMenuAction::CreateRule,
         "view-details" => MessageMenuAction::ViewDetails,
         "view-source" => MessageMenuAction::ViewSource,
@@ -412,12 +450,22 @@ mod tests {
                 vec!["Delete", "Archive", "Move ▸", "Copy ▸"],
                 vec!["Mark as unread", "Flag ▸", "Pin", "Snooze ▸", "Categorize ▸"],
                 vec!["Report ▸"],
+                vec!["Block ▸"],
                 vec!["Rules ▸"],
                 vec!["View ▸"],
                 vec!["Open in new window", "Print"],
             ]
         );
         assert_eq!(labels(submenu(&menu, "Report")), vec![vec!["Report junk", "Not junk"]]);
+        // Block ▸ offers Block sender / Block domain until the sender is
+        // blocked, when it becomes Unblock sender (item 2.9 / M-17).
+        assert_eq!(labels(submenu(&menu, "Block")), vec![vec!["Block sender", "Block domain"]]);
+        let blocked = MenuChoices {
+            sender_blocked: true,
+            ..MenuChoices::default()
+        };
+        let blocked_menu = message_menu_description(&state, &blocked);
+        assert_eq!(labels(submenu(&blocked_menu, "Block")), vec![vec!["Unblock sender"]]);
         // Report phishing joins the Report menu only when an address is set.
         let configured = MenuChoices {
             report_phishing: true,
@@ -454,15 +502,15 @@ mod tests {
     fn state_follows_folder_role_selection_and_accounts() {
         let inbox = facts(Some(MailboxRole::Inbox));
         let single = message_menu_state(std::slice::from_ref(&inbox), true, true);
-        assert!(single.single && single.can_reply && single.can_archive && single.can_move && single.can_snooze && single.can_report_junk);
+        assert!(single.single && single.can_reply && single.can_block && single.can_archive && single.can_move && single.can_snooze && single.can_report_junk);
         assert!(!single.can_not_junk, "Not junk is only offered inside Junk");
 
         let several = message_menu_state(&[inbox.clone(), inbox.clone()], false, true);
-        assert!(!several.single && !several.can_reply, "single-message verbs need one message");
+        assert!(!several.single && !several.can_reply && !several.can_block, "single-message verbs need one message");
         assert!(several.can_move);
 
         let draft = message_menu_state(&[facts(Some(MailboxRole::Drafts))], true, true);
-        assert!(!draft.can_reply && !draft.can_snooze, "no reply to or snooze of a draft");
+        assert!(!draft.can_reply && !draft.can_snooze && !draft.can_block, "no reply to, snooze of or block by a draft");
         let mut flagged_draft = inbox.clone();
         flagged_draft.draft = true;
         assert!(!message_menu_state(&[flagged_draft], true, true).can_reply, "\\Draft outside Drafts too");
@@ -517,6 +565,7 @@ mod tests {
                 at: wake,
             }],
             report_phishing: false,
+            sender_blocked: false,
         };
         let menu = message_menu_description(&message_menu_state(&[facts(None)], true, true), &choices);
         assert_eq!(labels(submenu(&menu, "Move")), vec![vec!["Projects"], vec!["Other folder…"]]);
@@ -565,6 +614,9 @@ mod tests {
             ("report-junk", MessageMenuAction::ReportJunk),
             ("not-junk", MessageMenuAction::NotJunk),
             ("report-phishing", MessageMenuAction::ReportPhishing),
+            ("block-sender", MessageMenuAction::BlockSender),
+            ("block-domain", MessageMenuAction::BlockDomain),
+            ("unblock-sender", MessageMenuAction::UnblockSender),
             ("view-details", MessageMenuAction::ViewDetails),
             ("view-source", MessageMenuAction::ViewSource),
             ("open-window", MessageMenuAction::OpenWindow),
