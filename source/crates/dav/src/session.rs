@@ -3,12 +3,13 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
-use lookout_core::{CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EventOccurrence, EventUid, SchedulingInfo};
+use lookout_core::{AttendeeAvailability, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EmailAddress, EventOccurrence, EventUid, SchedulingInfo};
 
 use crate::cache::CalendarCache;
 use crate::client::DavClient;
 use crate::config::{CalendarAccountConfig, Credential};
 use crate::error::{Error, Result};
+use crate::freebusy::build_vfreebusy_request;
 use crate::recurrence;
 
 /// How often to re-poll while idle. CalDAV has no IMAP-IDLE-equivalent
@@ -64,6 +65,18 @@ pub enum CalendarCommand {
     /// Force a resync of every task in every calendar, outside the poll
     /// cadence (e.g. right after a task edit lands).
     SyncTasks,
+    /// Ask the server for attendees' free/busy over `[start, end)` by POSTing
+    /// a `VFREEBUSY` request to the account's schedule-outbox (RFC 6638 §5,
+    /// CAL-19). `request_id` is echoed back on the `FreeBusyUpdated`/
+    /// `FreeBusyFailed` event so the caller can drop a stale answer. A no-op
+    /// failure when the account has no outbox.
+    FetchFreeBusy {
+        organizer: EmailAddress,
+        attendees: Vec<EmailAddress>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        request_id: u64,
+    },
     /// Store a brand-new task: PUT the serialized VTODO as a new calendar
     /// object under `task.calendar_id`'s collection (a client-generated
     /// `<uid>.ics` href, `If-None-Match: *`). Resyncs tasks on success.
@@ -104,6 +117,18 @@ pub enum CalendarSessionEvent {
         occurrences: Vec<EventOccurrence>,
     },
     TasksUpdated(Vec<CalendarTask>),
+    /// A `FetchFreeBusy` answer: one availability per requested attendee, in
+    /// request order (CAL-19). `request_id` matches the originating command.
+    FreeBusyUpdated {
+        request_id: u64,
+        availabilities: Vec<AttendeeAvailability>,
+    },
+    /// A `FetchFreeBusy` request failed, or the account has no schedule-outbox
+    /// to ask (in which case the app falls back to the user's own calendars).
+    FreeBusyFailed {
+        request_id: u64,
+        message: String,
+    },
     Error(String),
     /// A `CreateEvent`/`UpdateEvent` request failed. Kept distinct from
     /// `Error` so the UI can roll back exactly the occurrence it
@@ -247,10 +272,13 @@ async fn connect_and_run(
     let _ = events.send(CalendarSessionEvent::CalendarsUpdated(calendars.clone())).await;
     let _ = events
         .send(CalendarSessionEvent::SchedulingUpdated(SchedulingInfo {
-            schedule_outbox: discovery.schedule_outbox_href,
+            schedule_outbox: discovery.schedule_outbox_href.clone(),
             schedule_inbox: discovery.schedule_inbox_href,
         }))
         .await;
+    // The POST target for free/busy lookups (CAL-19); `None` on a server that
+    // doesn't advertise scheduling, in which case a FetchFreeBusy fails softly.
+    let schedule_outbox = discovery.schedule_outbox_href;
 
     let mut current_month = first_of_month(chrono::Utc::now().date_naive());
     sync_month(&client, &calendars, &credential, current_month, events, cache).await?;
@@ -314,6 +342,15 @@ async fn connect_and_run(
                         let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete event: {e}"))).await;
                     }
                 },
+                CalendarCommand::FetchFreeBusy {
+                    organizer,
+                    attendees,
+                    start,
+                    end,
+                    request_id,
+                } => {
+                    fetch_free_busy(&client, schedule_outbox.as_deref(), &credential, &organizer, &attendees, start, end, request_id, events).await;
+                }
                 CalendarCommand::SyncTasks => sync_tasks(&client, &calendars, &credential, events, cache).await?,
                 CalendarCommand::CreateTask { task } => {
                     write_task(&client, &calendars, &credential, &task, events, cache).await;
@@ -332,6 +369,49 @@ async fn connect_and_run(
                 // `run_calendar_session`.
                 CalendarCommand::Reconnect => {}
             }
+        }
+    }
+}
+
+/// POSTs a free/busy query to the account's schedule-outbox and emits the
+/// normalised answer (CAL-19). When the account has no outbox - a server that
+/// doesn't advertise RFC 6638 scheduling - nothing is sent and the app falls
+/// back to the user's own calendars, so this reports a soft failure rather
+/// than an error toast.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_free_busy(
+    client: &DavClient,
+    schedule_outbox: Option<&str>,
+    credential: &Credential,
+    organizer: &EmailAddress,
+    attendees: &[EmailAddress],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    request_id: u64,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+) {
+    let Some(outbox) = schedule_outbox else {
+        let _ = events
+            .send(CalendarSessionEvent::FreeBusyFailed {
+                request_id,
+                message: "the server does not advertise scheduling".to_string(),
+            })
+            .await;
+        return;
+    };
+    let uid = format!("lookout-freebusy-{}-{}", request_id, Utc::now().timestamp());
+    let request = build_vfreebusy_request(organizer, attendees, start, end, &uid);
+    match client.post_free_busy(outbox, request, credential).await {
+        Ok(availabilities) => {
+            let _ = events.send(CalendarSessionEvent::FreeBusyUpdated { request_id, availabilities }).await;
+        }
+        Err(e) => {
+            let _ = events
+                .send(CalendarSessionEvent::FreeBusyFailed {
+                    request_id,
+                    message: e.to_string(),
+                })
+                .await;
         }
     }
 }

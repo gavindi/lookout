@@ -345,7 +345,7 @@ fn resolve_datetime_utc(cdt: &CalendarDateTime) -> Option<DateTime<Utc>> {
 /// underlying `iso8601` parser accepts the fuller ISO 8601 grammar, so a
 /// year/month component (if a non-conformant server ever emits one) is
 /// approximated as 365/30 days respectively rather than rejected outright.
-fn parse_ical_duration(raw: &str) -> Duration {
+pub(crate) fn parse_ical_duration(raw: &str) -> Duration {
     match iso8601::duration(raw) {
         Ok(iso8601::Duration::Weeks(w)) => Duration::weeks(w as i64),
         Ok(iso8601::Duration::YMDHMS {

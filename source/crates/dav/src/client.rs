@@ -1,11 +1,12 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, VCard};
+use lookout_core::{AccountId, AttendeeAvailability, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, VCard};
 use reqwest::Method;
 
 use crate::config::Credential;
 use crate::error::{Error, Result};
+use crate::freebusy;
 use crate::ical;
 use crate::xml::{self, DavResponse, NS_CARDDAV};
 
@@ -494,6 +495,25 @@ impl DavClient {
         self.delete_object(href, credential, etag).await
     }
 
+    /// POSTs a `VFREEBUSY` request (built by
+    /// [`crate::freebusy::build_vfreebusy_request`]) to the schedule-outbox at
+    /// `outbox_href` and parses the `CALDAV:schedule-response` into one
+    /// [`AttendeeAvailability`] per recipient (RFC 6638 §5, CAL-19). The
+    /// server delivering iTIP itself is exactly what the outbox URL marks, so
+    /// this is the free/busy counterpart of the scheduling path in
+    /// `calendar_invites`: same discovery, the other direction.
+    pub async fn post_free_busy(&self, outbox_href: &str, request: String, credential: &Credential) -> Result<Vec<AttendeeAvailability>> {
+        let url = self.resolve(outbox_href)?;
+        let request_url = url.clone();
+        let response = self
+            .send_request("POST", url, credential, Some(request), &[("Content-Type", "text/calendar; charset=utf-8".to_string())])
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        tracing::debug!("DAV POST {request_url} -> {status}, body:\n{text}");
+        freebusy::parse_schedule_response(&text)
+    }
+
     /// Stores `card` as a vCard object at `href` via `PUT` (RFC 6352 §8.2).
     /// The same `If-Match`/`If-None-Match` precondition semantics as
     /// [`Self::put_calendar_object`]: `etag` guards an update against
@@ -779,6 +799,53 @@ mod tests {
 
         let err = client.discover_calendar(&credential).await.unwrap_err();
         assert!(matches!(err, Error::Discovery(_)), "expected Discovery, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn post_free_busy_posts_vfreebusy_and_parses_the_schedule_response() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        let response = r#"<?xml version="1.0" encoding="utf-8" ?>
+<C:schedule-response xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+<C:response>
+<C:recipient><D:href>mailto:wilfredo@example.com</D:href></C:recipient>
+<C:request-status>2.0;Success</C:request-status>
+<C:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+METHOD:REPLY
+BEGIN:VFREEBUSY
+FREEBUSY;FBTYPE=BUSY:20090602T110000Z/20090602T120000Z
+END:VFREEBUSY
+END:VCALENDAR
+</C:calendar-data>
+</C:response>
+</C:schedule-response>"#;
+        Mock::given(method("POST"))
+            .and(path("/dav/outbox/"))
+            .and(body_string_contains("METHOD:REQUEST"))
+            .and(body_string_contains("ATTENDEE:mailto:wilfredo@example.com"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Content-Type", "application/xml").set_body_string(response))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+        let start = "2009-06-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let end = "2009-06-04T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let body = freebusy::build_vfreebusy_request(
+            &lookout_core::EmailAddress::new("cyrus@example.com"),
+            &[lookout_core::EmailAddress::new("wilfredo@example.com")],
+            start,
+            end,
+            "uid-1",
+        );
+
+        let availabilities = client.post_free_busy("/dav/outbox/", body, &credential).await.unwrap();
+        assert_eq!(availabilities.len(), 1);
+        assert_eq!(availabilities[0].address.address, "wilfredo@example.com");
+        assert_eq!(availabilities[0].intervals.len(), 1);
     }
 
     #[tokio::test]

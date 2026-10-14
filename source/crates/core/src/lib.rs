@@ -7,6 +7,7 @@
 /// Software released under the GPL3 license
 pub mod calendar;
 pub mod email;
+pub mod freebusy;
 pub mod identity;
 pub mod ids;
 pub mod interop;
@@ -23,10 +24,11 @@ pub use calendar::{
     SchedulingInfo, TaskPriority, TaskStatus, WebcalSubscription,
 };
 pub use email::{
-    cid_matches, display_name_address_mismatch, header_value, is_auto_submitted, is_external_sender, is_report_message, parse_disposition_notification_to,
-    parse_imip_method, parse_list_unsubscribe, sanitize_tag_key, tag_key_from_keyword, tag_keyword, AuthenticationResults, BodyPart, ContactList, ContactListMember, ContactsProvider, DkimResult, DmarcResult, EmailAddress,
-    EmailBody, EmailSummary, ImipInvitation, ImipMethod, ListUnsubscribe, SpfResult, SystemFlagBit, TAG_KEYWORD_PREFIX,
+    cid_matches, display_name_address_mismatch, header_value, is_auto_submitted, is_external_sender, is_report_message, parse_disposition_notification_to, parse_imip_method,
+    parse_list_unsubscribe, sanitize_tag_key, tag_key_from_keyword, tag_keyword, AuthenticationResults, BodyPart, ContactList, ContactListMember, ContactsProvider, DkimResult,
+    DmarcResult, EmailAddress, EmailBody, EmailSummary, ImipInvitation, ImipMethod, ListUnsubscribe, SpfResult, SystemFlagBit, TAG_KEYWORD_PREFIX,
 };
+pub use freebusy::{all_free, AttendeeAvailability, FreeBusyInterval, ScheduleStatus};
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
 pub use interop::{

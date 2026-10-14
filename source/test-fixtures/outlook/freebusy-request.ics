@@ -1,0 +1,15 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+METHOD:REQUEST
+BEGIN:VFREEBUSY
+UID:4FD3AD926350
+DTSTAMP:20090602T190420Z
+DTSTART:20090602T000000Z
+DTEND:20090604T000000Z
+ORGANIZER;CN="Cyrus Daboo":mailto:cyrus@example.com
+ATTENDEE;CN="Wilfredo Sanchez Vega":mailto:wilfredo@example.com
+ATTENDEE;CN="Bernard Desruisseaux":mailto:bernard@example.net
+ATTENDEE;CN="Mike Douglass":mailto:mike@example.org
+END:VFREEBUSY
+END:VCALENDAR

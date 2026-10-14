@@ -20,6 +20,8 @@ behaviour rather than an interpretation of the specs.
 | `auth-results.eml` | RFC 8601 `Authentication-Results` (SPF softfail, DKIM fail, DMARC fail, plus a second header), with a `From` display name impersonating a different address — drives the unverified-sender banner (S-03, M-35). |
 | `winmail.dat` | A synthetic TNEF stream (`[MS-OXTNEF]`): plain/RTF/HTML bodies, a MAPI property stream, two attachments and an inline image. |
 | `tnef-message.eml` | The `winmail.dat` above wrapped in the MIME envelope Outlook sends: `text/plain` plus `application/ms-tnef; name="winmail.dat"`. |
+| `freebusy-request.ics` | The RFC 6638 §B.5 `VFREEBUSY` `METHOD:REQUEST` body a client POSTs to a CalDAV schedule-outbox (CAL-19). |
+| `freebusy-response.xml` | The RFC 6638 §B.5 `CALDAV:schedule-response` answer: three recipients (two busy, one an invalid calendar user with no `calendar-data`). |
 
 These are authored to the documented wire formats (`[MS-OXCICAL]`, `[MS-OXOMSG]`,
 `[MS-OXTNEF]`, RFC 6047) and verified by `crates/mail/tests/outlook_fixtures.rs`

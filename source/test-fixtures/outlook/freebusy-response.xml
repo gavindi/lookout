@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<C:schedule-response xmlns:D="DAV:"
+       xmlns:C="urn:ietf:params:xml:ns:caldav">
+<C:response>
+<C:recipient>
+<D:href>mailto:wilfredo@example.com</D:href>
+</C:recipient>
+<C:request-status>2.0;Success</C:request-status>
+<C:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Server//EN
+METHOD:REPLY
+BEGIN:VFREEBUSY
+UID:4FD3AD926350
+DTSTAMP:20090602T200733Z
+DTSTART:20090602T000000Z
+DTEND:20090604T000000Z
+ORGANIZER;CN="Cyrus Daboo":mailto:cyrus@example.com
+ATTENDEE;CN="Wilfredo Sanchez Vega":mailto:wilfredo@example.com
+FREEBUSY;FBTYPE=BUSY:20090602T110000Z/20090602T120000Z
+FREEBUSY;FBTYPE=BUSY:20090603T170000Z/20090603T180000Z
+END:VFREEBUSY
+END:VCALENDAR
+</C:calendar-data>
+</C:response>
+<C:response>
+<C:recipient>
+<D:href>mailto:bernard@example.net</D:href>
+</C:recipient>
+<C:request-status>2.0;Success</C:request-status>
+<C:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Server//EN
+METHOD:REPLY
+BEGIN:VFREEBUSY
+UID:4FD3AD926350
+DTSTAMP:20090602T200733Z
+DTSTART:20090602T000000Z
+DTEND:20090604T000000Z
+ORGANIZER;CN="Cyrus Daboo":mailto:cyrus@example.com
+ATTENDEE;CN="Bernard Desruisseaux":mailto:bernard@example.net
+FREEBUSY;FBTYPE=BUSY:20090602T150000Z/20090602T160000Z
+FREEBUSY;FBTYPE=BUSY:20090603T090000Z/20090603T100000Z
+FREEBUSY;FBTYPE=BUSY:20090603T180000Z/20090603T190000Z
+END:VFREEBUSY
+END:VCALENDAR
+</C:calendar-data>
+</C:response>
+<C:response>
+<C:recipient>
+<D:href>mailto:mike@example.org</D:href>
+</C:recipient>
+<C:request-status>3.7;Invalid calendar user</C:request-status>
+</C:response>
+</C:schedule-response>

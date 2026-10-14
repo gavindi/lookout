@@ -21,12 +21,17 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
-use lookout_core::{Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventUid, RecurrenceRange};
+use lookout_core::{
+    Attendee, AttendeeAvailability, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventUid,
+    FreeBusyInterval, RecurrenceRange,
+};
 
 use crate::calendar_colors::CalendarColorMap;
+use crate::calendar_tz::DisplayZone;
 use crate::datetime_picker::{set_calendar_date, time_cluster, wire_calendar};
 use crate::recipient_entry::{address_of, RecipientEntry, SuggestionSource};
 use crate::recurrence;
+use crate::schedule_grid::{self, ScheduleRow};
 
 /// The editor's "Show as" choices in new Outlook's order (CAL-05). The
 /// index↔state mapping is explicit - never the enum's own discriminant - so
@@ -66,6 +71,75 @@ type DeleteCallback = Rc<dyn Fn(CalendarId, EventOccurrence)>;
 pub type ForwardCallback = Rc<dyn Fn()>;
 /// The edited occurrence's identity + write target, threaded through the form.
 type EventMeta = (EventUid, Option<String>, Option<String>);
+
+/// A free/busy request the Scheduling page makes to its caller (CAL-19):
+/// which calendar's account to ask, the attendees, and the UTC window to
+/// cover. `generation` increases with each request so a late answer for an
+/// older one is discarded.
+pub struct AvailabilityRequest {
+    pub generation: u64,
+    pub calendar_id: CalendarId,
+    pub attendees: Vec<EmailAddress>,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// The caller's half of the scheduling bridge: it routes `AvailabilityRequest`s
+/// to the owning account's session and pushes answers back through the
+/// [`SchedulingHandle`] (keyed by the request's generation).
+#[derive(Clone)]
+pub struct SchedulingContext {
+    pub handle: SchedulingHandle,
+    pub request: Rc<dyn Fn(AvailabilityRequest)>,
+}
+
+/// The listener an open editor installs to receive free/busy answers.
+type AvailabilityListener = Rc<dyn Fn(u64, Vec<AttendeeAvailability>, Option<String>)>;
+/// A repaint hook shared between the Scheduling page's closures.
+type RefreshHook = Rc<dyn Fn()>;
+
+/// The handle the caller uses to deliver free/busy answers to an open editor.
+/// The editor installs a listener; the caller calls [`Self::deliver`] /
+/// [`Self::fail`] as events arrive. Data-in/out, so the dialog never touches
+/// the network itself.
+#[derive(Clone)]
+pub struct SchedulingHandle {
+    listener: Rc<RefCell<Option<AvailabilityListener>>>,
+}
+
+impl Default for SchedulingHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SchedulingHandle {
+    pub fn new() -> Self {
+        SchedulingHandle {
+            listener: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Registers the editor's listener (replacing any previous one - the
+    /// editor is modal, so only one is ever open).
+    pub fn set_listener(&self, listener: impl Fn(u64, Vec<AttendeeAvailability>, Option<String>) + 'static) {
+        *self.listener.borrow_mut() = Some(Rc::new(listener));
+    }
+
+    /// Delivers a free/busy answer for `generation`.
+    pub fn deliver(&self, generation: u64, availabilities: Vec<AttendeeAvailability>) {
+        if let Some(listener) = self.listener.borrow().as_ref() {
+            listener(generation, availabilities, None);
+        }
+    }
+
+    /// Reports that a lookup couldn't be answered (no backend, server error).
+    pub fn fail(&self, generation: u64, message: String) {
+        if let Some(listener) = self.listener.borrow().as_ref() {
+            listener(generation, Vec::new(), Some(message));
+        }
+    }
+}
 
 /// What to prefill the editor with: the pickable calendars (label + id), which
 /// calendar is selected by default, the event being edited (if any), and a
@@ -123,6 +197,10 @@ pub struct EventEditorPrefill<'a> {
     /// meeting" action passes the person it is about. Ignored when editing an
     /// existing occurrence (whose own attendees win).
     pub suggested_attendees: &'a [EmailAddress],
+    /// The Scheduling Assistant bridge (item 3.8 / CAL-19): when present, the
+    /// toolbar offers a Scheduling tab that asks the caller for attendees'
+    /// free/busy. `None` (no calendar account able to answer) hides the tab.
+    pub scheduling: Option<&'a SchedulingContext>,
 }
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
@@ -487,8 +565,7 @@ pub fn show_event_editor(
     // Categorize (item 2.1 / CAL-07): the shared master list as toggle rows,
     // plus any category the event already carries that isn't in the list (a
     // name written by another client), so nothing is silently dropped.
-    let (categorize_button, selected_categories) =
-        build_category_picker(prefill.categories, existing.as_ref().map(|occ| occ.categories.as_slice()).unwrap_or(&[]), read_only);
+    let (categorize_button, selected_categories) = build_category_picker(prefill.categories, existing.as_ref().map(|occ| occ.categories.as_slice()).unwrap_or(&[]), read_only);
     categorize_button.set_tooltip_text(Some("Categorize"));
 
     let reminder_choices = crate::settings::REMINDER_CHOICES;
@@ -631,6 +708,7 @@ pub fn show_event_editor(
         let displayed_day = displayed_day.clone();
         let existing = existing.clone();
         let zone_dropdown = zone_dropdown.clone();
+        let month_occurrences = month_occurrences.clone();
         Rc::new(move || {
             let day = displayed_day.get();
             let all_day = all_day_switch.is_active();
@@ -697,6 +775,339 @@ pub fn show_event_editor(
         });
     }
     refresh_preview();
+
+    // --- Scheduling Assistant page (item 3.8 / CAL-19): attendee rows over a
+    // horizontal time grid, filled from the caller's free/busy bridge. Like
+    // Tracking it is a named `editor_stack` child swapped in by a toolbar
+    // toggle; unlike Tracking it must ask the caller for data (the dialog has
+    // no network) and merges the answers in as they arrive.
+    let scheduling_button: Option<gtk::ToggleButton> = if let Some(scheduling) = prefill.scheduling {
+        let scheduling = scheduling.clone();
+        let schedule_existing = existing.clone();
+        let owner_subtitle = prefill.owner_email.clone();
+        let work_start = prefill.calendar_prefs.work_start;
+        let work_end = prefill.calendar_prefs.work_end;
+
+        let grid = Rc::new(schedule_grid::build_schedule_grid(
+            prefill.calendar_prefs,
+            start_date.get(),
+            zone_from_dropdown(&zone_dropdown),
+        ));
+        let availability: Rc<RefCell<Vec<AttendeeAvailability>>> = Rc::new(RefCell::new(Vec::new()));
+        let loading = Rc::new(Cell::new(false));
+        let generation = Rc::new(Cell::new(0u64));
+        let refresh_rows_holder: Rc<RefCell<Option<RefreshHook>>> = Rc::new(RefCell::new(None));
+
+        let suggestions_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        let page_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+        page_content.append(&grid.root);
+        page_content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        page_content.append(
+            &gtk::Label::builder()
+                .label("Suggested times")
+                .xalign(0.0)
+                .css_classes(["dim-label", "caption"])
+                .margin_start(12)
+                .build(),
+        );
+        page_content.append(&suggestions_box);
+        let page = gtk::ScrolledWindow::builder()
+            .child(&page_content)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+        editor_stack.add_named(&page, Some("scheduling"));
+
+        // Sets the form's start/end from a picked slot (grid click or a
+        // suggestion) and repaints the grid. The grid's date follows.
+        let apply_time: Rc<dyn Fn(NaiveDateTime, NaiveDateTime)> = {
+            let grid = grid.clone();
+            let start_date = start_date.clone();
+            let end_date = end_date.clone();
+            let start_calendar = start_calendar.clone();
+            let end_calendar = end_calendar.clone();
+            let start_hour = start_hour.clone();
+            let start_minute = start_minute.clone();
+            let end_hour = end_hour.clone();
+            let end_minute = end_minute.clone();
+            let refresh_preview = refresh_preview.clone();
+            let refresh_rows_holder = refresh_rows_holder.clone();
+            Rc::new(move |start: NaiveDateTime, end: NaiveDateTime| {
+                grid.set_date(start.date());
+                set_calendar_date(&start_calendar, &start_date, start.date());
+                start_hour.set_value(f64::from(start.hour()));
+                start_minute.set_value(f64::from(start.minute()));
+                set_calendar_date(&end_calendar, &end_date, end.date());
+                end_hour.set_value(f64::from(end.hour()));
+                end_minute.set_value(f64::from(end.minute()));
+                refresh_preview();
+                if let Some(refresh) = refresh_rows_holder.borrow().as_ref() {
+                    refresh();
+                }
+            })
+        };
+
+        // Rebuilds the grid rows and the suggestion buttons from the form and
+        // the latest availability answer.
+        let refresh_rows: Rc<dyn Fn()> = {
+            let grid = grid.clone();
+            let availability = availability.clone();
+            let loading = loading.clone();
+            let attendees_field = attendees_field.clone();
+            let zone_dropdown = zone_dropdown.clone();
+            let start_date = start_date.clone();
+            let end_date = end_date.clone();
+            let start_hour = start_hour.clone();
+            let start_minute = start_minute.clone();
+            let end_hour = end_hour.clone();
+            let end_minute = end_minute.clone();
+            let all_day_switch = all_day_switch.clone();
+            let month_occurrences = month_occurrences.clone();
+            let suggestions_box = suggestions_box.clone();
+            let apply_time = apply_time.clone();
+            Rc::new(move || {
+                let date = grid.date();
+                let zone = zone_from_dropdown(&zone_dropdown);
+                grid.set_zone(zone);
+                let mut rows = vec![organizer_schedule_row(&month_occurrences, schedule_existing.as_ref(), date, owner_subtitle.clone())];
+                let addresses = attendee_addresses(&attendees_field);
+                let avail = availability.borrow();
+                for address in &addresses {
+                    let named = address.name.as_deref().map(str::trim).is_some_and(|name| !name.is_empty());
+                    match avail.iter().find(|a| a.address.address.eq_ignore_ascii_case(&address.address)) {
+                        Some(a) => rows.push(ScheduleRow {
+                            label: address.display_label().to_string(),
+                            subtitle: named.then(|| address.address.clone()),
+                            intervals: a.intervals.clone(),
+                            unknown: a.unknown,
+                            loading: false,
+                            organizer: false,
+                        }),
+                        None => rows.push(ScheduleRow {
+                            label: address.display_label().to_string(),
+                            subtitle: named.then(|| address.address.clone()),
+                            intervals: Vec::new(),
+                            unknown: !loading.get(),
+                            loading: loading.get(),
+                            organizer: false,
+                        }),
+                    }
+                }
+                drop(avail);
+                grid.set_rows(rows);
+
+                let all_day = all_day_switch.is_active();
+                let start_local = date_time_from_form(&start_date, &start_hour, &start_minute, all_day);
+                let end_local = date_time_from_form(&end_date, &end_hour, &end_minute, all_day);
+                grid.set_proposed(Some(start_local), Some(end_local));
+
+                // Suggested times: free slots across every attendee (the
+                // organizer's own row is informational only).
+                let duration = (end_local - start_local).num_minutes().max(30);
+                let suggestions = schedule_grid::suggest_times(&availability.borrow(), date, work_start, work_end, zone, duration, 6);
+                while let Some(child) = suggestions_box.first_child() {
+                    suggestions_box.remove(&child);
+                }
+                if !addresses.is_empty() && !loading.get() && suggestions.is_empty() {
+                    suggestions_box.append(&gtk::Label::builder().label("No free time found on this day").xalign(0.0).css_classes(["dim-label"]).build());
+                }
+                for slot in suggestions {
+                    let button = gtk::Button::with_label(&slot.format("%H:%M").to_string());
+                    button.set_tooltip_text(Some("Set the meeting to this time"));
+                    let apply = apply_time.clone();
+                    button.connect_clicked(move |_| apply(slot, slot + chrono::Duration::minutes(duration)));
+                    suggestions_box.append(&button);
+                }
+            })
+        };
+        *refresh_rows_holder.borrow_mut() = Some(refresh_rows.clone());
+
+        // Asks the caller for a fresh window over the current attendees.
+        let request: Rc<dyn Fn()> = {
+            let scheduling = scheduling.clone();
+            let grid = grid.clone();
+            let availability = availability.clone();
+            let loading = loading.clone();
+            let generation = generation.clone();
+            let attendees_field = attendees_field.clone();
+            let zone_dropdown = zone_dropdown.clone();
+            let start_date = start_date.clone();
+            let calendar_dropdown = calendar_dropdown.clone();
+            let calendar_ids = calendar_ids.clone();
+            let refresh_rows = refresh_rows.clone();
+            Rc::new(move || {
+                attendees_field.commit_pending();
+                let addresses = attendee_addresses(&attendees_field);
+                let next = generation.get() + 1;
+                generation.set(next);
+                availability.borrow_mut().clear();
+                if addresses.is_empty() {
+                    loading.set(false);
+                    grid.set_status("Add attendees to check their availability.");
+                    refresh_rows();
+                    return;
+                }
+                loading.set(true);
+                grid.set_status("Checking availability…");
+                refresh_rows();
+                // Query the whole day, so the suggested-times scan has the
+                // full day's busy blocks (not just the current meeting span).
+                let zone = selected_zone(&zone_dropdown);
+                let day_start = start_date.get().and_hms_opt(0, 0, 0).unwrap();
+                let start = boundary_to_utc_in(zone, day_start, false);
+                let end = boundary_to_utc_in(zone, day_start + chrono::Duration::days(1), false);
+                let calendar_id = calendar_ids
+                    .get(calendar_dropdown.selected() as usize)
+                    .cloned()
+                    .unwrap_or_else(|| CalendarId(String::new()));
+                (scheduling.request)(AvailabilityRequest {
+                    generation: next,
+                    calendar_id,
+                    attendees: addresses,
+                    start,
+                    end,
+                });
+            })
+        };
+
+        // The caller pushes answers here (window.rs).
+        {
+            let grid = grid.clone();
+            let availability = availability.clone();
+            let loading = loading.clone();
+            let generation = generation.clone();
+            let refresh_rows = refresh_rows.clone();
+            scheduling.handle.set_listener(move |answered, availabilities, error| {
+                if answered != generation.get() {
+                    return;
+                }
+                loading.set(false);
+                match error {
+                    Some(message) => {
+                        availability.borrow_mut().clear();
+                        grid.set_status(&format!("Couldn't check availability: {message}"));
+                    }
+                    None => {
+                        *availability.borrow_mut() = availabilities;
+                        grid.set_status("");
+                    }
+                }
+                refresh_rows();
+            });
+        }
+
+        // A grid click sets the start (keeping the current duration).
+        {
+            let apply_time = apply_time.clone();
+            let all_day_switch = all_day_switch.clone();
+            let start_date = start_date.clone();
+            let end_date = end_date.clone();
+            let start_hour = start_hour.clone();
+            let start_minute = start_minute.clone();
+            let end_hour = end_hour.clone();
+            let end_minute = end_minute.clone();
+            grid.connect_time_picked(move |start| {
+                let all_day = all_day_switch.is_active();
+                let current_start = date_time_from_form(&start_date, &start_hour, &start_minute, all_day);
+                let current_end = date_time_from_form(&end_date, &end_hour, &end_minute, all_day);
+                let duration = (current_end - current_start).num_minutes().max(30);
+                apply_time(start, start + chrono::Duration::minutes(duration));
+            });
+        }
+
+        // The grid's own date navigation moves the form (and vice versa).
+        {
+            let request = request.clone();
+            let start_date = start_date.clone();
+            let start_calendar = start_calendar.clone();
+            let grid_for_cb = grid.clone();
+            grid.connect_date_changed(move |date| {
+                if grid_for_cb.date() != start_date.get() {
+                    set_calendar_date(&start_calendar, &start_date, date);
+                    request();
+                }
+            });
+        }
+        {
+            let request = request.clone();
+            let grid_for_cb = grid.clone();
+            let start_date = start_date.clone();
+            start_calendar.connect_day_selected(move |_| {
+                let date = start_date.get();
+                if grid_for_cb.date() != date {
+                    grid_for_cb.set_date(date);
+                    request();
+                }
+            });
+        }
+
+        let button = gtk::ToggleButton::builder()
+            .label("Scheduling")
+            .tooltip_text("Scheduling Assistant")
+            .valign(gtk::Align::Center)
+            .build();
+        button.set_visible(!read_only);
+        button.set_active(false);
+        {
+            let editor_stack = editor_stack.clone();
+            let request = request.clone();
+            let tracking_button = tracking_button.clone();
+            let refresh_rows = refresh_rows.clone();
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    tracking_button.set_active(false);
+                    editor_stack.set_visible_child_name("scheduling");
+                    request();
+                } else if !tracking_button.is_active() {
+                    editor_stack.set_visible_child_name("form");
+                }
+                refresh_rows();
+            });
+        }
+        {
+            let button = button.clone();
+            tracking_button.connect_toggled(move |tracking| {
+                if tracking.is_active() {
+                    button.set_active(false);
+                }
+            });
+        }
+        {
+            let button = button.clone();
+            let request = request.clone();
+            attendees_field.connect_addresses_changed(move || {
+                if button.is_active() {
+                    request();
+                }
+            });
+        }
+        {
+            let button = button.clone();
+            let request = request.clone();
+            zone_dropdown.connect_selected_notify(move |_| {
+                if button.is_active() {
+                    request();
+                }
+            });
+        }
+        {
+            let request = request.clone();
+            grid.connect_refresh(move || request());
+        }
+        Some(button)
+    } else {
+        None
+    };
+    if let Some(button) = &scheduling_button {
+        top_bar.insert_child_after(button, Some(&tracking_button));
+    }
 
     // --- Collect the form into a `CalendarEvent`. The uid/href/etag come
     // from the edited occurrence; a fresh event gets a new UUID. `rrule`
@@ -1086,6 +1497,47 @@ fn occurrences_for_day(month_occurrences: &[EventOccurrence], day: NaiveDate, ex
         .collect()
 }
 
+/// The display zone from the form's Time zone picker (the Scheduling grid
+/// draws in the event's own zone, so a click maps straight onto the form).
+fn zone_from_dropdown(dropdown: &gtk::DropDown) -> DisplayZone {
+    selected_zone(dropdown).map(DisplayZone::Named).unwrap_or_default()
+}
+
+/// The attendees the form currently holds, as addresses (display names kept).
+fn attendee_addresses(field: &RecipientEntry) -> Vec<EmailAddress> {
+    field
+        .addresses()
+        .iter()
+        .map(|token| EmailAddress {
+            name: name_of(token),
+            address: address_of(token).to_string(),
+        })
+        .filter(|address| !address.address.is_empty())
+        .collect()
+}
+
+/// The organizer's own row in the Scheduling grid: their cached events for
+/// the day (excluding the event being edited), as busy intervals. Free
+/// (transparent) events don't block, matching the grid's own show-as styling.
+fn organizer_schedule_row(month_occurrences: &[EventOccurrence], existing: Option<&EventOccurrence>, date: NaiveDate, subtitle: Option<String>) -> ScheduleRow {
+    let intervals = occurrences_for_day(month_occurrences, date, existing)
+        .into_iter()
+        .filter(|occ| occ.show_as != BusyStatus::Free)
+        .map(|occ| FreeBusyInterval {
+            start: occ.start,
+            end: occ.end,
+            status: occ.show_as,
+        })
+        .collect();
+    ScheduleRow {
+        label: "You".to_string(),
+        subtitle,
+        intervals,
+        organizer: true,
+        ..ScheduleRow::default()
+    }
+}
+
 /// A placeholder occurrence for the event currently being created/edited,
 /// rendered as an extra chip on the preview day-strip alongside whatever
 /// else is cached for that day - it isn't (or is stale) in the caller's
@@ -1240,11 +1692,7 @@ fn selected_zone_name(dropdown: &gtk::DropDown) -> Option<String> {
 /// list (a name written by another client) gets a row too, so it survives an
 /// edit rather than being dropped. Returns the button and the working
 /// selection (names), read back on save/print. Shared with the task editor.
-pub(crate) fn build_category_picker(
-    master: &[crate::categories::CategoryDef],
-    selected: &[String],
-    read_only: bool,
-) -> (gtk::MenuButton, Rc<RefCell<Vec<String>>>) {
+pub(crate) fn build_category_picker(master: &[crate::categories::CategoryDef], selected: &[String], read_only: bool) -> (gtk::MenuButton, Rc<RefCell<Vec<String>>>) {
     let chosen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(selected.to_vec()));
     let list = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

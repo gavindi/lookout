@@ -54,6 +54,7 @@ mod reminders;
 mod resources;
 mod rules;
 mod rules_view;
+mod schedule_grid;
 mod settings;
 mod shortcuts;
 mod signatures;

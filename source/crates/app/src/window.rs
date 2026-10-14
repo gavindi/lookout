@@ -1830,6 +1830,14 @@ struct CalendarUiState {
     /// `refresh_tasks_view` calls it so the pane's task rows stay live as
     /// tasks are created, synced, toggled, or removed; `None` until then.
     mail_overview_refresh: Option<Rc<dyn Fn()>>,
+    /// In-flight Scheduling Assistant free/busy lookups (item 3.8 / CAL-19),
+    /// keyed by a window-unique request id: the open editor's delivery handle
+    /// plus its own request generation. Filled by the editor's request
+    /// callback and drained by the calendar event loop when the account
+    /// answers (`FreeBusyUpdated`/`FreeBusyFailed`).
+    scheduling_pending: HashMap<u64, (crate::event_editor::SchedulingHandle, u64)>,
+    /// Monotonic id source for [`Self::scheduling_pending`].
+    scheduling_next_id: u64,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -7256,6 +7264,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         pending_calendar_moves: HashMap::new(),
         mail_overview_activate: None,
         mail_overview_refresh: None,
+        scheduling_pending: HashMap::new(),
+        scheduling_next_id: 0,
     }));
     // The calendar handle `render_body` reaches for when an incoming iMIP
     // REPLY arrives (item 3.6): stored on `UiState` so the reply can be
@@ -14307,6 +14317,16 @@ fn connect_calendar_account(
                         }
                         refresh_tasks_view(&calendar_state, &tasks_view);
                     }
+                    CalendarSessionEvent::FreeBusyUpdated { request_id, availabilities } => {
+                        if let Some((handle, generation)) = calendar_state.borrow_mut().scheduling_pending.remove(&request_id) {
+                            handle.deliver(generation, availabilities);
+                        }
+                    }
+                    CalendarSessionEvent::FreeBusyFailed { request_id, message } => {
+                        if let Some((handle, generation)) = calendar_state.borrow_mut().scheduling_pending.remove(&request_id) {
+                            handle.fail(generation, message);
+                        }
+                    }
                 }
             }
         }
@@ -14609,6 +14629,7 @@ fn open_event_editor_for(
     let owner_email = calendar_owner_email(state, calendar_state, &occ.calendar_id);
     let calendar_prefs = state.borrow().settings.calendar_preferences();
     let categories = state.borrow().app_config.borrow().categories.clone();
+    let scheduling = scheduling_context(state, calendar_state);
     crate::event_editor::show_event_editor(
         window,
         crate::event_editor::EventEditorPrefill {
@@ -14626,6 +14647,7 @@ fn open_event_editor_for(
             calendar_prefs: &calendar_prefs,
             categories: &categories,
             suggested_attendees: &[],
+            scheduling: Some(&scheduling),
         },
         calendar_attendee_suggestions(state, worker),
         profile_card.clone(),
@@ -14692,6 +14714,7 @@ fn show_new_event_editor(
     let owner_email = calendar_owner_email(state, calendar_state, &default_calendar);
     let calendar_prefs = state.borrow().settings.calendar_preferences();
     let categories = state.borrow().app_config.borrow().categories.clone();
+    let scheduling = scheduling_context(state, calendar_state);
     crate::event_editor::show_event_editor(
         window,
         crate::event_editor::EventEditorPrefill {
@@ -14709,6 +14732,7 @@ fn show_new_event_editor(
             calendar_prefs: &calendar_prefs,
             categories: &categories,
             suggested_attendees: attendees,
+            scheduling: Some(&scheduling),
         },
         calendar_attendee_suggestions(state, worker),
         profile_card.clone(),
@@ -14850,6 +14874,59 @@ fn calendar_scheduling(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_i
         .find(|handle| handle.calendars.iter().any(|calendar| calendar.id == *calendar_id))
         .map(|handle| handle.scheduling.clone())
         .unwrap_or_default()
+}
+
+/// The event editor's Scheduling Assistant bridge (item 3.8 / CAL-19): a
+/// `SchedulingHandle` the account's event loop pushes the answer into, and a
+/// request callback that routes a free/busy query to the owning account's
+/// session - or reports a soft failure when that account's server doesn't
+/// advertise scheduling (the editor then shows the attendees as unknown).
+fn scheduling_context(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>) -> crate::event_editor::SchedulingContext {
+    let handle = crate::event_editor::SchedulingHandle::new();
+    let request = {
+        let handle = handle.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        Rc::new(move |request: crate::event_editor::AvailabilityRequest| {
+            let (cmd_tx, supported) = {
+                let st = calendar_state.borrow();
+                match st.accounts.values().find(|h| h.calendars.iter().any(|c| c.id == request.calendar_id)) {
+                    Some(account) => (Some(account.cmd_tx.clone()), account.scheduling.supports_server_scheduling()),
+                    None => (None, false),
+                }
+            };
+            if !supported {
+                handle.fail(request.generation, "this calendar's server doesn't support scheduling".to_string());
+                return;
+            }
+            let Some(cmd_tx) = cmd_tx else {
+                handle.fail(request.generation, "no calendar account".to_string());
+                return;
+            };
+            let Some(organizer) = calendar_owner_email(&state, &calendar_state, &request.calendar_id)
+                .map(|email| email.trim().to_string())
+                .filter(|email| !email.is_empty())
+                .map(EmailAddress::new)
+            else {
+                handle.fail(request.generation, "no organizer address for this calendar".to_string());
+                return;
+            };
+            let request_id = {
+                let mut st = calendar_state.borrow_mut();
+                st.scheduling_next_id += 1;
+                st.scheduling_next_id
+            };
+            calendar_state.borrow_mut().scheduling_pending.insert(request_id, (handle.clone(), request.generation));
+            let _ = cmd_tx.send_blocking(CalendarCommand::FetchFreeBusy {
+                organizer,
+                attendees: request.attendees,
+                start: request.start,
+                end: request.end,
+                request_id,
+            });
+        }) as Rc<dyn Fn(crate::event_editor::AvailabilityRequest)>
+    };
+    crate::event_editor::SchedulingContext { handle, request }
 }
 
 /// The mail identity that organizes `calendar_id`'s events: the calendar

@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.192" date="2026-10-15">
+      <description>
+        <p>The event editor gains a Scheduling Assistant tab: invite attendees and see each person's free/busy against a time grid, with suggested times where nobody is booked. Availability is fetched from servers that support CalDAV scheduling, and your own calendar is always shown so suggested times work even without it.</p>
+      </description>
+    </release>
     <release version="0.9.191" date="2026-10-15">
       <description>
         <p>Meeting time proposals round-trip: propose a new time from an invitation with the new "Propose new time" button, and if you organize the meeting, a proposed time can be accepted in one click (everyone gets the update) or declined. Invitations and meetings in the calendar can also be forwarded to new people, who receive the meeting request while the organizer is notified.</p>
