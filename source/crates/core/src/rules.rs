@@ -141,7 +141,12 @@ impl RuleCondition {
             RuleCondition::Cc(text) => addresses_contain_text(&message.cc, text),
             RuleCondition::Subject(text) => contains_ci(message.subject.as_deref().unwrap_or_default(), text),
             RuleCondition::Body(text) => context.body.is_some_and(|body| contains_ci(body, text)),
-            RuleCondition::Header { name, value } => context.headers.iter().any(|(h, v)| h.eq_ignore_ascii_case(name) && contains_ci(v, value)),
+            // An empty `name` matches any header (Graph's `headerContains` has
+            // no header name of its own); otherwise the name must match too.
+            RuleCondition::Header { name, value } => context
+                .headers
+                .iter()
+                .any(|(h, v)| (name.trim().is_empty() || h.eq_ignore_ascii_case(name)) && contains_ci(v, value)),
             RuleCondition::HasAttachment(want) => message.has_attachment == *want,
             RuleCondition::Importance(want) => message.importance == *want,
             RuleCondition::Size { comparison, bytes } => comparison.holds(message.size, *bytes),
@@ -225,13 +230,19 @@ impl RuleAction {
 /// A single rule.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rule {
-    /// Stable identity, used by the editor and by server-side sync.
+    /// Stable identity, used by the editor and by server-side sync. For a
+    /// Graph-backed rule this is the Graph `messageRule` id.
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub backend: RuleBackend,
+    /// The account this rule belongs to, or `None` to apply on every account.
+    /// A `Graph` rule always names its Microsoft 365 account (its rules live in
+    /// that mailbox); a client rule with an account only runs for that account.
+    #[serde(default)]
+    pub account: Option<crate::ids::AccountId>,
     /// Every condition must hold (an empty list matches every message).
     pub conditions: Vec<RuleCondition>,
     /// If any exception holds, the rule does not apply (Outlook's "except …").
@@ -249,10 +260,21 @@ impl Rule {
             name: name.into(),
             enabled: true,
             backend: RuleBackend::Client,
+            account: None,
             conditions: Vec::new(),
             exceptions: Vec::new(),
             actions: Vec::new(),
         }
+    }
+
+    /// Whether the rule applies to `message` from `account`: enabled, scoped
+    /// to this account (or to all), every condition holds, and no exception
+    /// holds.
+    pub fn matches_for_account(&self, account: &crate::ids::AccountId, message: &EmailSummary, context: &RuleContext<'_>) -> bool {
+        if self.account.as_ref().is_some_and(|rule_account| rule_account != account) {
+            return false;
+        }
+        self.matches(message, context)
     }
 
     /// Whether the rule applies to `message`: enabled, every condition holds,
@@ -486,6 +508,7 @@ mod tests {
             name: "Big high-importance mail".into(),
             enabled: true,
             backend: RuleBackend::Client,
+            account: None,
             conditions: vec![
                 RuleCondition::Importance(Importance::High),
                 RuleCondition::Size {
@@ -519,6 +542,7 @@ mod tests {
             name: "Archive newsletters".into(),
             enabled: true,
             backend: RuleBackend::Client,
+            account: None,
             conditions: vec![
                 RuleCondition::ListId("news.example.com".into()),
                 RuleCondition::Header {

@@ -294,8 +294,16 @@ pub(crate) fn show_manage_rules_dialog(anchor: &gtk::Widget, state: Rc<RefCell<U
                 delete.connect_clicked({
                     let state = state.clone();
                     let id = rule.id.clone();
+                    let backend = rule.backend;
+                    let account = rule.account.clone();
                     let rebuild_handle = rebuild_handle.clone();
                     move |_| {
+                        // Remove the Outlook copy too, when this rule lives there.
+                        if backend == RuleBackend::Graph {
+                            if let Some(account) = &account {
+                                crate::window::delete_graph_rule(&state, account, id.clone());
+                            }
+                        }
                         let app_config = state.borrow().app_config.clone();
                         app_config.borrow_mut().remove_rule(&id);
                         crate::app_config::save(&app_config.borrow());
@@ -375,23 +383,89 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
     });
     root.append(&labeled_row("Name", &name_entry));
 
+    // Connected Microsoft 365 accounts, for the "Microsoft 365" backend - a
+    // Graph rule lives in one mailbox, so it needs an account.
+    let m365: Vec<(lookout_core::AccountId, String)> = {
+        let st = state.borrow();
+        let mut accounts: Vec<(lookout_core::AccountId, String)> = st
+            .accounts
+            .iter()
+            .filter(|(_, handle)| handle.graph_rules.is_some())
+            .map(|(account_id, handle)| {
+                let label = if !handle.display_name.trim().is_empty() {
+                    handle.display_name.clone()
+                } else if !handle.email.trim().is_empty() {
+                    handle.email.clone()
+                } else {
+                    account_id.0.clone()
+                };
+                (account_id.clone(), label)
+            })
+            .collect();
+        accounts.sort_by_key(|(_, label)| label.to_lowercase());
+        accounts
+    };
+
     let backend = gtk::DropDown::from_strings(&["This device", "Server (Sieve)", "Microsoft 365"]);
     backend.set_selected(match rule.borrow().backend {
         RuleBackend::Client => 0,
         RuleBackend::Sieve => 1,
         RuleBackend::Graph => 2,
     });
+    let account_row = if m365.is_empty() {
+        None
+    } else {
+        let labels: Vec<&str> = m365.iter().map(|(_, label)| label.as_str()).collect();
+        let account = gtk::DropDown::from_strings(&labels);
+        if let Some(index) = m365.iter().position(|(id, _)| rule.borrow().account.as_ref() == Some(id)) {
+            account.set_selected(index as u32);
+        }
+        account.connect_selected_notify({
+            let rule = rule.clone();
+            let m365 = m365.clone();
+            move |dropdown| {
+                if let Some((account_id, _)) = m365.get(dropdown.selected() as usize) {
+                    rule.borrow_mut().account = Some(account_id.clone());
+                }
+            }
+        });
+        let row = labeled_row("Account", &account);
+        row.set_visible(rule.borrow().backend != RuleBackend::Client);
+        Some(row)
+    };
     backend.connect_selected_notify({
         let rule = rule.clone();
+        let m365 = m365.clone();
+        let account_row = account_row.clone();
         move |dropdown| {
-            rule.borrow_mut().backend = match dropdown.selected() {
+            let selected = match dropdown.selected() {
                 1 => RuleBackend::Sieve,
                 2 => RuleBackend::Graph,
                 _ => RuleBackend::Client,
+            };
+            {
+                let mut rule = rule.borrow_mut();
+                rule.backend = selected;
+                // A Graph rule must name its account; the first connected one
+                // is the default. Clearing the backend clears the scope.
+                match selected {
+                    RuleBackend::Graph => {
+                        if rule.account.is_none() {
+                            rule.account = m365.first().map(|(account_id, _)| account_id.clone());
+                        }
+                    }
+                    _ => rule.account = None,
+                }
+            }
+            if let Some(row) = &account_row {
+                row.set_visible(selected != RuleBackend::Client);
             }
         }
     });
     root.append(&labeled_row("Runs on", &backend));
+    if let Some(row) = &account_row {
+        root.append(row);
+    }
 
     // The three sections are rebuilt whenever a row is added, removed or its
     // kind changes; the name entry and backend dropdown above persist.
@@ -471,6 +545,11 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
             let mut saved = rule.borrow().clone();
             if saved.name.trim().is_empty() {
                 saved.name = "Untitled rule".to_string();
+            }
+            // A Graph rule must name a connected account; pick the first when
+            // none was chosen.
+            if saved.backend == RuleBackend::Graph && saved.account.is_none() {
+                saved.account = m365.first().map(|(account_id, _)| account_id.clone());
             }
             let app_config = state.borrow().app_config.clone();
             app_config.borrow_mut().upsert_rule(saved);

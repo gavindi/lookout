@@ -101,6 +101,10 @@ pub(crate) struct AccountHandle {
     /// master list with Outlook's `masterCategories` through Graph (item 2.1),
     /// once the account has granted Graph access. See `graph_categories`.
     pub(crate) graph_categories: Option<Rc<crate::graph_categories::GraphCategoriesClient>>,
+    /// Present only for Microsoft 365 accounts: syncs the user's `Graph`-backend
+    /// rules with Outlook's inbox `messageRules` (item 2.5), once Graph access
+    /// is granted. See `graph_rules`.
+    pub(crate) graph_rules: Option<Rc<crate::graph_rules::GraphRulesClient>>,
 }
 
 /// One GNOME Online Accounts account as discovered at startup, keeping the
@@ -9456,6 +9460,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 sync_follow_ups_from_graph(&state, &account_id);
                                 sync_categories_from_graph(&state, &message_list, &account_id);
                                 push_categories_to_graph(&state);
+                                sync_and_push_rules_from_graph(&state, &account_id);
                                 let refresh = refresh_hook.borrow().clone();
                                 refresh();
                             }
@@ -9837,6 +9842,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let account_ids: Vec<AccountId> = state.borrow().accounts.keys().cloned().collect();
             for account_id in &account_ids {
                 sync_follow_ups_from_graph(&state, account_id);
+                sync_and_push_rules_from_graph(&state, account_id);
             }
             for cmd_tx in state.borrow().contact_cmd_tx.values() {
                 let _ = cmd_tx.send_blocking(ContactCommand::Refresh);
@@ -11787,6 +11793,7 @@ fn connect_account(
             graph_pin: is_microsoft_365.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
             graph_mail: is_microsoft_365.then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
             graph_categories: is_microsoft_365.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
+            graph_rules: is_microsoft_365.then(|| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone()))),
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
@@ -11802,6 +11809,11 @@ fn connect_account(
         let categories_message_list = message_list.clone();
         let categories_account = account_id.clone();
         glib::timeout_add_seconds_local_once(11, move || sync_categories_from_graph(&categories_state, &categories_message_list, &categories_account));
+        // Pull (and push) Outlook's inbox rules (item 2.5), last of the three
+        // so the category list it may reference is already in place.
+        let rules_state = state.clone();
+        let rules_account = account_id.clone();
+        glib::timeout_add_seconds_local_once(12, move || sync_and_push_rules_from_graph(&rules_state, &rules_account));
     }
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
@@ -12842,6 +12854,7 @@ fn connect_other_account(
             graph_pin: None,
             graph_mail: None,
             graph_categories: None,
+            graph_rules: None,
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
@@ -15464,6 +15477,141 @@ fn sync_categories_from_graph(state: &Rc<RefCell<UiState>>, message_list: &Messa
                 }
             }
             Err(e) => tracing::warn!("couldn't read Outlook's categories: {e}"),
+        }
+    });
+}
+
+/// Pulls a Microsoft 365 account's Outlook inbox rules into `AppConfig::rules`
+/// (item 2.5 / M-14), adding any rule the user doesn't have locally yet (by
+/// Graph id). A no-op for other accounts and before Graph access is granted.
+/// Best effort: a failure is logged and the next sync reconciles.
+fn sync_rules_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    let Some(client) = state.borrow().accounts.get(account_id).and_then(|h| h.graph_rules.clone()) else {
+        return;
+    };
+    if !client.consented() {
+        return;
+    }
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        match client.list().await {
+            Ok(remote) => {
+                let app_config = state.borrow().app_config.clone();
+                let mut changed = false;
+                {
+                    let mut config = app_config.borrow_mut();
+                    for rule in remote {
+                        match config.rules.iter_mut().find(|r| r.id == rule.id) {
+                            Some(existing) => {
+                                if *existing != rule {
+                                    *existing = rule;
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                config.rules.push(rule);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    crate::app_config::save(&app_config.borrow());
+                }
+            }
+            Err(e) => tracing::warn!("couldn't read Outlook's rules: {e}"),
+        }
+    });
+}
+
+/// Pushes every local `Graph`-backend rule to its Microsoft 365 account
+/// (item 2.5 / M-14): an existing Outlook rule is updated in place, a new one
+/// is created and its Graph id written back. A rule Outlook can't express
+/// (see `graph_rules`) is left alone as a client rule. Best effort.
+fn push_rules_to_graph(state: &Rc<RefCell<UiState>>) {
+    let clients: Vec<(AccountId, Rc<crate::graph_rules::GraphRulesClient>)> = {
+        let st = state.borrow();
+        st.accounts
+            .iter()
+            .filter_map(|(account_id, handle)| handle.graph_rules.clone().filter(|client| client.consented()).map(|client| (account_id.clone(), client)))
+            .collect()
+    };
+    if clients.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        for (account_id, client) in clients {
+            let local: Vec<lookout_core::Rule> = {
+                let st = state.borrow();
+                let rules = st
+                    .app_config
+                    .borrow()
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.backend == lookout_core::RuleBackend::Graph && rule.account.as_ref() == Some(&account_id))
+                    .cloned()
+                    .collect();
+                rules
+            };
+            if local.is_empty() {
+                continue;
+            }
+            let remote = match client.list().await {
+                Ok(remote) => remote,
+                Err(e) => {
+                    tracing::warn!("couldn't read Outlook's rules before pushing: {e}");
+                    continue;
+                }
+            };
+            let remote_ids: Vec<String> = remote.iter().map(|rule| rule.id.clone()).collect();
+            for rule in local {
+                if remote_ids.contains(&rule.id) {
+                    if let Err(e) = client.update(&rule).await {
+                        tracing::warn!("couldn't update Outlook rule '{}': {e}", rule.name);
+                    }
+                } else {
+                    match client.create(&rule).await {
+                        Ok(new_id) if !new_id.is_empty() => {
+                            let app_config = state.borrow().app_config.clone();
+                            if let Some(stored) = app_config
+                                .borrow_mut()
+                                .rules
+                                .iter_mut()
+                                .find(|r| r.id == rule.id && r.account.as_ref() == Some(&account_id))
+                            {
+                                stored.id = new_id;
+                            }
+                            crate::app_config::save(&app_config.borrow());
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("couldn't create Outlook rule '{}': {e}", rule.name),
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Pulls then pushes a Microsoft 365 account's Graph rules (item 2.5),
+/// reconciling the two directions.
+fn sync_and_push_rules_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    sync_rules_from_graph(state, account_id);
+    push_rules_to_graph(state);
+}
+
+/// Deletes a rule's Outlook copy (item 2.5) after the user removed it here.
+/// A no-op for other accounts and before Graph access is granted; best effort.
+pub(crate) fn delete_graph_rule(state: &Rc<RefCell<UiState>>, account_id: &AccountId, id: String) {
+    let Some(client) = state.borrow().accounts.get(account_id).and_then(|h| h.graph_rules.clone()) else {
+        return;
+    };
+    if !client.consented() {
+        return;
+    }
+    glib::spawn_future_local(async move {
+        if let Err(e) = client.delete(&id).await {
+            tracing::warn!("couldn't delete Outlook rule {id}: {e}");
         }
     });
 }
@@ -18102,6 +18250,7 @@ fn request_account_refresh(state: &Rc<RefCell<UiState>>, account_id: &AccountId)
         let _ = cmd_tx.send_blocking(AccountCommand::Refresh);
     }
     sync_follow_ups_from_graph(state, account_id);
+    sync_and_push_rules_from_graph(state, account_id);
 }
 
 /// The local-index pass of a search (M-18, roadmap 2.2/2.3): query the
@@ -25960,6 +26109,7 @@ mod tests {
                         graph_pin: None,
                         graph_mail: None,
                         graph_categories: None,
+                        graph_rules: None,
                     },
                 )
             })

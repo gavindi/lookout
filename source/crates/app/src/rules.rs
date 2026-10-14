@@ -94,6 +94,7 @@ fn rules_enabled(state: &Rc<RefCell<UiState>>) -> bool {
 /// The per-run snapshot of everything evaluation needs, taken under one
 /// borrow so dispatching a command can't deadlock on the state lock.
 struct RunContext {
+    account_id: AccountId,
     rules: Vec<Rule>,
     folders: Vec<Mailbox>,
     owner: Vec<EmailAddress>,
@@ -122,6 +123,7 @@ impl RunContext {
         let cmd_tx = handle.cmd_tx.clone();
         let interactive_cmd_tx = handle.interactive_cmd_tx.clone();
         Some(RunContext {
+            account_id: account_id.clone(),
             rules,
             folders,
             owner,
@@ -169,7 +171,7 @@ fn evaluate_message(state: &Rc<RefCell<UiState>>, run: &RunContext, message: &Em
     };
     let mut stop = false;
     for rule in &run.rules {
-        if !rule.matches(message, &context) {
+        if !rule.matches_for_account(&run.account_id, message, &context) {
             continue;
         }
         for action in &rule.actions {

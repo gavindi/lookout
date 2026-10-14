@@ -30,6 +30,7 @@ mod google_tasks;
 mod graph_categories;
 mod graph_mail;
 mod graph_pin;
+mod graph_rules;
 #[cfg(test)]
 mod gtk_test;
 mod identities;
@@ -49,9 +50,9 @@ mod profile_card;
 mod recipient_entry;
 mod recurrence;
 mod reminders;
+mod resources;
 mod rules;
 mod rules_view;
-mod resources;
 mod settings;
 mod shortcuts;
 mod signatures;

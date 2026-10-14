@@ -1,0 +1,40 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('user%40example.com')/mailFolders('inbox')/messageRules",
+  "value": [
+    {
+      "id": "AQAAAAB",
+      "displayName": "Archive newsletters",
+      "sequence": 1,
+      "isEnabled": true,
+      "hasError": false,
+      "isReadOnly": false,
+      "conditions": {
+        "senderContains": ["news@example.com"],
+        "headerContains": ["list.example.com"]
+      },
+      "exceptions": {
+        "senderContains": ["vip@example.com"]
+      },
+      "actions": {
+        "assignCategories": ["Newsletters"],
+        "moveToFolder": "f-archive",
+        "markAsRead": true,
+        "stopProcessingRules": false
+      }
+    },
+    {
+      "id": "AQAAAAC",
+      "displayName": "File project mail",
+      "sequence": 2,
+      "isEnabled": false,
+      "hasError": false,
+      "isReadOnly": false,
+      "conditions": {
+        "subjectContains": ["Project"]
+      },
+      "actions": {
+        "moveToFolder": "f-projects"
+      }
+    }
+  ]
+}
