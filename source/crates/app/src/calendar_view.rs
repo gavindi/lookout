@@ -937,8 +937,10 @@ pub fn build_event_peek(
         });
     }
     buttons.append(&edit_button);
-    if let Some(url) = occ.conference_url.as_deref().filter(|u| !u.trim().is_empty()) {
-        let join_button = gtk::LinkButton::builder().uri(url).label("Join").css_classes(["pill"]).build();
+    // CAL-20 / 3.17: a Join button for an online meeting, labelled by provider.
+    if let Some(meeting) = lookout_core::interop::onlinemeeting::detect(occ.conference_url.as_deref(), occ.location.as_deref(), occ.description.as_deref()) {
+        let label = format!("Join {}", meeting.provider.display_name());
+        let join_button = gtk::LinkButton::builder().uri(&meeting.url).label(&label).css_classes(["pill"]).build();
         buttons.append(&join_button);
     }
     if let Some(on_delete) = on_delete {

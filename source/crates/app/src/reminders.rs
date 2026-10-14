@@ -282,6 +282,16 @@ fn show_notification(app: &adw::Application, alert: &DueAlert) {
     let json = serde_json::to_string(&alert.occurrence).expect("EventOccurrence serialization cannot fail");
     let variant = glib::Variant::from(json);
     notification.set_default_action_and_target_value("app.open-event", Some(&variant));
+    // CAL-20 / 3.17: a Join button for an online meeting, opening the detected
+    // join URL in the default browser.
+    if let Some(meeting) = lookout_core::interop::onlinemeeting::detect(
+        alert.occurrence.conference_url.as_deref(),
+        alert.occurrence.location.as_deref(),
+        alert.occurrence.description.as_deref(),
+    ) {
+        let url_variant = glib::Variant::from(meeting.url);
+        notification.add_button_with_target_value("Join", "app.join-meeting", Some(&url_variant));
+    }
     notification.add_button_with_target_value("Snooze 5 min", "app.snooze-reminder", Some(&variant));
     notification.add_button_with_target_value("Dismiss", "app.dismiss-reminder", Some(&variant));
     app.send_notification(Some(&notification_id(&alert.occurrence)), &notification);
@@ -342,6 +352,16 @@ pub fn spawn_reminder_loop(
         }
     });
     app.add_action(&dismiss_action);
+
+    // CAL-20 / 3.17: opens an online-meeting join URL (the notification's
+    // Join button) in the default browser.
+    let join_action = gio::SimpleAction::new("join-meeting", Some(glib::VariantTy::STRING));
+    join_action.connect_activate(move |_, param| {
+        if let Some(url) = param.and_then(|value| value.str()) {
+            crate::window::open_uri_in_default_browser(url);
+        }
+    });
+    app.add_action(&join_action);
 
     // One startup tick (so an alert that came due while the app was closed
     // still appears if its event hasn't started), then the repeating timer.

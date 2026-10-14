@@ -420,6 +420,16 @@ pub fn show_event_editor(
         let video_url_row = video_url_row.clone();
         video_toggle.connect_active_notify(move |row| video_url_row.set_visible(row.is_active()));
     }
+    // CAL-20 / 3.17: name the provider once a recognised meeting URL is typed.
+    {
+        let video_toggle = video_toggle.clone();
+        video_url_row.connect_changed(move |row| {
+            video_toggle.set_subtitle(&match lookout_core::interop::onlinemeeting::classify(row.text().trim()) {
+                Some(provider) => format!("{} meeting link", provider.display_name()),
+                None => "Add a join-this-meeting URL".to_string(),
+            });
+        });
+    }
 
     let description_buffer = gtk::TextBuffer::new(None);
     let description_view = gtk::TextView::builder()

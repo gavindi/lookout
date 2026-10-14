@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use icalendar::{
     Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, PartStat, Property, Role, TodoStatus, Trigger,
 };
-use lookout_core::interop::cdo;
+use lookout_core::interop::{cdo, onlinemeeting};
 use lookout_core::{
     Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventUid, ImipInvitation, ImipMethod,
     RecurrenceRange, ScheduleAgent, TaskPriority, TaskStatus, TaskUid,
@@ -107,9 +107,24 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         categories: parse_categories(event),
         sensitivity: event.get_class().map(from_ical_class).unwrap_or_default(),
         show_as: parse_show_as(event),
-        conference_url: event.property_value("CONFERENCE").or_else(|| event.get_url()).map(str::to_string),
+        conference_url: online_meeting_url(event),
         reminder_minutes_before: parse_reminder(event),
     })
+}
+
+/// The event's join URL. An explicit property wins in Outlook's own order
+/// (`CONFERENCE`, then `URL`, then the two `X-MICROSOFT-*` meeting
+/// properties); when none is present, the location/description text is
+/// scanned for a recognised meeting link, which is where Outlook actually
+/// buries the Teams join URL (CAL-20 / 3.17, see
+/// [`lookout_core::interop::onlinemeeting`]).
+fn online_meeting_url(event: &icalendar::Event) -> Option<String> {
+    let explicit = event
+        .property_value("CONFERENCE")
+        .or_else(|| event.get_url())
+        .or_else(|| event.property_value(onlinemeeting::X_MICROSOFT_SKYPETEAMSMEETINGURL))
+        .or_else(|| event.property_value(onlinemeeting::X_MICROSOFT_ONLINEMEETINGCONFLINK));
+    onlinemeeting::detect(explicit, event.get_location(), event.get_description()).map(|meeting| meeting.url)
 }
 
 /// Every parsed `Property` under `key`, in multi-property order then
@@ -661,6 +676,7 @@ pub fn parse_imip_invitation(ics: &str) -> Option<ImipInvitation> {
         end: event.end,
         all_day: event.all_day,
         location: event.location,
+        conference_url: event.conference_url.clone(),
         description: event.description,
         rrule: event.rrule,
         disallow_counter: cdo::disallow_counter(ics),
@@ -1601,7 +1617,37 @@ END:VCALENDAR\r\n";
             invitation.location.as_deref(),
             Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc123%40thread.v2/0")
         );
+        // CAL-20/3.17: the Teams link stored as LOCATION is detected as the
+        // meeting's join URL.
+        assert_eq!(
+            invitation.conference_url.as_deref(),
+            Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc123%40thread.v2/0")
+        );
         assert_eq!(invitation.rrule, None);
+    }
+
+    /// CAL-20/3.17: the real Outlook shape (`test-fixtures/outlook/teams-invite.eml`)
+    /// carries the join URL in the two `X-MICROSOFT-*` properties and buries it
+    /// in the description with a plain "Microsoft Teams Meeting" location - the
+    /// parser must surface the URL anyway so the invite card and reminder can
+    /// offer Join.
+    #[test]
+    fn parse_imip_invitation_detects_outlook_teams_properties() {
+        let teams_url = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc%40thread.v2/0";
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:teams-1@example.com\r\nDTSTAMP:20260801T120000Z\r\nDTSTART:20260810T100000Z\r\nDTEND:20260810T103000Z\r\nSUMMARY:Weekly design sync\r\nLOCATION;LANGUAGE=en-US:Microsoft Teams Meeting\r\nDESCRIPTION;LANGUAGE=en-US:Microsoft Teams meeting\\nJoin: {teams_url}\\nMeeting ID: 123\r\nX-MICROSOFT-SKYPETEAMSMEETINGURL:{teams_url}\r\nX-MICROSOFT-ONLINEMEETINGCONFLINK:{teams_url}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let invitation = parse_imip_invitation(&ics).expect("parses");
+        assert_eq!(invitation.conference_url.as_deref(), Some(teams_url));
+    }
+
+    /// A description link is only accepted when it names a known meeting
+    /// provider - a stray web link in the notes must not become a Join button.
+    #[test]
+    fn parse_imip_invitation_ignores_a_non_meeting_link_in_the_description() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:x@example.com\r\nDTSTAMP:20260801T120000Z\r\nDTSTART:20260810T100000Z\r\nDTEND:20260810T103000Z\r\nSUMMARY:No meeting\r\nDESCRIPTION:Agenda at https://example.com/agenda\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let invitation = parse_imip_invitation(ics).expect("parses");
+        assert_eq!(invitation.conference_url, None);
     }
 
     /// The Outlook *desktop* form of the same invitation: `TZID` unquoted

@@ -4500,6 +4500,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     imip_invite_card.append(&invite_detail_row("imip-where-row", "imip-where", "Where"));
     imip_invite_card.append(&invite_detail_row("imip-organizer-row", "imip-organizer", "Organizer"));
     imip_invite_card.append(&invite_detail_row("imip-description-row", "imip-description", "Description"));
+    // CAL-20 / 3.17: a Join button for an online meeting (Teams/Zoom/Meet).
+    // `render_invite_card` sets its URL/label from the detected join URL and
+    // hides it for an in-person event.
+    let imip_join_button = gtk::LinkButton::builder()
+        .label("Join")
+        .uri("about:blank")
+        .css_classes(["suggested-action"])
+        .halign(gtk::Align::Start)
+        .build();
+    imip_join_button.set_widget_name("imip-join-button");
+    imip_join_button.set_visible(false);
+    imip_invite_card.append(&imip_join_button);
     message_page.append(&imip_invite_card);
     message_page.append(&content_stack);
     message_page.append(&message_header.action_bar);
@@ -23098,6 +23110,22 @@ fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<&lookout_co
     set_invite_row(&card, "imip-where-row", "imip-where", invitation.location.clone());
     set_invite_row(&card, "imip-organizer-row", "imip-organizer", invitation.organizer.as_ref().map(format_imip_organizer));
     set_invite_row(&card, "imip-description-row", "imip-description", invitation.description.clone());
+    // CAL-20 / 3.17: the online-meeting Join button, shown only when the
+    // invitation carries a join URL, labelled by provider ("Join Teams").
+    if let Some(join) = find_named_descendant(&card, "imip-join-button").and_then(|w| w.downcast::<gtk::LinkButton>().ok()) {
+        match invitation.conference_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            Some(url) => {
+                let label = match lookout_core::interop::onlinemeeting::classify(url) {
+                    Some(provider) => format!("Join {}", provider.display_name()),
+                    None => "Join".to_string(),
+                };
+                join.set_label(&label);
+                join.set_uri(url);
+                join.set_visible(true);
+            }
+            None => join.set_visible(false),
+        }
+    }
     // The response buttons (CAL-15) are for an invitation the user can
     // answer - a REQUEST. CANCEL and REPLY keep the details-only card, while
     // a COUNTER (a proposed new time, CAL-17) swaps the respond row for the
@@ -24592,7 +24620,7 @@ pub(crate) fn send_fetch_raw_message(state: &Rc<RefCell<UiState>>, mailbox: &Mai
 /// deliberately ignored - `data:`/`cid:`/`about:`/`file:` are local to the
 /// pane, and `mailto:` is itself a mail client's business (a
 /// compose-from-link flow is the later refinement).
-fn open_uri_in_default_browser(uri: &str) {
+pub(crate) fn open_uri_in_default_browser(uri: &str) {
     let scheme = uri.split(':').next().unwrap_or("");
     if matches!(scheme, "http" | "https") {
         if let Err(e) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {

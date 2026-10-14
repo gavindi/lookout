@@ -724,6 +724,11 @@ pub struct ImipInvitation {
     pub location: Option<String>,
     /// The event's `DESCRIPTION`, if any.
     pub description: Option<String>,
+    /// A join-this-meeting URL detected on the invitation - the RFC 7986
+    /// `CONFERENCE` property, Outlook's `X-MICROSOFT-SKYPE`/`-ONLINEMEETING`
+    /// properties, or a Teams/Zoom/Meet link found in the location or
+    /// description (CAL-20 / 3.17). Drives the invite card's **Join** button.
+    pub conference_url: Option<String>,
     /// The raw `RRULE` value (RFC 5545 `RECUR`) when the invitation is for a
     /// recurring event - the details card shows a "recurring" hint for it.
     pub rrule: Option<String>,
