@@ -13,6 +13,10 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.190] - 2026-10-14
+**Reference**: Mail — instant folder unread counts on move
+**Summary**: Touches `crates/mail/src/session.rs`; no data-format change. Deleting, archiving, moving or snoozing a message updated the folder pane's unread badge only once the move path's `STATUS` round trips had returned, so the count visibly lagged the message list (which already updates from the cache instantly). Every move path now applies a best-effort local patch the moment the server-side move succeeds, the same contract as the existing mark-read path: the moved messages' cached summaries are read before the cache drop (the new `cached_move_info`, which also supplies the bare `Message-ID`s the move ledger needs), and the new `apply_move_unread_delta` saturating-subtracts the unread ones from the source folder and adds them to the destination, so Inbox's badge drops and Trash's rises with the row. Undo, unsnooze and both wake paths reverse the same way, with a wake counting every message as arriving unread (it strips `\Seen`). The `STATUS` refresh that follows still overwrites the count with the server's number, so any miscount is corrected a round trip later. Covered by new `apply_move_unread_delta` (both ends, read-only moves, saturating, wake semantics) and `cached_move_info` (unread tally from cached summaries) tests.
+
 ## [v0.9.189] - 2026-10-14
 **Reference**: Outlook Parity Sprint 17 — RSVP options and response tracking (Phase 3.5, 3.6)
 **Summary**: Two Phase 3 items; see the two entries below. No data-format change.

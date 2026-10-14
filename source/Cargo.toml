@@ -28,7 +28,7 @@ imap-proto = { path = "crates/imap-proto" }
 async-imap = { path = "crates/async-imap" }
 
 [workspace.package]
-version = "0.9.189"
+version = "0.9.190"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gavindi/lookout"

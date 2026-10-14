@@ -1728,6 +1728,8 @@ async fn connect_and_run(
                     match wake_scheduled_uids(&mut session, &uids, &keywords, has_move, has_uidplus).await {
                         Ok(()) => {
                             tracing::info!(count = uids.len(), "woke snoozed messages");
+                            let info = cached_move_info(cache, &scheduled_id, &uids).await;
+                            let arrived = uids.len() as u32;
                             if let Some(Err(e)) = cache_op(cache, {
                                 let scheduled_id = scheduled_id.clone();
                                 move |c| c.delete_messages(&scheduled_id, &uids)
@@ -1737,6 +1739,9 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop woken messages from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &scheduled_id, events).await;
+                            if apply_move_unread_delta(&mut folders, &scheduled_id, Some(&inbox_id), info.unread, arrived) {
+                                publish_folders(&folders, &account_id, cache, events).await;
+                            }
                             refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
@@ -2615,8 +2620,8 @@ async fn connect_and_run(
                     }
                     match move_message_to_role(&mut session, &folders, &account_id, &[uid], role, has_move, has_uidplus).await {
                         Ok((destination, moved)) => {
-                            let message_ids = cached_message_ids(cache, &mailbox, &[uid]).await;
-                            move_ledger.record(&mailbox, &destination, &[uid], &moved, &message_ids);
+                            let info = cached_move_info(cache, &mailbox, &[uid]).await;
+                            move_ledger.record(&mailbox, &destination, &[uid], &moved, &info.message_ids);
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
                             // The MOVE already succeeded server-side, so drop the
                             // message from the cache and republish the remaining
@@ -2639,6 +2644,9 @@ async fn connect_and_run(
                             let mut ids = vec![mailbox.clone()];
                             if let Some(dest) = folders.iter().find(|m| m.role == role) {
                                 ids.push(dest.id.clone());
+                            }
+                            if apply_move_unread_delta(&mut folders, &mailbox, Some(&destination), info.unread, info.unread) {
+                                publish_folders(&folders, &account_id, cache, events).await;
                             }
                             refresh_folders_targeted(
                                 &mut session,
@@ -2693,8 +2701,8 @@ async fn connect_and_run(
                     }
                     match move_message_to_role(&mut session, &folders, &account_id, &uids, role, has_move, has_uidplus).await {
                         Ok((destination, moved)) => {
-                            let message_ids = cached_message_ids(cache, &mailbox, &uids).await;
-                            move_ledger.record(&mailbox, &destination, &uids, &moved, &message_ids);
+                            let info = cached_move_info(cache, &mailbox, &uids).await;
+                            move_ledger.record(&mailbox, &destination, &uids, &moved, &info.message_ids);
                             let _ = events.send(AccountEvent::MessageMoved { role }).await;
                             if let Some(Err(e)) = cache_op(cache, {
                                 let mailbox = mailbox.clone();
@@ -2709,6 +2717,9 @@ async fn connect_and_run(
                             let mut ids = vec![mailbox.clone()];
                             if let Some(dest) = folders.iter().find(|m| m.role == role) {
                                 ids.push(dest.id.clone());
+                            }
+                            if apply_move_unread_delta(&mut folders, &mailbox, Some(&destination), info.unread, info.unread) {
+                                publish_folders(&folders, &account_id, cache, events).await;
                             }
                             refresh_folders_targeted(
                                 &mut session,
@@ -2769,8 +2780,8 @@ async fn connect_and_run(
                     }
                     match move_uids_to_path(&mut session, &uids, &target_path, has_move, has_uidplus).await {
                         Ok(moved) => {
-                            let message_ids = cached_message_ids(cache, &mailbox, &uids).await;
-                            move_ledger.record(&mailbox, &target, &uids, &moved, &message_ids);
+                            let info = cached_move_info(cache, &mailbox, &uids).await;
+                            move_ledger.record(&mailbox, &target, &uids, &moved, &info.message_ids);
                             // `Custom` here is just a marker for the generic
                             // "Moved" toast - the target was an arbitrary
                             // folder, not a special-use role.
@@ -2785,6 +2796,9 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop moved messages from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                            if apply_move_unread_delta(&mut folders, &mailbox, Some(&target), info.unread, info.unread) {
+                                publish_folders(&folders, &account_id, cache, events).await;
+                            }
                             refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
@@ -2850,6 +2864,7 @@ async fn connect_and_run(
                     };
                     match reverted {
                         Ok((found, pairs)) => {
+                            let info = cached_move_info(cache, &moved_to, &found).await;
                             if let Some(Err(e)) = cache_op(cache, {
                                 let moved_to = moved_to.clone();
                                 move |c| c.delete_messages(&moved_to, &found)
@@ -2892,6 +2907,9 @@ async fn connect_and_run(
                                         tracing::warn!("failed to cache junk keyword removal: {e}");
                                     }
                                 }
+                            }
+                            if apply_move_unread_delta(&mut folders, &moved_to, Some(&moved_from), info.unread, info.unread) {
+                                publish_folders(&folders, &account_id, cache, events).await;
                             }
                             refresh_folders_targeted(
                                 &mut session,
@@ -2956,8 +2974,8 @@ async fn connect_and_run(
                     }
                     match copy_uids_to_path(&mut session, &uids, &target_path).await {
                         Ok(copied) => {
-                            let message_ids = cached_message_ids(cache, &mailbox, &uids).await;
-                            copy_ledger.record_above(&mailbox, &target, &uids, &copied, &message_ids, floor);
+                            let info = cached_move_info(cache, &mailbox, &uids).await;
+                            copy_ledger.record_above(&mailbox, &target, &uids, &copied, &info.message_ids, floor);
                             refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
@@ -3382,8 +3400,8 @@ async fn connect_and_run(
                                         Err(e) => tracing::warn!("couldn't tag messages for snooze, snoozing locally: {e}"),
                                         Ok(()) => match move_uids_to_path(&mut session, &uids, &scheduled_path, has_move, has_uidplus).await {
                                             Ok(moved) => {
-                                                let message_ids = cached_message_ids(cache, &mailbox, &uids).await;
-                                                move_ledger.record(&mailbox, &scheduled_id, &uids, &moved, &message_ids);
+                                                let info = cached_move_info(cache, &mailbox, &uids).await;
+                                                move_ledger.record(&mailbox, &scheduled_id, &uids, &moved, &info.message_ids);
                                                 if let Some(Err(e)) = cache_op(cache, {
                                                     let mailbox = mailbox.clone();
                                                     let uids = uids.clone();
@@ -3394,6 +3412,9 @@ async fn connect_and_run(
                                                     tracing::warn!("failed to drop snoozed messages from cache: {e}");
                                                 }
                                                 emit_cached_messages_after_removal(cache, &mailbox, events).await;
+                                                if apply_move_unread_delta(&mut folders, &mailbox, Some(&scheduled_id), info.unread, info.unread) {
+                                                    publish_folders(&folders, &account_id, cache, events).await;
+                                                }
                                                 refresh_folders_targeted(
                                                     &mut session,
                                                     &mut folders,
@@ -3472,6 +3493,7 @@ async fn connect_and_run(
                         store_raw_flags(&mut session, &found, &[], &keywords).await?;
                         match move_uids_to_path(&mut session, &found, &from_path, has_move, has_uidplus).await {
                             Ok(_) => {
+                                let info = cached_move_info(cache, &scheduled_id, &found).await;
                                 if let Some(Err(e)) = cache_op(cache, {
                                     let scheduled_id = scheduled_id.clone();
                                     move |c| c.delete_messages(&scheduled_id, &found)
@@ -3481,6 +3503,9 @@ async fn connect_and_run(
                                     tracing::warn!("failed to drop unsnoozed messages from cache: {e}");
                                 }
                                 emit_cached_messages_after_removal(cache, &scheduled_id, events).await;
+                                if apply_move_unread_delta(&mut folders, &scheduled_id, Some(&mailbox), info.unread, info.unread) {
+                                    publish_folders(&folders, &account_id, cache, events).await;
+                                }
                                 refresh_folders_targeted(
                                     &mut session,
                                     &mut folders,
@@ -3539,6 +3564,8 @@ async fn connect_and_run(
                     }
                     match wake_scheduled_uids(&mut session, &uids, &[], has_move, has_uidplus).await {
                         Ok(()) => {
+                            let info = cached_move_info(cache, &scheduled_id, &uids).await;
+                            let arrived = uids.len() as u32;
                             if let Some(Err(e)) = cache_op(cache, {
                                 let scheduled_id = scheduled_id.clone();
                                 move |c| c.delete_messages(&scheduled_id, &uids)
@@ -3548,6 +3575,9 @@ async fn connect_and_run(
                                 tracing::warn!("failed to drop woken messages from cache: {e}");
                             }
                             emit_cached_messages_after_removal(cache, &scheduled_id, events).await;
+                            if apply_move_unread_delta(&mut folders, &scheduled_id, Some(&inbox_id), info.unread, arrived) {
+                                publish_folders(&folders, &account_id, cache, events).await;
+                            }
                             refresh_folders_targeted(
                                 &mut session,
                                 &mut folders,
@@ -4794,9 +4824,18 @@ impl MoveLedger {
     }
 }
 
-/// The cached `Message-ID`s (bare) of `uids` in `mailbox`, read before a move
-/// drops them from the cache, for `MoveLedger`.
-async fn cached_message_ids(cache: &CacheHandle, mailbox: &MailboxId, uids: &[Uid]) -> HashMap<Uid, String> {
+/// What the move paths read from the cache before a move drops the messages:
+/// their bare `Message-ID`s (what `MoveLedger`'s undo lookup is keyed by) and
+/// how many of them were unread (what `apply_move_unread_delta` patches the
+/// folder list with).
+struct CachedMoveInfo {
+    message_ids: HashMap<Uid, String>,
+    unread: u32,
+}
+
+/// The cached `Message-ID`s (bare) of `uids` in `mailbox` plus their unread
+/// tally, read before a move drops them from the cache.
+async fn cached_move_info(cache: &CacheHandle, mailbox: &MailboxId, uids: &[Uid]) -> CachedMoveInfo {
     let summaries = cache_op(cache, {
         let mailbox = mailbox.clone();
         let uids = uids.to_vec();
@@ -4805,13 +4844,49 @@ async fn cached_message_ids(cache: &CacheHandle, mailbox: &MailboxId, uids: &[Ui
     .await
     .and_then(|r| r.ok())
     .unwrap_or_default();
-    summaries
-        .into_iter()
-        .filter_map(|(uid, summary)| {
-            let id = summary.message_id?.trim().trim_matches(|c| c == '<' || c == '>').to_string();
-            (!id.is_empty()).then_some((uid, id))
-        })
-        .collect()
+    let mut info = CachedMoveInfo {
+        message_ids: HashMap::new(),
+        unread: 0,
+    };
+    for (uid, summary) in summaries {
+        if summary.is_unread() {
+            info.unread += 1;
+        }
+        if let Some(id) = summary.message_id {
+            let id = id.trim().trim_matches(|c| c == '<' || c == '>').to_string();
+            if !id.is_empty() {
+                info.message_ids.insert(uid, id);
+            }
+        }
+    }
+    info
+}
+
+/// Patches the folder list's unread counts the moment a move succeeds, so the
+/// sidebar badges track the messages the user just watched leave (or arrive)
+/// instead of waiting out the STATUS round trips every move path runs next -
+/// the same best-effort contract as `StoreFlags`' patch above. The STATUS
+/// refresh that follows still overwrites this with the server's number, so a
+/// miscount (a concurrent arrival, a message the cache didn't have) costs a
+/// brief blink, never a stale count that sticks. `unread_before` is how many
+/// moved messages were unread in the source; `unread_arrived` how many land
+/// unread - the same number for a plain move, every message for
+/// `wake_scheduled_uids` (it strips `\Seen`, so read ones arrive unread too).
+/// Returns whether a count changed; the caller only publishes then.
+fn apply_move_unread_delta(folders: &mut [Mailbox], source: &MailboxId, dest: Option<&MailboxId>, unread_before: u32, unread_arrived: u32) -> bool {
+    let mut changed = false;
+    for folder in folders.iter_mut() {
+        if folder.id == *source {
+            let next = folder.unread.saturating_sub(unread_before);
+            changed |= next != folder.unread;
+            folder.unread = next;
+        } else if dest == Some(&folder.id) {
+            let next = folder.unread.saturating_add(unread_arrived);
+            changed |= next != folder.unread;
+            folder.unread = next;
+        }
+    }
+    changed
 }
 
 /// Finds, in the *currently selected* mailbox (`moved_to`), the messages
@@ -7673,6 +7748,117 @@ mod tests {
         let mut dirty = HashSet::new();
         assert!(!mark_count_changes(&previous, &listed, &inbox, &mut dirty));
         assert_eq!(dirty, HashSet::from([work]));
+    }
+
+    #[test]
+    fn move_unread_delta_shifts_both_ends_only_when_something_was_unread() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let trash = MailboxId::new(&account, "Trash");
+        let mut folders = vec![
+            mailbox(&account, "INBOX", MailboxRole::Inbox, 5),
+            mailbox(&account, "Trash", MailboxRole::Trash, 1),
+            mailbox(&account, "Archive", MailboxRole::Archive, 3),
+        ];
+        assert!(apply_move_unread_delta(&mut folders, &inbox, Some(&trash), 2, 2));
+        assert_eq!(folders[0].unread, 3, "the moved unread messages leave the source");
+        assert_eq!(folders[1].unread, 3, "and arrive at the destination");
+        assert_eq!(folders[2].unread, 3, "uninvolved folders keep their counts");
+
+        // A move of already-read messages changes no badge, so the caller
+        // publishes nothing for it.
+        assert!(!apply_move_unread_delta(&mut folders, &inbox, Some(&trash), 0, 0));
+        assert_eq!((folders[0].unread, folders[1].unread), (3, 3));
+    }
+
+    #[test]
+    fn move_unread_delta_saturates_and_tolerates_a_missing_destination() {
+        let account = AccountId("acc".into());
+        let inbox = MailboxId::new(&account, "INBOX");
+        let ghost = MailboxId::new(&account, "Ghost");
+        let mut folders = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 1)];
+        // The count can lag the cache (another device just read a message);
+        // the best-effort math must not wrap.
+        assert!(apply_move_unread_delta(&mut folders, &inbox, Some(&ghost), 3, 3));
+        assert_eq!(folders[0].unread, 0);
+        // Neither side present - a folder list that hasn't caught up yet -
+        // changes nothing, so nothing publishes.
+        assert!(!apply_move_unread_delta(&mut folders, &ghost, None, 1, 1));
+    }
+
+    #[test]
+    fn move_unread_delta_models_a_wake_arriving_all_unread() {
+        let account = AccountId("acc".into());
+        let scheduled = MailboxId::new(&account, "Scheduled");
+        let inbox = MailboxId::new(&account, "INBOX");
+        let mut folders = vec![mailbox(&account, "INBOX", MailboxRole::Inbox, 4), mailbox(&account, "Scheduled", MailboxRole::Custom, 3)];
+        // Waking strips \Seen: only the previously unread leave Scheduled,
+        // every woken message lands in the Inbox unread.
+        assert!(apply_move_unread_delta(&mut folders, &scheduled, Some(&inbox), 2, 5));
+        assert_eq!(folders[1].unread, 1);
+        assert_eq!(folders[0].unread, 9);
+    }
+
+    fn unread_summary(mailbox_id: &MailboxId, uid: u32, unread: bool) -> EmailSummary {
+        EmailSummary {
+            uid: Uid(uid),
+            mailbox: mailbox_id.clone(),
+            message_id: Some(format!("<{uid}@example.com>")),
+            in_reply_to: None,
+            references: Vec::new(),
+            thread_key: lookout_core::ThreadKey(String::new()),
+            subject: None,
+            from: Vec::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: chrono::Utc::now(),
+            flags: if unread {
+                std::collections::BTreeSet::new()
+            } else {
+                std::collections::BTreeSet::from([SystemFlagBit::Seen])
+            },
+            keywords: std::collections::BTreeSet::new(),
+            size: 0,
+            has_attachment: false,
+            has_calendar: false,
+            preview: None,
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
+            structure: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_move_info_counts_unread_and_bares_message_ids() {
+        let tag = uuid::Uuid::new_v4().to_string();
+        let account_id = AccountId(format!("/test/session_move_info_{tag}"));
+        let cache: CacheHandle = std::sync::Arc::new(Some(crate::cache::Cache::open(&account_id).unwrap()));
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let stored = cache_op(&cache, {
+            let mailbox_id = mailbox_id.clone();
+            let messages = vec![
+                unread_summary(&mailbox_id, 1, true),
+                unread_summary(&mailbox_id, 2, false),
+                unread_summary(&mailbox_id, 3, true),
+            ];
+            move |c| c.replace_messages(&mailbox_id, UidValidity(1), &messages)
+        })
+        .await;
+        assert!(matches!(stored, Some(Ok(()))));
+
+        let info = cached_move_info(&cache, &mailbox_id, &[Uid(1), Uid(2), Uid(3), Uid(9)]).await;
+        assert_eq!(info.unread, 2, "only the unread cached messages count");
+        assert_eq!(info.message_ids.get(&Uid(2)).map(String::as_str), Some("2@example.com"));
+        assert_eq!(info.message_ids.len(), 3, "an uncached uid contributes nothing");
+
+        if let Ok(entries) = std::fs::read_dir(crate::cache::cache_info().0) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().contains(&tag) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     #[test]
