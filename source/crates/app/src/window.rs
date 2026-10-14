@@ -11384,6 +11384,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
         });
     }
+    // --- Calendar event peek (UX-56): a single click on an event chip in the
+    // Month/Split grids shows a compact read-only card anchored to the chip,
+    // with Edit (the full editor), Delete and Join actions. A double-click
+    // still routes through `connect_event_activated` above.
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
+        calendar_view::connect_event_peeked(&calendar_main, move |occ, anchor| {
+            show_event_peek(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ, &anchor);
+        });
+    }
     // --- Calendar drag-reschedule: dropping an event chip at a new position
     // in the Day/Week/Work week or Month/Split grids persists the change
     // through the same route the editor's save uses (an etag-guarded
@@ -14686,6 +14701,51 @@ fn open_event_editor_for(
             }) as crate::event_editor::ForwardCallback)
         },
     );
+}
+
+/// Shows the Month/Split event peek card (UX-56) anchored to `anchor` (the
+/// clicked chip). Edit opens the full editor, Delete routes through the same
+/// invite-aware delete path the editor uses, and Join opens the meeting URL.
+/// Read-only (webcal) events get no Delete.
+#[allow(clippy::too_many_arguments)]
+fn show_event_peek(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    profile_card: &crate::profile_card::ContextProvider,
+    occ: &EventOccurrence,
+    anchor: &gtk::Widget,
+) {
+    let colors = calendar_state.borrow().calendar_colors.clone();
+    let read_only = calendar_state.borrow().is_read_only_calendar(&occ.calendar_id);
+    let on_edit: Rc<dyn Fn()> = {
+        let window = window.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card.clone();
+        let occ = occ.clone();
+        Rc::new(move || {
+            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
+        })
+    };
+    let on_delete: Option<Rc<dyn Fn()>> = (!read_only).then(|| {
+        let window = window.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let occ = occ.clone();
+        let callback: Rc<dyn Fn()> = Rc::new(move || {
+            delete_event_with_invites(&window, &state, &calendar_state, &toast_overlay, occ.calendar_id.clone(), occ.clone());
+        });
+        callback
+    });
+    let popover = calendar_view::build_event_peek(occ, &colors, on_edit, on_delete);
+    popover.set_parent(anchor);
+    popover.popup();
 }
 
 /// Opens the "New event" editor prefilled for `suggested_start` (and

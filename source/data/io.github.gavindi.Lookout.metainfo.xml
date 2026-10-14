@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.193" date="2026-10-15">
+      <description>
+        <p>Events in the month and split calendar views open again: a single click shows a quick peek card with the title, time, location, organizer and attendees plus Edit, Delete and Join actions, while a double-click opens the full event editor. Event chips also fill the width of their day cell once more.</p>
+      </description>
+    </release>
     <release version="0.9.192" date="2026-10-15">
       <description>
         <p>The event editor gains a Scheduling Assistant tab: invite attendees and see each person's free/busy against a time grid, with suggested times where nobody is booked. Availability is fetched from servers that support CalDAV scheduling, and your own calendar is always shown so suggested times work even without it.</p>

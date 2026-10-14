@@ -81,6 +81,9 @@ const CHIP_TEXT_BASELINE_OFFSET: f64 = 0.36;
 /// Pointer travel (pixels) before a press on an event chip becomes a drag
 /// rather than a click - the same jitter tolerance the slot selection uses.
 const DRAG_THRESHOLD: f64 = 8.0;
+/// How long a drag-free single click on a month chip waits before it is
+/// treated as a peek rather than the first half of a double-click (UX-56).
+const DOUBLE_CLICK_DELAY_MS: u64 = 250;
 /// Bottom-edge strip of a timed chip (pixels) that grabs a resize instead of
 /// a move.
 const RESIZE_GRAB_HEIGHT: f64 = 8.0;
@@ -97,6 +100,16 @@ type ActivateEvent = Rc<dyn Fn(EventOccurrence)>;
 /// render pass from `CalendarMain::connect_event_activated`, consumed by the
 /// widget's click handling.
 type PendingActivate = Rc<RefCell<Option<ActivateEvent>>>;
+
+/// A callback fired when the user single-clicks an event chip in the Month
+/// grid (UX-56), receiving the clicked occurrence and the chip widget it was
+/// clicked on (so the caller can anchor a peek popover to it). A double-click
+/// instead fires [`ActivateEvent`] and opens the full editor.
+type PeekEvent = Rc<dyn Fn(EventOccurrence, gtk::Widget)>;
+
+/// One entry in a month grid's pending peek callback: set by each
+/// `set_month_occurrences` render pass from `CalendarMain::connect_event_peeked`.
+type PendingPeek = Rc<RefCell<Option<PeekEvent>>>;
 
 /// A callback fired when the user activates a highlighted slot range in a
 /// Day/Week time grid (a click inside the selection), so the caller can open
@@ -181,6 +194,10 @@ struct MonthDrag {
     /// True once the pointer crossed the drag threshold (the press became a
     /// drag rather than a click).
     dragging: bool,
+    /// The `n_press` of the press that armed this drag (1 for a single click,
+    /// 2 for the second click of a double-click). Drives the peek-vs-editor
+    /// decision on a drag-free release (UX-56).
+    n_press: i32,
 }
 
 struct DayCell {
@@ -295,6 +312,10 @@ pub struct MonthGrid {
     day_cells: Vec<DayCell>,
     anchor_month: Rc<RefCell<NaiveDate>>,
     on_activate: PendingActivate,
+    /// The single-click peek callback, set by each `set_month_occurrences`
+    /// render pass (see [`connect_event_peeked`]); `on_activate` is the
+    /// double-click full-editor callback.
+    on_peek: PendingPeek,
     /// The drag-reschedule callback, set by each `set_month_occurrences`
     /// render pass (see [`connect_event_dragged`]).
     on_drag: PendingEventDrag,
@@ -348,6 +369,10 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
     let on_day_selected: DaySelectedCallbacks = Rc::new(RefCell::new(Vec::new()));
     let selected_day: Rc<RefCell<Option<NaiveDate>>> = Rc::new(RefCell::new(None));
     let on_day_activate: PendingDayActivate = Rc::new(RefCell::new(None));
+    // Chips register themselves here as they render (see
+    // `clickable_event_label`); the day-cell gesture below reads it to tell a
+    // chip click from a bare-cell click, so it's created before the loop.
+    let chip_events: Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>> = Rc::new(RefCell::new(HashMap::new()));
     for index in 0..42usize {
         let row = index / 7;
         let col = index % 7;
@@ -360,9 +385,9 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
         // Clicking a day cell selects it and re-anchors every view to that
         // date (the same action the sidebar mini-calendar's day buttons take);
         // clicking the already-selected cell again opens a new-event editor
-        // for that day. Clicks landing on an event chip are ignored here -
-        // the chip's own button handles them, so opening an editor never also
-        // jumps the anchor.
+        // for that day. Clicks landing on an event chip are ignored here - the
+        // month-grid gesture (see `attach_month_drag`) owns chip clicks and
+        // opens the peek/editor, so a chip click never also jumps the anchor.
         {
             let click_target = container.clone();
             let anchor_month = anchor_month.clone();
@@ -370,11 +395,12 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
             let on_day_selected = on_day_selected.clone();
             let selected_day = selected_day.clone();
             let on_day_activate = on_day_activate.clone();
+            let chip_events = chip_events.clone();
             let gesture = gtk::GestureClick::new();
             gesture.connect_pressed(move |_, _, x, y| {
                 let mut widget = click_target.pick(x, y, gtk::PickFlags::DEFAULT);
                 while let Some(current) = widget {
-                    if current.is::<gtk::Button>() {
+                    if chip_events.borrow().contains_key(&current) {
                         return;
                     }
                     widget = current.parent();
@@ -408,15 +434,16 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
 
     let on_activate: PendingActivate = Rc::new(RefCell::new(None));
     let month_drag: Rc<RefCell<Option<MonthDrag>>> = Rc::new(RefCell::new(None));
-    let chip_events: Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>> = Rc::new(RefCell::new(HashMap::new()));
     let on_drag: PendingEventDrag = Rc::new(RefCell::new(None));
-    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag, &week_start);
+    let on_peek: PendingPeek = Rc::new(RefCell::new(None));
+    attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag, &on_peek, &week_start);
 
     MonthGrid {
         root: root_box.upcast(),
         day_cells,
         anchor_month,
         on_activate,
+        on_peek,
         on_drag,
         month_drag,
         chip_events,
@@ -491,9 +518,11 @@ pub fn set_month_occurrences(
     colors: &HashMap<CalendarId, String>,
     on_activate: Option<ActivateEvent>,
     on_drag: Option<EventDrag>,
+    on_peek: Option<PeekEvent>,
 ) {
     *mg.on_activate.borrow_mut() = on_activate;
     *mg.on_drag.borrow_mut() = on_drag;
+    *mg.on_peek.borrow_mut() = on_peek;
     // A re-render rebuilds every chip, so any in-flight drag is stale.
     *mg.month_drag.borrow_mut() = None;
     mg.chip_events.borrow_mut().clear();
@@ -513,7 +542,8 @@ pub fn set_month_occurrences(
         let Some(day_occurrences) = by_date.get(&date) else { continue };
         for occ in &day_occurrences[..day_occurrences.len().min(MAX_VISIBLE_EVENTS_PER_DAY)] {
             let label = event_label(occ, colors);
-            if mg.on_activate.borrow().is_some() {
+            let interactive = mg.on_activate.borrow().is_some() || mg.on_peek.borrow().is_some() || mg.on_drag.borrow().is_some();
+            if interactive {
                 cell.events_box.append(&clickable_event_label(label, occ, mg));
             } else {
                 cell.events_box.append(&label);
@@ -604,15 +634,20 @@ fn cell_index_at_point(width: f64, height: f64, x: f64, y: f64) -> Option<usize>
     Some(row * 7 + col)
 }
 
-/// Attaches the month grid's chip-drag gesture: a press landing on a chip
-/// button (identified by its `lookout-occ` data) arms a potential drag, motion
+/// Attaches the month grid's chip gesture: a press landing on a chip
+/// (identified by its entry in `chip_events`) arms a potential drag, motion
 /// beyond [`DRAG_THRESHOLD`] turns it into a drag across day cells (the chip
 /// is live re-parented between cells as it moves, with the target cell
-/// highlighted), and a drag-free release activates the event. Only the
-/// grabbed chip follows the pointer live - the sibling chips of a multi-day
-/// event in other cells catch up when the resync after the drop lands.
-/// Coordinates stay grid-relative for the gesture's whole lifetime, so
-/// reparenting the chip never skews them.
+/// highlighted), and a drag-free release either peeks (single click, UX-56) or
+/// opens the editor (double click). Only the grabbed chip follows the pointer
+/// live - the sibling chips of a multi-day event in other cells catch up when
+/// the resync after the drop lands. Coordinates stay grid-relative for the
+/// gesture's whole lifetime, so reparenting the chip never skews them.
+///
+/// Single vs double click: the first drag-free release cannot know whether a
+/// second click is coming, so it schedules the peek after
+/// [`DOUBLE_CLICK_DELAY_MS`]; a second press cancels the timer and the second
+/// release opens the editor. A drag cancels the peek outright.
 #[allow(clippy::too_many_arguments)]
 fn attach_month_drag(
     grid: &gtk::Grid,
@@ -622,43 +657,55 @@ fn attach_month_drag(
     chip_events: &Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>>,
     on_activate: &PendingActivate,
     on_drag: &PendingEventDrag,
+    on_peek: &PendingPeek,
     week_start: &Rc<Cell<chrono::Weekday>>,
 ) {
     let gesture = gtk::GestureClick::new();
     let events_boxes: Vec<gtk::Box> = day_cells.iter().map(|c| c.events_box.clone()).collect();
     let containers: Vec<gtk::Box> = day_cells.iter().map(|c| c.container.clone()).collect();
+    // The queued single-click peek, if any (cancelled by a second press).
+    let pending_peek: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
     {
         let grid = grid.clone();
         let anchor_month = anchor_month.clone();
         let month_drag = month_drag.clone();
         let chip_events = chip_events.clone();
+        let pending_peek = pending_peek.clone();
         let week_start = week_start.clone();
-        gesture.connect_pressed(move |_, _, x, y| {
+        gesture.connect_pressed(move |_, n_press, x, y| {
+            // A second press means this is a double-click: cancel the peek the
+            // first release queued so the editor wins.
+            if n_press >= 2 {
+                if let Some(id) = pending_peek.borrow_mut().take() {
+                    id.remove();
+                }
+            }
             // Only presses that land on a chip arm the drag; the day cells'
             // own gestures handle everything else.
             let mut current = grid.pick(x, y, gtk::PickFlags::DEFAULT);
             let mut occ = None;
             while let Some(w) = current.as_ref() {
-                if w.is::<gtk::Button>() {
-                    occ = chip_events.borrow().get(w).cloned();
+                if let Some(found) = chip_events.borrow().get(w) {
+                    occ = Some(found.clone());
                     break;
                 }
                 current = w.parent();
             }
             let Some(occ) = occ else { return };
-            let Some(button) = current else { return };
+            let Some(chip) = current else { return };
             let Some(cell) = cell_index_at_point(grid.width() as f64, grid.height() as f64, x, y) else {
                 return;
             };
             let date = first_grid_day(*anchor_month.borrow(), week_start.get()) + chrono::Duration::days(cell as i64);
             *month_drag.borrow_mut() = Some(MonthDrag {
                 occ,
-                button,
+                button: chip,
                 from_date: date,
                 to_date: date,
                 px: x,
                 py: y,
                 dragging: false,
+                n_press,
             });
         });
     }
@@ -708,6 +755,8 @@ fn attach_month_drag(
         let month_drag = month_drag.clone();
         let on_activate = on_activate.clone();
         let on_drag = on_drag.clone();
+        let on_peek = on_peek.clone();
+        let pending_peek = pending_peek.clone();
         gesture.connect_released(move |_, _, _, _| {
             let drag = month_drag.borrow_mut().take();
             for container in &containers {
@@ -715,9 +764,31 @@ fn attach_month_drag(
             }
             let Some(d) = drag else { return };
             if !d.dragging {
-                if let Some(callback) = on_activate.borrow().as_ref() {
-                    callback(d.occ);
+                // A double-click opens the editor now; a single click is
+                // queued as a peek in case a second click follows.
+                if d.n_press >= 2 {
+                    if let Some(callback) = on_activate.borrow().as_ref() {
+                        callback(d.occ);
+                    }
+                    return;
                 }
+                let occ = d.occ.clone();
+                let anchor = d.button;
+                let on_peek = on_peek.clone();
+                let pending_peek_clear = pending_peek.clone();
+                let id = gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(DOUBLE_CLICK_DELAY_MS), move || {
+                    *pending_peek_clear.borrow_mut() = None;
+                    // A re-render (or a new month) may have dropped the chip
+                    // while the timer was pending; there's nothing to anchor to
+                    // then, so skip the peek.
+                    if anchor.parent().is_none() {
+                        return;
+                    }
+                    if let Some(callback) = on_peek.borrow().as_ref() {
+                        callback(occ, anchor);
+                    }
+                });
+                *pending_peek.borrow_mut() = Some(id);
                 return;
             }
             // A drop: shift the event by the day-cell delta (only the grabbed
@@ -733,33 +804,158 @@ fn attach_month_drag(
     grid.add_controller(gesture);
 }
 
-/// Wraps a month-grid event chip in a clickable button that fires
-/// `on_activate` with the occurrence - the month view's edit entry point.
-/// The button chrome is stripped by `.calendar-event-chip-button` so it still
-/// renders as the plain colored chip. When a drag callback is wired up, the
-/// button additionally hosts the drag state the grid-level gesture reads, and
-/// activation fires from that gesture's drag-free release instead of the
-/// button's `clicked` signal (so a drag never also opens the editor).
-fn clickable_event_label(label: gtk::Label, occ: &EventOccurrence, mg: &MonthGrid) -> gtk::Button {
-    let button = gtk::Button::builder()
-        .child(&label)
-        .css_classes(["flat", "calendar-event-chip-button"])
+/// Wraps a month-grid event chip's label in a plain clickable box and
+/// registers it (with its occurrence) in `chip_events` - the lookup the
+/// month-grid gesture uses to find what the pointer hit. The grid gesture
+/// (see `attach_month_drag`) owns press/click handling: a drag-free single
+/// click peeks, a double-click opens the editor, and a drag reschedules.
+///
+/// A `gtk::Box` rather than a `gtk::Button` on purpose: a button's own click
+/// gesture claims the pointer sequence, which starves the ancestor grid's
+/// gesture of the press/release events it needs (so nothing happened at all).
+/// A box has no competing gesture, so the grid gesture sees every click. The
+/// label itself paints the coloured chip; `.calendar-event-chip-button` keeps
+/// the old chrome-strip rule harmless.
+fn clickable_event_label(label: gtk::Label, occ: &EventOccurrence, mg: &MonthGrid) -> gtk::Widget {
+    let chip = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .css_classes(["calendar-event-chip-button", "calendar-event-chip"])
         .halign(gtk::Align::Fill)
         .build();
-    if mg.on_drag.borrow().is_some() {
-        // The grid-level drag gesture (see `attach_month_drag`) identifies
-        // this chip by its occurrence (looked up from `chip_events`); the
-        // activation also happens there, so a drag never also opens the
-        // editor.
-        mg.chip_events.borrow_mut().insert(button.clone().upcast(), occ.clone());
-        return button;
+    chip.set_cursor_from_name(Some("pointer"));
+    // The label's own background is the coloured chip, so it must fill the
+    // cell-wide chip box (a `gtk::Button` did this implicitly; a plain
+    // child of the horizontal box would otherwise stop at its text width).
+    label.set_hexpand(true);
+    label.set_halign(gtk::Align::Fill);
+    chip.append(&label);
+    mg.chip_events.borrow_mut().insert(chip.clone().upcast(), occ.clone());
+    chip.upcast()
+}
+
+/// The one-line "when" text for the event peek: "All day · Mon 12 Aug" for an
+/// all-day event, "Mon 12 Aug 2025 · 9:00am – 10:00am" within a day, or a
+/// cross-day range.
+fn peek_when_text(occ: &EventOccurrence) -> String {
+    let (start, end) = local_span(occ);
+    let start_date = start.date();
+    if occ.all_day {
+        let last = (end - chrono::Duration::days(1)).date().max(start_date);
+        return if last > start_date {
+            format!("All day · {} – {}", start_date.format("%a %d %b"), last.format("%a %d %b"))
+        } else {
+            format!("All day · {}", start_date.format("%a %d %b %Y"))
+        };
     }
-    let occ = occ.clone();
-    let on_activate = mg.on_activate.borrow().clone();
-    if let Some(on_activate) = on_activate {
-        button.connect_clicked(move |_| on_activate(occ.clone()));
+    if start.date() == end.date() {
+        format!("{} · {} – {}", start_date.format("%a %d %b %Y"), format_event_time(&start), format_event_time(&end))
+    } else {
+        format!("{} {} – {} {}", start.format("%a %d %b"), format_event_time(&start), end.format("%a %d %b"), format_event_time(&end))
     }
-    button
+}
+
+/// A wrapped, left-aligned detail line for the event peek.
+fn peek_detail(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["caption"])
+        .build()
+}
+
+/// Builds the Month/Split event peek popover (UX-56): a compact read-only card
+/// shown on a single chip click, with Edit/Delete/Join actions supplied by the
+/// caller. The caller parents it to the clicked chip and pops it up; every
+/// action pops it back down first.
+pub fn build_event_peek(
+    occ: &EventOccurrence,
+    colors: &HashMap<CalendarId, String>,
+    on_edit: Rc<dyn Fn()>,
+    on_delete: Option<Rc<dyn Fn()>>,
+) -> gtk::Popover {
+    let popover = gtk::Popover::builder().autohide(true).has_arrow(true).build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .width_request(320)
+        .build();
+
+    // Title, led by a dot in the owning calendar's colour.
+    let title_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or("#808080");
+    let swatch = gtk::Label::builder()
+        .label(format!("<span foreground=\"{}\" size=\"large\">●</span>", gtk::glib::markup_escape_text(color)))
+        .use_markup(true)
+        .valign(gtk::Align::Start)
+        .build();
+    let title = gtk::Label::builder()
+        .label(occ.summary.as_deref().unwrap_or("(untitled)"))
+        .css_classes(["title-4"])
+        .xalign(0.0)
+        .wrap(true)
+        .hexpand(true)
+        .build();
+    title_row.append(&swatch);
+    title_row.append(&title);
+    content.append(&title_row);
+
+    content.append(&peek_detail(&peek_when_text(occ)));
+    if occ.rrule.is_some() {
+        content.append(&peek_detail("Recurring event"));
+    }
+    if let Some(location) = occ.location.as_deref().filter(|l| !l.trim().is_empty()) {
+        content.append(&peek_detail(&format!("Where: {location}")));
+    }
+    if let Some(organizer) = &occ.organizer {
+        content.append(&peek_detail(&format!("Organizer: {}", organizer.display_label())));
+    }
+    let attendee_count = occ.attendees.len();
+    if attendee_count > 0 {
+        content.append(&peek_detail(&format!(
+            "{attendee_count} attendee{}",
+            if attendee_count == 1 { "" } else { "s" }
+        )));
+    }
+
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::End)
+        .margin_top(6)
+        .build();
+    let edit_button = gtk::Button::builder().label("Edit").css_classes(["suggested-action"]).build();
+    {
+        let popover = popover.clone();
+        edit_button.connect_clicked(move |_| {
+            popover.popdown();
+            on_edit();
+        });
+    }
+    buttons.append(&edit_button);
+    if let Some(url) = occ.conference_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        let join_button = gtk::LinkButton::builder().uri(url).label("Join").css_classes(["pill"]).build();
+        buttons.append(&join_button);
+    }
+    if let Some(on_delete) = on_delete {
+        let delete_button = gtk::Button::builder().label("Delete").css_classes(["destructive-action"]).build();
+        {
+            let popover = popover.clone();
+            delete_button.connect_clicked(move |_| {
+                popover.popdown();
+                on_delete();
+            });
+        }
+        buttons.append(&delete_button);
+    }
+    content.append(&buttons);
+
+    popover.set_child(Some(&content));
+    popover
 }
 
 /// One event rendered on a [`TimeGrid`] canvas: a rectangle whose horizontal
@@ -2451,6 +2647,9 @@ pub struct CalendarMain {
     /// The click-to-edit callback, handed to every sub-view by each render
     /// pass (see [`connect_event_activated`]).
     on_activate: PendingActivate,
+    /// The single-click peek callback (UX-56), handed to the Month/Split
+    /// grids by each render pass (see [`connect_event_peeked`]).
+    on_peek: PendingPeek,
     /// The click-a-time-slot-to-create callback, handed to every time grid by
     /// each render pass (see [`connect_slot_activated`]).
     on_slot_activate: PendingSlotActivate,
@@ -2562,6 +2761,7 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
         colors: Rc::new(RefCell::new(HashMap::new())),
         check_colors,
         on_activate: Rc::new(RefCell::new(None)),
+        on_peek: Rc::new(RefCell::new(None)),
         on_slot_activate: Rc::new(RefCell::new(None)),
         on_drag: Rc::new(RefCell::new(None)),
     };
@@ -2654,10 +2854,21 @@ pub fn set_calendar_colors(c: &CalendarMain, colors: &HashMap<CalendarId, String
 
 /// Registers `f` to run when the user activates (clicks) an event in any of
 /// the main panel's views - the month grid, the time grids, or the agenda -
-/// receiving the clicked occurrence so the caller can open its editor.
+/// receiving the clicked occurrence so the caller can open its editor. In the
+/// Month/Split grids a single click peeks instead (see
+/// [`connect_event_peeked`]); this fires on their double-click.
 /// One subscriber is expected (the window); a later registration replaces it.
 pub fn connect_event_activated(c: &CalendarMain, f: impl Fn(EventOccurrence) + 'static) {
     *c.on_activate.borrow_mut() = Some(Rc::new(f));
+}
+
+/// Registers `f` to run when the user single-clicks an event chip in the
+/// Month/Split grids (UX-56), receiving the clicked occurrence and the chip
+/// widget to anchor a peek popover to. A double-click fires
+/// [`connect_event_activated`] (the full editor) instead.
+/// One subscriber is expected (the window); a later registration replaces it.
+pub fn connect_event_peeked(c: &CalendarMain, f: impl Fn(EventOccurrence, gtk::Widget) + 'static) {
+    *c.on_peek.borrow_mut() = Some(Rc::new(f));
 }
 
 /// Registers `f` to run when the user drags an event chip to a new time in
@@ -2723,13 +2934,14 @@ fn refresh(c: &CalendarMain) {
     let occurrences = c.occurrences.borrow();
     let colors = c.colors.borrow();
     let on_activate = c.on_activate.borrow().clone();
+    let on_peek = c.on_peek.borrow().clone();
     let on_slot_activate = c.on_slot_activate.borrow().clone();
     let on_drag = c.on_drag.borrow().clone();
 
     set_month(&c.month, anchor);
-    set_month_occurrences(&c.month, &occurrences, &colors, on_activate.clone(), on_drag.clone());
+    set_month_occurrences(&c.month, &occurrences, &colors, on_activate.clone(), on_drag.clone(), on_peek.clone());
     set_month(&c.split.month, anchor);
-    set_month_occurrences(&c.split.month, &occurrences, &colors, on_activate.clone(), on_drag.clone());
+    set_month_occurrences(&c.split.month, &occurrences, &colors, on_activate.clone(), on_drag.clone(), on_peek);
 
     set_time_grid(&c.workweek, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone(), on_drag.clone());
     set_time_grid(&c.week, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone(), on_drag.clone());
@@ -3492,6 +3704,25 @@ mod tests {
             reminder_minutes_before: None,
             conference_url: None,
         }
+    }
+
+    /// UX-56: the peek's one-line "when" text - timed within a day, cross-day,
+    /// and the all-day single- and multi-day forms (all-day ends are
+    /// exclusive, so the displayed last day is one before `end`).
+    #[test]
+    fn peek_when_text_formats_timed_and_all_day_spans() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        let timed = occ("Standup", day.and_hms_opt(9, 0, 0).unwrap(), day.and_hms_opt(10, 0, 0).unwrap(), false);
+        assert_eq!(peek_when_text(&timed), "Thu 06 Aug 2026 · 9:00am – 10:00am");
+
+        let overnight = occ("Red-eye", day.and_hms_opt(23, 0, 0).unwrap(), (day + chrono::Duration::days(1)).and_hms_opt(2, 0, 0).unwrap(), false);
+        assert_eq!(peek_when_text(&overnight), "Thu 06 Aug 11:00pm – Fri 07 Aug 2:00am");
+
+        let all_day = occ("Holiday", day.and_hms_opt(0, 0, 0).unwrap(), (day + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap(), true);
+        assert_eq!(peek_when_text(&all_day), "All day · Thu 06 Aug 2026");
+
+        let multi = occ("Conference", day.and_hms_opt(0, 0, 0).unwrap(), (day + chrono::Duration::days(3)).and_hms_opt(0, 0, 0).unwrap(), true);
+        assert_eq!(peek_when_text(&multi), "All day · Thu 06 Aug – Sat 08 Aug");
     }
 
     #[test]
