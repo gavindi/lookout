@@ -127,12 +127,20 @@ impl GraphClient {
 
     /// Follows `@odata.nextLink` until the collection ends or `max_items` is
     /// reached, flattening every page's `value` array. This is the shape every
-    /// list endpoint (`/me/messages`, `/me/contacts`, …) uses.
+    /// list endpoint (`/me/messages`, `/me/contacts`, …) uses. A thin wrapper
+    /// over [`Self::get_all_with_headers`] with no extra headers.
     pub async fn get_all(&self, path: &str, max_items: usize) -> Result<Vec<Value>> {
+        self.get_all_with_headers(path, max_items, &[]).await
+    }
+
+    /// [`Self::get_all`] carrying extra request headers on every page - the
+    /// mail-property sync's `Prefer: IdType="ImmutableId"` (item 5.4), which
+    /// keeps a message's Graph id stable across folder moves.
+    pub async fn get_all_with_headers(&self, path: &str, max_items: usize, headers: &[(&str, &str)]) -> Result<Vec<Value>> {
         let mut items = Vec::new();
         let mut next = Some(self.absolute(path));
         while let Some(url) = next {
-            let page = self.get(&url).await?;
+            let page = self.get_with_headers(&url, headers).await?;
             for value in page_items(&page) {
                 items.push(value.clone());
                 if items.len() >= max_items {
@@ -147,13 +155,20 @@ impl GraphClient {
     /// Reads one `/delta` result: pass `None` (or a path) for the initial full
     /// read, or a previously returned [`DeltaPage::delta_link`] for an
     /// incremental one. Follows any `@odata.nextLink` pages internally and
-    /// returns the fresh delta cursor.
+    /// returns the fresh delta cursor. A thin wrapper over
+    /// [`Self::delta_with_headers`] with no extra headers.
     pub async fn delta(&self, path: &str, delta_link: Option<&str>) -> Result<DeltaPage> {
+        self.delta_with_headers(path, delta_link, &[]).await
+    }
+
+    /// [`Self::delta`] carrying extra request headers on every page - the
+    /// mail-property sync's `Prefer: IdType="ImmutableId"` (item 5.4).
+    pub async fn delta_with_headers(&self, path: &str, delta_link: Option<&str>, headers: &[(&str, &str)]) -> Result<DeltaPage> {
         let mut items = Vec::new();
         let mut next = Some(delta_link.map(str::to_string).unwrap_or_else(|| self.absolute(path)));
         let mut new_delta_link = None;
         while let Some(url) = next {
-            let page = self.get(&url).await?;
+            let page = self.get_with_headers(&url, headers).await?;
             items.extend(page_items(&page).iter().cloned());
             if let Some(link) = delta_link_of(&page) {
                 new_delta_link = Some(link.to_string());
@@ -480,6 +495,53 @@ mod tests {
 
         let page = client(&server).get_with_headers("users", &[("ConsistencyLevel", "eventual")]).await.unwrap();
         assert_eq!(page_items(&page).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_all_with_headers_sends_the_extra_header_on_every_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{"id": "1"}],
+                "@odata.nextLink": format!("{}/v1.0/messages-page-2", server.uri())
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/messages-page-2"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [{"id": "2"}] })))
+            .mount(&server)
+            .await;
+
+        let items = client(&server)
+            .get_all_with_headers("me/messages", 100, &[("Prefer", "IdType=\"ImmutableId\"")])
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delta_with_headers_sends_the_extra_header_and_returns_the_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages/delta"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{"id": "1"}],
+                "@odata.deltaLink": format!("{}/v1.0/delta-cursor", server.uri())
+            })))
+            .mount(&server)
+            .await;
+
+        let page = client(&server)
+            .delta_with_headers("me/messages/delta", None, &[("Prefer", "IdType=\"ImmutableId\"")])
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.delta_link.as_deref(), Some(format!("{}/v1.0/delta-cursor", server.uri()).as_str()));
     }
 
     #[tokio::test]

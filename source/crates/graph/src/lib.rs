@@ -20,6 +20,7 @@ pub mod calendar;
 pub mod client;
 pub mod contacts;
 pub mod error;
+pub mod mail;
 pub mod scopes;
 pub mod todo;
 
@@ -35,6 +36,11 @@ pub use client::{delta_link_of, next_link, page_items, retry_after, DeltaPage, G
 pub use contacts::client::ContactsClient;
 pub use contacts::{contact_folder_from_graph, contact_from_graph, contact_to_graph, person_from_graph, removed_id, user_from_graph, ContactFolder, DirectoryPerson, GraphContact};
 pub use error::{GraphError, Result};
+pub use mail::client::MailClient;
+pub use mail::{
+    categories_body, classification_body, flag_body, flag_from_graph, importance_body, message_id_filter, message_properties_from_graph, override_body, override_from_graph,
+    InferenceClassification, InferenceOverride, MessageDelta, MessageProperties,
+};
 pub use scopes::{
     GraphFeature, BASE_GRAPH_SCOPES, CALENDARS_READ_SHARED, CALENDARS_READ_WRITE, CALENDARS_READ_WRITE_SHARED, CONTACTS_READ_WRITE, MAILBOX_SETTINGS_READ_WRITE, MAIL_READ_WRITE,
     MAIL_READ_WRITE_SHARED, MAIL_SEND, PEOPLE_READ, PLACE_READ_ALL, TASKS_READ_WRITE, USER_READ_BASIC_ALL,
