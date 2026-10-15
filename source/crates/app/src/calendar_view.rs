@@ -905,30 +905,26 @@ fn peek_when_text(occ: &EventOccurrence) -> String {
     if start.date() == end.date() {
         format!("{} · {} – {}", start_date.format("%a %d %b %Y"), format_event_time(&start), format_event_time(&end))
     } else {
-        format!("{} {} – {} {}", start.format("%a %d %b"), format_event_time(&start), end.format("%a %d %b"), format_event_time(&end))
+        format!(
+            "{} {} – {} {}",
+            start.format("%a %d %b"),
+            format_event_time(&start),
+            end.format("%a %d %b"),
+            format_event_time(&end)
+        )
     }
 }
 
 /// A wrapped, left-aligned detail line for the event peek.
 fn peek_detail(text: &str) -> gtk::Label {
-    gtk::Label::builder()
-        .label(text)
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["caption"])
-        .build()
+    gtk::Label::builder().label(text).xalign(0.0).wrap(true).css_classes(["caption"]).build()
 }
 
 /// Builds the Month/Split event peek popover (UX-56): a compact read-only card
 /// shown on a single chip click, with Edit/Delete/Join actions supplied by the
 /// caller. The caller parents it to the clicked chip and pops it up; every
 /// action pops it back down first.
-pub fn build_event_peek(
-    occ: &EventOccurrence,
-    colors: &HashMap<CalendarId, String>,
-    on_edit: Rc<dyn Fn()>,
-    on_delete: Option<Rc<dyn Fn()>>,
-) -> gtk::Popover {
+pub fn build_event_peek(occ: &EventOccurrence, colors: &HashMap<CalendarId, String>, on_edit: Rc<dyn Fn()>, on_delete: Option<Rc<dyn Fn()>>) -> gtk::Popover {
     let popover = gtk::Popover::builder().autohide(true).has_arrow(true).build();
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -971,10 +967,7 @@ pub fn build_event_peek(
     }
     let attendee_count = occ.attendees.len();
     if attendee_count > 0 {
-        content.append(&peek_detail(&format!(
-            "{attendee_count} attendee{}",
-            if attendee_count == 1 { "" } else { "s" }
-        )));
+        content.append(&peek_detail(&format!("{attendee_count} attendee{}", if attendee_count == 1 { "" } else { "s" })));
     }
 
     let buttons = gtk::Box::builder()
@@ -4270,13 +4263,28 @@ mod tests {
         let timed = occ("Standup", day.and_hms_opt(9, 0, 0).unwrap(), day.and_hms_opt(10, 0, 0).unwrap(), false);
         assert_eq!(peek_when_text(&timed), "Thu 06 Aug 2026 · 9:00am – 10:00am");
 
-        let overnight = occ("Red-eye", day.and_hms_opt(23, 0, 0).unwrap(), (day + chrono::Duration::days(1)).and_hms_opt(2, 0, 0).unwrap(), false);
+        let overnight = occ(
+            "Red-eye",
+            day.and_hms_opt(23, 0, 0).unwrap(),
+            (day + chrono::Duration::days(1)).and_hms_opt(2, 0, 0).unwrap(),
+            false,
+        );
         assert_eq!(peek_when_text(&overnight), "Thu 06 Aug 11:00pm – Fri 07 Aug 2:00am");
 
-        let all_day = occ("Holiday", day.and_hms_opt(0, 0, 0).unwrap(), (day + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap(), true);
+        let all_day = occ(
+            "Holiday",
+            day.and_hms_opt(0, 0, 0).unwrap(),
+            (day + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap(),
+            true,
+        );
         assert_eq!(peek_when_text(&all_day), "All day · Thu 06 Aug 2026");
 
-        let multi = occ("Conference", day.and_hms_opt(0, 0, 0).unwrap(), (day + chrono::Duration::days(3)).and_hms_opt(0, 0, 0).unwrap(), true);
+        let multi = occ(
+            "Conference",
+            day.and_hms_opt(0, 0, 0).unwrap(),
+            (day + chrono::Duration::days(3)).and_hms_opt(0, 0, 0).unwrap(),
+            true,
+        );
         assert_eq!(peek_when_text(&multi), "All day · Thu 06 Aug – Sat 08 Aug");
     }
 
@@ -4980,7 +4988,12 @@ mod tests {
         assert_eq!(schedule_block_span(day, &all_day), Some((0, 1440)));
 
         // A cross-midnight event is clipped to the shown day.
-        let overnight = occ("Red-eye", (day - Duration::days(1)).and_hms_opt(22, 0, 0).unwrap(), day.and_hms_opt(2, 0, 0).unwrap(), false);
+        let overnight = occ(
+            "Red-eye",
+            (day - Duration::days(1)).and_hms_opt(22, 0, 0).unwrap(),
+            day.and_hms_opt(2, 0, 0).unwrap(),
+            false,
+        );
         assert_eq!(schedule_block_span(day, &overnight), Some((0, 2 * 60)));
 
         // An end at exactly midnight renders as the full last minute.
@@ -4988,7 +5001,12 @@ mod tests {
         assert_eq!(schedule_block_span(day, &to_midnight), Some((23 * 60, 1440)));
 
         // A next-day event does not belong to this day's lane.
-        let outside = occ("Later", (day + Duration::days(1)).and_hms_opt(1, 0, 0).unwrap(), (day + Duration::days(1)).and_hms_opt(2, 0, 0).unwrap(), false);
+        let outside = occ(
+            "Later",
+            (day + Duration::days(1)).and_hms_opt(1, 0, 0).unwrap(),
+            (day + Duration::days(1)).and_hms_opt(2, 0, 0).unwrap(),
+            false,
+        );
         assert_eq!(schedule_block_span(day, &outside), None);
     }
 

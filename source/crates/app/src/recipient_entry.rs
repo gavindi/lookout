@@ -1125,10 +1125,7 @@ mod tests {
             return;
         }
         let field = RecipientEntry::new("To");
-        field.append_suggestions(&[
-            Suggestion::Address(EmailAddress::new("ada@x.com")),
-            Suggestion::List(sample_list()),
-        ]);
+        field.append_suggestions(&[Suggestion::Address(EmailAddress::new("ada@x.com")), Suggestion::List(sample_list())]);
         assert_eq!(field.addresses(), vec!["ada@x.com", "kirk@x.com", "spock@x.com"]);
     }
 

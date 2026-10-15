@@ -52,9 +52,7 @@ impl Item {
     fn matches(&self, filter: &str) -> bool {
         filter.is_empty()
             || match self {
-                Item::Address(address) => {
-                    address.display_label().to_lowercase().contains(filter) || address.address.to_lowercase().contains(filter)
-                }
+                Item::Address(address) => address.display_label().to_lowercase().contains(filter) || address.address.to_lowercase().contains(filter),
                 Item::List(list) => list.name.to_lowercase().contains(filter),
             }
     }
@@ -174,11 +172,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, on
                     });
                 }
 
-                let name = gtk::Label::builder()
-                    .label(candidate.label())
-                    .xalign(0.0)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .build();
+                let name = gtk::Label::builder().label(candidate.label()).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
                 let text_box = gtk::Box::builder()
                     .orientation(gtk::Orientation::Vertical)
                     .spacing(2)

@@ -30,7 +30,7 @@ pub(crate) fn save_rules(state: &Rc<RefCell<UiState>>, rules: Vec<Rule>) {
     app_config.borrow_mut().rules = rules;
     crate::app_config::save(&app_config.borrow());
     // A changed rule set may alter what the server should run (item 2.5).
-    crate::window::push_sieve_rules(state);
+    crate::window::push_sieve_script(state);
 }
 
 /// The label for a rule's backend, as the manager shows it ("runs on").
@@ -268,7 +268,7 @@ pub(crate) fn show_manage_rules_dialog(anchor: &gtk::Widget, state: Rc<RefCell<U
                                 let app_config = state.borrow().app_config.clone();
                                 app_config.borrow_mut().move_rule(index, target as usize);
                                 crate::app_config::save(&app_config.borrow());
-                                crate::window::push_sieve_rules(&state);
+                                crate::window::push_sieve_script(&state);
                             }
                             (rebuild_handle.borrow())();
                         }
@@ -310,7 +310,7 @@ pub(crate) fn show_manage_rules_dialog(anchor: &gtk::Widget, state: Rc<RefCell<U
                         let app_config = state.borrow().app_config.clone();
                         app_config.borrow_mut().remove_rule(&id);
                         crate::app_config::save(&app_config.borrow());
-                        crate::window::push_sieve_rules(&state);
+                        crate::window::push_sieve_script(&state);
                         (rebuild_handle.borrow())();
                     }
                 });
@@ -558,7 +558,7 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
             let app_config = state.borrow().app_config.clone();
             app_config.borrow_mut().upsert_rule(saved);
             crate::app_config::save(&app_config.borrow());
-            crate::window::push_sieve_rules(&state);
+            crate::window::push_sieve_script(&state);
             on_saved();
             dialog.close();
         });

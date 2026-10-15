@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::PrefetchStarted { .. } | AccountEvent::PrefetchFinished { .. } => {}
                     AccountEvent::NewMessages { .. } => {}
                     AccountEvent::NewMailArrived { .. } => {}
-                    AccountEvent::SieveAdvertised(_) | AccountEvent::SieveScriptUpdated | AccountEvent::SieveFailed { .. } => {}
+                    AccountEvent::SieveAdvertised(_) | AccountEvent::SieveScriptUpdated | AccountEvent::SieveFailed { .. } | AccountEvent::SieveCapabilities { .. } => {}
                     AccountEvent::SearchResults { .. } => {}
                     AccountEvent::PartFetched { part, bytes, .. } => println!("part {} fetched ({} bytes)", part.part_number, bytes.len()),
                     AccountEvent::PartFetchFailed { part_number, message, .. } => println!("part {part_number} fetch failed: {message}"),

@@ -93,7 +93,10 @@ fn url_text_domain(text: &str) -> Option<String> {
 /// The host of an `http`/`https`/`ftp` URL: userinfo, port and path stripped.
 fn uri_host(uri: &str) -> Option<String> {
     let lower = uri.trim().to_ascii_lowercase();
-    let after_scheme = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")).or_else(|| lower.strip_prefix("ftp://"))?;
+    let after_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .or_else(|| lower.strip_prefix("ftp://"))?;
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or(authority); // drop userinfo
     let host = host.split(':').next().unwrap_or(host); // drop port

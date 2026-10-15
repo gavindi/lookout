@@ -98,7 +98,14 @@ mod tests {
     #[test]
     fn parses_a_graph_category() {
         let cat = category_from_graph(&json!({ "id": "c1", "displayName": "Work", "color": "preset7" })).unwrap();
-        assert_eq!(cat, GraphCategory { id: "c1".into(), name: "Work".into(), preset: 7 });
+        assert_eq!(
+            cat,
+            GraphCategory {
+                id: "c1".into(),
+                name: "Work".into(),
+                preset: 7
+            }
+        );
         // Missing colour defaults to the first preset; a missing id/name is None.
         let plain = category_from_graph(&json!({ "id": "c2", "displayName": "No colour" })).unwrap();
         assert_eq!(plain.preset, 0);

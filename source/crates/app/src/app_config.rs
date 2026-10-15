@@ -74,6 +74,17 @@ pub struct AccountSignatureDefaults {
     pub reply: Option<uuid::Uuid>,
 }
 
+/// One account's automatic replies (item 2.11 / M-24). This is the Sieve
+/// backend's source of truth: the settings dialog writes it and the Sieve push
+/// path recompiles the account's script from it. Microsoft 365 accounts are
+/// configured server-side through Graph; their fetched state lives in the UI
+/// instead of here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAutomaticReplies {
+    pub account_id: AccountId,
+    pub settings: lookout_core::AutomaticReplies,
+}
+
 /// The whole file's contents. All fields are additive: an older build's file
 /// (or a `{}` hand-edited file) deserializes into defaults for the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -109,6 +120,10 @@ pub struct AppConfig {
     /// deserializes (the struct has no container-level default).
     #[serde(default)]
     pub templates: Vec<lookout_core::MailTemplate>,
+    /// Per-account automatic replies (item 2.11 / M-24) for the Sieve backend.
+    /// Graph accounts keep theirs on the server, so they never appear here.
+    #[serde(default)]
+    pub automatic_replies: Vec<AccountAutomaticReplies>,
 }
 
 impl AppConfig {
@@ -188,6 +203,26 @@ impl AppConfig {
     /// Removes the rule with `id`, if any.
     pub fn remove_rule(&mut self, id: &str) {
         self.rules.retain(|r| r.id != id);
+    }
+
+    /// The automatic-replies settings configured for `account_id`, if any.
+    pub fn automatic_replies_for(&self, account_id: &AccountId) -> Option<lookout_core::AutomaticReplies> {
+        self.automatic_replies
+            .iter()
+            .find(|entry| &entry.account_id == account_id)
+            .map(|entry| entry.settings.clone())
+    }
+
+    /// Inserts `account_id`'s automatic replies, replacing any existing entry
+    /// (the edit path) or appending it (the first save). Turning replies off
+    /// stores a `Disabled` entry rather than deleting it, so the messages are
+    /// still there the next time they're switched on.
+    pub fn upsert_automatic_replies(&mut self, account_id: AccountId, settings: lookout_core::AutomaticReplies) {
+        if let Some(existing) = self.automatic_replies.iter_mut().find(|entry| entry.account_id == account_id) {
+            existing.settings = settings;
+        } else {
+            self.automatic_replies.push(AccountAutomaticReplies { account_id, settings });
+        }
     }
 
     /// Moves the rule at `from` to `to`, clamping both to the list's bounds -
@@ -331,6 +366,7 @@ mod tests {
             categories: Vec::new(),
             rules: Vec::new(),
             templates: Vec::new(),
+            automatic_replies: Vec::new(),
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -361,6 +397,7 @@ mod tests {
             categories: Vec::new(),
             rules: Vec::new(),
             templates: Vec::new(),
+            automatic_replies: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -510,6 +547,51 @@ mod tests {
 
         save_at(&path, &config);
         assert_eq!(load_at(&path).templates, vec![edited]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn automatic_replies_round_trip_upsert_and_remove() {
+        let dir = std::env::temp_dir().join(format!("lookout-auto-replies-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `automatic_replies` loads as an empty list.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        assert!(load_at(&path).automatic_replies.is_empty());
+
+        let account = AccountId("account_1".into());
+        let other = AccountId("account_2".into());
+        let away = lookout_core::AutomaticReplies {
+            status: lookout_core::AutomaticReplyStatus::AlwaysEnabled,
+            internal_message: "Away until Friday.".into(),
+            ..lookout_core::AutomaticReplies::default()
+        };
+        let mut config = AppConfig::default();
+        assert_eq!(config.automatic_replies_for(&account), None);
+        config.upsert_automatic_replies(account.clone(), away.clone());
+        assert_eq!(config.automatic_replies_for(&account), Some(away.clone()));
+
+        // Upsert replaces in place rather than appending a duplicate.
+        let mut edited = away.clone();
+        edited.internal_message = "Back Monday.".into();
+        config.upsert_automatic_replies(account.clone(), edited.clone());
+        assert_eq!(config.automatic_replies.len(), 1);
+        assert_eq!(config.automatic_replies_for(&account), Some(edited.clone()));
+
+        config.upsert_automatic_replies(other.clone(), lookout_core::AutomaticReplies::default());
+        save_at(&path, &config);
+        let loaded = load_at(&path);
+        assert_eq!(loaded.automatic_replies_for(&account), Some(edited));
+        assert_eq!(loaded.automatic_replies_for(&other), Some(lookout_core::AutomaticReplies::default()));
+        assert_eq!(loaded.automatic_replies_for(&AccountId("account_nope".into())), None);
+
+        // Turning replies off keeps the entry (messages are remembered).
+        let mut loaded = loaded;
+        loaded.upsert_automatic_replies(account.clone(), lookout_core::AutomaticReplies::default());
+        assert_eq!(loaded.automatic_replies_for(&account), Some(lookout_core::AutomaticReplies::default()));
+        assert_eq!(loaded.automatic_replies.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -5,6 +5,7 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+pub mod automatic_replies;
 pub mod calendar;
 pub mod calendar_protocol;
 pub mod email;
@@ -22,6 +23,7 @@ pub mod trust;
 pub mod tzmap;
 pub mod vcard;
 
+pub use automatic_replies::{AutomaticReplies, AutomaticRepliesError, AutomaticReplyStatus, ExternalAudience};
 pub use calendar::{
     Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, CalendarTask, EventOccurrence, EventSensitivity, EventTransparency, RecurrenceRange, ScheduleAgent,
     SchedulingInfo, TaskPriority, TaskStatus, WebcalSubscription,
@@ -35,6 +37,7 @@ pub use freebusy::{all_free, AttendeeAvailability, FreeBusyInterval, ScheduleSta
 pub use holidays::{holiday_countries, is_holiday_subscribed, HolidayCountry};
 pub use identity::Identity;
 pub use ids::{AccountId, CalendarId, EventUid, MailboxId, TaskUid, Uid, UidValidity};
+pub use interop::MentionMatcher;
 pub use interop::{
     auth_results_from_headers, disallow_counter, flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords,
     follow_up_headers, follow_up_keywords, graph_preset, importance_from_headers, importance_headers, is_flag_keyword, nearest_preset_for_rgb, preset_by_graph, preset_by_index,
@@ -46,7 +49,6 @@ pub use interop::{
     NOT_JUNK_KEYWORD, TNEF_CONTENT_TYPE,
 };
 pub use interop::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
-pub use interop::MentionMatcher;
 pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use rules::{Rule, RuleAction, RuleBackend, RuleCondition, RuleContext, RuleTarget, SizeComparison};
 pub use signature::Signature;

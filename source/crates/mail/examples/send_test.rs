@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::PrefetchStarted { .. } | AccountEvent::PrefetchFinished { .. } => {}
                     AccountEvent::NewMessages { .. } => {}
                     AccountEvent::NewMailArrived { .. } => {}
-                    AccountEvent::SieveAdvertised(_) | AccountEvent::SieveScriptUpdated | AccountEvent::SieveFailed { .. } => {}
+                    AccountEvent::SieveAdvertised(_) | AccountEvent::SieveScriptUpdated | AccountEvent::SieveFailed { .. } | AccountEvent::SieveCapabilities { .. } => {}
                     AccountEvent::BodyFetched { .. } => {}
                     AccountEvent::DraftSaved { .. } => {}
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}

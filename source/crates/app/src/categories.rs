@@ -50,7 +50,12 @@ pub struct CategoryDef {
 impl CategoryDef {
     /// A new category with no shortcut assigned.
     pub fn new(key: impl Into<String>, name: impl Into<String>, preset: u8) -> Self {
-        CategoryDef { key: key.into(), name: name.into(), preset, shortcut: None }
+        CategoryDef {
+            key: key.into(),
+            name: name.into(),
+            preset,
+            shortcut: None,
+        }
     }
 
     /// The preset data (name/Graph constant/RGB) for this category, falling

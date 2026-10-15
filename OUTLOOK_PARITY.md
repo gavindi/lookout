@@ -42,15 +42,15 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 29 | 5 | 10 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, `@mentions` detection with a filter, and rules across client, Graph and Sieve backends). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
+| Mail (5.1) | 30 | 5 | 9 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, `@mentions` detection with a filter, rules across client, Graph and Sieve backends, and automatic replies across Graph and Sieve). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 15 | 3 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
 | Calendar (5.3) | 23 | 8 | 4 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, the organizer's own cache as a fallback, or Graph `getSchedule` for Microsoft 365, 5.1) with Suggested times; the editor's room suggestions from Graph `places` remain to be wired. |
 | People (5.4) | 10 | 0 | 2 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). CSV import/export matches Outlook's format (4.5). No directory. |
 | Tasks (5.5) | 5 | 1 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
-| Accounts / Microsoft 365 (5.6) | 3 | 1 | 4 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar is now native via Graph** (5.1). No Graph contacts, To Do, auto-reply or Focused Inbox yet. |
+| Accounts / Microsoft 365 (5.6) | 3 | 1 | 4 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar is now native via Graph** (5.1). No Graph contacts, To Do or Focused Inbox yet. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **95** | **22** | **35** | **5** | ~60% at parity, ~15% partial |
+| **Total** | **96** | **22** | **34** | **5** | ~60% at parity, ~15% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -63,7 +63,7 @@ Counts are tallied from the §5 tables.
 7. **Calendar preferences**: week start, working hours, time zones (CAL-08…CAL-11).
 8. **Scheduling Assistant / free/busy** (CAL-19) — CalDAV RFC 6638 and a local fallback landed with 3.8, and Graph `getSchedule` with 5.1; room suggestions from Graph `places` remain to be wired into the editor.
 9. **Reopen drafts; forward with attachments** (C-12, C-13).
-10. **Automatic replies (Out of Office)** (M-24).
+10. ✅ ~~**Automatic replies (Out of Office)** (M-24) - done: a per-account Settings page (on/off, optional time range, messages) backed by Graph `automaticRepliesSetting` on Microsoft 365 or an RFC 5230 Sieve `vacation` block elsewhere, with an "Automatic replies are on" banner in Mail and a Turn off action.~~
 
 ### 2.3 UI/UX at a glance
 
@@ -256,7 +256,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-21 | Undo (move, delete, flag, archive) | "… / Undo" toast and Ctrl+Z for delete, archive, junk, drag-move, pin, read/unread, categorize and snooze; moves are reverted by `RevertMove` via the COPYUID map (or Message-ID) | ✅ | Follow-up flags are undone too (1.16) |
 | M-22 | Mark-as-read options | Setting: when selection changes (default), when opened, after N seconds, never | ✅ | — |
 | M-23 | Read receipts | Request toggle, banner, RFC 8098 MDN (`mail/src/send.rs`) | ✅ | Add "always / never / ask" policy |
-| M-24 | Automatic replies (OOF) | — | ❌ | Graph or Sieve vacation |
+| M-24 | Automatic replies (OOF) | Settings → Mail → "Automatic replies…": per-account on/off, an optional time period and the messages. Microsoft 365 via Graph `automaticRepliesSetting` (internal/external messages + audience); ManageSieve servers via an RFC 5230 `vacation` block merged into the account's **lookout** script (`:days 1`; scheduled with RFC 5260 `currentdate`), with a capability probe so unsupported servers or schedules degrade in the form; Sieve settings in `settings.json`; "Automatic replies are on (until …)" bar above the message list with Turn off | ✅ | — |
 | M-25 | @mentions | A message that mentions one of the user's identities (an `mailto:`/bare address token, or `@Name`) is flagged from its body snippet and marked with an `@` glyph in the list; the **Mentions me** filter and `is:mentions` search match it. Detection runs where the body is already parsed (the preview pass, new-message fetch, on-demand open) and the account's identity aliases count as "me" (`core/src/interop/mentions.rs`, `EmailSummary.mentions`, 2.13) | ✅ | Over IMAP, best-effort: unflagged until a body snippet is fetched (same window as previews) |
 | M-26 | Message recall | — | ⛔ | Exchange-internal only |
 | M-27 | Delivery receipts (DSN) | — | ❌ | §4.1 |
@@ -391,7 +391,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | A-03 | Microsoft 365 calendar | `lookout-graph`'s `calendar::session` actor (`calendarView` month sync, event CRUD, RRULE/Teams/RSVP/free-busy mapping) drives a Microsoft 365 account through the same contract as CalDAV; Graph access is opted into from Config (5.1) | ✅ | — |
 | A-04 | Microsoft 365 contacts | — | ❌ | Graph backend |
 | A-05 | Microsoft To Do | — | ❌ | Graph backend |
-| A-06 | Microsoft 365 mail | IMAP/SMTP with Lookout's own XOAUTH2 (`microsoft_oauth.rs`) | 🟡 | Graph-only mail features (categories, flags, Focused, rules, OOF) |
+| A-06 | Microsoft 365 mail | IMAP/SMTP with Lookout's own XOAUTH2 (`microsoft_oauth.rs`) | 🟡 | Remaining Graph-only mail features (Focused Inbox, server-side property sync) |
 | A-07 | Exchange on-premises (EWS) | — | ❌ | Deferred (§9) |
 | A-08 | POP3 | — | ❌ | Low priority; IMAP covers modern hosts |
 
@@ -640,7 +640,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 2.8 | Ignore / Clean up conversation | M-20 | Ignore: thread-ID list, client rule moves new arrivals to Deleted; "Ignore" in the context menu (`message_menu.rs`). Clean up: delete messages whose text is wholly quoted in a later message | M |
 | 2.9 | ✅ ~~Safe / blocked senders~~ | M-17 | Lists in `ui_state_db` (a `blocked_senders` table; the S-01 trusted senders are the safe list); the message menu's Block ▸ (Block sender / Block domain / Unblock sender) moves mail to Junk with `$Junk`; new arrivals from a blocked sender are junked by `rules::enforce_blocked_senders`, independent of the rules switch; Settings → Mail → Junk email manages both lists | S |
 | 2.10 | ✅ ~~My Templates~~ | C-17 | Stored HTML snippets (`AppConfig.templates`, `lookout_core::MailTemplate`); managed in Settings → Mail and inserted from the composer's **My Templates** menu | S |
-| 2.11 | Automatic replies | M-24 | Settings page: on/off, schedule, internal/external messages; Graph `automaticRepliesSetting` or Sieve `vacation`; banner in Mail while active | M |
+| 2.11 | ✅ ~~Automatic replies~~ | M-24 | Per-account Settings dialog (on/off, optional time period, messages): Microsoft 365 through Graph `automaticRepliesSetting` (internal/external + audience), other servers through an RFC 5230 `vacation` block merged into the account's Sieve script (capability-probed); "Automatic replies are on" banner in Mail with Turn off | M |
 | 2.12 | Focused Inbox | M-03 | Microsoft 365: read `inferenceClassification`, "Move to Focused/Other" writes overrides. Elsewhere, optional local classifier (sender seen in Sent/contacts = Focused; bulk/List-Id = Other). Tabs above the Inbox list | L |
 | 2.13 | ✅ ~~@mentions~~ | M-25 | Detect the user's address in body `mailto:` anchors / `@Name`; list glyph plus filter | S |
 

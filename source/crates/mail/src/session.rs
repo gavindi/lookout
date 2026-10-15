@@ -684,6 +684,14 @@ pub enum AccountCommand {
     PutSieveScript {
         script: String,
     },
+    /// Ask the account's ManageSieve server which extensions it advertises
+    /// (item 2.11). The automatic-replies settings page needs this before it
+    /// can offer settings: the `vacation` extension backs the feature at all,
+    /// and `date` + `relational` (RFC 5260 `currentdate`) back scheduling.
+    /// Best effort - the answer reports `reachable: false` when the Sieve port
+    /// can't be talked to, and nothing else happens (no toast: this is a
+    /// question, not an action).
+    FetchSieveCapabilities,
     Shutdown,
 }
 
@@ -958,6 +966,17 @@ pub enum AccountEvent {
     /// authentication the Sieve port wouldn't accept).
     SieveFailed {
         message: String,
+    },
+    /// The answer to `AccountCommand::FetchSieveCapabilities` (item 2.11):
+    /// whether the ManageSieve server was reachable at all, and which RFC 5230
+    /// `vacation` extensions it advertises. `vacation` gates the Sieve backend
+    /// for automatic replies; `date` + `relational` gate scheduled replies. A
+    /// false `reachable` leaves the other flags meaninglessly false.
+    SieveCapabilities {
+        reachable: bool,
+        vacation: bool,
+        date: bool,
+        relational: bool,
     },
     Error(String),
 }
@@ -2641,6 +2660,46 @@ async fn connect_and_run(
                         }
                         Err(e) => {
                             let _ = events.send(AccountEvent::SieveFailed { message: e }).await;
+                        }
+                    }
+                }
+                // ManageSieve capability probe for item 2.11 - the same
+                // detached-connection pattern as `PutSieveScript`, and always
+                // answered so the settings page can stop waiting.
+                AccountCommand::FetchSieveCapabilities => {
+                    let probe_config = config.clone();
+                    let probe_events = events.clone();
+                    match credentials.imap_credential().await {
+                        Ok(Credential::Password(password)) => {
+                            tokio::spawn(async move {
+                                let event = match fetch_sieve_capabilities(&probe_config.imap.host, &probe_config.imap.username, &password).await {
+                                    Ok(capabilities) => AccountEvent::SieveCapabilities {
+                                        reachable: true,
+                                        vacation: capabilities.has_extension("vacation"),
+                                        date: capabilities.has_extension("date"),
+                                        relational: capabilities.has_extension("relational"),
+                                    },
+                                    Err(_) => AccountEvent::SieveCapabilities {
+                                        reachable: false,
+                                        vacation: false,
+                                        date: false,
+                                        relational: false,
+                                    },
+                                };
+                                let _ = probe_events.send(event).await;
+                            });
+                        }
+                        // OAuth accounts can't authenticate over ManageSieve
+                        // (see `PutSieveScript`), so there's nothing to ask.
+                        Ok(Credential::OAuth2AccessToken(_)) | Err(_) => {
+                            let _ = events
+                                .send(AccountEvent::SieveCapabilities {
+                                    reachable: false,
+                                    vacation: false,
+                                    date: false,
+                                    relational: false,
+                                })
+                                .await;
                         }
                     }
                 }
@@ -5488,6 +5547,21 @@ async fn upload_sieve_script(host: &str, username: &str, password: &str, script:
     client.set_active(crate::sieve::SCRIPT_NAME).await?;
     let _ = client.logout().await;
     Ok(())
+}
+
+/// Asks the account's ManageSieve server which extensions it supports
+/// (item 2.11's capability probe), on the same STARTTLS-then-plain connection
+/// [`upload_sieve_script`] uses.
+async fn fetch_sieve_capabilities(host: &str, username: &str, password: &str) -> Result<crate::managesieve::SieveCapabilities> {
+    use crate::managesieve::{self, SieveSecurity};
+    let mut client = match managesieve::connect(host, managesieve::DEFAULT_PORT, SieveSecurity::StartTls).await {
+        Ok(client) => client,
+        Err(_) => managesieve::connect(host, managesieve::DEFAULT_PORT, SieveSecurity::Plain).await?,
+    };
+    client.authenticate_plain(username, password).await?;
+    let capabilities = client.capabilities().await?;
+    let _ = client.logout().await;
+    Ok(capabilities)
 }
 
 async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {

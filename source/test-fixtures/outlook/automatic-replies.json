@@ -1,0 +1,18 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('ada%40contoso.com')/mailboxSettings",
+  "timeZone": "W. Europe Standard Time",
+  "automaticRepliesSetting": {
+    "status": "scheduled",
+    "externalAudience": "contactsOnly",
+    "scheduledStartDateTime": {
+      "dateTime": "2026-10-19T09:00:00.0000000",
+      "timeZone": "W. Europe Standard Time"
+    },
+    "scheduledEndDateTime": {
+      "dateTime": "2026-10-23T17:00:00.0000000",
+      "timeZone": "W. Europe Standard Time"
+    },
+    "internalReplyMessage": "<html><body>I'm away until Friday.<br><br>Back Monday.</body></html>",
+    "externalReplyMessage": "<html><body>Out of office.</body></html>"
+  }
+}

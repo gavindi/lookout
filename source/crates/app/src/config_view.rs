@@ -305,6 +305,9 @@ pub struct ConfigView {
     /// "Rules…" row (Config → Mail), exposed so the caller can open the rules
     /// manager (item 2.5 / M-14).
     pub rules_row: adw::ActionRow,
+    /// "Automatic replies…" row (Config → Mail), exposed so the caller can
+    /// open the automatic-replies settings dialog (item 2.11 / M-24).
+    pub automatic_replies_row: adw::ActionRow,
     /// "New template…" row (Config → Mail → My Templates), exposed so the
     /// caller can open the template editor (item 2.10 / C-17).
     pub new_template_row: adw::ActionRow,
@@ -672,6 +675,12 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     mail_settings_group.add(&rules_row);
+    let automatic_replies_row = adw::ActionRow::builder()
+        .title("Automatic replies…")
+        .subtitle("Send out-of-office replies")
+        .activatable(true)
+        .build();
+    mail_settings_group.add(&automatic_replies_row);
     let rich_text_row = adw::SwitchRow::builder()
         .title("Rich text")
         .subtitle("Start new messages in the formatted editor")
@@ -1139,6 +1148,7 @@ pub fn build() -> ConfigView {
         blocked_senders_row,
         categories_row,
         rules_row,
+        automatic_replies_row,
         rich_text_row,
         spell_check_row,
         spell_languages_row,

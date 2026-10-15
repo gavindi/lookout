@@ -12,13 +12,19 @@
 //! or actions have no Sieve form (`[`crate::sieve::is_sieve_expressible`] is
 //! false) is skipped, with a comment in the script, so the rest still apply -
 //! the same "leave it as a client rule" behaviour the Graph backend uses.
+//!
+//! The same script also carries the account's automatic replies (roadmap item
+//! 2.11) as an RFC 5230 `vacation` block, since ManageSieve activates exactly
+//! one script: [`build_sieve_script`] merges the two, and the vacation block
+//! runs before the rules so a `stop;` rule can't suppress it.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::collections::BTreeSet;
 
 use lookout_core::{
-    sanitize_tag_key, tag_keyword, FlagStatus, Importance, Rule, RuleAction, RuleBackend, RuleCondition, RuleTarget, SizeComparison, FLAG_DONE_KEYWORD, FLAG_KEYWORD,
+    sanitize_tag_key, tag_keyword, AutomaticReplies, AutomaticReplyStatus, FlagStatus, Importance, Rule, RuleAction, RuleBackend, RuleCondition, RuleTarget, SizeComparison,
+    FLAG_DONE_KEYWORD, FLAG_KEYWORD,
 };
 
 /// The script name Lookout owns on the server. Its entries are wholly managed
@@ -180,12 +186,71 @@ fn rule_test(rule: &Rule) -> Option<String> {
     Some(combine(&conditions, false))
 }
 
-/// Compiles the enabled, `Sieve`-backend rules into one script. Rules Sieve
-/// can't express are skipped and named in a comment; the rest still apply.
-pub fn rules_to_sieve(rules: &[Rule]) -> String {
+/// The Sieve string for arbitrary text: a quoted string when it fits on one
+/// line, else an RFC 5228 multi-line `text:` literal (a quoted string can't
+/// contain a raw newline). `.`-stuffing is applied and CRLF endings emitted,
+/// and the content lines start at column 0 - leading whitespace would become
+/// part of the message.
+fn text_literal(value: &str) -> String {
+    if !value.contains(['\r', '\n']) {
+        return quoted(value);
+    }
+    let mut out = String::from("text:");
+    for line in value.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
+        out.push_str("\r\n");
+        if line.starts_with('.') {
+            out.push('.');
+        }
+        out.push_str(line);
+    }
+    out.push_str("\r\n.\r\n");
+    out
+}
+
+/// The Sieve block and required extensions for an account's automatic replies,
+/// or `None` when they're off (or a scheduled range is incomplete). The
+/// `vacation` action brings RFC 5230's own loop protection - it skips
+/// auto-submitted and bulk mail - and `:days 1` throttles replies to one per
+/// sender per day. No `:subject` is emitted: a fixed subject would lose the
+/// original one, and prefixing it needs the optional `variables` extension,
+/// so the server's own reply subject is used instead.
+fn vacation_to_sieve(vacation: &AutomaticReplies) -> Option<(String, Vec<&'static str>)> {
+    match vacation.status {
+        AutomaticReplyStatus::Disabled => None,
+        AutomaticReplyStatus::AlwaysEnabled => {
+            let message = text_literal(&vacation.internal_message);
+            Some((format!("# Automatic replies\nvacation :days 1 {message};"), vec!["vacation"]))
+        }
+        AutomaticReplyStatus::Scheduled => {
+            let (start, end) = (vacation.start?, vacation.end?);
+            if end <= start {
+                return None;
+            }
+            // The `date` extension's `currentdate` test; the `:value` form's
+            // relational matches need the `relational` extension.
+            let start = start.format("%Y-%m-%dT%H:%M:%SZ");
+            let end = end.format("%Y-%m-%dT%H:%M:%SZ");
+            let message = text_literal(&vacation.internal_message);
+            let block = format!(
+                "# Automatic replies until {end}\nif allof (currentdate :value \"ge\" \"iso8601\" \"{start}\",\n    currentdate :value \"le\" \"iso8601\" \"{end}\") {{\n    vacation :days 1 {message};\n}}"
+            );
+            Some((block, vec!["vacation", "date", "relational"]))
+        }
+    }
+}
+
+/// Compiles the enabled, `Sieve`-backend rules - plus the account's automatic
+/// replies, when configured - into one script. Rules Sieve can't express are
+/// skipped and named in a comment; the rest still apply.
+pub fn build_sieve_script(rules: &[Rule], vacation: Option<&AutomaticReplies>) -> String {
     let mut requirements: BTreeSet<&'static str> = BTreeSet::new();
     let mut blocks: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+
+    let vacation = vacation.and_then(vacation_to_sieve);
+    if let Some((_, vacation_requires)) = &vacation {
+        requirements.extend(vacation_requires.iter().copied());
+    }
 
     for rule in rules.iter().filter(|rule| rule.enabled && rule.backend == RuleBackend::Sieve) {
         if !is_sieve_expressible(rule) {
@@ -225,13 +290,20 @@ pub fn rules_to_sieve(rules: &[Rule]) -> String {
         blocks.push(format!("# {}\nif {} {{\n    {}\n}}", sanitize_comment(&rule.name), test, body));
     }
 
-    let mut script = String::from("# Rules generated by Lookout - do not edit by hand.\n");
+    let mut script = String::from("# Script generated by Lookout - do not edit by hand.\n");
     if !requirements.is_empty() {
         let list = requirements.iter().map(|name| quoted(name)).collect::<Vec<_>>().join(", ");
         script.push_str(&format!("require [{list}];\n"));
     }
+    if let Some((block, _)) = &vacation {
+        script.push('\n');
+        script.push_str(block);
+        script.push('\n');
+    }
     if blocks.is_empty() {
-        script.push_str("# No rules are set to run on the server.\n");
+        if vacation.is_none() {
+            script.push_str("# No rules are set to run on the server.\n");
+        }
     } else {
         script.push('\n');
         script.push_str(&blocks.join("\n\n"));
@@ -243,6 +315,11 @@ pub fn rules_to_sieve(rules: &[Rule]) -> String {
         script.push('\n');
     }
     script
+}
+
+/// [`build_sieve_script`] with no automatic replies (rule compilation alone).
+pub fn rules_to_sieve(rules: &[Rule]) -> String {
+    build_sieve_script(rules, None)
 }
 
 /// Strips anything that would break a Sieve comment (newlines).
@@ -346,5 +423,80 @@ mod tests {
         assert!(script.contains("fileinto :copy \"Projects\";"));
         assert!(script.contains("redirect \"team@example.com\";"));
         assert!(script.contains("header :contains \"List-Id\" \"list.example.com\""));
+    }
+
+    #[test]
+    fn always_on_vacation_compiles_to_a_vacation_action() {
+        let vacation = AutomaticReplies {
+            status: AutomaticReplyStatus::AlwaysEnabled,
+            internal_message: "Away until Friday.".into(),
+            ..AutomaticReplies::default()
+        };
+        let script = build_sieve_script(&[], Some(&vacation));
+        assert!(script.contains("require [\"vacation\"];"));
+        assert!(script.contains("vacation :days 1 \"Away until Friday.\";"));
+        assert!(script.contains("# Automatic replies"));
+        assert!(!script.contains("No rules are set to run on the server"));
+    }
+
+    #[test]
+    fn scheduled_vacation_guards_on_the_current_date() {
+        use chrono::{TimeZone, Utc};
+        let vacation = AutomaticReplies {
+            status: AutomaticReplyStatus::Scheduled,
+            start: Some(Utc.with_ymd_and_hms(2026, 10, 15, 9, 0, 0).unwrap()),
+            end: Some(Utc.with_ymd_and_hms(2026, 10, 20, 17, 0, 0).unwrap()),
+            internal_message: "Back next week.".into(),
+            ..AutomaticReplies::default()
+        };
+        let script = build_sieve_script(&[], Some(&vacation));
+        assert!(script.contains("require [\"date\", \"relational\", \"vacation\"];"));
+        assert!(script.contains("currentdate :value \"ge\" \"iso8601\" \"2026-10-15T09:00:00Z\""));
+        assert!(script.contains("currentdate :value \"le\" \"iso8601\" \"2026-10-20T17:00:00Z\""));
+        assert!(script.contains("vacation :days 1 \"Back next week.\";"));
+    }
+
+    #[test]
+    fn disabled_or_incomplete_vacation_emits_nothing() {
+        let disabled = AutomaticReplies::default();
+        let script = build_sieve_script(&[], Some(&disabled));
+        assert!(!script.contains("vacation"));
+        assert!(script.contains("No rules are set to run on the server"));
+
+        let incomplete = AutomaticReplies {
+            status: AutomaticReplyStatus::Scheduled,
+            ..AutomaticReplies::default()
+        };
+        assert!(!build_sieve_script(&[], Some(&incomplete)).contains("vacation"));
+    }
+
+    #[test]
+    fn multiline_vacation_message_becomes_a_text_literal() {
+        let vacation = AutomaticReplies {
+            status: AutomaticReplyStatus::AlwaysEnabled,
+            internal_message: "Out of office.\n\n--\nGavin\n.leading dot".into(),
+            ..AutomaticReplies::default()
+        };
+        let script = build_sieve_script(&[], Some(&vacation));
+        assert!(
+            script.contains("vacation :days 1 text:\r\nOut of office.\r\n\r\n--\r\nGavin\r\n..leading dot\r\n.\r\n;"),
+            "script:\n{script}"
+        );
+    }
+
+    #[test]
+    fn vacation_runs_before_the_rules() {
+        let mut rule = sieve_rule("Archive");
+        rule.conditions = vec![RuleCondition::From("news@example.com".into())];
+        rule.actions = vec![RuleAction::Move(RuleTarget::Folder("News".into())), RuleAction::StopProcessing];
+        let vacation = AutomaticReplies {
+            status: AutomaticReplyStatus::AlwaysEnabled,
+            internal_message: "Away".into(),
+            ..AutomaticReplies::default()
+        };
+        let script = build_sieve_script(&[rule], Some(&vacation));
+        let vacation_at = script.find("vacation :days 1").expect("vacation block");
+        let rule_at = script.find("# Archive").expect("rule block");
+        assert!(vacation_at < rule_at, "script:\n{script}");
     }
 }

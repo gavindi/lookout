@@ -104,6 +104,10 @@ pub(crate) struct AccountHandle {
     /// rules with Outlook's inbox `messageRules` (item 2.5), once Graph access
     /// is granted. See `graph_rules`.
     pub(crate) graph_rules: Option<Rc<crate::graph_rules::GraphRulesClient>>,
+    /// Present only for Microsoft 365 accounts: reads and writes the
+    /// mailbox's automatic replies (item 2.11 / M-24) through Graph, once the
+    /// account has granted Graph access. See `graph_automatic_replies`.
+    pub(crate) graph_automatic_replies: Option<Rc<crate::graph_automatic_replies::GraphAutomaticRepliesClient>>,
     /// Whether this account's server advertised ManageSieve at login (item
     /// 2.5), from `AccountEvent::SieveAdvertised`. Gates offering the Sieve
     /// backend for the account.
@@ -938,6 +942,26 @@ impl BodyCache {
     }
 }
 
+/// One account's ManageSieve capability answer (item 2.11 / M-24), from
+/// `AccountEvent::SieveCapabilities`. The `vacation` extension gates the Sieve
+/// backend for automatic replies at all; `date` + `relational` (RFC 5260
+/// `currentdate`) gate scheduled replies. A false `reachable` means the probe
+/// couldn't talk to the Sieve port, so nothing else is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SieveVacationSupport {
+    pub(crate) reachable: bool,
+    pub(crate) vacation: bool,
+    pub(crate) date: bool,
+    pub(crate) relational: bool,
+}
+
+impl SieveVacationSupport {
+    /// Whether the server can host scheduled replies (`currentdate`).
+    pub(crate) fn supports_scheduling(self) -> bool {
+        self.vacation && self.date && self.relational
+    }
+}
+
 /// A late-bound action on one message (`UiState::create_task_from_message`).
 type MessageActionFn = Rc<dyn Fn(&EmailSummary)>;
 
@@ -1164,6 +1188,21 @@ pub(crate) struct UiState {
     /// The "Scheduled messages" dialog and its row container, while open,
     /// so a fresh `OutboxContents` repaints it in place.
     outbox_dialog: Option<(adw::Dialog, gtk::Box)>,
+    /// Each account's ManageSieve capability answer (item 2.11 / M-24), from
+    /// `AccountEvent::SieveCapabilities`: what the Automatic replies dialog
+    /// can offer on a Sieve account.
+    pub(crate) sieve_support: HashMap<AccountId, SieveVacationSupport>,
+    /// Each Microsoft 365 account's automatic replies as last fetched from
+    /// Graph (item 2.11 / M-24). Sieve accounts read `app_config` instead;
+    /// the Mail banner merges both sources.
+    pub(crate) automatic_replies: HashMap<AccountId, lookout_core::AutomaticReplies>,
+    /// The "Automatic replies are on" banner above the message list (item
+    /// 2.11 / M-24). `None` only in tests.
+    automatic_replies_banner: Option<adw::Banner>,
+    /// The open Automatic replies dialog's repaint hook (item 2.11), while one
+    /// is open: a fresh Graph fetch or ManageSieve capability answer calls it
+    /// so the form reflects the new state.
+    pub(crate) automatic_replies_dialog_refresh: Option<Rc<dyn Fn()>>,
     /// A reopened draft's raw fetch in flight (item 1.12), waiting on
     /// `AccountEvent::RawMessageFetched` to build the composer prefill.
     /// Cleared on navigation and by whichever response lands, so a late
@@ -2779,6 +2818,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         outbox: HashMap::new(),
         outbox_banner: None,
         outbox_dialog: None,
+        sieve_support: HashMap::new(),
+        automatic_replies: HashMap::new(),
+        automatic_replies_banner: None,
+        automatic_replies_dialog_refresh: None,
         pending_draft_open: None,
         pending_forward_raw: None,
         unsubscribe_info: None,
@@ -4159,9 +4202,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     state.borrow_mut().outbox_banner = Some(outbox_banner.clone());
 
+    // The automatic-replies banner (item 2.11 / M-24): "Automatic replies are
+    // on …" above the list while any account has them active, with a Turn off
+    // action. Revealed by `refresh_automatic_replies_ui`.
+    let automatic_replies_banner = adw::Banner::new("");
+    automatic_replies_banner.set_button_label(Some("Turn off"));
+    automatic_replies_banner.set_revealed(false);
+    {
+        let state = state.clone();
+        automatic_replies_banner.connect_button_clicked(move |_| turn_off_automatic_replies(&state));
+    }
+    state.borrow_mut().automatic_replies_banner = Some(automatic_replies_banner.clone());
+
     let message_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_box.append(&message_header_row);
     message_box.append(&outbox_banner);
+    message_box.append(&automatic_replies_banner);
     message_box.append(&column_header_row);
     message_box.append(&search_refiner_row);
     message_box.append(&message_list_stack);
@@ -8485,6 +8541,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Automatic replies…": opens the per-account
+    // out-of-office settings (item 2.11 / M-24).
+    {
+        let state = state.clone();
+        let row = config_view.automatic_replies_row.clone();
+        row.clone().connect_activated(move |_| {
+            crate::automatic_replies_view::show_automatic_replies_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
+        });
+    }
+
     // Config → Mail → "Rich text": sets the default body mode for future
     // compose sessions. Read at composer-open time, so an already-open
     // composer is untouched.
@@ -10299,8 +10365,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             for account_id in &account_ids {
                 sync_follow_ups_from_graph(&state, account_id);
                 sync_and_push_rules_from_graph(&state, account_id);
+                sync_automatic_replies_from_graph(&state, account_id);
             }
-            push_sieve_rules(&state);
+            push_sieve_script(&state);
+            for handle in state.borrow().accounts.values().filter(|handle| handle.sieve_advertised) {
+                let _ = handle.cmd_tx.send_blocking(AccountCommand::FetchSieveCapabilities);
+            }
+            refresh_automatic_replies_ui(&state);
             for cmd_tx in state.borrow().contact_cmd_tx.values() {
                 let _ = cmd_tx.send_blocking(ContactCommand::Refresh);
             }
@@ -12319,6 +12390,7 @@ fn connect_account(
             graph_mail: is_microsoft_365.then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
             graph_categories: is_microsoft_365.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
             graph_rules: is_microsoft_365.then(|| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone()))),
+            graph_automatic_replies: is_microsoft_365.then(|| Rc::new(crate::graph_automatic_replies::GraphAutomaticRepliesClient::new(account_id.clone()))),
             sieve_advertised: false,
         },
     );
@@ -12340,6 +12412,11 @@ fn connect_account(
         let rules_state = state.clone();
         let rules_account = account_id.clone();
         glib::timeout_add_seconds_local_once(12, move || sync_and_push_rules_from_graph(&rules_state, &rules_account));
+        // Pull the mailbox's automatic replies (item 2.11 / M-24), after the
+        // rules, so the Mail banner can reveal on startup.
+        let replies_state = state.clone();
+        let replies_account = account_id.clone();
+        glib::timeout_add_seconds_local_once(13, move || sync_automatic_replies_from_graph(&replies_state, &replies_account));
     }
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
@@ -12781,16 +12858,49 @@ fn spawn_account_event_loop(
                         if let Some(handle) = state.borrow_mut().accounts.get_mut(&account_id) {
                             handle.sieve_advertised = advertised;
                         }
-                        // Push any Sieve rules now that the server is reachable.
                         if advertised {
-                            push_sieve_rules(&state);
+                            // Push any Sieve rules now that the server is
+                            // reachable, and ask which vacation extensions the
+                            // automatic-replies settings can rely on (item 2.11).
+                            push_sieve_script(&state);
+                            if let Some(handle) = state.borrow().accounts.get(&account_id) {
+                                let _ = handle.cmd_tx.send_blocking(AccountCommand::FetchSieveCapabilities);
+                            }
+                            // A Sieve account's automatic replies read from
+                            // `settings.json`, so the banner can settle now.
+                            refresh_automatic_replies_ui(&state);
                         }
                     }
                     AccountEvent::SieveScriptUpdated => {
-                        toast_overlay.add_toast(adw::Toast::new("Server rules updated"));
+                        toast_overlay.add_toast(adw::Toast::new("Server script updated"));
                     }
                     AccountEvent::SieveFailed { message } => {
-                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't update server rules: {message}"))));
+                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't update the server script: {message}"))));
+                    }
+                    AccountEvent::SieveCapabilities {
+                        reachable,
+                        vacation,
+                        date,
+                        relational,
+                    } => {
+                        // What the account's ManageSieve server can host for
+                        // automatic replies (item 2.11); the settings dialog
+                        // reads this to decide what to offer.
+                        state.borrow_mut().sieve_support.insert(
+                            account_id.clone(),
+                            SieveVacationSupport {
+                                reachable,
+                                vacation,
+                                date,
+                                relational,
+                            },
+                        );
+                        // An open Automatic replies dialog is waiting on the
+                        // answer: repaint it in place.
+                        let hook = state.borrow().automatic_replies_dialog_refresh.clone();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
                     }
                     AccountEvent::BodyFetched { mailbox, uid, body } => {
                         // A rules-engine evaluation (item 2.5 / M-14, A5b)
@@ -13465,6 +13575,7 @@ fn connect_other_account(
             graph_mail: None,
             graph_categories: None,
             graph_rules: None,
+            graph_automatic_replies: None,
             sieve_advertised: false,
         },
     );
@@ -14088,13 +14199,28 @@ impl CalendarUiState {
         let first = month.with_day(1).unwrap_or(month);
         let mut out: Vec<&EventOccurrence> = Vec::new();
         for handle in self.accounts.values() {
-            out.extend(month_occurrences_from(&handle.occurrences_by_month, handle.last_synced_month, &handle.last_occurrences, first));
+            out.extend(month_occurrences_from(
+                &handle.occurrences_by_month,
+                handle.last_synced_month,
+                &handle.last_occurrences,
+                first,
+            ));
         }
         for handle in self.webcal_handles.values() {
-            out.extend(month_occurrences_from(&handle.occurrences_by_month, handle.last_synced_month, &handle.last_occurrences, first));
+            out.extend(month_occurrences_from(
+                &handle.occurrences_by_month,
+                handle.last_synced_month,
+                &handle.last_occurrences,
+                first,
+            ));
         }
         if let Some(handle) = &self.birthdays {
-            out.extend(month_occurrences_from(&handle.occurrences_by_month, handle.last_synced_month, &handle.last_occurrences, first));
+            out.extend(month_occurrences_from(
+                &handle.occurrences_by_month,
+                handle.last_synced_month,
+                &handle.last_occurrences,
+                first,
+            ));
         }
         out.into_iter().filter(|occ| self.checked_calendar_ids.contains(&occ.calendar_id)).collect()
     }
@@ -16820,11 +16946,188 @@ fn sync_and_push_rules_from_graph(state: &Rc<RefCell<UiState>>, account_id: &Acc
     push_rules_to_graph(state);
 }
 
-/// Compiles the enabled `Sieve`-backend rules and uploads the script to every
-/// account whose server advertises ManageSieve (item 2.5). A rule with no
-/// account applies to every such server; a scoped rule only to its own. Best
+/// Pulls a Microsoft 365 account's automatic replies from Graph (item 2.11 /
+/// M-24) and repaints the Mail banner (and any open dialog) from the result.
+/// Silent on failure - the banner simply stays as it was; the settings dialog
+/// surfaces errors when it's open.
+pub(crate) fn sync_automatic_replies_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    let Some(client) = state.borrow().accounts.get(account_id).and_then(|handle| handle.graph_automatic_replies.clone()) else {
+        return;
+    };
+    if !client.consented() {
+        return;
+    }
+    let state = state.clone();
+    let account_id = account_id.clone();
+    glib::spawn_future_local(async move {
+        match client.get().await {
+            Ok(settings) => {
+                state.borrow_mut().automatic_replies.insert(account_id.clone(), settings);
+                refresh_automatic_replies_ui(&state);
+            }
+            Err(e) => tracing::warn!("couldn't read automatic replies for {account_id}: {e}"),
+        }
+    });
+}
+
+/// Runs the interactive Graph consent flow for an account that hasn't opted
+/// into Outlook sync yet (the Automatic replies dialog's "Enable Outlook
+/// sync" action, item 2.11), then fetches the mailbox's replies.
+pub(crate) fn enable_graph_automatic_replies(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    let Some(client) = state.borrow().accounts.get(account_id).and_then(|handle| handle.graph_automatic_replies.clone()) else {
+        return;
+    };
+    let state = state.clone();
+    let account_id = account_id.clone();
+    glib::spawn_future_local(async move {
+        match client.ensure_consent().await {
+            Ok(()) => {
+                toast(&state, "Outlook sync enabled");
+                // The same grant covers the other Graph features; sync the
+                // ones that need no extra widgets (flags, rules) and fetch
+                // the automatic replies the dialog is waiting on.
+                sync_follow_ups_from_graph(&state, &account_id);
+                sync_and_push_rules_from_graph(&state, &account_id);
+                sync_automatic_replies_from_graph(&state, &account_id);
+            }
+            Err(message) => toast(&state, &format!("Couldn't enable Outlook sync: {message}")),
+        }
+    });
+}
+
+/// Shows a toast through the shared overlay, best effort (absent in tests).
+pub(crate) fn toast(state: &Rc<RefCell<UiState>>, message: &str) {
+    let overlay = state.borrow().toast_overlay.clone();
+    if let Some(overlay) = overlay {
+        overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(message)));
+    }
+}
+
+/// The automatic-reply state that applies right now, per connected account:
+/// `(account_id, settings, graph client)`. Sieve accounts read their
+/// `settings.json` entry; Microsoft 365 accounts read the last Graph fetch.
+/// Accounts with replies off (or outside their schedule) are left out.
+fn active_automatic_replies(
+    state: &UiState,
+) -> Vec<(
+    AccountId,
+    lookout_core::AutomaticReplies,
+    Option<Rc<crate::graph_automatic_replies::GraphAutomaticRepliesClient>>,
+)> {
+    let now = chrono::Utc::now();
+    let mut active = Vec::new();
+    for (account_id, handle) in &state.accounts {
+        let (settings, graph) = match &handle.graph_automatic_replies {
+            Some(client) => (state.automatic_replies.get(account_id).cloned(), Some(client.clone())),
+            // Sieve accounts read their stored settings; one whose server no
+            // longer advertises ManageSieve isn't sending anything, so its
+            // (stale) entry is ignored.
+            None if handle.sieve_advertised => (state.app_config.borrow().automatic_replies_for(account_id), None),
+            None => (None, None),
+        };
+        if let Some(settings) = settings {
+            if settings.is_active_at(now) {
+                active.push((account_id.clone(), settings, graph));
+            }
+        }
+    }
+    active.sort_by(|a, b| a.0.cmp(&b.0));
+    active
+}
+
+/// The Mail banner's title (item 2.11), or `None` while no account has
+/// automatic replies active.
+fn automatic_replies_banner_text(state: &UiState) -> Option<String> {
+    let active = active_automatic_replies(state);
+    match active.len() {
+        0 => None,
+        1 => {
+            let settings = &active[0].1;
+            match (settings.status, settings.end) {
+                (lookout_core::AutomaticReplyStatus::Scheduled, Some(end)) => Some(format!(
+                    "Automatic replies are on until {}",
+                    crate::datetime_picker::format_short_time(&end.with_timezone(&chrono::Local), &chrono::Local::now())
+                )),
+                _ => Some("Automatic replies are on".to_string()),
+            }
+        }
+        count => Some(format!("Automatic replies are on for {count} accounts")),
+    }
+}
+
+/// Reveals or hides the automatic-replies banner and repaints an open
+/// Automatic replies dialog (item 2.11).
+pub(crate) fn refresh_automatic_replies_ui(state: &Rc<RefCell<UiState>>) {
+    let (banner, title, dialog_refresh) = {
+        let st = state.borrow();
+        (
+            st.automatic_replies_banner.clone(),
+            automatic_replies_banner_text(&st),
+            st.automatic_replies_dialog_refresh.clone(),
+        )
+    };
+    if let Some(banner) = banner {
+        match title {
+            Some(title) => {
+                banner.set_title(&glib::markup_escape_text(&title));
+                banner.set_revealed(true);
+            }
+            None => banner.set_revealed(false),
+        }
+    }
+    if let Some(refresh) = dialog_refresh {
+        refresh();
+    }
+}
+
+/// The banner's "Turn off" action: disables automatic replies on every
+/// account currently active them - Graph via a PATCH, Sieve via
+/// `settings.json` plus a script re-push - and hides the banner.
+fn turn_off_automatic_replies(state: &Rc<RefCell<UiState>>) {
+    let active = active_automatic_replies(&state.borrow());
+    if active.is_empty() {
+        return;
+    }
+    let mut sieve_changed = false;
+    for (account_id, settings, graph) in active {
+        let disabled = lookout_core::AutomaticReplies {
+            status: lookout_core::AutomaticReplyStatus::Disabled,
+            ..settings
+        };
+        match graph {
+            Some(client) => {
+                let state = state.clone();
+                glib::spawn_future_local(async move {
+                    match client.set(&disabled).await {
+                        Ok(()) => {
+                            state.borrow_mut().automatic_replies.insert(account_id.clone(), disabled);
+                            refresh_automatic_replies_ui(&state);
+                        }
+                        Err(e) => toast(&state, &format!("Couldn't turn off automatic replies: {e}")),
+                    }
+                });
+            }
+            None => {
+                let app_config = state.borrow().app_config.clone();
+                app_config.borrow_mut().upsert_automatic_replies(account_id, disabled);
+                crate::app_config::save(&app_config.borrow());
+                sieve_changed = true;
+            }
+        }
+    }
+    if sieve_changed {
+        push_sieve_script(state);
+    }
+    refresh_automatic_replies_ui(state);
+    toast(state, "Automatic replies turned off");
+}
+
+/// Compiles each ManageSieve account's Sieve script - its enabled
+/// `Sieve`-backend rules plus its automatic replies (item 2.11 / M-24) - and
+/// uploads it (item 2.5). A rule with no account applies to every such server;
+/// a scoped rule and an account's automatic replies only to their own. Best
 /// effort: the session reports success or failure with a toast.
-pub(crate) fn push_sieve_rules(state: &Rc<RefCell<UiState>>) {
+pub(crate) fn push_sieve_script(state: &Rc<RefCell<UiState>>) {
     let targets: Vec<AccountId> = {
         let st = state.borrow();
         st.accounts
@@ -16836,14 +17139,19 @@ pub(crate) fn push_sieve_rules(state: &Rc<RefCell<UiState>>) {
     if targets.is_empty() {
         return;
     }
-    let rules = state.borrow().app_config.borrow().rules.clone();
+    let (rules, automatic_replies) = {
+        let st = state.borrow();
+        let app_config = st.app_config.borrow();
+        (app_config.rules.clone(), app_config.automatic_replies.clone())
+    };
     for account_id in targets {
         let scoped: Vec<lookout_core::Rule> = rules
             .iter()
             .filter(|rule| rule.account.as_ref().is_none_or(|account| account == &account_id))
             .cloned()
             .collect();
-        let script = lookout_mail::sieve::rules_to_sieve(&scoped);
+        let vacation = automatic_replies.iter().find(|entry| entry.account_id == account_id).map(|entry| entry.settings.clone());
+        let script = lookout_mail::sieve::build_sieve_script(&scoped, vacation.as_ref());
         if let Some(handle) = state.borrow().accounts.get(&account_id) {
             let _ = handle.cmd_tx.send_blocking(AccountCommand::PutSieveScript { script });
         }
@@ -19310,11 +19618,7 @@ fn build_more_menu(
         .build();
     // "Reply with meeting…" (item 3.19 / C-20): a new event prefilled with
     // the conversation's participants and subject.
-    let reply_meeting = gtk::Button::builder()
-        .label("Reply with meeting…")
-        .css_classes(["flat"])
-        .halign(gtk::Align::Start)
-        .build();
+    let reply_meeting = gtk::Button::builder().label("Reply with meeting…").css_classes(["flat"]).halign(gtk::Align::Start).build();
     reply_meeting.set_sensitive(has_selection);
     {
         let message_list = message_list.clone();
@@ -24252,11 +24556,13 @@ fn conflict_summary(conflicts: &[EventOccurrence]) -> Option<String> {
     let names: Vec<String> = conflicts
         .iter()
         .map(|occurrence| {
-            occurrence
-                .summary
-                .clone()
-                .filter(|summary| !summary.trim().is_empty())
-                .unwrap_or_else(|| if occurrence.all_day { "an all-day event".to_string() } else { "an event".to_string() })
+            occurrence.summary.clone().filter(|summary| !summary.trim().is_empty()).unwrap_or_else(|| {
+                if occurrence.all_day {
+                    "an all-day event".to_string()
+                } else {
+                    "an event".to_string()
+                }
+            })
         })
         .collect();
     Some(names.join(", "))
@@ -24700,10 +25006,7 @@ fn arm_attachment_batch_timeout(state: &Rc<RefCell<UiState>>, mailbox: &MailboxI
     glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
         let timed_out = {
             let mut st = timeout_state.borrow_mut();
-            let matches_batch = st
-                .pending_attachment_batch
-                .as_ref()
-                .is_some_and(|b| b.mailbox == timeout_mailbox && b.uid == uid);
+            let matches_batch = st.pending_attachment_batch.as_ref().is_some_and(|b| b.mailbox == timeout_mailbox && b.uid == uid);
             if matches_batch {
                 let is_forward = matches!(st.pending_attachment_batch.as_ref().map(|b| &b.action), Some(AttachmentBatchAction::Forward(_)));
                 st.pending_attachment_batch = None;
@@ -28761,6 +29064,7 @@ mod tests {
                         graph_mail: None,
                         graph_categories: None,
                         graph_rules: None,
+                        graph_automatic_replies: None,
                         sieve_advertised: false,
                     },
                 )
@@ -28810,6 +29114,10 @@ mod tests {
             outbox: HashMap::new(),
             outbox_banner: None,
             outbox_dialog: None,
+            sieve_support: HashMap::new(),
+            automatic_replies: HashMap::new(),
+            automatic_replies_banner: None,
+            automatic_replies_dialog_refresh: None,
             pending_draft_open: None,
             pending_forward_raw: None,
             unsubscribe_info: None,
