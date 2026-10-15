@@ -27,6 +27,8 @@ use crate::categories::CategoryDef;
 /// keys on the `AccountId` string, so the prefix is just the marker the
 /// account management UI greps for.
 pub const OTHER_ACCOUNT_ID_PREFIX: &str = "other:";
+/// The id prefix for shared mailboxes added by address (item 5.6 / M-42).
+pub const SHARED_MAILBOX_ID_PREFIX: &str = "shared:";
 /// The id prefix for shared/delegated calendars opened from another user's
 /// mailbox (item 5.6 / CAL-25).
 pub const SHARED_CALENDAR_ID_PREFIX: &str = "sharedcal:";
@@ -221,6 +223,12 @@ impl AppConfig {
     /// The persisted other account with `id`, if any.
     pub fn other_account(&self, id: &str) -> Option<OtherAccount> {
         self.other_accounts.iter().find(|a| a.id == id).cloned()
+    }
+
+    /// The parent Microsoft 365 account whose OAuth token a shared mailbox
+    /// borrows, when `id` names one (item 5.6 / M-42).
+    pub fn shared_mailbox_parent(&self, id: &AccountId) -> Option<AccountId> {
+        self.shared_mailboxes.iter().find(|m| m.id == id.0).map(|m| m.parent_account.clone())
     }
 
     /// Inserts `account`, replacing any existing entry with the same id
@@ -531,6 +539,39 @@ mod tests {
 
         // Other accounts' identities are never mixed in.
         assert!(config.identities_for(&other).iter().all(|i| i.email == "other@example.com"));
+    }
+
+    #[test]
+    fn shared_mailbox_parent_resolves_the_owning_account() {
+        let mut config = AppConfig::default();
+        config.shared_mailboxes.push(SharedMailbox {
+            id: format!("{SHARED_MAILBOX_ID_PREFIX}1"),
+            parent_account: AccountId("acct".into()),
+            address: "support@example.com".into(),
+            display_name: "Support".into(),
+            owner_id: None,
+        });
+        assert_eq!(
+            config.shared_mailbox_parent(&AccountId(format!("{SHARED_MAILBOX_ID_PREFIX}1"))),
+            Some(AccountId("acct".into()))
+        );
+        assert_eq!(config.shared_mailbox_parent(&AccountId("nope".into())), None);
+    }
+
+    #[test]
+    fn shared_calendars_round_trip_through_the_config_file() {
+        let mut config = AppConfig::default();
+        config.shared_calendars.push(SharedCalendar {
+            id: format!("{SHARED_CALENDAR_ID_PREFIX}1"),
+            parent_account: AccountId("acct".into()),
+            address: "ada@example.com".into(),
+            owner_id: "u2".into(),
+            calendar_id: "AAAACAL".into(),
+            display_name: "Ada's Calendar".into(),
+        });
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.shared_calendars, config.shared_calendars);
     }
 
     #[test]

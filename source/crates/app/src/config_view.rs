@@ -211,6 +211,9 @@ pub struct ConfigView {
     /// own manually-managed mail accounts (see `other_accounts.rs`), wired
     /// by the caller to the add-account dialog.
     pub add_imap_row: adw::ActionRow,
+    /// The "Add shared mailbox…" row (item 5.6 / M-42): opens the shared
+    /// mailbox manager.
+    pub add_shared_mailbox_row: adw::ActionRow,
     /// The GOA accounts enable/disable list, rebuilt by `refresh` like the
     /// mail/calendar groups.
     goa_group: adw::PreferencesGroup,
@@ -521,6 +524,12 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     accounts_group.add(&add_imap_row);
+    let add_shared_mailbox_row = adw::ActionRow::builder()
+        .title("Add shared mailbox…")
+        .subtitle("Another mailbox you have full access to on a Microsoft 365 account")
+        .activatable(true)
+        .build();
+    accounts_group.add(&add_shared_mailbox_row);
 
     // The user-authored signature list: the "New Signature…" button opens
     // the rich-text signature editor; saved signatures appear as rows below
@@ -1112,6 +1121,7 @@ pub fn build() -> ConfigView {
         section_names,
         add_account_row,
         add_imap_row,
+        add_shared_mailbox_row,
         goa_group,
         goa_rows: RefCell::new(Vec::new()),
         new_signature_row,

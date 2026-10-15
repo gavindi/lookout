@@ -122,6 +122,7 @@ pub(crate) fn spawn_account_discovery(
                     // cloning it per account reuses the one D-Bus connection
                     // rather than opening a redundant one each time.
                     for account in enabled_accounts {
+                        let parent_id = AccountId(account.account_id.0.clone());
                         connect_account(
                             worker.clone(),
                             state.clone(),
@@ -136,10 +137,32 @@ pub(crate) fn spawn_account_discovery(
                             app.clone(),
                             client.clone(),
                             list_header.clone(),
-                            account,
+                            account.clone(),
                             dashboard_refresh.clone(),
                             mark_read_button.clone(),
                             pin_button.clone(),
+                        );
+                        // Any shared mailboxes configured against this parent
+                        // (item 5.6 / M-42) connect alongside it.
+                        connect_shared_mailboxes(
+                            worker.clone(),
+                            state.clone(),
+                            folder_selection.clone(),
+                            folder_scroller.clone(),
+                            message_list.clone(),
+                            message_list_stack.clone(),
+                            message_header.clone(),
+                            reading_stack.clone(),
+                            toast_overlay.clone(),
+                            window.clone(),
+                            app.clone(),
+                            client.clone(),
+                            list_header.clone(),
+                            dashboard_refresh.clone(),
+                            mark_read_button.clone(),
+                            pin_button.clone(),
+                            &parent_id,
+                            &account,
                         );
                     }
                     refresh_config();
@@ -222,8 +245,17 @@ pub(crate) fn connect_account(
             username: account.smtp.username.clone(),
         },
     };
-    let is_microsoft_365 = account.is_microsoft_365();
-    let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = if is_microsoft_365 {
+    // A shared mailbox (item 5.6 / M-42) is an Exchange Online mailbox the
+    // user has Full Access to; it borrows the *parent* account's OAuth token
+    // (the SASL `user=` is the shared address, carried in the account config's
+    // username) instead of having a token of its own. Its own Graph property
+    // sync is skipped - only the parent account mirrors message properties.
+    let shared_parent = state.borrow().app_config.borrow().shared_mailbox_parent(&account_id);
+    let is_microsoft_365 = account.is_microsoft_365() || shared_parent.is_some();
+    let graph_own = is_microsoft_365 && shared_parent.is_none();
+    let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = if let Some(parent) = &shared_parent {
+        Rc::new(MicrosoftCredentialProvider::new(parent.clone()))
+    } else if is_microsoft_365 {
         // GOA's Microsoft 365 token carries only Microsoft Graph scopes and
         // can't authenticate to Exchange Online IMAP/SMTP (verified live), so
         // Microsoft accounts use Lookout's own OAuth2 flow instead - see
@@ -283,16 +315,16 @@ pub(crate) fn connect_account(
             address_cache: None,
             // Independent of the `credentials` provider constructed above -
             // see the field's own doc comment on `AccountHandle`.
-            graph_pin: is_microsoft_365.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
-            graph_mail: is_microsoft_365.then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
-            graph_categories: is_microsoft_365.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
-            graph_rules: is_microsoft_365.then(|| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone()))),
-            graph_automatic_replies: is_microsoft_365.then(|| Rc::new(crate::graph_automatic_replies::GraphAutomaticRepliesClient::new(account_id.clone()))),
+            graph_pin: graph_own.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
+            graph_mail: graph_own.then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
+            graph_categories: graph_own.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
+            graph_rules: graph_own.then(|| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone()))),
+            graph_automatic_replies: graph_own.then(|| Rc::new(crate::graph_automatic_replies::GraphAutomaticRepliesClient::new(account_id.clone()))),
             sieve_advertised: false,
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
-    if is_microsoft_365 {
+    if graph_own {
         // Read Outlook's per-message properties (categories, flags,
         // importance, Focused/Other) once the session has had a moment to open
         // its cache (item 5.4); `GRAPH_PROPERTY_RESYNC` and F5 keep them fresh.
@@ -1690,6 +1722,28 @@ pub(crate) fn connect_goa_account(
             mark_read_button.clone(),
             pin_button.clone(),
         );
+        // Shared mailboxes configured against this parent connect with it too
+        // (item 5.6 / M-42).
+        connect_shared_mailboxes(
+            worker.clone(),
+            state.clone(),
+            folder_selection.clone(),
+            folder_scroller.clone(),
+            message_list.clone(),
+            message_list_stack.clone(),
+            message_header.clone(),
+            reading_stack.clone(),
+            toast_overlay.clone(),
+            window.clone(),
+            app.clone(),
+            goa_client.clone(),
+            list_header.clone(),
+            dashboard_refresh.clone(),
+            mark_read_button.clone(),
+            pin_button.clone(),
+            &account_id,
+            mail,
+        );
         current_mail_page.set("mail");
         if mail_view_button.is_active() {
             root_stack.set_visible_child_name("mail");
@@ -2167,6 +2221,83 @@ pub(crate) fn connect_graph_todo_account(
             }
         }
     });
+}
+
+/// Connects every shared mailbox configured against `parent` (item 5.6 /
+/// M-42). A shared mailbox is a second Exchange Online mailbox the user has
+/// Full Access to, so it reuses the parent Microsoft 365 account's OAuth token
+/// and Exchange endpoints, authenticating with the shared address as the SASL
+/// user (`connect_account` picks the parent token up from the config). A no-op
+/// for a non-Microsoft parent or when none are configured, and skips a mailbox
+/// already connected.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn connect_shared_mailboxes(
+    worker: Rc<Worker>,
+    state: Rc<RefCell<UiState>>,
+    folder_selection: gtk::SingleSelection,
+    folder_scroller: gtk::ScrolledWindow,
+    message_list: MessageListModel,
+    message_list_stack: gtk::Stack,
+    message_header: crate::message_header::MessageHeader,
+    reading_stack: gtk::Stack,
+    toast_overlay: adw::ToastOverlay,
+    window: adw::ApplicationWindow,
+    app: adw::Application,
+    goa_client: GoaClient,
+    list_header: ListHeader,
+    dashboard_refresh: Rc<dyn Fn()>,
+    mark_read_button: gtk::Button,
+    pin_button: gtk::Button,
+    parent_id: &AccountId,
+    parent: &lookout_goa::GoaMailAccount,
+) {
+    if !parent.is_microsoft_365() {
+        return;
+    }
+    let shared = state
+        .borrow()
+        .app_config
+        .borrow()
+        .shared_mailboxes
+        .iter()
+        .filter(|mailbox| &mailbox.parent_account == parent_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for mailbox in shared {
+        let id = AccountId(mailbox.id.clone());
+        if state.borrow().accounts.contains_key(&id) {
+            continue;
+        }
+        let mut mail = parent.clone();
+        mail.account_id = id;
+        mail.email = mailbox.address.clone();
+        if !mailbox.display_name.trim().is_empty() {
+            mail.display_name = mailbox.display_name.clone();
+        }
+        // Exchange resolves the shared mailbox from the SASL user, with the
+        // delegate's (parent's) token proving Full Access (verify on-tenant).
+        mail.imap.username = mailbox.address.clone();
+        mail.smtp.username = mailbox.address.clone();
+        connect_account(
+            worker.clone(),
+            state.clone(),
+            folder_selection.clone(),
+            folder_scroller.clone(),
+            message_list.clone(),
+            message_list_stack.clone(),
+            message_header.clone(),
+            reading_stack.clone(),
+            toast_overlay.clone(),
+            window.clone(),
+            app.clone(),
+            goa_client.clone(),
+            list_header.clone(),
+            mail,
+            dashboard_refresh.clone(),
+            mark_read_button.clone(),
+            pin_button.clone(),
+        );
+    }
 }
 
 /// The Graph owner ids of the shared/delegated calendars configured for

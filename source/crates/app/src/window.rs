@@ -8043,6 +8043,98 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Accounts → "Add shared mailbox…" (item 5.6 / M-42): manage the
+    // shared mailboxes Lookout connects against a Microsoft 365 account.
+    {
+        let add_shared_mailbox_row = config_view.add_shared_mailbox_row.clone();
+        let worker = worker.clone();
+        let state = state.clone();
+        let window = window.clone();
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        let folder_selection = folder_selection.clone();
+        let folder_scroller = folder_scroller.clone();
+        let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
+        let message_header = message_header.clone();
+        let reading_stack = reading_stack.clone();
+        let list_header = list_header.clone();
+        let dashboard_refresh = dashboard_refresh.clone();
+        let mark_read_button = mark_read_button.clone();
+        let pin_button = pin_button.clone();
+        let refresh_hook = refresh_hook.clone();
+        add_shared_mailbox_row.connect_activated(move |row| {
+            let app_config = state.borrow().app_config.clone();
+            let parents: Vec<crate::shared_mailbox::SharedMailboxParent> = state
+                .borrow()
+                .goa_accounts
+                .values()
+                .filter_map(|discovered| {
+                    discovered
+                        .mail
+                        .as_ref()
+                        .filter(|mail| mail.is_microsoft_365())
+                        .map(|mail| crate::shared_mailbox::SharedMailboxParent {
+                            account_id: mail.account_id.clone(),
+                            label: format!("{} <{}>", discovered.display_name, discovered.email),
+                        })
+                })
+                .collect();
+            let on_changed = {
+                let state = state.clone();
+                let worker = worker.clone();
+                let window = window.clone();
+                let app = app.clone();
+                let toast_overlay = toast_overlay.clone();
+                let folder_selection = folder_selection.clone();
+                let folder_scroller = folder_scroller.clone();
+                let message_list = message_list.clone();
+                let message_list_stack = message_list_stack.clone();
+                let message_header = message_header.clone();
+                let reading_stack = reading_stack.clone();
+                let list_header = list_header.clone();
+                let dashboard_refresh = dashboard_refresh.clone();
+                let mark_read_button = mark_read_button.clone();
+                let pin_button = pin_button.clone();
+                let refresh_hook = refresh_hook.borrow().clone();
+                Rc::new(move || {
+                    let Some(goa_client) = state.borrow().goa_client.clone() else { return };
+                    let parents: Vec<(lookout_core::AccountId, lookout_goa::GoaMailAccount)> = state
+                        .borrow()
+                        .goa_accounts
+                        .values()
+                        .filter_map(|discovered| discovered.mail.clone().filter(lookout_goa::GoaMailAccount::is_microsoft_365))
+                        .map(|mail| (mail.account_id.clone(), mail))
+                        .collect();
+                    for (parent_id, parent) in parents {
+                        crate::window::connect::connect_shared_mailboxes(
+                            worker.clone(),
+                            state.clone(),
+                            folder_selection.clone(),
+                            folder_scroller.clone(),
+                            message_list.clone(),
+                            message_list_stack.clone(),
+                            message_header.clone(),
+                            reading_stack.clone(),
+                            toast_overlay.clone(),
+                            window.clone(),
+                            app.clone(),
+                            goa_client.clone(),
+                            list_header.clone(),
+                            dashboard_refresh.clone(),
+                            mark_read_button.clone(),
+                            pin_button.clone(),
+                            &parent_id,
+                            &parent,
+                        );
+                    }
+                    refresh_hook();
+                })
+            };
+            crate::shared_mailbox::show_manage_shared_mailboxes(row.upcast_ref::<gtk::Widget>(), app_config, parents, on_changed);
+        });
+    }
+
     // Config → Accounts → Signatures → "New Signature…": the rich-text
     // signature editor. Saving writes through to `app_config` and re-runs
     // this closure (via `refresh_hook`) so the list below the button

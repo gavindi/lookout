@@ -66,6 +66,7 @@ mod rules;
 mod rules_view;
 mod schedule_grid;
 mod settings;
+mod shared_mailbox;
 mod shortcuts;
 mod signatures;
 mod snooze;
