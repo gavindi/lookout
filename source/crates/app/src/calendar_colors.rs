@@ -19,6 +19,8 @@ use std::path::PathBuf;
 
 use lookout_core::{CalendarId, CalendarInfo};
 
+use crate::app_config::config_dir;
+
 pub type CalendarColorMap = HashMap<CalendarId, String>;
 
 /// Distinct, colourblind-friendly-ish accent colours (blue, red, green,
@@ -40,13 +42,6 @@ pub const CALENDAR_PALETTE: [&str; 10] = [
 /// The colour shown while a calendar is checked but hasn't been assigned one
 /// yet - a neutral grey, kept in sync with the app's dim-text tone.
 pub const DEFAULT_CHECK_COLOR: &str = "#9a9996";
-
-fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| std::env::var_os("USERPROFILE").unwrap_or_default());
-        PathBuf::from(home).join(".config")
-    })
-}
 
 /// `$XDG_CONFIG_HOME/lookout/calendar-colors.json` (or the equivalent
 /// `~/.config` path when `XDG_CONFIG_HOME` is unset).

@@ -31,13 +31,12 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use gtk::gio;
+use lookout_core::text::{base64url_encode, parse_query, percent_encode};
 use lookout_core::AccountId;
 use lookout_mail::session::CredentialProvider;
 use lookout_mail::Credential;
@@ -658,103 +657,9 @@ fn pkce_challenge(verifier: &str) -> String {
     base64url_encode(&Sha256::digest(verifier.as_bytes()))
 }
 
-fn base64url_encode(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// RFC 3986 unreserved characters pass through; everything else becomes
-/// `%XX`. Covers the space/slash/colon in the scope string.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// Decodes an `application/x-www-form-urlencoded` query value (`%XX` escapes
-/// and `+` as space).
-fn url_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                    out.push(h * 16 + l);
-                    i += 3;
-                } else {
-                    out.push(b'%');
-                    i += 1;
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn parse_query(query: &str) -> HashMap<String, String> {
-    query
-        .split('&')
-        .filter_map(|pair| {
-            let mut it = pair.splitn(2, '=');
-            let k = it.next()?;
-            let v = it.next().unwrap_or("");
-            Some((url_decode(k), url_decode(v)))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn percent_encode_keeps_unreserved_and_encodes_the_rest() {
-        assert_eq!(percent_encode("abc-_.~"), "abc-_.~");
-        assert_eq!(percent_encode("a b"), "a%20b");
-        assert_eq!(
-            percent_encode("https://outlook.office.com/IMAP.AccessAsUser.All"),
-            "https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All"
-        );
-    }
-
-    #[test]
-    fn url_decode_handles_percent_escapes_and_plus() {
-        assert_eq!(url_decode("a%20b+c"), "a b c");
-        assert_eq!(url_decode("%2F%3A%2F"), "/:/");
-        assert_eq!(url_decode("plain"), "plain");
-    }
-
-    #[test]
-    fn parse_query_extracts_and_decodes_pairs() {
-        let params = parse_query("code=abc%2B1&state=xyz&empty");
-        assert_eq!(params.get("code").map(String::as_str), Some("abc+1"));
-        assert_eq!(params.get("state").map(String::as_str), Some("xyz"));
-        assert_eq!(params.get("empty").map(String::as_str), Some(""));
-    }
 
     #[test]
     fn pkce_verifier_and_challenge_are_spec_shaped() {

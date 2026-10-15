@@ -17,19 +17,8 @@ use adw::prelude::*;
 use gtk::glib;
 use lookout_core::AccountId;
 
+use crate::util::account_label;
 use crate::window::UiState;
-
-/// A short account label for the section headers: the display name, the
-/// account's own address, or the bare account id - whichever is non-empty.
-fn account_label(account: &AccountId, display_name: &str, email: &str) -> String {
-    if !display_name.trim().is_empty() {
-        display_name.to_string()
-    } else if !email.trim().is_empty() {
-        email.to_string()
-    } else {
-        account.0.clone()
-    }
-}
 
 /// Presents the modal blocked-senders window, anchored to `anchor`'s window
 /// when one exists (tests have no window).

@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use lookout_core::text::percent_encode;
 use lookout_core::{AccountId, FlagStatus, FollowUpFlag};
 use lookout_graph::{GraphClient, GraphError};
 use serde_json::{json, Value};
@@ -147,20 +148,6 @@ pub fn flag_from_graph(value: &Value, zone: DisplayZone) -> Option<FollowUpFlag>
         due: (status == FlagStatus::Flagged).then(|| date("dueDateTime")).flatten(),
         completed: date("completedDateTime"),
     })
-}
-
-/// RFC 3986 unreserved characters pass through; everything else becomes
-/// `%XX` (as in `graph_pin`: the workspace's `reqwest` lacks `.query()`).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 #[cfg(test)]

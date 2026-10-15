@@ -22,6 +22,7 @@ use adw::prelude::*;
 use gtk::glib;
 use lookout_core::{EmailAddress, FollowUpFlag, Importance, MailboxRole, Rule, RuleAction, RuleBackend, RuleCondition, RuleTarget, SizeComparison};
 
+use crate::util::{clear_box, labeled_row};
 use crate::window::UiState;
 
 /// Persists a rule list into `settings.json` (`AppConfig::rules`).
@@ -568,13 +569,6 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
     dialog.present();
 }
 
-/// Removes every child of `container`.
-fn clear_box(container: &gtk::Box) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
-}
-
 /// A titled section around `content`.
 fn section(title: &str, content: &gtk::Box) -> gtk::Box {
     let outer = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
@@ -592,16 +586,6 @@ fn add_button(label: &str, on_click: impl Fn(&gtk::Button) + 'static) -> gtk::Bu
     button.add_css_class("dim-label");
     button.connect_clicked(move |button| on_click(button));
     button
-}
-
-/// A row with a leading label and a widget.
-fn labeled_row(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
-    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
-    let label = gtk::Label::builder().label(label).width_chars(9).halign(gtk::Align::Start).build();
-    widget.set_hexpand(true);
-    row.append(&label);
-    row.append(widget);
-    row
 }
 
 /// Writes `new` into the condition/exception at `index`.

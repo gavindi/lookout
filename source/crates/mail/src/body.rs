@@ -397,8 +397,6 @@ fn address_header_to_strings(value: &HeaderValue<'_>) -> Vec<String> {
 ///
 /// Returns a map from mail-parser's flat part index to the dotted path, e.g.
 /// `"2"` or `"1.3"`.
-//
-#[allow(dead_code)]
 fn part_paths(message: &Message<'_>) -> HashMap<u32, String> {
     fn walk(message: &Message<'_>, part_id: u32, prefix: &mut Vec<u32>, out: &mut HashMap<u32, String>) {
         let Some(part) = message.parts.get(part_id as usize) else { return };

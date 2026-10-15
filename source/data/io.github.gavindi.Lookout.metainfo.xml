@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.215" date="2026-10-15">
+      <description>
+        <p>Internal housekeeping: the main window's code was split into smaller modules and duplicated helpers were consolidated. No user-visible changes.</p>
+      </description>
+    </release>
     <release version="0.9.214" date="2026-10-15">
       <description>
         <p>Automatic replies (Out of Office) can now be set per account, and are sent by Microsoft 365 or your mail server even while Lookout is closed.</p>

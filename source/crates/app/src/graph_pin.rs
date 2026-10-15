@@ -26,14 +26,15 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use lookout_core::text::percent_encode;
 use lookout_core::AccountId;
+use lookout_graph::{GraphClient, GraphError};
+use serde_json::{json, Value};
 
-use crate::microsoft_oauth::{GraphAuthError, MicrosoftOAuth};
-
-const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
+use crate::microsoft_oauth::MicrosoftOAuth;
 
 /// The `PR_RENEW_TIME` sentinel Exchange itself uses for a pinned message -
 /// far enough in the future that date-sorted views always put it first.
@@ -55,20 +56,30 @@ pub enum GraphPinError {
     Http(String),
 }
 
+impl From<GraphError> for GraphPinError {
+    fn from(error: GraphError) -> Self {
+        match error {
+            GraphError::ConsentRequired(_) => GraphPinError::ConsentRequired,
+            other => GraphPinError::Http(other.to_string()),
+        }
+    }
+}
+
 /// One Microsoft 365 account's Graph pin-mirroring client. Cheap to
-/// construct - holds its own `reqwest::Client` and an independent
-/// `MicrosoftOAuth` (separate from the one driving the IMAP/SMTP session;
-/// both safely share the same on-disk token file via its atomic save).
+/// construct - holds a [`GraphClient`] over an independent `MicrosoftOAuth`
+/// (separate from the one driving the IMAP/SMTP session; both safely share
+/// the same on-disk token file via its atomic save).
 pub struct GraphPinClient {
-    oauth: Rc<MicrosoftOAuth>,
-    http: reqwest::Client,
+    oauth: Arc<MicrosoftOAuth>,
+    graph: GraphClient,
 }
 
 impl GraphPinClient {
     pub fn new(account_id: AccountId) -> Self {
+        let oauth = Arc::new(MicrosoftOAuth::new(account_id));
         GraphPinClient {
-            oauth: Rc::new(MicrosoftOAuth::new(account_id)),
-            http: reqwest::Client::new(),
+            graph: GraphClient::new(oauth.clone()),
+            oauth,
         }
     }
 
@@ -88,37 +99,19 @@ impl GraphPinClient {
     /// `original_date` is written back on unpin, matching Outlook's own
     /// "reset to the item's real date" unpin behavior.
     pub async fn set_pinned(&self, message_id: &str, original_date: DateTime<Utc>, pinned: bool) -> Result<(), GraphPinError> {
-        let token = self.oauth.graph_access_token().await.map_err(|e| match e {
-            GraphAuthError::ConsentRequired => GraphPinError::ConsentRequired,
-            GraphAuthError::Transient(msg) => GraphPinError::Http(msg),
-        })?;
-
-        let graph_id = self.resolve_message_id(&token, message_id).await?;
+        let graph_id = self.resolve_message_id(message_id).await?;
 
         let value = if pinned {
             FAR_FUTURE_RENEW_TIME.to_string()
         } else {
             original_date.to_rfc3339_opts(SecondsFormat::Secs, true)
         };
-        let body = serde_json::json!({
+        let body = json!({
             "singleValueExtendedProperties": [
                 { "id": "SystemTime 0x0F01", "value": value }
             ]
         });
-        let resp = self
-            .http
-            .patch(format!("{GRAPH_BASE}/me/messages/{graph_id}"))
-            .bearer_auth(&token)
-            .header("Content-Type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| GraphPinError::Http(format!("Graph pin update failed: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(GraphPinError::Http(format!("Graph returned {status}: {text}")));
-        }
+        self.graph.patch(&format!("me/messages/{graph_id}"), &body).await?;
         Ok(())
     }
 
@@ -126,68 +119,19 @@ impl GraphPinClient {
     /// the extended-property write. No extra IMAP round trip: the caller
     /// already has `EmailSummary::message_id` from the standard `ENVELOPE`
     /// fetch.
-    async fn resolve_message_id(&self, token: &str, message_id: &str) -> Result<String, GraphPinError> {
+    async fn resolve_message_id(&self, message_id: &str) -> Result<String, GraphPinError> {
         // OData string-literal escaping: only the quote character needs
         // doubling. The angle brackets, `@`, etc. that RFC 822 Message-IDs
-        // contain are fine inside a quoted literal; `reqwest`'s `.query()`
-        // percent-encodes the whole filter value for the URL.
+        // contain are fine inside a quoted literal; the whole filter value
+        // is percent-encoded for the URL.
         let escaped = message_id.replace('\'', "''");
-        let filter = format!("internetMessageId eq '{escaped}'");
-        let url = format!("{GRAPH_BASE}/me/messages?$filter={}&$select=id", percent_encode(&filter));
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| GraphPinError::Http(format!("Graph message lookup failed: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(GraphPinError::Http(format!("Graph returned {status}: {text}")));
-        }
-
-        #[derive(serde::Deserialize)]
-        struct Page {
-            value: Vec<IdOnly>,
-        }
-        #[derive(serde::Deserialize)]
-        struct IdOnly {
-            id: String,
-        }
-
-        let page: Page = resp
-            .json()
-            .await
-            .map_err(|e| GraphPinError::Http(format!("couldn't parse Graph message lookup response: {e}")))?;
-        page.value.into_iter().next().map(|m| m.id).ok_or(GraphPinError::MessageNotFound)
-    }
-}
-
-/// RFC 3986 unreserved characters pass through; everything else becomes
-/// `%XX`. Same convention as `microsoft_oauth.rs`/`google_tasks.rs` -
-/// `reqwest`'s own `.query()` needs the `query` Cargo feature this
-/// workspace's `reqwest` dependency doesn't enable, so query strings here are
-/// built by hand.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn percent_encode_keeps_unreserved_and_encodes_the_rest() {
-        assert_eq!(percent_encode("abc-_.~"), "abc-_.~");
-        assert_eq!(percent_encode("internetMessageId eq '<a@b>'"), "internetMessageId%20eq%20%27%3Ca%40b%3E%27");
+        let filter = percent_encode(&format!("internetMessageId eq '{escaped}'"));
+        let page = self.graph.get(&format!("me/messages?$filter={filter}&$select=id")).await?;
+        lookout_graph::page_items(&page)
+            .first()
+            .and_then(|message| message.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or(GraphPinError::MessageNotFound)
     }
 }

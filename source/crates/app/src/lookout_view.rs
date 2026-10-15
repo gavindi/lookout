@@ -21,6 +21,7 @@ use webkit::prelude::*;
 
 use crate::calendar_colors::{CalendarColorMap, DEFAULT_CHECK_COLOR};
 use crate::tasks_view::{self, ActivateHandler, TaskBucket, ToggleHandler};
+use crate::util::{clear_box, escape_attribute, escape_html};
 
 /// How many rows each dashboard section shows. `TOP_CONTACTS_LIMIT` is
 /// `pub(crate)` because the caller unions each account's top list and needs
@@ -467,12 +468,6 @@ fn draw_histogram(cr: &gtk::cairo::Context, width: f64, height: f64, histogram: 
         let x = pad_x + hour as f64 * (bar_width + gap) + (bar_width - advance) / 2.0;
         cr.move_to(x.max(0.0), height - pad_bottom + 12.0);
         let _ = cr.show_text(&text);
-    }
-}
-
-fn clear_box(box_: &gtk::Box) {
-    while let Some(child) = box_.first_child() {
-        box_.remove(&child);
     }
 }
 
@@ -937,26 +932,6 @@ fn bracket_paren(s: &str) -> Option<(&str, (&str, &str))> {
     }
     let end = after.find(')')?;
     Some((&s[..close], (&after[..end], &after[end + 1..])))
-}
-
-/// Escapes text for the document body: `&`, `<`, `>` only, so the renderer
-/// keeps its own tags while everything the reply said stays literal.
-fn escape_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-/// Escapes text for a quoted attribute value: `escape_html` plus quotes.
-fn escape_attribute(s: &str) -> String {
-    escape_html(s).replace('"', "&quot;")
 }
 
 #[cfg(test)]

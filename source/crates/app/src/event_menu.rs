@@ -116,15 +116,15 @@ fn show_as_submenu() -> MenuDescription {
 /// Duplicate, Copy to calendar…, Save as .ics… · Categorize ▸, Show as ▸,
 /// Private. Read-only feeds keep only Open and Save as .ics.
 pub fn event_menu_description(state: &EventMenuState) -> MenuDescription {
-    let mut menu = MenuDescription::new().section().action("Open", ns("open"));
+    let mut menu = MenuDescription::new().section().icon_action("Open", ns("open"), "document-open-symbolic");
     if !state.read_only {
         menu = menu
             .section()
-            .action("Delete", ns("delete"))
-            .action("Duplicate", ns("duplicate"))
-            .action("Copy to calendar…", ns("copy-calendar"));
+            .icon_action("Delete", ns("delete"), "user-trash-symbolic")
+            .icon_action("Duplicate", ns("duplicate"), "edit-copy-symbolic")
+            .icon_action("Copy to calendar…", ns("copy-calendar"), "x-office-calendar-symbolic");
     }
-    menu = menu.section().action("Save as .ics…", ns("save-ics"));
+    menu = menu.section().icon_action("Save as .ics…", ns("save-ics"), "document-save-symbolic");
     if !state.read_only {
         menu = menu
             .section()
@@ -133,7 +133,7 @@ pub fn event_menu_description(state: &EventMenuState) -> MenuDescription {
             // A single stateful item whose target is `true`: checked while the
             // event is Private, unchecked otherwise (the caller sets the state
             // from the event before popping the menu, and toggles on activate).
-            .action_with_target("Private", ns("private"), true.to_variant());
+            .icon_action_with_target("Private", ns("private"), true.to_variant(), "changes-prevent-symbolic");
     }
     menu
 }

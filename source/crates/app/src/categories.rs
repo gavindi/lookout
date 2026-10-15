@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use lookout_core::{nearest_preset_for_rgb, preset_by_index, CategoryPreset, OUTLOOK_CATEGORY_PRESETS};
 
+use crate::app_config::config_dir;
+
 /// The number of function keys classic Outlook binds category shortcuts to:
 /// `Ctrl+F2` … `Ctrl+F12` (11 keys).
 pub const SHORTCUT_KEYS: std::ops::RangeInclusive<u8> = 2..=12;
@@ -120,13 +122,6 @@ pub fn categories_for_keywords<'a>(categories: &'a CategorySet, keywords: &BTree
 /// round-robin, so a fresh list is colourful without the user choosing.
 pub fn default_preset(index: usize) -> u8 {
     (index % OUTLOOK_CATEGORY_PRESETS.len()) as u8
-}
-
-fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| std::env::var_os("USERPROFILE").unwrap_or_default());
-        PathBuf::from(home).join(".config")
-    })
 }
 
 /// `$XDG_CONFIG_HOME/lookout/tags.json` - the pre-2.1 tag file, read once for

@@ -611,7 +611,9 @@ visible window": the XDG Background portal (`org.freedesktop.portal.Background` 
 
 ### 8.2 `UiState` and `CalendarUiState` — the two central state structs
 
-`window.rs` (18,143 lines) holds two sibling per-domain state blobs rather than one giant struct.
+`window/state.rs` (the shell is split by concern: `window.rs` keeps `build_window` and the module
+tree, and the sibling `window/*` modules own the behaviour it wires up) holds two sibling
+per-domain state blobs rather than one giant struct.
 
 **`UiState`** (mail/reading-pane/session plumbing) groups roughly into:
 - **Account handles & discovery bookkeeping**: `accounts: HashMap<AccountId, AccountHandle>`
@@ -664,7 +666,7 @@ thread runs the actor and sends events over a **bounded** `async_channel`; the U
    then calling a targeted repaint helper (`rebuild_folder_tree`, `message_list.repopulate`,
    `dashboard_refresh()`, a toast on error) rather than redrawing the whole window.
 
-There are 35 `glib::spawn_future_local` call sites in `window.rs` — one per connected-account
+There are 35 `glib::spawn_future_local` call sites across the window shell (`window/*`) — one per connected-account
 event loop plus assorted one-shot async UI tasks. Command channels, in contrast, are unbounded
 and sent via `send_blocking` straight from the GTK thread.
 
@@ -842,16 +844,17 @@ keycode (layout-independent); `context_menu.rs` — the shared context-menu buil
 declarative `MenuDescription` compiled to a `gio::Menu` plus a `SimpleActionGroup` routed through
 one dispatch closure, used by `folder_menu.rs`, `message_menu.rs` and the event/contact menus to
 come; `message_menu.rs` — the message context menu (item 1.17): Outlook's entries and order, the
-enable rules (`message_menu_state`) and the item → `MessageMenuAction` mapping, with `window.rs`'s
-`open_message_menu`/`run_message_menu_action` running each action through the ribbon's helpers;
+enable rules (`message_menu_state`) and the item → `MessageMenuAction` mapping, with
+`window/mail_actions.rs`'s `open_message_menu`/`run_message_menu_action` running each action
+through the ribbon's helpers;
 `conversation_view.rs` (+ `conversation_view.js`) — the reading pane's conversation view (item
 1.7): a selected conversation header, or a message inside a conversation, shows every message as a
 card in one WebView, beside the single-message "message" page. Each body is a sandboxed `srcdoc`
 iframe carrying its sender's CSP; the only script is a trusted user script in its own world
 (markup JavaScript stays off), which sizes the frames, toggles cards and posts clicks to
-`window.rs`'s `handle_conversation_message`. `MessageListModel::reading_target` decides between the
+`window/conversation.rs`'s `handle_conversation_message`. `MessageListModel::reading_target` decides between the
 two pages, and `Cache::conversation_members_in` adds the user's replies from Sent Items.
-`window.rs`'s `UiState.undo_stack` holds the reversible-action
+`window/undo.rs` works `UiState.undo_stack`, which holds the reversible-action
 history (item 0.4): each destructive action records an `UndoEntry { id, description, inverse }`,
 shows a bottom-left toast whose Undo button reverses exactly that entry, and is also undoable with
 Ctrl+Z (`ACTION_UNDO`); entries expire with their toast and are capped by `MAX_UNDO_ENTRIES`.
@@ -947,10 +950,10 @@ more likely to get mangled by the model than a short delimited pair.
 
 | Task | Start here |
 |---|---|
-| Add an IMAP command/event | `crates/mail/src/session.rs` — extend `AccountCommand`/`AccountEvent`, dispatch in `connect_and_run`'s `match`, handle in `window.rs`'s account event loop |
+| Add an IMAP command/event | `crates/mail/src/session.rs` — extend `AccountCommand`/`AccountEvent`, dispatch in `connect_and_run`'s `match`, handle in `window/connect.rs`'s account event loop |
 | Add a CalDAV command/event | `crates/dav/src/session.rs`, same pattern via `CalendarCommand`/`CalendarSessionEvent` |
 | Add a cached field to a message | `crates/core/src/email.rs` (`EmailSummary`/`EmailBody`, remember `#[serde(default)]`), bump `ENVELOPE_CACHE_VERSION`/`BODY_CACHE_VERSION` in `crates/mail/src/cache.rs` if the shape changes incompatibly |
 | Add a Settings toggle | `crates/app/src/settings.rs` (GSettings key) + the app's `data/gschema/*.xml` + wire it into `config_view.rs`/`build_window` |
 | Add a UI-persisted (non-cache) preference | `crates/app/src/ui_state_db.rs` if it's per-item state, `app_config.rs` if it's structured config |
 | Add an AI assistant tool | `crates/app/src/assistant_tools.rs` — `tool_definitions()` + a branch in `execute_tool()`, keep it read-only over local caches |
-| Add a new pane/module to the shell | `crates/app/src/window.rs`'s `root_stack` + nav rail wiring, following the data-in/widget-out convention (`calendar_view.rs`/`folder_tree.rs`/`config_view.rs` are the cleanest examples) |
+| Add a new pane/module to the shell | `crates/app/src/window.rs`'s `build_window` (`root_stack` + nav rail wiring), following the data-in/widget-out convention (`calendar_view.rs`/`folder_tree.rs`/`config_view.rs` are the cleanest examples) |

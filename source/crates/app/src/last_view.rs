@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app_config::config_dir;
 use crate::settings::{LAST_VIEW_MAILBOX, LAST_VIEW_UNIFIED};
 
 /// The folder pane's last-selected view. `unified` marks the synthetic
@@ -26,13 +27,6 @@ use crate::settings::{LAST_VIEW_MAILBOX, LAST_VIEW_UNIFIED};
 pub struct LastSelection {
     pub unified: bool,
     pub mailbox: Option<String>,
-}
-
-fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| std::env::var_os("USERPROFILE").unwrap_or_default());
-        PathBuf::from(home).join(".config")
-    })
 }
 
 /// The pre-GSettings `last-view.json` file, consulted once by the migration

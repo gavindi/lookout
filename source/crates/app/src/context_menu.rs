@@ -70,8 +70,7 @@ impl MenuAction {
     }
 
     /// A themed icon shown before the label. Used by the message and event
-    /// menus (items 1.17/3.12); the folder menu has none, hence the allow.
-    #[allow(dead_code)]
+    /// menus (items 1.17/3.12); the folder menu keeps plain labels.
     pub fn icon(mut self, icon: impl Into<String>) -> Self {
         self.icon = Some(icon.into());
         self
@@ -126,6 +125,16 @@ impl MenuDescription {
 
     pub fn action(self, label: impl Into<String>, action: impl Into<String>) -> Self {
         self.item(MenuItem::Action(MenuAction::new(label, action)))
+    }
+
+    /// An action item carrying a themed icon before its label.
+    pub fn icon_action(self, label: impl Into<String>, action: impl Into<String>, icon: impl Into<String>) -> Self {
+        self.item(MenuItem::Action(MenuAction::new(label, action).icon(icon)))
+    }
+
+    /// [`MenuDescription::icon_action`] for a parameterised or stateful item.
+    pub fn icon_action_with_target(self, label: impl Into<String>, action: impl Into<String>, target: impl Into<glib::Variant>, icon: impl Into<String>) -> Self {
+        self.item(MenuItem::Action(MenuAction::new(label, action).target(target).icon(icon)))
     }
 
     /// An action item carrying a target value (a parameterised or radio item).

@@ -29,6 +29,7 @@ use chrono::{DateTime, NaiveDate, NaiveTime, Timelike, Utc};
 use gtk::glib;
 use lookout_core::{AccountId, AutomaticReplies, AutomaticReplyStatus, ExternalAudience};
 
+use crate::util::labeled_row;
 use crate::window::UiState;
 
 /// Where one connected account keeps its automatic replies.
@@ -614,16 +615,6 @@ fn set_label_if_needed(label: &gtk::Label, text: &str) {
     if label.label() != text {
         label.set_label(text);
     }
-}
-
-/// A row with a leading label and a widget (the rule editor's shape).
-fn labeled_row(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
-    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
-    let label = gtk::Label::builder().label(label).width_chars(9).halign(gtk::Align::Start).build();
-    widget.set_hexpand(true);
-    row.append(&label);
-    row.append(widget);
-    row
 }
 
 /// A labeled switch row.

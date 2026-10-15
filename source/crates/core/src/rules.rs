@@ -22,6 +22,7 @@ use chrono::{DateTime, Utc};
 use crate::email::{EmailAddress, EmailSummary};
 use crate::interop::{FollowUpFlag, Importance};
 use crate::mailbox::MailboxRole;
+use crate::text::human_size;
 
 /// Where a rule is executed (item 2.5). `Client` runs in `lookout-app` on new
 /// mail; `Sieve` is uploaded to a ManageSieve server (RFC 5804); `Graph` is
@@ -355,22 +356,6 @@ fn role_label(role: MailboxRole) -> &'static str {
 
 fn join_addresses(addresses: &[EmailAddress]) -> String {
     addresses.iter().map(|a| a.address.as_str()).collect::<Vec<_>>().join(", ")
-}
-
-/// A human-readable byte size ("2.0 MB") for the size condition's label.
-fn human_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]

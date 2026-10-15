@@ -14,6 +14,7 @@ use lookout_mail::{new_message_id, Attachment, ComposedMessage, InlineImage};
 use webkit::prelude::*;
 
 use crate::recipient_entry::{RecipientEntry, Suggestion, SuggestionSource};
+use crate::util::escape_html;
 
 /// How long the composer waits after the last check before autosaving the
 /// draft again. The autosave runs on a fixed tick and compares the current
@@ -511,24 +512,6 @@ fn with_identity_bcc(mut bcc: Vec<String>, identity: &Identity) -> Vec<String> {
         }
     }
     bcc
-}
-
-/// HTML-escapes the characters that would otherwise break out of element
-/// text. Applied to the plain-text prefill before it's embedded in the
-/// editor document, so `&`, `<`, `>`, quotes and apostrophes stay literal.
-fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 fn push_blockquote(out: &mut String, lines: &[String]) {
@@ -1464,7 +1447,7 @@ fn install_file_drop_target(widget: &impl IsA<gtk::Widget>, attachments: Rc<RefC
 
 fn build_attachment_chip(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, flow: &gtk::FlowBox, index: usize, item: &PendingAttachment) -> gtk::Box {
     let label = gtk::Label::builder()
-        .label(format!("{}  ·  {}", item.filename, crate::window::human_size(item.bytes.len() as u32)))
+        .label(format!("{}  ·  {}", item.filename, lookout_core::text::human_size(item.bytes.len() as u64)))
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
         .max_width_chars(28)
         .build();

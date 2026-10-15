@@ -263,7 +263,7 @@ fn folder_submenu(action: &str, other: &str, recent: &[(MailboxId, String)]) -> 
     for (id, name) in recent {
         menu = menu.action_with_target(name.clone(), ns(action), id.0.to_variant());
     }
-    menu.section().action("Other folder…", ns(other))
+    menu.section().icon_action("Other folder…", ns(other), "folder-symbolic")
 }
 
 /// The menu for `state`, in Outlook's order (UX-36), less the entries still
@@ -275,73 +275,80 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
         flag = flag.action_with_target(entry.name.clone(), ns("flag"), target.to_variant());
     }
     let flag = flag
-        .action("Custom date…", ns("flag-custom"))
+        .icon_action("Custom date…", ns("flag-custom"), "mail-flag-symbolic")
         .section()
-        .action("Mark complete", ns("flag-complete"))
-        .action("Clear flag", ns("flag-clear"));
+        .icon_action("Mark complete", ns("flag-complete"), "object-select-symbolic")
+        .icon_action("Clear flag", ns("flag-clear"), "edit-clear-symbolic");
 
     let mut menu = MenuDescription::new()
         .section()
-        .action("Reply", ns("reply"))
-        .action("Reply all", ns("reply-all"))
-        .action("Forward", ns("forward"))
-        .action("Reply with meeting", ns("reply-with-meeting"))
+        .icon_action("Reply", ns("reply"), "mail-reply-sender-symbolic")
+        .icon_action("Reply all", ns("reply-all"), "mail-reply-all-symbolic")
+        .icon_action("Forward", ns("forward"), "mail-forward-symbolic")
+        .icon_action("Reply with meeting", ns("reply-with-meeting"), "x-office-calendar-symbolic")
         .section()
-        .action("Delete", ns("delete"))
-        .action("Archive", ns("archive"))
+        .icon_action("Delete", ns("delete"), "user-trash-symbolic")
+        .icon_action("Archive", ns("archive"), "mail-archive-symbolic")
         .submenu("Move", folder_submenu("move", "move-other", &choices.recent_folders))
         .submenu("Copy", folder_submenu("copy", "copy-other", &choices.recent_folders))
         .section();
     menu = if state.any_unread {
-        menu.action("Mark as read", ns("mark-read"))
+        menu.icon_action("Mark as read", ns("mark-read"), "object-select-symbolic")
     } else {
-        menu.action("Mark as unread", ns("mark-unread"))
+        menu.icon_action("Mark as unread", ns("mark-unread"), "mail-unread-symbolic")
     };
     menu = menu.submenu("Flag", flag);
     menu = if state.all_pinned {
-        menu.action("Unpin", ns("unpin"))
+        menu.icon_action("Unpin", ns("unpin"), "view-pin-symbolic")
     } else {
-        menu.action("Pin", ns("pin"))
+        menu.icon_action("Pin", ns("pin"), "view-pin-symbolic")
     };
     menu = if state.snoozed {
-        menu.action("Unsnooze", ns("unsnooze"))
+        menu.icon_action("Unsnooze", ns("unsnooze"), "alarm-symbolic")
     } else {
         let mut snooze = MenuDescription::new().section();
         for entry in &choices.snoozes {
             snooze = snooze.action_with_target(entry.label.clone(), ns("snooze"), entry.at.timestamp().to_variant());
         }
-        menu.submenu("Snooze", snooze.section().action("Choose a date…", ns("snooze-custom")))
+        menu.submenu("Snooze", snooze.section().icon_action("Choose a date…", ns("snooze-custom"), "appointment-soon-symbolic"))
     };
     menu = menu.submenu("Categorize", MenuDescription::new().section().custom(CATEGORIZE_SLOT)).section();
-    let mut report = MenuDescription::new().section().action("Report junk", ns("report-junk"));
+    let mut report = MenuDescription::new().section().icon_action("Report junk", ns("report-junk"), "mail-mark-junk-symbolic");
     if choices.report_phishing {
-        report = report.action("Report phishing", ns("report-phishing"));
+        report = report.icon_action("Report phishing", ns("report-phishing"), "dialog-warning-symbolic");
     }
-    report = report.action("Not junk", ns("not-junk"));
+    report = report.icon_action("Not junk", ns("not-junk"), "mail-mark-notjunk-symbolic");
     menu = menu.submenu("Report", report).section();
     // Block ▸ (item 2.9 / M-17): add the sender (or its whole domain) to the
     // account's blocked list, or - when the sender is already blocked - remove
     // it. Sits between Report ▸ and Rules ▸ in Outlook's order (UX-36).
     let block = if choices.sender_blocked {
-        MenuDescription::new().section().action("Unblock sender", ns("unblock-sender"))
+        MenuDescription::new()
+            .section()
+            .icon_action("Unblock sender", ns("unblock-sender"), "object-select-symbolic")
     } else {
         MenuDescription::new()
             .section()
-            .action("Block sender", ns("block-sender"))
-            .action("Block domain", ns("block-domain"))
+            .icon_action("Block sender", ns("block-sender"), "action-unavailable-symbolic")
+            .icon_action("Block domain", ns("block-domain"), "action-unavailable-symbolic")
     };
     menu = menu.submenu("Block", block).section();
-    menu = menu.submenu("Rules", MenuDescription::new().section().action("Create rule…", ns("create-rule"))).section();
+    menu = menu
+        .submenu(
+            "Rules",
+            MenuDescription::new().section().icon_action("Create rule…", ns("create-rule"), "emblem-system-symbolic"),
+        )
+        .section();
     menu.submenu(
         "View",
         MenuDescription::new()
             .section()
-            .action("View message details", ns("view-details"))
-            .action("View message source", ns("view-source")),
+            .icon_action("View message details", ns("view-details"), "document-properties-symbolic")
+            .icon_action("View message source", ns("view-source"), "text-x-generic-symbolic"),
     )
     .section()
-    .action("Open in new window", ns("open-window"))
-    .action("Print", ns("print"))
+    .icon_action("Open in new window", ns("open-window"), "window-new-symbolic")
+    .icon_action("Print", ns("print"), "printer-symbolic")
 }
 
 /// Maps an activated action's bare name and parameter back to what it asks

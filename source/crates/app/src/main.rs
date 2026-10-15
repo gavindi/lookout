@@ -72,6 +72,7 @@ mod theme;
 mod tray;
 mod trusted_senders;
 mod ui_state_db;
+mod util;
 mod window;
 mod worker;
 

@@ -21,6 +21,7 @@ use std::rc::Rc;
 use gtk::gio;
 use gtk::gio::prelude::ActionMapExt;
 use gtk::glib;
+use lookout_core::text::percent_encode;
 use lookout_core::{EventOccurrence, MailboxId, Uid};
 
 const SCHEME: &str = "lookout-action";
@@ -63,21 +64,6 @@ pub fn parse(uri: &str) -> Option<(String, String)> {
         return None;
     }
     Some((action.to_string(), percent_decode(data)))
-}
-
-/// RFC 3986 unreserved characters pass through; everything else becomes
-/// `%XX`. Same convention as `graph_pin.rs`/`google_tasks.rs` - no `url`
-/// crate in this workspace.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 fn percent_decode(s: &str) -> String {

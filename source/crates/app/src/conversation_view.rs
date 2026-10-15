@@ -31,6 +31,7 @@ use chrono::{DateTime, Utc};
 use lookout_core::{EmailBody, EmailSummary, Importance, MailboxId, SystemFlagBit, Uid};
 
 use crate::settings::ConversationOrder;
+use crate::util::{escape_attribute, escape_html};
 
 /// The user-script world the conversation script runs in, isolated from
 /// the (script-free) page.
@@ -273,21 +274,6 @@ pub fn body_srcdoc(body: &EmailBody, card: usize, images_allowed: bool, all_allo
 /// and wide content scrolls within its card instead of widening the page.
 const BODY_BASE_CSS: &str = "html,body{margin:0;padding:0}body{overflow-x:auto;overflow-wrap:anywhere}img{max-width:100%;height:auto}";
 
-pub fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 /// The document-level CSP: our own markup and styles only. Frames inherit
 /// it, so it allows remote images, fonts and media as far as the most
 /// trusting card needs; each frame's own CSP then narrows that to its
@@ -437,13 +423,6 @@ fn frame_html(srcdoc: &str) -> String {
         "<iframe class=\"body\" title=\"Message body\" sandbox=\"allow-same-origin allow-popups\" scrolling=\"no\" data-srcdoc=\"{}\"></iframe>",
         escape_attribute(srcdoc)
     )
-}
-
-/// Escapes a value for a double-quoted attribute: quotes and ampersands are
-/// what matter, and angle brackets go too, so even a reader of the markup
-/// can't mistake a body's `</iframe>` for structure.
-fn escape_attribute(value: &str) -> String {
-    escape_html(value)
 }
 
 fn recipients_line(summary: &EmailSummary) -> String {

@@ -13,14 +13,8 @@
 /// Software released under the GPL3 license
 use std::path::{Path, PathBuf};
 
+use crate::app_config::config_dir;
 use crate::settings::WINDOW_BACKGROUND_PATH;
-
-fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| std::env::var_os("USERPROFILE").unwrap_or_default());
-        PathBuf::from(home).join(".config")
-    })
-}
 
 /// The pre-GSettings `background-image-path` file, consulted once by the
 /// migration in `load` and then deleted.

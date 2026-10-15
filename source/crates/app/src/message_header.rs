@@ -3,6 +3,8 @@
 use adw::prelude::*;
 use lookout_core::EmailSummary;
 
+use crate::util::action_button;
+
 pub const AVATAR_COLOR_CLASSES: [&str; 6] = ["avatar-color-0", "avatar-color-1", "avatar-color-2", "avatar-color-3", "avatar-color-4", "avatar-color-5"];
 
 /// Reading-pane header: a full-bleed subject strip (`subject_bar`), the
@@ -58,11 +60,6 @@ pub struct MessageHeader {
 /// A flat button with an icon + text label, via `adw::ButtonContent` - used
 /// for the Reply/Reply All/Forward cluster so they read as labelled actions
 /// rather than bare icon chrome.
-fn action_button(icon: &str, label: &str) -> gtk::Button {
-    let content = adw::ButtonContent::builder().icon_name(icon).label(label).build();
-    gtk::Button::builder().child(&content).css_classes(["flat"]).build()
-}
-
 /// A disabled placeholder button for a control that isn't wired up yet - same
 /// convention as the top command toolbar's `more_button`. The tooltip names
 /// what it will do so the disabled state reads as "not yet" rather than

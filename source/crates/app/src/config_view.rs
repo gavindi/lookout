@@ -21,6 +21,8 @@ use adw::prelude::*;
 use gtk::glib;
 use lookout_core::AccountId;
 
+use crate::util::card_section;
+
 /// The caller's hook for opening the manage-identities dialog: takes the
 /// anchoring widget and the account id (opaque string).
 pub type ManageIdentities = Rc<dyn Fn(&gtk::Widget, &str)>;
@@ -502,20 +504,6 @@ fn placeholder_group(title: &str) -> adw::PreferencesGroup {
 /// window.rs's private `card_section` helper - duplicated here rather than
 /// shared so this module stays decoupled from window.rs, per its own
 /// data-in/widget-out convention).
-fn card_section(content: &impl IsA<gtk::Widget>) -> gtk::Box {
-    let card = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .css_classes(["card"])
-        .overflow(gtk::Overflow::Hidden)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(6)
-        .margin_end(6)
-        .build();
-    card.append(content);
-    card
-}
-
 pub fn build() -> ConfigView {
     let accounts_group = adw::PreferencesGroup::builder().title("Accounts").build();
     let add_account_row = adw::ActionRow::builder()

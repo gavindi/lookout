@@ -18,6 +18,7 @@ pub mod mailbox;
 pub mod rules;
 pub mod signature;
 pub mod template;
+pub mod text;
 pub mod thread;
 pub mod trust;
 pub mod tzmap;

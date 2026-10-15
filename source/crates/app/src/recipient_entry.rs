@@ -210,7 +210,7 @@ impl RecipientEntry {
     /// chips. An empty `title` omits the caption label. Kept for test
     /// coverage of the plain path; the composer and event editor both use
     /// chip mode now (UX-42).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new_plain(title: &str) -> Self {
         Self::build(title, true)
     }

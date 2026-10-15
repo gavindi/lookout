@@ -95,7 +95,7 @@ There is a full map in SCAFFOLD.md. These are the extension points the roadmap r
 | Local UI state DB | `source/crates/app/src/ui_state_db.rs` | Safe/blocked senders, Quick Steps, reminder dismissals |
 | JSON config | `source/crates/app/src/app_config.rs` (`settings.json`) | Rules (client-side), category master list, signature defaults, My Templates snippets |
 | GSettings | `source/data/gschema/io.github.gavindi.Lookout.gschema.xml` | Scalar preferences (week start, reading-pane position, mark-as-read delay) |
-| UI state and dispatch | `source/crates/app/src/window.rs` (`UiState`, `CalendarUiState`) | All UI |
+| UI state and dispatch | `source/crates/app/src/window.rs` (`build_window`) plus the `window/` submodules it wires up (`state.rs` holds `UiState`/`CalendarUiState`) | All UI |
 | Context menus | `source/crates/app/src/context_menu.rs` (builder); `folder_menu.rs`, `message_menu.rs` (1.17) | Folder and message menus today; event, contact and task menus next |
 | Shortcut registry | `source/crates/app/src/shortcuts.rs` | Outlook keymap preset, new actions |
 | Notifications | `mail_notifications.rs`, `reminders.rs` (`ReminderEngine`), `tray.rs`, `launcher_entry.rs` | Reminders window, scheduled-send notices |
@@ -432,7 +432,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 
 Feature parity on its own isn't enough. An Outlook user should find every user-facing function **where Outlook puts it, under Outlook's name, behaving the way Outlook behaves by default**. This section is the UX specification. Every user-facing roadmap item in §7 must meet the matching rows here, as well as its functional gap row in §5.
 
-**Basis of comparison.** For Lookout: the current UI code (`source/crates/app/src/window.rs`, `calendar_view.rs`, `compose.rs`, `folder_tree.rs`, `recipient_entry.rs`) and the screenshots in `assets/screenshots/`. Screenshots can lag the code, so recheck screenshot-derived rows (marked **verify**) against a current build. For Outlook: new Outlook for Windows / OWA as of 2026. Ribbon contents and orders are approximate and should be re-captured from a live build before implementation.
+**Basis of comparison.** For Lookout: the current UI code (`source/crates/app/src/window.rs` and its `window/` submodules, `calendar_view.rs`, `compose.rs`, `folder_tree.rs`, `recipient_entry.rs`) and the screenshots in `assets/screenshots/`. Screenshots can lag the code, so recheck screenshot-derived rows (marked **verify**) against a current build. For Outlook: new Outlook for Windows / OWA as of 2026. Ribbon contents and orders are approximate and should be re-captured from a live build before implementation.
 
 ### 6.1 Principles
 

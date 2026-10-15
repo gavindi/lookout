@@ -21,6 +21,7 @@ use chrono::{Duration, NaiveDateTime};
 use gtk::glib;
 use lookout_core::{AccountId, EmailAddress, EmailSummary, EventOccurrence, VCard};
 
+use crate::util::action_button;
 use crate::window::UiState;
 use crate::worker::Worker;
 
@@ -481,11 +482,6 @@ fn empty_label(text: &str) -> gtk::Widget {
 }
 
 /// A flat icon + label button, matching the reading pane's action cluster.
-fn action_button(icon: &str, label: &str) -> gtk::Button {
-    let content = adw::ButtonContent::builder().icon_name(icon).label(label).build();
-    gtk::Button::builder().child(&content).css_classes(["flat"]).build()
-}
-
 /// The shared avatar widget: a coloured circle with initials, and an optional
 /// photo over it (a photo with no paintable leaves the initials visible).
 fn avatar_widget(size: i32) -> (gtk::Overlay, gtk::Label, gtk::Picture) {
