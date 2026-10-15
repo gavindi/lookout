@@ -30,6 +30,23 @@ pub enum ConnectionState {
     Error { message: String, retryable: bool },
 }
 
+/// A response to a meeting invitation, as Graph's RSVP actions model it
+/// (item 12 / CAL-15). Used by [`CalendarCommand::RespondInvitation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationResponse {
+    Accept,
+    Tentative,
+    Decline,
+}
+
+/// A proposed new time for an invitation (iTIP COUNTER, item 12 / CAL-17):
+/// the start/end the attendee would prefer, as UTC instants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposedTime {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
 #[derive(Debug)]
 pub enum CalendarCommand {
     /// Any date within the month to display; the actor resolves the
@@ -64,6 +81,21 @@ pub enum CalendarCommand {
         calendar_id: CalendarId,
         href: String,
         etag: Option<String>,
+    },
+    /// Respond to a meeting invitation stored in a Graph calendar (item 12):
+    /// Graph delivers iTIP itself, so the app calls the server's own RSVP
+    /// action (`/me/events/{id}/accept|tentativelyAccept|decline`) rather than
+    /// sending an iMIP REPLY. `event_id` is the event's Graph id
+    /// (`EventOccurrence::href`); `proposed_new_time` carries an iTIP COUNTER.
+    /// CalDAV accounts never receive this - their RSVP is an iMIP REPLY sent by
+    /// the app.
+    RespondInvitation {
+        calendar_id: CalendarId,
+        event_id: String,
+        response: InvitationResponse,
+        comment: Option<String>,
+        send_response: bool,
+        proposed_new_time: Option<ProposedTime>,
     },
     /// Force a resync of every task in every calendar, outside the poll
     /// cadence (e.g. right after a task edit lands).

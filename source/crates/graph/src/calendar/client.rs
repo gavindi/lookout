@@ -12,12 +12,14 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use chrono::{DateTime, Utc};
+use lookout_core::calendar_protocol::{InvitationResponse, ProposedTime};
 use lookout_core::{AccountId, CalendarEvent, CalendarInfo, EventOccurrence};
+use serde_json::json;
 
 use crate::client::{DeltaPage, GraphClient};
 use crate::error::{GraphError, Result};
 
-use super::{calendar_from_graph, event_create_body, event_from_graph, event_patch_body, occurrence_from_graph};
+use super::{calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph};
 
 /// Most event instances read for one calendar-view window - a guard against an
 /// unbounded recurring series.
@@ -96,6 +98,37 @@ impl CalendarClient {
         Ok(())
     }
 
+    /// Responds to a meeting invitation through Graph's own RSVP action
+    /// (item 12 / CAL-15): `POST /me/events/{id}/{accept|tentativelyAccept|decline}`.
+    /// `send_response` asks Graph to email the organizer; `proposed_new_time`
+    /// carries an iTIP COUNTER (item 3.7).
+    pub async fn respond_invitation(
+        &self,
+        event_id: &str,
+        response: InvitationResponse,
+        comment: Option<&str>,
+        send_response: bool,
+        proposed_new_time: Option<ProposedTime>,
+    ) -> Result<()> {
+        let action = match response {
+            InvitationResponse::Accept => "accept",
+            InvitationResponse::Tentative => "tentativelyAccept",
+            InvitationResponse::Decline => "decline",
+        };
+        let mut body = json!({ "sendResponse": send_response });
+        if let Some(comment) = comment.filter(|c| !c.trim().is_empty()) {
+            body["comment"] = json!(comment);
+        }
+        if let Some(proposed) = proposed_new_time {
+            body["proposedNewTime"] = json!({
+                "start": graph_date_time(proposed.start, None),
+                "end": graph_date_time(proposed.end, None),
+            });
+        }
+        self.graph.post(&format!("me/events/{}/{}", encode_segment(event_id), action), &body).await?;
+        Ok(())
+    }
+
     /// `/me/calendars/{id}/calendarView?startDateTime=…`, encoded and windowed.
     fn view_path(&self, calendar: &CalendarInfo, start: DateTime<Utc>, end: DateTime<Utc>) -> String {
         format!(
@@ -162,7 +195,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::{json, Value};
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -342,6 +375,45 @@ mod tests {
             .await;
 
         client(&server).delete_event("ev1", Some("ck1")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn respond_invitation_posts_the_action_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/events/ev1/tentativelyAccept"))
+            .and(body_partial_json(json!({ "sendResponse": true, "comment": "running late" })))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        client(&server)
+            .respond_invitation("ev1", InvitationResponse::Tentative, Some("running late"), true, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn respond_invitation_carries_a_proposed_new_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/events/ev1/decline"))
+            .and(body_partial_json(json!({
+                "sendResponse": false,
+                "proposedNewTime": { "start": { "dateTime": "2026-10-15T00:00:00", "timeZone": "UTC" } }
+            })))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let proposed = ProposedTime {
+            start: utc(2026, 10, 15),
+            end: utc(2026, 10, 16),
+        };
+        client(&server)
+            .respond_invitation("ev1", InvitationResponse::Decline, None, false, Some(proposed))
+            .await
+            .unwrap();
     }
 
     #[test]

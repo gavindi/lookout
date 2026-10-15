@@ -13,6 +13,13 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.209] - 2026-10-15
+**Reference**: Microsoft 365 — Graph RSVP command (Phase 5, item 12 / CAL-15, CAL-17)
+**Summary**: Touches `crates/core/src/calendar_protocol.rs`, `crates/graph/src/calendar/{client,session}.rs` and `crates/dav/src/session.rs`; no data-format change. The shared calendar contract gains `CalendarCommand::RespondInvitation` (with `InvitationResponse` and `ProposedTime`), mapping to Graph's own RSVP actions (`/me/events/{id}/accept|tentativelyAccept|decline`, with `sendResponse`, `comment` and an iTIP `proposedNewTime` COUNTER). The Graph session dispatches it and resyncs; the CalDAV session treats it as a no-op, since CalDAV RSVP is an iMIP REPLY sent by the app. Covered by 2 new `calendar::client` tests.
+
+**Reference**: Microsoft 365 — invite-card RSVP on Graph (Phase 5, item 13 / CAL-15, CAL-16)
+**Summary**: Touches `crates/app/src/window.rs`; no data-format change. Accept/Tentative/Decline on an invitation now route through Graph's RSVP endpoint when the invited event lives in a Microsoft 365 calendar: `CalendarAccountHandle` records whether its backend is Graph, and `respond_to_imip_invitation` sends `RespondInvitation` (using the occurrence's Graph id) instead of an iMIP REPLY, falling back to the iMIP path when the event isn't in a synced month or the account isn't Graph. Response tracking already reads attendee statuses off the synced occurrence, which the Graph read maps from `attendees[].status`. Propose-new-time from the card still goes out as an iMIP COUNTER; the Graph COUNTER write is a follow-up.
+
 ## [v0.9.208] - 2026-10-15
 **Reference**: Microsoft 365 — connect the calendar on consent (Phase 5, item 19 / A-03)
 **Summary**: Touches `crates/app/src/window.rs`; no data-format change. Enabling Outlook sync from Config's "Sync with Outlook" now brings the account's Microsoft 365 calendar online immediately rather than on the next launch: once the consent flow succeeds, the handler connects the account's calendar session, reusing `connect_calendar_account` (which routes Microsoft 365 accounts to the Graph backend), so the calendar appears the moment consent is granted.

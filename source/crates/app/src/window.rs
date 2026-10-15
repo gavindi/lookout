@@ -1658,6 +1658,10 @@ struct CalendarAccountHandle {
     /// The account's CalDAV base URL, kept for the Config view's account
     /// overview.
     uri: String,
+    /// Whether this account is served by the Microsoft Graph backend. Graph
+    /// delivers iTIP itself, so invitation responses go through Graph's own
+    /// RSVP endpoints rather than an iMIP REPLY (item 13).
+    graph: bool,
     calendars: Vec<CalendarInfo>,
     /// Latest reported session state, rendered in the sidebar's "My
     /// calendars" checklist while the account hasn't delivered any
@@ -14616,6 +14620,7 @@ fn connect_calendar_account(
             cmd_tx,
             display_name,
             uri: if microsoft_365 { "Microsoft 365".to_string() } else { config.base_url.clone() },
+            graph: microsoft_365,
             calendars: Vec::new(),
             connection_state: CalConnectionState::Connecting,
             last_occurrences: Vec::new(),
@@ -15619,6 +15624,17 @@ fn calendar_handle_for_id(calendar_state: &Rc<RefCell<CalendarUiState>>, calenda
         .values()
         .find(|handle| handle.calendars.iter().any(|c| c.id == *calendar_id))
         .map(|handle| handle.cmd_tx.clone())
+}
+
+/// Whether the calendar account owning `calendar_id` is served by the
+/// Microsoft Graph backend (item 13): its invitation responses use Graph's own
+/// RSVP endpoints instead of an iMIP REPLY.
+fn calendar_account_is_graph(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> bool {
+    calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .any(|handle| handle.graph && handle.calendars.iter().any(|calendar| calendar.id == *calendar_id))
 }
 
 /// Routes a saved (created or edited) event to its account's session. An event
@@ -17171,6 +17187,34 @@ fn respond_to_imip_invitation(
         toast_overlay.add_toast(adw::Toast::new("Couldn't parse this invitation's calendar data."));
         return;
     };
+    // On a Microsoft 365 (Graph) calendar the server owns iTIP delivery, so
+    // respond through Graph's RSVP action rather than sending an iMIP REPLY
+    // (item 13). The invited event must be in a synced month for its Graph id
+    // to be known; otherwise this falls through to the iMIP path.
+    if let Some(occ) = find_calendar_occurrence(calendar_state, &event.uid) {
+        if calendar_account_is_graph(calendar_state, &occ.calendar_id) {
+            let response = match status {
+                AttendeeStatus::Accepted => lookout_core::calendar_protocol::InvitationResponse::Accept,
+                AttendeeStatus::Tentative => lookout_core::calendar_protocol::InvitationResponse::Tentative,
+                AttendeeStatus::Declined => lookout_core::calendar_protocol::InvitationResponse::Decline,
+                AttendeeStatus::NeedsAction => return,
+            };
+            if let Some(href) = occ.href.clone() {
+                if let Some(handle) = calendar_handle_for_id(calendar_state, &occ.calendar_id) {
+                    let _ = handle.send_blocking(CalendarCommand::RespondInvitation {
+                        calendar_id: occ.calendar_id.clone(),
+                        event_id: href,
+                        response,
+                        comment: comment.map(str::to_string),
+                        send_response,
+                        proposed_new_time: None,
+                    });
+                }
+            }
+            toast_overlay.add_toast(adw::Toast::new(crate::calendar_invites::reply_toast(status, send_response)));
+            return;
+        }
+    }
     if send_response {
         let Some(organizer) = &invitation.organizer else {
             toast_overlay.add_toast(adw::Toast::new("This invitation names no organizer - can't send a reply."));

@@ -225,6 +225,10 @@ async fn connect_and_run(
                         let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete event: {e}"))).await;
                     }
                 },
+                // RSVP on a CalDAV account is an iMIP REPLY sent by the app
+                // (or applied server-side under RFC 6638), never a calendar
+                // command - nothing to do here.
+                CalendarCommand::RespondInvitation { .. } => {}
                 CalendarCommand::FetchFreeBusy {
                     organizer,
                     attendees,

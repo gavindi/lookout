@@ -172,6 +172,19 @@ async fn connect_and_run(
                         let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete event: {e}"))).await;
                     }
                 },
+                CalendarCommand::RespondInvitation {
+                    event_id,
+                    response,
+                    comment,
+                    send_response,
+                    proposed_new_time,
+                    ..
+                } => match client.respond_invitation(&event_id, response, comment.as_deref(), send_response, proposed_new_time).await {
+                    Ok(()) => sync_month(client, &calendars, current_month, events).await?,
+                    Err(e) => {
+                        let _ = events.send(CalendarSessionEvent::Error(format!("failed to respond to the invitation: {e}"))).await;
+                    }
+                },
                 CalendarCommand::SyncTasks => {
                     let _ = events.send(CalendarSessionEvent::TasksUpdated(Vec::new())).await;
                 }
