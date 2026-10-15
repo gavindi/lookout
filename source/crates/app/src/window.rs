@@ -5526,9 +5526,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Calendar's own command toolbar row, swapped in for the Mail one
     // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
     // active. New Event opens the event editor (wired later, once
-    // `calendar_state` exists); all five segmented options (Day/Work
-    // week/Week/Month/Split) switch the main panel's stack; Filter/Share
-    // remain disabled placeholders. Print is live (prints the displayed
+    // `calendar_state` exists); the segmented options (Day/Work
+    // week/Week/Month/Schedule/Split/List) switch the main panel's stack;
+    // Filter/Share remain disabled placeholders. Print is live (prints the displayed
     // range through WebKit's print pipeline).
     let new_event_button = gtk::Button::from_icon_name("appointment-new-symbolic");
     new_event_button.set_tooltip_text(Some("New Event"));
@@ -5537,11 +5537,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let work_week_view_button = gtk::ToggleButton::builder().label("Work week").build();
     let week_view_button = gtk::ToggleButton::builder().label("Week").build();
     let month_view_button = gtk::ToggleButton::builder().label("Month").active(true).build();
+    let schedule_view_button = gtk::ToggleButton::builder().label("Schedule").build();
     let split_view_button = gtk::ToggleButton::builder().label("Split view").build();
+    let list_view_button = gtk::ToggleButton::builder().label("List").build();
     // One mutual-exclusion group so exactly one view is active at a time
     // (same `set_group` trick as the nav rail's Mail/Calendar buttons).
+    schedule_view_button.set_group(Some(&month_view_button));
     split_view_button.set_group(Some(&month_view_button));
-    week_view_button.set_group(Some(&split_view_button));
+    list_view_button.set_group(Some(&month_view_button));
+    week_view_button.set_group(Some(&month_view_button));
     work_week_view_button.set_group(Some(&week_view_button));
     day_view_button.set_group(Some(&work_week_view_button));
     let view_switch_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).css_classes(["linked"]).build();
@@ -5549,13 +5553,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     view_switch_box.append(&work_week_view_button);
     view_switch_box.append(&week_view_button);
     view_switch_box.append(&month_view_button);
+    view_switch_box.append(&schedule_view_button);
     view_switch_box.append(&split_view_button);
+    view_switch_box.append(&list_view_button);
     for (button, view) in [
         (&day_view_button, "day"),
         (&work_week_view_button, "workweek"),
         (&week_view_button, "week"),
         (&month_view_button, "month"),
+        (&schedule_view_button, "schedule"),
         (&split_view_button, "split"),
+        (&list_view_button, "list"),
     ] {
         let calendar_main = calendar_main.clone();
         button.connect_toggled(move |btn| {
@@ -14074,6 +14082,7 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
     let on_toggle = {
         let calendar_state = calendar_state.clone();
         let calendar_main = calendar_main.clone();
+        let all_calendars = all_calendars.clone();
         move |id: CalendarId, is_checked: bool| {
             {
                 let mut st = calendar_state.borrow_mut();
@@ -14083,12 +14092,27 @@ fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, cal
                     st.checked_calendar_ids.remove(&id);
                 }
             }
+            // The toggle takes the quick refresh path, skipping this checklist
+            // rebuild, so recompute the Schedule view's lanes here (CAL-03).
+            let checked = calendar_state.borrow().checked_calendar_ids.clone();
+            calendar_view::set_schedule_calendars(&calendar_main, &schedule_calendars_from(&all_calendars, &checked));
             refresh_displayed_calendar_view(&calendar_state, &calendar_main);
         }
     };
     calendar_view::rebuild_calendar_checklist(calendar_list_box, &groups, &checked, &colors, &calendar_main.check_colors, on_toggle);
     calendar_view::set_calendar_colors(calendar_main, &colors);
+    calendar_view::set_schedule_calendars(calendar_main, &schedule_calendars_from(&all_calendars, &checked));
     refresh_displayed_calendar_view(calendar_state, calendar_main);
+}
+
+/// The checked calendars in sidebar order, as `(id, display_name)`, for the
+/// Schedule view's lanes (CAL-03) - an empty calendar still gets a row.
+fn schedule_calendars_from(all_calendars: &[CalendarInfo], checked: &HashSet<CalendarId>) -> Vec<(CalendarId, String)> {
+    all_calendars
+        .iter()
+        .filter(|c| checked.contains(&c.id))
+        .map(|c| (c.id.clone(), c.display_name.clone()))
+        .collect()
 }
 
 /// Unions every connected calendar account's latest occurrences for

@@ -2318,14 +2318,24 @@ fn paint_chip(
     fg: (f64, f64, f64),
 ) {
     let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
-    let (r, g, b) = css_color_rgb(color);
     let (cx, cy, cw, ch) = chip_geometry(gutter, chip, col_width);
+    paint_event_block(cr, (cx, cy, cw, ch), color, occ.show_as, &chip_text(occ, chip, ch), hovered, alpha, fg);
+}
+
+/// Paints an event block into `rect`: the calendar-colour fill/outline, the
+/// hover ring and the label, styled per show-as state (CAL-05, UX-57). Shared
+/// by the Day/Week time-grid chips ([`paint_chip`]) and the Schedule view's
+/// lanes, so both read identically. `alpha` scales the fill opacity; `fg` is
+/// the canvas's theme foreground, the text colour on the light-filled styles.
+#[allow(clippy::too_many_arguments)]
+fn paint_event_block(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: &str, show_as: BusyStatus, label: &str, hovered: bool, alpha: f64, fg: (f64, f64, f64)) {
+    let (cx, cy, cw, ch) = rect;
     if cw < 2.0 || ch < 2.0 {
         return;
     }
-    let style = chip_style(occ.show_as);
+    let (r, g, b) = css_color_rgb(color);
+    let style = chip_style(show_as);
     let chip_color = (r, g, b);
-    let rect = (cx, cy, cw, ch);
     let inset = (cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0);
     match style {
         // Busy: the original solid fill with its dark hairline border.
@@ -2371,7 +2381,7 @@ fn paint_chip(
         ChipStyle::Dotted => readable_chip_color(color),
         ChipStyle::Hatched | ChipStyle::Hollow => (fg.0, fg.1, fg.2, 0.95),
     };
-    let text = ellipsize_text(cr, &chip_text(occ, chip, ch), (cw - 8.0).max(4.0));
+    let text = ellipsize_text(cr, label, (cw - 8.0).max(4.0));
     if !text.is_empty() {
         cr.set_source_rgba(text_color.0, text_color.1, text_color.2, text_color.3);
         cr.select_font_face("Sans", FontSlant::Normal, FontWeight::Normal);
@@ -2474,21 +2484,29 @@ fn build_agenda_view() -> AgendaView {
     }
 }
 
-/// Rebuilds the agenda's rows for `anchor` (its own month forward), grouped by
-/// day: a day header per local date ("Today"/"Tomorrow"/"Wed 12 Aug") with its
-/// events under it, each row a time column plus "5:00pm – 6:00pm summary" (or
-/// "All day summary").
-pub fn set_agenda(a: &AgendaView, anchor: NaiveDate, occurrences: &[EventOccurrence], colors: &HashMap<CalendarId, String>, on_activate: Option<ActivateEvent>) {
+/// Rebuilds the agenda's rows for the inclusive `anchor..=window_end` range,
+/// grouped by day: a day header per local date ("Today"/"Tomorrow"/"Wed 12
+/// Aug") with its events under it, each row a time column plus "5:00pm –
+/// 6:00pm summary" (or "All day summary"). The Split view passes its month's
+/// end (a month agenda); the standalone List view passes a rolling window
+/// (see [`list_window_end`]).
+pub fn set_agenda(
+    a: &AgendaView,
+    anchor: NaiveDate,
+    window_end: NaiveDate,
+    occurrences: &[EventOccurrence],
+    colors: &HashMap<CalendarId, String>,
+    on_activate: Option<ActivateEvent>,
+) {
     *a.on_activate.borrow_mut() = on_activate;
     *a.anchor.borrow_mut() = anchor;
     clear_children(&a.events_box);
 
-    let month_end = last_of_month(anchor);
     let mut upcoming: Vec<&EventOccurrence> = occurrences
         .iter()
         .filter(|occ| {
             let date = local_span(occ).0.date();
-            date >= anchor && date <= month_end
+            date >= anchor && date <= window_end
         })
         .collect();
     upcoming.sort_by_key(|occ| occ.start);
@@ -2606,11 +2624,356 @@ fn build_split_view(week_start: chrono::Weekday) -> SplitView {
     }
 }
 
+/// Width of the calendar-name gutter on the left of the Schedule view's
+/// timeline - wide enough for a calendar's name without crowding the axis.
+const SCHEDULE_LABEL_WIDTH: f64 = 168.0;
+/// Height of one calendar's lane in the Schedule view.
+const SCHEDULE_ROW_HEIGHT: f64 = 44.0;
+/// Height of the hour-axis header above the lanes.
+const SCHEDULE_HEADER_HEIGHT: f64 = 22.0;
+/// Vertical inset of an event block within its lane.
+const SCHEDULE_BLOCK_INSET: f64 = 3.0;
+
+/// One calendar's lane in the Schedule view: its display name, its colour and
+/// the event blocks laid out across the shared horizontal timeline.
+struct ScheduleLane {
+    label: String,
+    color: String,
+    blocks: Vec<ScheduleBlock>,
+}
+
+/// One event block on a Schedule lane. `start_minutes`/`end_minutes` are
+/// display-zone minutes since local midnight of the shown day, clamped to
+/// `0..=1440`; all-day events occupy the whole span.
+struct ScheduleBlock {
+    occ: EventOccurrence,
+    start_minutes: i64,
+    end_minutes: i64,
+}
+
+/// The Schedule view's mutable render state, shared with its draw/hit-test
+/// closures.
+struct ScheduleState {
+    lanes: Vec<ScheduleLane>,
+    date: NaiveDate,
+    work_start: u32,
+    work_end: u32,
+    work_days: Vec<chrono::Weekday>,
+}
+
+/// Outlook's Schedule view (CAL-03): a scrollable horizontal timeline with one
+/// lane per calendar, events drawn as blocks at their exact times over a
+/// shared hour axis (all-day events span their lane). Read-only except for
+/// click-to-open, like the other calendar grids; the widget is
+/// data-in/callback-out like the rest of this module.
+pub struct ScheduleView {
+    pub root: gtk::Widget,
+    canvas: gtk::DrawingArea,
+    state: Rc<RefCell<ScheduleState>>,
+    /// The click-to-edit callback, set by each `set_schedule` render pass.
+    on_activate: PendingActivate,
+}
+
+fn build_schedule_view(prefs: &crate::settings::CalendarPreferences) -> ScheduleView {
+    let canvas = gtk::DrawingArea::new();
+    canvas.set_hexpand(true);
+    canvas.set_content_height((SCHEDULE_HEADER_HEIGHT + SCHEDULE_ROW_HEIGHT) as i32);
+
+    let state = Rc::new(RefCell::new(ScheduleState {
+        lanes: Vec::new(),
+        date: today(),
+        work_start: prefs.work_start,
+        work_end: prefs.work_end,
+        work_days: prefs.work_days.clone(),
+    }));
+    let on_activate: PendingActivate = Rc::new(RefCell::new(None));
+    let hover: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
+
+    {
+        let state = state.clone();
+        let hover = hover.clone();
+        canvas.set_draw_func(move |canvas, cr, width, height| {
+            paint_schedule(cr, width as f64, height as f64, &state.borrow(), hover.get(), foreground_rgb(canvas));
+        });
+    }
+
+    // Hover: ring the block under the pointer and show its time range.
+    {
+        let state = state.clone();
+        let hover = hover.clone();
+        let canvas_widget = canvas.clone();
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion(move |_, x, y| {
+            let width = canvas_widget.width() as f64;
+            let hit = schedule_block_at(&state.borrow(), width, x, y);
+            if hover.get() != hit {
+                hover.set(hit);
+                canvas_widget.queue_draw();
+                match hit {
+                    Some((lane, block)) => {
+                        let tooltip = schedule_block_tooltip(&state.borrow().lanes[lane].blocks[block].occ);
+                        canvas_widget.set_tooltip_text(Some(&tooltip));
+                    }
+                    None => canvas_widget.set_tooltip_text(None),
+                }
+            }
+        });
+        canvas.add_controller(motion);
+    }
+
+    // Click: open the clicked event (the caller's editor).
+    {
+        let state = state.clone();
+        let on_activate = on_activate.clone();
+        let canvas_widget = canvas.clone();
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.connect_released(move |_, _n, x, y| {
+            let width = canvas_widget.width() as f64;
+            // Bind the hit first (its own statement), so the `state` borrow is
+            // released before we clone the occurrence and call back out.
+            let hit = schedule_block_at(&state.borrow(), width, x, y);
+            if let Some((lane, block)) = hit {
+                let occ = state.borrow().lanes[lane].blocks[block].occ.clone();
+                if let Some(callback) = on_activate.borrow().as_ref() {
+                    callback(occ);
+                }
+            }
+        });
+        canvas.add_controller(click);
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
+        .child(&canvas)
+        .build();
+
+    let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).hexpand(true).build();
+    root.append(&scroller);
+
+    ScheduleView {
+        root: root.upcast(),
+        canvas,
+        state,
+        on_activate,
+    }
+}
+
+impl ScheduleView {
+    /// Applies the Calendar preferences (item 3.1): the business-hours band and
+    /// work days. The axis itself is the process-wide display zone, so it is
+    /// picked up on the next render. The caller re-renders afterwards.
+    fn apply_preferences(&self, prefs: &crate::settings::CalendarPreferences) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.work_start = prefs.work_start;
+            st.work_end = prefs.work_end;
+            st.work_days = prefs.work_days.clone();
+        }
+        self.canvas.queue_draw();
+    }
+}
+
+/// Rebuilds the Schedule view's lanes for `date`: one per `(id, display_name)`
+/// in `calendars` (sidebar order, so an empty calendar still gets a lane),
+/// each holding that calendar's occurrences for the day with their clamped
+/// time spans. Sets the canvas height to fit the lanes and repaints.
+fn set_schedule(
+    view: &ScheduleView,
+    date: NaiveDate,
+    occurrences: &[EventOccurrence],
+    colors: &HashMap<CalendarId, String>,
+    calendars: &[(CalendarId, String)],
+    on_activate: Option<ActivateEvent>,
+) {
+    *view.on_activate.borrow_mut() = on_activate;
+    let mut lanes = Vec::with_capacity(calendars.len());
+    for (id, label) in calendars {
+        let mut blocks: Vec<ScheduleBlock> = occurrences
+            .iter()
+            .filter(|occ| &occ.calendar_id == id && !covered_local_dates(occ, date, date).is_empty())
+            .filter_map(|occ| {
+                schedule_block_span(date, occ).map(|(start_minutes, end_minutes)| ScheduleBlock {
+                    occ: occ.clone(),
+                    start_minutes,
+                    end_minutes,
+                })
+            })
+            .collect();
+        blocks.sort_by_key(|b| (b.start_minutes, b.end_minutes));
+        lanes.push(ScheduleLane {
+            label: label.clone(),
+            color: colors.get(id).cloned().unwrap_or_else(|| calendar_colors::DEFAULT_CHECK_COLOR.to_string()),
+            blocks,
+        });
+    }
+    {
+        let mut st = view.state.borrow_mut();
+        st.lanes = lanes;
+        st.date = date;
+    }
+    let rows = view.state.borrow().lanes.len().max(1);
+    view.canvas.set_content_height((SCHEDULE_HEADER_HEIGHT + rows as f64 * SCHEDULE_ROW_HEIGHT).ceil() as i32);
+    view.canvas.queue_draw();
+}
+
+/// An occurrence's span within the shown `date`, as display-zone minutes since
+/// local midnight clamped to `0..=1440` (all-day events occupy the whole day).
+/// `None` when the event does not actually cover `date` (shouldn't happen
+/// after the caller's `covered_local_dates` filter, but kept honest).
+fn schedule_block_span(date: NaiveDate, occ: &EventOccurrence) -> Option<(i64, i64)> {
+    if occ.all_day {
+        return Some((0, 1440));
+    }
+    let (start, end) = local_span(occ);
+    let minutes_on = |local: NaiveDateTime| (local.date() - date).num_days() * 1440 + i64::from(local.hour()) * 60 + i64::from(local.minute());
+    let start_minutes = minutes_on(start);
+    let end_minutes = minutes_on(end);
+    if end_minutes <= 0 || start_minutes >= 1440 {
+        return None;
+    }
+    Some((start_minutes.max(0), end_minutes.min(1440)))
+}
+
+/// The x position for a minutes-since-midnight value on the Schedule axis; the
+/// time plot runs from `SCHEDULE_LABEL_WIDTH` to the widget edge.
+fn schedule_x_for_minutes(minutes: f64, width: f64) -> f64 {
+    let plot = (width - SCHEDULE_LABEL_WIDTH).max(1.0);
+    SCHEDULE_LABEL_WIDTH + (minutes / 1440.0).clamp(0.0, 1.0) * plot
+}
+
+/// The pixel rectangle a block occupies in its lane, used for both painting
+/// and hit-testing.
+fn schedule_block_rect(lane: usize, block: &ScheduleBlock, width: f64) -> (f64, f64, f64, f64) {
+    let x = schedule_x_for_minutes(block.start_minutes as f64, width) + 1.0;
+    let x_end = schedule_x_for_minutes(block.end_minutes as f64, width) - 1.0;
+    let y = SCHEDULE_HEADER_HEIGHT + lane as f64 * SCHEDULE_ROW_HEIGHT + SCHEDULE_BLOCK_INSET;
+    let h = SCHEDULE_ROW_HEIGHT - 2.0 * SCHEDULE_BLOCK_INSET;
+    (x, y, (x_end - x).max(3.0), h)
+}
+
+/// The lane and block index under the pointer, if any.
+fn schedule_block_at(state: &ScheduleState, width: f64, x: f64, y: f64) -> Option<(usize, usize)> {
+    if y < SCHEDULE_HEADER_HEIGHT {
+        return None;
+    }
+    let lane = ((y - SCHEDULE_HEADER_HEIGHT) / SCHEDULE_ROW_HEIGHT) as usize;
+    if lane >= state.lanes.len() {
+        return None;
+    }
+    state.lanes[lane]
+        .blocks
+        .iter()
+        .enumerate()
+        .find(|(_, block)| {
+            let (bx, by, bw, bh) = schedule_block_rect(lane, block, width);
+            x >= bx && x <= bx + bw && y >= by && y <= by + bh
+        })
+        .map(|(index, _)| (lane, index))
+}
+
+/// The tooltip for a Schedule block: the summary plus its full time range.
+fn schedule_block_tooltip(occ: &EventOccurrence) -> String {
+    if occ.all_day {
+        occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
+    } else {
+        let start = format_event_time(&local_span(occ).0);
+        let end = format_event_time(&local_span(occ).1);
+        format!("{start} – {end}  {}", occ.summary.as_deref().unwrap_or("(untitled)"))
+    }
+}
+
+/// Paints the Schedule view: the hour axis, one lane per calendar (name,
+/// working-hours shading, event blocks) and the current-time line.
+fn paint_schedule(cr: &gtk::cairo::Context, width: f64, height: f64, state: &ScheduleState, hover: Option<(usize, usize)>, fg: (f64, f64, f64)) {
+    let _ = height;
+    cr.select_font_face("Sans", FontSlant::Normal, FontWeight::Normal);
+
+    if state.lanes.is_empty() {
+        cr.set_font_size(12.0);
+        cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_DIM_TEXT_ALPHA);
+        cr.move_to(12.0, SCHEDULE_HEADER_HEIGHT + 20.0);
+        let _ = cr.show_text("No calendars selected");
+        return;
+    }
+
+    let lanes_height = state.lanes.len() as f64 * SCHEDULE_ROW_HEIGHT;
+
+    // Hour axis labels and vertical grid lines.
+    for hour in (0..24).step_by(2) {
+        let x = schedule_x_for_minutes(hour as f64 * 60.0, width);
+        cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_LINE_ALPHA);
+        cr.set_line_width(0.5);
+        cr.move_to(x, SCHEDULE_HEADER_HEIGHT);
+        cr.line_to(x, SCHEDULE_HEADER_HEIGHT + lanes_height);
+        let _ = cr.stroke();
+        cr.set_font_size(10.0);
+        cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_DIM_TEXT_ALPHA);
+        cr.move_to(x + 2.0, SCHEDULE_HEADER_HEIGHT - 7.0);
+        let _ = cr.show_text(&hour_gutter_text(hour));
+    }
+
+    for (lane_index, lane) in state.lanes.iter().enumerate() {
+        let y = SCHEDULE_HEADER_HEIGHT + lane_index as f64 * SCHEDULE_ROW_HEIGHT;
+
+        // Business-hours shading on work days.
+        if state.work_days.contains(&state.date.weekday()) {
+            let start = schedule_x_for_minutes(state.work_start as f64 * 60.0, width);
+            let end = schedule_x_for_minutes(state.work_end as f64 * 60.0, width);
+            cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_BUSINESS_ALPHA);
+            cr.rectangle(start, y, (end - start).max(0.0), SCHEDULE_ROW_HEIGHT);
+            let _ = cr.fill();
+        }
+
+        // The calendar's name in the left gutter.
+        cr.set_font_size(12.0);
+        cr.set_source_rgba(fg.0, fg.1, fg.2, 0.9);
+        cr.move_to(8.0, y + SCHEDULE_ROW_HEIGHT / 2.0 + 4.0);
+        let _ = cr.show_text(&ellipsize_text(cr, &lane.label, SCHEDULE_LABEL_WIDTH - 16.0));
+
+        // The lane's event blocks.
+        for (block_index, block) in lane.blocks.iter().enumerate() {
+            let rect = schedule_block_rect(lane_index, block, width);
+            let label = block.occ.summary.as_deref().unwrap_or("(untitled)");
+            paint_event_block(cr, rect, &lane.color, block.occ.show_as, label, hover == Some((lane_index, block_index)), 0.95, fg);
+        }
+
+        // Row separator.
+        cr.set_source_rgba(fg.0, fg.1, fg.2, GRID_LINE_ALPHA);
+        cr.set_line_width(0.5);
+        cr.move_to(0.0, y + SCHEDULE_ROW_HEIGHT);
+        cr.line_to(width, y + SCHEDULE_ROW_HEIGHT);
+        let _ = cr.stroke();
+    }
+
+    // Label column separator.
+    cr.set_source_rgba(fg.0, fg.1, fg.2, 0.3);
+    cr.set_line_width(0.5);
+    cr.move_to(SCHEDULE_LABEL_WIDTH, 0.0);
+    cr.line_to(SCHEDULE_LABEL_WIDTH, SCHEDULE_HEADER_HEIGHT + lanes_height);
+    let _ = cr.stroke();
+
+    // Current-time line.
+    if state.date == today() {
+        let now = crate::calendar_tz::display_zone().now();
+        let minutes = i64::from(now.hour()) * 60 + i64::from(now.minute());
+        let x = schedule_x_for_minutes(minutes as f64, width);
+        cr.set_source_rgba(0.85, 0.2, 0.2, 0.8);
+        cr.set_line_width(1.0);
+        cr.move_to(x, SCHEDULE_HEADER_HEIGHT);
+        cr.line_to(x, SCHEDULE_HEADER_HEIGHT + lanes_height);
+        let _ = cr.stroke();
+    }
+}
+
 /// The calendar view's main panel: a shared header row (Today + prev/next +
 /// a current-month dropdown whose popover holds a mini month grid) above a
-/// stack of the five views - Month, Work week, Week, Day,
-/// and Split - all anchored to a single date so they always agree on what's
-/// displayed. `window.rs` drives it the same way it drove the old standalone
+/// stack of the views - Month, Work week, Week, Day, Split, List and the
+/// horizontal Schedule view - all anchored to a single date so they always
+/// agree on what's displayed. `window.rs` drives it the same way it drove the old standalone
 /// [`MonthGrid`]: `set_anchor`/`set_occurrences` in, read the anchor back
 /// with `anchor()` to decide which month to resync.
 pub struct CalendarMain {
@@ -2632,6 +2995,12 @@ pub struct CalendarMain {
     day: TimeGrid,
     agenda: AgendaView,
     split: SplitView,
+    /// The horizontal calendars-as-rows Schedule view (CAL-03).
+    schedule: ScheduleView,
+    /// The checked calendars, in sidebar order, as `(id, display_name)` - the
+    /// rows the Schedule view draws (CAL-03). Refreshed by window.rs from the
+    /// sidebar checklist via [`set_schedule_calendars`].
+    schedule_calendars: Rc<RefCell<Vec<(CalendarId, String)>>>,
     anchor: Rc<RefCell<NaiveDate>>,
     occurrences: Rc<RefCell<Vec<EventOccurrence>>>,
     /// The current `CalendarId` -> colour map, mirrored from the sidebar's
@@ -2710,12 +3079,15 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
     }
     let agenda = build_agenda_view();
     let split = build_split_view(week_start);
+    let schedule = build_schedule_view(prefs);
 
     let stack = gtk::Stack::new();
     stack.add_named(&workweek.root, Some("workweek"));
     stack.add_named(&week.root, Some("week"));
     stack.add_named(&day.root, Some("day"));
     stack.add_named(&split.root, Some("split"));
+    stack.add_named(&agenda.root, Some("list"));
+    stack.add_named(&schedule.root, Some("schedule"));
     stack.add_named(&month.root, Some("month"));
     stack.set_visible_child_name("month");
 
@@ -2758,6 +3130,8 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
         day,
         agenda,
         split,
+        schedule,
+        schedule_calendars: Rc::new(RefCell::new(Vec::new())),
         anchor: anchor.clone(),
         occurrences: Rc::new(RefCell::new(Vec::new())),
         colors: Rc::new(RefCell::new(HashMap::new())),
@@ -2779,7 +3153,7 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
 }
 
 /// Switches the main panel to the named view (`"day"`, `"workweek"`, `"week"`,
-/// `"month"`, or `"split"`) and re-renders the shared header title for it.
+/// `"month"`, `"split"`, `"list"`, or `"schedule"`) and re-renders the shared header title for it.
 /// Switching to a time-grid view also scrolls its timeline to the current time
 /// (wired to the scroller's `map` signal in [`build_time_grid`]).
 pub fn set_view(c: &CalendarMain, view: &'static str) {
@@ -2796,6 +3170,8 @@ pub fn active_view(c: &CalendarMain) -> &'static str {
         Some("workweek") => "workweek",
         Some("week") => "week",
         Some("split") => "split",
+        Some("list") => "list",
+        Some("schedule") => "schedule",
         _ => "month",
     }
 }
@@ -2823,6 +3199,7 @@ pub fn apply_preferences(c: &CalendarMain, prefs: &crate::settings::CalendarPref
     for grid in [&c.workweek, &c.week, &c.day] {
         apply_time_grid_preferences(grid, prefs);
     }
+    c.schedule.apply_preferences(prefs);
     refresh(c);
 }
 
@@ -2852,6 +3229,14 @@ pub fn set_occurrences(c: &CalendarMain, occurrences: &[EventOccurrence]) {
 /// part of the same checklist refresh).
 pub fn set_calendar_colors(c: &CalendarMain, colors: &HashMap<CalendarId, String>) {
     *c.colors.borrow_mut() = colors.clone();
+}
+
+/// Sets the calendars the Schedule view draws as rows (CAL-03), in sidebar
+/// order as `(id, display_name)`. The caller is expected to re-render (the
+/// checklist refresh does, right after); the next [`refresh`] rebuilds the
+/// lanes.
+pub fn set_schedule_calendars(c: &CalendarMain, calendars: &[(CalendarId, String)]) {
+    *c.schedule_calendars.borrow_mut() = calendars.to_vec();
 }
 
 /// Registers `f` to run when the user activates (clicks) an event in any of
@@ -2917,7 +3302,7 @@ pub fn connect_main_day_activated(c: &CalendarMain, f: impl Fn(NaiveDate) + 'sta
 pub fn step(c: &CalendarMain, by: i64) {
     let anchor = *c.anchor.borrow();
     let new_anchor = match active_view(c) {
-        "day" | "agenda" => anchor + chrono::Duration::days(by),
+        "day" | "list" => anchor + chrono::Duration::days(by),
         "workweek" | "week" => anchor + chrono::Duration::days(by * 7),
         _ if by > 0 => anchor.checked_add_months(chrono::Months::new(1)).unwrap_or(anchor),
         _ => anchor.checked_sub_months(chrono::Months::new(1)).unwrap_or(anchor),
@@ -2949,8 +3334,9 @@ fn refresh(c: &CalendarMain) {
     set_time_grid(&c.week, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate.clone(), on_drag.clone());
     set_time_grid(&c.day, anchor, &occurrences, &colors, on_activate.clone(), on_slot_activate, on_drag.clone());
 
-    set_agenda(&c.agenda, anchor, &occurrences, &colors, on_activate.clone());
-    set_agenda(&c.split.agenda, anchor, &occurrences, &colors, on_activate);
+    set_agenda(&c.agenda, anchor, list_window_end(anchor), &occurrences, &colors, on_activate.clone());
+    set_agenda(&c.split.agenda, anchor, last_of_month(anchor), &occurrences, &colors, on_activate.clone());
+    set_schedule(&c.schedule, anchor, &occurrences, &colors, &c.schedule_calendars.borrow(), on_activate);
 
     c.header_label.set_label(&header_text(c));
 }
@@ -2974,6 +3360,8 @@ fn header_text(c: &CalendarMain) -> String {
             }
         }
         "split" => format!("Split · {}", anchor.format("%d %b %Y")),
+        "list" => format!("List · {}", anchor.format("%d %b %Y")),
+        "schedule" => format!("Schedule · {}", anchor.format("%d %b %Y")),
         _ => first_of_month(anchor).format("%B %Y").to_string(),
     }
 }
@@ -3486,6 +3874,16 @@ fn last_of_month(date: NaiveDate) -> NaiveDate {
     let first = first_of_month(date);
     let next = first.checked_add_months(chrono::Months::new(1)).unwrap_or(first);
     next - chrono::Duration::days(1)
+}
+
+/// How many days forward the standalone List view looks from its anchor: a
+/// rolling window (Outlook's List is an upcoming-events list), rather than the
+/// Split view's "rest of this month".
+const LIST_WINDOW_DAYS: i64 = 30;
+
+/// The last day the standalone List view shows for `anchor`.
+fn list_window_end(anchor: NaiveDate) -> NaiveDate {
+    anchor + chrono::Duration::days(LIST_WINDOW_DAYS)
 }
 
 /// The first day of the grid's 6-week window: on or before the 1st of `month`,
@@ -4412,5 +4810,89 @@ mod tests {
         assert_eq!(cell_index_at_point(700.0, 600.0, 50.0, 600.0), None);
         // Degenerate sizes.
         assert_eq!(cell_index_at_point(0.0, 600.0, 0.0, 0.0), None);
+    }
+
+    /// CAL-03: a block's span is its display-zone minutes since local
+    /// midnight, with each end clamped to the shown day; all-day events fill
+    /// the lane and events wholly outside the day are dropped.
+    #[test]
+    fn schedule_block_span_clamps_each_end_to_the_day() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        let timed = occ("Standup", day.and_hms_opt(9, 0, 0).unwrap(), day.and_hms_opt(10, 0, 0).unwrap(), false);
+        assert_eq!(schedule_block_span(day, &timed), Some((9 * 60, 10 * 60)));
+
+        let all_day = occ("Holiday", day.and_hms_opt(0, 0, 0).unwrap(), (day + Duration::days(1)).and_hms_opt(0, 0, 0).unwrap(), true);
+        assert_eq!(schedule_block_span(day, &all_day), Some((0, 1440)));
+
+        // A cross-midnight event is clipped to the shown day.
+        let overnight = occ("Red-eye", (day - Duration::days(1)).and_hms_opt(22, 0, 0).unwrap(), day.and_hms_opt(2, 0, 0).unwrap(), false);
+        assert_eq!(schedule_block_span(day, &overnight), Some((0, 2 * 60)));
+
+        // An end at exactly midnight renders as the full last minute.
+        let to_midnight = occ("Late", day.and_hms_opt(23, 0, 0).unwrap(), (day + Duration::days(1)).and_hms_opt(0, 0, 0).unwrap(), false);
+        assert_eq!(schedule_block_span(day, &to_midnight), Some((23 * 60, 1440)));
+
+        // A next-day event does not belong to this day's lane.
+        let outside = occ("Later", (day + Duration::days(1)).and_hms_opt(1, 0, 0).unwrap(), (day + Duration::days(1)).and_hms_opt(2, 0, 0).unwrap(), false);
+        assert_eq!(schedule_block_span(day, &outside), None);
+    }
+
+    /// CAL-03: the axis maps midnight to the gutter edge and 24:00 to the
+    /// widget edge, and a block's rectangle hit-tests back to its lane/block.
+    #[test]
+    fn schedule_axis_and_block_rect_agree_with_hit_testing() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        let width = SCHEDULE_LABEL_WIDTH + 720.0;
+        assert_eq!(schedule_x_for_minutes(0.0, width), SCHEDULE_LABEL_WIDTH);
+        assert_eq!(schedule_x_for_minutes(1440.0, width), width);
+
+        let block = ScheduleBlock {
+            occ: occ("Standup", day.and_hms_opt(9, 0, 0).unwrap(), day.and_hms_opt(10, 0, 0).unwrap(), false),
+            start_minutes: 9 * 60,
+            end_minutes: 10 * 60,
+        };
+        let (x, y, w, h) = schedule_block_rect(0, &block, width);
+        assert_eq!(y, SCHEDULE_HEADER_HEIGHT + SCHEDULE_BLOCK_INSET);
+        assert_eq!(h, SCHEDULE_ROW_HEIGHT - 2.0 * SCHEDULE_BLOCK_INSET);
+        assert!(w > 0.0 && x > SCHEDULE_LABEL_WIDTH);
+
+        let state = ScheduleState {
+            lanes: vec![ScheduleLane {
+                label: "Work".to_string(),
+                color: "#3584e4".to_string(),
+                blocks: vec![block],
+            }],
+            date: day,
+            work_start: 8,
+            work_end: 18,
+            work_days: Vec::new(),
+        };
+        assert_eq!(schedule_block_at(&state, width, x + w / 2.0, y + h / 2.0), Some((0, 0)));
+        // Nothing in the hour-axis header.
+        assert_eq!(schedule_block_at(&state, width, x + w / 2.0, SCHEDULE_HEADER_HEIGHT - 1.0), None);
+    }
+
+    /// CAL-02: the standalone List view looks a rolling 30 days ahead.
+    #[test]
+    fn list_window_spans_thirty_days_forward() {
+        let anchor = NaiveDate::from_ymd_opt(2026, 10, 15).unwrap();
+        assert_eq!(list_window_end(anchor), NaiveDate::from_ymd_opt(2026, 11, 14).unwrap());
+    }
+
+    /// CAL-02/CAL-03: the List and Schedule pages are reachable through the
+    /// shared view switcher and reported back by `active_view`.
+    #[test]
+    fn view_switcher_reaches_list_and_schedule() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let prefs = crate::settings::CalendarPreferences::default();
+        let main = build_main(&prefs);
+        set_view(&main, "list");
+        assert_eq!(active_view(&main), "list");
+        set_view(&main, "schedule");
+        assert_eq!(active_view(&main), "schedule");
+        set_view(&main, "month");
+        assert_eq!(active_view(&main), "month");
     }
 }

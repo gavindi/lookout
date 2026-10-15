@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.197" date="2026-10-15">
+      <description>
+        <p>The calendar gains two new views. Schedule lays your calendars out as rows on a horizontal timeline, so the whole day reads at a glance across them, and List is a plain chronological list of what is coming up. Both are one click away in the calendar's view switcher.</p>
+      </description>
+    </release>
     <release version="0.9.196" date="2026-10-15">
       <description>
         <p>Forwarding now keeps what came with the message: its files and inline pictures ride along, and a rich original keeps its formatting. The Forward button is now a menu - its dropdown adds "Forward as attachment", which sends the whole original message as an attachment instead; the same option sits in the reading pane's More menu.</p>
