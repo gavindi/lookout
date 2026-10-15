@@ -83,6 +83,7 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            mentions: false,
             importance: Default::default(),
             sensitivity: Default::default(),
             list_id: None,

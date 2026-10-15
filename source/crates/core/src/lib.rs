@@ -46,6 +46,7 @@ pub use interop::{
     NOT_JUNK_KEYWORD, TNEF_CONTENT_TYPE,
 };
 pub use interop::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
+pub use interop::MentionMatcher;
 pub use mailbox::{display_name, Mailbox, MailboxRole};
 pub use rules::{Rule, RuleAction, RuleBackend, RuleCondition, RuleContext, RuleTarget, SizeComparison};
 pub use signature::Signature;

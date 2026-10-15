@@ -1,0 +1,16 @@
+From: "Priya Raman" <priya@contoso.example>
+To: "Gavin Graham" <gavin@contoso.example>
+Subject: Re: Q4 planning
+Date: Wed, 14 Oct 2026 09:12:00 +0000
+Message-ID: <mentions-1@contoso.example>
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+
+<html>
+<body>
+<p>Hi team,</p>
+<p><span class="mention" data-mention="gavin">@Gavin</span> can you own the budget slide?</p>
+<p>If it slips, ping me at <a href="mailto:priya@contoso.example">priya@contoso.example</a>.</p>
+<p>Thanks,<br>Priya</p>
+</body>
+</html>

@@ -80,6 +80,8 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         account_id: AccountId("test-account".to_string()),
         display_name: "Test Account".to_string(),
         email: "testuser@localhost".to_string(),
+        mention_addresses: vec!["testuser@localhost".to_string()],
+        mention_names: vec!["Test Account".to_string()],
         imap: EndpointConfig {
             host: host.clone(),
             port: imaps_port,
@@ -722,6 +724,8 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
         account_id: AccountId("test-account".to_string()),
         display_name: "Test Account".to_string(),
         email: "testuser@localhost".to_string(),
+        mention_addresses: vec!["testuser@localhost".to_string()],
+        mention_names: vec!["Test Account".to_string()],
         imap: EndpointConfig {
             host: host.clone(),
             port: imaps_port,

@@ -42,7 +42,7 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 27 | 6 | 11 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, and rules across client, Graph and Sieve backends). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
+| Mail (5.1) | 29 | 5 | 10 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, `@mentions` detection with a filter, and rules across client, Graph and Sieve backends). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 15 | 3 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
 | Calendar (5.3) | 23 | 8 | 4 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, the organizer's own cache as a fallback, or Graph `getSchedule` for Microsoft 365, 5.1) with Suggested times; the editor's room suggestions from Graph `places` remain to be wired. |
 | People (5.4) | 9 | 1 | 2 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). No CSV or directory. |
@@ -50,7 +50,7 @@ Counts are tallied from the §5 tables.
 | Accounts / Microsoft 365 (5.6) | 3 | 1 | 4 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar is now native via Graph** (5.1). No Graph contacts, To Do, auto-reply or Focused Inbox yet. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **92** | **24** | **36** | **5** | ~59% at parity, ~15% partial |
+| **Total** | **94** | **23** | **35** | **5** | ~60% at parity, ~15% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -240,7 +240,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-05 | Reading pane right / bottom / off | `layout-reading-pane` boolean plus `layout-reading-pane-position`; View ribbon dropdown and Settings row | ✅ | — |
 | M-06 | Density and message preview lines | `layout-vertical-spacing` tight/medium/loose; `layout-message-preview-lines` 0–3; `mail-show-sender-images` (vCard photo, else initials) | ✅ | Density still uses Lookout's names (UX-83) |
 | M-07 | Sort / arrange by | `message_list.rs` `SortKey { Date, Sender, Subject, Size, Importance, Flag, Category, To, Attachments }`; group headers derived from every sort key (`GroupKey`) | 🟡 | No per-column sortable headers yet (U.4) |
-| M-08 | Filter menu | `FilterSet`: Unread, Flagged (open follow-up flags), Pinned, Has files, High importance, Categorized, To me (combinable check items) | 🟡 | @mentions me pending (M-25/2.13) |
+| M-08 | Filter menu | `FilterSet`: Unread, Flagged (open follow-up flags), Pinned, Has files, High importance, Categorized, To me, Mentions me (combinable check items) | ✅ | — |
 | M-09 | Categories (named, coloured, multiple) | `app/src/categories.rs` shared master list (`$Lookout-tag-*` keywords), Categorize menu with preset-colour dots, drop-on-category, editor (name, one of Outlook's 25 presets, classic shortcut); on Microsoft 365 synced with Graph `masterCategories`; stored in `settings.json` (2.1) | ✅ | — |
 | M-10 | Flag for follow-up with dates | Message-level flag state (keywords, local fallback, Graph `flag` on Microsoft 365, §4.2); Flag ▾ (Today, Tomorrow, This week, Next week, No date, Custom date…, Mark complete, Clear flag) following the calendar's week start and work days; Insert toggles; row flag icon and due label (red once overdue); Flag sort and groups by due (Overdue … Later, No date, Completed); "Follow up. Due by …" bar; Undo; Pin stays separate | ✅ | Incoming `X-Message-Flag`/`Reply-By` not shown yet (UX-33) |
 | M-11 | Snooze | Snooze ▾ presets (Later today, Tomorrow, This weekend, Next week, Choose a date…); synced via the server "Scheduled" folder plus a wake-time keyword, local fallback where keywords aren't stored (§4.2); wakes on time back to the Inbox, unread; "Snoozed until …" bar with Unsnooze; Undo | ✅ | Outlook's own snooze isn't visible over IMAP (⛔) |
@@ -257,7 +257,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | M-22 | Mark-as-read options | Setting: when selection changes (default), when opened, after N seconds, never | ✅ | — |
 | M-23 | Read receipts | Request toggle, banner, RFC 8098 MDN (`mail/src/send.rs`) | ✅ | Add "always / never / ask" policy |
 | M-24 | Automatic replies (OOF) | — | ❌ | Graph or Sieve vacation |
-| M-25 | @mentions | — | ❌ | Highlight "@Me" in the list; filter |
+| M-25 | @mentions | A message that mentions one of the user's identities (an `mailto:`/bare address token, or `@Name`) is flagged from its body snippet and marked with an `@` glyph in the list; the **Mentions me** filter and `is:mentions` search match it. Detection runs where the body is already parsed (the preview pass, new-message fetch, on-demand open) and the account's identity aliases count as "me" (`core/src/interop/mentions.rs`, `EmailSummary.mentions`, 2.13) | ✅ | Over IMAP, best-effort: unflagged until a body snippet is fetched (same window as previews) |
 | M-26 | Message recall | — | ⛔ | Exchange-internal only |
 | M-27 | Delivery receipts (DSN) | — | ❌ | §4.1 |
 | M-28 | Print | `print_visible_message` | ✅ | — |
@@ -642,7 +642,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 2.10 | ✅ ~~My Templates~~ | C-17 | Stored HTML snippets (`AppConfig.templates`, `lookout_core::MailTemplate`); managed in Settings → Mail and inserted from the composer's **My Templates** menu | S |
 | 2.11 | Automatic replies | M-24 | Settings page: on/off, schedule, internal/external messages; Graph `automaticRepliesSetting` or Sieve `vacation`; banner in Mail while active | M |
 | 2.12 | Focused Inbox | M-03 | Microsoft 365: read `inferenceClassification`, "Move to Focused/Other" writes overrides. Elsewhere, optional local classifier (sender seen in Sent/contacts = Focused; bulk/List-Id = Other). Tabs above the Inbox list | L |
-| 2.13 | @mentions | M-25 | Detect the user's address in body `mailto:` anchors / `@Name`; list glyph plus filter | S |
+| 2.13 | ✅ ~~@mentions~~ | M-25 | Detect the user's address in body `mailto:` anchors / `@Name`; list glyph plus filter | S |
 
 ### Phase 3: Calendar and meetings
 

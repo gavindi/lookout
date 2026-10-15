@@ -55,6 +55,8 @@ async fn main() -> anyhow::Result<()> {
         account_id: AccountId(account.account_id.0.clone()),
         display_name: account.display_name.clone(),
         email: account.email.clone(),
+        mention_addresses: vec![account.email.clone()],
+        mention_names: vec![account.display_name.clone()],
         imap: EndpointConfig {
             host: account.imap.host.clone(),
             port: account.imap.port.unwrap_or(993),

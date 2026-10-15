@@ -757,6 +757,10 @@ pub enum AccountEvent {
     PreviewsFetched {
         mailbox: MailboxId,
         previews: HashMap<Uid, String>,
+        /// `@mentions` verdicts (M-25) for the uids whose fetched body
+        /// mentions one of the user's identities - only the `true` entries, so
+        /// a uid absent from the map keeps its cached (default `false`) value.
+        mentions: HashMap<Uid, bool>,
     },
     BodyFetched {
         mailbox: MailboxId,
@@ -978,6 +982,16 @@ pub trait CredentialProvider: Send + Sync {
 /// against every other account's session too.
 type CacheHandle = std::sync::Arc<Option<crate::cache::Cache>>;
 
+/// The account's `@mentions` detection context (M-25), installed on the cache
+/// by `run_account_session`, or an empty matcher (matching nothing) when the
+/// session runs without a cache.
+fn mention_matcher(cache: &CacheHandle) -> lookout_core::MentionMatcher {
+    match cache.as_ref() {
+        Some(cache) => cache.mention_matcher(),
+        None => lookout_core::MentionMatcher::default(),
+    }
+}
+
 /// One row of the local outbox as the UI lists it (item 1.14): the payload's
 /// display fields, without the raw message bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1164,6 +1178,14 @@ pub async fn run_account_session(
             None
         }
     });
+
+    // The `@mentions` detection context (M-25): the account's own addresses
+    // and names, compiled once. Hung off the cache handle so every body-parsing
+    // path (the preview pass, the new-message fetch, on-demand bodies) can read
+    // it without threading a matcher through `sync_mailbox`'s many call sites.
+    if let Some(c) = cache.as_ref() {
+        c.set_mention_matcher(lookout_core::MentionMatcher::new(&config.mention_addresses, &config.mention_names));
+    }
 
     // Fast first paint: emit whatever's cached from the previous session
     // before the network connection even starts. This is immediately
@@ -2228,12 +2250,38 @@ async fn connect_and_run(
                         elapsed_ms = started.elapsed().as_millis(),
                         "FetchBody: batch ready"
                     );
+                    // Derive the `@mentions` verdict from each body now it's in
+                    // hand (M-25), so opening an older message fills in its
+                    // list glyph and the Mentions filter on demand.
+                    let matcher = mention_matcher(cache);
+                    let mut mentions: HashMap<Uid, bool> = HashMap::new();
                     for (uid, body) in bodies {
+                        if crate::body::mentions_in_body(&matcher, &body) {
+                            mentions.insert(uid, true);
+                        }
                         let _ = events
                             .send(AccountEvent::BodyFetched {
                                 mailbox: mailbox.clone(),
                                 uid,
                                 body,
+                            })
+                            .await;
+                    }
+                    if !mentions.is_empty() {
+                        if let Some(Err(e)) = cache_op(cache, {
+                            let mailbox = mailbox.clone();
+                            let mentions = mentions.clone();
+                            move |c| c.update_previews(&mailbox, &HashMap::new(), &mentions)
+                        })
+                        .await
+                        {
+                            tracing::warn!("failed to cache mentions for {mailbox}: {e}");
+                        }
+                        let _ = events
+                            .send(AccountEvent::PreviewsFetched {
+                                mailbox: mailbox.clone(),
+                                previews: HashMap::new(),
+                                mentions,
                             })
                             .await;
                     }
@@ -6389,7 +6437,9 @@ async fn sync_mailbox(
             }
             match fetch_bodies_batch(cache, session, mailbox_id, uidvalidity, &inline_uids, &structures).await {
                 Ok(bodies) => {
+                    let matcher = mention_matcher(cache);
                     let mut previews_from_bodies: HashMap<Uid, String> = HashMap::new();
+                    let mut mentions_from_bodies: HashMap<Uid, bool> = HashMap::new();
                     for (uid, body) in &bodies {
                         // Warms the reading pane's in-memory body cache, so a
                         // click on the just-arrived message renders without
@@ -6404,20 +6454,28 @@ async fn sync_mailbox(
                         if let Some(preview) = crate::body::preview_from_body(body) {
                             previews_from_bodies.insert(*uid, preview);
                         }
+                        if crate::body::mentions_in_body(&matcher, body) {
+                            mentions_from_bodies.insert(*uid, true);
+                        }
                     }
-                    if !previews_from_bodies.is_empty() {
+                    if !previews_from_bodies.is_empty() || !mentions_from_bodies.is_empty() {
                         // Patch the in-memory summaries so the preview pass
                         // below skips these uids, then persist and emit the
-                        // derived previews exactly as `fetch_previews` would.
+                        // derived previews/mentions exactly as `fetch_previews`
+                        // would.
                         for msg in messages.iter_mut() {
                             if let Some(p) = previews_from_bodies.get(&msg.uid) {
                                 msg.preview = Some(p.clone());
+                            }
+                            if let Some(m) = mentions_from_bodies.get(&msg.uid) {
+                                msg.mentions = *m;
                             }
                         }
                         if let Some(Err(e)) = cache_op(cache, {
                             let mailbox_id = mailbox_id.clone();
                             let previews = previews_from_bodies.clone();
-                            move |c| c.update_previews(&mailbox_id, &previews)
+                            let mentions = mentions_from_bodies.clone();
+                            move |c| c.update_previews(&mailbox_id, &previews, &mentions)
                         })
                         .await
                         {
@@ -6427,6 +6485,7 @@ async fn sync_mailbox(
                             .send(AccountEvent::PreviewsFetched {
                                 mailbox: mailbox_id.clone(),
                                 previews: previews_from_bodies,
+                                mentions: mentions_from_bodies,
                             })
                             .await;
                     }
@@ -6681,29 +6740,44 @@ async fn fetch_previews(
         fetches.extend(chunk);
     }
 
+    // `@mentions` is derived from the same fetched bytes (M-25); the context
+    // is empty (matching nothing) when the session couldn't open a cache.
+    let matcher = mention_matcher(cache);
+
     let mut previews = HashMap::new();
+    let mut mentions = HashMap::new();
     for fetch in &fetches {
         let (Some(uid), Some(raw)) = (fetch.uid, fetch.body()) else { continue };
         if let Some(preview) = preview_from_raw(raw) {
             previews.insert(Uid(uid), preview);
         }
+        if crate::body::mentions_in_raw(&matcher, raw) {
+            mentions.insert(Uid(uid), true);
+        }
     }
-    if previews.is_empty() {
+    if previews.is_empty() && mentions.is_empty() {
         return Ok(());
     }
 
-    tracing::debug!(mailbox = %mailbox_id, count = previews.len(), "fetched message previews");
+    tracing::debug!(mailbox = %mailbox_id, previews = previews.len(), mentions = mentions.len(), "fetched message previews");
     let mailbox_id = mailbox_id.clone();
     let cached = cache_op(cache, {
         let mailbox_id = mailbox_id.clone();
         let previews = previews.clone();
-        move |c| c.update_previews(&mailbox_id, &previews)
+        let mentions = mentions.clone();
+        move |c| c.update_previews(&mailbox_id, &previews, &mentions)
     })
     .await;
     if let Some(Err(e)) = cached {
         tracing::warn!("failed to cache previews for {mailbox_id}: {e}");
     }
-    let _ = events.send(AccountEvent::PreviewsFetched { mailbox: mailbox_id, previews }).await;
+    let _ = events
+        .send(AccountEvent::PreviewsFetched {
+            mailbox: mailbox_id,
+            previews,
+            mentions,
+        })
+        .await;
     Ok(())
 }
 
@@ -7440,6 +7514,7 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            mentions: false,
             importance: Default::default(),
             sensitivity: Default::default(),
             list_id: None,
@@ -7822,6 +7897,7 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            mentions: false,
             importance: Default::default(),
             sensitivity: Default::default(),
             list_id: None,

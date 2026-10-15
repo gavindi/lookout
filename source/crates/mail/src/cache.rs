@@ -51,6 +51,13 @@ pub struct Cache {
     /// as `attachments_dir`: raw messages are opaque bytes served only for
     /// export, so a deterministic path is the whole index.
     messages_dir: std::path::PathBuf,
+    /// `@mentions` detection context (M-25): the user's own addresses and
+    /// names, compiled once at session start. This is configuration, not
+    /// cached data - the session installs it wherever it parses a body
+    /// snippet, and hanging it off the per-account handle avoids threading a
+    /// matcher through every `sync_mailbox` call site. The app's read-side
+    /// handle leaves it empty, matching nothing.
+    mention_matcher: std::sync::RwLock<lookout_core::MentionMatcher>,
 }
 
 /// State of a row in the local outbox (see [`OutboxEntry`]).
@@ -660,10 +667,15 @@ impl Cache {
         // full re-sync. Version 5: `EmailSummary` gained importance,
         // sensitivity and `List-Id`, read from a selected-header block only
         // newer builds request - cached rows can't be back-filled, so they are
-        // wiped once and re-fetched with the header block. Version 5 subsumes
-        // version 1 (any older cache is also below 5). Snoozes, addresses and
+        // wiped once and re-fetched with the header block. Version 7:
+        // `EmailSummary` gained `mentions` (M-25), derived from the body
+        // snippet the preview pass fetches - an already-cached row carries a
+        // preview but no mention verdict, and the pass only runs for rows
+        // *without* a preview, so older rows would stay unflagged forever;
+        // wiping forces one full re-sync whose preview pass re-inspects every
+        // body. Each version subsumes the earlier ones. Snoozes, addresses and
         // the mailbox list are untouched.
-        const ENVELOPE_CACHE_VERSION: i64 = 5;
+        const ENVELOPE_CACHE_VERSION: i64 = 7;
         // One-time body-cache migration: `bodies` rows changed format from
         // raw RFC 5322 bytes to serialized `EmailBody` JSON (the partial-fetch
         // path never assembles a whole raw message), so pre-partial-fetch
@@ -674,9 +686,10 @@ impl Cache {
         // Authentication-Results verdicts, item 6.1). Old rows decode with it
         // `None`, and since it is *derived* from the raw headers at assembly
         // time it can't be back-filled from the stored JSON, so bodies are
-        // wiped once and reassembled. The value must stay above
-        // `ENVELOPE_CACHE_VERSION` (5), or the shared `user_version`
-        // high-water mark would swallow the bump.
+        // wiped once and reassembled. A *body* bump must stay above
+        // `ENVELOPE_CACHE_VERSION`, or the shared `user_version` high-water
+        // mark would swallow it (the envelope bump to 7 already exceeds this
+        // value).
         const BODY_CACHE_VERSION: i64 = 6;
         // Version 3: the whole-message fallback path (`parse_body`) used to
         // number attachment parts by enumerate counter ("0", "1", ...) instead
@@ -715,7 +728,20 @@ impl Cache {
             conn: Mutex::new(conn),
             attachments_dir,
             messages_dir,
+            mention_matcher: std::sync::RwLock::new(lookout_core::MentionMatcher::default()),
         })
+    }
+
+    /// Installs the `@mentions` detection context for this account's session
+    /// (M-25). `run_account_session` calls this once, from its `AccountConfig`.
+    pub fn set_mention_matcher(&self, matcher: lookout_core::MentionMatcher) {
+        *self.mention_matcher.write().unwrap() = matcher;
+    }
+
+    /// The `@mentions` detection context, or an empty matcher (matching
+    /// nothing) if the session hasn't installed one.
+    pub fn mention_matcher(&self) -> lookout_core::MentionMatcher {
+        self.mention_matcher.read().unwrap().clone()
     }
 
     /// One-time FTS backfill: populates an empty `search_fts` from the
@@ -1813,10 +1839,16 @@ impl Cache {
         Ok(all_found)
     }
 
-    /// Patches in a fetched preview snippet for each uid in `previews`,
-    /// without the whole-mailbox diff/upsert/expunge-purge `replace_messages`
-    /// does - `fetch_previews` calls this for the up-to-`PREVIEW_FETCH_LIMIT`
-    /// messages it just fetched a snippet for, not the whole mailbox.
+    /// Patches in a fetched preview snippet (`previews`) and/or an `@mentions`
+    /// verdict (`mentions`, M-25) for each uid, without the whole-mailbox
+    /// diff/upsert/expunge-purge `replace_messages` does - `fetch_previews`
+    /// calls this for the up-to-`PREVIEW_FETCH_LIMIT` messages it just fetched
+    /// a snippet for, and a body fetch calls it with a mention-only map, not
+    /// the whole mailbox.
+    ///
+    /// A uid may appear in either map or both (the preview pass derives both
+    /// from one fetch), so the two are walked as a union: each row is parsed
+    /// and rewritten once.
     ///
     /// Deliberately does not touch `search_fts`: unlike `replace_messages`,
     /// which re-indexes a changed row to preserve or seed the search index,
@@ -1830,14 +1862,15 @@ impl Cache {
     /// any uid is missing from the cached window (e.g. expunged between the
     /// fetch and this write) - the caller only logs it, since a missing
     /// preview for a message that no longer exists needs no reconciliation.
-    pub fn update_previews(&self, mailbox_id: &MailboxId, previews: &HashMap<Uid, String>) -> Result<bool> {
+    pub fn update_previews(&self, mailbox_id: &MailboxId, previews: &HashMap<Uid, String>, mentions: &HashMap<Uid, bool>) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut all_found = true;
         {
             let mut select = tx.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
             let mut update = tx.prepare("UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3")?;
-            for (uid, preview) in previews {
+            let uids: HashSet<&Uid> = previews.keys().chain(mentions.keys()).collect();
+            for uid in uids {
                 let mut rows = select.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
                 let Some(data) = rows.next().transpose()? else {
                     all_found = false;
@@ -1847,7 +1880,12 @@ impl Cache {
                     all_found = false;
                     continue;
                 };
-                summary.preview = Some(preview.clone());
+                if let Some(preview) = previews.get(uid) {
+                    summary.preview = Some(preview.clone());
+                }
+                if let Some(value) = mentions.get(uid) {
+                    summary.mentions = *value;
+                }
                 let data = serde_json::to_string(&summary)?;
                 update.execute(rusqlite::params![data, mailbox_id.0, uid.0])?;
             }
@@ -2929,25 +2967,25 @@ mod tests {
         assert!(cache.load_messages(&mailbox_id).unwrap().is_empty(), "a pre-migration cache must be wiped");
         assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), "a pre-migration body must be wiped");
 
-        // Simulate a version-5 database (envelopes current, but bodies stored
-        // before `EmailBody.auth_results` was parsed): the bodies are wiped so
-        // each is reassembled with the parsed verdicts, while the current
-        // envelope rows survive.
+        // Simulate a version-6 database (bodies current at `BODY_CACHE_VERSION`,
+        // envelopes one behind at `ENVELOPE_CACHE_VERSION`): the envelope rows
+        // are wiped so the preview/mention pass re-inspects each body (M-25),
+        // while the bodies themselves survive.
         cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 3, None)]).unwrap();
-        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("stale body")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("kept body")).unwrap();
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 5).unwrap();
+            conn.pragma_update(None, "user_version", 6).unwrap();
         }
-        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("stale body")).unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("kept body")).unwrap();
         let cache = Cache::open(&account_id).unwrap();
         assert!(
-            !cache.load_messages(&mailbox_id).unwrap().is_empty(),
-            "a version-5 cache's envelope rows must survive"
+            cache.load_messages(&mailbox_id).unwrap().is_empty(),
+            "a version-6 cache's envelope rows must be wiped for the mention pass"
         );
         assert!(
-            !cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(),
-            "a version-5 body must be wiped for the auth_results re-parse"
+            cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(),
+            "a version-6 cache's bodies must survive the envelope-only bump"
         );
 
         let _ = std::fs::remove_file(path);
@@ -3199,6 +3237,7 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: preview.map(|p| p.to_string()),
+            mentions: false,
             importance: Default::default(),
             sensitivity: Default::default(),
             list_id: None,
@@ -3396,7 +3435,7 @@ mod tests {
         cache.replace_messages(&mailbox_id, UidValidity(1), &messages).unwrap();
 
         let previews = HashMap::from([(Uid(1), "new snippet for 1".to_string())]);
-        assert!(cache.update_previews(&mailbox_id, &previews).unwrap());
+        assert!(cache.update_previews(&mailbox_id, &previews, &HashMap::new()).unwrap());
 
         let reloaded = cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap();
         assert_eq!(reloaded[&Uid(1)].preview.as_deref(), Some("new snippet for 1"));
@@ -3407,6 +3446,30 @@ mod tests {
         assert_eq!(reloaded[&Uid(2)].preview, None);
         assert_eq!(reloaded[&Uid(2)].subject.as_deref(), Some("subject 2"));
         assert_eq!(reloaded[&Uid(3)].preview.as_deref(), Some("already had one"));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_previews_patches_mentions_without_a_preview() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+
+        let messages = vec![sample_summary(&mailbox_id, 1, Some("kept")), sample_summary(&mailbox_id, 2, Some("kept"))];
+        cache.replace_messages(&mailbox_id, UidValidity(1), &messages).unwrap();
+
+        // A mention-only patch (the on-demand body-fetch path): the preview map
+        // is empty, so `update_previews` must still walk the mention uid.
+        let mentions = HashMap::from([(Uid(1), true)]);
+        assert!(cache.update_previews(&mailbox_id, &HashMap::new(), &mentions).unwrap());
+
+        let reloaded = cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap();
+        assert!(reloaded[&Uid(1)].mentions);
+        assert!(!reloaded[&Uid(2)].mentions);
+        // The preview is untouched by a mention-only patch.
+        assert_eq!(reloaded[&Uid(1)].preview.as_deref(), Some("kept"));
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
@@ -3424,7 +3487,7 @@ mod tests {
         // Uid 99 was never synced into this mailbox (e.g. expunged between
         // the preview fetch and this write).
         let previews = HashMap::from([(Uid(1), "ok".to_string()), (Uid(99), "gone".to_string())]);
-        assert!(!cache.update_previews(&mailbox_id, &previews).unwrap());
+        assert!(!cache.update_previews(&mailbox_id, &previews, &HashMap::new()).unwrap());
 
         let reloaded = cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap();
         assert_eq!(reloaded[&Uid(1)].preview.as_deref(), Some("ok"));
@@ -4325,13 +4388,14 @@ mod tests {
         // Create a database with envelopes + a body but no search index at all,
         // exactly what a pre-search build left on disk (user_version current:
         // the envelope/body-format and header migrations done, the FTS index
-        // absent).
+        // absent). A comfortably-high version marks it current without having
+        // to track `ENVELOPE_CACHE_VERSION`/`BODY_CACHE_VERSION` here.
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 "
-                PRAGMA user_version = 6;
+                PRAGMA user_version = 100;
                 CREATE TABLE messages (
                     mailbox_id TEXT NOT NULL,
                     uid INTEGER NOT NULL,

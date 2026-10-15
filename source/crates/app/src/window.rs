@@ -165,6 +165,9 @@ struct MessageRowWidgets {
     /// own pair.
     thread_attachment_icon: gtk::Image,
     thread_calendar_icon: gtk::Image,
+    /// `@` glyph on the conversation-header row when any message in the
+    /// thread mentions the user (M-25); hidden otherwise.
+    thread_mention_icon: gtk::Image,
     /// Importance glyph on the conversation-header row (`!` high, `↓` low);
     /// hidden on normal-importance threads.
     thread_importance_icon: gtk::Image,
@@ -199,6 +202,9 @@ struct MessageRowWidgets {
     /// their position aligned across rows.
     attachment_icon: gtk::Image,
     calendar_icon: gtk::Image,
+    /// `@` glyph shown when the message body mentions the user (M-25); hidden
+    /// otherwise, so it takes no width on the common row.
+    mention_icon: gtk::Image,
     /// Importance glyph (`!` high, `↓` low), right after the sender column
     /// next to the attachment/calendar pair; hidden on normal-importance
     /// messages.
@@ -2989,6 +2995,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .tooltip_text("Meeting invite")
             .visible(false)
             .build();
+        // The `@` badge for a message that mentions the user (M-25). No
+        // standard `at-symbolic` ships with Adwaita, so resolve the closest
+        // themed glyph - the UX-80 icon decision can bundle a proper one later.
+        let mention_icon = gtk::Image::builder()
+            .icon_name(themed_icon_name(&["at-symbolic", "chat-message-new-symbolic", "user-info-symbolic"]))
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Mentions you")
+            .visible(false)
+            .build();
         let importance_icon = gtk::Image::builder()
             .icon_name("emblem-important-symbolic")
             .pixel_size(12)
@@ -3020,6 +3037,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         top_row.append(&sender_label);
         top_row.append(&attachment_icon);
         top_row.append(&calendar_icon);
+        top_row.append(&mention_icon);
         top_row.append(&importance_icon);
         top_row.append(&subject_label);
         top_row.append(&pin_icon);
@@ -3105,6 +3123,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .tooltip_text("Meeting invite")
             .visible(false)
             .build();
+        let thread_mention_icon = gtk::Image::builder()
+            .icon_name(themed_icon_name(&["at-symbolic", "chat-message-new-symbolic", "user-info-symbolic"]))
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Mentions you")
+            .visible(false)
+            .build();
         let thread_importance_icon = gtk::Image::builder()
             .icon_name("emblem-important-symbolic")
             .pixel_size(12)
@@ -3128,6 +3154,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         thread_top.append(&thread_sender);
         thread_top.append(&thread_attachment_icon);
         thread_top.append(&thread_calendar_icon);
+        thread_top.append(&thread_mention_icon);
         thread_top.append(&thread_importance_icon);
         thread_top.append(&thread_subject);
         thread_top.append(&thread_count);
@@ -3548,6 +3575,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     thread_sender,
                     thread_attachment_icon,
                     thread_calendar_icon,
+                    thread_mention_icon,
                     thread_importance_icon,
                     thread_subject,
                     thread_count,
@@ -3563,6 +3591,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     sender_label,
                     attachment_icon,
                     calendar_icon,
+                    mention_icon,
                     importance_icon,
                     subject_label,
                     pin_icon,
@@ -3683,6 +3712,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // attachment is both.
                 widgets.attachment_icon.set_visible(summary.has_attachment);
                 widgets.calendar_icon.set_visible(summary.has_calendar);
+                widgets.mention_icon.set_visible(summary.mentions);
                 let (imp_icon, imp_tip) = importance_icon_and_tooltip(summary.importance);
                 widgets.importance_icon.set_icon_name(Some(imp_icon));
                 widgets.importance_icon.set_tooltip_text(Some(imp_tip));
@@ -3765,6 +3795,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.thread_sender.set_label(&thread.sender);
                 widgets.thread_attachment_icon.set_visible(thread.has_attachment);
                 widgets.thread_calendar_icon.set_visible(thread.has_calendar);
+                widgets.thread_mention_icon.set_visible(thread.has_mentions);
                 let (imp_icon, imp_tip) = importance_icon_and_tooltip(thread.importance);
                 widgets.thread_importance_icon.set_icon_name(Some(imp_icon));
                 widgets.thread_importance_icon.set_tooltip_text(Some(imp_tip));
@@ -12173,10 +12204,13 @@ fn connect_account(
 ) {
     let account_id = AccountId(account.account_id.0.clone());
     let display_name = account.display_name.clone();
+    let (mention_addresses, mention_names) = mention_identity_lists(&state.borrow().app_config.borrow().identities_for_account(&account_id, &display_name, &account.email));
     let config = AccountConfig {
         account_id: account_id.clone(),
         display_name: account.display_name.clone(),
         email: account.email.clone(),
+        mention_addresses,
+        mention_names,
         imap: EndpointConfig {
             host: account.imap.host.clone(),
             port: account.imap.port.unwrap_or(993),
@@ -12650,7 +12684,7 @@ fn spawn_account_event_loop(
                     AccountEvent::PrefetchFinished { mailbox } => {
                         set_mailbox_prefetching(&state, &mailbox, false);
                     }
-                    AccountEvent::PreviewsFetched { mailbox, previews } => {
+                    AccountEvent::PreviewsFetched { mailbox, previews, mentions } => {
                         // Keep the unified-view snapshot current regardless of
                         // what's on screen - it's what the 3 full-rebuild call
                         // sites (disconnect, exit_search, enter_unified_inbox)
@@ -12659,6 +12693,9 @@ fn spawn_account_event_loop(
                             for m in snapshot.iter_mut() {
                                 if let Some(p) = previews.get(&m.uid) {
                                     m.preview = Some(p.clone());
+                                }
+                                if let Some(mentions) = mentions.get(&m.uid) {
+                                    m.mentions = *mentions;
                                 }
                             }
                         }
@@ -12678,7 +12715,7 @@ fn spawn_account_event_loop(
                             }
                         };
                         if display {
-                            patch_previews(&state, &message_list, &mailbox, &previews);
+                            patch_previews(&state, &message_list, &mailbox, &previews, &mentions);
                         }
                     }
                     AccountEvent::NewMessages { mailbox, messages } => {
@@ -13338,10 +13375,13 @@ fn connect_other_account(
 ) {
     let account_id = AccountId(account.id.clone());
     let display_name = account.display_name.clone();
+    let (mention_addresses, mention_names) = mention_identity_lists(&state.borrow().app_config.borrow().identities_for_account(&account_id, &display_name, &account.email));
     let config = AccountConfig {
         account_id: account_id.clone(),
         display_name: account.display_name.clone(),
         email: account.email.clone(),
+        mention_addresses,
+        mention_names,
         imap: EndpointConfig {
             host: account.imap_host.clone(),
             port: account.imap_port,
@@ -20512,6 +20552,7 @@ enum Refiner {
     Read,
     Flagged,
     Pinned,
+    Mentions,
     Category(String),
     Received(String),
     Size(String),
@@ -20540,6 +20581,9 @@ fn refiners_of(query: &SearchQuery) -> Vec<Refiner> {
     if query.is_pinned {
         out.push(Refiner::Pinned);
     }
+    if query.is_mentions {
+        out.push(Refiner::Mentions);
+    }
     out.extend(query.category.iter().cloned().map(Refiner::Category));
     if let Some(received) = &query.received {
         out.push(Refiner::Received(received.label.clone()));
@@ -20566,6 +20610,7 @@ fn refiner_label(refiner: &Refiner) -> String {
         Refiner::Read => "Read".to_string(),
         Refiner::Flagged => "Flagged".to_string(),
         Refiner::Pinned => "Pinned".to_string(),
+        Refiner::Mentions => "Mentions me".to_string(),
         Refiner::Category(value) => format!("Category: {value}"),
         Refiner::Received(value) => format!("Received: {value}"),
         Refiner::Size(value) => format!("Size: {value}"),
@@ -20586,6 +20631,7 @@ fn remove_refiner(query: &SearchQuery, refiner: &Refiner) -> SearchQuery {
         Refiner::Unread | Refiner::Read => next.is_unread = None,
         Refiner::Flagged => next.is_flagged = false,
         Refiner::Pinned => next.is_pinned = false,
+        Refiner::Mentions => next.is_mentions = false,
         Refiner::Category(value) => next.category.retain(|item| item != value),
         Refiner::Received(_) => next.received = None,
         Refiner::Size(_) => next.size = None,
@@ -20659,6 +20705,7 @@ fn build_refine_popover(state: &Rc<RefCell<UiState>>) -> gtk::Popover {
     let has_files = gtk::CheckButton::with_label("Has files");
     let unread = gtk::CheckButton::with_label("Unread");
     let flagged = gtk::CheckButton::with_label("Flagged");
+    let mentions = gtk::CheckButton::with_label("Mentions me");
     let received = gtk::DropDown::from_strings(&["Any time", "Today", "Last 7 days", "This month", "Last month", "This year"]);
 
     let fields: [(&str, &gtk::Widget); 6] = [
@@ -20679,11 +20726,12 @@ fn build_refine_popover(state: &Rc<RefCell<UiState>>) -> gtk::Popover {
     grid.attach(&has_files, 0, row + 1, 1, 1);
     grid.attach(&unread, 1, row + 1, 1, 1);
     grid.attach(&flagged, 0, row + 2, 1, 1);
+    grid.attach(&mentions, 1, row + 2, 1, 1);
 
     let apply = gtk::Button::with_label("Search");
     apply.add_css_class("suggested-action");
     apply.set_halign(gtk::Align::End);
-    grid.attach(&apply, 1, row + 2, 1, 1);
+    grid.attach(&apply, 1, row + 3, 1, 1);
     popover.set_child(Some(&grid));
 
     {
@@ -20727,6 +20775,9 @@ fn build_refine_popover(state: &Rc<RefCell<UiState>>) -> gtk::Popover {
             }
             if flagged.is_active() {
                 query.is_flagged = true;
+            }
+            if mentions.is_active() {
+                query.is_mentions = true;
             }
             entry.set_text(query.to_string().trim());
             popover.popdown();
@@ -20969,6 +21020,32 @@ fn resort_message_list(state: &Rc<RefCell<UiState>>, message_list: &MessageListM
 /// account - used to evaluate the "To me" message filter.
 fn viewer_addresses(state: &UiState) -> HashSet<String> {
     state.accounts.values().map(|handle| handle.email.to_lowercase()).collect()
+}
+
+/// The addresses and `@Name` tokens used to detect `@mentions` (M-25) for one
+/// account: every sending identity's address, and as names its full display
+/// name, that name's first word and the address local-part - so `@Gavin`,
+/// `@Gavin Graham` and `@gavin.graham` all match. Compiled into a
+/// [`lookout_core::MentionMatcher`] by the mail session.
+fn mention_identity_lists(identities: &[lookout_core::Identity]) -> (Vec<String>, Vec<String>) {
+    let mut addresses = Vec::new();
+    let mut names = Vec::new();
+    for identity in identities {
+        addresses.push(identity.email.clone());
+        let name = identity.name.trim();
+        if !name.is_empty() {
+            names.push(name.to_string());
+            if let Some(first) = name.split_whitespace().next() {
+                names.push(first.to_string());
+            }
+        }
+        if let Some((local, _)) = identity.email.split_once('@') {
+            if !local.is_empty() {
+                names.push(local.to_string());
+            }
+        }
+    }
+    (addresses, names)
 }
 
 /// How long an Undo toast - and its stack entry - stays live. Matches the
@@ -22599,8 +22676,9 @@ fn reconcile_optimistic_pinned_changes(state: &Rc<RefCell<UiState>>, message_lis
     }
 }
 
-/// Patches a preview snippet onto matching displayed rows in place - the
-/// UI-side half of `AccountEvent::PreviewsFetched`. Not optimistic (unlike
+/// Patches a preview snippet and/or `@mentions` verdict onto matching
+/// displayed rows in place - the UI-side half of
+/// `AccountEvent::PreviewsFetched` (M-25). Not optimistic (unlike
 /// `optimistic_toggle_read` above): the cache write already succeeded before
 /// this event was sent, so there's nothing to stash for rollback.
 ///
@@ -22609,7 +22687,7 @@ fn reconcile_optimistic_pinned_changes(state: &Rc<RefCell<UiState>>, message_lis
 /// function even runs - a preview must persist there even for a mailbox
 /// that isn't currently on screen, whereas this function only has anything
 /// to patch when the affected mailbox is actually displayed.
-fn patch_previews(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, previews: &HashMap<Uid, String>) {
+fn patch_previews(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, previews: &HashMap<Uid, String>, mentions: &HashMap<Uid, bool>) {
     let all: Vec<EmailSummary> = message_list
         .all_messages()
         .into_iter()
@@ -22617,6 +22695,9 @@ fn patch_previews(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel,
             if m.mailbox == *mailbox {
                 if let Some(p) = previews.get(&m.uid) {
                     m.preview = Some(p.clone());
+                }
+                if let Some(mentions) = mentions.get(&m.uid) {
+                    m.mentions = *mentions;
                 }
             }
             m
@@ -29151,7 +29232,7 @@ mod tests {
         state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one, two]);
 
         let previews = HashMap::from([(Uid(2), "new snippet".to_string())]);
-        patch_previews(&state, &message_list, &mailbox, &previews);
+        patch_previews(&state, &message_list, &mailbox, &previews, &HashMap::new());
 
         assert_eq!(
             rendered_preview(&message_list, Uid(2)),
@@ -29162,6 +29243,14 @@ mod tests {
 
         let patched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
         assert_eq!(patched.preview.as_deref(), Some("new snippet"));
+
+        // A mention-only patch (M-25) reaches the model too, so the row's `@`
+        // glyph and the Mentions filter pick it up.
+        patch_previews(&state, &message_list, &mailbox, &HashMap::new(), &HashMap::from([(Uid(1), true)]));
+        let mentioned = message_list.all_messages().into_iter().find(|m| m.uid == Uid(1)).unwrap();
+        assert!(mentioned.mentions);
+        let unmentioned = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
+        assert!(!unmentioned.mentions);
     }
 
     /// A uid the patch doesn't mention, or one for a mailbox not currently
@@ -29185,12 +29274,12 @@ mod tests {
         // A uid that doesn't exist in this mailbox, and a whole mailbox
         // that isn't displayed.
         let previews = HashMap::from([(Uid(99), "nobody".to_string())]);
-        patch_previews(&state, &message_list, &mailbox, &previews);
+        patch_previews(&state, &message_list, &mailbox, &previews, &HashMap::new());
         assert_eq!(message_list.all_messages().len(), 1, "no row should be added");
         assert_eq!(rendered_preview(&message_list, Uid(1)), Some(None), "the one real row must be untouched");
 
         let previews_for_other = HashMap::from([(Uid(1), "wrong mailbox".to_string())]);
-        patch_previews(&state, &message_list, &other_mailbox, &previews_for_other);
+        patch_previews(&state, &message_list, &other_mailbox, &previews_for_other, &HashMap::new());
         assert_eq!(
             rendered_preview(&message_list, Uid(1)),
             Some(None),
@@ -29594,6 +29683,7 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            mentions: false,
             importance: Default::default(),
             sensitivity: Default::default(),
             list_id: None,

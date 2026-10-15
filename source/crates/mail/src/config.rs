@@ -33,6 +33,14 @@ pub struct AccountConfig {
     pub account_id: lookout_core::AccountId,
     pub display_name: String,
     pub email: String,
+    /// The user's own addresses for `@mentions` detection (M-25): the account
+    /// address plus any configured identity (send-as) aliases. The session
+    /// compiles these into a [`lookout_core::MentionMatcher`] and scans body
+    /// snippets against them.
+    pub mention_addresses: Vec<String>,
+    /// The user's names for `@mentions`: the display name, its first word and
+    /// address local-parts, so `@Name`, `@First` and `@local-part` all match.
+    pub mention_names: Vec<String>,
     pub imap: EndpointConfig,
     pub smtp: EndpointConfig,
 }

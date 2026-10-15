@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.212" date="2026-10-15">
+      <description>
+        <p>Messages that mention you are now marked with an "@" badge in the list and can be found with a new "Mentions me" filter.</p>
+      </description>
+    </release>
     <release version="0.9.211" date="2026-10-15">
       <description>
         <p>Polish for the Microsoft 365 calendar: a clear message when Outlook sync needs to be enabled again, and a clearer account label in Settings.</p>

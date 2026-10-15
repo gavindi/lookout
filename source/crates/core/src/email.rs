@@ -167,6 +167,12 @@ pub struct EmailSummary {
     #[serde(default)]
     pub has_calendar: bool,
     pub preview: Option<String>,
+    /// Whether the message body mentions one of the user's own identities
+    /// (an address token or an `@Name`, see [`crate::interop::MentionMatcher`],
+    /// M-25 / item 2.13). Detected client-side from the body snippet, since
+    /// IMAP carries no mention flag; `false` until a body's been inspected.
+    #[serde(default)]
+    pub mentions: bool,
     /// The message's importance, read from the selected importance headers
     /// (`Importance` / `X-Priority` / `X-MSMail-Priority` / RFC 2156
     /// `Priority`, see [`crate::interop::headers`]). `Normal` is the default,

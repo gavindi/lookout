@@ -162,7 +162,8 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
         size: fetch.size.unwrap_or(0),
         has_attachment,
         has_calendar,
-        preview: None, // Requires a body fetch; filled in by `sync_mailbox`'s second phase.
+        preview: None,   // Requires a body fetch; filled in by `sync_mailbox`'s second phase.
+        mentions: false, // Likewise derived from the body; filled in with the preview (M-25).
         importance,
         sensitivity,
         list_id,

@@ -125,6 +125,9 @@ pub enum Filter {
     HighImportance,
     Categorized,
     ToMe,
+    /// Messages whose body mentions one of the user's own identities
+    /// (`@Name` or an address token, M-25 / item 2.13).
+    Mentions,
     /// Pinned (`\Flagged`) messages. Kept apart from `Flagged`, which since
     /// item 1.16 means an open follow-up flag (UX-02).
     Pinned,
@@ -132,7 +135,7 @@ pub enum Filter {
 
 impl Filter {
     /// Every filter, in menu order.
-    pub const ALL: [Filter; 7] = [
+    pub const ALL: [Filter; 8] = [
         Filter::Unread,
         Filter::Flagged,
         Filter::Pinned,
@@ -140,6 +143,7 @@ impl Filter {
         Filter::HighImportance,
         Filter::Categorized,
         Filter::ToMe,
+        Filter::Mentions,
     ];
 
     /// The filter menu's item label.
@@ -151,6 +155,7 @@ impl Filter {
             Filter::HighImportance => "High importance",
             Filter::Categorized => "Categorized",
             Filter::ToMe => "To me",
+            Filter::Mentions => "Mentions me",
             Filter::Pinned => "Pinned",
         }
     }
@@ -165,6 +170,7 @@ impl Filter {
             Filter::HighImportance => "high-importance",
             Filter::Categorized => "categorized",
             Filter::ToMe => "to-me",
+            Filter::Mentions => "mentions",
             Filter::Pinned => "pinned",
         }
     }
@@ -182,7 +188,8 @@ impl Filter {
             Filter::HighImportance => 1 << 3,
             Filter::Categorized => 1 << 4,
             Filter::ToMe => 1 << 5,
-            Filter::Pinned => 1 << 6,
+            Filter::Mentions => 1 << 6,
+            Filter::Pinned => 1 << 7,
         }
     }
 
@@ -197,6 +204,7 @@ impl Filter {
             Filter::HighImportance => message.importance == lookout_core::Importance::High,
             Filter::Categorized => message.keywords.iter().any(|k| lookout_core::tag_key_from_keyword(k).is_some()),
             Filter::ToMe => message.to.iter().chain(message.cc.iter()).any(|address| viewer.contains(&address.address.to_lowercase())),
+            Filter::Mentions => message.mentions,
         }
     }
 }
@@ -600,6 +608,9 @@ pub struct ThreadRow {
     /// The thread's most urgent open follow-up flag (earliest due, dated
     /// before undated), if any message has one - the header's flag icon.
     pub follow_up: Option<lookout_core::FollowUpFlag>,
+    /// Any message in the thread mentions the user (M-25) - the header shows
+    /// the `@` icon, mirroring a lone message row's own.
+    pub has_mentions: bool,
     /// Any message in the thread has an attachment - the header shows the
     /// attachment icon, mirroring how a lone message row renders its own.
     pub has_attachment: bool,
@@ -797,6 +808,7 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
             has_unread: latest.is_unread() || emails.iter().any(|m| m.is_unread()),
             has_pinned: latest.is_pinned() || emails.iter().any(|m| m.is_pinned()),
             follow_up: thread_follow_up(&emails),
+            has_mentions: latest.mentions || emails.iter().any(|m| m.mentions),
             has_attachment: latest.has_attachment || emails.iter().any(|m| m.has_attachment),
             has_calendar: latest.has_calendar || emails.iter().any(|m| m.has_calendar),
             importance: thread_importance(&emails),
@@ -828,23 +840,25 @@ fn thread_importance(messages: &[EmailSummary]) -> lookout_core::Importance {
 }
 
 /// Message identity, the two flag-derived styles (unread, flagged), the four
-/// text fields a row renders, the color-tag keywords it carries, and its
-/// thread key. Named rather than written inline so the tuple stays under
-/// clippy's type-complexity threshold.
-type MessageRowKey = (
-    MailboxId,
-    Uid,
-    bool,
-    bool,
-    DateTime<Utc>,
-    Option<String>,
-    String,
-    Option<String>,
-    Vec<String>,
-    ThreadKey,
-    lookout_core::Importance,
-    Option<lookout_core::FollowUpFlag>,
-);
+/// text fields a row renders, the color-tag keywords it carries, its thread
+/// key, and the mention verdict. A named struct rather than a tuple so it can
+/// grow past Rust's 12-element tuple trait impls.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct MessageRowKey {
+    mailbox: MailboxId,
+    uid: Uid,
+    unread: bool,
+    pinned: bool,
+    date: DateTime<Utc>,
+    subject: Option<String>,
+    from: String,
+    preview: Option<String>,
+    tags: Vec<String>,
+    thread_key: ThreadKey,
+    importance: lookout_core::Importance,
+    follow_up: Option<lookout_core::FollowUpFlag>,
+    mentions: bool,
+}
 
 /// A compact fingerprint of the fields one message-list row displays, keyed
 /// to keep the row distinct from any other. Used to detect "nothing changed"
@@ -870,21 +884,25 @@ fn message_row_key(m: &EmailSummary) -> MessageRowKey {
     // `thread_key` decides which conversation a row belongs to when the list
     // is threaded, so a re-sync that re-groups messages must count as a
     // change even when every rendered field is identical.
-    (
-        m.mailbox.clone(),
-        m.uid,
-        m.is_unread(),
-        m.is_pinned(),
-        m.date,
-        m.subject.clone(),
+    MessageRowKey {
+        mailbox: m.mailbox.clone(),
+        uid: m.uid,
+        unread: m.is_unread(),
+        pinned: m.is_pinned(),
+        date: m.date,
+        subject: m.subject.clone(),
         from,
-        m.preview.clone(),
+        preview: m.preview.clone(),
         tags,
-        m.thread_key.clone(),
-        m.importance,
+        thread_key: m.thread_key.clone(),
+        importance: m.importance,
         // The follow-up flag drives the row's flag icon and due label.
-        m.follow_up(),
-    )
+        follow_up: m.follow_up(),
+        // The mention verdict drives the row's `@` glyph and the Mentions
+        // filter; it arrives with `PreviewsFetched`, so a late patch must
+        // count as a change.
+        mentions: m.mentions,
+    }
 }
 
 /// The `message_row_key` fingerprint of every message in `messages`, in
@@ -950,39 +968,42 @@ fn section_row_key(group: GroupKey, label: &str) -> SectionRowKey {
 
 /// A `ThreadRow` header fingerprint - every field the header renders, plus
 /// its identity. Does not cover the thread's own messages; those are a
-/// separate diff against the thread's child store. Named rather than written
-/// inline for the same clippy type-complexity reason as `MessageRowKey`, and
-/// must be kept in sync by hand with `ThreadRow`'s fields the same way.
-type ThreadRowKey = (
-    ThreadId,
-    String,
-    Vec<String>,
-    Option<String>,
-    usize,
-    DateTime<Utc>,
-    bool,
-    bool,
-    bool,
-    bool,
-    lookout_core::Importance,
-    Option<lookout_core::FollowUpFlag>,
-);
+/// separate diff against the thread's child store. A named struct rather than
+/// a tuple so it can grow past Rust's 12-element tuple trait impls, and must
+/// be kept in sync by hand with `ThreadRow`'s fields.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ThreadRowKey {
+    id: ThreadId,
+    sender: String,
+    participants: Vec<String>,
+    subject: Option<String>,
+    count: usize,
+    latest: DateTime<Utc>,
+    has_unread: bool,
+    has_pinned: bool,
+    has_attachment: bool,
+    has_calendar: bool,
+    has_mentions: bool,
+    importance: lookout_core::Importance,
+    follow_up: Option<lookout_core::FollowUpFlag>,
+}
 
 fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
-    (
-        row.id.clone(),
-        row.sender.clone(),
-        row.participants.clone(),
-        row.subject.clone(),
-        row.count,
-        row.latest,
-        row.has_unread,
-        row.has_pinned,
-        row.has_attachment,
-        row.has_calendar,
-        row.importance,
-        row.follow_up.clone(),
-    )
+    ThreadRowKey {
+        id: row.id.clone(),
+        sender: row.sender.clone(),
+        participants: row.participants.clone(),
+        subject: row.subject.clone(),
+        count: row.count,
+        latest: row.latest,
+        has_unread: row.has_unread,
+        has_pinned: row.has_pinned,
+        has_attachment: row.has_attachment,
+        has_calendar: row.has_calendar,
+        has_mentions: row.has_mentions,
+        importance: row.importance,
+        follow_up: row.follow_up.clone(),
+    }
 }
 
 /// The uniform per-row fingerprint every store's incremental diff runs on -
@@ -2988,6 +3009,7 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            mentions: false,
             importance: Default::default(),
             sensitivity: Default::default(),
             list_id: None,
@@ -3449,6 +3471,7 @@ mod tests {
             follow_up: None,
             has_attachment: false,
             has_calendar: false,
+            has_mentions: false,
             importance: lookout_core::Importance::Normal,
         }
     }
@@ -3506,6 +3529,10 @@ mod tests {
         let mut other_calendar = base.clone();
         other_calendar.has_calendar = true;
         assert_ne!(thread_row_key(&other_calendar), base_key);
+
+        let mut other_mentions = base.clone();
+        other_mentions.has_mentions = true;
+        assert_ne!(thread_row_key(&other_mentions), base_key);
 
         let mut other_importance = base.clone();
         other_importance.importance = lookout_core::Importance::High;
@@ -3794,6 +3821,12 @@ mod tests {
         assert!(FilterSet::none().with(Filter::Categorized, true).matches(&m, &viewer));
         assert!(FilterSet::none().with(Filter::ToMe, true).matches(&m, &viewer));
         assert!(!FilterSet::none().with(Filter::ToMe, true).matches(&m, &HashSet::new()), "an empty viewer matches nothing");
+
+        // The mention verdict is stored on the summary (M-25), not derived
+        // from the viewer set.
+        assert!(!FilterSet::none().with(Filter::Mentions, true).matches(&m, &viewer));
+        m.mentions = true;
+        assert!(FilterSet::none().with(Filter::Mentions, true).matches(&m, &viewer));
     }
 
     #[test]

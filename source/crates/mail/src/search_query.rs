@@ -98,6 +98,9 @@ pub struct SearchQuery {
     pub is_flagged: bool,
     /// The `\Flagged` Pin (M-13).
     pub is_pinned: bool,
+    /// Whether the body mentions the user (M-25). Not IMAP-expressible, so it
+    /// is enforced by [`SearchQuery::matches_summary`] on the server fallback.
+    pub is_mentions: bool,
     /// Sanitised category keys (the `$Lookout-tag-<key>` suffix).
     pub category: Vec<String>,
     pub received: Option<ReceivedFilter>,
@@ -125,6 +128,7 @@ impl SearchQuery {
             && self.is_unread.is_none()
             && !self.is_flagged
             && !self.is_pinned
+            && !self.is_mentions
             && self.category.is_empty()
             && self.received.is_none()
             && self.size.is_none()
@@ -187,6 +191,9 @@ impl SearchQuery {
         }
         if self.is_pinned {
             clauses.push("EXISTS (SELECT 1 FROM json_each(messages.data, '$.flags') WHERE value = 'Flagged')".to_string());
+        }
+        if self.is_mentions {
+            clauses.push("json_extract(messages.data, '$.mentions') = 1".to_string());
         }
         if self.is_flagged {
             clauses.push("EXISTS (SELECT 1 FROM json_each(messages.data, '$.keywords') WHERE value = ? OR value LIKE ?)".to_string());
@@ -327,6 +334,9 @@ impl SearchQuery {
         if self.is_flagged && !message.is_flagged_for_follow_up() {
             return false;
         }
+        if self.is_mentions && !message.mentions {
+            return false;
+        }
         for key in &self.category {
             if !message.keywords.contains(&tag_keyword(key)) {
                 return false;
@@ -380,6 +390,9 @@ impl std::fmt::Display for SearchQuery {
         if self.is_pinned {
             parts.push("is:pinned".to_string());
         }
+        if self.is_mentions {
+            parts.push("is:mentions".to_string());
+        }
         for key in &self.category {
             parts.push(format!("category:{}", quote_field(key)));
         }
@@ -426,6 +439,7 @@ pub fn parse(input: &str) -> SearchQuery {
                 "read" => query.is_unread = Some(false),
                 "flagged" => query.is_flagged = true,
                 "pinned" => query.is_pinned = true,
+                "mentions" => query.is_mentions = true,
                 _ => {}
             },
             "category" => {
@@ -750,6 +764,7 @@ mod tests {
             has_attachment: true,
             has_calendar: false,
             preview: None,
+            mentions: false,
             importance: Importance::Normal,
             sensitivity: MessageSensitivity::Normal,
             list_id: None,
@@ -794,6 +809,24 @@ mod tests {
         assert!(q.is_flagged && !q.is_pinned);
         let q = parse("is:pinned");
         assert!(q.is_pinned && !q.is_flagged);
+    }
+
+    #[test]
+    fn is_mentions_parses_displays_and_matches() {
+        let q = parse("is:mentions");
+        assert!(q.is_mentions);
+        assert!(!q.is_empty());
+        assert_eq!(q.to_string(), "is:mentions");
+        // Not IMAP-expressible: the criterion string stays empty and the
+        // verdict is enforced on the summary instead.
+        assert_eq!(q.to_imap_criteria(), "");
+        let mut message = summary();
+        assert!(!q.matches_summary(&message));
+        message.mentions = true;
+        assert!(q.matches_summary(&message));
+        // The local predicate reads the stored flag off the summary JSON.
+        let (clauses, _) = parse("is:mentions").sql_predicates();
+        assert!(clauses.iter().any(|c| c.contains("$.mentions")));
     }
 
     #[test]

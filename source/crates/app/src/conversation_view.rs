@@ -616,6 +616,7 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: Some("See you there".into()),
+            mentions: false,
             importance: Importance::Normal,
             sensitivity: Default::default(),
             list_id: None,

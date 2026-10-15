@@ -12,6 +12,7 @@
 //! - [`categories`] — Outlook's 25 category colour presets (§4.4, UX-85).
 //! - [`flags`] — follow-up flag semantics (§4.1, §4.4, M-10).
 //! - [`junk`] — the RFC 5788 `$Junk` / `$NotJunk` keywords (§4.2, M-17).
+//! - [`mentions`] — `@mentions` detection in a message body (§5.1, M-25).
 //! - [`onlinemeeting`] — Teams/Zoom/Meet join-URL detection (§4.3, CAL-20).
 //! - [`snooze`] — the snooze folder and wake-time keyword (§4.2, M-11).
 //! - [`tnef`] — the TNEF (`winmail.dat`) decoder, RTF decompression and HTML
@@ -27,6 +28,7 @@ pub mod cdo;
 pub mod flags;
 pub mod headers;
 pub mod junk;
+pub mod mentions;
 pub mod onlinemeeting;
 pub mod snooze;
 pub mod tnef;
@@ -42,6 +44,7 @@ pub use headers::{
     AUTHENTICATION_RESULTS_HEADER,
 };
 pub use junk::{junk_keyword, junk_keyword_change, junk_keywords, JUNK_KEYWORD, NOT_JUNK_KEYWORD};
+pub use mentions::MentionMatcher;
 pub use onlinemeeting::{
     classify as classify_online_meeting, detect as detect_online_meeting, is_teams_meeting, OnlineMeeting, OnlineMeetingProvider, X_MICROSOFT_ONLINEMEETINGCONFLINK,
     X_MICROSOFT_SKYPETEAMSMEETINGURL,

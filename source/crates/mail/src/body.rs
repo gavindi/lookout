@@ -969,6 +969,33 @@ pub fn preview_from_body(body: &EmailBody) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
+/// Whether the *leading bytes* of a raw message mention one of the user's
+/// identities (M-25): parsed like [`preview_from_raw`], then scanned with
+/// `matcher`. The preview-pass fetch (`BODY.PEEK[]<0.N>`) is what makes this
+/// affordable at sync time, so a truncated message is expected; a match found
+/// anywhere in the fetched prefix still counts.
+pub fn mentions_in_raw(matcher: &lookout_core::MentionMatcher, raw: &[u8]) -> bool {
+    if matcher.is_empty() {
+        return false;
+    }
+    let Some(message) = MessageParser::default().parse(raw) else {
+        return false;
+    };
+    // Both forms: the plain text can hold `@Name`, while the HTML holds an
+    // authored `mailto:` anchor whose address never appears as text.
+    message.body_text(0).is_some_and(|text| matcher.matches(&text)) || message.body_html(0).is_some_and(|html| matcher.matches(&html))
+}
+
+/// Whether an assembled [`EmailBody`] mentions one of the user's identities
+/// (M-25). Scans the text body and the HTML body, for the same reason as
+/// [`mentions_in_raw`].
+pub fn mentions_in_body(matcher: &lookout_core::MentionMatcher, body: &EmailBody) -> bool {
+    if matcher.is_empty() {
+        return false;
+    }
+    body.text_body.as_deref().is_some_and(|text| matcher.matches(text)) || body.html_body.as_deref().is_some_and(|html| matcher.matches(html))
+}
+
 /// Crude tag-stripper for the HTML fallback - enough to turn markup into
 /// readable words, not a sanitizer. The reading pane renders real HTML
 /// through WebKit; this is only ever a list row's worth of plain text.
@@ -1021,6 +1048,23 @@ mod tests {
     fn fixture(name: &str) -> Vec<u8> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/").to_string() + name;
         std::fs::read(&path).unwrap_or_else(|e| panic!("reading fixture {path}: {e}"))
+    }
+
+    #[test]
+    fn mentions_reach_the_raw_and_assembled_body() {
+        use lookout_core::MentionMatcher;
+        let raw = fixture("outlook/mentions.eml");
+        // The `@Gavin` mention, matched by display name...
+        assert!(mentions_in_raw(&MentionMatcher::new(Vec::<String>::new(), ["Gavin"]), &raw));
+        // ...and the `mailto:` anchor, matched by address.
+        assert!(mentions_in_raw(&MentionMatcher::new(["priya@contoso.example"], Vec::<String>::new()), &raw));
+        // An unrelated identity matches neither signal.
+        assert!(!mentions_in_raw(&MentionMatcher::new(["nobody@example.com"], ["Nobody"]), &raw));
+        // An empty matcher never flags anything.
+        assert!(!mentions_in_raw(&MentionMatcher::default(), &raw));
+
+        let body = parse_body(Uid(0), &raw).expect("parses");
+        assert!(mentions_in_body(&MentionMatcher::new(Vec::<String>::new(), ["gavin"]), &body));
     }
 
     #[test]

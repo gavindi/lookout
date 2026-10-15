@@ -401,6 +401,7 @@ mod tests {
             has_attachment: true,
             has_calendar: false,
             preview: None,
+            mentions: false,
             importance: Importance::High,
             sensitivity: crate::interop::MessageSensitivity::Normal,
             list_id: Some("team.example.com".into()),

@@ -1003,6 +1003,7 @@ mod tests {
             has_attachment: false,
             has_calendar: false,
             preview: None,
+            mentions: false,
             importance: Importance::Normal,
             sensitivity: MessageSensitivity::Normal,
             list_id: Some("list.example.com".into()),
