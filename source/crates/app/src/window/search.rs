@@ -723,3 +723,81 @@ pub(crate) fn mention_identity_lists(identities: &[lookout_core::Identity]) -> (
     }
     (addresses, names)
 }
+
+/// Installs non-modal recent-search suggestions. Visibility follows the entry
+/// rather than a popup grab, so outside clicks and Escape always work.
+pub(crate) fn install_search_history(state: &Rc<RefCell<UiState>>, search_entry: &gtk::SearchEntry) -> gtk::Popover {
+    // The history popover, anchored to the entry and shown on focus while
+    // the entry is empty (Outlook's recent-search list).
+    let history_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let history_popover = gtk::Popover::new();
+    // Suggestions must leave keyboard and pointer input with the entry
+    // and the rest of the window. An autohiding popover takes a modal
+    // grab; restoring focus to its parent can then reopen it immediately.
+    history_popover.set_autohide(false);
+    history_popover.set_child(Some(&history_box));
+    history_popover.set_parent(search_entry);
+    let refresh_history: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let entry = search_entry.clone();
+        let history_box = history_box.clone();
+        let popover = history_popover.clone();
+        Rc::new(move || {
+            while let Some(child) = history_box.first_child() {
+                history_box.remove(&child);
+            }
+            let recent = state.borrow().recent_searches.clone();
+            if recent.is_empty() {
+                history_box.append(&gtk::Label::builder().label("No recent searches").xalign(0.0).css_classes(["dim-label"]).build());
+                return;
+            }
+            for query in recent {
+                let button = gtk::Button::with_label(&query);
+                button.add_css_class("flat");
+                button.set_halign(gtk::Align::Start);
+                {
+                    let entry = entry.clone();
+                    let popover = popover.clone();
+                    button.connect_clicked(move |_| {
+                        entry.set_text(&query);
+                        popover.popdown();
+                    });
+                }
+                history_box.append(&button);
+            }
+        })
+    };
+    let focus = gtk::EventControllerFocus::new();
+    {
+        let popover = history_popover.clone();
+        let entry = search_entry.clone();
+        let refresh_history = refresh_history.clone();
+        focus.connect_enter(move |_| {
+            if entry.text().is_empty() {
+                refresh_history();
+                popover.popup();
+            }
+        });
+    }
+    {
+        let popover = history_popover.clone();
+        focus.connect_leave(move |_| popover.popdown());
+    }
+    search_entry.connect_changed({
+        let popover = history_popover.clone();
+        move |_| popover.popdown()
+    });
+    search_entry.connect_stop_search({
+        let popover = history_popover.clone();
+        move |_| popover.popdown()
+    });
+    search_entry.add_controller(focus);
+    history_popover
+}
