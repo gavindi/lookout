@@ -44,13 +44,13 @@ Counts are tallied from the §5 tables.
 |---|---|---|---|---|---|
 | Mail (5.1) | 27 | 6 | 11 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, and rules across client, Graph and Sieve backends). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 15 | 3 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
-| Calendar (5.3) | 22 | 8 | 5 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, or the organizer's own cache as a fallback) with Suggested times; Graph `getSchedule` and rooms wait on 5.1. |
+| Calendar (5.3) | 23 | 8 | 4 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, or the organizer's own cache as a fallback) with Suggested times; Graph `getSchedule` and rooms wait on 5.1. |
 | People (5.4) | 9 | 1 | 2 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). No CSV or directory. |
 | Tasks (5.5) | 5 | 1 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **90** | **24** | **38** | **5** | ~57% at parity, ~15% partial |
+| **Total** | **91** | **24** | **37** | **5** | ~58% at parity, ~15% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -341,8 +341,8 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | CAL-27 | Birthdays | `dav/src/birthdays.rs` | ✅ | — |
 | CAL-28 | Holidays | "Add calendar" dialog country picker subscribes to a bundled public holiday feed (`core/src/holidays.rs`, `data/holidays.json`, ~50 countries) via CAL-26 (3.15) | ✅ | — |
 | CAL-29 | Weather in calendar header | — | ❌ | Optional (Open-Meteo); low priority |
-| CAL-30 | Drag to move / resize | `DragMode`, `attach_month_drag` | ✅ | Ctrl-drag to copy |
-| CAL-31 | Event context menu (copy, duplicate, delete, categorise, show as, private) | — | ❌ | |
+| CAL-30 | Drag to move / resize | `DragMode`, `attach_month_drag`; Ctrl-drag copies the occurrence to the dropped time (3.12) | ✅ | — |
+| CAL-31 | Event context menu (copy, duplicate, delete, categorise, show as, private) | Right-click in any view (`event_menu.rs`, `connect_event_context_menu`, 3.12): Open, Delete, Duplicate, Copy to calendar…, Save as .ics…, Categorize, Show as, Private; Duplicate/Copy clone under a fresh UID and open the editor once the server confirms it; inline edits ask the recurring scope | ✅ | — |
 | CAL-32 | Calendar colour picker | Server colour or palette (`app/src/calendar_colors.rs`) | 🟡 | Picker; write back `calendar-color` |
 | CAL-33 | Calendar groups | Grouped by account | 🟡 | User-defined groups |
 | CAL-34 | My Day / calendar peek in Mail | `refresh_mail_overview_day_list` | ✅ | — |
@@ -659,7 +659,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 3.9 | Reminders window | CAL-12, T-05 | `adw::Window` listing due reminders (events and tasks): Dismiss / Dismiss all / Snooze [5 min…1 week] / Open; multiple `VALARM`s; default reminder; catch-up on launch for missed reminders | M |
 | 3.10 | Advanced recurrence builder | CAL-13 | Monthly "day N" / "the Nth weekday"; yearly "month day" / "Nth weekday of month"; BYSETPOS; end by/after; preview string | M |
 | 3.11 | ✅ ~~List and Schedule views~~ | CAL-02, CAL-03 | Standalone **List** view (reuses `build_agenda_view` as the `"list"` stack page); **Schedule** view (calendars as rows, horizontal time) in `calendar_view.rs`, both wired to the calendar view switcher | L |
-| 3.12 | Event context menu, copy, duplicate | CAL-30, CAL-31 | 0.5; Ctrl-drag copies; "Duplicate", "Copy to calendar", "Save as .ics" | S |
+| 3.12 | ✅ ~~Event context menu, copy, duplicate~~ | CAL-30, CAL-31 | 0.5; the event menu (`app/src/event_menu.rs` + `connect_event_context_menu`) with Open/Delete/Duplicate/Copy to calendar…/Save as .ics…/Categorize/Show as/Private; Ctrl-drag copies; Duplicate and Copy create then open the editor | S |
 | 3.13 | Calendar colour picker and groups | CAL-32, CAL-33 | `gtk::ColorDialog`; PROPPATCH `calendar-color` when writable; user groups persisted in `settings.json` | M |
 | 3.14 | Event search | CAL-22 | Search over the `dav` cache (title, location, notes, attendees); results list; global search scope "Calendar" | M |
 | 3.15 | ✅ ~~Holidays~~ | CAL-28 | Country picker → subscribe to a bundled public `.ics` URL via CAL-26 | S |

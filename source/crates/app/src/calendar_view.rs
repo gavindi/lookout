@@ -133,14 +133,27 @@ type DayActivate = Rc<dyn Fn(NaiveDate)>;
 type PendingDayActivate = Rc<RefCell<Option<DayActivate>>>;
 
 /// A callback fired when the user drags an event chip to a new time in a
-/// Day/Week/Work week or Month grid, receiving the dragged occurrence and its
-/// resolved new start/end (UTC). The caller is responsible for persisting the
-/// change (route it through the event editor's save path).
-type EventDrag = Rc<dyn Fn(EventOccurrence, DateTime<Utc>, DateTime<Utc>)>;
+/// Day/Week/Work week or Month grid, receiving the dragged occurrence, its
+/// resolved new start/end (UTC), and whether the drag was a copy (`true` when
+/// Ctrl was held at the press, so the caller clones the event instead of
+/// moving it). The caller is responsible for persisting the change (route it
+/// through the event editor's save path).
+type EventDrag = Rc<dyn Fn(EventOccurrence, DateTime<Utc>, DateTime<Utc>, bool)>;
 
 /// One entry in a widget's pending drag callback: set by the current render
 /// pass from `CalendarMain::connect_event_dragged`.
 type PendingEventDrag = Rc<RefCell<Option<EventDrag>>>;
+
+/// A callback fired when the user right-clicks an event (item 3.12 / CAL-31),
+/// receiving the clicked occurrence, the widget to anchor the menu to, and -
+/// for a Cairo-drawn surface (the time grids and the Schedule view) - the
+/// click point in that widget's coordinates, so the menu pops up at the
+/// pointer. `None` points at the anchor widget as a whole (a chip or row).
+type EventContext = Rc<dyn Fn(EventOccurrence, gtk::Widget, Option<(f64, f64)>)>;
+
+/// One entry in a widget's pending context-menu callback: shared by every
+/// sub-view (set once from `CalendarMain::connect_event_context_menu`).
+type PendingContext = Rc<RefCell<Option<EventContext>>>;
 
 /// How a chip drag changes the event: move shifts both ends together, resize
 /// keeps the start and follows the pointer with the end.
@@ -198,6 +211,9 @@ struct MonthDrag {
     /// 2 for the second click of a double-click). Drives the peek-vs-editor
     /// decision on a drag-free release (UX-56).
     n_press: i32,
+    /// Whether Ctrl was held at the press: the drop clones the event instead
+    /// of moving it (CAL-30 / item 3.12).
+    copy: bool,
 }
 
 struct DayCell {
@@ -343,7 +359,7 @@ pub struct MonthGrid {
     weekday_labels: Vec<gtk::Label>,
 }
 
-fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
+fn build_month_grid(week_start: chrono::Weekday, on_context: &PendingContext) -> MonthGrid {
     let week_start = Rc::new(Cell::new(week_start));
     let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(1).homogeneous(true).build();
     let mut weekday_labels = Vec::with_capacity(7);
@@ -397,6 +413,9 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
             let on_day_activate = on_day_activate.clone();
             let chip_events = chip_events.clone();
             let gesture = gtk::GestureClick::new();
+            // Primary only, so a right-click on a chip reaches
+            // `attach_month_context` rather than selecting the day cell.
+            gesture.set_button(gtk::gdk::BUTTON_PRIMARY);
             gesture.connect_pressed(move |_, _, x, y| {
                 let mut widget = click_target.pick(x, y, gtk::PickFlags::DEFAULT);
                 while let Some(current) = widget {
@@ -437,6 +456,7 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
     let on_drag: PendingEventDrag = Rc::new(RefCell::new(None));
     let on_peek: PendingPeek = Rc::new(RefCell::new(None));
     attach_month_drag(&grid, &day_cells, &anchor_month, &month_drag, &chip_events, &on_activate, &on_drag, &on_peek, &week_start);
+    attach_month_context(&grid, &chip_events, on_context);
 
     MonthGrid {
         root: root_box.upcast(),
@@ -453,6 +473,35 @@ fn build_month_grid(week_start: chrono::Weekday) -> MonthGrid {
         week_start,
         weekday_labels,
     }
+}
+
+/// A right-click on an event chip opens the event context menu (item 3.12 /
+/// CAL-31), anchored to the chip. Kept separate from the primary-button drag
+/// gesture so a secondary click never arms a drag or the queued peek.
+fn attach_month_context(grid: &gtk::Grid, chip_events: &Rc<RefCell<HashMap<gtk::Widget, EventOccurrence>>>, on_context: &PendingContext) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+    {
+        let grid = grid.clone();
+        let chip_events = chip_events.clone();
+        let on_context = on_context.clone();
+        gesture.connect_pressed(move |_, _, x, y| {
+            let mut current = grid.pick(x, y, gtk::PickFlags::DEFAULT);
+            let mut occ = None;
+            while let Some(w) = current.as_ref() {
+                if let Some(found) = chip_events.borrow().get(w) {
+                    occ = Some(found.clone());
+                    break;
+                }
+                current = w.parent();
+            }
+            let (Some(occ), Some(chip)) = (occ, current) else { return };
+            if let Some(callback) = on_context.borrow().as_ref() {
+                callback(occ, chip, None);
+            }
+        });
+    }
+    grid.add_controller(gesture);
 }
 
 /// Changes the grid's first weekday (item 3.1): relabels the weekday header
@@ -661,6 +710,9 @@ fn attach_month_drag(
     week_start: &Rc<Cell<chrono::Weekday>>,
 ) {
     let gesture = gtk::GestureClick::new();
+    // Primary only: a secondary click is the context menu's (see
+    // `attach_month_context`), and must not arm a drag or the queued peek.
+    gesture.set_button(gtk::gdk::BUTTON_PRIMARY);
     let events_boxes: Vec<gtk::Box> = day_cells.iter().map(|c| c.events_box.clone()).collect();
     let containers: Vec<gtk::Box> = day_cells.iter().map(|c| c.container.clone()).collect();
     // The queued single-click peek, if any (cancelled by a second press).
@@ -672,7 +724,7 @@ fn attach_month_drag(
         let chip_events = chip_events.clone();
         let pending_peek = pending_peek.clone();
         let week_start = week_start.clone();
-        gesture.connect_pressed(move |_, n_press, x, y| {
+        gesture.connect_pressed(move |gesture, n_press, x, y| {
             // A second press means this is a double-click: cancel the peek the
             // first release queued so the editor wins.
             if n_press >= 2 {
@@ -680,6 +732,8 @@ fn attach_month_drag(
                     id.remove();
                 }
             }
+            // Ctrl at press turns the drop into a copy (CAL-30).
+            let copy = gesture.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
             // Only presses that land on a chip arm the drag; the day cells'
             // own gestures handle everything else.
             let mut current = grid.pick(x, y, gtk::PickFlags::DEFAULT);
@@ -706,6 +760,7 @@ fn attach_month_drag(
                 py: y,
                 dragging: false,
                 n_press,
+                copy,
             });
         });
     }
@@ -797,7 +852,7 @@ fn attach_month_drag(
             let new_start = d.occ.start + chrono::Duration::days(shift);
             let new_end = d.occ.end + chrono::Duration::days(shift);
             if let Some(callback) = on_drag.borrow().as_ref() {
-                callback(d.occ, new_start, new_end);
+                callback(d.occ, new_start, new_end, d.copy);
             }
         });
     }
@@ -1088,6 +1143,9 @@ struct TimeGridData {
     /// The slot the drag started from, used to distinguish a jittery click
     /// from a real drag and to anchor the range while dragging.
     drag_anchor: Rc<RefCell<Option<(NaiveDate, i64)>>>,
+    /// Whether Ctrl was held when the armed chip press began: the drop clones
+    /// the event instead of moving it (CAL-30 / item 3.12).
+    drag_copy: Rc<Cell<bool>>,
     /// A pending press on an event chip: `(chip index, grab mode, press x,
     /// press y)`. Armed by `attach_click`'s pressed handler; a release without
     /// further movement activates the event, movement beyond the drag
@@ -1114,7 +1172,7 @@ struct TimeGridData {
     secondary_zone: Rc<Cell<Option<chrono_tz::Tz>>>,
 }
 
-pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> TimeGrid {
+pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool, on_context: &PendingContext) -> TimeGrid {
     // Two stacked DrawingAreas: the all-day band (fixed, above the scroller)
     // and the 24-hour timeline (scrollable). Both share one `TimeGridData` so
     // they stay in sync, and their column separators align because both are
@@ -1134,6 +1192,7 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
         selection: Rc::new(RefCell::new(None)),
         drag_active: Rc::new(Cell::new(false)),
         drag_anchor: Rc::new(RefCell::new(None)),
+        drag_copy: Rc::new(Cell::new(false)),
         chip_press: Rc::new(RefCell::new(None)),
         drag: Rc::new(RefCell::new(None)),
         work_start: Rc::new(Cell::new(8)),
@@ -1166,6 +1225,8 @@ pub(crate) fn build_time_grid(weekdays: &[chrono::Weekday], day_view: bool) -> T
     attach_hover(&canvas, false, &data, &hover);
     attach_click(&band, true, &data, &on_activate, &on_slot_activate, &on_drag);
     attach_click(&canvas, false, &data, &on_activate, &on_slot_activate, &on_drag);
+    attach_time_grid_context(&band, true, &data, on_context);
+    attach_time_grid_context(&canvas, false, &data, on_context);
 
     let mut headers = Vec::new();
     let mut header_row_slot = None;
@@ -1354,6 +1415,9 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
 /// `set_time_grid` render pass.
 fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_activate: &PendingActivate, on_slot_activate: &PendingSlotActivate, on_drag: &PendingEventDrag) {
     let gesture = gtk::GestureClick::new();
+    // Primary only: a secondary click is the context menu's (see
+    // `attach_time_grid_context`).
+    gesture.set_button(gtk::gdk::BUTTON_PRIMARY);
     {
         let canvas_widget = canvas.clone();
         let data = data.clone();
@@ -1393,7 +1457,9 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
         let update_canvas = canvas_widget.clone();
         let release_data = data.clone();
         let release_canvas = canvas_widget.clone();
-        gesture.connect_pressed(move |_, _, x, y| {
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            // Ctrl at press turns a chip drop into a copy (CAL-30).
+            pressed_data.drag_copy.set(gesture.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK));
             if let Some(hit) = chip_at(x, y) {
                 // Arm a potential chip drag. The event still activates if the
                 // pointer is released without moving (see `connect_released`).
@@ -1545,7 +1611,7 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
                 let Some(occ) = occ else { return };
                 let (new_start, new_end) = drag_times(&drag, &occ);
                 if let Some(callback) = on_drag.borrow().as_ref() {
-                    callback(occ, new_start, new_end);
+                    callback(occ, new_start, new_end, release_data.drag_copy.get());
                 }
                 release_canvas.queue_draw();
                 return;
@@ -1570,6 +1636,35 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
                         callback(range.start_date, range.start_minutes, range.end_date, range.end_minutes);
                     }
                 }
+            }
+        });
+    }
+    canvas.add_controller(gesture);
+}
+
+/// A right-click on a time-grid chip opens the event context menu (item 3.12
+/// / CAL-31), anchored to the canvas at the click point. Separate from
+/// `attach_click`, whose primary-button gesture owns drag/select/activate.
+fn attach_time_grid_context(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_context: &PendingContext) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+    {
+        let data = data.clone();
+        let canvas_widget = canvas.clone();
+        let on_context = on_context.clone();
+        gesture.connect_pressed(move |_, _, x, y| {
+            // Resolve the chip first (its own borrows end with the block) so
+            // the callback can re-render without a borrow conflict.
+            let occ = {
+                let dates_guard = data.dates.borrow();
+                let chips_guard = data.chips.borrow();
+                hovered_chip(data.gutter.get(), &chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band)
+                    .and_then(|idx| chips_guard.get(idx))
+                    .and_then(|chip| data.occurrences.borrow().get(chip.occurrence).cloned())
+            };
+            let Some(occ) = occ else { return };
+            if let Some(callback) = on_context.borrow().as_ref() {
+                callback(occ, canvas_widget.clone().upcast(), Some((x, y)));
             }
         });
     }
@@ -1734,6 +1829,7 @@ pub fn set_time_grid(
     *t.data.drag_anchor.borrow_mut() = None;
     *t.data.chip_press.borrow_mut() = None;
     *t.data.drag.borrow_mut() = None;
+    t.data.drag_copy.set(false);
 
     let dates = grid_dates(t);
     let chips = compute_time_grid_chips(&dates, occurrences);
@@ -2461,9 +2557,12 @@ pub struct AgendaView {
     events_box: gtk::Box,
     anchor: Rc<RefCell<NaiveDate>>,
     on_activate: PendingActivate,
+    /// The right-click context-menu callback (item 3.12), shared with the
+    /// other views (see [`connect_event_context_menu`]).
+    on_context: PendingContext,
 }
 
-fn build_agenda_view() -> AgendaView {
+fn build_agenda_view(on_context: &PendingContext) -> AgendaView {
     let events_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -2481,6 +2580,7 @@ fn build_agenda_view() -> AgendaView {
         events_box,
         anchor: Rc::new(RefCell::new(today())),
         on_activate: Rc::new(RefCell::new(None)),
+        on_context: on_context.clone(),
     }
 }
 
@@ -2565,6 +2665,21 @@ pub fn set_agenda(
             row.append(&time_label);
             row.append(&summary_label);
 
+            // A right-click on the row opens the event context menu, anchored
+            // to the row (item 3.12 / CAL-31).
+            let attach_context = |widget: &gtk::Widget| {
+                let Some(callback) = a.on_context.borrow().clone() else { return };
+                let occ = occ.clone();
+                let gesture = gtk::GestureClick::new();
+                gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+                gesture.connect_pressed(move |gesture, _, _, _| {
+                    if let Some(anchor) = gesture.widget() {
+                        callback(occ.clone(), anchor, None);
+                    }
+                });
+                widget.add_controller(gesture);
+            };
+
             // The row is a clickable button when an editor is wired up, so the
             // agenda can open an event too. A plain box otherwise.
             if let Some(callback) = a.on_activate.borrow().as_ref() {
@@ -2572,8 +2687,10 @@ pub fn set_agenda(
                 let occ = occ.clone();
                 let callback = callback.clone();
                 button.connect_clicked(move |_| callback(occ.clone()));
+                attach_context(button.upcast_ref());
                 a.events_box.append(&button);
             } else {
+                attach_context(row.upcast_ref());
                 a.events_box.append(&row);
             }
         }
@@ -2600,10 +2717,10 @@ pub struct SplitView {
     pub agenda: AgendaView,
 }
 
-fn build_split_view(week_start: chrono::Weekday) -> SplitView {
-    let month = build_month_grid(week_start);
+fn build_split_view(week_start: chrono::Weekday, on_context: &PendingContext) -> SplitView {
+    let month = build_month_grid(week_start, on_context);
     month.root.set_width_request(300);
-    let agenda = build_agenda_view();
+    let agenda = build_agenda_view(on_context);
 
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -2674,7 +2791,7 @@ pub struct ScheduleView {
     on_activate: PendingActivate,
 }
 
-fn build_schedule_view(prefs: &crate::settings::CalendarPreferences) -> ScheduleView {
+fn build_schedule_view(prefs: &crate::settings::CalendarPreferences, on_context: &PendingContext) -> ScheduleView {
     let canvas = gtk::DrawingArea::new();
     canvas.set_hexpand(true);
     canvas.set_content_height((SCHEDULE_HEADER_HEIGHT + SCHEDULE_ROW_HEIGHT) as i32);
@@ -2738,6 +2855,26 @@ fn build_schedule_view(prefs: &crate::settings::CalendarPreferences) -> Schedule
                 if let Some(callback) = on_activate.borrow().as_ref() {
                     callback(occ);
                 }
+            }
+        });
+        canvas.add_controller(click);
+    }
+
+    // Right-click: open the event context menu (item 3.12 / CAL-31) at the
+    // click point.
+    {
+        let state = state.clone();
+        let on_context = on_context.clone();
+        let canvas_widget = canvas.clone();
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        click.connect_pressed(move |_, _, x, y| {
+            let width = canvas_widget.width() as f64;
+            let hit = schedule_block_at(&state.borrow(), width, x, y);
+            let Some((lane, block)) = hit else { return };
+            let occ = state.borrow().lanes[lane].blocks[block].occ.clone();
+            if let Some(callback) = on_context.borrow().as_ref() {
+                callback(occ, canvas_widget.clone().upcast(), Some((x, y)));
             }
         });
         canvas.add_controller(click);
@@ -3027,6 +3164,10 @@ pub struct CalendarMain {
     /// The drag-reschedule callback, handed to every drag-capable sub-view by
     /// each render pass (see [`connect_event_dragged`]).
     on_drag: PendingEventDrag,
+    /// The right-click context-menu callback (item 3.12), shared (the same
+    /// cell) with every sub-view at build time; `connect_event_context_menu`
+    /// fills it in after `build_main`.
+    on_context: PendingContext,
 }
 
 pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain {
@@ -3068,18 +3209,22 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
     header_row.append(&next_button);
     header_row.append(&month_button);
 
-    let month = build_month_grid(week_start);
-    let workweek = build_time_grid(&prefs.work_days, false);
-    let week = build_time_grid(&week_days(week_start), false);
-    let day = build_time_grid(&[week_start], true);
+    // The event context-menu callback (item 3.12) is registered after
+    // `build_main` returns, so the shared cell is created up-front and cloned
+    // into every sub-view; `connect_event_context_menu` fills it in once.
+    let on_context: PendingContext = Rc::new(RefCell::new(None));
+    let month = build_month_grid(week_start, &on_context);
+    let workweek = build_time_grid(&prefs.work_days, false, &on_context);
+    let week = build_time_grid(&week_days(week_start), false, &on_context);
+    let day = build_time_grid(&[week_start], true, &on_context);
     // The Day/Week/Work-week grids share the configured business-hours band
     // and second time zone.
     for grid in [&workweek, &week, &day] {
         apply_time_grid_preferences(grid, prefs);
     }
-    let agenda = build_agenda_view();
-    let split = build_split_view(week_start);
-    let schedule = build_schedule_view(prefs);
+    let agenda = build_agenda_view(&on_context);
+    let split = build_split_view(week_start, &on_context);
+    let schedule = build_schedule_view(prefs, &on_context);
 
     let stack = gtk::Stack::new();
     stack.add_named(&workweek.root, Some("workweek"));
@@ -3140,6 +3285,7 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
         on_peek: Rc::new(RefCell::new(None)),
         on_slot_activate: Rc::new(RefCell::new(None)),
         on_drag: Rc::new(RefCell::new(None)),
+        on_context,
     };
     // Extracted into a local first (rather than inlined into the call
     // below) so the `Ref` temporary from `.borrow()` is dropped before
@@ -3260,11 +3406,20 @@ pub fn connect_event_peeked(c: &CalendarMain, f: impl Fn(EventOccurrence, gtk::W
 
 /// Registers `f` to run when the user drags an event chip to a new time in
 /// any drag-capable view (the Day/Week/Work week grids and the Month/Split
-/// grids), receiving the dragged occurrence and its resolved new start/end
-/// (UTC) so the caller can persist the move/resize through the session.
+/// grids), receiving the dragged occurrence, its resolved new start/end (UTC)
+/// and whether the drag was a copy (Ctrl held at the press, CAL-30) so the
+/// caller can persist the move/resize - or clone - through the session.
 /// One subscriber is expected (the window); a later registration replaces it.
-pub fn connect_event_dragged(c: &CalendarMain, f: impl Fn(EventOccurrence, DateTime<Utc>, DateTime<Utc>) + 'static) {
+pub fn connect_event_dragged(c: &CalendarMain, f: impl Fn(EventOccurrence, DateTime<Utc>, DateTime<Utc>, bool) + 'static) {
     *c.on_drag.borrow_mut() = Some(Rc::new(f));
+}
+
+/// Registers `f` to run when the user right-clicks an event in any view (item
+/// 3.12 / CAL-31), receiving the clicked occurrence, the widget to anchor the
+/// menu to, and - on a Cairo-drawn surface - the click point within it. One
+/// subscriber is expected (the window); a later registration replaces it.
+pub fn connect_event_context_menu(c: &CalendarMain, f: impl Fn(EventOccurrence, gtk::Widget, Option<(f64, f64)>) + 'static) {
+    *c.on_context.borrow_mut() = Some(Rc::new(f));
 }
 
 /// Registers `f` to run when the user clicks a highlighted slot range in the
@@ -3959,7 +4114,7 @@ mod tests {
             return;
         }
         use chrono::Weekday::*;
-        let grid = build_time_grid(&[Mon, Tue, Wed, Thu, Fri], false);
+        let grid = build_time_grid(&[Mon, Tue, Wed, Thu, Fri], false, &Rc::new(RefCell::new(None)));
         assert_eq!(grid.headers.borrow().len(), 5);
         grid.set_weekdays(&[Sun, Mon, Tue, Wed]);
         assert_eq!(grid.headers.borrow().len(), 4);

@@ -22,6 +22,7 @@ mod context_menu;
 mod conversation_view;
 mod datetime_picker;
 mod event_editor;
+mod event_menu;
 mod folder_menu;
 mod folder_tree;
 mod follow_up;

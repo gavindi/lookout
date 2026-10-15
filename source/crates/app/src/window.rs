@@ -1899,6 +1899,17 @@ struct CalendarUiState {
     scheduling_pending: HashMap<u64, (crate::event_editor::SchedulingHandle, u64)>,
     /// Monotonic id source for [`Self::scheduling_pending`].
     scheduling_next_id: u64,
+    /// An event the context menu just created (Duplicate / Copy to calendar,
+    /// item 3.12) whose editor should open once the server has confirmed it.
+    /// The calendar event loop resolves it against the next `OccurrencesUpdated`
+    /// that carries the new UID, so the editor opens on the real href/etag
+    /// rather than re-creating the copy on save.
+    pending_open_editor: Option<(CalendarId, EventUid)>,
+    /// The open-event-editor hook, registered by the window once
+    /// `calendar_state` exists (same late-binding pattern as
+    /// `dashboard_refresh`), so the calendar event loop can open the editor
+    /// for a just-created occurrence without holding the window's closures.
+    open_event_editor: Option<Rc<dyn Fn(EventOccurrence)>>,
 }
 
 /// Strips `Gtk.Paned`'s default visible grey separator line - the card
@@ -7379,6 +7390,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mail_overview_refresh: None,
         scheduling_pending: HashMap::new(),
         scheduling_next_id: 0,
+        pending_open_editor: None,
+        open_event_editor: None,
     }));
     // The calendar handle `render_body` reaches for when an incoming iMIP
     // REPLY arrives (item 3.6): stored on `UiState` so the reply can be
@@ -11548,6 +11561,36 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
         });
     }
+    // The calendar event loop's window into the event editor: after a
+    // context-menu Duplicate / Copy (item 3.12) the loop opens the new
+    // occurrence's editor once the server has confirmed it.
+    calendar_state.borrow_mut().open_event_editor = Some({
+        let window = window.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
+        Rc::new(move |occ| {
+            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
+        })
+    });
+    // --- Calendar event context menu (item 3.12 / CAL-31): a right-click on
+    // an event in any view opens Outlook's event menu (Open, Delete,
+    // Duplicate, Copy to calendar…, Save as .ics…, Categorize, Show as,
+    // Private). The menu's effects run through the same helpers as the editor,
+    // so a duplicate prompts for invitations exactly like a save would.
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card_provider.clone();
+        calendar_view::connect_event_context_menu(&calendar_main, move |occ, anchor, point| {
+            show_event_menu(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ, &anchor, point);
+        });
+    }
     // --- Calendar event peek (UX-56): a single click on an event chip in the
     // Month/Split grids shows a compact read-only card anchored to the chip,
     // with Edit (the full editor), Delete and Join actions. A double-click
@@ -11576,9 +11619,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_state = calendar_state.clone();
         let calendar_main_for_drag = calendar_main.clone();
         let toast_overlay = toast_overlay.clone();
-        calendar_view::connect_event_dragged(&calendar_main, move |occ, new_start, new_end| {
+        calendar_view::connect_event_dragged(&calendar_main, move |occ, new_start, new_end, copy| {
             if calendar_state.borrow().is_read_only_calendar(&occ.calendar_id) {
                 toast_overlay.add_toast(adw::Toast::new("Events from calendar subscriptions are read-only."));
+                return;
+            }
+            // Ctrl-drag copies the occurrence to the dropped time instead of
+            // moving it (CAL-30 / item 3.12): a brand-new event in the same
+            // calendar, so no move is persisted and no editor opens.
+            if copy {
+                create_event_copy(
+                    &window,
+                    &state,
+                    &calendar_state,
+                    &toast_overlay,
+                    &occ,
+                    occ.calendar_id.clone(),
+                    Some((new_start, new_end)),
+                    false,
+                    "Event copied",
+                );
                 return;
             }
             // Patch the dropped occurrence into the on-screen model and
@@ -14558,6 +14618,19 @@ fn connect_calendar_account(
                         }
                     }
                     CalendarSessionEvent::OccurrencesUpdated { month, occurrences } => {
+                        // An event the context menu just created (item 3.12,
+                        // Duplicate / Copy) is opened once the server's own
+                        // copy has synced - so the editor writes to the real
+                        // href rather than re-creating the copy on save.
+                        let open_after = {
+                            let st = calendar_state.borrow();
+                            st.pending_open_editor
+                                .as_ref()
+                                .and_then(|(cal_id, uid)| occurrences.iter().find(|o| o.calendar_id == *cal_id && o.uid == *uid).cloned())
+                        };
+                        if open_after.is_some() {
+                            calendar_state.borrow_mut().pending_open_editor = None;
+                        }
                         // Feed the reminder engine before `occurrences` moves into
                         // the handle below - the engine keeps its own copy of
                         // every month it's been shown, since `last_occurrences`
@@ -14580,6 +14653,15 @@ fn connect_calendar_account(
                         if calendar_view::mini_month(&mini_calendar) == month {
                             let event_days = calendar_event_days(&calendar_state, month);
                             calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+                        }
+                        // Now that the new event is in the model, open its
+                        // editor (item 3.12) through the window's late-bound
+                        // hook.
+                        if let Some(occ) = open_after {
+                            let callback = calendar_state.borrow().open_event_editor.clone();
+                            if let Some(callback) = callback {
+                                callback(occ);
+                            }
                         }
                     }
                     CalendarSessionEvent::Error(message) => {
@@ -15019,6 +15101,376 @@ fn show_event_peek(
     let popover = calendar_view::build_event_peek(occ, &colors, on_edit, on_delete);
     popover.set_parent(anchor);
     popover.popup();
+}
+
+/// A field change a context-menu action makes to an event (item 3.12 /
+/// CAL-31), applied to a clone of the stored event before it's re-PUT.
+#[derive(Clone)]
+enum EventFieldEdit {
+    ShowAs(lookout_core::interop::BusyStatus),
+    /// `true` = Private, `false` = Public.
+    Private(bool),
+    Categories(Vec<String>),
+}
+
+impl EventFieldEdit {
+    fn apply(&self, event: &mut CalendarEvent) {
+        match self {
+            EventFieldEdit::ShowAs(show_as) => event.show_as = *show_as,
+            EventFieldEdit::Private(private) => {
+                event.sensitivity = if *private {
+                    lookout_core::EventSensitivity::Private
+                } else {
+                    lookout_core::EventSensitivity::Public
+                };
+            }
+            EventFieldEdit::Categories(categories) => event.categories = categories.clone(),
+        }
+    }
+}
+
+/// Opens the event context menu (item 3.12 / CAL-31) on `anchor`, pointing at
+/// `point` (in `anchor`'s coordinates) or at the whole widget.
+#[allow(clippy::too_many_arguments)]
+fn show_event_menu(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    profile_card: &crate::profile_card::ContextProvider,
+    occ: &EventOccurrence,
+    anchor: &gtk::Widget,
+    point: Option<(f64, f64)>,
+) {
+    use crate::event_menu::{EventMenuState, NAMESPACE};
+
+    let read_only = calendar_state.borrow().is_read_only_calendar(&occ.calendar_id);
+    let has_writable_target = pickable_calendars(calendar_state).iter().any(|(_, id)| !calendar_state.borrow().is_read_only_calendar(id));
+    let menu_state = EventMenuState {
+        read_only,
+        has_writable_target,
+        is_recurring: occ.rrule.is_some() || occ.recurrence_id.is_some(),
+        show_as: occ.show_as,
+        private: occ.sensitivity == lookout_core::EventSensitivity::Private,
+    };
+
+    let description = crate::event_menu::event_menu_description(&menu_state);
+    let dispatch: crate::context_menu::Dispatch = {
+        let window = window.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let profile_card = profile_card.clone();
+        let occ = occ.clone();
+        Rc::new(move |name, param| {
+            let Some(action) = crate::event_menu::event_action_for(name, param.as_ref()) else {
+                return;
+            };
+            run_event_menu_action(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ, action);
+        })
+    };
+    let menu = crate::context_menu::ContextMenu::new(&description, &crate::event_menu::action_specs(), dispatch);
+    for (name, enabled) in crate::event_menu::enabled_actions(&menu_state) {
+        menu.set_enabled(name, enabled);
+    }
+    // Show as ▸ checks the event's current state; Private its sensitivity.
+    menu.set_state("show-as", &occ.show_as.as_cdo().to_variant());
+    menu.set_state("private", &menu_state.private.to_variant());
+    let categorize = build_event_category_menu(window, state, calendar_state, toast_overlay, occ);
+    menu.add_child(&categorize, crate::event_menu::CATEGORIZE_SLOT);
+
+    let popover = menu.popover.clone();
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk::Align::Start);
+    popover.set_parent(anchor);
+    menu.insert_action_group(anchor, NAMESPACE);
+    if let Some((x, y)) = point {
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    }
+    // Built per opening, so it's dropped once closed - after the activated
+    // item has run, hence the idle (the message menu's idiom).
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
+    });
+    popover.popup();
+}
+
+/// The event menu's Categorize checklist (a custom slot, like the message
+/// menu's): a check per master category, applied on toggle.
+fn build_event_category_menu(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    occ: &EventOccurrence,
+) -> gtk::Box {
+    let master = state.borrow().app_config.borrow().categories.clone();
+    let boxed = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    if master.is_empty() {
+        boxed.append(
+            &gtk::Label::builder()
+                .label("No categories defined yet")
+                .halign(gtk::Align::Start)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        return boxed;
+    }
+    for category in &master {
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+        row.append(&preset_dot_area(category.color(), 10));
+        let check = gtk::CheckButton::builder().label(&category.name).build();
+        check.set_active(occ.categories.iter().any(|name| name.eq_ignore_ascii_case(&category.name)));
+        {
+            let window = window.clone();
+            let state = state.clone();
+            let calendar_state = calendar_state.clone();
+            let toast_overlay = toast_overlay.clone();
+            let occ = occ.clone();
+            let name = category.name.clone();
+            check.connect_toggled(move |check| {
+                let mut categories = occ.categories.clone();
+                if check.is_active() {
+                    if !categories.iter().any(|existing| existing.eq_ignore_ascii_case(&name)) {
+                        categories.push(name.clone());
+                    }
+                } else {
+                    categories.retain(|existing| !existing.eq_ignore_ascii_case(&name));
+                }
+                apply_event_field_edit(&window, &state, &calendar_state, &toast_overlay, &occ, EventFieldEdit::Categories(categories));
+            });
+        }
+        row.append(&check);
+        boxed.append(&row);
+    }
+    boxed
+}
+
+/// Runs one event context-menu action (item 3.12 / CAL-31) through the same
+/// helpers the editor and ribbon use, so every verb behaves - and prompts for
+/// invitations - the same wherever it's invoked.
+#[allow(clippy::too_many_arguments)]
+fn run_event_menu_action(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    profile_card: &crate::profile_card::ContextProvider,
+    occ: &EventOccurrence,
+    action: crate::event_menu::EventMenuAction,
+) {
+    use crate::event_menu::EventMenuAction as A;
+    match action {
+        A::Open => open_event_editor_for(window, state, worker, calendar_state, toast_overlay, profile_card, occ),
+        A::Delete => delete_event_with_invites(window, state, calendar_state, toast_overlay, occ.calendar_id.clone(), occ.clone()),
+        A::Duplicate => create_event_copy(window, state, calendar_state, toast_overlay, occ, occ.calendar_id.clone(), None, true, "Event duplicated"),
+        A::CopyToCalendar => {
+            let targets: Vec<(CalendarId, String, usize)> = pickable_calendars(calendar_state)
+                .into_iter()
+                .filter(|(_, id)| !calendar_state.borrow().is_read_only_calendar(id))
+                .map(|(label, id)| (id, label, 0))
+                .collect();
+            if targets.is_empty() {
+                toast_overlay.add_toast(adw::Toast::new("No other calendar to copy into."));
+                return;
+            }
+            let window_for_pick = window.clone();
+            let state_for_pick = state.clone();
+            let calendar_state_for_pick = calendar_state.clone();
+            let toast_overlay_for_pick = toast_overlay.clone();
+            let occ_for_pick = occ.clone();
+            crate::folder_menu::present_folder_picker(
+                window.upcast_ref(),
+                "Copy to calendar",
+                "Choose the calendar to copy this event into.",
+                "Copy",
+                targets,
+                move |target| {
+                    create_event_copy(
+                        &window_for_pick,
+                        &state_for_pick,
+                        &calendar_state_for_pick,
+                        &toast_overlay_for_pick,
+                        &occ_for_pick,
+                        target,
+                        None,
+                        true,
+                        "Event copied",
+                    );
+                },
+            );
+        }
+        A::SaveAsIcs => save_event_ics(window, toast_overlay, occ),
+        A::ShowAs(show_as) => {
+            apply_event_field_edit(window, state, calendar_state, toast_overlay, occ, EventFieldEdit::ShowAs(show_as));
+        }
+        A::Private => {
+            let make_private = occ.sensitivity != lookout_core::EventSensitivity::Private;
+            apply_event_field_edit(window, state, calendar_state, toast_overlay, occ, EventFieldEdit::Private(make_private));
+        }
+    }
+}
+
+/// Clones `source` into `target` as a brand-new event (fresh UID, no
+/// href/etag, sequence reset, recurrence dropped so the copy is standalone),
+/// optionally at a new `times` span. Routes through `save_event_with_invites`
+/// with `previous = None`, so an organizer's meeting sends invitations exactly
+/// as a new meeting from the editor would. With `open_editor`, the new
+/// occurrence's editor opens once the server confirms it (`pending_open_editor`).
+#[allow(clippy::too_many_arguments)]
+fn create_event_copy(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    source: &EventOccurrence,
+    target: CalendarId,
+    times: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    open_editor: bool,
+    toast: &str,
+) {
+    if calendar_state.borrow().is_read_only_calendar(&target) {
+        toast_overlay.add_toast(adw::Toast::new("That calendar is read-only."));
+        return;
+    }
+    let (start, end) = times.unwrap_or((source.start, source.end));
+    let (start_local, end_local) = crate::event_editor::dragged_local_span(source, start, end);
+    let mut event = crate::event_editor::calendar_event_from_occurrence(source, start_local, end_local);
+    let new_uid = EventUid(uuid::Uuid::new_v4().to_string());
+    event.uid = new_uid.clone();
+    event.calendar_id = target.clone();
+    event.href = None;
+    event.etag = None;
+    event.sequence = 0;
+    event.recurrence_id = None;
+    event.recurrence_range = lookout_core::RecurrenceRange::default();
+    event.rrule = None;
+    event.exdates = Vec::new();
+    event.rdates = Vec::new();
+    if open_editor {
+        calendar_state.borrow_mut().pending_open_editor = Some((target.clone(), new_uid));
+    }
+    save_event_with_invites(window, state, calendar_state, toast_overlay, None, target, event);
+    toast_overlay.add_toast(adw::Toast::new(toast));
+}
+
+/// Applies a field change to an event (item 3.12 / CAL-31). A recurring event
+/// asks for the edit scope first, exactly as the editor's own dropdown does,
+/// so a single occurrence becomes an override rather than re-anchoring the
+/// series.
+fn apply_event_field_edit(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    occ: &EventOccurrence,
+    edit: EventFieldEdit,
+) {
+    if calendar_state.borrow().is_read_only_calendar(&occ.calendar_id) {
+        return;
+    }
+    if occ.rrule.is_none() && occ.recurrence_id.is_none() {
+        let mut event = crate::calendar_invites::stored_event_from_occurrence(occ);
+        edit.apply(&mut event);
+        save_event_with_invites(window, state, calendar_state, toast_overlay, Some(occ), occ.calendar_id.clone(), event);
+        return;
+    }
+    let window = window.clone();
+    let parent = window.clone();
+    let state = state.clone();
+    let calendar_state = calendar_state.clone();
+    let toast_overlay = toast_overlay.clone();
+    let occ = occ.clone();
+    present_event_edit_scope_dialog(&parent, move |scope| {
+        let mut event = crate::calendar_invites::stored_event_from_occurrence(&occ);
+        edit.apply(&mut event);
+        crate::event_editor::apply_edit_scope(&mut event, scope, Some(&occ));
+        save_event_with_invites(&window, &state, &calendar_state, &toast_overlay, Some(&occ), occ.calendar_id.clone(), event);
+    });
+}
+
+/// Asks which part of a recurring series an inline edit applies to ("This
+/// occurrence" / "This and following" / "All events"), matching the editor's
+/// edit-scope dropdown. `on_choose` receives the scope index
+/// [`crate::event_editor::apply_edit_scope`] expects.
+fn present_event_edit_scope_dialog(parent: &adw::ApplicationWindow, on_choose: impl Fn(usize) + 'static) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Edit recurring event")
+        .body("This event is part of a recurring series. Which events should the change apply to?")
+        .default_response("this")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("this", "This occurrence");
+    dialog.add_response("following", "This and following");
+    dialog.add_response("all", "All events");
+    dialog.set_response_appearance("this", adw::ResponseAppearance::Suggested);
+    let on_choose: Rc<dyn Fn(usize)> = Rc::new(on_choose);
+    dialog.connect_response(None, move |_, response| {
+        let scope = match response {
+            "this" => 0,
+            "following" => 1,
+            "all" => 2,
+            _ => return,
+        };
+        on_choose(scope);
+    });
+    dialog.present(Some(parent));
+}
+
+/// Prompts for a location and writes `occ` (as its whole series when it's a
+/// recurring event) to a `.ics` file, mirroring the message "Save as .eml…"
+/// export. The serialized body is the same `build_vcalendar` a CalDAV PUT
+/// sends, so the file is a valid RFC 5545 document.
+fn save_event_ics(window: &adw::ApplicationWindow, toast_overlay: &adw::ToastOverlay, occ: &EventOccurrence) {
+    let event = crate::calendar_invites::stored_event_from_occurrence(occ);
+    let ics = lookout_dav::build_vcalendar(&event);
+    let initial_name = event_ics_name(occ);
+    let window = window.clone();
+    let toast_overlay = toast_overlay.clone();
+    glib::spawn_future_local(async move {
+        let filter = gtk::FileFilter::new();
+        filter.add_suffix("ics");
+        filter.set_name(Some("iCalendar files (*.ics)"));
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::builder().title("Save event as .ics").initial_name(&initial_name).filters(&filters).build();
+        let Ok(file) = dialog.save_future(Some(&window)).await else { return };
+        let result = file
+            .replace_contents_bytes_future(&glib::Bytes::from(ics.as_bytes()), None, false, gio::FileCreateFlags::REPLACE_DESTINATION)
+            .await;
+        match result {
+            Ok(_) => toast_overlay.add_toast(adw::Toast::new("Event saved as .ics")),
+            Err(e) => {
+                let title = glib::markup_escape_text(&format!("Couldn't save event: {e}"));
+                toast_overlay.add_toast(adw::Toast::new(&title));
+            }
+        }
+    });
+}
+
+/// A safe suggested filename for the `.ics` export dialog: the event's summary
+/// plus `.ics`, or a plain placeholder when the summary is empty or contains
+/// path separators (untrusted data must never reach the dialog as a path, the
+/// same rationale as `eml_suggested_name`).
+fn event_ics_name(occ: &EventOccurrence) -> String {
+    let summary = occ.summary.as_deref().unwrap_or("").trim();
+    if summary.is_empty() || summary.contains('/') || summary.contains('\\') {
+        "event.ics".to_string()
+    } else {
+        format!("{summary}.ics")
+    }
 }
 
 /// Opens the "New event" editor prefilled for `suggested_start` (and

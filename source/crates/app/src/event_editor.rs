@@ -513,7 +513,11 @@ pub fn show_event_editor(
     // schedule strip, reusing the widgets the main Calendar tab already
     // builds for itself (`calendar_view::build_mini`/`build_time_grid`).
     let preview_mini = crate::calendar_view::build_mini(prefill.calendar_prefs.week_start);
-    let preview_day_strip = Rc::new(crate::calendar_view::build_time_grid(&[prefill.calendar_prefs.week_start], true));
+    let preview_day_strip = Rc::new(crate::calendar_view::build_time_grid(
+        &[prefill.calendar_prefs.week_start],
+        true,
+        &Rc::new(RefCell::new(None)),
+    ));
     crate::calendar_view::apply_time_grid_preferences(&preview_day_strip, prefill.calendar_prefs);
     let preview_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
