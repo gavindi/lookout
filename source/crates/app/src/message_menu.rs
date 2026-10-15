@@ -21,7 +21,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use gtk::glib;
 use gtk::prelude::*;
-use lookout_core::{FollowUpFlag, MailboxId, MailboxRole};
+use lookout_core::{FollowUpFlag, Importance, MailboxId, MailboxRole};
 
 use crate::context_menu::{ActionSpec, MenuDescription};
 
@@ -76,6 +76,15 @@ pub enum MessageMenuAction {
     BlockDomain,
     /// Remove the target's sender from the account's blocked list.
     UnblockSender,
+    /// Reclassify the targets' Focused/Other bucket (M-03): `true` = Focused.
+    MoveFocused(bool),
+    /// Also record a sender override so future mail follows: `true` = Focused
+    /// ("Always move…").
+    AlwaysMoveFocused(bool),
+    /// Delete the target sender's Focused/Other override ("Stop moving…").
+    StopMovingFocused,
+    /// Set the targets' importance (M-12).
+    SetImportance(Importance),
     ViewDetails,
     ViewSource,
     OpenWindow,
@@ -114,6 +123,8 @@ pub struct MessageMenuState {
     pub can_report_junk: bool,
     /// Report ▸ Not junk (every target is in the Junk folder).
     pub can_not_junk: bool,
+    /// Focused Inbox ▸ (M-03): every target lives in one account.
+    pub can_focused: bool,
 }
 
 /// The facts [`message_menu_state`] needs about one target message.
@@ -148,6 +159,7 @@ pub fn message_menu_state(targets: &[TargetFacts], single: bool, has_archive: bo
         snoozed: targets.iter().any(|t| t.snoozed),
         can_report_junk: targets.iter().all(|t| t.role != Some(MailboxRole::Junk)),
         can_not_junk: targets.iter().all(|t| t.role == Some(MailboxRole::Junk)),
+        can_focused: one_account,
     }
 }
 
@@ -181,6 +193,11 @@ pub struct MenuChoices {
     /// (item 2.9 / M-17): when true the Block ▸ submenu offers Unblock sender
     /// instead of Block sender / Block domain.
     pub sender_blocked: bool,
+    /// Whether the target account provides Focused Inbox (M-03 / item 5.4):
+    /// when true the Focused Inbox ▸ submenu is offered. Left out entirely
+    /// otherwise, per the module docs' "features not available are left out"
+    /// rule.
+    pub focused_inbox: bool,
 }
 
 /// Every action the menu's group carries.
@@ -210,6 +227,14 @@ pub fn action_specs() -> Vec<ActionSpec> {
         "block-sender",
         "block-domain",
         "unblock-sender",
+        "importance-high",
+        "importance-normal",
+        "importance-low",
+        "focus-focused",
+        "focus-other",
+        "focus-always-focused",
+        "focus-always-other",
+        "focus-stop",
         "view-details",
         "view-source",
         "open-window",
@@ -245,6 +270,14 @@ pub fn enabled_actions(state: &MessageMenuState) -> Vec<(&'static str, bool)> {
         ("block-sender", state.can_block),
         ("block-domain", state.can_block),
         ("unblock-sender", state.can_block),
+        ("importance-high", state.can_focused),
+        ("importance-normal", state.can_focused),
+        ("importance-low", state.can_focused),
+        ("focus-focused", state.can_focused),
+        ("focus-other", state.can_focused),
+        ("focus-always-focused", state.single),
+        ("focus-always-other", state.single),
+        ("focus-stop", state.single),
         ("create-rule", state.single),
         ("view-details", state.single),
         ("view-source", state.single),
@@ -312,7 +345,31 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
         }
         menu.submenu("Snooze", snooze.section().icon_action("Choose a date…", ns("snooze-custom"), "appointment-soon-symbolic"))
     };
-    menu = menu.submenu("Categorize", MenuDescription::new().section().custom(CATEGORIZE_SLOT)).section();
+    menu = menu.submenu("Categorize", MenuDescription::new().section().custom(CATEGORIZE_SLOT));
+    // Tags group (M-12, M-03): Importance ▸ is universal; Focused Inbox ▸ is
+    // offered only on an account that provides a classification (item 5.4).
+    menu = menu.submenu(
+        "Importance",
+        MenuDescription::new()
+            .section()
+            .icon_action("High", ns("importance-high"), "mail-mark-important-symbolic")
+            .icon_action("Normal", ns("importance-normal"), "mail-mark-important-symbolic")
+            .icon_action("Low", ns("importance-low"), "mail-mark-important-symbolic"),
+    );
+    if choices.focused_inbox {
+        menu = menu.submenu(
+            "Focused Inbox",
+            MenuDescription::new()
+                .section()
+                .icon_action("Move to Focused", ns("focus-focused"), "view-list-symbolic")
+                .icon_action("Move to Other", ns("focus-other"), "view-list-symbolic")
+                .section()
+                .icon_action("Always move to Focused", ns("focus-always-focused"), "view-list-symbolic")
+                .icon_action("Always move to Other", ns("focus-always-other"), "view-list-symbolic")
+                .icon_action("Stop moving from this sender", ns("focus-stop"), "edit-clear-symbolic"),
+        );
+    }
+    menu = menu.section();
     let mut report = MenuDescription::new().section().icon_action("Report junk", ns("report-junk"), "mail-mark-junk-symbolic");
     if choices.report_phishing {
         report = report.icon_action("Report phishing", ns("report-phishing"), "dialog-warning-symbolic");
@@ -391,6 +448,14 @@ pub fn message_action_for(name: &str, param: Option<&glib::Variant>) -> Option<M
         "block-sender" => MessageMenuAction::BlockSender,
         "block-domain" => MessageMenuAction::BlockDomain,
         "unblock-sender" => MessageMenuAction::UnblockSender,
+        "importance-high" => MessageMenuAction::SetImportance(Importance::High),
+        "importance-normal" => MessageMenuAction::SetImportance(Importance::Normal),
+        "importance-low" => MessageMenuAction::SetImportance(Importance::Low),
+        "focus-focused" => MessageMenuAction::MoveFocused(true),
+        "focus-other" => MessageMenuAction::MoveFocused(false),
+        "focus-always-focused" => MessageMenuAction::AlwaysMoveFocused(true),
+        "focus-always-other" => MessageMenuAction::AlwaysMoveFocused(false),
+        "focus-stop" => MessageMenuAction::StopMovingFocused,
         "create-rule" => MessageMenuAction::CreateRule,
         "view-details" => MessageMenuAction::ViewDetails,
         "view-source" => MessageMenuAction::ViewSource,
@@ -462,7 +527,7 @@ mod tests {
             vec![
                 vec!["Reply", "Reply all", "Forward", "Reply with meeting"],
                 vec!["Delete", "Archive", "Move ▸", "Copy ▸"],
-                vec!["Mark as unread", "Flag ▸", "Pin", "Snooze ▸", "Categorize ▸"],
+                vec!["Mark as unread", "Flag ▸", "Pin", "Snooze ▸", "Categorize ▸", "Importance ▸"],
                 vec!["Report ▸"],
                 vec!["Block ▸"],
                 vec!["Rules ▸"],
@@ -489,6 +554,20 @@ mod tests {
         assert_eq!(labels(submenu(&menu, "Report")), vec![vec!["Report junk", "Report phishing", "Not junk"]]);
         assert_eq!(labels(submenu(&menu, "View")), vec![vec!["View message details", "View message source"]]);
         assert_eq!(labels(submenu(&menu, "Categorize")), vec![vec![format!("[{CATEGORIZE_SLOT}]")]]);
+        // Focused Inbox ▸ appears only on an account that provides it (M-03).
+        let focused = MenuChoices {
+            focused_inbox: true,
+            ..MenuChoices::default()
+        };
+        let focused_menu = message_menu_description(&state, &focused);
+        assert_eq!(
+            labels(submenu(&focused_menu, "Focused Inbox")),
+            vec![
+                vec!["Move to Focused", "Move to Other"],
+                vec!["Always move to Focused", "Always move to Other", "Stop moving from this sender"]
+            ]
+        );
+        assert_eq!(labels(submenu(&focused_menu, "Importance")), vec![vec!["High", "Normal", "Low"]]);
     }
 
     #[test]
@@ -502,7 +581,7 @@ mod tests {
 
         let mixed = message_menu_state(&[unread.clone(), pinned.clone()], false, true);
         let third = &labels(&message_menu_description(&mixed, &MenuChoices::default()))[2];
-        assert_eq!(third, &vec!["Mark as read", "Flag ▸", "Pin", "Snooze ▸", "Categorize ▸"]);
+        assert_eq!(third, &vec!["Mark as read", "Flag ▸", "Pin", "Snooze ▸", "Categorize ▸", "Importance ▸"]);
 
         let all_pinned = message_menu_state(&[pinned.clone(), pinned], false, true);
         assert!(labels(&message_menu_description(&all_pinned, &MenuChoices::default()))[2].contains(&"Unpin".to_string()));
@@ -580,6 +659,7 @@ mod tests {
             }],
             report_phishing: false,
             sender_blocked: false,
+            focused_inbox: false,
         };
         let menu = message_menu_description(&message_menu_state(&[facts(None)], true, true), &choices);
         assert_eq!(labels(submenu(&menu, "Move")), vec![vec!["Projects"], vec!["Other folder…"]]);
@@ -632,6 +712,14 @@ mod tests {
             ("block-sender", MessageMenuAction::BlockSender),
             ("block-domain", MessageMenuAction::BlockDomain),
             ("unblock-sender", MessageMenuAction::UnblockSender),
+            ("importance-high", MessageMenuAction::SetImportance(Importance::High)),
+            ("importance-normal", MessageMenuAction::SetImportance(Importance::Normal)),
+            ("importance-low", MessageMenuAction::SetImportance(Importance::Low)),
+            ("focus-focused", MessageMenuAction::MoveFocused(true)),
+            ("focus-other", MessageMenuAction::MoveFocused(false)),
+            ("focus-always-focused", MessageMenuAction::AlwaysMoveFocused(true)),
+            ("focus-always-other", MessageMenuAction::AlwaysMoveFocused(false)),
+            ("focus-stop", MessageMenuAction::StopMovingFocused),
             ("view-details", MessageMenuAction::ViewDetails),
             ("view-source", MessageMenuAction::ViewSource),
             ("open-window", MessageMenuAction::OpenWindow),

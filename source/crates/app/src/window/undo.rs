@@ -54,7 +54,9 @@ pub(crate) fn command_mailbox(command: &AccountCommand) -> Option<&MailboxId> {
         | AccountCommand::StoreFlagsMany { mailbox, .. }
         | AccountCommand::StoreKeywords { mailbox, .. }
         | AccountCommand::StoreKeywordsMany { mailbox, .. }
-        | AccountCommand::SetFollowUp { mailbox, .. } => Some(mailbox),
+        | AccountCommand::SetFollowUp { mailbox, .. }
+        | AccountCommand::SetImportance { mailbox, .. }
+        | AccountCommand::SetFocused { mailbox, .. } => Some(mailbox),
         _ => None,
     }
 }

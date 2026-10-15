@@ -276,6 +276,29 @@ impl FilterSet {
     }
 }
 
+/// Which Focused Inbox bucket the list shows (M-03 / item 5.4): everything, or
+/// just Outlook's Focused or Other classification. `All` is the default; the
+/// Focused/Other tabs are only shown for an account that provides a
+/// classification, and the three are mutually exclusive (unlike [`FilterSet`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FocusedView {
+    #[default]
+    All,
+    Focused,
+    Other,
+}
+
+impl FocusedView {
+    /// Whether `message` belongs in this view.
+    fn matches(self, message: &EmailSummary) -> bool {
+        match self {
+            FocusedView::All => true,
+            FocusedView::Focused => message.inference_classification == lookout_core::InferenceClassification::Focused,
+            FocusedView::Other => message.inference_classification == lookout_core::InferenceClassification::Other,
+        }
+    }
+}
+
 /// The date range one section header covers.
 ///
 /// Deliberately payload-free and `Copy + Eq + Hash`: the set of
@@ -932,16 +955,18 @@ fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
 /// message is pinned and a pinned copy would just duplicate the list) - `apply_layout`'s
 /// `splice_pinned_section` renders them as their own leading section,
 /// independent of `sort_key`/`threaded`.
+#[allow(clippy::too_many_arguments)]
 fn compute_layout(
     truth: Vec<EmailSummary>,
     filter: FilterSet,
+    focused: FocusedView,
     viewer: &HashSet<String>,
     sort_key: SortKey,
     sort_descending: bool,
     threaded: bool,
     now: DateTime<Local>,
 ) -> ComputedLayout {
-    let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m, viewer)).collect();
+    let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m, viewer) && focused.matches(m)).collect();
     sort_messages(&mut messages, sort_key, sort_descending);
     let pinned = if filter.contains(Filter::Pinned) {
         Vec::new()
@@ -1073,7 +1098,7 @@ fn splice_diff(store: &gio::ListStore, old_keys: &[RowKey], new_keys: &[RowKey],
 /// themselves: the fingerprint is the only thing the comparison needs, and
 /// key vectors make it a plain `Vec` equality (allocation-free) instead of a
 /// per-message key rebuild on both sides of every event.
-type DisplayedMessages = Option<(SortKey, bool, FilterSet, bool, Vec<MessageRowKey>)>;
+type DisplayedMessages = Option<(SortKey, bool, FilterSet, bool, FocusedView, Vec<MessageRowKey>)>;
 
 /// What the message list's selection currently points at. The cases are
 /// genuinely distinct to the reading pane: nothing selected clears it, a
@@ -1251,6 +1276,11 @@ pub struct MessageListModel {
     /// sort), so every caller that rebuilds the list gets the same subset
     /// without threading the filters through each call site.
     filter: Rc<RefCell<FilterSet>>,
+    /// The active Focused Inbox bucket (M-03 / item 5.4), applied inside
+    /// `repopulate` alongside `filter`. Owned by the model, like `filter`, so a
+    /// tab switch re-renders from `truth` without threading it through every
+    /// call site.
+    focused: Rc<RefCell<FocusedView>>,
     /// The viewer's own lowercased email addresses (every connected account's
     /// address), used to evaluate [`Filter::ToMe`]. Empty until the window
     /// seeds it, which makes `ToMe` match nothing - a safe default.
@@ -1354,6 +1384,7 @@ impl MessageListModel {
             displayed: Rc::new(RefCell::new(None)),
             truth: Rc::new(RefCell::new(Vec::new())),
             filter: Rc::new(RefCell::new(FilterSet::none())),
+            focused: Rc::new(RefCell::new(FocusedView::All)),
             viewer: Rc::new(RefCell::new(HashSet::new())),
             generation: Rc::new(Cell::new(0)),
             worker,
@@ -1647,6 +1678,7 @@ impl MessageListModel {
     /// generation-guard rationale.
     fn recompute_and_apply(&self, sort_key: SortKey, sort_descending: bool) {
         let filter = *self.filter.borrow();
+        let focused = *self.focused.borrow();
         let viewer = self.viewer.borrow().clone();
         let threaded = *self.threaded.borrow();
         let now = Local::now();
@@ -1667,14 +1699,14 @@ impl MessageListModel {
             // Small enough to be imperceptible inline (or no worker - every
             // test-built model), or under the threshold: compute and apply
             // in the same call, exactly as before this split existed.
-            let computed = compute_layout(truth_snapshot, filter, &viewer, sort_key, sort_descending, threaded, now);
-            self.apply_layout(sort_key, sort_descending, filter, threaded, now, computed);
+            let computed = compute_layout(truth_snapshot, filter, focused, &viewer, sort_key, sort_descending, threaded, now);
+            self.apply_layout(sort_key, sort_descending, filter, focused, threaded, now, computed);
             return;
         };
 
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         worker.spawn(async move {
-            if let Ok(result) = tokio::task::spawn_blocking(move || compute_layout(truth_snapshot, filter, &viewer, sort_key, sort_descending, threaded, now)).await {
+            if let Ok(result) = tokio::task::spawn_blocking(move || compute_layout(truth_snapshot, filter, focused, &viewer, sort_key, sort_descending, threaded, now)).await {
                 let _ = reply_tx.send(result).await;
             }
         });
@@ -1684,7 +1716,7 @@ impl MessageListModel {
             if model.generation.get() != generation {
                 return;
             }
-            model.apply_layout(sort_key, sort_descending, filter, threaded, now, computed);
+            model.apply_layout(sort_key, sort_descending, filter, focused, threaded, now, computed);
         });
     }
 
@@ -1693,7 +1725,8 @@ impl MessageListModel {
     /// `compute_layout` dispatch), does the no-op check, snapshots collapse
     /// and selection state, and splices the result into the tree. See
     /// `repopulate`'s doc comment for the two ways this gets called.
-    fn apply_layout(&self, sort_key: SortKey, sort_descending: bool, filter: FilterSet, threaded: bool, now: DateTime<Local>, computed: ComputedLayout) {
+    #[allow(clippy::too_many_arguments)]
+    fn apply_layout(&self, sort_key: SortKey, sort_descending: bool, filter: FilterSet, focused: FocusedView, threaded: bool, now: DateTime<Local>, computed: ComputedLayout) {
         let ComputedLayout { pinned, layout, keys } = computed;
         // The sort is part of the comparison, not just the contents: a list
         // can be element-identical under ascending and descending order yet
@@ -1707,8 +1740,8 @@ impl MessageListModel {
             .displayed
             .borrow()
             .as_ref()
-            .is_some_and(|(key, descending, shown_filter, shown_threaded, current_keys)| {
-                *key == sort_key && *descending == sort_descending && *shown_filter == filter && *shown_threaded == threaded && *current_keys == keys
+            .is_some_and(|(key, descending, shown_filter, shown_threaded, shown_focused, current_keys)| {
+                *key == sort_key && *descending == sort_descending && *shown_filter == filter && *shown_threaded == threaded && *shown_focused == focused && *current_keys == keys
             });
         if unchanged {
             return;
@@ -1737,7 +1770,7 @@ impl MessageListModel {
             gtk::INVALID_LIST_POSITION
         };
 
-        *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, threaded, keys));
+        *self.displayed.borrow_mut() = Some((sort_key, sort_descending, filter, threaded, focused, keys));
 
         // The Pinned section, spliced first and unconditionally -
         // it exists independent of `layout`'s own grouping/threading mode,
@@ -1877,9 +1910,26 @@ impl MessageListModel {
         }
         *self.filter.borrow_mut() = filter;
         let (sort_key, sort_descending) = match *self.displayed.borrow() {
-            Some((key, descending, _, _, _)) => (key, descending),
+            Some((key, descending, ..)) => (key, descending),
             // Nothing has ever been rendered; the defaults are what a first
             // repopulate would use anyway.
+            None => (SortKey::Date, true),
+        };
+        let truth = self.all_messages();
+        self.repopulate(truth, sort_key, sort_descending);
+    }
+
+    /// Switches which Focused Inbox bucket the list shows (M-03 / item 5.4) -
+    /// everything, or just Outlook's Focused or Other classification - and
+    /// re-renders from the stored unfiltered set. A no-op when the view is
+    /// already in effect. All three views are mutually exclusive.
+    pub fn set_focused(&self, view: FocusedView) {
+        if *self.focused.borrow() == view {
+            return;
+        }
+        *self.focused.borrow_mut() = view;
+        let (sort_key, sort_descending) = match *self.displayed.borrow() {
+            Some((key, descending, ..)) => (key, descending),
             None => (SortKey::Date, true),
         };
         let truth = self.all_messages();
@@ -1913,7 +1963,7 @@ impl MessageListModel {
         }
         *self.threaded.borrow_mut() = threaded;
         let (sort_key, sort_descending) = match *self.displayed.borrow() {
-            Some((key, descending, _, _, _)) => (key, descending),
+            Some((key, descending, ..)) => (key, descending),
             None => (SortKey::Date, true),
         };
         let truth = self.all_messages();
@@ -1929,7 +1979,7 @@ impl MessageListModel {
     /// rendered yet" and rebuild unconditionally.
     pub fn refresh(&self) {
         let (sort_key, sort_descending) = match *self.displayed.borrow() {
-            Some((key, descending, _, _, _)) => (key, descending),
+            Some((key, descending, ..)) => (key, descending),
             None => (SortKey::Date, true),
         };
         // Clearing `displayed` first makes the no-op check see "nothing
@@ -3081,7 +3131,7 @@ mod tests {
     fn pinned_messages_render_ahead_of_the_grouped_body_and_are_excluded_from_it() {
         let now = local(2026, 8, 4, 8);
         let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 2, 1)), pinned(3, utc_on(now, 2026, 1, 1))];
-        let computed = compute_layout(messages, FilterSet::none(), &HashSet::new(), SortKey::Sender, true, false, now);
+        let computed = compute_layout(messages, FilterSet::none(), FocusedView::All, &HashSet::new(), SortKey::Sender, true, false, now);
         assert_eq!(
             computed.pinned.iter().map(|m| m.uid.0).collect::<Vec<_>>(),
             vec![1, 3],
@@ -3101,7 +3151,16 @@ mod tests {
     fn pinned_section_is_empty_under_the_pinned_filter() {
         let now = local(2026, 8, 4, 8);
         let messages = vec![pinned(1, utc_on(now, 2026, 8, 4)), summary(2, utc_on(now, 2026, 8, 4))];
-        let computed = compute_layout(messages, FilterSet::none().with(Filter::Pinned, true), &HashSet::new(), SortKey::Date, true, false, now);
+        let computed = compute_layout(
+            messages,
+            FilterSet::none().with(Filter::Pinned, true),
+            FocusedView::All,
+            &HashSet::new(),
+            SortKey::Date,
+            true,
+            false,
+            now,
+        );
         assert!(computed.pinned.is_empty(), "Pinned already shows nothing but pinned messages - no separate pin needed");
         let ListLayout::Grouped(sections) = computed.layout else {
             panic!("expected a grouped layout under Date sort")
@@ -3171,7 +3230,7 @@ mod tests {
         let n = BACKGROUND_REPOPULATE_THRESHOLD + 1;
         let messages: Vec<EmailSummary> = (0..n as u32).map(|uid| summary(uid, dates[uid as usize % 3])).collect();
 
-        let computed = compute_layout(messages, FilterSet::none(), &HashSet::new(), SortKey::Date, true, false, now);
+        let computed = compute_layout(messages, FilterSet::none(), FocusedView::All, &HashSet::new(), SortKey::Date, true, false, now);
         assert!(computed.pinned.is_empty(), "none of the fixture messages are pinned");
         assert_eq!(computed.keys.len(), n, "every message produced one row-key fingerprint");
 
@@ -3873,5 +3932,19 @@ mod tests {
         let newer = summary_in(1, "a:INBOX", utc_on(now, 2026, 8, 2));
         // Newest-first regardless of the tie-break fields.
         assert_eq!(unified_merge_order(&newer, &a), std::cmp::Ordering::Less);
+    }
+
+    /// The Focused/Other tabs select by Graph's `inferenceClassification`
+    /// (M-03 / item 5.4); `All` shows everything.
+    #[test]
+    fn focused_view_selects_by_classification() {
+        let mut focused = summary(1, chrono::Utc::now());
+        focused.inference_classification = lookout_core::InferenceClassification::Focused;
+        let mut other = summary(2, chrono::Utc::now());
+        other.inference_classification = lookout_core::InferenceClassification::Other;
+
+        assert!(FocusedView::All.matches(&focused) && FocusedView::All.matches(&other));
+        assert!(FocusedView::Focused.matches(&focused) && !FocusedView::Focused.matches(&other));
+        assert!(!FocusedView::Other.matches(&focused) && FocusedView::Other.matches(&other));
     }
 }

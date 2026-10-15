@@ -671,6 +671,18 @@ pub enum AccountCommand {
         delta_cursor: Option<String>,
         taken_at: chrono::DateTime<chrono::Utc>,
     },
+    /// Replaces the local Focused/Other override rows with a Graph snapshot
+    /// (M-03 / item 5.4), as `(sender, classification, Graph override id)`.
+    /// Rows changed here after `taken_at` are kept.
+    ApplyInferenceOverrides {
+        overrides: Vec<(String, lookout_core::InferenceClassification, Option<String>)>,
+        taken_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Drops a sender's local Focused/Other override row - "Stop moving"
+    /// (M-03).
+    ClearInferenceOverride {
+        sender: String,
+    },
     /// Kick off background body prefetch for all mailboxes. The prefetch
     /// runs cooperatively in batches between IDLE cycles, fetching full
     /// message bodies and caching them on disk so subsequent message views
@@ -4393,6 +4405,16 @@ async fn connect_and_run(
                     if applied {
                         emit_cached_messages(cache, &current_mailbox_id, events).await;
                         emit_flagged_messages(cache, events).await;
+                    }
+                }
+                AccountCommand::ApplyInferenceOverrides { overrides, taken_at } => {
+                    if let Some(Err(e)) = cache_op(cache, move |c| c.apply_inference_overrides(&overrides, taken_at)).await {
+                        tracing::warn!("failed to apply Outlook's Focused/Other overrides: {e}");
+                    }
+                }
+                AccountCommand::ClearInferenceOverride { sender } => {
+                    if let Some(Err(e)) = cache_op(cache, move |c| c.clear_inference_override(&sender)).await {
+                        tracing::warn!("failed to clear a Focused/Other override: {e}");
                     }
                 }
                 AccountCommand::SetImportance { mailbox, uids, importance } => {

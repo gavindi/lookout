@@ -514,6 +514,17 @@ pub(crate) struct ListHeader {
     /// The removable refiner chips shown above the list during a search
     /// (M-18, roadmap 2.3). Empty and hidden otherwise.
     pub(crate) refiner_row: gtk::Box,
+    /// The Focused / Other tabs (M-03 / item 5.4), shown only while an Inbox of
+    /// an account that provides Focused Inbox is open.
+    pub(crate) focused_box: gtk::Box,
+    /// The Focused tab button, kept so a refresh can re-select it when the tabs
+    /// (re)appear.
+    pub(crate) focused_button: gtk::ToggleButton,
+    /// Whether the tabs were shown at the last refresh, so the model's view is
+    /// reset only on a transition and a user's tab choice survives a repaint.
+    pub(crate) focused_available: Rc<Cell<bool>>,
+    /// The list model the tabs re-filter.
+    pub(crate) message_list: MessageListModel,
 }
 
 /// The header's two title lines for the active view: the open folder's display
@@ -571,6 +582,42 @@ pub(crate) fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHea
     header.favorite_button.set_active(starred);
     apply_favorite_visual(&header.favorite_button, starred);
     header.favorite_suppress.set(false);
+
+    // Focused / Other tabs (M-03 / item 5.4): offered only while an Inbox of an
+    // account that provides Focused Inbox is open, and only reset on a
+    // transition so a user's tab choice survives an unrelated repaint.
+    let focused_available = {
+        let st = state.borrow();
+        let account = match (st.mail_view, st.current_mailbox.as_ref()) {
+            (MailView::Search, _) => None,
+            (_, Some(mailbox)) => mailbox_account_id(mailbox),
+            (_, None) => None,
+        };
+        let inbox = account.as_ref().is_some_and(|account_id| {
+            st.current_mailbox.as_ref().is_some_and(|mailbox| {
+                st.accounts
+                    .get(account_id)
+                    .and_then(|handle| handle.folders.iter().find(|folder| folder.id == *mailbox))
+                    .is_some_and(|folder| folder.role == lookout_core::MailboxRole::Inbox)
+            })
+        });
+        inbox
+            && account
+                .as_ref()
+                .and_then(|id| st.accounts.get(id))
+                .and_then(|handle| handle.graph_mail.clone())
+                .is_some_and(|client| client.consented())
+    };
+    if focused_available != header.focused_available.get() {
+        header.focused_available.set(focused_available);
+        header.focused_box.set_visible(focused_available);
+        if focused_available {
+            header.focused_button.set_active(true);
+            header.message_list.set_focused(crate::message_list::FocusedView::Focused);
+        } else {
+            header.message_list.set_focused(crate::message_list::FocusedView::All);
+        }
+    }
 }
 
 /// The bundled bytes of an SVG resource, preferring the GResource bundle

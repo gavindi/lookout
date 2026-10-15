@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.223" date="2026-10-16">
+      <description>
+        <p>Focused Inbox comes to Lookout for Microsoft 365: Focused/Other tabs over the Inbox, and Move to / Always move / Stop moving from the message menu. The message menu also gains an Importance submenu.</p>
+      </description>
+    </release>
     <release version="0.9.222" date="2026-10-16">
       <description>
         <p>Categories now sync both ways with Outlook on Microsoft 365: categorise a message in Lookout and it is written to Outlook, and categories set in Outlook appear in Lookout. Follow-up flags, importance and Focused Inbox are read back too.</p>

@@ -1870,6 +1870,41 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Focused / Other tabs (M-03 / item 5.4): shown only for an Inbox of an
+    // account that provides Focused Inbox (see `refresh_list_header`). Two
+    // linked radio-style toggles; Focused is selected when they appear, which
+    // is safe even when Outlook's Focused Inbox is off (every message then
+    // classifies as Focused).
+    let focused_button = gtk::ToggleButton::with_label("Focused");
+    let other_button = gtk::ToggleButton::with_label("Other");
+    other_button.set_group(Some(&focused_button));
+    focused_button.set_active(true);
+    let focused_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .css_classes(["linked"])
+        .valign(gtk::Align::Center)
+        .tooltip_text("Focused Inbox")
+        .build();
+    focused_box.append(&focused_button);
+    focused_box.append(&other_button);
+    focused_box.set_visible(false);
+    {
+        let message_list = message_list.clone();
+        focused_button.connect_toggled(move |button| {
+            if button.is_active() {
+                message_list.set_focused(crate::message_list::FocusedView::Focused);
+            }
+        });
+    }
+    {
+        let message_list = message_list.clone();
+        other_button.connect_toggled(move |button| {
+            if button.is_active() {
+                message_list.set_focused(crate::message_list::FocusedView::Other);
+            }
+        });
+    }
+
     let message_header_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -1879,6 +1914,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .margin_bottom(4)
         .build();
     message_header_row.append(&title_column);
+    message_header_row.append(&focused_box);
     message_header_row.append(&favorite_button);
     message_header_row.append(&select_mode_button);
     message_header_row.append(&sync_button);
@@ -1904,6 +1940,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         favorite_button: favorite_button.clone(),
         favorite_suppress: favorite_suppress.clone(),
         refiner_row: search_refiner_row.clone(),
+        focused_box: focused_box.clone(),
+        focused_button: focused_button.clone(),
+        focused_available: Rc::new(Cell::new(false)),
+        message_list: message_list.clone(),
     };
     refresh_list_header(&state, &list_header);
 

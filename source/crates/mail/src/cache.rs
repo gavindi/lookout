@@ -2524,6 +2524,23 @@ impl Cache {
         Ok(())
     }
 
+    /// Replaces the local Focused/Other override rows with a Graph snapshot
+    /// (M-03 / item 5.4), keyed by sender. A row changed here after `taken_at`
+    /// (an override just set, not yet on Graph) is kept as it is.
+    pub fn apply_inference_overrides(&self, overrides: &[(String, InferenceClassification, Option<String>)], taken_at: DateTime<Utc>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM inference_overrides WHERE updated_at <= ?1", [taken_at.timestamp()])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO inference_overrides (sender, classify_as, override_id, updated_at) VALUES (?1, ?2, ?3, ?4)")?;
+            for (sender, classification, override_id) in overrides {
+                stmt.execute(rusqlite::params![sender, classification_code(*classification), override_id, taken_at.timestamp()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Applies one page of the `/me/messages/delta` feed (item 5.4): records
     /// each message's Graph id and its non-default Outlook properties, drops
     /// the overlay rows for the tombstones in `removed_graph_ids` (a deleted or
@@ -3765,6 +3782,42 @@ mod tests {
 
         cache.clear_inference_override("sam@contoso.com").unwrap();
         assert!(cache.inference_overrides().unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A Graph override snapshot replaces older rows, but keeps one set here
+    /// after it was taken (M-03).
+    #[test]
+    fn apply_inference_overrides_replaces_older_rows_only() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let taken_at = Utc::now();
+        // Set here after the snapshot was taken: must survive.
+        cache
+            .set_inference_override("local@x", lookout_core::InferenceClassification::Other, None, taken_at + chrono::Duration::seconds(5))
+            .unwrap();
+        cache
+            .apply_inference_overrides(
+                &[
+                    ("outlook@x".to_string(), lookout_core::InferenceClassification::Focused, Some("o1".to_string())),
+                    ("local@x".to_string(), lookout_core::InferenceClassification::Focused, Some("o2".to_string())),
+                ],
+                taken_at,
+            )
+            .unwrap();
+
+        let mut rows = cache.inference_overrides().unwrap();
+        rows.sort_by(|a, b| a.sender.cmp(&b.sender));
+        assert_eq!(rows.len(), 2);
+        // The snapshot's own override is stored with its Graph id.
+        assert_eq!(rows[0].sender, "local@x");
+        assert_eq!(rows[0].classify_as, lookout_core::InferenceClassification::Other, "the newer local choice wins");
+        assert_eq!(rows[0].override_id, None);
+        assert_eq!(rows[1].sender, "outlook@x");
+        assert_eq!(rows[1].classify_as, lookout_core::InferenceClassification::Focused);
+        assert_eq!(rows[1].override_id.as_deref(), Some("o1"));
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

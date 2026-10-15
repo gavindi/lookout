@@ -79,9 +79,19 @@ impl GraphMailClient {
         self.mail.set_inference_classification(graph_id, classification).await
     }
 
+    /// The account's Focused / Other sender overrides (M-03).
+    pub async fn list_overrides(&self) -> Result<Vec<InferenceOverride>, GraphError> {
+        self.mail.list_overrides().await
+    }
+
     /// Creates or updates a sender override (Graph upserts by SMTP address),
     /// returning Graph's copy with its id.
     pub async fn create_override(&self, classification: InferenceClassification, sender: &EmailAddress) -> Result<Option<InferenceOverride>, GraphError> {
         self.mail.create_override(classification, sender).await
+    }
+
+    /// Deletes a sender override by id ("stop moving").
+    pub async fn delete_override(&self, override_id: &str) -> Result<(), GraphError> {
+        self.mail.delete_override(override_id).await
     }
 }

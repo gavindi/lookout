@@ -2010,6 +2010,111 @@ fn set_follow_up_shows_sends_and_undoes_per_previous_state() {
     );
 }
 
+/// Setting importance (M-12) shows it at once, sends one `SetImportance` for
+/// the mailbox, and its Undo restores each message's own earlier importance.
+#[test]
+fn set_importance_shows_sends_and_undoes_per_previous_state() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let acc = AccountId("acc".into());
+    let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+    let mut high = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+    high.importance = lookout_core::Importance::High;
+    let plain = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+    let message_list = MessageListModel::build();
+    message_list.repopulate(vec![high, plain], SortKey::Date, true);
+
+    let targets = message_list.all_messages();
+    set_importance(&state, &message_list, &targets, lookout_core::Importance::Low);
+    assert!(
+        message_list.all_messages().iter().all(|m| m.importance == lookout_core::Importance::Low),
+        "shown before the server answers"
+    );
+    match cmd_rx.try_recv() {
+        Ok(AccountCommand::SetImportance { mut uids, importance, .. }) => {
+            uids.sort();
+            assert_eq!((uids, importance), (vec![Uid(1), Uid(2)], lookout_core::Importance::Low));
+        }
+        other => panic!("expected SetImportance, got {other:?}"),
+    }
+
+    assert!(undo_last(&state));
+    let mut restored: Vec<(Vec<Uid>, lookout_core::Importance)> = std::iter::from_fn(|| cmd_rx.try_recv().ok())
+        .map(|command| match command {
+            AccountCommand::SetImportance { uids, importance, .. } => (uids, importance),
+            other => panic!("expected SetImportance, got {other:?}"),
+        })
+        .collect();
+    restored.sort_by_key(|(uids, _)| uids[0]);
+    assert_eq!(
+        restored,
+        vec![(vec![Uid(1)], lookout_core::Importance::High), (vec![Uid(2)], lookout_core::Importance::Normal)]
+    );
+}
+
+/// Reclassifying Focused/Other (M-03) shows it at once, sends one `SetFocused`
+/// for the mailbox, and its Undo restores each message's previous bucket.
+#[test]
+fn set_focused_shows_sends_and_undoes_per_previous_state() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let acc = AccountId("acc".into());
+    let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+    let mut other = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+    other.inference_classification = lookout_core::InferenceClassification::Other;
+    let focused = summary(Uid(2), "acc:INBOX", 2026, 8, 1, 10);
+    let message_list = MessageListModel::build();
+    message_list.repopulate(vec![other, focused], SortKey::Date, true);
+
+    let targets = message_list.all_messages();
+    set_focused(
+        &state,
+        &message_list,
+        &targets,
+        lookout_core::InferenceClassification::Focused,
+        lookout_mail::session::FocusedScope::Message,
+    );
+    assert!(
+        message_list
+            .all_messages()
+            .iter()
+            .all(|m| m.inference_classification == lookout_core::InferenceClassification::Focused),
+        "shown before the server answers"
+    );
+    match cmd_rx.try_recv() {
+        Ok(AccountCommand::SetFocused {
+            mut uids, classification, scope, ..
+        }) => {
+            uids.sort();
+            assert_eq!((uids, classification), (vec![Uid(1), Uid(2)], lookout_core::InferenceClassification::Focused));
+            assert_eq!(scope, lookout_mail::session::FocusedScope::Message);
+        }
+        other => panic!("expected SetFocused, got {other:?}"),
+    }
+
+    assert!(undo_last(&state));
+    let mut restored: Vec<(Vec<Uid>, lookout_core::InferenceClassification)> = std::iter::from_fn(|| cmd_rx.try_recv().ok())
+        .map(|command| match command {
+            AccountCommand::SetFocused { uids, classification, .. } => (uids, classification),
+            other => panic!("expected SetFocused, got {other:?}"),
+        })
+        .collect();
+    restored.sort_by_key(|(uids, _)| uids[0]);
+    assert_eq!(
+        restored,
+        vec![
+            (vec![Uid(1)], lookout_core::InferenceClassification::Other),
+            (vec![Uid(2)], lookout_core::InferenceClassification::Focused)
+        ]
+    );
+}
+
 /// A toast's own Undo button removes exactly its entry, leaving later
 /// actions for Ctrl+Z.
 #[test]

@@ -225,6 +225,15 @@ pub(crate) fn sync_mail_properties_from_graph(state: &Rc<RefCell<UiState>>, acco
                 taken_at,
             })
             .await;
+        // The Focused/Other sender overrides (M-03), so "Stop moving" knows an
+        // override's Graph id without a live lookup.
+        if let Ok(overrides) = client.list_overrides().await {
+            let rows: Vec<(String, InferenceClassification, Option<String>)> = overrides
+                .into_iter()
+                .map(|override_entry| (override_entry.sender.address, override_entry.classify_as, Some(override_entry.id)))
+                .collect();
+            let _ = cmd_tx.send(AccountCommand::ApplyInferenceOverrides { overrides: rows, taken_at }).await;
+        }
     });
 }
 

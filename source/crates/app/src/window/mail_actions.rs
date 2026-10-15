@@ -451,7 +451,7 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
     }
     let state = &context.state;
     let account = mailbox_account_id(&targets[0].mailbox);
-    let (menu_state, recent_folders, sender_blocked) = {
+    let (menu_state, recent_folders, sender_blocked, focused_inbox) = {
         let st = state.borrow();
         let facts: Vec<TargetFacts> = targets
             .iter()
@@ -492,7 +492,14 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
                     .map(|folder| (id.clone(), lookout_core::display_name(&folder.name)))
             })
             .collect();
-        (menu_state, recent, sender_blocked)
+        // Whether the account provides Focused Inbox (M-03 / item 5.4): a
+        // Microsoft 365 account with Graph access.
+        let focused_inbox = account
+            .as_ref()
+            .and_then(|id| st.accounts.get(id))
+            .and_then(|handle| handle.graph_mail.clone())
+            .is_some_and(|client| client.consented());
+        (menu_state, recent, sender_blocked, focused_inbox)
     };
     let today = crate::calendar_tz::display_zone().today();
     let prefs = state.borrow().settings.calendar_preferences();
@@ -515,6 +522,7 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
             .collect(),
         report_phishing: targets.len() == 1 && !state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().is_empty(),
         sender_blocked,
+        focused_inbox,
     };
 
     let description = crate::message_menu::message_menu_description(&menu_state, &choices);
@@ -677,6 +685,13 @@ pub(crate) fn run_message_menu_action(
                 let _ = cmd_tx.send_blocking(AccountCommand::WakeSnoozed { mailbox, uids });
             }
         }
+        A::SetImportance(importance) => set_importance(state, message_list, targets, importance),
+        A::MoveFocused(focused) => set_focused(state, message_list, targets, focused_classification(focused), lookout_mail::session::FocusedScope::Message),
+        A::AlwaysMoveFocused(focused) => set_focused(state, message_list, targets, focused_classification(focused), lookout_mail::session::FocusedScope::Sender),
+        A::StopMovingFocused => {
+            let Some(summary) = primary.cloned() else { return };
+            stop_moving_focused(state, &summary);
+        }
         A::ViewDetails | A::ViewSource => {
             let (Some(summary), Some(parent)) = (primary, app_window) else { return };
             let page = if matches!(action, A::ViewSource) { DetailsPage::Source } else { DetailsPage::Details };
@@ -693,6 +708,232 @@ pub(crate) fn run_message_menu_action(
             print_message(state, &parent, summary);
         }
     }
+}
+
+/// The Focused/Other classification for a menu choice (`true` = Focused).
+fn focused_classification(focused: bool) -> lookout_core::InferenceClassification {
+    if focused {
+        lookout_core::InferenceClassification::Focused
+    } else {
+        lookout_core::InferenceClassification::Other
+    }
+}
+
+/// The Undo-toast wording for an importance change.
+fn importance_label(importance: lookout_core::Importance) -> String {
+    match importance {
+        lookout_core::Importance::High => "Marked high importance".to_string(),
+        lookout_core::Importance::Low => "Marked low importance".to_string(),
+        lookout_core::Importance::Normal => "Marked normal importance".to_string(),
+    }
+}
+
+/// The Undo-toast wording for a Focused/Other change.
+fn focused_label(classification: lookout_core::InferenceClassification, sender_scope: bool) -> String {
+    let bucket = if classification == lookout_core::InferenceClassification::Focused {
+        "Focused"
+    } else {
+        "Other"
+    };
+    if sender_scope {
+        format!("Always moved to {bucket}")
+    } else {
+        format!("Moved to {bucket}")
+    }
+}
+
+/// Groups `summaries`' `(mailbox, uids)` pairs by mailbox, for one command per
+/// mailbox.
+fn groups_by_mailbox(summaries: &[EmailSummary]) -> Vec<(MailboxId, Vec<Uid>)> {
+    let mut groups: Vec<(MailboxId, Vec<Uid>)> = Vec::new();
+    for summary in summaries {
+        match groups.iter_mut().find(|(mailbox, _)| *mailbox == summary.mailbox) {
+            Some((_, uids)) => uids.push(summary.uid),
+            None => groups.push((summary.mailbox.clone(), vec![summary.uid])),
+        }
+    }
+    groups
+}
+
+/// Sets the targets' importance (M-12): shows it at once, sends one
+/// `SetImportance` per mailbox, and records an undo that restores each
+/// message's previous importance (grouped by that previous value).
+pub(crate) fn set_importance(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, targets: &[EmailSummary], importance: lookout_core::Importance) {
+    if targets.is_empty() {
+        return;
+    }
+    let mut previous: Vec<(MailboxId, lookout_core::Importance, Vec<Uid>)> = Vec::new();
+    for summary in targets {
+        let before = summary.importance;
+        match previous.iter_mut().find(|(mailbox, importance, _)| *mailbox == summary.mailbox && *importance == before) {
+            Some((_, _, uids)) => uids.push(summary.uid),
+            None => previous.push((summary.mailbox.clone(), before, vec![summary.uid])),
+        }
+    }
+    for (mailbox, uids) in groups_by_mailbox(targets) {
+        optimistic_set_importance(state, message_list, &mailbox, &uids, importance);
+        let Some(account_id) = mailbox_account_id(&mailbox) else { continue };
+        let Some(cmd_tx) = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone()) else {
+            continue;
+        };
+        let _ = cmd_tx.send_blocking(AccountCommand::SetImportance { mailbox, uids, importance });
+    }
+    let inverse = previous
+        .into_iter()
+        .map(|(mailbox, importance, uids)| AccountCommand::SetImportance { mailbox, uids, importance })
+        .collect();
+    record_undo(state, &importance_label(importance), inverse);
+}
+
+/// Shows `importance` on `mailbox`/`uids` in the list (and the unified view's
+/// snapshot) before the session confirms it.
+fn optimistic_set_importance(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid], importance: lookout_core::Importance) {
+    let mut changed = false;
+    let all: Vec<EmailSummary> = message_list
+        .all_messages()
+        .into_iter()
+        .map(|mut message| {
+            if message.mailbox == *mailbox && uids.contains(&message.uid) {
+                message.importance = importance;
+                changed = true;
+            }
+            message
+        })
+        .collect();
+    if changed {
+        let (key, descending) = current_sort(state);
+        message_list.repopulate(all, key, descending);
+    }
+    if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(mailbox) {
+        for message in snapshot.iter_mut().filter(|message| uids.contains(&message.uid)) {
+            message.importance = importance;
+        }
+    }
+}
+
+/// Reclassifies the targets' Focused/Other bucket (M-03): shows it at once,
+/// sends one `SetFocused` per mailbox (`scope` deciding whether a sender
+/// override is also recorded), and records an undo that restores each
+/// message's previous classification. A sender-scope change's override is not
+/// undone (the messages are).
+pub(crate) fn set_focused(
+    state: &Rc<RefCell<UiState>>,
+    message_list: &MessageListModel,
+    targets: &[EmailSummary],
+    classification: lookout_core::InferenceClassification,
+    scope: lookout_mail::session::FocusedScope,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    let mut previous: Vec<(MailboxId, lookout_core::InferenceClassification, Vec<Uid>)> = Vec::new();
+    for summary in targets {
+        let before = summary.inference_classification;
+        match previous
+            .iter_mut()
+            .find(|(mailbox, classification, _)| *mailbox == summary.mailbox && *classification == before)
+        {
+            Some((_, _, uids)) => uids.push(summary.uid),
+            None => previous.push((summary.mailbox.clone(), before, vec![summary.uid])),
+        }
+    }
+    for (mailbox, uids) in groups_by_mailbox(targets) {
+        optimistic_set_focused(state, message_list, &mailbox, &uids, classification);
+        let Some(account_id) = mailbox_account_id(&mailbox) else { continue };
+        let Some(cmd_tx) = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone()) else {
+            continue;
+        };
+        let _ = cmd_tx.send_blocking(AccountCommand::SetFocused {
+            mailbox,
+            uids,
+            classification,
+            scope,
+        });
+    }
+    let inverse = previous
+        .into_iter()
+        .map(|(mailbox, classification, uids)| AccountCommand::SetFocused {
+            mailbox,
+            uids,
+            classification,
+            scope: lookout_mail::session::FocusedScope::Message,
+        })
+        .collect();
+    record_undo(state, &focused_label(classification, scope == lookout_mail::session::FocusedScope::Sender), inverse);
+}
+
+/// Shows `classification` on `mailbox`/`uids` in the list (and the unified
+/// view's snapshot) before the session confirms it.
+fn optimistic_set_focused(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, uids: &[Uid], classification: lookout_core::InferenceClassification) {
+    let mut changed = false;
+    let all: Vec<EmailSummary> = message_list
+        .all_messages()
+        .into_iter()
+        .map(|mut message| {
+            if message.mailbox == *mailbox && uids.contains(&message.uid) {
+                message.inference_classification = classification;
+                changed = true;
+            }
+            message
+        })
+        .collect();
+    if changed {
+        let (key, descending) = current_sort(state);
+        message_list.repopulate(all, key, descending);
+    }
+    if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(mailbox) {
+        for message in snapshot.iter_mut().filter(|message| uids.contains(&message.uid)) {
+            message.inference_classification = classification;
+        }
+    }
+}
+
+/// "Stop moving from this sender" (M-03): delete the sender's Focused/Other
+/// override on Graph and drop the local row. Uses the id from the last
+/// override sync when it's known, else a live lookup.
+pub(crate) fn stop_moving_focused(state: &Rc<RefCell<UiState>>, summary: &EmailSummary) {
+    let Some(account_id) = mailbox_account_id(&summary.mailbox) else {
+        return;
+    };
+    let (client, cmd_tx, read_cache) = {
+        let st = state.borrow();
+        let Some(handle) = st.accounts.get(&account_id) else { return };
+        let Some(client) = handle.graph_mail.clone().filter(|client| client.consented()) else {
+            return;
+        };
+        (client, handle.cmd_tx.clone(), handle.address_cache.clone())
+    };
+    let Some(sender) = summary.from.first().cloned() else {
+        return;
+    };
+    let local_id = read_cache.as_ref().and_then(|cache| cache.inference_overrides().ok()).and_then(|rows| {
+        rows.into_iter()
+            .find(|row| row.sender.eq_ignore_ascii_case(&sender.address))
+            .and_then(|row| row.override_id)
+    });
+    // Drop the local row whatever Graph says.
+    let _ = cmd_tx.send_blocking(AccountCommand::ClearInferenceOverride { sender: sender.address.clone() });
+    glib::spawn_future_local(async move {
+        let ids: Vec<String> = match local_id {
+            Some(id) => vec![id],
+            None => match client.list_overrides().await {
+                Ok(overrides) => overrides
+                    .into_iter()
+                    .filter(|override_entry| override_entry.sender.address.eq_ignore_ascii_case(&sender.address))
+                    .map(|override_entry| override_entry.id)
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("couldn't read the Focused/Other overrides: {e}");
+                    return;
+                }
+            },
+        };
+        for id in ids {
+            if let Err(e) = client.delete_override(&id).await {
+                tracing::warn!("couldn't delete the Focused/Other override for {}: {e}", sender.address);
+            }
+        }
+    });
 }
 
 /// The Snooze menus' "Choose a date…" dialog (the ribbon's and the message
