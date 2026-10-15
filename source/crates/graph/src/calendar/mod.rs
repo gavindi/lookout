@@ -26,6 +26,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 pub mod client;
+pub mod recurrence;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use lookout_core::{
@@ -72,7 +73,7 @@ pub fn event_from_graph(value: &Value, calendar_id: &CalendarId) -> Option<Calen
         end: end.0,
         all_day: is_all_day(value),
         time_zone,
-        rrule: None,
+        rrule: value.get("recurrence").and_then(recurrence::recurrence_from_graph),
         recurrence_id: None,
         recurrence_range: Default::default(),
         exdates: Vec::new(),
@@ -110,7 +111,9 @@ pub fn occurrence_from_graph(value: &Value, calendar_id: &CalendarId) -> Option<
         end: end.0,
         all_day: is_all_day(value),
         time_zone,
-        rrule: None,
+        // `calendarView` expands a series for us, so an occurrence carries no
+        // `recurrence` of its own (the series master does).
+        rrule: value.get("recurrence").and_then(recurrence::recurrence_from_graph),
         recurrence_id: None,
         exdates: Vec::new(),
         master_start: None,
@@ -167,6 +170,14 @@ fn event_fields(event: &CalendarEvent) -> Value {
     }
     if !event.categories.is_empty() {
         body["categories"] = json!(event.categories);
+    }
+    if let Some(rrule) = event.rrule.as_deref() {
+        // An RRULE the Graph model can't express is omitted (the event is
+        // written without recurrence) rather than misrepresented; the session
+        // surfaces the limitation.
+        if let Some(recurrence) = recurrence::rrule_to_graph(rrule, local_anchor_date(event.start, zone), zone) {
+            body["recurrence"] = recurrence;
+        }
     }
     let attendees: Vec<Value> = event.attendees.iter().map(attendee_to_graph).collect();
     if !attendees.is_empty() {
@@ -284,6 +295,19 @@ pub fn graph_date_time(instant: DateTime<Utc>, zone: Option<&str>) -> Value {
         }
     }
     json!({ "dateTime": instant.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string(), "timeZone": "UTC" })
+}
+
+/// The event's anchor date in its own zone (falling back to its UTC date),
+/// used as the RRULE / Graph recurrence `startDate`.
+fn local_anchor_date(instant: DateTime<Utc>, zone: Option<&str>) -> NaiveDate {
+    if let Some(name) = zone.filter(|z| !z.trim().is_empty()) {
+        if let Some(iana) = to_iana(name) {
+            if let Ok(tz) = iana.parse::<chrono_tz::Tz>() {
+                return instant.with_timezone(&tz).date_naive();
+            }
+        }
+    }
+    instant.date_naive()
 }
 
 /// Resolves a Graph/Outlook time-zone name to its IANA name: an IANA name
