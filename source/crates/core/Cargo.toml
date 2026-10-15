@@ -10,3 +10,8 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Only used to validate that every IANA name in `tzmap`'s table is a real
+# chrono-tz zone (the table's whole purpose); not needed by the library.
+chrono-tz = "0.10"

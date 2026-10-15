@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.200" date="2026-10-15">
+      <description>
+        <p>Under-the-hood groundwork for displaying Microsoft 365 calendar events at the correct time in every time zone.</p>
+      </description>
+    </release>
     <release version="0.9.199" date="2026-10-15">
       <description>
         <p>Opting a Microsoft 365 account into Outlook sync now also grants access to its calendar, in preparation for Outlook's calendar features arriving natively for those accounts.</p>

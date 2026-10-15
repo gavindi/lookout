@@ -16,7 +16,6 @@ mod ical;
 mod recurrence;
 pub mod session;
 pub mod subscription;
-mod tzmap;
 mod vtimezone;
 mod xml;
 

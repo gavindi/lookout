@@ -1,9 +1,15 @@
-//! Windows timezone ID → IANA name mapping, for iMIP invitations from
-//! Outlook/Exchange (Teams meetings included), which stamp their events with
-//! Windows IDs (`DTSTART;TZID=W. Europe Standard Time:...`) instead of IANA
-//! names. `chrono-tz` only knows the latter, so without this table such an
-//! event can't be resolved to UTC and the reading pane's invitation banner
-//! never appears.
+//! Windows timezone ID → IANA name mapping, for the Windows IDs
+//! Outlook/Exchange stamp their artefacts with instead of IANA names -
+//! iMIP invitations (Teams meetings included, `DTSTART;TZID=W. Europe
+//! Standard Time:...`) and Microsoft Graph `dateTimeTimeZone` objects
+//! (`"timeZone": "Pacific Standard Time"`). `chrono-tz` only knows IANA
+//! names, so without this table such a time can't be resolved to UTC (the
+//! reading pane's invitation banner never appears; the Graph calendar backend
+//! can't place an event).
+//!
+//! Lives in `lookout-core` - the crate both the CalDAV/iMIP parser
+//! (`lookout-dav`) and the Graph calendar backend (`lookout-graph`) depend on
+//! - so the one mapping is shared rather than duplicated.
 //!
 //! The table is CLDR `windowsZones.xml`'s territory-001 primary mapping (the
 //! same table Go's `time/tzdata` and Thunderbird ship): each Windows ID maps
@@ -16,16 +22,16 @@
 /// Software released under the GPL3 license
 /// Resolves a Windows timezone ID to its IANA-equivalent name, matched
 /// case-insensitively like every other header/parameter lookup in this
-/// crate. Unknown IDs return `None` - the caller treats that like any other
-/// unresolvable event rather than guessing an offset.
+/// workspace. Unknown IDs return `None` - the caller treats that like any
+/// other unresolvable time rather than guessing an offset.
 pub fn windows_to_iana(tzid: &str) -> Option<&'static str> {
     WINDOWS_TO_IANA.iter().find(|(windows, _)| windows.eq_ignore_ascii_case(tzid)).map(|(_, iana)| *iana)
 }
 
 /// `(Windows ID, IANA name)` pairs, Windows IDs as emitted by Outlook,
-/// Exchange Online and Teams (some also appear with a trailing "Standard
-/// Time"/"Daylight Time" variant - only the canonical form is listed; the
-/// match is on the ID as it appears in `TZID=`).
+/// Exchange Online, Teams and Microsoft Graph (some also appear with a
+/// trailing "Standard Time"/"Daylight Time" variant - only the canonical form
+/// is listed; the match is on the ID as it appears in `TZID=`/`timeZone`).
 const WINDOWS_TO_IANA: &[(&str, &str)] = &[
     ("Afghanistan Standard Time", "Asia/Kabul"),
     ("Alaskan Standard Time", "America/Anchorage"),

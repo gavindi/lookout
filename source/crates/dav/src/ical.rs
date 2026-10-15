@@ -342,7 +342,7 @@ fn resolve_datetime_utc(cdt: &CalendarDateTime) -> Option<DateTime<Utc>> {
         CalendarDateTime::WithTimezone { date_time, tzid } => {
             let zone = std::str::FromStr::from_str(tzid)
                 .ok()
-                .or_else(|| crate::tzmap::windows_to_iana(tzid).and_then(|iana| iana.parse().ok()));
+                .or_else(|| lookout_core::windows_to_iana(tzid).and_then(|iana| iana.parse().ok()));
             match zone.and_then(|tz: chrono_tz::Tz| tz.from_local_datetime(date_time).single()) {
                 Some(dt) => Some(dt.with_timezone(&Utc)),
                 None => {
@@ -401,7 +401,8 @@ pub(crate) fn parse_ical_duration(raw: &str) -> Duration {
 ///
 /// The event's own IANA time zone (CAL-11): the `TZID` on its `DTSTART`,
 /// normalized to an IANA name (a Windows ID from an Outlook/Exchange
-/// invitation maps through `tzmap`). `None` for a UTC or floating start and
+/// invitation maps through `lookout_core::windows_to_iana`). `None` for a UTC
+/// or floating start and
 /// for all-day events, whose `DATE` start carries no zone. An unknown `TZID`
 /// never reaches here - `resolve_datetime_utc` has already dropped the event.
 fn event_time_zone(event: &icalendar::Event) -> Option<String> {
@@ -412,7 +413,7 @@ fn event_time_zone(event: &icalendar::Event) -> Option<String> {
     let zone = tzid
         .parse::<chrono_tz::Tz>()
         .ok()
-        .or_else(|| crate::tzmap::windows_to_iana(&tzid).and_then(|iana| iana.parse().ok()))?;
+        .or_else(|| lookout_core::windows_to_iana(&tzid).and_then(|iana| iana.parse().ok()))?;
     Some(zone.name().to_string())
 }
 

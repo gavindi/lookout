@@ -13,6 +13,10 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.200] - 2026-10-15
+**Reference**: Microsoft 365 — Windows time-zone mapping moved to `lookout-core` (Phase 5 groundwork, item 5.1)
+**Summary**: Touches `crates/core/src/{lib,tzmap}.rs`, `crates/core/Cargo.toml` and `crates/dav/src/{lib,ical}.rs`; no data-format change. The CLDR Windows→IANA time-zone lookup (`windows_to_iana`, used to resolve Outlook/Exchange `TZID=W. Europe Standard Time` values) moves from `lookout-dav`'s private `tzmap` module into `lookout-core`, re-exported as `lookout_core::windows_to_iana` and consumed by `lookout-dav`'s iCalendar parser. Sharing it lets the forthcoming Microsoft Graph calendar backend resolve Graph `dateTimeTimeZone` values (which also use Windows names) without depending on `lookout-dav`; the table's tests move with it (`chrono-tz` becomes a dev-dependency of `lookout-core`).
+
 ## [v0.9.199] - 2026-10-15
 **Reference**: Microsoft 365 — shared calendar actor contract (Phase 5 groundwork, item 5.1)
 **Summary**: Touches `crates/core/src/{lib,calendar_protocol}.rs`, `crates/dav/src/session.rs` and `crates/app/src/{window,calendar_view}.rs`; no data-format change. The calendar session's command/event contract (`CalendarCommand`, `CalendarSessionEvent`, `ConnectionState`) moves out of `lookout-dav` into a new backend-neutral `lookout_core::calendar_protocol`, so the CalDAV actor and the forthcoming Microsoft Graph calendar actor share one vocabulary without either depending on the other. `lookout-dav` re-exports the three types under `session::` (existing `lookout_dav::session::…` paths keep working) and the app imports them from `lookout-core`; a pure refactor, covered by the existing suite.

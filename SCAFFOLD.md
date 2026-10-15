@@ -514,7 +514,7 @@ on the `rrule` crate) is the sole consumer, invoked from both `session.rs::sync_
 replaces; `RANGE=THISANDFUTURE` overrides replace their anchor and every later instance.
 Timezone resolution falls back through `chrono_tz` then, for unrecognized TZIDs (Outlook/Exchange
 stamping Windows zone names like `"W. Europe Standard Time"`), a CLDR-sourced Windows→IANA lookup
-table in `tzmap.rs`.
+table in `lookout-core`'s `tzmap.rs` (shared with the Graph calendar backend).
 
 ### 5.4 XML handling (`xml.rs`)
 
