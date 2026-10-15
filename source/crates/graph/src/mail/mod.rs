@@ -39,34 +39,7 @@ use chrono::{DateTime, Duration, NaiveDateTime, Offset, TimeZone, Utc};
 use lookout_core::{EmailAddress, FlagStatus, FollowUpFlag, Importance};
 use serde_json::{json, Value};
 
-/// Graph's per-message `inferenceClassification` and an override's `classifyAs`
-/// (M-03). Focused is the default for a message with no explicit value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InferenceClassification {
-    #[default]
-    Focused,
-    Other,
-}
-
-impl InferenceClassification {
-    /// Parses Graph's lowercase value; unknown values yield `None` so callers
-    /// can fall back to the default.
-    pub fn from_graph(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "focused" => Some(InferenceClassification::Focused),
-            "other" => Some(InferenceClassification::Other),
-            _ => None,
-        }
-    }
-
-    /// Graph's value for writing.
-    pub fn as_graph_str(self) -> &'static str {
-        match self {
-            InferenceClassification::Focused => "focused",
-            InferenceClassification::Other => "other",
-        }
-    }
-}
+pub use lookout_core::InferenceClassification;
 
 /// One message's Outlook properties as read from a delta page or a `GET`
 /// (item 5.4).

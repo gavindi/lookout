@@ -146,6 +146,7 @@ pub fn summary_from_fetch(mailbox: &MailboxId, fetch: &Fetch) -> Option<EmailSum
     let has_calendar = structure.as_ref().map(|p| crate::structure::has_calendar_parts(p)).unwrap_or(false);
 
     Some(EmailSummary {
+        inference_classification: Default::default(),
         uid,
         mailbox: mailbox.clone(),
         message_id,

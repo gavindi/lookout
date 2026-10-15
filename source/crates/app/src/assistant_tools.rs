@@ -778,6 +778,7 @@ mod tests {
         let mailbox_id = MailboxId::new(&account_id, "INBOX");
 
         let older = EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(1),
             mailbox: mailbox_id.clone(),
             message_id: None,
@@ -870,6 +871,7 @@ mod tests {
         let second = Arc::new(Cache::open(&second_id).unwrap());
         let second_mailbox = MailboxId::new(&second_id, "INBOX");
         let message = EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(1),
             mailbox: second_mailbox.clone(),
             message_id: None,

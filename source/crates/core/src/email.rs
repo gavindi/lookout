@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, Utc};
 
 use crate::ids::{MailboxId, Uid};
-use crate::interop::{Importance, MessageSensitivity};
+use crate::interop::{Importance, InferenceClassification, MessageSensitivity};
 use crate::thread::ThreadKey;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -183,6 +183,13 @@ pub struct EmailSummary {
     /// The message's RFC 2156 `Sensitivity`. `Normal` is the default.
     #[serde(default)]
     pub sensitivity: MessageSensitivity,
+    /// The message's Focused Inbox classification (M-03). `Focused` is the
+    /// default; on Microsoft 365 it is read from Graph's
+    /// `inferenceClassification` and overlaid from the cache (item 5.4), so an
+    /// un-fetched or non-Microsoft message reads as Focused until item 2.12's
+    /// local heuristic lands.
+    #[serde(default)]
+    pub inference_classification: InferenceClassification,
     /// The message's RFC 2919 `List-Id`, when present - the list a mailing
     /// message came through, which the rules engine matches on (M-14).
     #[serde(default)]

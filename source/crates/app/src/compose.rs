@@ -2677,6 +2677,7 @@ mod tests {
     fn sample_summary() -> EmailSummary {
         let account_id = AccountId("/test/account".to_string());
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(1),
             mailbox: MailboxId::new(&account_id, "INBOX"),
             message_id: Some("orig@example.com".to_string()),

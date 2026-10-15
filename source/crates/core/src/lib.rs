@@ -43,7 +43,7 @@ pub use interop::MentionMatcher;
 pub use interop::{
     auth_results_from_headers, disallow_counter, flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords,
     follow_up_headers, follow_up_keywords, graph_preset, importance_from_headers, importance_headers, is_flag_keyword, nearest_preset_for_rgb, preset_by_graph, preset_by_index,
-    preset_by_name, sensitivity_from_headers, sensitivity_header, BusyStatus, CategoryPreset, FlagStatus, FollowUpFlag, Importance, MessageSensitivity,
+    preset_by_name, sensitivity_from_headers, sensitivity_header, BusyStatus, CategoryPreset, FlagStatus, FollowUpFlag, Importance, InferenceClassification, MessageSensitivity,
     AUTHENTICATION_RESULTS_HEADER, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD, OUTLOOK_CATEGORY_PRESETS,
 };
 pub use interop::{

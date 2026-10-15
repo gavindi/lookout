@@ -203,8 +203,19 @@ impl SearchQuery {
             params.push(Value::Text(FLAG_DONE_KEYWORD.to_string()));
         }
         for key in &self.category {
-            clauses.push("EXISTS (SELECT 1 FROM json_each(messages.data, '$.keywords') WHERE value = ?)".to_string());
+            // The keyword is authoritative on servers that keep custom
+            // keywords; a folder without them (Exchange IMAP) stores the
+            // category in the cache's `local_categories` overlay instead
+            // (item 5.4), which this clause matches too.
+            clauses.push(
+                "(EXISTS (SELECT 1 FROM json_each(messages.data, '$.keywords') WHERE value = ?) \
+                  OR EXISTS (SELECT 1 FROM local_categories lc \
+                             WHERE lc.message_key = trim(json_extract(messages.data, '$.message_id'), '<> ') \
+                               AND EXISTS (SELECT 1 FROM json_each(lc.category_keys) WHERE value = ?)))"
+                    .to_string(),
+            );
             params.push(Value::Text(tag_keyword(key)));
+            params.push(Value::Text(key.clone()));
         }
         if let Some(received) = &self.received {
             if let Some(after) = received.after {
@@ -744,6 +755,7 @@ mod tests {
 
     fn summary() -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(1),
             mailbox: lookout_core::MailboxId::new(&lookout_core::AccountId("a".into()), "INBOX"),
             message_id: Some("<m@example.com>".into()),
@@ -921,6 +933,7 @@ mod tests {
     fn sql_predicates_bind_parameters() {
         let (clauses, params) = parse("to:team has:attachment is:unread category:work").sql_predicates();
         assert_eq!(clauses.len(), 4);
-        assert_eq!(params.len(), 3);
+        // to: binds 2 (address + name LIKE), category: binds 2 (keyword + local key).
+        assert_eq!(params.len(), 4);
     }
 }

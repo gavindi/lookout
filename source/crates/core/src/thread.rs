@@ -218,6 +218,7 @@ mod tests {
 
     fn msg(uid: u32, message_id: &str, in_reply_to: Option<&str>, references: &[&str], subject: &str, hours_offset: i64) -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(uid),
             mailbox: crate::ids::MailboxId("acct:INBOX".into()),
             message_id: Some(message_id.to_string()),

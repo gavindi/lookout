@@ -9,7 +9,8 @@
 //!
 //! - [`contacts_csv`] — Outlook's "Comma Separated Values" contact file
 //!   (§4.6, P-08).
-//! - [`headers`] — message importance and sensitivity (§4.1).
+//! - [`headers`] — message importance, sensitivity and Focused Inbox
+//!   classification (§4.1, M-03).
 //! - [`cdo`] — the `X-MICROSOFT-CDO-*` calendar properties (§4.3).
 //! - [`categories`] — Outlook's 25 category colour presets (§4.4, UX-85).
 //! - [`flags`] — follow-up flag semantics (§4.1, §4.4, M-10).
@@ -44,7 +45,7 @@ pub use flags::{
     is_flag_keyword, FlagStatus, FollowUpFlag, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD,
 };
 pub use headers::{
-    auth_results_from_headers, importance_from_headers, importance_headers, sensitivity_from_headers, sensitivity_header, Importance, MessageSensitivity,
+    auth_results_from_headers, importance_from_headers, importance_headers, sensitivity_from_headers, sensitivity_header, Importance, InferenceClassification, MessageSensitivity,
     AUTHENTICATION_RESULTS_HEADER,
 };
 pub use junk::{junk_keyword, junk_keyword_change, junk_keywords, JUNK_KEYWORD, NOT_JUNK_KEYWORD};

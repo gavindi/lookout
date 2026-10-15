@@ -99,6 +99,37 @@ impl MessageSensitivity {
     }
 }
 
+/// A message's Focused Inbox classification (Graph `inferenceClassification`,
+/// M-03). `Focused` is the default for a message with no explicit value, so a
+/// message Outlook hasn't classified reads as Focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum InferenceClassification {
+    #[default]
+    Focused,
+    Other,
+}
+
+impl InferenceClassification {
+    /// Parses Graph's lowercase `inferenceClassification` / `classifyAs`
+    /// value. Unknown values yield `None` so callers can fall back to the
+    /// default.
+    pub fn from_graph(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "focused" => Some(InferenceClassification::Focused),
+            "other" => Some(InferenceClassification::Other),
+            _ => None,
+        }
+    }
+
+    /// Graph's value for writing.
+    pub fn as_graph_str(self) -> &'static str {
+        match self {
+            InferenceClassification::Focused => "focused",
+            InferenceClassification::Other => "other",
+        }
+    }
+}
+
 /// Reads importance from a message's `(name, value)` header list, trying each
 /// of the four names in precedence order: `Importance`, then `X-Priority`,
 /// then `X-MSMail-Priority`, then RFC 2156 `Priority`. Returns `None` when no
@@ -305,6 +336,16 @@ mod tests {
         assert_eq!(importance_from_headers(&headers(&[("Importance", "banana")])), None);
         assert_eq!(importance_from_headers(&headers(&[("X-Priority", "")])), None);
         assert_eq!(importance_from_headers(&headers(&[("X-Priority", "9")])), None);
+    }
+
+    #[test]
+    fn inference_classification_round_trips_graph_values() {
+        for classification in [InferenceClassification::Focused, InferenceClassification::Other] {
+            assert_eq!(InferenceClassification::from_graph(classification.as_graph_str()), Some(classification));
+        }
+        assert_eq!(InferenceClassification::from_graph("FOCUSED"), Some(InferenceClassification::Focused));
+        assert_eq!(InferenceClassification::from_graph("nonsense"), None);
+        assert_eq!(InferenceClassification::default(), InferenceClassification::Focused);
     }
 
     #[test]

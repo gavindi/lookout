@@ -1653,6 +1653,7 @@ fn summary(uid: Uid, mailbox: &str, year: i32, month: u32, day: u32, hour: u32) 
     use lookout_core::ThreadKey;
     use std::collections::BTreeSet;
     EmailSummary {
+        inference_classification: Default::default(),
         uid,
         mailbox: MailboxId(mailbox.into()),
         message_id: None,

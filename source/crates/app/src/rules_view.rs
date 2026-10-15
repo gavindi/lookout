@@ -986,6 +986,7 @@ mod tests {
     fn prefill_takes_sender_subject_and_list() {
         use lookout_core::{EmailAddress, EmailSummary, MailboxId, MessageSensitivity, ThreadKey, Uid};
         let summary = EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(1),
             mailbox: MailboxId("acct:INBOX".into()),
             message_id: None,

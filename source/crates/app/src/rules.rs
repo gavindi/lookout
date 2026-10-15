@@ -665,6 +665,7 @@ mod tests {
 
     fn summary() -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(7),
             mailbox: MailboxId("acct:INBOX".into()),
             message_id: Some("<m@example.com>".into()),

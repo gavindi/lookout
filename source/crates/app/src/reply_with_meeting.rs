@@ -66,6 +66,7 @@ mod tests {
             address: value.to_string(),
         };
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(uid),
             mailbox: MailboxId("acct:INBOX".into()),
             message_id: None,

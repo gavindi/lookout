@@ -572,6 +572,7 @@ mod tests {
 
     fn summary(mailbox: &MailboxId, uid: u32, hour: u32, id: &str) -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(uid),
             mailbox: mailbox.clone(),
             message_id: Some(format!("<{id}>")),

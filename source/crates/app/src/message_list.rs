@@ -2992,6 +2992,7 @@ mod tests {
 
     fn summary(uid: u32, date: DateTime<Utc>) -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(uid),
             mailbox: MailboxId("acct:INBOX".into()),
             message_id: None,

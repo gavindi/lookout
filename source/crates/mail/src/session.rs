@@ -7571,6 +7571,7 @@ mod tests {
             flags.insert(SystemFlagBit::Seen);
         }
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(uid),
             mailbox: mailbox.clone(),
             message_id: None,
@@ -7950,6 +7951,7 @@ mod tests {
 
     fn unread_summary(mailbox_id: &MailboxId, uid: u32, unread: bool) -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(uid),
             mailbox: mailbox_id.clone(),
             message_id: Some(format!("<{uid}@example.com>")),

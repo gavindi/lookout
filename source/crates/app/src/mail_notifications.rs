@@ -110,6 +110,7 @@ mod tests {
 
     fn summary(subject: Option<&str>, from: Option<&str>) -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: lookout_core::Uid(1),
             mailbox: MailboxId("acc:INBOX".into()),
             message_id: None,

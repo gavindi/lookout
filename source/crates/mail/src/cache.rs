@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Local, Timelike, Utc};
-use lookout_core::{AccountId, ContactsProvider, EmailAddress, EmailBody, EmailSummary, FlagStatus, FollowUpFlag, Mailbox, MailboxId, SystemFlagBit, Uid, UidValidity};
+use lookout_core::{
+    AccountId, ContactsProvider, EmailAddress, EmailBody, EmailSummary, FlagStatus, FollowUpFlag, Importance, InferenceClassification, Mailbox, MailboxId, SystemFlagBit, Uid,
+    UidValidity,
+};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
@@ -459,15 +462,160 @@ fn apply_local_follow_up(local: &HashMap<String, FollowUpFlag>, summary: &mut Em
     summary.keywords.extend(lookout_core::follow_up_keywords(flag));
 }
 
-fn overlay_local_follow_ups(conn: &Connection, messages: &mut [EmailSummary]) -> Result<()> {
+/// One message's Outlook properties as pushed from a Graph delta or read on
+/// demand (OUTLOOK_PARITY.md §4.4, item 5.4). `message_id` is the RFC 822
+/// `Message-ID` (angle brackets allowed); `categories` are Lookout category
+/// *keys* (the app maps Graph's category names onto keys before sending), so a
+/// key maps straight back to the `$Lookout-tag-<key>` keyword.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMailProperties {
+    pub message_id: String,
+    pub graph_id: String,
+    pub categories: Vec<String>,
+    pub importance: Importance,
+    pub classification: InferenceClassification,
+    /// The follow-up flag, or `None` when Graph reports it `notFlagged`.
+    pub flag: Option<FollowUpFlag>,
+}
+
+/// One Focused/Other sender override (M-03), as stored locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceOverrideRow {
+    pub sender: String,
+    pub classify_as: InferenceClassification,
+    /// Graph's override id, once the create has answered; `None` for a local
+    /// override not yet pushed.
+    pub override_id: Option<String>,
+}
+
+/// The Graph `importance` code stored in `local_importance` (`Normal` is never
+/// stored - it is the absence of a row).
+fn importance_code(importance: Importance) -> i64 {
+    match importance {
+        Importance::Low => 1,
+        Importance::Normal => 0,
+        Importance::High => 2,
+    }
+}
+
+fn importance_from_code(code: i64) -> Importance {
+    match code {
+        1 => Importance::Low,
+        2 => Importance::High,
+        _ => Importance::Normal,
+    }
+}
+
+/// The Focused/Other code stored in `local_inference` (`Focused` is never
+/// stored - it is the absence of a row).
+fn classification_code(classification: InferenceClassification) -> i64 {
+    match classification {
+        InferenceClassification::Focused => 0,
+        InferenceClassification::Other => 1,
+    }
+}
+
+fn classification_from_code(code: i64) -> InferenceClassification {
+    if code == 1 {
+        InferenceClassification::Other
+    } else {
+        InferenceClassification::Focused
+    }
+}
+
+fn load_local_categories(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare("SELECT message_key, category_keys FROM local_categories")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, json) = row?;
+        out.insert(key, serde_json::from_str(&json).unwrap_or_default());
+    }
+    Ok(out)
+}
+
+fn load_local_importance(conn: &Connection) -> Result<HashMap<String, Importance>> {
+    let mut stmt = conn.prepare("SELECT message_key, importance FROM local_importance")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, code) = row?;
+        out.insert(key, importance_from_code(code));
+    }
+    Ok(out)
+}
+
+fn load_local_inference(conn: &Connection) -> Result<HashMap<String, InferenceClassification>> {
+    let mut stmt = conn.prepare("SELECT message_key, classification FROM local_inference")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (key, code) = row?;
+        out.insert(key, classification_from_code(code));
+    }
+    Ok(out)
+}
+
+/// Rewrites `summary`'s category keywords to the local row's keys, if it has
+/// one - the `$Lookout-tag-*` keyword store for a folder that can't keep custom
+/// keywords (Exchange IMAP, item 5.4).
+fn apply_local_categories(local: &HashMap<String, Vec<String>>, summary: &mut EmailSummary) {
+    let Some(keys) = local.get(&follow_up_key(summary)) else {
+        return;
+    };
+    summary.keywords.retain(|k| !k.starts_with(lookout_core::TAG_KEYWORD_PREFIX));
+    summary.keywords.extend(keys.iter().map(|key| lookout_core::tag_keyword(key)));
+}
+
+fn apply_local_importance(local: &HashMap<String, Importance>, summary: &mut EmailSummary) {
+    if let Some(importance) = local.get(&follow_up_key(summary)) {
+        summary.importance = *importance;
+    }
+}
+
+fn apply_local_classification(local: &HashMap<String, InferenceClassification>, summary: &mut EmailSummary) {
+    if let Some(classification) = local.get(&follow_up_key(summary)) {
+        summary.inference_classification = *classification;
+    }
+}
+
+/// Every locally-stored Outlook overlay (item 5.4), loaded once per read.
+#[derive(Default)]
+struct LocalOverlays {
+    follow_ups: HashMap<String, FollowUpFlag>,
+    categories: HashMap<String, Vec<String>>,
+    importance: HashMap<String, Importance>,
+    classification: HashMap<String, InferenceClassification>,
+}
+
+impl LocalOverlays {
+    fn load(conn: &Connection) -> Result<Self> {
+        Ok(LocalOverlays {
+            follow_ups: load_local_follow_ups(conn)?,
+            categories: load_local_categories(conn)?,
+            importance: load_local_importance(conn)?,
+            classification: load_local_inference(conn)?,
+        })
+    }
+
+    fn apply(&self, summary: &mut EmailSummary) {
+        apply_local_follow_up(&self.follow_ups, summary);
+        apply_local_categories(&self.categories, summary);
+        apply_local_importance(&self.importance, summary);
+        apply_local_classification(&self.classification, summary);
+    }
+}
+
+/// Overlays every locally-stored Outlook property (follow-up flags, categories,
+/// importance, Focused/Other classification) onto `messages`, so the UI reads
+/// one representation however each value is stored (item 1.16, item 5.4).
+fn overlay_local(conn: &Connection, messages: &mut [EmailSummary]) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
-    let local = load_local_follow_ups(conn)?;
-    if !local.is_empty() {
-        for summary in messages.iter_mut() {
-            apply_local_follow_up(&local, summary);
-        }
+    let overlays = LocalOverlays::load(conn)?;
+    for summary in messages.iter_mut() {
+        overlays.apply(summary);
     }
     Ok(())
 }
@@ -585,6 +733,48 @@ impl Cache {
                 status INTEGER NOT NULL,
                 due INTEGER,
                 completed INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+            -- Microsoft 365 per-message Outlook properties (OUTLOOK_PARITY.md
+            -- §4.4, item 5.4): the categories, importance and Focused/Other
+            -- classification a mailbox either can't store as IMAP keywords
+            -- (Exchange has no custom keywords) or doesn't expose at all, plus
+            -- the Graph-id map and delta cursor the sync needs. Every overlay
+            -- table holds only NON-default values, keyed by `follow_up_key`
+            -- (the bare Message-ID where there is one) exactly like
+            -- `follow_up_flags`, and is overlaid onto every cache read; the
+            -- `updated_at` guard keeps a local change made while a Graph
+            -- snapshot was in flight. Append-only, so no `user_version` wipe.
+            CREATE TABLE IF NOT EXISTS message_graph_ids (
+                message_key TEXT PRIMARY KEY,
+                graph_id TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS message_graph_ids_by_graph ON message_graph_ids (graph_id);
+            CREATE TABLE IF NOT EXISTS local_categories (
+                message_key TEXT PRIMARY KEY,
+                category_keys TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS local_importance (
+                message_key TEXT PRIMARY KEY,
+                importance INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS local_inference (
+                message_key TEXT PRIMARY KEY,
+                classification INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS inference_overrides (
+                sender TEXT PRIMARY KEY,
+                classify_as INTEGER NOT NULL,
+                override_id TEXT,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS graph_delta_cursor (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                cursor TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS bodies (
@@ -1011,7 +1201,7 @@ impl Cache {
                 messages.push(msg);
             }
         }
-        overlay_local_follow_ups(&conn, &mut messages)?;
+        overlay_local(&conn, &mut messages)?;
         Ok(messages)
     }
 
@@ -1080,11 +1270,9 @@ impl Cache {
                 }
             }
         }
-        let local = load_local_follow_ups(&conn)?;
-        if !local.is_empty() {
-            for summary in out.values_mut() {
-                apply_local_follow_up(&local, summary);
-            }
+        let overlays = LocalOverlays::load(&conn)?;
+        for summary in out.values_mut() {
+            overlays.apply(summary);
         }
         Ok(out)
     }
@@ -1625,7 +1813,7 @@ impl Cache {
             }
             out.push(serde_json::from_str(&data)?);
         }
-        overlay_local_follow_ups(&conn, &mut out)?;
+        overlay_local(&conn, &mut out)?;
         Ok(out)
     }
 
@@ -1711,7 +1899,7 @@ impl Cache {
             }
             out.push(serde_json::from_str(&data)?);
         }
-        overlay_local_follow_ups(&conn, &mut out)?;
+        overlay_local(&conn, &mut out)?;
         Ok(out)
     }
 
@@ -1762,7 +1950,7 @@ impl Cache {
             }
             out.push(serde_json::from_str(&data)?);
         }
-        overlay_local_follow_ups(&conn, &mut out)?;
+        overlay_local(&conn, &mut out)?;
         Ok(out)
     }
 
@@ -2161,12 +2349,291 @@ impl Cache {
         Ok(())
     }
 
-    /// Applies the local follow-up rows to `messages` (see
-    /// `set_local_follow_ups`), for summaries that came from the server
-    /// rather than from a cache read, which overlays them already.
+    /// Records locally the categories (Lookout `$Lookout-tag-<key>` keys) for
+    /// messages whose folder can't store custom keywords (Exchange IMAP,
+    /// item 5.4) or that Graph reported - the category counterpart of
+    /// [`Cache::set_local_follow_ups`]. An empty `keys` clears the row.
+    pub fn set_local_categories(&self, summaries: &[EmailSummary], keys: &[String], now: DateTime<Utc>) -> Result<()> {
+        if keys.is_empty() {
+            return self.clear_local_categories(summaries);
+        }
+        let json = serde_json::to_string(keys)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO local_categories (message_key, category_keys, updated_at) VALUES (?1, ?2, ?3)")?;
+            for summary in summaries {
+                stmt.execute(rusqlite::params![follow_up_key(summary), json, now.timestamp()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drops the local category rows for `summaries` - their keywords on the
+    /// server are authoritative again (a keyword STORE just succeeded).
+    pub fn clear_local_categories(&self, summaries: &[EmailSummary]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM local_categories WHERE message_key = ?1")?;
+            for summary in summaries {
+                stmt.execute([follow_up_key(summary)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records locally a message's importance (item 5.4) where the header can't
+    /// carry it reliably; `Normal` clears the row (the default needs no overlay).
+    pub fn set_local_importance(&self, summaries: &[EmailSummary], importance: Importance, now: DateTime<Utc>) -> Result<()> {
+        if importance == Importance::Normal {
+            return self.clear_local_importance(summaries);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO local_importance (message_key, importance, updated_at) VALUES (?1, ?2, ?3)")?;
+            for summary in summaries {
+                stmt.execute(rusqlite::params![follow_up_key(summary), importance_code(importance), now.timestamp()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drops the local importance rows for `summaries`.
+    pub fn clear_local_importance(&self, summaries: &[EmailSummary]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM local_importance WHERE message_key = ?1")?;
+            for summary in summaries {
+                stmt.execute([follow_up_key(summary)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records locally a message's Focused/Other classification (M-03) where
+    /// Graph carries it (Exchange IMAP exposes no such flag); `Focused` clears
+    /// the row (the default needs no overlay).
+    pub fn set_local_inference(&self, summaries: &[EmailSummary], classification: InferenceClassification, now: DateTime<Utc>) -> Result<()> {
+        if classification == InferenceClassification::Focused {
+            return self.clear_local_inference(summaries);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO local_inference (message_key, classification, updated_at) VALUES (?1, ?2, ?3)")?;
+            for summary in summaries {
+                stmt.execute(rusqlite::params![follow_up_key(summary), classification_code(classification), now.timestamp()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drops the local Focused/Other rows for `summaries`.
+    pub fn clear_local_inference(&self, summaries: &[EmailSummary]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM local_inference WHERE message_key = ?1")?;
+            for summary in summaries {
+                stmt.execute([follow_up_key(summary)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The Graph id of `message_key` (a bare Message-ID), if the map has it.
+    pub fn graph_id(&self, message_key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT graph_id FROM message_graph_ids WHERE message_key = ?1", [message_key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?)
+    }
+
+    /// The Graph ids of `message_keys`, keyed by the same bare Message-IDs -
+    /// what the write path resolves before a Graph `PATCH` (item 5.4).
+    pub fn graph_ids(&self, message_keys: &[String]) -> Result<HashMap<String, String>> {
+        if message_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT graph_id FROM message_graph_ids WHERE message_key = ?1")?;
+        let mut out = HashMap::new();
+        for key in message_keys {
+            if let Some(id) = stmt.query_row([key], |row| row.get::<_, String>(0)).optional()? {
+                out.insert(key.clone(), id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The stored `/me/messages/delta` cursor, if a sync has persisted one.
+    pub fn graph_delta_cursor(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT cursor FROM graph_delta_cursor WHERE id = 1", [], |row| row.get::<_, String>(0))
+            .optional()?)
+    }
+
+    /// The locally-stored Focused/Other sender overrides (M-03).
+    pub fn inference_overrides(&self) -> Result<Vec<InferenceOverrideRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT sender, classify_as, override_id FROM inference_overrides")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(InferenceOverrideRow {
+                sender: row.get(0)?,
+                classify_as: classification_from_code(row.get(1)?),
+                override_id: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Records a sender override (M-03), with Graph's override id once known.
+    pub fn set_inference_override(&self, sender: &str, classify_as: InferenceClassification, override_id: Option<&str>, now: DateTime<Utc>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO inference_overrides (sender, classify_as, override_id, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![sender, classification_code(classify_as), override_id, now.timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Drops a sender override ("stop moving").
+    pub fn clear_inference_override(&self, sender: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM inference_overrides WHERE sender = ?1", [sender])?;
+        Ok(())
+    }
+
+    /// Applies one page of the `/me/messages/delta` feed (item 5.4): records
+    /// each message's Graph id and its non-default Outlook properties, drops
+    /// the overlay rows for the tombstones in `removed_graph_ids` (a deleted or
+    /// moved-out message), and persists `delta_cursor`. Because the delta is
+    /// *incremental* (unlike the flagged snapshot), only the messages it names
+    /// are touched; a local change written after `taken_at` is left alone, so
+    /// an in-flight snapshot can't undo it.
+    pub fn apply_remote_mail_properties(
+        &self,
+        properties: &[RemoteMailProperties],
+        removed_graph_ids: &[String],
+        delta_cursor: Option<&str>,
+        taken_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let ts = taken_at.timestamp();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut upsert_id = tx.prepare(
+                "INSERT INTO message_graph_ids (message_key, graph_id, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(message_key) DO UPDATE SET graph_id = excluded.graph_id, updated_at = excluded.updated_at",
+            )?;
+            let mut clear_cat = tx.prepare("DELETE FROM local_categories WHERE message_key = ?1 AND updated_at <= ?2")?;
+            let mut set_cat = tx.prepare(
+                "INSERT INTO local_categories (message_key, category_keys, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(message_key) DO UPDATE SET category_keys = excluded.category_keys, updated_at = excluded.updated_at \
+                 WHERE local_categories.updated_at <= excluded.updated_at",
+            )?;
+            let mut clear_imp = tx.prepare("DELETE FROM local_importance WHERE message_key = ?1 AND updated_at <= ?2")?;
+            let mut set_imp = tx.prepare(
+                "INSERT INTO local_importance (message_key, importance, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(message_key) DO UPDATE SET importance = excluded.importance, updated_at = excluded.updated_at \
+                 WHERE local_importance.updated_at <= excluded.updated_at",
+            )?;
+            let mut clear_cls = tx.prepare("DELETE FROM local_inference WHERE message_key = ?1 AND updated_at <= ?2")?;
+            let mut set_cls = tx.prepare(
+                "INSERT INTO local_inference (message_key, classification, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(message_key) DO UPDATE SET classification = excluded.classification, updated_at = excluded.updated_at \
+                 WHERE local_inference.updated_at <= excluded.updated_at",
+            )?;
+            let mut clear_flag = tx.prepare("DELETE FROM follow_up_flags WHERE message_key = ?1 AND updated_at <= ?2")?;
+            let mut set_flag = tx.prepare(
+                "INSERT INTO follow_up_flags (message_key, status, due, completed, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(message_key) DO UPDATE SET status = excluded.status, due = excluded.due, completed = excluded.completed, updated_at = excluded.updated_at \
+                 WHERE follow_up_flags.updated_at <= excluded.updated_at",
+            )?;
+
+            for p in properties {
+                let key = bare_message_id(&p.message_id);
+                if key.is_empty() {
+                    continue;
+                }
+                upsert_id.execute(rusqlite::params![key, p.graph_id, ts])?;
+                if p.categories.is_empty() {
+                    clear_cat.execute(rusqlite::params![key, ts])?;
+                } else {
+                    set_cat.execute(rusqlite::params![key, serde_json::to_string(&p.categories)?, ts])?;
+                }
+                if p.importance == Importance::Normal {
+                    clear_imp.execute(rusqlite::params![key, ts])?;
+                } else {
+                    set_imp.execute(rusqlite::params![key, importance_code(p.importance), ts])?;
+                }
+                if p.classification == InferenceClassification::Focused {
+                    clear_cls.execute(rusqlite::params![key, ts])?;
+                } else {
+                    set_cls.execute(rusqlite::params![key, classification_code(p.classification), ts])?;
+                }
+                match &p.flag {
+                    Some(flag) if flag.status != FlagStatus::NotFlagged => {
+                        set_flag.execute(rusqlite::params![
+                            key,
+                            flag_status_code(flag.status),
+                            flag.due.map(|d| d.timestamp()),
+                            flag.completed.map(|d| d.timestamp()),
+                            ts
+                        ])?;
+                    }
+                    _ => {
+                        clear_flag.execute(rusqlite::params![key, ts])?;
+                    }
+                }
+            }
+
+            let mut find_key = tx.prepare("SELECT message_key FROM message_graph_ids WHERE graph_id = ?1 LIMIT 1")?;
+            for graph_id in removed_graph_ids {
+                let key: Option<String> = find_key.query_row([graph_id], |row| row.get(0)).optional()?;
+                if let Some(key) = key {
+                    for table in ["local_categories", "local_importance", "local_inference", "follow_up_flags"] {
+                        tx.execute(&format!("DELETE FROM {table} WHERE message_key = ?1"), [&key])?;
+                    }
+                }
+                tx.execute("DELETE FROM message_graph_ids WHERE graph_id = ?1", [graph_id])?;
+            }
+
+            if let Some(cursor) = delta_cursor {
+                tx.execute(
+                    "INSERT INTO graph_delta_cursor (id, cursor, updated_at) VALUES (1, ?1, ?2) \
+                     ON CONFLICT(id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+                    rusqlite::params![cursor, ts],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Applies every locally-stored Outlook overlay (follow-up flags,
+    /// categories, importance, Focused/Other) to `messages`, for summaries that
+    /// came from the server rather than from a cache read, which overlays them
+    /// already.
     pub fn overlay_follow_ups(&self, messages: &mut [EmailSummary]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        overlay_local_follow_ups(&conn, messages)
+        overlay_local(&conn, messages)
     }
 
     /// Every cached message carrying a follow-up flag (open or complete),
@@ -2187,7 +2654,7 @@ impl Cache {
                 messages.push(msg);
             }
         }
-        overlay_local_follow_ups(&conn, &mut messages)?;
+        overlay_local(&conn, &mut messages)?;
         let mut seen = HashSet::new();
         messages.retain(|m| m.follow_up().is_some() && seen.insert(follow_up_key(m)));
         Ok(messages)
@@ -2222,7 +2689,7 @@ impl Cache {
                 messages.push(msg);
             }
         }
-        overlay_local_follow_ups(&conn, &mut messages)?;
+        overlay_local(&conn, &mut messages)?;
         Ok(messages)
     }
 
@@ -3135,6 +3602,170 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Locally-stored categories, importance and Focused/Other overlay every
+    /// read (the Exchange-IMAP path, item 5.4) and the `category:` search finds
+    /// a locally-stored tag.
+    #[test]
+    fn local_properties_overlay_cache_reads_and_search() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let msg = with_message_id(sample_summary(&mailbox_id, 1, None), "one@x");
+        cache.replace_messages(&mailbox_id, UidValidity(1), std::slice::from_ref(&msg)).unwrap();
+
+        let now = Utc::now();
+        let one = std::slice::from_ref(&msg);
+        cache.set_local_categories(one, &["work".to_string(), "red".to_string()], now).unwrap();
+        cache.set_local_importance(one, lookout_core::Importance::High, now).unwrap();
+        cache.set_local_inference(one, lookout_core::InferenceClassification::Other, now).unwrap();
+
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(loaded[0].keywords.contains(&lookout_core::tag_keyword("work")));
+        assert!(loaded[0].keywords.contains(&lookout_core::tag_keyword("red")));
+        assert_eq!(loaded[0].importance, lookout_core::Importance::High);
+        assert_eq!(loaded[0].inference_classification, lookout_core::InferenceClassification::Other);
+        // `load_summaries` (the on-demand body path) overlays too.
+        assert_eq!(
+            cache.load_summaries(&mailbox_id, &[Uid(1)]).unwrap()[&Uid(1)].inference_classification,
+            lookout_core::InferenceClassification::Other
+        );
+        // Server summaries get the same overlay through `overlay_follow_ups`.
+        let mut fresh = vec![msg.clone()];
+        cache.overlay_follow_ups(&mut fresh).unwrap();
+        assert!(fresh[0].keywords.contains(&lookout_core::tag_keyword("work")));
+
+        assert_eq!(cache.search_query(&crate::search_query::parse("category:work"), None, 50).unwrap().len(), 1);
+        assert!(cache.search_query(&crate::search_query::parse("category:nope"), None, 50).unwrap().is_empty());
+
+        // Clearing resets to the defaults and drops the tag keywords.
+        cache.clear_local_categories(one).unwrap();
+        cache.clear_local_importance(one).unwrap();
+        cache.clear_local_inference(one).unwrap();
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(!loaded[0].keywords.iter().any(|k| k.starts_with(lookout_core::TAG_KEYWORD_PREFIX)));
+        assert_eq!(loaded[0].importance, lookout_core::Importance::Normal);
+        assert_eq!(loaded[0].inference_classification, lookout_core::InferenceClassification::Focused);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A delta page records the Graph-id map, the non-default properties and
+    /// the cursor, and leaves a newer local change alone.
+    #[test]
+    fn apply_remote_mail_properties_upserts_non_defaults_and_respects_taken_at() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let msg = with_message_id(sample_summary(&mailbox_id, 1, None), "one@x");
+        cache.replace_messages(&mailbox_id, UidValidity(1), std::slice::from_ref(&msg)).unwrap();
+
+        let taken_at = Utc::now();
+        let due = lookout_core::flag_due_for_date(chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap());
+        let props = RemoteMailProperties {
+            message_id: "<one@x>".to_string(),
+            graph_id: "g1".to_string(),
+            categories: vec!["work".to_string()],
+            importance: lookout_core::Importance::High,
+            classification: lookout_core::InferenceClassification::Other,
+            flag: Some(flagged(Some(due))),
+        };
+        cache.apply_remote_mail_properties(std::slice::from_ref(&props), &[], Some("cursor-1"), taken_at).unwrap();
+
+        assert_eq!(cache.graph_id("one@x").unwrap().as_deref(), Some("g1"));
+        assert_eq!(cache.graph_ids(&["one@x".to_string()]).unwrap().get("one@x").map(String::as_str), Some("g1"));
+        assert_eq!(cache.graph_delta_cursor().unwrap().as_deref(), Some("cursor-1"));
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(loaded[0].keywords.contains(&lookout_core::tag_keyword("work")));
+        assert_eq!(loaded[0].importance, lookout_core::Importance::High);
+        assert_eq!(loaded[0].inference_classification, lookout_core::InferenceClassification::Other);
+        assert_eq!(loaded[0].follow_up(), Some(flagged(Some(due))));
+
+        // A local change made *after* the snapshot survives an older one.
+        cache.set_local_importance(std::slice::from_ref(&msg), lookout_core::Importance::Low, Utc::now()).unwrap();
+        let mut stale = props;
+        stale.categories = Vec::new();
+        stale.importance = lookout_core::Importance::High;
+        stale.classification = lookout_core::InferenceClassification::Focused;
+        stale.flag = None;
+        cache.apply_remote_mail_properties(&[stale], &[], None, taken_at - chrono::Duration::seconds(60)).unwrap();
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert_eq!(loaded[0].importance, lookout_core::Importance::Low, "a newer local change is not clobbered");
+        assert!(loaded[0].keywords.contains(&lookout_core::tag_keyword("work")), "the earlier category survives too");
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A removed delta entry drops the message's Graph id and every overlay row
+    /// so a deleted/moved-out message leaves nothing behind.
+    #[test]
+    fn apply_remote_mail_properties_drops_removed_graph_ids() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let msg = with_message_id(sample_summary(&mailbox_id, 1, None), "one@x");
+        cache.replace_messages(&mailbox_id, UidValidity(1), std::slice::from_ref(&msg)).unwrap();
+        cache
+            .apply_remote_mail_properties(
+                &[RemoteMailProperties {
+                    message_id: "<one@x>".to_string(),
+                    graph_id: "g1".to_string(),
+                    categories: vec!["work".to_string()],
+                    importance: lookout_core::Importance::High,
+                    classification: lookout_core::InferenceClassification::Other,
+                    flag: None,
+                }],
+                &[],
+                None,
+                Utc::now(),
+            )
+            .unwrap();
+
+        cache.apply_remote_mail_properties(&[], &["g1".to_string()], None, Utc::now()).unwrap();
+        assert_eq!(cache.graph_id("one@x").unwrap(), None);
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(!loaded[0].keywords.iter().any(|k| k.starts_with(lookout_core::TAG_KEYWORD_PREFIX)));
+        assert_eq!(loaded[0].importance, lookout_core::Importance::Normal);
+        assert_eq!(loaded[0].inference_classification, lookout_core::InferenceClassification::Focused);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The Focused/Other sender overrides (M-03) round-trip, upsert by sender
+    /// and clear.
+    #[test]
+    fn inference_overrides_round_trip() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        assert!(cache.inference_overrides().unwrap().is_empty());
+
+        cache
+            .set_inference_override("sam@contoso.com", lookout_core::InferenceClassification::Other, Some("o1"), Utc::now())
+            .unwrap();
+        let rows = cache.inference_overrides().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender, "sam@contoso.com");
+        assert_eq!(rows[0].classify_as, lookout_core::InferenceClassification::Other);
+        assert_eq!(rows[0].override_id.as_deref(), Some("o1"));
+
+        // Re-setting the same sender replaces its row.
+        cache
+            .set_inference_override("sam@contoso.com", lookout_core::InferenceClassification::Focused, None, Utc::now())
+            .unwrap();
+        let rows = cache.inference_overrides().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].classify_as, lookout_core::InferenceClassification::Focused);
+        assert_eq!(rows[0].override_id, None);
+
+        cache.clear_inference_override("sam@contoso.com").unwrap();
+        assert!(cache.inference_overrides().unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
     /// A Graph snapshot replaces the local rows, but never one changed here
     /// after the snapshot was taken.
     #[test]
@@ -3220,6 +3851,7 @@ mod tests {
 
     fn sample_summary(mailbox_id: &MailboxId, uid: u32, preview: Option<&str>) -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: Uid(uid),
             mailbox: mailbox_id.clone(),
             message_id: None,

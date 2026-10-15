@@ -896,6 +896,7 @@ mod tests {
 
     fn flagged_message(uid: u32, flag: lookout_core::FollowUpFlag) -> EmailSummary {
         EmailSummary {
+            inference_classification: Default::default(),
             uid: lookout_core::Uid(uid),
             mailbox: lookout_core::MailboxId("a:INBOX".into()),
             message_id: None,
