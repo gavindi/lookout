@@ -6,6 +6,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 pub mod calendar;
+pub mod calendar_protocol;
 pub mod email;
 pub mod freebusy;
 pub mod holidays;

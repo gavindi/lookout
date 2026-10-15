@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.199" date="2026-10-15">
+      <description>
+        <p>Opting a Microsoft 365 account into Outlook sync now also grants access to its calendar, in preparation for Outlook's calendar features arriving natively for those accounts.</p>
+      </description>
+    </release>
     <release version="0.9.198" date="2026-10-15">
       <description>
         <p>Right-clicking an event now opens a menu with the actions you reach for most: open, delete, duplicate, copy to another calendar, save as .ics, categorize, change the show-as state, or mark it private. Ctrl-dragging an event copies it to the new time instead of moving it.</p>

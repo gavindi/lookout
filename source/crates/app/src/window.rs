@@ -9,11 +9,11 @@ use std::sync::Arc;
 use adw::prelude::*;
 use chrono::{Datelike, Timelike};
 use gtk::{gio, glib};
+use lookout_core::calendar_protocol::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_core::{
     display_name, AccountId, AttendeeStatus, BodyPart, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, ContactsProvider, EmailAddress, EmailBody, EmailSummary,
     EventOccurrence, EventUid, Mailbox, MailboxId, MailboxRole, SchedulingInfo, SystemFlagBit, TaskPriority, TaskStatus, TaskUid, Uid, UidValidity, VCard, WebcalSubscription,
 };
-use lookout_dav::session::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
 use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};

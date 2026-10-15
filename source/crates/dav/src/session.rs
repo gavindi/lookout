@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
-use lookout_core::{AttendeeAvailability, CalendarEvent, CalendarId, CalendarInfo, CalendarTask, EmailAddress, EventOccurrence, EventUid, SchedulingInfo};
+use lookout_core::{CalendarEvent, CalendarInfo, CalendarTask, EmailAddress, EventUid, SchedulingInfo};
 
 use crate::cache::CalendarCache;
 use crate::client::DavClient;
@@ -12,134 +12,17 @@ use crate::error::{Error, Result};
 use crate::freebusy::build_vfreebusy_request;
 use crate::recurrence;
 
+// The actor contract (commands, events, connection state) is shared with the
+// Microsoft Graph calendar session, so it lives in `lookout-core` rather than
+// here; re-exported under this module's path so existing
+// `lookout_dav::session::…` imports keep working unchanged.
+pub use lookout_core::calendar_protocol::{CalendarCommand, CalendarSessionEvent, ConnectionState};
+
 /// How often to re-poll while idle. CalDAV has no IMAP-IDLE-equivalent
 /// long-poll built into the core spec (RFC 6578 `sync-collection` would be
 /// the "proper" incremental mechanism, but is out of scope for this pass) -
 /// so this is a plain fixed-interval refetch instead.
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
-
-#[derive(Debug, Clone)]
-pub enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Idle,
-    Busy,
-    Error { message: String, retryable: bool },
-}
-
-#[derive(Debug)]
-pub enum CalendarCommand {
-    /// Any date within the month to display; the actor resolves the
-    /// month's own first/last-instant bounds itself.
-    SyncMonth(NaiveDate),
-    /// Fetch one month's occurrences without making it the polled month -
-    /// the Lookout dashboard's "upcoming events" horizon reaches into next
-    /// month without hijacking `current_month`, so the 5-minute poll keeps
-    /// re-syncing whatever month the calendar view is showing.
-    FetchMonth(NaiveDate),
-    /// Force a resync of the currently-displayed month outside the poll cadence.
-    Refresh,
-    /// A hint that it's worth retrying the connection now rather than
-    /// waiting out the current backoff delay. A no-op if already connected.
-    Reconnect,
-    /// Store a brand-new event: PUT the serialized VEVENT as a new calendar
-    /// object under `event.calendar_id`'s collection (a client-generated
-    /// `<uid>.ics` href, `If-None-Match: *`). Resyncs the on-screen month on
-    /// success so the new occurrence renders.
-    CreateEvent {
-        event: Box<CalendarEvent>,
-    },
-    /// Store an edited event in place: PUT to `event.href` with `event.etag`
-    /// as `If-Match` (fails with a surfaced error rather than clobbering a
-    /// concurrent change if the etag is stale). Resyncs on success.
-    UpdateEvent {
-        event: Box<CalendarEvent>,
-    },
-    /// Delete the calendar object at `href` (with an optional `etag` as
-    /// `If-Match`). Resyncs on success.
-    DeleteEvent {
-        calendar_id: CalendarId,
-        href: String,
-        etag: Option<String>,
-    },
-    /// Force a resync of every task in every calendar, outside the poll
-    /// cadence (e.g. right after a task edit lands).
-    SyncTasks,
-    /// Ask the server for attendees' free/busy over `[start, end)` by POSTing
-    /// a `VFREEBUSY` request to the account's schedule-outbox (RFC 6638 §5,
-    /// CAL-19). `request_id` is echoed back on the `FreeBusyUpdated`/
-    /// `FreeBusyFailed` event so the caller can drop a stale answer. A no-op
-    /// failure when the account has no outbox.
-    FetchFreeBusy {
-        organizer: EmailAddress,
-        attendees: Vec<EmailAddress>,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        request_id: u64,
-    },
-    /// Store a brand-new task: PUT the serialized VTODO as a new calendar
-    /// object under `task.calendar_id`'s collection (a client-generated
-    /// `<uid>.ics` href, `If-None-Match: *`). Resyncs tasks on success.
-    CreateTask {
-        task: Box<CalendarTask>,
-    },
-    /// Store an edited task in place: PUT to `task.href` with `task.etag`
-    /// as `If-Match`. Resyncs tasks on success.
-    UpdateTask {
-        task: Box<CalendarTask>,
-    },
-    /// Delete the calendar object at `href` (with an optional `etag` as
-    /// `If-Match`). Resyncs tasks on success.
-    DeleteTask {
-        calendar_id: CalendarId,
-        href: String,
-        etag: Option<String>,
-    },
-    Shutdown,
-}
-
-/// Named `CalendarSessionEvent` rather than `CalendarEvent` to avoid
-/// colliding with `lookout_core::CalendarEvent` when both are in scope
-/// unqualified (e.g. in `crates/app/src/window.rs`).
-#[derive(Debug)]
-pub enum CalendarSessionEvent {
-    ConnectionStateChanged(ConnectionState),
-    CalendarsUpdated(Vec<CalendarInfo>),
-    /// The account principal's RFC 6638 scheduling capability
-    /// (`schedule-outbox-URL`/`schedule-inbox-URL`), reported once per
-    /// connection right after discovery. The app stores it per account: an
-    /// outbox means the server delivers iTIP itself, so the client-side iMIP
-    /// sender stands down (and a later CAL-19 free/busy request has its POST
-    /// target).
-    SchedulingUpdated(SchedulingInfo),
-    OccurrencesUpdated {
-        month: NaiveDate,
-        occurrences: Vec<EventOccurrence>,
-    },
-    TasksUpdated(Vec<CalendarTask>),
-    /// A `FetchFreeBusy` answer: one availability per requested attendee, in
-    /// request order (CAL-19). `request_id` matches the originating command.
-    FreeBusyUpdated {
-        request_id: u64,
-        availabilities: Vec<AttendeeAvailability>,
-    },
-    /// A `FetchFreeBusy` request failed, or the account has no schedule-outbox
-    /// to ask (in which case the app falls back to the user's own calendars).
-    FreeBusyFailed {
-        request_id: u64,
-        message: String,
-    },
-    Error(String),
-    /// A `CreateEvent`/`UpdateEvent` request failed. Kept distinct from
-    /// `Error` so the UI can roll back exactly the occurrence it
-    /// optimistically moved (if any - harmless no-op otherwise), mirroring
-    /// `lookout_mail::session::AccountEvent::MoveFailed`.
-    EventSaveFailed {
-        uid: EventUid,
-        recurrence_id: Option<DateTime<Utc>>,
-        message: String,
-    },
-}
 
 /// Fetches a fresh credential immediately before each (re)connect attempt.
 /// `lookout-dav` never caches credentials itself; the app crate implements

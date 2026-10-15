@@ -7,8 +7,8 @@ use std::rc::Rc;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::prelude::*;
+use lookout_core::calendar_protocol::ConnectionState as CalendarConnectionState;
 use lookout_core::{BusyStatus, CalendarId, CalendarInfo, EventOccurrence};
-use lookout_dav::session::ConnectionState as CalendarConnectionState;
 
 use crate::calendar_colors;
 

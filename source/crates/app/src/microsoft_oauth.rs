@@ -16,16 +16,18 @@
 //! connect refreshes the access token silently. Access tokens are cached in
 //! memory and re-fetched only when near expiry.
 //!
-//! The app registration also carries `Microsoft Graph` → `Mail.ReadWrite` and
-//! `MailboxSettings.ReadWrite` delegated permissions (alongside the Exchange
+//! The app registration also carries `Microsoft Graph` → `Mail.ReadWrite`,
+//! `MailboxSettings.ReadWrite`, `Calendars.ReadWrite` and
+//! `Calendars.Read.Shared` delegated permissions (alongside the Exchange
 //! Online IMAP/SMTP ones), requested only when a user explicitly opts a
 //! Microsoft 365 account into Outlook sync (pin mirroring - see `graph_pin.rs` -
-//! and the category master list - see `graph_categories.rs`) via
-//! `ensure_graph_consent`. AAD v2 access tokens are
-//! single-resource, so a Graph-audience token is always minted separately
-//! from the Exchange-audience one - but the refresh token and the underlying
-//! consent grant aren't resource-scoped, so one combined-scope interactive
-//! consent is enough to redeem access tokens for either audience afterwards.
+//! the category master list - see `graph_categories.rs` - and the calendar
+//! backend - OUTLOOK_PARITY.md item 5.1) via `ensure_graph_consent`. AAD v2
+//! access tokens are single-resource, so a Graph-audience token is always
+//! minted separately from the Exchange-audience one - but the refresh token
+//! and the underlying consent grant aren't resource-scoped, so one
+//! combined-scope interactive consent is enough to redeem access tokens for
+//! either audience afterwards.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -62,25 +64,39 @@ const EXCHANGE_SCOPES: &str = concat!(
 
 /// The Graph scopes Lookout requests for its Microsoft 365 features: writing
 /// MAPI extended properties (`PR_RENEW_TIME`) on a message so pinning mirrors
-/// to Outlook (`graph_pin.rs`), and the category master list
-/// (`/me/outlook/masterCategories`, item 2.1 - `MailboxSettings.ReadWrite`).
-/// Only ever requested as part of `COMBINED_SCOPES` below, via the explicit,
-/// Config-triggered `ensure_graph_consent`. An existing grant made before the
-/// category scope was added must be re-run from Config to cover it.
-const GRAPH_SCOPES: &str =
-    concat!("offline_access ", "https://graph.microsoft.com/Mail.ReadWrite ", "https://graph.microsoft.com/MailboxSettings.ReadWrite");
+/// to Outlook (`graph_pin.rs`), the category master list
+/// (`/me/outlook/masterCategories`, item 2.1 - `MailboxSettings.ReadWrite`),
+/// and the calendar backend (`Calendars.ReadWrite` for events, item 5.1 /
+/// A-03, plus `Calendars.Read.Shared` for free/busy, CAL-19). `Place.Read.All`
+/// (room finding) is deliberately *not* here: some tenants admin-block it, so
+/// it's requested only through `GraphFeature::Rooms` when the room finder is
+/// first used, keeping the default consent from breaking. Only ever requested
+/// as part of `COMBINED_SCOPES` below, via the explicit, Config-triggered
+/// `ensure_graph_consent`. An existing grant made before a scope was added
+/// must be re-run from Config to cover it.
+const GRAPH_SCOPES: &str = concat!(
+    "offline_access ",
+    "https://graph.microsoft.com/Mail.ReadWrite ",
+    "https://graph.microsoft.com/MailboxSettings.ReadWrite ",
+    "https://graph.microsoft.com/Calendars.ReadWrite ",
+    "https://graph.microsoft.com/Calendars.Read.Shared"
+);
 
 /// Requested only by `ensure_graph_consent`: a single interactive consent
 /// covering both resources at once, so the resulting refresh token can mint
 /// access tokens for either audience afterwards (a v2.0 refresh token isn't
 /// scope-bound, even though each individual access token it mints is
-/// single-resource).
+/// single-resource). Mirrors [`GRAPH_SCOPES`]'s Graph set plus the Exchange
+/// ones, so one Config action opts the account into every Outlook-sync
+/// feature (mail properties, categories, calendar).
 const COMBINED_SCOPES: &str = concat!(
     "offline_access ",
     "https://outlook.office.com/IMAP.AccessAsUser.All ",
     "https://outlook.office.com/SMTP.Send ",
     "https://graph.microsoft.com/Mail.ReadWrite ",
-    "https://graph.microsoft.com/MailboxSettings.ReadWrite"
+    "https://graph.microsoft.com/MailboxSettings.ReadWrite ",
+    "https://graph.microsoft.com/Calendars.ReadWrite ",
+    "https://graph.microsoft.com/Calendars.Read.Shared"
 );
 
 /// Which resource a token is being requested for - AAD v2 access tokens are
@@ -183,9 +199,9 @@ enum RefreshOutcome {
 
 /// Why a Graph-audience token request failed. `ConsentRequired` covers both
 /// "no token at all" and "a token exists but was never (or no longer)
-/// granted `Mail.ReadWrite`" - either way, the caller needs to send the user
-/// through `ensure_graph_consent` before this account can mirror pins to
-/// Outlook.
+/// granted the Graph scopes" - either way, the caller needs to send the user
+/// through `ensure_graph_consent` before this account can use any
+/// Outlook-sync feature (pin/flag/category mirroring, the calendar backend).
 pub enum GraphAuthError {
     ConsentRequired,
     Transient(String),
@@ -194,7 +210,7 @@ pub enum GraphAuthError {
 impl std::fmt::Display for GraphAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GraphAuthError::ConsentRequired => write!(f, "Outlook pin sync isn't enabled for this account"),
+            GraphAuthError::ConsentRequired => write!(f, "Outlook sync isn't enabled for this account"),
             GraphAuthError::Transient(message) => write!(f, "{message}"),
         }
     }
@@ -358,7 +374,7 @@ impl MicrosoftOAuth {
                     refresh_token: stored.refresh_token,
                     graph_consented: false,
                 });
-                Err("Microsoft granted sign-in but didn't allow the Outlook pin-sync permission - check your organization's app consent policy and try again".to_string())
+                Err("Microsoft granted sign-in but didn't allow the Outlook permissions requested - check your organization's app consent policy and try again".to_string())
             }
             Err(e) => Err(e),
         }
@@ -794,6 +810,22 @@ mod tests {
         assert_eq!(TokenAudience::Exchange.refresh_scopes(), EXCHANGE_SCOPES);
         assert_eq!(TokenAudience::Graph.refresh_scopes(), GRAPH_SCOPES);
         assert_ne!(TokenAudience::Exchange.refresh_scopes(), TokenAudience::Graph.refresh_scopes());
+    }
+
+    #[test]
+    fn combined_consent_covers_calendar_but_omits_the_room_scope() {
+        // The Config "Sync with Outlook" consent must grant the calendar
+        // backend its event and free/busy scopes (item 5.1 / A-03, CAL-19)...
+        for bare in [lookout_graph::CALENDARS_READ_WRITE, lookout_graph::CALENDARS_READ_SHARED] {
+            let qualified = format!("https://graph.microsoft.com/{bare}");
+            assert!(GRAPH_SCOPES.contains(qualified.as_str()), "{bare} missing from GRAPH_SCOPES");
+            assert!(COMBINED_SCOPES.contains(qualified.as_str()), "{bare} missing from COMBINED_SCOPES");
+        }
+        // ...but not `Place.Read.All`, which some tenants admin-block; it stays
+        // a per-feature (`GraphFeature::Rooms`) request so the default consent
+        // never breaks.
+        assert!(!GRAPH_SCOPES.contains(lookout_graph::PLACE_READ_ALL));
+        assert!(!COMBINED_SCOPES.contains(lookout_graph::PLACE_READ_ALL));
     }
 
     #[test]
