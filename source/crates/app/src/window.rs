@@ -15646,6 +15646,7 @@ fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar
             show_as: occ.show_as,
             reminder_minutes_before: occ.reminder_minutes_before,
             conference_url: occ.conference_url.clone(),
+            is_online_meeting: lookout_core::interop::is_teams_meeting(occ.conference_url.as_deref()),
         };
         master.exdates.push(occ.start);
         let _ = handle.send_blocking(CalendarCommand::UpdateEvent { event: Box::new(master) });

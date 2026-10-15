@@ -89,6 +89,7 @@ pub fn event_from_graph(value: &Value, calendar_id: &CalendarId) -> Option<Calen
         show_as: show_as_from_graph(value),
         reminder_minutes_before: reminder_minutes(value),
         conference_url: conference_url(value),
+        is_online_meeting: is_online_meeting(value),
     })
 }
 
@@ -189,6 +190,12 @@ fn event_fields(event: &CalendarEvent) -> Value {
             body["reminderMinutesBeforeStart"] = json!(minutes);
         }
         None => body["isReminderOn"] = json!(false),
+    }
+    // Graph creates (or, with `false`, removes) the Teams meeting link itself;
+    // the resulting join URL then reads back into `conference_url`.
+    body["isOnlineMeeting"] = json!(event.is_online_meeting);
+    if event.is_online_meeting {
+        body["onlineMeetingProvider"] = json!("teamsForBusiness");
     }
     body
 }
@@ -344,6 +351,10 @@ fn is_all_day(value: &Value) -> bool {
     value.get("isAllDay").and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn is_online_meeting(value: &Value) -> bool {
+    value.get("isOnlineMeeting").and_then(Value::as_bool).unwrap_or(false)
+}
+
 fn show_as_from_graph(value: &Value) -> BusyStatus {
     value.get("showAs").and_then(Value::as_str).and_then(BusyStatus::from_graph).unwrap_or_default()
 }
@@ -470,6 +481,7 @@ mod tests {
                 { "emailAddress": { "name": "Bob", "address": "bob@example.com" }, "type": "required", "status": { "response": "accepted" } },
                 { "emailAddress": { "address": "carol@example.com" }, "type": "optional", "status": { "response": "tentativelyAccepted" } }
             ],
+            "isOnlineMeeting": true,
             "onlineMeeting": { "joinUrl": "https://teams.microsoft.com/l/meetup-join/abc" }
         })
     }
@@ -508,6 +520,7 @@ mod tests {
         assert_eq!(event.categories, vec!["Projects".to_string(), "Urgent".to_string()]);
         assert_eq!(event.reminder_minutes_before, Some(15));
         assert_eq!(event.conference_url.as_deref(), Some("https://teams.microsoft.com/l/meetup-join/abc"));
+        assert!(event.is_online_meeting);
         // Pacific 09:00 on 15 Oct 2026 (PDT, UTC-7) is 16:00 UTC; the Windows
         // name resolves to the IANA zone, kept on the event.
         assert_eq!(event.start.to_rfc3339(), "2026-10-15T16:00:00+00:00");
@@ -617,6 +630,34 @@ mod tests {
         let (utc, zone) = parse_graph_date_time_str("2026-10-15T09:00:00.0000000Z", None).unwrap();
         assert_eq!(utc.to_rfc3339(), "2026-10-15T09:00:00+00:00");
         assert_eq!(zone, None);
+    }
+
+    #[test]
+    fn create_body_requests_a_teams_link_when_flagged() {
+        let mut event = event_from_graph(&sample_event(), &calendar_id()).unwrap();
+        event.is_online_meeting = true;
+        let body = event_create_body(&event);
+        assert_eq!(body["isOnlineMeeting"], true);
+        assert_eq!(body["onlineMeetingProvider"], "teamsForBusiness");
+    }
+
+    #[test]
+    fn a_non_teams_event_writes_the_flag_off_without_a_provider() {
+        let mut event = event_from_graph(&sample_event(), &calendar_id()).unwrap();
+        event.is_online_meeting = false;
+        let body = event_patch_body(&event);
+        assert_eq!(body["isOnlineMeeting"], false);
+        assert!(body.get("onlineMeetingProvider").is_none());
+    }
+
+    #[test]
+    fn an_event_without_the_graph_flag_is_not_an_online_meeting() {
+        let value = json!({
+            "id": "e",
+            "start": { "dateTime": "2026-10-15T09:00:00", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-10-15T10:00:00", "timeZone": "UTC" }
+        });
+        assert!(!event_from_graph(&value, &calendar_id()).unwrap().is_online_meeting);
     }
 
     #[test]

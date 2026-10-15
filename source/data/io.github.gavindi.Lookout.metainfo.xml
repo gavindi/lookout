@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.205" date="2026-10-15">
+      <description>
+        <p>More Microsoft 365 calendar groundwork: Lookout now understands Teams meetings and can ask Microsoft to create the meeting link for an event.</p>
+      </description>
+    </release>
     <release version="0.9.204" date="2026-10-15">
       <description>
         <p>Recurring Microsoft 365 events are now understood: Lookout translates between their repeat rules and Microsoft's own format, so recurring events can be shown and created.</p>

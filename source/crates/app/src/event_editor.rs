@@ -2034,6 +2034,7 @@ pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveD
         show_as: occ.show_as,
         reminder_minutes_before: occ.reminder_minutes_before,
         conference_url: occ.conference_url.clone(),
+        is_online_meeting: lookout_core::interop::is_teams_meeting(occ.conference_url.as_deref()),
     }
 }
 
@@ -2107,6 +2108,10 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         sensitivity: input.sensitivity,
         show_as: input.show_as,
         reminder_minutes_before: input.reminder_minutes_before,
+        // A typed Teams URL (or a Teams link carried over) means "this is a
+        // Teams meeting", so a Graph write preserves/creates the link; the
+        // dedicated Teams toggle lands with the Microsoft calendar wiring.
+        is_online_meeting: lookout_core::interop::is_teams_meeting(conference_url.as_deref()),
         conference_url,
     })
 }

@@ -248,6 +248,14 @@ pub struct CalendarEvent {
     /// provider-specific "Teams meeting" integration this app doesn't have.
     #[serde(default)]
     pub conference_url: Option<String>,
+    /// Whether this is an online meeting hosted by Microsoft Teams (Graph
+    /// `isOnlineMeeting`). When set, the Graph writer asks Microsoft to
+    /// create the meeting link (`onlineMeetingProvider: teamsForBusiness`) and
+    /// the resulting join URL comes back in `conference_url`. Non-Graph
+    /// backends ignore it, and `EventOccurrence` infers the state from
+    /// `conference_url` rather than carrying this field.
+    #[serde(default)]
+    pub is_online_meeting: bool,
 }
 
 /// One instance to actually render on a calendar view - either a

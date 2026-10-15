@@ -250,6 +250,7 @@ mod tests {
             show_as: lookout_core::BusyStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            is_online_meeting: false,
         }
     }
 

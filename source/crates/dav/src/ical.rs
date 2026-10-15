@@ -108,6 +108,9 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         sensitivity: event.get_class().map(from_ical_class).unwrap_or_default(),
         show_as: parse_show_as(event),
         conference_url: online_meeting_url(event),
+        // A CalDAV/iMIP event carries no Graph Teams-meeting flag; the join
+        // URL (parsed above) is the only online-meeting signal.
+        is_online_meeting: false,
         reminder_minutes_before: parse_reminder(event),
     })
 }
@@ -1069,6 +1072,7 @@ mod tests {
             show_as: BusyStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            is_online_meeting: false,
         }
     }
 

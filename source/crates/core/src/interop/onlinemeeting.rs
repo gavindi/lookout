@@ -73,6 +73,14 @@ pub fn classify(url: &str) -> Option<OnlineMeetingProvider> {
     None
 }
 
+/// Whether a join URL is a Microsoft Teams meeting (`classify` == Teams).
+/// The model's `CalendarEvent::is_online_meeting` flag isn't carried on
+/// `EventOccurrence`, so reconstructing an event from an occurrence uses this
+/// on its `conference_url` to preserve the Teams identity on a Graph write.
+pub fn is_teams_meeting(url: Option<&str>) -> bool {
+    url.and_then(classify) == Some(OnlineMeetingProvider::Teams)
+}
+
 /// Picks the online meeting an event offers. An explicit join URL
 /// (`CONFERENCE`, the `X-MICROSOFT-*` properties, or `URL`) is trusted first
 /// and always wins - an unrecognised host becomes [`OnlineMeetingProvider::Other`],

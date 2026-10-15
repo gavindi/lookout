@@ -43,7 +43,7 @@ pub use headers::{
 };
 pub use junk::{junk_keyword, junk_keyword_change, junk_keywords, JUNK_KEYWORD, NOT_JUNK_KEYWORD};
 pub use onlinemeeting::{
-    classify as classify_online_meeting, detect as detect_online_meeting, OnlineMeeting, OnlineMeetingProvider, X_MICROSOFT_ONLINEMEETINGCONFLINK,
+    classify as classify_online_meeting, detect as detect_online_meeting, is_teams_meeting, OnlineMeeting, OnlineMeetingProvider, X_MICROSOFT_ONLINEMEETINGCONFLINK,
     X_MICROSOFT_SKYPETEAMSMEETINGURL,
 };
 pub use snooze::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
