@@ -7,7 +7,9 @@
 //! top regardless of its real date. IMAP has no way to reach that property
 //! at all (`STORE` only touches system/keyword flags), so this module talks
 //! to Graph's extended-properties API instead - the only reachable transport
-//! now that EWS is being retired for Exchange Online.
+//! now that EWS is being retired for Exchange Online. It rides the shared
+//! `lookout_graph::mail` transport (item 5.4) for the `internetMessageId`
+//! lookup and the `PATCH`.
 //!
 //! This is a **write-only mirror**: Lookout's own pinned/unpinned state stays
 //! driven by the IMAP `\Flagged` flag exactly as before (see
@@ -29,10 +31,9 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use lookout_core::text::percent_encode;
 use lookout_core::AccountId;
-use lookout_graph::{GraphClient, GraphError};
-use serde_json::{json, Value};
+use lookout_graph::{GraphClient, GraphError, MailClient};
+use serde_json::json;
 
 use crate::microsoft_oauth::MicrosoftOAuth;
 
@@ -66,19 +67,19 @@ impl From<GraphError> for GraphPinError {
 }
 
 /// One Microsoft 365 account's Graph pin-mirroring client. Cheap to
-/// construct - holds a [`GraphClient`] over an independent `MicrosoftOAuth`
+/// construct - holds a [`MailClient`] over an independent `MicrosoftOAuth`
 /// (separate from the one driving the IMAP/SMTP session; both safely share
 /// the same on-disk token file via its atomic save).
 pub struct GraphPinClient {
     oauth: Arc<MicrosoftOAuth>,
-    graph: GraphClient,
+    mail: MailClient,
 }
 
 impl GraphPinClient {
     pub fn new(account_id: AccountId) -> Self {
         let oauth = Arc::new(MicrosoftOAuth::new(account_id));
         GraphPinClient {
-            graph: GraphClient::new(oauth.clone()),
+            mail: MailClient::new(GraphClient::new(oauth.clone())),
             oauth,
         }
     }
@@ -99,7 +100,9 @@ impl GraphPinClient {
     /// `original_date` is written back on unpin, matching Outlook's own
     /// "reset to the item's real date" unpin behavior.
     pub async fn set_pinned(&self, message_id: &str, original_date: DateTime<Utc>, pinned: bool) -> Result<(), GraphPinError> {
-        let graph_id = self.resolve_message_id(message_id).await?;
+        // The same `internetMessageId` lookup the mail-property mirror uses
+        // (item 5.4), so the two share one resolver.
+        let graph_id = self.mail.resolve_message_id(message_id).await?.ok_or(GraphPinError::MessageNotFound)?;
 
         let value = if pinned {
             FAR_FUTURE_RENEW_TIME.to_string()
@@ -111,27 +114,7 @@ impl GraphPinClient {
                 { "id": "SystemTime 0x0F01", "value": value }
             ]
         });
-        self.graph.patch(&format!("me/messages/{graph_id}"), &body).await?;
+        self.mail.patch_message(&graph_id, &body).await?;
         Ok(())
-    }
-
-    /// Resolves an RFC 822 `Message-ID` to the Graph message id needed for
-    /// the extended-property write. No extra IMAP round trip: the caller
-    /// already has `EmailSummary::message_id` from the standard `ENVELOPE`
-    /// fetch.
-    async fn resolve_message_id(&self, message_id: &str) -> Result<String, GraphPinError> {
-        // OData string-literal escaping: only the quote character needs
-        // doubling. The angle brackets, `@`, etc. that RFC 822 Message-IDs
-        // contain are fine inside a quoted literal; the whole filter value
-        // is percent-encoded for the URL.
-        let escaped = message_id.replace('\'', "''");
-        let filter = percent_encode(&format!("internetMessageId eq '{escaped}'"));
-        let page = self.graph.get(&format!("me/messages?$filter={filter}&$select=id")).await?;
-        lookout_graph::page_items(&page)
-            .first()
-            .and_then(|message| message.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or(GraphPinError::MessageNotFound)
     }
 }

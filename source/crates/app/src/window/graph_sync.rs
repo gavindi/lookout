@@ -3,19 +3,20 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk::glib;
-use lookout_core::{AccountId, EmailSummary};
+use lookout_core::{AccountId, EmailAddress, EmailSummary, Importance, InferenceClassification};
 use lookout_mail::session::AccountCommand;
 
 use crate::message_list::MessageListModel;
 
 use super::*;
 
-/// How often Outlook's follow-up flags are re-read through Graph on
-/// Microsoft 365 accounts (item 1.16) - the snooze rescan's cadence.
-pub(crate) const GRAPH_FLAG_RESYNC: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How often Outlook's per-message properties are re-read through Graph on
+/// Microsoft 365 accounts (item 5.4) - the snooze rescan's cadence.
+pub(crate) const GRAPH_PROPERTY_RESYNC: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// Every account's flagged mail, merged - what the Tasks view lists.
 pub(crate) fn all_flagged_mail(state: &Rc<RefCell<UiState>>) -> Vec<EmailSummary> {
@@ -30,50 +31,200 @@ pub(crate) fn refresh_flagged_mail(state: &Rc<RefCell<UiState>>) {
     }
 }
 
-/// Mirrors a stored flag change to Outlook through Graph (item 1.16) on a
-/// Microsoft 365 account that has granted Graph access. Best effort: a
-/// failure is logged, and the next Graph snapshot reconciles the two.
+/// The Graph mail-property client for `account_id`, when the account is
+/// Microsoft 365 and has granted Graph access (item 5.4).
+fn consented_graph_mail(state: &UiState, account_id: &AccountId) -> Option<Rc<crate::graph_mail::GraphMailClient>> {
+    state
+        .accounts
+        .get(account_id)
+        .and_then(|handle| handle.graph_mail.clone())
+        .filter(|client| client.consented())
+}
+
+/// The zone a flag's due date is written in (item 1.16 / item 5.4).
+fn display_zone_tz() -> Option<chrono_tz::Tz> {
+    crate::calendar_tz::display_zone().tz()
+}
+
+/// Mirrors a stored flag change to Outlook through Graph (item 1.16 / item
+/// 5.4). Best effort: a failure is logged, and the next delta pull reconciles
+/// the two.
 pub(crate) fn mirror_follow_up_to_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId, message_ids: Vec<String>, flag: lookout_core::FollowUpFlag) {
-    let Some(client) = state.borrow().accounts.get(account_id).and_then(|h| h.graph_mail.clone()) else {
+    let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
         return;
     };
-    if !client.consented() {
-        return;
-    }
-    let zone = crate::calendar_tz::display_zone();
+    let zone = display_zone_tz();
     glib::spawn_future_local(async move {
         for message_id in message_ids {
-            if let Err(e) = client.set_follow_up(&message_id, &flag, zone).await {
-                tracing::warn!("Outlook flag mirror failed for {message_id}: {e}");
+            match client.resolve_message_id(&message_id).await {
+                Ok(Some(graph_id)) => {
+                    if let Err(e) = client.set_follow_up(&graph_id, &flag, zone).await {
+                        tracing::warn!("Outlook flag mirror failed for {message_id}: {e}");
+                    }
+                }
+                Ok(None) => tracing::debug!("no Graph message for {message_id}; skipping the flag mirror"),
+                Err(e) => tracing::warn!("Outlook flag mirror lookup failed for {message_id}: {e}"),
             }
         }
     });
 }
 
-/// Fetches the Graph snapshot of every flagged message on a Microsoft 365
-/// account and hands it to the session (item 1.16), so flags set in Outlook
-/// show here. A no-op for other accounts and before Graph access is granted.
-pub(crate) fn sync_follow_ups_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
-    let target = state
-        .borrow()
-        .accounts
-        .get(account_id)
-        .and_then(|h| h.graph_mail.clone().map(|client| (client, h.cmd_tx.clone())));
-    let Some((client, cmd_tx)) = target else {
-        return;
-    };
-    if !client.consented() {
+/// Mirrors a stored category change to Outlook through Graph (item 5.4 /
+/// M-09): `updates` pairs each message's `Message-ID` with its resulting
+/// Lookout category *keys*, which are mapped to Outlook's display names and
+/// written as the message's whole category list.
+pub(crate) fn mirror_categories_to_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId, updates: Vec<(String, Vec<String>)>) {
+    if updates.is_empty() {
         return;
     }
-    let zone = crate::calendar_tz::display_zone();
+    let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
+        return;
+    };
+    let names_by_key: HashMap<String, String> = state
+        .borrow()
+        .categories
+        .borrow()
+        .categories
+        .iter()
+        .map(|def| (def.key.clone(), def.name.clone()))
+        .collect();
     glib::spawn_future_local(async move {
-        let taken_at = chrono::Utc::now();
-        match client.flagged_snapshot(zone).await {
-            Ok(snapshot) => {
-                let _ = cmd_tx.send(AccountCommand::ApplyRemoteFollowUps { snapshot, taken_at }).await;
+        for (message_id, keys) in updates {
+            let names: Vec<String> = keys.iter().filter_map(|key| names_by_key.get(key).cloned()).collect();
+            match client.resolve_message_id(&message_id).await {
+                Ok(Some(graph_id)) => {
+                    if let Err(e) = client.set_categories(&graph_id, &names).await {
+                        tracing::warn!("Outlook category mirror failed for {message_id}: {e}");
+                    }
+                }
+                Ok(None) => tracing::debug!("no Graph message for {message_id}; skipping the category mirror"),
+                Err(e) => tracing::warn!("Outlook category mirror lookup failed for {message_id}: {e}"),
             }
-            Err(e) => tracing::warn!("couldn't read Outlook's flags: {e}"),
         }
+    });
+}
+
+/// Mirrors an importance change to Outlook through Graph (item 5.4 / M-12).
+pub(crate) fn mirror_importance_to_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId, message_ids: Vec<String>, importance: Importance) {
+    let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
+        return;
+    };
+    glib::spawn_future_local(async move {
+        for message_id in message_ids {
+            match client.resolve_message_id(&message_id).await {
+                Ok(Some(graph_id)) => {
+                    if let Err(e) = client.set_importance(&graph_id, importance).await {
+                        tracing::warn!("Outlook importance mirror failed for {message_id}: {e}");
+                    }
+                }
+                Ok(None) => tracing::debug!("no Graph message for {message_id}; skipping the importance mirror"),
+                Err(e) => tracing::warn!("Outlook importance mirror lookup failed for {message_id}: {e}"),
+            }
+        }
+    });
+}
+
+/// Mirrors a Focused/Other change to Outlook through Graph (item 5.4 / M-03):
+/// each message's classification, and - for a "Always move…" change - a sender
+/// override so future mail follows.
+pub(crate) fn mirror_focused_to_graph(
+    state: &Rc<RefCell<UiState>>,
+    account_id: &AccountId,
+    message_ids: Vec<String>,
+    classification: InferenceClassification,
+    sender: Option<EmailAddress>,
+) {
+    let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
+        return;
+    };
+    glib::spawn_future_local(async move {
+        for message_id in message_ids {
+            match client.resolve_message_id(&message_id).await {
+                Ok(Some(graph_id)) => {
+                    if let Err(e) = client.set_inference_classification(&graph_id, classification).await {
+                        tracing::warn!("Outlook Focused/Other mirror failed for {message_id}: {e}");
+                    }
+                }
+                Ok(None) => tracing::debug!("no Graph message for {message_id}; skipping the Focused/Other mirror"),
+                Err(e) => tracing::warn!("Outlook Focused/Other mirror lookup failed for {message_id}: {e}"),
+            }
+        }
+        if let Some(sender) = sender {
+            if let Err(e) = client.create_override(classification, &sender).await {
+                tracing::warn!("Outlook Focused/Other override failed for {}: {e}", sender.address);
+            }
+        }
+    });
+}
+
+/// Maps Outlook category names to Lookout keys through the shared master list
+/// (item 2.1), deriving the same key `sanitize_tag_key` would for a name the
+/// list doesn't have yet - so a category created in Outlook between master-list
+/// pulls still lands under the key its later definition will use (item 5.4).
+fn category_keys_for_names(set: &crate::categories::CategorySet, names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|name| set.find_by_name(name).map(|def| def.key.clone()).unwrap_or_else(|| lookout_core::sanitize_tag_key(name)))
+        .collect()
+}
+
+/// Fetches one page of the Graph messages delta on a Microsoft 365 account and
+/// hands it to the session (item 5.4), so categories, flags, importance and
+/// Focused/Other set in Outlook show here. The cursor is read from (and the
+/// next one stored in) the mail cache, so an incremental pull after the first.
+/// A no-op for other accounts and before Graph access is granted.
+pub(crate) fn sync_mail_properties_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    let target = {
+        let st = state.borrow();
+        st.accounts.get(account_id).and_then(|handle| {
+            handle
+                .graph_mail
+                .clone()
+                .filter(|client| client.consented())
+                .map(|client| (client, handle.cmd_tx.clone(), handle.address_cache.clone()))
+        })
+    };
+    let Some((client, cmd_tx, read_cache)) = target else {
+        return;
+    };
+    let zone = display_zone_tz();
+    let categories = state.borrow().categories.clone();
+    glib::spawn_future_local(async move {
+        let cursor = read_cache.as_ref().and_then(|cache| cache.graph_delta_cursor().ok().flatten());
+        let taken_at = chrono::Utc::now();
+        let delta = match client.property_delta(cursor.as_deref(), zone).await {
+            Ok(delta) => delta,
+            Err(e) => {
+                tracing::warn!("couldn't read Outlook's mail properties: {e}");
+                return;
+            }
+        };
+        let properties: Vec<lookout_mail::RemoteMailProperties> = delta
+            .upserts
+            .iter()
+            .filter_map(|props| {
+                let message_id = props.message_id.clone()?;
+                // Outlook names -> Lookout keys (the master-list pull keeps the
+                // definitions; an unknown name derives the same key it would).
+                let keys = category_keys_for_names(&categories.borrow(), &props.categories);
+                Some(lookout_mail::RemoteMailProperties {
+                    message_id,
+                    graph_id: props.graph_id.clone(),
+                    categories: keys,
+                    importance: props.importance,
+                    classification: props.classification,
+                    flag: props.flag.clone(),
+                })
+            })
+            .collect();
+        let _ = cmd_tx
+            .send(AccountCommand::ApplyRemoteMailProperties {
+                properties,
+                removed_graph_ids: delta.removals,
+                delta_cursor: delta.delta_link,
+                taken_at,
+            })
+            .await;
     });
 }
 
@@ -319,9 +470,9 @@ pub(crate) fn enable_graph_automatic_replies(state: &Rc<RefCell<UiState>>, accou
             Ok(()) => {
                 toast(&state, "Outlook sync enabled");
                 // The same grant covers the other Graph features; sync the
-                // ones that need no extra widgets (flags, rules) and fetch
-                // the automatic replies the dialog is waiting on.
-                sync_follow_ups_from_graph(&state, &account_id);
+                // ones that need no extra widgets (properties, rules) and
+                // fetch the automatic replies the dialog is waiting on.
+                sync_mail_properties_from_graph(&state, &account_id);
                 sync_and_push_rules_from_graph(&state, &account_id);
                 sync_automatic_replies_from_graph(&state, &account_id);
             }
@@ -507,4 +658,24 @@ pub(crate) fn delete_graph_rule(state: &Rc<RefCell<UiState>>, account_id: &Accou
             tracing::warn!("couldn't delete Outlook rule {id}: {e}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Outlook category names map to Lookout keys through the shared master
+    /// list, and a name it doesn't know yet derives the key its later
+    /// definition will use (item 5.4).
+    #[test]
+    fn category_keys_map_names_via_the_master_list_or_derive() {
+        let set = crate::categories::CategorySet::from_defs(vec![crate::categories::CategoryDef::new("work-items", "Work Items", 3)]);
+        // "work items" matches case-insensitively; "Personal" is unknown and
+        // derives the sanitized key.
+        assert_eq!(
+            category_keys_for_names(&set, &["work items".to_string(), "Personal".to_string()]),
+            vec!["work-items".to_string(), lookout_core::sanitize_tag_key("Personal")]
+        );
+        assert!(category_keys_for_names(&set, &[]).is_empty());
+    }
 }

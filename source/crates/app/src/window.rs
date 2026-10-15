@@ -5647,13 +5647,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             refresh_dashboard_hook(&calendar_state);
             refresh_mail_overview_hook(&calendar_state);
         }));
-        // Outlook's flags on Microsoft 365 accounts, re-read on a timer as
-        // well as on connect and F5.
+        // Outlook's per-message properties on Microsoft 365 accounts, re-read
+        // on a timer as well as on connect and F5.
         let state = state.clone();
-        glib::timeout_add_seconds_local(GRAPH_FLAG_RESYNC.as_secs() as u32, move || {
+        glib::timeout_add_seconds_local(GRAPH_PROPERTY_RESYNC.as_secs() as u32, move || {
             let account_ids: Vec<AccountId> = state.borrow().accounts.keys().cloned().collect();
             for account_id in &account_ids {
-                sync_follow_ups_from_graph(&state, account_id);
+                sync_mail_properties_from_graph(&state, account_id);
             }
             glib::ControlFlow::Continue
         });
@@ -7726,7 +7726,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 // The same grant covers follow-up flags (item
                                 // 1.16) and the category master list (item
                                 // 2.1): sync both with Outlook now.
-                                sync_follow_ups_from_graph(&state, &account_id);
+                                sync_mail_properties_from_graph(&state, &account_id);
                                 sync_categories_from_graph(&state, &message_list, &account_id);
                                 push_categories_to_graph(&state);
                                 sync_and_push_rules_from_graph(&state, &account_id);
@@ -8186,7 +8186,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
             let account_ids: Vec<AccountId> = state.borrow().accounts.keys().cloned().collect();
             for account_id in &account_ids {
-                sync_follow_ups_from_graph(&state, account_id);
+                sync_mail_properties_from_graph(&state, account_id);
                 sync_and_push_rules_from_graph(&state, account_id);
                 sync_automatic_replies_from_graph(&state, account_id);
             }

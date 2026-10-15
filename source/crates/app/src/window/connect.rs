@@ -293,11 +293,12 @@ pub(crate) fn connect_account(
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     if is_microsoft_365 {
-        // Read Outlook's flags once the session has had a moment to open its
-        // cache (item 1.16); `GRAPH_FLAG_RESYNC` and F5 keep them fresh.
+        // Read Outlook's per-message properties (categories, flags,
+        // importance, Focused/Other) once the session has had a moment to open
+        // its cache (item 5.4); `GRAPH_PROPERTY_RESYNC` and F5 keep them fresh.
         let flags_state = state.clone();
         let flags_account = account_id.clone();
-        glib::timeout_add_seconds_local_once(10, move || sync_follow_ups_from_graph(&flags_state, &flags_account));
+        glib::timeout_add_seconds_local_once(10, move || sync_mail_properties_from_graph(&flags_state, &flags_account));
         // Pull Outlook's category master list into the shared list (item 2.1),
         // a little after the flags, so the message list has rendered first.
         let categories_state = state.clone();
@@ -1312,12 +1313,19 @@ pub(crate) fn spawn_account_event_loop(
                         refresh_flagged_mail(&state);
                         refresh_follow_up_banner(&state, &message_list, &reading_stack);
                     }
-                    // The session has already stored these in the cache and
-                    // repainted; carrying them to Outlook through Graph is the
-                    // item-5.4 app sprint.
-                    AccountEvent::CategoriesChanged { .. } => {}
-                    AccountEvent::ImportanceSet { .. } => {}
-                    AccountEvent::FocusedSet { .. } => {}
+                    AccountEvent::CategoriesChanged { updates } => {
+                        mirror_categories_to_graph(&state, &account_id, updates);
+                    }
+                    AccountEvent::ImportanceSet { message_ids, importance } => {
+                        mirror_importance_to_graph(&state, &account_id, message_ids, importance);
+                    }
+                    AccountEvent::FocusedSet {
+                        message_ids,
+                        classification,
+                        sender,
+                    } => {
+                        mirror_focused_to_graph(&state, &account_id, message_ids, classification, sender);
+                    }
                     AccountEvent::MailboxCreated { mailbox } => {
                         // Open the new folder's parent, so it's visible once the
                         // re-list that follows lands in `FoldersUpdated`.

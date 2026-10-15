@@ -643,13 +643,6 @@ pub enum AccountCommand {
         uids: Vec<Uid>,
         flag: lookout_core::FollowUpFlag,
     },
-    /// A Graph snapshot of every flagged message on a Microsoft 365 mailbox
-    /// (item 1.16), as `(internetMessageId, flag)` pairs taken at `taken_at`.
-    /// Replaces the local follow-up rows, except ones changed here since.
-    ApplyRemoteFollowUps {
-        snapshot: Vec<(String, lookout_core::FollowUpFlag)>,
-        taken_at: chrono::DateTime<chrono::Utc>,
-    },
     /// Sets `uids`' importance (M-12). There is no IMAP way to change a
     /// message's importance header, so it is stored in the cache's local
     /// overlay and answered by `ImportanceSet` plus a list repaint; the app
@@ -952,14 +945,12 @@ pub enum AccountEvent {
         flag: lookout_core::FollowUpFlag,
     },
     /// A category (tag) change was stored (item 5.4 / M-09), on the server or
-    /// in the local overlay: the affected messages' `Message-ID`s and the
-    /// added/removed Lookout category *keys*, so the UI can mirror it to
-    /// Outlook through Graph whatever sent it - a toggle, a drag-drop, or its
-    /// undo.
+    /// in the local overlay: each affected message's `Message-ID` paired with
+    /// its resulting Lookout category *keys*, so the UI can replace that
+    /// message's Outlook categories through Graph whatever sent it - a toggle,
+    /// a drag-drop, or its undo.
     CategoriesChanged {
-        message_ids: Vec<String>,
-        add: Vec<String>,
-        remove: Vec<String>,
+        updates: Vec<(String, Vec<String>)>,
     },
     /// A `SetImportance` was stored (M-12): the affected messages' `Message-ID`s
     /// and the new importance, for the app to mirror to Graph.
@@ -1094,19 +1085,29 @@ fn tag_keys(atoms: &[String]) -> Vec<String> {
 }
 
 /// Reports a stored category change (item 5.4) so the app can mirror it to
-/// Graph on Microsoft 365.
+/// Graph on Microsoft 365: each message's resulting category *keys*, computed
+/// from its current (pre-change) keywords adjusted by the delta.
 async fn emit_categories_changed(events: &async_channel::Sender<AccountEvent>, summaries: &[EmailSummary], add: &[String], remove: &[String]) {
-    let message_ids: Vec<String> = summaries.iter().filter_map(|summary| summary.message_id.clone()).collect();
-    if message_ids.is_empty() {
+    let add_keys = tag_keys(add);
+    let remove_keys = tag_keys(remove);
+    let mut updates: Vec<(String, Vec<String>)> = Vec::new();
+    for summary in summaries {
+        let Some(message_id) = summary.message_id.clone() else {
+            continue;
+        };
+        let mut keys: std::collections::BTreeSet<&str> = summary.keywords.iter().filter_map(|keyword| lookout_core::tag_key_from_keyword(keyword)).collect();
+        for key in &add_keys {
+            keys.insert(key.as_str());
+        }
+        for key in &remove_keys {
+            keys.remove(key.as_str());
+        }
+        updates.push((message_id, keys.into_iter().map(str::to_string).collect()));
+    }
+    if updates.is_empty() {
         return;
     }
-    let _ = events
-        .send(AccountEvent::CategoriesChanged {
-            message_ids,
-            add: tag_keys(add),
-            remove: tag_keys(remove),
-        })
-        .await;
+    let _ = events.send(AccountEvent::CategoriesChanged { updates }).await;
 }
 
 /// One row of the local outbox as the UI lists it (item 1.14): the payload's
@@ -4371,14 +4372,6 @@ async fn connect_and_run(
                         let _ = events.send(AccountEvent::FollowUpSet { message_ids, flag }).await;
                     }
                     emit_cached_messages(cache, &mailbox, events).await;
-                    emit_flagged_messages(cache, events).await;
-                }
-                AccountCommand::ApplyRemoteFollowUps { snapshot, taken_at } => {
-                    if let Some(Err(e)) = cache_op(cache, move |c| c.apply_remote_follow_ups(&snapshot, taken_at)).await {
-                        tracing::warn!("failed to apply the Graph follow-up snapshot: {e}");
-                        continue;
-                    }
-                    emit_cached_messages(cache, &current_mailbox_id, events).await;
                     emit_flagged_messages(cache, events).await;
                 }
                 AccountCommand::ApplyRemoteMailProperties {
@@ -8330,10 +8323,8 @@ mod tests {
         let (tx, rx) = async_channel::bounded(4);
         emit_categories_changed(&tx, &summaries, &[lookout_core::tag_keyword("work")], &[lookout_core::tag_keyword("red")]).await;
         match rx.recv().await.unwrap() {
-            AccountEvent::CategoriesChanged { message_ids, add, remove } => {
-                assert_eq!(message_ids, vec!["<one@example.com>".to_string()]);
-                assert_eq!(add, vec!["work".to_string()]);
-                assert_eq!(remove, vec!["red".to_string()]);
+            AccountEvent::CategoriesChanged { updates } => {
+                assert_eq!(updates, vec![("<one@example.com>".to_string(), vec!["work".to_string()])]);
             }
             other => panic!("expected CategoriesChanged, got {other:?}"),
         }

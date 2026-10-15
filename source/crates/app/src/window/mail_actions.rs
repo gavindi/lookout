@@ -1709,7 +1709,7 @@ pub(crate) fn request_account_refresh(state: &Rc<RefCell<UiState>>, account_id: 
     if let Some(cmd_tx) = cmd_tx {
         let _ = cmd_tx.send_blocking(AccountCommand::Refresh);
     }
-    sync_follow_ups_from_graph(state, account_id);
+    sync_mail_properties_from_graph(state, account_id);
     sync_and_push_rules_from_graph(state, account_id);
 }
 

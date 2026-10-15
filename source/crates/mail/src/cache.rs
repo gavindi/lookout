@@ -2321,34 +2321,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Replaces the local follow-up rows with a Graph snapshot of every
-    /// flagged message (item 1.16), keyed by bare Message-ID. Rows written
-    /// after `taken_at` - a change made here while the snapshot was in
-    /// flight - are kept as they are, so the snapshot can't undo it.
-    pub fn apply_remote_follow_ups(&self, snapshot: &[(String, FollowUpFlag)], taken_at: DateTime<Utc>) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM follow_up_flags WHERE updated_at <= ?1", [taken_at.timestamp()])?;
-        {
-            let mut stmt = tx.prepare("INSERT OR IGNORE INTO follow_up_flags (message_key, status, due, completed, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)")?;
-            for (message_id, flag) in snapshot {
-                let key = bare_message_id(message_id);
-                if key.is_empty() {
-                    continue;
-                }
-                stmt.execute(rusqlite::params![
-                    key,
-                    flag_status_code(flag.status),
-                    flag.due.map(|d| d.timestamp()),
-                    flag.completed.map(|d| d.timestamp()),
-                    taken_at.timestamp()
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Records locally the categories (Lookout `$Lookout-tag-<key>` keys) for
     /// messages whose folder can't store custom keywords (Exchange IMAP,
     /// item 5.4) or that Graph reported - the category counterpart of
@@ -3829,40 +3801,6 @@ mod tests {
             .unwrap();
         let loaded = cache.load_messages(&mailbox_id).unwrap();
         assert!(!loaded[0].keywords.iter().any(|k| k.starts_with(lookout_core::TAG_KEYWORD_PREFIX)));
-
-        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
-        let _ = std::fs::remove_file(path);
-    }
-
-    /// A Graph snapshot replaces the local rows, but never one changed here
-    /// after the snapshot was taken.
-    #[test]
-    fn remote_follow_up_snapshot_replaces_older_rows_only() {
-        let account_id = temp_account_id();
-        let cache = Cache::open(&account_id).unwrap();
-        let mailbox_id = MailboxId::new(&account_id, "INBOX");
-        let a = with_message_id(sample_summary(&mailbox_id, 1, None), "a@x");
-        let b = with_message_id(sample_summary(&mailbox_id, 2, None), "b@x");
-        let c = with_message_id(sample_summary(&mailbox_id, 3, None), "c@x");
-        cache.replace_messages(&mailbox_id, UidValidity(1), &[a.clone(), b.clone(), c.clone()]).unwrap();
-
-        let taken_at = Utc::now();
-        // `a` was flagged before the snapshot (and cleared in Outlook since);
-        // `b` was cleared here after the snapshot was taken.
-        cache
-            .set_local_follow_ups(std::slice::from_ref(&a), &flagged(None), taken_at - chrono::Duration::minutes(5))
-            .unwrap();
-        cache
-            .set_local_follow_ups(std::slice::from_ref(&b), &FollowUpFlag::default(), taken_at + chrono::Duration::seconds(5))
-            .unwrap();
-        cache
-            .apply_remote_follow_ups(&[("<b@x>".to_string(), flagged(None)), ("c@x".to_string(), flagged(None))], taken_at)
-            .unwrap();
-
-        let loaded = cache.load_summaries(&mailbox_id, &[Uid(1), Uid(2), Uid(3)]).unwrap();
-        assert_eq!(loaded[&Uid(1)].follow_up(), None, "the snapshot no longer lists a");
-        assert_eq!(loaded[&Uid(2)].follow_up(), None, "the newer local clear wins over the snapshot");
-        assert!(loaded[&Uid(3)].is_flagged_for_follow_up());
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
