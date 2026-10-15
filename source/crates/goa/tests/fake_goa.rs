@@ -154,7 +154,8 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     // empty and ImapSupported/SmtpSupported false (mirrors the live account),
     // plus a Calendar interface with an empty Uri as GOA reports for these
     // accounts. list_mail_accounts() must list it with hardcoded Exchange
-    // Online endpoints; the empty-Uri calendar must not be listed.
+    // Online endpoints; list_calendar_accounts() must list its (empty-Uri)
+    // calendar too, flagged `is_microsoft_365()`, for the Graph backend.
     let mut ms_ifaces = microsoft365_account_props("work@contoso.com");
     add_calendar_iface(&mut ms_ifaces, "", false);
     objects.insert(OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/ms365_account").unwrap(), ms_ifaces);
@@ -288,39 +289,51 @@ async fn discovers_and_fetches_credentials_over_real_dbus_wire() {
     assert_eq!(password, "fake-pw-imap-password");
 
     // Calendar accounts are a fully separate set: `unsupported_account` (no
-    // Calendar interface at all) must be excluded, `ms365_account`'s
-    // empty-Uri Calendar interface is excluded too (matching live GOA), while
-    // `no_mail_account` (no Mail interface, but a real Calendar one - mirrors
-    // the live Nextcloud account this fixture is modeled on) must now appear
-    // here even though it's absent from `list_mail_accounts()` above.
+    // Calendar interface at all) must be excluded, while `no_mail_account` (no
+    // Mail interface, but a real Calendar one - mirrors the live Nextcloud
+    // account this fixture is modeled on) must appear here even though it's
+    // absent from `list_mail_accounts()` above. `ms365_account`'s empty-Uri
+    // Calendar interface is now kept too, flagged `is_microsoft_365()` so the
+    // app routes it to the Graph backend. Sorted by URI, the empty one leads.
     let mut cal_accounts = client.list_calendar_accounts().await.unwrap();
     cal_accounts.sort_by(|a, b| a.uri.cmp(&b.uri));
 
-    assert_eq!(cal_accounts.len(), 3, "expected exactly the three usable-calendar accounts, got: {cal_accounts:?}");
-    assert_eq!(cal_accounts[0].uri, "https://caldav.example.com/dav/oauth@example.com/");
+    assert_eq!(cal_accounts.len(), 4, "expected exactly the four usable-calendar accounts, got: {cal_accounts:?}");
+    // The Microsoft 365 account: empty Uri, OAuth2, flagged for the Graph
+    // calendar backend rather than CalDAV.
+    assert_eq!(cal_accounts[0].uri, "");
+    assert!(cal_accounts[0].is_microsoft_365());
+    assert_eq!(cal_accounts[0].provider_type.as_deref(), Some("ms_graph"));
     assert!(matches!(cal_accounts[0].auth, CalendarAuthMethod::OAuth2));
-    assert_eq!(cal_accounts[1].uri, "https://caldav.example.com/dav/password@example.com/");
-    assert!(matches!(cal_accounts[1].auth, CalendarAuthMethod::Password { .. }));
+    assert_eq!(cal_accounts[1].uri, "https://caldav.example.com/dav/oauth@example.com/");
+    assert!(!cal_accounts[1].is_microsoft_365());
+    assert!(matches!(cal_accounts[1].auth, CalendarAuthMethod::OAuth2));
+    assert_eq!(cal_accounts[2].uri, "https://caldav.example.com/dav/password@example.com/");
+    assert!(matches!(cal_accounts[2].auth, CalendarAuthMethod::Password { .. }));
     // The live-shaped Nextcloud URI comes out normalized: userinfo stripped
     // and the DAV path given its trailing slash. The `@` inside the other
     // accounts' *paths* (e.g. `oauth@example.com`) must be untouched.
-    assert_eq!(cal_accounts[2].uri, "https://cloud.wahwahhut.com/remote.php/dav/");
-    assert!(matches!(cal_accounts[2].auth, CalendarAuthMethod::Password { .. }));
+    assert_eq!(cal_accounts[3].uri, "https://cloud.wahwahhut.com/remote.php/dav/");
+    assert!(matches!(cal_accounts[3].auth, CalendarAuthMethod::Password { .. }));
     // `Identity` (the login the CalDAV server expects over Basic auth) is a
     // separate value from the display name for this account.
-    assert_eq!(cal_accounts[2].identity, "ggraham");
-    assert_eq!(cal_accounts[2].display_name, "ggraham@cloud.wahwahhut.com");
-    assert_eq!(cal_accounts[2].provider_type.as_deref(), Some("owncloud"));
+    assert_eq!(cal_accounts[3].identity, "ggraham");
+    assert_eq!(cal_accounts[3].display_name, "ggraham@cloud.wahwahhut.com");
+    assert_eq!(cal_accounts[3].provider_type.as_deref(), Some("owncloud"));
 
     client.ensure_credentials_calendar(&cal_accounts[0]).await.unwrap();
-    let (cal_token, cal_expires_in) = client.get_access_token_calendar(&cal_accounts[0]).await.unwrap();
+    let (ms_token, ms_expires_in) = client.get_access_token_calendar(&cal_accounts[0]).await.unwrap();
+    assert_eq!(ms_token, "fake-ms-token");
+    assert_eq!(ms_expires_in, 3600);
+
+    let (cal_token, cal_expires_in) = client.get_access_token_calendar(&cal_accounts[1]).await.unwrap();
     assert_eq!(cal_token, "fake-access-token");
     assert_eq!(cal_expires_in, 3600);
 
-    let cal_password = client.get_calendar_password(&cal_accounts[1]).await.unwrap();
+    let cal_password = client.get_calendar_password(&cal_accounts[2]).await.unwrap();
     assert_eq!(cal_password, "fake-pw-calendar-password");
 
-    let nextcloud_password = client.get_calendar_password(&cal_accounts[2]).await.unwrap();
+    let nextcloud_password = client.get_calendar_password(&cal_accounts[3]).await.unwrap();
     assert_eq!(nextcloud_password, "fake-nc-pw-calendar-password");
 
     // Contacts accounts are likewise a fully separate set from Mail.

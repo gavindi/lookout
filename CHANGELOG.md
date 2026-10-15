@@ -13,6 +13,10 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.202] - 2026-10-15
+**Reference**: Microsoft 365 — detect Microsoft 365 calendar accounts (Phase 5, item 5.1 / A-03)
+**Summary**: Touches `crates/goa/src/discovery.rs`, `crates/goa/tests/fake_goa.rs` and `crates/app/src/window.rs`; no data-format change. GOA reports a Microsoft 365 account's `Calendar` interface with an empty `Uri` (its calendar is modelled as Graph/EWS), which the parser previously dropped. `parse_calendar_account` now keeps such accounts, and a new `GoaCalendarAccount::is_microsoft_365()` (sharing the provider-type predicate with the mail path) flags them so the app can route them to the Graph calendar backend. Until that backend lands the app's calendar discovery skips them, so no CalDAV session is attempted against an empty URL and today's behaviour (no Microsoft 365 calendar yet) is unchanged. The fake-GOA D-Bus test now asserts the account is listed and flagged.
+
 ## [v0.9.201] - 2026-10-15
 **Reference**: Microsoft 365 — Graph calendar model mapping (Phase 5 groundwork, item 5.1 / A-03)
 **Summary**: Adds `crates/graph/src/calendar.rs` and touches `crates/graph/{Cargo.toml,src/lib.rs}`; no data-format change. A pure, unit-tested module translating Microsoft Graph's calendar JSON to and from `lookout-core`'s model: `calendar_from_graph` (id/name/colour), `event_from_graph` and `occurrence_from_graph` (subject, body, location, times, all-day, show-as, sensitivity, categories, reminder, attendees with roles/statuses, organizer, and a meeting's Teams join URL), plus `event_create_body`/`event_patch_body` for writes (attendees, `transactionId` on create only, `dateTimeTimeZone`). Graph's Windows time-zone names resolve through the shared `lookout_core::windows_to_iana`, an event's identity uses Graph's `iCalUId`, and `href`/`etag` carry the Graph id/`changeKey` for later updates. Recurrence round-tripping and Teams-link creation are deferred to their own items; `lookout-graph` gains `lookout-core`, `chrono` and `chrono-tz` dependencies. Covered by 13 new `calendar` tests.

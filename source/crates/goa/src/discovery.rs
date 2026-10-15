@@ -64,7 +64,7 @@ impl GoaMailAccount {
     /// Graph scopes and can't authenticate to Exchange Online IMAP/SMTP, so
     /// the app supplies its own OAuth2 credentials instead of GOA's.
     pub fn is_microsoft_365(&self) -> bool {
-        matches!(self.provider_type.as_deref(), Some("ms_graph") | Some("microsoft365") | Some("microsoft"))
+        is_microsoft365_provider_type(self.provider_type.as_deref())
     }
 }
 
@@ -104,6 +104,18 @@ pub struct GoaCalendarAccount {
     /// GOA `ProviderType` for the account (`google`, `nextcloud`/`owncloud`,
     /// ...), when the account advertises one.
     pub provider_type: Option<String>,
+}
+
+impl GoaCalendarAccount {
+    /// Microsoft 365 accounts (GOA provider types `ms_graph`, the legacy
+    /// `microsoft365`, and the older personal `microsoft`) are served by the
+    /// Microsoft Graph calendar backend, not CalDAV - GOA models their
+    /// calendar as Graph/EWS and reports the Calendar interface with an empty
+    /// `Uri` (see [`parse_calendar_account`](GoaClient), which now keeps such
+    /// accounts so the app can route them - OUTLOOK_PARITY.md item 5.1).
+    pub fn is_microsoft_365(&self) -> bool {
+        is_microsoft365_provider_type(self.provider_type.as_deref())
+    }
 }
 
 /// How to obtain live credentials for a [`GoaContactsAccount`]. Kept
@@ -344,8 +356,15 @@ impl GoaClient {
         // authoritative for now. Revisit if a live account turns up one.
         let display_name = get_string(account_props, "PresentationIdentity").unwrap_or_default();
         let identity = get_string(account_props, "Identity").unwrap_or_default();
-        let uri = normalize_dav_base_url(get_string(cal_props, "Uri").unwrap_or_default(), get_string(account_props, "ProviderType").as_deref());
-        if uri.is_empty() {
+        let provider_type = get_string(account_props, "ProviderType");
+        let microsoft_365 = is_microsoft365_provider_type(provider_type.as_deref());
+        let uri = normalize_dav_base_url(get_string(cal_props, "Uri").unwrap_or_default(), provider_type.as_deref());
+        // A Microsoft 365 account's Calendar interface carries an empty `Uri`
+        // (GOA models its calendar as Graph/EWS), but the account is still
+        // valid - the Graph calendar backend needs no CalDAV base URL - so it
+        // is kept for the app to route (`GoaCalendarAccount::is_microsoft_365`).
+        // Every other provider must have a usable URI.
+        if uri.is_empty() && !microsoft_365 {
             return Ok(None);
         }
         let accept_ssl_errors = get_bool(cal_props, "AcceptSslErrors").unwrap_or(false);
@@ -368,7 +387,7 @@ impl GoaClient {
             uri,
             accept_ssl_errors,
             auth,
-            provider_type: get_string(account_props, "ProviderType"),
+            provider_type,
         }))
     }
 
@@ -473,10 +492,15 @@ fn get_bool(props: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
 /// [`parse_mail_account`] supplies known-good settings for them instead of
 /// reading them from the account.
 fn is_microsoft365_provider(account_props: &HashMap<String, OwnedValue>) -> bool {
-    matches!(
-        get_string(account_props, "ProviderType").as_deref(),
-        Some("ms_graph") | Some("microsoft365") | Some("microsoft")
-    )
+    is_microsoft365_provider_type(get_string(account_props, "ProviderType").as_deref())
+}
+
+/// The GOA `ProviderType` values that identify a Microsoft 365 account:
+/// the current `ms_graph`, the legacy `microsoft365`, and the older personal
+/// `microsoft`. Shared by the Mail and Calendar account parsers and both
+/// `is_microsoft_365` accessors.
+fn is_microsoft365_provider_type(provider_type: Option<&str>) -> bool {
+    matches!(provider_type, Some("ms_graph") | Some("microsoft365") | Some("microsoft"))
 }
 
 /// GOA embeds a port override in the host string itself (`"host:port"`) only
@@ -592,6 +616,29 @@ mod tests {
             assert!(!is_microsoft365_provider(&props_with_provider_type(t)), "expected {t:?} not to be treated as Microsoft 365");
         }
         assert!(!is_microsoft365_provider(&HashMap::new()), "accounts without a ProviderType must not be special-cased");
+    }
+
+    #[test]
+    fn microsoft_365_calendar_accounts_are_flagged_by_provider_type() {
+        fn calendar_account(provider_type: Option<&str>) -> GoaCalendarAccount {
+            GoaCalendarAccount {
+                account_id: AccountId("acct".to_string()),
+                object_path: OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/a").unwrap(),
+                display_name: "Work".to_string(),
+                identity: "work@contoso.com".to_string(),
+                uri: String::new(),
+                accept_ssl_errors: false,
+                auth: CalendarAuthMethod::OAuth2,
+                provider_type: provider_type.map(str::to_string),
+            }
+        }
+        for t in ["ms_graph", "microsoft365", "microsoft"] {
+            assert!(calendar_account(Some(t)).is_microsoft_365(), "expected {t:?} to be treated as Microsoft 365");
+        }
+        for t in ["google", "nextcloud", "owncloud"] {
+            assert!(!calendar_account(Some(t)).is_microsoft_365(), "expected {t:?} not to be treated as Microsoft 365");
+        }
+        assert!(!calendar_account(None).is_microsoft_365(), "an account without a ProviderType must not be special-cased");
     }
 
     #[test]

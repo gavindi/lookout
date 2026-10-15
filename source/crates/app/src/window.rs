@@ -13688,7 +13688,12 @@ fn spawn_calendar_discovery(
                         entry.calendar = Some(account.clone());
                         st.account_enabled(&id)
                     };
-                    if enabled {
+                    // Microsoft 365 calendar accounts are detected (recorded
+                    // above) but not counted as enabled CalDAV calendars -
+                    // `connect_calendar_account` skips them pending the Graph
+                    // backend (item 5.1), so they must not flip the page to a
+                    // non-empty calendar view.
+                    if enabled && !account.is_microsoft_365() {
                         enabled_accounts.push(account);
                     }
                 }
@@ -14521,6 +14526,15 @@ fn connect_calendar_account(
     account: GoaCalendarAccount,
     tasks_view: Rc<crate::tasks_view::TasksView>,
 ) {
+    // Microsoft 365 calendars are served by the Graph backend (OUTLOOK_PARITY
+    // item 5.1), not CalDAV - GOA reports their Calendar interface with an
+    // empty `Uri`, which `GoaCalendarAccount::is_microsoft_365` now flags.
+    // Until the Graph session lands, skip them so no CalDAV discovery is
+    // attempted against an empty base URL.
+    if account.is_microsoft_365() {
+        tracing::debug!("skipping CalDAV for Microsoft 365 calendar account {}; the Graph backend is pending", account.account_id);
+        return;
+    }
     let account_id = account.account_id.clone();
     let display_name = account.display_name.clone();
     let config = CalendarAccountConfig {

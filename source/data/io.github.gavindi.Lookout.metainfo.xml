@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.202" date="2026-10-15">
+      <description>
+        <p>Microsoft 365 calendar accounts are now recognised from your Online Accounts, the first step towards showing Outlook calendars natively.</p>
+      </description>
+    </release>
     <release version="0.9.201" date="2026-10-15">
       <description>
         <p>Under-the-hood groundwork for Microsoft 365 calendars: a translation layer between Microsoft's calendar data and Lookout's.</p>
