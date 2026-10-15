@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.216" date="2026-10-16">
+      <description>
+        <p>Quick Steps run a chain of actions - archive, categorise, flag, move or forward - on the selected messages in one click, from the Mail ribbon or the Ctrl+Shift+1 to Ctrl+Shift+9 slots.</p>
+      </description>
+    </release>
     <release version="0.9.215" date="2026-10-15">
       <description>
         <p>Internal housekeeping: the main window's code was split into smaller modules and duplicated helpers were consolidated. No user-visible changes.</p>

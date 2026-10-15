@@ -53,6 +53,8 @@ mod microsoft_oauth;
 mod online_accounts;
 mod other_accounts;
 mod profile_card;
+mod quick_steps;
+mod quick_steps_view;
 mod recipient_entry;
 mod recurrence;
 mod reminders;

@@ -307,6 +307,9 @@ pub struct ConfigView {
     /// "Rules…" row (Config → Mail), exposed so the caller can open the rules
     /// manager (item 2.5 / M-14).
     pub rules_row: adw::ActionRow,
+    /// "Quick Steps…" row (Config → Mail), exposed so the caller can open the
+    /// Quick Steps manager (item 2.6 / M-15).
+    pub quick_steps_row: adw::ActionRow,
     /// "Automatic replies…" row (Config → Mail), exposed so the caller can
     /// open the automatic-replies settings dialog (item 2.11 / M-24).
     pub automatic_replies_row: adw::ActionRow,
@@ -663,6 +666,12 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     mail_settings_group.add(&rules_row);
+    let quick_steps_row = adw::ActionRow::builder()
+        .title("Quick Steps…")
+        .subtitle("Chains of actions you run on the selected messages")
+        .activatable(true)
+        .build();
+    mail_settings_group.add(&quick_steps_row);
     let automatic_replies_row = adw::ActionRow::builder()
         .title("Automatic replies…")
         .subtitle("Send out-of-office replies")
@@ -1136,6 +1145,7 @@ pub fn build() -> ConfigView {
         blocked_senders_row,
         categories_row,
         rules_row,
+        quick_steps_row,
         automatic_replies_row,
         rich_text_row,
         spell_check_row,

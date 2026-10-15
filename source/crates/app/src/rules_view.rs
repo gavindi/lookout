@@ -153,7 +153,7 @@ fn condition_kind_index(condition: &RuleCondition) -> u32 {
 }
 
 /// The default action for each kind label, in dropdown order.
-fn action_kinds() -> Vec<(&'static str, RuleAction)> {
+pub(crate) fn action_kinds() -> Vec<(&'static str, RuleAction)> {
     vec![
         ("Move to", RuleAction::Move(RuleTarget::Role(MailboxRole::Archive))),
         ("Copy to", RuleAction::Copy(RuleTarget::Role(MailboxRole::Archive))),
@@ -780,7 +780,11 @@ fn comparison_from_index(index: u32) -> SizeComparison {
 }
 
 /// Writes `new` into the action at `index`.
-type ActionSetter = Rc<dyn Fn(RuleAction)>;
+pub(crate) type ActionSetter = Rc<dyn Fn(RuleAction)>;
+/// Reads the action at `index` (the editor's working copy).
+pub(crate) type ActionGetter = Rc<dyn Fn() -> Option<RuleAction>>;
+/// Removes the action at `index`.
+pub(crate) type ActionRemover = Rc<dyn Fn()>;
 
 fn action_setter(rule: Rc<RefCell<Rule>>, index: usize) -> ActionSetter {
     Rc::new(move |new| {
@@ -791,10 +795,13 @@ fn action_setter(rule: Rc<RefCell<Rule>>, index: usize) -> ActionSetter {
     })
 }
 
-/// One action row: a kind dropdown, a kind-specific value editor, and a
-/// remove button.
-fn action_row(rule: Rc<RefCell<Rule>>, index: usize, rebuild: Rc<RefCell<Box<dyn Fn()>>>) -> gtk::Box {
-    let current = rule.borrow().actions.get(index).cloned().unwrap_or(RuleAction::MarkRead(true));
+/// One action row (kind dropdown, kind-specific value editor, remove button).
+/// Shared by the rule editor and the Quick Step editor (item 2.6), so the two
+/// offer exactly the same actions with identical value editors. The three
+/// closures read, write and remove the row's action from the caller's working
+/// copy, which is either a `Rule`'s action list or a `QuickStep`'s.
+pub(crate) fn action_row_with(get: ActionGetter, set: ActionSetter, remove: ActionRemover, rebuild: Rc<RefCell<Box<dyn Fn()>>>) -> gtk::Box {
+    let current = get().unwrap_or(RuleAction::MarkRead(true));
     let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
     let kinds = action_kinds();
     let labels: Vec<&str> = kinds.iter().map(|(label, _)| *label).collect();
@@ -802,7 +809,7 @@ fn action_row(rule: Rc<RefCell<Rule>>, index: usize, rebuild: Rc<RefCell<Box<dyn
     dropdown.set_selected(action_kind_index(&current));
     dropdown.set_valign(gtk::Align::Center);
     dropdown.connect_selected_notify({
-        let rule = rule.clone();
+        let set = set.clone();
         let rebuild = rebuild.clone();
         move |dropdown| {
             let kinds = action_kinds();
@@ -810,35 +817,44 @@ fn action_row(rule: Rc<RefCell<Rule>>, index: usize, rebuild: Rc<RefCell<Box<dyn
                 .get(dropdown.selected() as usize)
                 .map(|(_, sample)| sample.clone())
                 .unwrap_or(RuleAction::MarkRead(true));
-            {
-                let mut rule = rule.borrow_mut();
-                if index < rule.actions.len() {
-                    rule.actions[index] = replacement;
-                }
-            }
+            set(replacement);
             (rebuild.borrow())();
         }
     });
     row.append(&dropdown);
-    append_action_value(&row, action_setter(rule.clone(), index), current);
-    let remove = gtk::Button::from_icon_name("list-remove-symbolic");
-    remove.add_css_class("flat");
-    remove.set_valign(gtk::Align::Center);
-    remove.connect_clicked({
-        let rule = rule.clone();
+    append_action_value(&row, set, current);
+    let remove_button = gtk::Button::from_icon_name("list-remove-symbolic");
+    remove_button.add_css_class("flat");
+    remove_button.set_valign(gtk::Align::Center);
+    remove_button.connect_clicked({
         let rebuild = rebuild.clone();
         move |_| {
-            {
-                let mut rule = rule.borrow_mut();
-                if index < rule.actions.len() {
-                    rule.actions.remove(index);
-                }
-            }
+            remove();
             (rebuild.borrow())();
         }
     });
-    row.append(&remove);
+    row.append(&remove_button);
     row
+}
+
+/// One action row for a rule being edited: binds [`action_row_with`] to the
+/// rule's own action list.
+fn action_row(rule: Rc<RefCell<Rule>>, index: usize, rebuild: Rc<RefCell<Box<dyn Fn()>>>) -> gtk::Box {
+    let get: ActionGetter = {
+        let rule = rule.clone();
+        Rc::new(move || rule.borrow().actions.get(index).cloned())
+    };
+    let set = action_setter(rule.clone(), index);
+    let remove: ActionRemover = {
+        let rule = rule.clone();
+        Rc::new(move || {
+            let mut rule = rule.borrow_mut();
+            if index < rule.actions.len() {
+                rule.actions.remove(index);
+            }
+        })
+    };
+    action_row_with(get, set, remove, rebuild)
 }
 
 /// Appends the value editor for an action's kind.

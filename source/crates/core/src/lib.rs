@@ -15,6 +15,7 @@ pub mod identity;
 pub mod ids;
 pub mod interop;
 pub mod mailbox;
+pub mod quick_step;
 pub mod rules;
 pub mod signature;
 pub mod template;
@@ -51,6 +52,7 @@ pub use interop::{
 };
 pub use interop::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
 pub use mailbox::{display_name, Mailbox, MailboxRole};
+pub use quick_step::{default_quick_steps, QuickStep};
 pub use rules::{Rule, RuleAction, RuleBackend, RuleCondition, RuleContext, RuleTarget, SizeComparison};
 pub use signature::Signature;
 pub use template::MailTemplate;

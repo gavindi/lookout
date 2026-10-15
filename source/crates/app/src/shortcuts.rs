@@ -82,6 +82,21 @@ pub const ACTION_TASKS: &str = "tasks";
 pub const ACTION_LOOKOUT: &str = "lookout";
 pub const ACTION_CONFIG: &str = "config";
 
+/// The nine Quick Step slots (item 2.6 / M-15): each runs the quick step in
+/// that gallery position on the selected messages, matching Outlook's
+/// `Ctrl+Shift+1`…`9`.
+pub const ACTION_QUICK_STEP_SLOTS: [&str; 9] = [
+    "quick-step-1",
+    "quick-step-2",
+    "quick-step-3",
+    "quick-step-4",
+    "quick-step-5",
+    "quick-step-6",
+    "quick-step-7",
+    "quick-step-8",
+    "quick-step-9",
+];
+
 /// One built-in shortcut: an action, its Config-screen title, and its
 /// default *logical* chord (a keyval + modifier mask).
 pub struct DefaultShortcut {
@@ -227,6 +242,60 @@ pub const DEFAULT_SHORTCUTS: &[DefaultShortcut] = &[
         title: "Go to Settings",
         keyval: gdk::Key::_6,
         modifiers: CONTROL,
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[0],
+        title: "Quick step 1",
+        keyval: gdk::Key::_1,
+        modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[1],
+        title: "Quick step 2",
+        keyval: gdk::Key::_2,
+        modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[2],
+        title: "Quick step 3",
+        keyval: gdk::Key::_3,
+        modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[3],
+        title: "Quick step 4",
+        keyval: gdk::Key::_4,
+        modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[4],
+        title: "Quick step 5",
+        keyval: gdk::Key::_5,
+        modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[5],
+        title: "Quick step 6",
+        keyval: gdk::Key::_6,
+        modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[6],
+        title: "Quick step 7",
+        keyval: gdk::Key::_7,
+        modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[7],
+        title: "Quick step 8",
+        keyval: gdk::Key::_8,
+        modifiers: mods(&[CONTROL, SHIFT]),
+    },
+    DefaultShortcut {
+        action: ACTION_QUICK_STEP_SLOTS[8],
+        title: "Quick step 9",
+        keyval: gdk::Key::_9,
+        modifiers: mods(&[CONTROL, SHIFT]),
     },
 ];
 
@@ -520,7 +589,17 @@ mod tests {
             let key = d.keyval.to_lower();
             assert!(chords.insert((d.modifiers & MODIFIER_MASK, key)), "duplicate chord for {}", d.action);
         }
-        assert_eq!(actions.len(), 22);
+        assert_eq!(actions.len(), 31);
+    }
+
+    #[test]
+    fn quick_step_slots_default_to_ctrl_shift_1_to_9() {
+        for (slot, action) in ACTION_QUICK_STEP_SLOTS.iter().enumerate() {
+            let default = DEFAULT_SHORTCUTS.iter().find(|d| d.action == *action).expect("slot is bound");
+            assert_eq!(default.modifiers, CONTROL | SHIFT);
+            let key_name = format!("{}", slot + 1);
+            assert_eq!(default.keyval, gdk::Key::from_name(&key_name).unwrap());
+        }
     }
 
     #[test]

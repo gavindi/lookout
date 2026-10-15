@@ -210,9 +210,167 @@ fn evaluate_batch(state: &Rc<RefCell<UiState>>, run: &RunContext, messages: &[Em
     }
 }
 
+/// A forward or redirect a plan asks its caller to perform. The caller fetches
+/// the message's raw bytes (interactively) and then sends it, because that is
+/// I/O the pure planner can't do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedForward {
+    pub to: Vec<EmailAddress>,
+    pub kind: RuleForwardKind,
+}
+
+/// The commands an action chain produces for one message, plus what reverses
+/// them and any forwards to queue. Pure: it neither sends nor touches UI
+/// state, so the rules engine (which sends and forgets) and Quick Steps (which
+/// sends, updates the list, and records a single Undo entry) share it (item
+/// 2.5 → 2.6).
+#[derive(Debug, Default)]
+pub(crate) struct ActionPlan {
+    /// Commands to send, in the chain's order.
+    pub commands: Vec<AccountCommand>,
+    /// Commands that reverse `commands` - for Quick Steps' undo. The rules
+    /// engine ignores this.
+    pub inverse: Vec<AccountCommand>,
+    pub forwards: Vec<PlannedForward>,
+    /// The chain ended with "stop processing more rules".
+    pub stop: bool,
+}
+
+/// Translates one message's action chain into commands, inverse commands and
+/// forwards. `folders` resolves move/copy targets and the Deleted Items
+/// destination; `categories` resolves category names to their `$Lookout-tag-*`
+/// keywords. An action whose target doesn't exist on this account is skipped
+/// (never an error), and a move to the message's current folder is a no-op -
+/// the same rules (no pun intended) the old inline dispatch followed.
+pub(crate) fn plan_actions(folders: &[Mailbox], categories: &crate::categories::CategorySet, message: &EmailSummary, actions: &[RuleAction]) -> ActionPlan {
+    let mailbox = &message.mailbox;
+    let uid = message.uid;
+    let mut plan = ActionPlan::default();
+    for action in actions {
+        match action {
+            RuleAction::Move(target) => {
+                if let Some(target) = resolve_target(folders, target) {
+                    if target != *mailbox {
+                        plan.commands.push(AccountCommand::MoveMessagesTo {
+                            mailbox: mailbox.clone(),
+                            uids: vec![uid],
+                            target: target.clone(),
+                        });
+                        plan.inverse.push(AccountCommand::RevertMove {
+                            moved_from: mailbox.clone(),
+                            moved_to: target,
+                            uids: vec![uid],
+                        });
+                    }
+                }
+            }
+            RuleAction::Copy(target) => {
+                if let Some(target) = resolve_target(folders, target) {
+                    plan.commands.push(AccountCommand::CopyMessagesTo {
+                        mailbox: mailbox.clone(),
+                        uids: vec![uid],
+                        target: target.clone(),
+                    });
+                    plan.inverse.push(AccountCommand::RevertCopy {
+                        copied_from: mailbox.clone(),
+                        copied_to: target,
+                        uids: vec![uid],
+                    });
+                }
+            }
+            RuleAction::Delete => {
+                plan.commands.push(AccountCommand::MoveMessage {
+                    mailbox: mailbox.clone(),
+                    uid,
+                    role: MailboxRole::Trash,
+                });
+                if let Some(destination) = folders.iter().find(|folder| folder.role == MailboxRole::Trash).map(|folder| folder.id.clone()) {
+                    plan.inverse.push(AccountCommand::RevertMove {
+                        moved_from: mailbox.clone(),
+                        moved_to: destination,
+                        uids: vec![uid],
+                    });
+                }
+            }
+            RuleAction::Flag(flag) => {
+                let before = message.follow_up().unwrap_or_default();
+                plan.commands.push(AccountCommand::SetFollowUp {
+                    mailbox: mailbox.clone(),
+                    uids: vec![uid],
+                    flag: flag.clone(),
+                });
+                plan.inverse.push(AccountCommand::SetFollowUp {
+                    mailbox: mailbox.clone(),
+                    uids: vec![uid],
+                    flag: before,
+                });
+            }
+            RuleAction::Categorize(names) => {
+                let keywords: Vec<String> = names.iter().filter_map(|name| categories.find_by_name(name).map(|category| category.keyword())).collect();
+                if !keywords.is_empty() {
+                    plan.commands.push(AccountCommand::StoreKeywordsMany {
+                        mailbox: mailbox.clone(),
+                        uids: vec![uid],
+                        add: keywords.clone(),
+                        remove: Vec::new(),
+                    });
+                    plan.inverse.push(AccountCommand::StoreKeywordsMany {
+                        mailbox: mailbox.clone(),
+                        uids: vec![uid],
+                        add: Vec::new(),
+                        remove: keywords,
+                    });
+                }
+            }
+            RuleAction::MarkRead(read) => {
+                let (add, remove) = if *read {
+                    (vec![SystemFlagBit::Seen], Vec::new())
+                } else {
+                    (Vec::new(), vec![SystemFlagBit::Seen])
+                };
+                plan.commands.push(AccountCommand::StoreFlagsMany {
+                    mailbox: mailbox.clone(),
+                    uids: vec![uid],
+                    add: add.clone(),
+                    remove: remove.clone(),
+                });
+                plan.inverse.push(AccountCommand::StoreFlagsMany {
+                    mailbox: mailbox.clone(),
+                    uids: vec![uid],
+                    add: remove,
+                    remove: add,
+                });
+            }
+            RuleAction::Forward(to) => {
+                if !to.is_empty() {
+                    plan.forwards.push(PlannedForward {
+                        to: to.clone(),
+                        kind: RuleForwardKind::Forward,
+                    });
+                }
+            }
+            RuleAction::Redirect(to) => {
+                if !to.is_empty() {
+                    plan.forwards.push(PlannedForward {
+                        to: to.clone(),
+                        kind: RuleForwardKind::Redirect,
+                    });
+                }
+            }
+            RuleAction::StopProcessing => {
+                plan.stop = true;
+                break;
+            }
+        }
+    }
+    plan
+}
+
 /// Runs the enabled rules over one message (with the fetched body when the
 /// deferred path supplies one), executing the matching rules' actions in
-/// order and honouring `StopProcessing`.
+/// order and honouring `StopProcessing`. The action chain itself is built by
+/// [`plan_actions`], so a rule and a Quick Step translate an action list
+/// identically.
 fn evaluate_message(state: &Rc<RefCell<UiState>>, run: &RunContext, message: &EmailSummary, body: Option<&EmailBody>) {
     let fallback_headers: &[(String, String)] = &[];
     let context = RuleContext {
@@ -221,84 +379,19 @@ fn evaluate_message(state: &Rc<RefCell<UiState>>, run: &RunContext, message: &Em
         owner: &run.owner,
         date: None,
     };
-    let mut stop = false;
     for rule in &run.rules {
         if !rule.matches_for_account(&run.account_id, message, &context) {
             continue;
         }
-        for action in &rule.actions {
-            match action {
-                RuleAction::Move(target) => {
-                    if let Some(target) = resolve_target(&run.folders, target) {
-                        if target != message.mailbox {
-                            let _ = run.cmd_tx.send_blocking(AccountCommand::MoveMessagesTo {
-                                mailbox: message.mailbox.clone(),
-                                uids: vec![message.uid],
-                                target,
-                            });
-                        }
-                    }
-                }
-                RuleAction::Copy(target) => {
-                    if let Some(target) = resolve_target(&run.folders, target) {
-                        let _ = run.cmd_tx.send_blocking(AccountCommand::CopyMessagesTo {
-                            mailbox: message.mailbox.clone(),
-                            uids: vec![message.uid],
-                            target,
-                        });
-                    }
-                }
-                RuleAction::Delete => {
-                    let _ = run.cmd_tx.send_blocking(AccountCommand::MoveMessage {
-                        mailbox: message.mailbox.clone(),
-                        uid: message.uid,
-                        role: MailboxRole::Trash,
-                    });
-                }
-                RuleAction::Flag(flag) => {
-                    let _ = run.cmd_tx.send_blocking(AccountCommand::SetFollowUp {
-                        mailbox: message.mailbox.clone(),
-                        uids: vec![message.uid],
-                        flag: flag.clone(),
-                    });
-                }
-                RuleAction::Categorize(names) => {
-                    let keywords: Vec<String> = names
-                        .iter()
-                        .filter_map(|name| run.categories.find_by_name(name).map(|category| category.keyword()))
-                        .collect();
-                    if !keywords.is_empty() {
-                        let _ = run.cmd_tx.send_blocking(AccountCommand::StoreKeywordsMany {
-                            mailbox: message.mailbox.clone(),
-                            uids: vec![message.uid],
-                            add: keywords,
-                            remove: Vec::new(),
-                        });
-                    }
-                }
-                RuleAction::MarkRead(read) => {
-                    let (add, remove) = if *read {
-                        (vec![SystemFlagBit::Seen], Vec::new())
-                    } else {
-                        (Vec::new(), vec![SystemFlagBit::Seen])
-                    };
-                    let _ = run.cmd_tx.send_blocking(AccountCommand::StoreFlagsMany {
-                        mailbox: message.mailbox.clone(),
-                        uids: vec![message.uid],
-                        add,
-                        remove,
-                    });
-                }
-                RuleAction::Forward(to) => queue_forward(state, run, message, to, RuleForwardKind::Forward),
-                RuleAction::Redirect(to) => queue_forward(state, run, message, to, RuleForwardKind::Redirect),
-                RuleAction::StopProcessing => {
-                    stop = true;
-                    break;
-                }
-            }
+        let plan = plan_actions(&run.folders, &run.categories, message, &rule.actions);
+        for command in plan.commands {
+            let _ = run.cmd_tx.send_blocking(command);
         }
-        if stop {
-            break;
+        for forward in plan.forwards {
+            queue_forward(state, &run.interactive_cmd_tx, &run.account_email, message, &forward.to, forward.kind);
+        }
+        if plan.stop {
+            return;
         }
     }
 }
@@ -360,14 +453,22 @@ pub(crate) fn resolve_target(folders: &[Mailbox], target: &RuleTarget) -> Option
     }
 }
 
-/// Queues a rule forward/redirect and asks the session for the message's raw
-/// bytes; `deliver_rule_forwards` sends it once they arrive. Messages the
-/// account itself sent are skipped, so a forward-to-self rule can't loop.
-fn queue_forward(state: &Rc<RefCell<UiState>>, run: &RunContext, message: &EmailSummary, to: &[EmailAddress], kind: RuleForwardKind) {
+/// Queues a rule or quick-step forward/redirect and asks the session for the
+/// message's raw bytes; `deliver_rule_forwards` sends it once they arrive.
+/// Messages the account itself sent are skipped, so a forward-to-self rule
+/// can't loop. Shared by the rules engine and Quick Steps (item 2.6).
+pub(crate) fn queue_forward(
+    state: &Rc<RefCell<UiState>>,
+    interactive_cmd_tx: &async_channel::Sender<AccountCommand>,
+    account_email: &str,
+    message: &EmailSummary,
+    to: &[EmailAddress],
+    kind: RuleForwardKind,
+) {
     if to.is_empty() {
         return;
     }
-    if message.from.iter().any(|address| address.address.eq_ignore_ascii_case(&run.account_email)) {
+    if message.from.iter().any(|address| address.address.eq_ignore_ascii_case(account_email)) {
         return;
     }
     let to: Vec<String> = to.iter().map(|address| address.address.clone()).collect();
@@ -379,7 +480,7 @@ fn queue_forward(state: &Rc<RefCell<UiState>>, run: &RunContext, message: &Email
         subject: message.subject.clone(),
         kind,
     });
-    let _ = run.interactive_cmd_tx.send_blocking(AccountCommand::FetchRawMessage {
+    let _ = interactive_cmd_tx.send_blocking(AccountCommand::FetchRawMessage {
         mailbox: message.mailbox.clone(),
         uid: message.uid,
     });
@@ -560,5 +661,124 @@ mod tests {
         assert_eq!(message.subject, "Budget");
         assert!(message.text_body.is_empty());
         assert_eq!(message.display_name, None);
+    }
+
+    fn summary() -> EmailSummary {
+        EmailSummary {
+            uid: Uid(7),
+            mailbox: MailboxId("acct:INBOX".into()),
+            message_id: Some("<m@example.com>".into()),
+            in_reply_to: None,
+            references: Vec::new(),
+            thread_key: lookout_core::ThreadKey("m@example.com".into()),
+            subject: Some("Hi".into()),
+            from: vec![EmailAddress::new("alice@example.com")],
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: "2026-10-14T09:00:00Z".parse().unwrap(),
+            flags: std::collections::BTreeSet::new(),
+            keywords: std::collections::BTreeSet::new(),
+            size: 1024,
+            has_attachment: false,
+            has_calendar: false,
+            preview: None,
+            mentions: false,
+            importance: lookout_core::Importance::Normal,
+            sensitivity: lookout_core::MessageSensitivity::Normal,
+            list_id: None,
+            structure: None,
+        }
+    }
+
+    fn test_categories() -> crate::categories::CategorySet {
+        crate::categories::CategorySet::from_defs(vec![crate::categories::CategoryDef::new("news", "Newsletters", 7)])
+    }
+
+    #[test]
+    fn plans_move_and_delete_with_inverses() {
+        let folders = vec![
+            folder("INBOX", "Inbox", MailboxRole::Inbox),
+            folder("Archive", "Archive", MailboxRole::Archive),
+            folder("Trash", "Deleted Items", MailboxRole::Trash),
+        ];
+        let message = summary();
+        let plan = plan_actions(
+            &folders,
+            &test_categories(),
+            &message,
+            &[RuleAction::Move(RuleTarget::Role(MailboxRole::Archive)), RuleAction::Delete],
+        );
+        assert_eq!(plan.commands.len(), 2);
+        assert!(matches!(&plan.commands[0], AccountCommand::MoveMessagesTo { target, .. } if target.0 == "acct:Archive"));
+        assert!(matches!(&plan.commands[1], AccountCommand::MoveMessage { role: MailboxRole::Trash, .. }));
+        assert_eq!(plan.inverse.len(), 2);
+        assert!(matches!(&plan.inverse[0], AccountCommand::RevertMove { moved_to, .. } if moved_to.0 == "acct:Archive"));
+        assert!(matches!(&plan.inverse[1], AccountCommand::RevertMove { moved_to, .. } if moved_to.0 == "acct:Trash"));
+        assert!(!plan.stop && plan.forwards.is_empty());
+    }
+
+    #[test]
+    fn plans_copy_read_flag_and_categorize_with_restoring_inverses() {
+        let folders = vec![folder("INBOX", "Inbox", MailboxRole::Inbox), folder("Archive", "Archive", MailboxRole::Archive)];
+        let message = summary();
+        let flag = lookout_core::FollowUpFlag {
+            status: lookout_core::FlagStatus::Flagged,
+            ..Default::default()
+        };
+        let plan = plan_actions(
+            &folders,
+            &test_categories(),
+            &message,
+            &[
+                RuleAction::Copy(RuleTarget::Role(MailboxRole::Archive)),
+                RuleAction::MarkRead(true),
+                RuleAction::Flag(flag),
+                RuleAction::Categorize(vec!["Newsletters".into()]),
+            ],
+        );
+        assert_eq!(plan.commands.len(), 4);
+        assert_eq!(plan.inverse.len(), 4);
+        assert!(matches!(&plan.inverse[0], AccountCommand::RevertCopy { copied_to, .. } if copied_to.0 == "acct:Archive"));
+        // Mark-read's inverse marks unread again.
+        assert!(matches!(&plan.inverse[1], AccountCommand::StoreFlagsMany { add, remove, .. } if add.is_empty() && remove == &vec![SystemFlagBit::Seen]));
+        // The flag's inverse restores the (unset) previous state.
+        assert!(matches!(&plan.inverse[2], AccountCommand::SetFollowUp { flag, .. } if flag.status == lookout_core::FlagStatus::NotFlagged));
+        // The categorize inverse removes the keyword it added.
+        assert!(matches!(&plan.inverse[3], AccountCommand::StoreKeywordsMany { add, remove, .. } if add.is_empty() && !remove.is_empty()));
+    }
+
+    #[test]
+    fn skips_missing_targets_current_folder_moves_and_unknown_categories() {
+        let folders = vec![folder("INBOX", "Inbox", MailboxRole::Inbox)];
+        let message = summary();
+        // No Archive folder -> the move is skipped, not an error.
+        let plan = plan_actions(&folders, &test_categories(), &message, &[RuleAction::Move(RuleTarget::Role(MailboxRole::Archive))]);
+        assert!(plan.commands.is_empty() && plan.inverse.is_empty());
+        // Moving to the folder it's already in is a no-op.
+        let plan = plan_actions(&folders, &test_categories(), &message, &[RuleAction::Move(RuleTarget::Role(MailboxRole::Inbox))]);
+        assert!(plan.commands.is_empty());
+        // An unknown category name contributes no keyword.
+        let plan = plan_actions(&folders, &test_categories(), &message, &[RuleAction::Categorize(vec!["Nope".into()])]);
+        assert!(plan.commands.is_empty());
+    }
+
+    #[test]
+    fn stop_processing_ends_the_chain_and_forwards_are_planned() {
+        let folders = vec![folder("INBOX", "Inbox", MailboxRole::Inbox)];
+        let message = summary();
+        let plan = plan_actions(
+            &folders,
+            &test_categories(),
+            &message,
+            &[RuleAction::MarkRead(true), RuleAction::StopProcessing, RuleAction::Delete],
+        );
+        assert!(plan.stop);
+        assert_eq!(plan.commands.len(), 1, "actions after StopProcessing never run");
+
+        let plan = plan_actions(&folders, &test_categories(), &message, &[RuleAction::Forward(vec![EmailAddress::new("a@example.com")])]);
+        assert!(plan.commands.is_empty());
+        assert_eq!(plan.forwards.len(), 1);
+        assert_eq!(plan.forwards[0].kind, RuleForwardKind::Forward);
+        assert_eq!(plan.forwards[0].to, vec![EmailAddress::new("a@example.com")]);
     }
 }

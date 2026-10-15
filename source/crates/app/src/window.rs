@@ -3350,6 +3350,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     let snooze_button = gtk::Button::from_icon_name("appointment-soon-symbolic");
     snooze_button.set_tooltip_text(Some("Snooze"));
+    // Quick steps ▾ (item 2.6 / M-15): a menu of the user's named action
+    // chains, run on the selection. Rebuilt on every `show` so each row's
+    // enabled state tracks the live selection, like the Categorize menu.
+    let quick_steps_button = gtk::MenuButton::builder()
+        .icon_name(themed_icon_name(&["system-run-symbolic", "media-playback-start-symbolic", "go-next-symbolic"]))
+        .build();
+    quick_steps_button.set_tooltip_text(Some("Quick steps"));
+    let quick_steps_popover = gtk::Popover::new();
+    quick_steps_button.set_popover(Some(&quick_steps_popover));
+    {
+        let state = state.clone();
+        let message_list = message_list.clone();
+        quick_steps_popover.connect_show(move |popover| {
+            let menu = crate::quick_steps_view::build_quick_steps_menu(&state, &message_list, popover);
+            popover.set_child(Some(&menu));
+        });
+    }
     // "More": a popover of reading-pane extras (currently "Save as .eml…").
     // The popover's contents are rebuilt on every `show`, like
     // `categorize_button`'s, so the enabled state can track whichever
@@ -3384,6 +3401,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&mark_read_button);
     command_toolbar.append(&categorize_button);
     command_toolbar.append(&snooze_button);
+    command_toolbar.append(&quick_steps_button);
     command_toolbar.append(&more_button);
 
     // --- Calendar's own command toolbar row, swapped in for the Mail one
@@ -6302,6 +6320,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Quick Steps…": opens the Quick Steps manager
+    // (item 2.6 / M-15).
+    {
+        let state = state.clone();
+        let row = config_view.quick_steps_row.clone();
+        row.clone().connect_activated(move |_| {
+            crate::quick_steps_view::show_manage_quick_steps_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
+        });
+    }
+
     // Config → Mail → "Automatic replies…": opens the per-account
     // out-of-office settings (item 2.11 / M-24).
     {
@@ -7036,6 +7064,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         }),
     );
+    // Quick Steps (Ctrl+Shift+1…9, item 2.6 / M-15): run the step in the
+    // matching gallery slot on the current selection. A no-op when the slot is
+    // empty or nothing is selected, same convention as the ribbon buttons.
+    for (slot, action) in crate::shortcuts::ACTION_QUICK_STEP_SLOTS.iter().copied().enumerate() {
+        let state = state.clone();
+        let message_list = message_list.clone();
+        dispatch.insert(action, Rc::new(move || crate::quick_steps::apply_quick_step_slot(&state, &message_list, slot)));
+    }
     // Print: the reading-pane print path (the calendar toolbar's Print
     // button prints the month instead), gated the same way the More menu's
     // Print item is: only while a message is actually rendered.

@@ -16,7 +16,7 @@
 /// Software released under the GPL3 license
 use std::path::PathBuf;
 
-use lookout_core::{AccountId, Identity, MailboxRole, Rule, Signature, WebcalSubscription};
+use lookout_core::{AccountId, Identity, MailboxRole, QuickStep, Rule, Signature, WebcalSubscription};
 use serde::{Deserialize, Serialize};
 
 use crate::categories::CategoryDef;
@@ -124,6 +124,18 @@ pub struct AppConfig {
     /// Graph accounts keep theirs on the server, so they never appear here.
     #[serde(default)]
     pub automatic_replies: Vec<AccountAutomaticReplies>,
+    /// The user's Quick Steps (item 2.6 / M-15): named action chains run by
+    /// hand from the Mail ribbon's **Quick steps** gallery or the
+    /// `Ctrl+Shift+1`…`9` slots (in gallery order). Local only - stored here
+    /// because Outlook's own Quick Steps live in the mailbox, which IMAP has
+    /// no equivalent of (`app/src/quick_steps.rs` runs them).
+    #[serde(default)]
+    pub quick_steps: Vec<QuickStep>,
+    /// Whether the shipped default Quick Steps have been seeded once. Set on
+    /// the first load so that deleting every step stays deleted (a plain
+    /// "empty means seed" guard would resurrect them on the next launch).
+    #[serde(default)]
+    pub quick_steps_seeded: bool,
 }
 
 impl AppConfig {
@@ -205,6 +217,32 @@ impl AppConfig {
         self.rules.retain(|r| r.id != id);
     }
 
+    /// Inserts `step`, replacing any existing entry with the same id (the edit
+    /// path) or appending it (the add path) - so gallery order is list order.
+    pub fn upsert_quick_step(&mut self, step: QuickStep) {
+        if let Some(existing) = self.quick_steps.iter_mut().find(|s| s.id == step.id) {
+            *existing = step;
+        } else {
+            self.quick_steps.push(step);
+        }
+    }
+
+    /// Removes the quick step with `id`, if any.
+    pub fn remove_quick_step(&mut self, id: &str) {
+        self.quick_steps.retain(|s| s.id != id);
+    }
+
+    /// Moves the quick step at `from` to `to`, clamping both to the list's
+    /// bounds - the manager's reorder controls (which also change the
+    /// `Ctrl+Shift+1`…`9` slot a step occupies).
+    pub fn move_quick_step(&mut self, from: usize, to: usize) {
+        if from >= self.quick_steps.len() || to >= self.quick_steps.len() || from == to {
+            return;
+        }
+        let step = self.quick_steps.remove(from);
+        self.quick_steps.insert(to, step);
+    }
+
     /// The automatic-replies settings configured for `account_id`, if any.
     pub fn automatic_replies_for(&self, account_id: &AccountId) -> Option<lookout_core::AutomaticReplies> {
         self.automatic_replies
@@ -277,6 +315,13 @@ pub fn load() -> AppConfig {
             config.categories = migrated;
             save(&config);
         }
+    }
+    // One-time seed of the shipped Quick Steps (item 2.6 / M-15). The seeded
+    // flag keeps a deliberately emptied gallery empty on the next launch.
+    if !config.quick_steps_seeded {
+        config.quick_steps = lookout_core::default_quick_steps();
+        config.quick_steps_seeded = true;
+        save(&config);
     }
     config
 }
@@ -367,6 +412,8 @@ mod tests {
             rules: Vec::new(),
             templates: Vec::new(),
             automatic_replies: Vec::new(),
+            quick_steps: Vec::new(),
+            quick_steps_seeded: false,
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -398,6 +445,8 @@ mod tests {
             rules: Vec::new(),
             templates: Vec::new(),
             automatic_replies: Vec::new(),
+            quick_steps: Vec::new(),
+            quick_steps_seeded: false,
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -635,6 +684,54 @@ mod tests {
         let mut loaded = loaded;
         loaded.move_rule(9, 0);
         assert_eq!(loaded.rules.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_steps_round_trip_upsert_move_and_remove() {
+        let dir = std::env::temp_dir().join(format!("lookout-quick-steps-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `quick_steps` loads as an empty list and an unseeded
+        // flag (the seed runs in `load`, against the real config path).
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        let loaded = load_at(&path);
+        assert!(loaded.quick_steps.is_empty());
+        assert!(!loaded.quick_steps_seeded);
+
+        let mut config = AppConfig::default();
+        let mut a = lookout_core::QuickStep::new("q1", "Archive and read");
+        a.actions = vec![lookout_core::RuleAction::Move(lookout_core::RuleTarget::Role(MailboxRole::Archive))];
+        let b = lookout_core::QuickStep::new("q2", "Flag");
+        config.upsert_quick_step(a.clone());
+        config.upsert_quick_step(b.clone());
+        assert_eq!(config.quick_steps.len(), 2);
+
+        // Upsert replaces in place; reorder; remove.
+        let mut edited = a.clone();
+        edited.name = "Archive".into();
+        config.upsert_quick_step(edited.clone());
+        assert_eq!(config.quick_steps.len(), 2);
+        assert_eq!(config.quick_steps[0].name, "Archive");
+        config.move_quick_step(0, 1);
+        assert_eq!(config.quick_steps[0].id, "q2");
+        config.remove_quick_step("q2");
+        assert_eq!(config.quick_steps.len(), 1);
+
+        config.quick_steps_seeded = true;
+        save_at(&path, &config);
+        let loaded = load_at(&path);
+        assert_eq!(loaded.quick_steps, config.quick_steps);
+        assert!(loaded.quick_steps_seeded);
+
+        // Out-of-range moves and unknown removals are no-ops, never a panic.
+        let mut loaded = loaded;
+        loaded.move_quick_step(9, 0);
+        assert_eq!(loaded.quick_steps.len(), 1);
+        loaded.remove_quick_step("nope");
+        assert_eq!(loaded.quick_steps.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
