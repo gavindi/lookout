@@ -13,6 +13,10 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.208] - 2026-10-15
+**Reference**: Microsoft 365 — connect the calendar on consent (Phase 5, item 19 / A-03)
+**Summary**: Touches `crates/app/src/window.rs`; no data-format change. Enabling Outlook sync from Config's "Sync with Outlook" now brings the account's Microsoft 365 calendar online immediately rather than on the next launch: once the consent flow succeeds, the handler connects the account's calendar session, reusing `connect_calendar_account` (which routes Microsoft 365 accounts to the Graph backend), so the calendar appears the moment consent is granted.
+
 ## [v0.9.207] - 2026-10-15
 **Reference**: Microsoft 365 — connect Microsoft 365 calendars (Phase 5, item 18 / A-03)
 **Summary**: Touches `crates/app/src/window.rs`; no data-format change. A Microsoft 365 calendar account now connects through the Graph session instead of being skipped: `connect_calendar_account` routes it to `lookout_graph::run_calendar_session` (built from the account's own `MicrosoftOAuth` token provider), while every other account keeps the CalDAV path. Because the Graph session speaks the identical command/event contract, the sidebar checklist, event views, reminder engine and Lookout dashboard all light up with no further changes. Graph access stays opt-in: an account that hasn't run Config's "Sync with Outlook" consent keeps no calendar (and doesn't flip the empty-state page to non-empty), and the account toggle/reconnect path routes correctly too.

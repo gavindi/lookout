@@ -9758,6 +9758,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let toast_overlay = toast_overlay.clone();
                 let refresh_hook = refresh_hook.clone();
                 let message_list = message_list.clone();
+                // The calendar wiring, so the account's Microsoft 365 calendar
+                // can come online the moment Graph is consented (item 19) -
+                // it couldn't start before then.
+                let worker = worker.clone();
+                let calendar_state = calendar_state.clone();
+                let calendar_main = calendar_main.clone();
+                let calendar_list_box = calendar_list_box.clone();
+                let mini_calendar = mini_calendar.clone();
+                let mail_overview_day = mail_overview_day.clone();
+                let mail_overview_day_list = mail_overview_day_list.clone();
+                let reminders_engine = reminders_engine.clone();
+                let tasks_view = tasks_view.clone();
                 Rc::new(move |_anchor, account_id: &str| {
                     let Some(client) = state.borrow().accounts.get(&AccountId(account_id.to_string())).and_then(|h| h.graph_pin.clone()) else {
                         return;
@@ -9766,6 +9778,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let refresh_hook = refresh_hook.clone();
                     let state = state.clone();
                     let message_list = message_list.clone();
+                    let worker = worker.clone();
+                    let calendar_state = calendar_state.clone();
+                    let calendar_main = calendar_main.clone();
+                    let calendar_list_box = calendar_list_box.clone();
+                    let mini_calendar = mini_calendar.clone();
+                    let mail_overview_day = mail_overview_day.clone();
+                    let mail_overview_day_list = mail_overview_day_list.clone();
+                    let reminders_engine = reminders_engine.clone();
+                    let tasks_view = tasks_view.clone();
                     let account_id = AccountId(account_id.to_string());
                     glib::spawn_future_local(async move {
                         match client.ensure_consent().await {
@@ -9778,6 +9799,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 sync_categories_from_graph(&state, &message_list, &account_id);
                                 push_categories_to_graph(&state);
                                 sync_and_push_rules_from_graph(&state, &account_id);
+                                // Bring the account's Microsoft 365 calendar
+                                // online now that Graph is consented (item 19).
+                                let (goa_client, goa_account) = {
+                                    let st = state.borrow();
+                                    (st.goa_client.clone(), st.goa_accounts.get(&account_id).and_then(|a| a.calendar.clone()))
+                                };
+                                if let (Some(goa_client), Some(goa_account)) = (goa_client, goa_account) {
+                                    connect_calendar_account(
+                                        worker.clone(),
+                                        calendar_state.clone(),
+                                        calendar_main.clone(),
+                                        calendar_list_box.clone(),
+                                        mini_calendar.clone(),
+                                        mail_overview_day.clone(),
+                                        mail_overview_day_list.clone(),
+                                        reminders_engine.clone(),
+                                        toast_overlay.clone(),
+                                        goa_client,
+                                        goa_account,
+                                        tasks_view.clone(),
+                                    );
+                                }
                                 let refresh = refresh_hook.borrow().clone();
                                 refresh();
                             }
