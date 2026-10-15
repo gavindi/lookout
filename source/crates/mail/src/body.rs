@@ -186,40 +186,54 @@ pub fn find_part_in_raw(raw: &[u8], requested: &BodyPart) -> Option<Vec<u8>> {
 }
 
 /// Rewrites every `cid:` image reference in `html` to a `data:` URI carrying
-/// the referenced part's already-transfer-decoded bytes from `raw`. Used by
-/// self-contained render paths that have no account session behind them - the
-/// debug ".eml viewer" and the popped-out message window - where the reading
-/// pane's scheme handler (which fetches cid parts over IMAP) can't serve
-/// these.
+/// the referenced part's bytes from `raw`. A thin wrapper over
+/// [`rewrite_cid_refs_with`] for self-contained render paths that hold the
+/// whole raw message: the debug ".eml viewer", the popped-out message window,
+/// and the forward composer. Callers that already have individual parts'
+/// bytes (the forward-with-attachments fetch) call `rewrite_cid_refs_with`
+/// directly and skip parsing the raw message.
 pub fn rewrite_cid_refs_to_data_uris(html: &str, raw: &[u8]) -> String {
     let Some(message) = MessageParser::default().parse(raw) else { return html.to_string() };
+    let images: Vec<(String, String, Vec<u8>)> = message
+        .attachments()
+        .filter_map(|part| {
+            let cid = part.content_id()?.to_string();
+            let content_type = part
+                .content_type()
+                .map(|ct| match ct.subtype() {
+                    Some(sub) => format!("{}/{sub}", ct.ctype()),
+                    None => ct.ctype().to_string(),
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            Some((cid, content_type, part.contents().to_vec()))
+        })
+        .collect();
+    rewrite_cid_refs_with(html, &images)
+}
+
+/// Rewrites every `cid:` image reference in `html` to a `data:` URI built
+/// from the matching entry in `images` - each `(cid, content_type, bytes)`.
+/// The bytes are expected already transfer-decoded. A reference with no
+/// matching entry is left in place, the way the sandboxed viewer renders a
+/// missing image. `cid` matching is RFC 2392 lenient (`lookout_core::cid_matches`),
+/// so a bare id resolves against a bracketed `Content-ID` and vice versa.
+pub fn rewrite_cid_refs_with(html: &str, images: &[(String, String, Vec<u8>)]) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(start) = rest.find("cid:") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 4..];
-        // The reference runs until whitespace or an HTML delimiter - enough
-        // for a dev-only helper (a robust parser would be overkill here).
+        // The reference runs until whitespace or an HTML delimiter (the
+        // reference sits inside `src="..."`, so a quote also ends it).
         let end = after.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '>').unwrap_or(after.len());
         let reference = &after[..end];
-        let resolved = message
-            .attachments()
-            .find(|p| p.content_id().is_some_and(|cid| lookout_core::cid_matches(reference, cid)))
-            .map(|part| {
-                let content_type = part
-                    .content_type()
-                    .map(|ct| match ct.subtype() {
-                        Some(sub) => format!("{}/{sub}", ct.ctype()),
-                        None => ct.ctype().to_string(),
-                    })
-                    .unwrap_or_else(|| "application/octet-stream".to_string());
-                let data = base64::engine::general_purpose::STANDARD.encode(part.contents());
-                format!("data:{content_type};base64,{data}")
-            });
+        let resolved = images.iter().find(|(cid, _, _)| lookout_core::cid_matches(reference, cid)).map(|(_, content_type, bytes)| {
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            format!("data:{content_type};base64,{data}")
+        });
         match resolved {
             Some(data_uri) => out.push_str(&data_uri),
-            // Unresolvable reference: leave the original `cid:` text in
-            // place, the way the sandboxed viewer renders a missing image.
+            // Unresolvable reference: leave the original `cid:` text in place.
             None => out.push_str(&rest[start..start + 4 + end]),
         }
         rest = &after[end..];
@@ -1271,6 +1285,18 @@ mod tests {
         let html = "<img src=\"cid:missing123\">";
         let rewritten = rewrite_cid_refs_to_data_uris(html, &raw);
         assert_eq!(rewritten, html);
+    }
+
+    #[test]
+    fn cid_refs_rewrite_with_a_supplied_image_map() {
+        // The forward path supplies already-fetched parts rather than a raw
+        // message, so the map form resolves the reference itself.
+        let images = vec![("logo123@lookout".to_string(), "image/png".to_string(), b"hello".to_vec())];
+        let html = "<img src=\"cid:logo123@lookout\"> and <img src=\"cid:missing\">";
+        let rewritten = rewrite_cid_refs_with(html, &images);
+        assert!(rewritten.contains("data:image/png;base64,aGVsbG8="), "rewritten: {rewritten}");
+        assert!(!rewritten.contains("cid:logo123@lookout"), "resolved ref is gone: {rewritten}");
+        assert!(rewritten.contains("cid:missing"), "unmatched ref survives: {rewritten}");
     }
 
     /// A draft saved through its own raw builder round-trips through

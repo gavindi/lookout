@@ -43,14 +43,14 @@ Counts are tallied from the §5 tables.
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
 | Mail (5.1) | 27 | 6 | 11 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, and rules across client, Graph and Sieve backends). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
-| Compose (5.2) | 15 | 4 | 3 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder and sensitivity. No forwarding with attachments. |
+| Compose (5.2) | 16 | 3 | 3 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
 | Calendar (5.3) | 19 | 9 | 6 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. Events share the category master list (2.1). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, or the organizer's own cache as a fallback) with Suggested times; Graph `getSchedule` and rooms wait on 5.1. |
 | People (5.4) | 7 | 2 | 3 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). No CSV or directory. |
 | Tasks (5.5) | 4 | 2 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
 | Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **85** | **27** | **37** | **5** | ~55% at parity, ~18% partial |
+| **Total** | **86** | **26** | **37** | **5** | ~56% at parity, ~17% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -296,7 +296,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | C-10 | Signatures | Rich, per-account defaults for new and reply (`app_config.rs` `signature_defaults`) | ✅ | — |
 | C-11 | Drafts autosave | 5 s autosave to IMAP Drafts | ✅ | — |
 | C-12 | Reopen a draft | "Edit" banner on a Drafts preview (or Enter/double-click) opens the composer prefilled from the parsed MIME: identity, To/Cc/Bcc, subject, HTML/text, inline images, attachments, importance, receipt, threading; saving replaces the stored draft (UID on first, Message-ID after) | ✅ | — |
-| C-13 | Forward with attachments / as attachment | Forward quotes text and drops attachments | 🟡 | Re-attach original parts; "Forward as attachment" (`message/rfc822`) |
+| C-13 | Forward with attachments / as attachment | Forward quotes the original (HTML preserved) and re-attaches its file attachments and inline `cid:` images; "Forward as attachment" (ribbon Forward ▾, reading-pane More menu) sends the whole message as a `message/rfc822` part (1.11) | ✅ | — |
 | C-14 | Emoji picker | `gtk::EmojiChooser` in the format toolbar (1.20) | ✅ | — |
 | C-15 | Paste / drop images and files | Paste images works; file drop onto the composer attaches (1.20) | ✅ | — |
 | C-16 | Attachment reminder | Body/subject scan on send → "Send without an attachment?" dialog, toggle in Settings → Mail (1.19) | ✅ | — |
@@ -611,7 +611,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 1.8 | ✅ ~~Mark-as-read options~~ | M-22 | Setting: on open, after N seconds, on selection change, never | S |
 | 1.9 | ✅ ~~Message in new window~~ | M-31 | Reuse the reading-pane builder in an `adw::Window`; double-click and Enter open it | M |
 | 1.10 | ✅ ~~View message details / source~~ | M-30 | Dialog with parsed headers plus raw source (via `FetchRawMessage`) | S |
-| 1.11 | Forward with attachments; forward as attachment | C-13 | Fetch original parts (`FetchAttachment`) into the composer; `message/rfc822` part | M |
+| 1.11 | ✅ ~~Forward with attachments; forward as attachment~~ | C-13 | Fetch original parts (`FetchAttachment`) into the composer, resolving inline `cid:` images; `message/rfc822` part | M |
 | 1.12 | ✅ ~~Reopen drafts~~ | C-12 | Open a Drafts message → parse MIME → composer prefill (identity, recipients, HTML, attachments); replace on save | M |
 | 1.13 | ✅ ~~Undo send / undo actions~~ | M-21, C-09 | 0.3 delay (setting 0/5/10 s) plus 0.4 for move/delete/flag/archive | M |
 | 1.14 | ✅ ~~Schedule send~~ | C-08 | Send menu → "Schedule send" date-time; 0.3 `not_before`; banner listing scheduled items; Graph deferred send on Microsoft 365 later (5.x) | M |

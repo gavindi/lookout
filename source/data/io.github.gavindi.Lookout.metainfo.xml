@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.196" date="2026-10-15">
+      <description>
+        <p>Forwarding now keeps what came with the message: its files and inline pictures ride along, and a rich original keeps its formatting. The Forward button is now a menu - its dropdown adds "Forward as attachment", which sends the whole original message as an attachment instead; the same option sits in the reading pane's More menu.</p>
+      </description>
+    </release>
     <release version="0.9.195" date="2026-10-15">
       <description>
         <p>Calendars get holidays, invitations show clashes, and mail can turn into a meeting. The "Add calendar" dialog now has a Holidays section: pick a country and subscribe to its public holidays in one click. An incoming invitation's card warns when the time clashes with something already on your calendar and draws a mini timeline of the day, and the message menu's new "Reply with meeting" opens a new event prefilled with the conversation's people and subject.</p>

@@ -18,7 +18,7 @@ use lookout_dav::subscription::{SubscriptionCommand, SubscriptionSessionEvent};
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
-use lookout_mail::{AccountConfig, EndpointConfig, SearchQuery, SearchScope};
+use lookout_mail::{AccountConfig, Attachment, EndpointConfig, SearchQuery, SearchScope};
 use webkit::prelude::*;
 
 use crate::calendar_colors;
@@ -696,18 +696,50 @@ struct PendingAttachment {
     button: gtk::MenuButton,
 }
 
-/// What a batch of fetched attachments is for (item 1.23 / M-33).
-enum AttachmentBatchAction {
-    /// Write each attachment into this folder, one file per part.
-    SaveAll(gio::File),
-    /// Write the attachments as a single zip archive at this file.
-    Zip(gio::File),
+/// One fetched part in an [`AttachmentBatch`]: the part (for classifying it
+/// as an attachment vs an inline `cid:` image) plus its de-duplicated save
+/// name and bytes.
+struct CollectedAttachment {
+    part: BodyPart,
+    /// A de-duplicated file name, computed as the part is collected.
+    name: String,
+    bytes: Vec<u8>,
 }
 
-/// A "Save all" / "Download as zip" run in flight, tracked in
-/// `UiState::pending_attachment_batch`: the attachments' bytes are fetched one
-/// part at a time (the session serves one `FetchAttachment` per command), then
-/// written once the queue drains.
+/// What a batch of fetched attachments is for.
+enum AttachmentBatchAction {
+    /// Write each attachment into this folder, one file per part (item 1.23 /
+    /// M-33).
+    SaveAll(gio::File),
+    /// Write the attachments as a single zip archive at this file (item 1.23).
+    Zip(gio::File),
+    /// Open a forward composer with the fetched original's parts (item 1.11 /
+    /// C-13): the `base` prefill already carries the `Fwd:` subject and both
+    /// body forms; the collected attachments fill its `attachments` list and
+    /// its inline `cid:` images are resolved from the same batch.
+    Forward(Box<ForwardBatch>),
+}
+
+/// The context a forward-with-attachments batch opens its composer with once
+/// the original's parts have drained (item 1.11 / C-13).
+struct ForwardBatch {
+    /// The prefill built by `build_forward_prefill`, with `attachments` empty
+    /// and `html_body` still carrying raw `cid:` references - both are filled
+    /// in at drain time.
+    prefill: crate::compose::ComposePrefill,
+    /// The composer's send channel (the message's account), captured at
+    /// launch so the composer opens even if the selection has moved on.
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    title: String,
+    account_id: Option<AccountId>,
+    signature_kind: Option<crate::config_view::SignatureDefault>,
+}
+
+/// A batched fetch of one message's parts, tracked in
+/// `UiState::pending_attachment_batch`: the parts' bytes are fetched one part
+/// at a time (the session serves one `FetchAttachment` per command), then
+/// either written to disk ("Save all" / "Download as zip") or handed to a
+/// composer (forward) once the queue drains.
 struct AttachmentBatch {
     mailbox: MailboxId,
     uid: Uid,
@@ -717,8 +749,8 @@ struct AttachmentBatch {
     current: String,
     /// Parts still to fetch, in the order they were listed.
     queue: VecDeque<BodyPart>,
-    /// Bytes already fetched, paired with a de-duplicated save name.
-    collected: Vec<(String, Vec<u8>)>,
+    /// Parts already fetched, in order.
+    collected: Vec<CollectedAttachment>,
     action: AttachmentBatchAction,
 }
 
@@ -797,6 +829,20 @@ struct PendingDraftOpen {
     mailbox: MailboxId,
     uid: Uid,
     summary: EmailSummary,
+}
+
+/// A "Forward as attachment" action waiting on the original's raw bytes (item
+/// 1.11 / C-13), tracked in `UiState::pending_forward_raw`. The whole message
+/// goes out as a `message/rfc822` attachment, so the composer opens once
+/// `AccountEvent::RawMessageFetched` lands. The summary names the attachment
+/// and the `Fwd:` subject; `cmd_tx`/`account_id` are captured at launch so
+/// the composer opens through the right account even if the selection moves.
+struct PendingForwardRaw {
+    mailbox: MailboxId,
+    uid: Uid,
+    summary: EmailSummary,
+    cmd_tx: async_channel::Sender<AccountCommand>,
+    account_id: Option<AccountId>,
 }
 
 /// A rule-initiated Forward/Redirect (item 2.5 / M-14) waiting on the
@@ -1118,6 +1164,11 @@ pub(crate) struct UiState {
     /// response can't open a composer over a message the user has since
     /// selected. See `open_draft_composer`.
     pending_draft_open: Option<PendingDraftOpen>,
+    /// A "Forward as attachment" fetch in flight (item 1.11 / C-13), waiting
+    /// on `AccountEvent::RawMessageFetched` to build the composer prefill with
+    /// the whole message as a `message/rfc822` part. One at a time; cleared by
+    /// whichever response lands.
+    pending_forward_raw: Option<PendingForwardRaw>,
     /// Inline `cid:` image fetches in flight for the message on the reading
     /// pane, keyed by `BodyPart::part_number`. A message can embed several
     /// images, so - unlike `pending_attachment` - this is a map. Each entry
@@ -2708,6 +2759,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         outbox_banner: None,
         outbox_dialog: None,
         pending_draft_open: None,
+        pending_forward_raw: None,
         unsubscribe_info: None,
         unsubscribe_dismissed: None,
         imip: None,
@@ -5335,8 +5387,30 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     reply_button.set_tooltip_text(Some("Reply"));
     let reply_all_button = gtk::Button::from_icon_name("mail-reply-all-symbolic");
     reply_all_button.set_tooltip_text(Some("Reply All"));
-    let forward_button = gtk::Button::from_icon_name("mail-forward-symbolic");
+    // Forward ▾ (UX-21, item 1.11 / C-13): the main part forwards the
+    // selection - re-attaching the original's files and inline images - and
+    // the arrow offers "Forward as attachment" (the whole message as a
+    // `message/rfc822` part).
+    let forward_button = adw::SplitButton::builder().icon_name("mail-forward-symbolic").dropdown_tooltip("Forward options").build();
     forward_button.set_tooltip_text(Some("Forward"));
+    {
+        let group = gio::SimpleActionGroup::new();
+        let action_forward_as_attachment = gio::SimpleAction::new("forward-as-attachment", None);
+        {
+            let state = state.clone();
+            let message_list = message_list.clone();
+            action_forward_as_attachment.connect_activate(move |_, _| {
+                if let Some(summary) = message_list.selected_summary() {
+                    forward_as_attachment(&state, &summary);
+                }
+            });
+        }
+        group.add_action(&action_forward_as_attachment);
+        forward_button.insert_action_group("forward", Some(&group));
+        let forward_menu = gio::Menu::new();
+        forward_menu.append(Some("Forward as attachment"), Some("forward.forward-as-attachment"));
+        forward_button.set_menu_model(Some(&forward_menu));
+    }
     let delete_button = gtk::Button::from_icon_name("user-trash-symbolic");
     delete_button.set_tooltip_text(Some("Delete"));
     let archive_button = gtk::Button::from_icon_name("mail-archive-symbolic");
@@ -8995,7 +9069,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         (crate::shortcuts::ACTION_COMPOSE, &compose_button),
         (crate::shortcuts::ACTION_REPLY, &reply_button),
         (crate::shortcuts::ACTION_REPLY_ALL, &reply_all_button),
-        (crate::shortcuts::ACTION_FORWARD, &forward_button),
         (crate::shortcuts::ACTION_DELETE, &delete_button),
         (crate::shortcuts::ACTION_ARCHIVE, &archive_button),
         (crate::shortcuts::ACTION_SNOOZE, &snooze_button),
@@ -9005,6 +9078,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let button = button.clone();
         dispatch.insert(action, Rc::new(move || button.emit_clicked()));
     }
+    // Forward (its shortcut): the Forward split button's main action - the
+    // plain `emit_clicked` the other buttons use.
+    dispatch.insert(
+        crate::shortcuts::ACTION_FORWARD,
+        Rc::new({
+            let forward_button = forward_button.clone();
+            move || forward_button.emit_clicked()
+        }),
+    );
     // Report junk (its shortcut): the Report split button's main action.
     dispatch.insert(
         crate::shortcuts::ACTION_REPORT_JUNK,
@@ -10524,26 +10606,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
-    for button in [&forward_button, &message_header.forward_button, &message_header.bottom_forward_button] {
+    // The ribbon's Forward split button: the main action re-attaches the
+    // original's parts (its dropdown's "Forward as attachment" is wired with
+    // the button above).
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let reading_stack = reading_stack.clone();
+        forward_button.connect_clicked(move |_| {
+            if let Some((summary, body, _from_email, _cmd_tx)) = selected_message_reply_context(&message_list, &state) {
+                forward_message(&state, &worker, &reading_stack, &summary, &body);
+            }
+        });
+    }
+    // The reading-pane header and bottom-bar Forward buttons.
+    for button in [&message_header.forward_button, &message_header.bottom_forward_button] {
         let message_list = message_list.clone();
         let state = state.clone();
         let worker = worker.clone();
         let reading_stack = reading_stack.clone();
         button.connect_clicked(move |_| {
-            if let Some((summary, body, _from_email, cmd_tx)) = selected_message_reply_context(&message_list, &state) {
-                let prefill = crate::compose::build_forward_prefill(&summary, &body);
-                let rich_text_default = state.borrow().rich_text_default;
-                show_composer_in_reading_pane(
-                    &state,
-                    &worker,
-                    &reading_stack,
-                    "Forward",
-                    cmd_tx,
-                    prefill,
-                    rich_text_default,
-                    mailbox_account_id(&summary.mailbox),
-                    Some(crate::config_view::SignatureDefault::Reply),
-                );
+            if let Some((summary, body, _from_email, _cmd_tx)) = selected_message_reply_context(&message_list, &state) {
+                forward_message(&state, &worker, &reading_stack, &summary, &body);
             }
         });
     }
@@ -12597,7 +12682,7 @@ fn spawn_account_event_loop(
                         // be collecting this part instead of a single-row
                         // action; it takes precedence and consumes the bytes
                         // when it does.
-                        if !advance_attachment_batch(&state, &mailbox, uid, &part, &bytes) {
+                        if !advance_attachment_batch(&state, &worker, &reading_stack, &mailbox, uid, &part, &bytes) {
                             let pending = {
                                 let mut st = state.borrow_mut();
                                 let on_screen = message_is_visible(&st, &mailbox, uid);
@@ -12672,20 +12757,34 @@ fn spawn_account_event_loop(
                             }
                         }
                         // A "Save all" / "Download as zip" run (item 1.23)
-                        // waiting on this part gives up as a whole.
-                        let batch_failed = {
+                        // waiting on this part gives up as a whole; a forward
+                        // (item 1.11 / C-13) still opens its composer with the
+                        // parts that did arrive, minus this failed one.
+                        let failed_batch = {
                             let mut st = state.borrow_mut();
                             let failed = st
                                 .pending_attachment_batch
                                 .as_ref()
                                 .is_some_and(|b| b.mailbox == mailbox && b.uid == uid && b.current == part_number);
                             if failed {
-                                st.pending_attachment_batch = None;
+                                st.pending_attachment_batch.take()
+                            } else {
+                                None
                             }
-                            failed
                         };
-                        if batch_failed {
-                            toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't save attachments: {message}"))));
+                        if let Some(batch) = failed_batch {
+                            let AttachmentBatch { action, collected, .. } = batch;
+                            match action {
+                                AttachmentBatchAction::Forward(fb) => {
+                                    toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
+                                        "Couldn't attach one of the original's files: {message}"
+                                    ))));
+                                    open_forward_composer(&state, &worker, &reading_stack, *fb, collected);
+                                }
+                                _ => {
+                                    toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't save attachments: {message}"))));
+                                }
+                            }
                         }
                         // The same failure for an inline `cid:` image request:
                         // finish the WebKit request with an error so the browser
@@ -12768,6 +12867,34 @@ fn spawn_account_event_loop(
                         // A rule-initiated Forward/Redirect (item 2.5 / M-14)
                         // waiting on this message's raw bytes sends it on now.
                         crate::rules::deliver_rule_forwards(&state, &mailbox, uid, &bytes);
+                        // A "Forward as attachment" run (item 1.11 / C-13)
+                        // waiting on these bytes opens its composer with the
+                        // whole message attached.
+                        let pending_forward = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_forward_raw.take() {
+                                Some(p) if p.mailbox == mailbox && p.uid == uid => Some(p),
+                                other => {
+                                    st.pending_forward_raw = other;
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(pending) = pending_forward {
+                            let prefill = crate::compose::build_forward_attachment_prefill(&pending.summary, &bytes);
+                            let rich_text_default = state.borrow().rich_text_default;
+                            show_composer_in_reading_pane(
+                                &state,
+                                &worker,
+                                &reading_stack,
+                                "Forward",
+                                pending.cmd_tx,
+                                prefill,
+                                rich_text_default,
+                                pending.account_id,
+                                Some(crate::config_view::SignatureDefault::Reply),
+                            );
+                        }
                         // The .eml export's whole raw message arrived. Only act if
                         // it belongs to the outstanding export request; a response
                         // that lands after the user selected a different message
@@ -12815,6 +12942,21 @@ fn spawn_account_event_loop(
                         // A rule-initiated Forward/Redirect waiting on the same
                         // fetch fails with it.
                         crate::rules::fail_rule_forwards(&state, &mailbox, uid, &message);
+                        // A "Forward as attachment" run (item 1.11 / C-13)
+                        // waiting on the same fetch fails as a whole.
+                        let forward_failed = {
+                            let mut st = state.borrow_mut();
+                            match st.pending_forward_raw.take() {
+                                Some(pending) if pending.mailbox == mailbox && pending.uid == uid => true,
+                                other => {
+                                    st.pending_forward_raw = other;
+                                    false
+                                }
+                            }
+                        };
+                        if forward_failed {
+                            toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't forward the message: {message}"))));
+                        }
                         // A draft "Edit" action (item 1.12) waiting on the
                         // same fetch: drop back to the empty pane and say why.
                         let draft_pending = {
@@ -18536,6 +18678,26 @@ fn build_more_menu(
         });
     }
     boxed.append(&reply_meeting);
+    // "Forward as attachment" (item 1.11 / C-13): the whole message goes out
+    // as a `message/rfc822` part, nothing quoted inline (UX-32's reading-pane
+    // ⋯ verb).
+    let forward_attachment = gtk::Button::builder()
+        .label("Forward as attachment")
+        .css_classes(["flat"])
+        .halign(gtk::Align::Start)
+        .build();
+    forward_attachment.set_sensitive(has_selection);
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        forward_attachment.connect_clicked(move |_| {
+            popover.popdown();
+            let Some(summary) = message_list.selected_summary() else { return };
+            forward_as_attachment(&state, &summary);
+        });
+    }
+    boxed.append(&forward_attachment);
     let open_window = gtk::Button::builder().label("Open in new window").css_classes(["flat"]).halign(gtk::Align::Start).build();
     open_window.set_sensitive(has_selection);
     {
@@ -20705,29 +20867,137 @@ fn reply_to_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_s
     let state_for_body = state.clone();
     let worker = worker.clone();
     let reading_stack = reading_stack.clone();
-    with_message_body(state, &summary.clone(), move |body| {
-        let (prefill, title) = match mode {
-            Some(mode) => (
-                crate::compose::build_reply_prefill(&summary, &body, &from_email, mode),
-                match mode {
-                    crate::compose::ReplyMode::Reply => "Reply",
-                    crate::compose::ReplyMode::ReplyAll => "Reply All",
-                },
-            ),
-            None => (crate::compose::build_forward_prefill(&summary, &body), "Forward"),
-        };
-        let rich_text_default = state_for_body.borrow().rich_text_default;
+    with_message_body(state, &summary.clone(), move |body| match mode {
+        Some(mode) => {
+            let prefill = crate::compose::build_reply_prefill(&summary, &body, &from_email, mode);
+            let title = match mode {
+                crate::compose::ReplyMode::Reply => "Reply",
+                crate::compose::ReplyMode::ReplyAll => "Reply All",
+            };
+            let rich_text_default = state_for_body.borrow().rich_text_default;
+            show_composer_in_reading_pane(
+                &state_for_body,
+                &worker,
+                &reading_stack,
+                title,
+                cmd_tx,
+                prefill,
+                rich_text_default,
+                mailbox_account_id(&summary.mailbox),
+                Some(crate::config_view::SignatureDefault::Reply),
+            );
+        }
+        None => forward_message(&state_for_body, &worker, &reading_stack, &summary, &body),
+    });
+}
+
+/// Opens a forward composer for `summary` (item 1.11 / C-13), Outlook's
+/// default Forward: the original is quoted inline and its attachments (and
+/// inline `cid:` images) are fetched and re-attached. The fetch runs first
+/// (`ForwardBatch`); if the message has nothing to attach, the composer opens
+/// straight away.
+pub(crate) fn forward_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, summary: &EmailSummary, body: &EmailBody) {
+    let account_id = mailbox_account_id(&summary.mailbox);
+    let cmd_tx = account_id.as_ref().and_then(|id| state.borrow().accounts.get(id).map(|h| h.cmd_tx.clone()));
+    let Some(cmd_tx) = cmd_tx else { return };
+
+    let prefill = crate::compose::build_forward_prefill(summary, body);
+    // The parts to re-attach: file attachments (the strip's filter) and the
+    // inline `cid:` images the forwarded HTML references.
+    let parts: Vec<BodyPart> = body.parts.iter().filter(|p| p.is_attachment || p.cid.is_some()).cloned().collect();
+    if parts.is_empty() {
+        let rich_text_default = state.borrow().rich_text_default;
         show_composer_in_reading_pane(
-            &state_for_body,
-            &worker,
-            &reading_stack,
-            title,
+            state,
+            worker,
+            reading_stack,
+            "Forward",
             cmd_tx,
             prefill,
             rich_text_default,
-            mailbox_account_id(&summary.mailbox),
+            account_id,
             Some(crate::config_view::SignatureDefault::Reply),
         );
+        return;
+    }
+    // One fetch at a time, shared with "Save all" / "Download as zip".
+    {
+        let st = state.borrow();
+        if st.pending_attachment_batch.is_some() || st.pending_attachment.is_some() {
+            if let Some(toast_overlay) = &st.toast_overlay {
+                toast_overlay.add_toast(adw::Toast::new("Another attachment download is still running"));
+            }
+            return;
+        }
+    }
+    start_attachment_batch(
+        state,
+        &summary.mailbox,
+        summary.uid,
+        parts,
+        AttachmentBatchAction::Forward(Box::new(ForwardBatch {
+            prefill,
+            cmd_tx,
+            title: "Forward".to_string(),
+            account_id,
+            signature_kind: Some(crate::config_view::SignatureDefault::Reply),
+        })),
+    );
+}
+
+/// Opens a "Forward as attachment" composer for `summary` (item 1.11 / C-13):
+/// nothing is quoted; the session is asked for the whole raw message, which
+/// is attached as a `message/rfc822` part once it arrives.
+pub(crate) fn forward_as_attachment(state: &Rc<RefCell<UiState>>, summary: &EmailSummary) {
+    let account_id = mailbox_account_id(&summary.mailbox);
+    let cmd_tx = account_id.as_ref().and_then(|id| state.borrow().accounts.get(id).map(|h| h.cmd_tx.clone()));
+    let Some(cmd_tx) = cmd_tx else { return };
+    start_forward_as_attachment(state, summary.clone(), cmd_tx, account_id);
+}
+
+/// Starts a "Forward as attachment" fetch (item 1.11 / C-13): records the
+/// request, asks the session for the whole raw message, and arms the same
+/// 60-second backstop as the other raw fetches. The composer opens once
+/// `AccountEvent::RawMessageFetched` lands.
+fn start_forward_as_attachment(state: &Rc<RefCell<UiState>>, summary: EmailSummary, cmd_tx: async_channel::Sender<AccountCommand>, account_id: Option<AccountId>) {
+    let Some(account) = mailbox_account_id(&summary.mailbox) else { return };
+    let fetch_tx = state.borrow().accounts.get(&account).map(|h| h.interactive_cmd_tx.clone());
+    let Some(fetch_tx) = fetch_tx else { return };
+    // One forward-as-attachment fetch at a time.
+    if state.borrow().pending_forward_raw.is_some() {
+        return;
+    }
+    state.borrow_mut().pending_forward_raw = Some(PendingForwardRaw {
+        mailbox: summary.mailbox.clone(),
+        uid: summary.uid,
+        summary: summary.clone(),
+        cmd_tx,
+        account_id,
+    });
+    let _ = fetch_tx.send_blocking(AccountCommand::FetchRawMessage {
+        mailbox: summary.mailbox.clone(),
+        uid: summary.uid,
+    });
+    // Backstop: clear the pending state after a generous grace period rather
+    // than blocking future forwards forever (a session dying mid-fetch loses
+    // the command to the reconnect). Only fires if this exact request is still
+    // outstanding.
+    let timeout_state = state.clone();
+    let timeout_mailbox = summary.mailbox.clone();
+    let timeout_uid = summary.uid;
+    glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
+        let active = timeout_state
+            .borrow()
+            .pending_forward_raw
+            .as_ref()
+            .is_some_and(|p| p.mailbox == timeout_mailbox && p.uid == timeout_uid);
+        if active {
+            timeout_state.borrow_mut().pending_forward_raw = None;
+            if let Some(toast_overlay) = &timeout_state.borrow().toast_overlay {
+                toast_overlay.add_toast(adw::Toast::new("Forward timed out"));
+            }
+        }
+        glib::ControlFlow::Break
     });
 }
 
@@ -23732,26 +24002,39 @@ fn arm_attachment_batch_timeout(state: &Rc<RefCell<UiState>>, mailbox: &MailboxI
     let timeout_state = state.clone();
     let timeout_mailbox = mailbox.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(ATTACHMENT_FETCH_TIMEOUT_MS), move || {
-        let active = timeout_state
-            .borrow()
-            .pending_attachment_batch
-            .as_ref()
-            .is_some_and(|b| b.mailbox == timeout_mailbox && b.uid == uid);
-        if active {
-            timeout_state.borrow_mut().pending_attachment_batch = None;
+        let timed_out = {
+            let mut st = timeout_state.borrow_mut();
+            let matches_batch = st
+                .pending_attachment_batch
+                .as_ref()
+                .is_some_and(|b| b.mailbox == timeout_mailbox && b.uid == uid);
+            if matches_batch {
+                let is_forward = matches!(st.pending_attachment_batch.as_ref().map(|b| &b.action), Some(AttachmentBatchAction::Forward(_)));
+                st.pending_attachment_batch = None;
+                Some(is_forward)
+            } else {
+                None
+            }
+        };
+        if let Some(is_forward) = timed_out {
             if let Some(toast_overlay) = &timeout_state.borrow().toast_overlay {
-                toast_overlay.add_toast(adw::Toast::new("Attachment download timed out"));
+                let message = if is_forward {
+                    "Forward timed out - the original's files couldn't be attached"
+                } else {
+                    "Attachment download timed out"
+                };
+                toast_overlay.add_toast(adw::Toast::new(message));
             }
         }
         glib::ControlFlow::Break
     });
 }
 
-/// Feeds one fetched part into the in-flight batch (item 1.23): stores the
-/// bytes under a de-duplicated name, requests the next part, or finishes the
-/// run once the queue drains. Returns `true` when the part belonged to the
-/// batch, so the single-row path is skipped.
-fn advance_attachment_batch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, part: &BodyPart, bytes: &[u8]) -> bool {
+/// Feeds one fetched part into the in-flight batch: stores it under a
+/// de-duplicated name, requests the next part, or finishes the run once the
+/// queue drains. Returns `true` when the part belonged to the batch, so the
+/// single-row path is skipped.
+fn advance_attachment_batch(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, mailbox: &MailboxId, uid: Uid, part: &BodyPart, bytes: &[u8]) -> bool {
     let next = {
         let mut st = state.borrow_mut();
         let Some(batch) = st.pending_attachment_batch.as_mut() else {
@@ -23760,9 +24043,13 @@ fn advance_attachment_batch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, u
         if batch.mailbox != *mailbox || batch.uid != uid || batch.current != part.part_number {
             return false;
         }
-        let mut used: HashSet<String> = batch.collected.iter().map(|(name, _)| name.clone()).collect();
+        let mut used: HashSet<String> = batch.collected.iter().map(|c| c.name.clone()).collect();
         let name = unique_attachment_name(part, &mut used);
-        batch.collected.push((name, bytes.to_vec()));
+        batch.collected.push(CollectedAttachment {
+            part: part.clone(),
+            name,
+            bytes: bytes.to_vec(),
+        });
         let next = batch.queue.pop_front();
         if let Some(next_part) = &next {
             batch.current = next_part.part_number.clone();
@@ -23780,31 +24067,97 @@ fn advance_attachment_batch(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, u
                 });
             }
         }
-        None => finish_attachment_batch(state),
+        None => finish_attachment_batch(state, worker, reading_stack),
     }
     true
 }
 
-/// Writes a drained batch's attachments into the chosen folder, or as a zip
-/// archive, then toasts the result (item 1.23).
-fn finish_attachment_batch(state: &Rc<RefCell<UiState>>) {
+/// Finishes a drained batch: writes its attachments to the chosen folder or a
+/// zip ("Save all" / "Download as zip", item 1.23), or opens a forward
+/// composer with them (item 1.11 / C-13).
+fn finish_attachment_batch(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack) {
     let Some(batch) = state.borrow_mut().pending_attachment_batch.take() else {
         return;
     };
     let toast_overlay = state.borrow().toast_overlay.clone();
     let AttachmentBatch { action, collected, .. } = batch;
-    glib::spawn_future_local(async move {
-        let result = match action {
-            AttachmentBatchAction::SaveAll(folder) => save_batch_to_folder(&folder, &collected).await,
-            AttachmentBatchAction::Zip(file) => save_batch_as_zip(&file, &collected).await,
-        };
-        if let Some(toast_overlay) = toast_overlay {
-            match result {
-                Ok(message) => toast_overlay.add_toast(adw::Toast::new(&message)),
-                Err(e) => toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't save attachments: {e}")))),
-            }
+    match action {
+        AttachmentBatchAction::Forward(fb) => open_forward_composer(state, worker, reading_stack, *fb, collected),
+        AttachmentBatchAction::SaveAll(folder) => {
+            glib::spawn_future_local(async move {
+                let files: Vec<(String, Vec<u8>)> = collected.into_iter().map(|c| (c.name, c.bytes)).collect();
+                let result = save_batch_to_folder(&folder, &files).await;
+                if let Some(toast_overlay) = toast_overlay {
+                    match result {
+                        Ok(message) => toast_overlay.add_toast(adw::Toast::new(&message)),
+                        Err(e) => toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't save attachments: {e}")))),
+                    }
+                }
+            });
         }
-    });
+        AttachmentBatchAction::Zip(file) => {
+            glib::spawn_future_local(async move {
+                let files: Vec<(String, Vec<u8>)> = collected.into_iter().map(|c| (c.name, c.bytes)).collect();
+                let result = save_batch_as_zip(&file, &files).await;
+                if let Some(toast_overlay) = toast_overlay {
+                    match result {
+                        Ok(message) => toast_overlay.add_toast(adw::Toast::new(&message)),
+                        Err(e) => toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't save attachments: {e}")))),
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// A part's `type/subtype`, or `application/octet-stream` when the wire
+/// carried none - the same default the attachment strip's save path uses.
+fn part_content_type(part: &BodyPart) -> String {
+    let content_type = part.content_type.trim();
+    if content_type.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        content_type.to_string()
+    }
+}
+
+/// Opens a forward composer once its batch has drained (item 1.11 / C-13):
+/// the fetched `is_attachment` parts become the composer's attachments and the
+/// fetched inline (`cid:`) parts resolve the forwarded HTML's image
+/// references to `data:` URIs, so a rich original forwards with its formatting
+/// and pictures intact. A part that failed to fetch simply doesn't appear -
+/// the composer still opens with whatever arrived (§10, degrade softly).
+fn open_forward_composer(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, fb: ForwardBatch, collected: Vec<CollectedAttachment>) {
+    let mut prefill = fb.prefill;
+    let mut attachments: Vec<Attachment> = Vec::new();
+    let mut images: Vec<(String, String, Vec<u8>)> = Vec::new();
+    for c in collected {
+        if c.part.is_attachment {
+            attachments.push(Attachment {
+                filename: c.name,
+                content_type: part_content_type(&c.part),
+                bytes: c.bytes,
+            });
+        } else if let Some(cid) = c.part.cid.clone() {
+            images.push((cid, part_content_type(&c.part), c.bytes));
+        }
+    }
+    prefill.attachments = attachments;
+    if let Some(html) = prefill.html_body.take() {
+        prefill.html_body = Some(lookout_mail::body::rewrite_cid_refs_with(&html, &images));
+    }
+    let rich_text_default = state.borrow().rich_text_default;
+    show_composer_in_reading_pane(
+        state,
+        worker,
+        reading_stack,
+        &fb.title,
+        fb.cmd_tx,
+        prefill,
+        rich_text_default,
+        fb.account_id,
+        fb.signature_kind,
+    );
 }
 
 /// Writes each `(name, bytes)` into `folder` (item 1.23's "Save all").
@@ -23946,7 +24299,7 @@ async fn save_raw_message_to_disk(window: &adw::ApplicationWindow, toast_overlay
 /// data and must not be fed to the dialog as a path (same rationale as
 /// `attachment_display_name`). Just the initial name; the user can change it
 /// in the dialog.
-fn eml_suggested_name(summary: &EmailSummary) -> String {
+pub(crate) fn eml_suggested_name(summary: &EmailSummary) -> String {
     let subject = summary.subject.as_deref().unwrap_or("").trim();
     if subject.is_empty() || subject.contains('/') || subject.contains('\\') {
         "message.eml".to_string()
@@ -27277,6 +27630,23 @@ mod tests {
         assert_eq!(eml_suggested_name(&with_subject(Some("a\\b"))), "message.eml");
     }
 
+    #[test]
+    fn part_content_type_defaults_only_when_the_wire_gave_none() {
+        let part = |content_type: &str| BodyPart {
+            part_number: "2".to_string(),
+            content_type: content_type.to_string(),
+            charset: None,
+            transfer_encoding: None,
+            filename: None,
+            cid: None,
+            size: 0,
+            is_attachment: true,
+        };
+        assert_eq!(part_content_type(&part("application/pdf")), "application/pdf");
+        assert_eq!(part_content_type(&part("")), "application/octet-stream");
+        assert_eq!(part_content_type(&part("  ")), "application/octet-stream");
+    }
+
     /// The details dialog's key fields come from the summary: From/To always,
     /// Cc only when present, and Message ID only when the envelope has one.
     #[test]
@@ -27745,6 +28115,7 @@ mod tests {
             outbox_banner: None,
             outbox_dialog: None,
             pending_draft_open: None,
+            pending_forward_raw: None,
             unsubscribe_info: None,
             unsubscribe_dismissed: None,
             imip: None,

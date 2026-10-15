@@ -717,24 +717,12 @@ fn wire_forward_button(
     let parent = parent.clone();
     button.connect_clicked(move |_| {
         let summary = entry.borrow().summary.clone();
-        let Some((_own_email, cmd_tx)) = crate::window::reply_send_context(&state, &summary) else {
+        if crate::window::reply_send_context(&state, &summary).is_none() {
             return;
-        };
+        }
         let body = entry.borrow().last_body.clone().or_else(|| state.borrow_mut().cached_body(&summary.mailbox, summary.uid));
         let Some(body) = body else { return };
-        let prefill = crate::compose::build_forward_prefill(&summary, &body);
-        let rich_text_default = state.borrow().rich_text_default();
-        crate::window::show_composer_in_reading_pane(
-            &state,
-            &worker,
-            &main_reading_stack,
-            "Forward",
-            cmd_tx,
-            prefill,
-            rich_text_default,
-            crate::window::mailbox_account_id(&summary.mailbox),
-            Some(crate::config_view::SignatureDefault::Reply),
-        );
+        crate::window::forward_message(&state, &worker, &main_reading_stack, &summary, &body);
         parent.present();
     });
 }

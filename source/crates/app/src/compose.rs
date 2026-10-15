@@ -101,9 +101,11 @@ pub struct ComposePrefill {
     pub body: Option<String>,
     /// The exact HTML body for the rich editor. Set when reopening a draft
     /// whose saved form was HTML (with `cid:` images already rewritten to
-    /// `data:` URIs - see `lookout_mail::body::parse_draft_prefill`). `None`
-    /// for every other prefill, where the rich editor derives its markup
-    /// from `body` via `text_to_html`.
+    /// `data:` URIs - see `lookout_mail::body::parse_draft_prefill`), and by
+    /// Forward when the original carried an HTML body (item 1.11 / C-13; the
+    /// forward launcher rewrites its `cid:` references too). `None` for every
+    /// other prefill, where the rich editor derives its markup from `body` via
+    /// `text_to_html`.
     pub html_body: Option<String>,
     /// The sending identity's address to preselect in the From dropdown,
     /// matched case-insensitively against the account's identities - a draft
@@ -251,26 +253,69 @@ pub fn build_reply_prefill(summary: &EmailSummary, body: &EmailBody, own_email: 
 
 /// Builds the Forward prefill: blank recipients (the user fills these in), a
 /// `Fwd: `-prefixed subject, and a forwarded-message header block followed
-/// by the original body verbatim. Unlike Reply, this starts a new,
-/// unthreaded conversation - no `in_reply_to`/`references` are set.
+/// by the original body. Unlike Reply, this starts a new, unthreaded
+/// conversation - no `in_reply_to`/`references` are set.
+///
+/// Two bodies are produced. `body` is the plain-text form (the send-time
+/// fallback and the source for the editor's plain mode). When the original
+/// carried an HTML body, `html_body` is set too - the same header block
+/// followed by the original HTML in a `<blockquote>`, so a rich original
+/// forwards with its formatting intact. Its inline `cid:` image references
+/// are left as-is here; the forward launcher (`window.rs`) fetches the
+/// referenced parts and rewrites them to `data:` URIs (see
+/// `lookout_mail::body::rewrite_cid_refs_with`) before the composer opens, so
+/// the images survive. Attachments are likewise filled in by the launcher
+/// after it fetches the original's parts (item 1.11 / C-13).
+///
+/// The forwarded header block names the original's own `From:`/`To:` even
+/// though a `Fwd:` message goes to new recipients.
 pub fn build_forward_prefill(summary: &EmailSummary, body: &EmailBody) -> ComposePrefill {
     let subject = summary.subject.as_deref().map(|s| with_prefix_once(s, "Fwd: ")).unwrap_or_else(|| "Fwd: ".to_string());
 
     let from = summary.from.iter().map(|a| a.display_label()).collect::<Vec<_>>().join(", ");
     let to = summary.to.iter().map(|a| a.display_label()).collect::<Vec<_>>().join(", ");
+    let date = summary.date.format("%a, %b %d, %Y at %I:%M %p").to_string();
+    let original_subject = summary.subject.as_deref().unwrap_or("");
     let original = body.text_body.as_deref().unwrap_or("");
-    let forward_body = format!(
-        "\n\n---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\nTo: {}\n\n{}",
-        from,
-        summary.date.format("%a, %b %d, %Y at %I:%M %p"),
-        summary.subject.as_deref().unwrap_or(""),
-        to,
-        original
-    );
+    let forward_body = format!("\n\n---------- Forwarded message ----------\nFrom: {from}\nDate: {date}\nSubject: {original_subject}\nTo: {to}\n\n{original}");
+
+    // The HTML companion forwards the original's HTML, not the plain text, so
+    // its formatting is preserved. The header block is the HTML rendering of
+    // the same fields.
+    let html_body = body.html_body.as_deref().map(|html| {
+        format!(
+            "<p><br></p><p>---------- Forwarded message ----------<br>From: {}<br>Date: {}<br>Subject: {}<br>To: {}</p><blockquote>{html}</blockquote>",
+            escape_html(&from),
+            escape_html(&date),
+            escape_html(original_subject),
+            escape_html(&to),
+        )
+    });
 
     ComposePrefill {
         subject: Some(subject),
         body: Some(forward_body),
+        html_body,
+        ..Default::default()
+    }
+}
+
+/// Builds the prefill for "Forward as attachment" (item 1.11 / C-13): a
+/// `Fwd: `-prefixed subject, an empty body (the user types above the
+/// attachment), and the whole original attached as a `message/rfc822` part
+/// named from its subject. Unlike [`build_forward_prefill`] nothing is quoted
+/// inline - the recipient opens the attached message to read it, which is
+/// exactly how Outlook's "Forward as attachment" behaves.
+pub fn build_forward_attachment_prefill(summary: &EmailSummary, raw: &[u8]) -> ComposePrefill {
+    let subject = summary.subject.as_deref().map(|s| with_prefix_once(s, "Fwd: ")).unwrap_or_else(|| "Fwd: ".to_string());
+    ComposePrefill {
+        subject: Some(subject),
+        body: Some("\n\n".to_string()),
+        attachments: vec![Attachment {
+            filename: crate::window::eml_suggested_name(summary),
+            content_type: "message/rfc822".to_string(),
+            bytes: raw.to_vec(),
+        }],
         ..Default::default()
     }
 }
@@ -2980,6 +3025,37 @@ mod tests {
         assert!(forward.references.is_empty());
         assert_eq!(forward.subject.as_deref(), Some("Fwd: Hello there"));
         assert!(forward.body.unwrap().contains("original text"));
+        assert!(forward.html_body.is_none(), "a plain-text-only original forwards with no HTML companion");
+    }
+
+    #[test]
+    fn forward_prefill_carries_the_original_html_with_its_cid_refs() {
+        let summary = sample_summary();
+        let mut body = sample_body(Vec::new(), Some("original text"));
+        body.html_body = Some("<p>Hi <img src=\"cid:logo@lookout\"></p>".to_string());
+        let forward = build_forward_prefill(&summary, &body);
+        let html = forward.html_body.expect("html companion");
+        assert!(html.contains("---------- Forwarded message ----------"), "header block present: {html}");
+        assert!(html.contains("blockquote"), "original HTML is quoted: {html}");
+        // The `cid:` reference survives verbatim so the launcher can resolve it
+        // to a `data:` URI once the inline part has been fetched.
+        assert!(html.contains("cid:logo@lookout"), "cid ref preserved for the launcher: {html}");
+        assert!(!html.contains("Fwd:"), "header names the original subject, not the Fwd: one: {html}");
+    }
+
+    #[test]
+    fn forward_as_attachment_prefill_attaches_the_raw_message() {
+        let summary = sample_summary();
+        let raw = b"From: ada@example.com\r\nSubject: Hi\r\n\r\nbody";
+        let forward = build_forward_attachment_prefill(&summary, raw);
+        assert_eq!(forward.subject.as_deref(), Some("Fwd: Hello there"));
+        assert_eq!(forward.attachments.len(), 1);
+        assert_eq!(forward.attachments[0].content_type, "message/rfc822");
+        assert_eq!(forward.attachments[0].filename, "Hello there.eml");
+        assert_eq!(forward.attachments[0].bytes, raw.to_vec());
+        // Nothing is quoted inline - the attachment carries the original.
+        assert!(forward.body.as_deref().unwrap_or("").trim().is_empty());
+        assert!(forward.html_body.is_none());
     }
 
     #[test]
