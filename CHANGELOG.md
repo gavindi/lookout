@@ -13,6 +13,10 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.201] - 2026-10-15
+**Reference**: Microsoft 365 — Graph calendar model mapping (Phase 5 groundwork, item 5.1 / A-03)
+**Summary**: Adds `crates/graph/src/calendar.rs` and touches `crates/graph/{Cargo.toml,src/lib.rs}`; no data-format change. A pure, unit-tested module translating Microsoft Graph's calendar JSON to and from `lookout-core`'s model: `calendar_from_graph` (id/name/colour), `event_from_graph` and `occurrence_from_graph` (subject, body, location, times, all-day, show-as, sensitivity, categories, reminder, attendees with roles/statuses, organizer, and a meeting's Teams join URL), plus `event_create_body`/`event_patch_body` for writes (attendees, `transactionId` on create only, `dateTimeTimeZone`). Graph's Windows time-zone names resolve through the shared `lookout_core::windows_to_iana`, an event's identity uses Graph's `iCalUId`, and `href`/`etag` carry the Graph id/`changeKey` for later updates. Recurrence round-tripping and Teams-link creation are deferred to their own items; `lookout-graph` gains `lookout-core`, `chrono` and `chrono-tz` dependencies. Covered by 13 new `calendar` tests.
+
 ## [v0.9.200] - 2026-10-15
 **Reference**: Microsoft 365 — Windows time-zone mapping moved to `lookout-core` (Phase 5 groundwork, item 5.1)
 **Summary**: Touches `crates/core/src/{lib,tzmap}.rs`, `crates/core/Cargo.toml` and `crates/dav/src/{lib,ical}.rs`; no data-format change. The CLDR Windows→IANA time-zone lookup (`windows_to_iana`, used to resolve Outlook/Exchange `TZID=W. Europe Standard Time` values) moves from `lookout-dav`'s private `tzmap` module into `lookout-core`, re-exported as `lookout_core::windows_to_iana` and consumed by `lookout-dav`'s iCalendar parser. Sharing it lets the forthcoming Microsoft Graph calendar backend resolve Graph `dateTimeTimeZone` values (which also use Windows names) without depending on `lookout-dav`; the table's tests move with it (`chrono-tz` becomes a dev-dependency of `lookout-core`).
