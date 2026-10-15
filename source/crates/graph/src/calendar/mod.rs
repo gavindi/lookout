@@ -27,6 +27,9 @@
 /// Software released under the GPL3 license
 pub mod client;
 pub mod recurrence;
+pub mod session;
+
+pub use client::CalendarClient;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use lookout_core::{
