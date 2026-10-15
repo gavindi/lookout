@@ -13,6 +13,10 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.211] - 2026-10-15
+**Reference**: Microsoft 365 — calendar polish and docs (Phase 5, item 20 / A-03)
+**Summary**: Touches `crates/graph/src/calendar/session.rs`, `crates/app/src/config_view.rs` and `OUTLOOK_PARITY.md`; no data-format change. A Microsoft 365 calendar session that discovers consent is missing or revoked now stops with a **non-retryable** connection state (which the app toasts) instead of retrying forever, with Config's "Sync with Outlook" reconnecting it after consent. The Config view's calendar row labels a Graph account's backend ("Microsoft 365") rather than implying a CalDAV URL, and the parity document's status marks and roadmap row are updated for the landed Graph calendar backend (A-03 now ✅, CAL-19 free/busy). Colour write-back needs no special-casing: the app reads a calendar's server colour but has no write-back path yet (Graph colours are read-only in v1.0). Covered by a new `calendar::session` test.
+
 ## [v0.9.210] - 2026-10-15
 **Reference**: Microsoft 365 — Graph free/busy (Phase 5, item 14 / CAL-19)
 **Summary**: Touches `crates/graph/src/calendar/{client,session}.rs`; no data-format change. `CalendarClient::get_schedule` calls `POST /me/calendar/getSchedule` and maps the answer onto `lookout_core`'s availability model: one `AttendeeAvailability` per requested attendee in order, each `scheduleItem` becoming a `FreeBusyInterval` with the five-state show-as, and an attendee Graph didn't resolve marked `unknown`, so the editor shows "no data" rather than "free". The Graph session now answers `FetchFreeBusy` with `FreeBusyUpdated` (previously a soft failure), so the event editor's Scheduling Assistant tab and Suggested times work for Microsoft 365 accounts as they already do for RFC 6638 CalDAV. Covered by a new `calendar::client` test.

@@ -143,7 +143,8 @@ pub struct MailAccountInfo {
 /// Plain display data for one calendar account.
 pub struct CalendarAccountInfo {
     pub display_name: String,
-    /// The account's CalDAV base URL.
+    /// The account's connection label: its CalDAV base URL, or "Microsoft 365"
+    /// for a Graph-backed account.
     pub uri: String,
 }
 

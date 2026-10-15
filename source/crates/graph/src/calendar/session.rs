@@ -62,6 +62,21 @@ pub async fn run_calendar_session(
                 return;
             }
             Err(e) => {
+                // A missing or revoked Graph consent can't fix itself by
+                // retrying, so surface it once as a non-retryable error (which
+                // the app toasts) and stop, rather than spinning forever.
+                // Config's "Sync with Outlook" reconnects the account once the
+                // user consents.
+                if matches!(e, GraphError::ConsentRequired(_)) {
+                    let _ = events
+                        .send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Error {
+                            message: e.to_string(),
+                            retryable: false,
+                        }))
+                        .await;
+                    let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                    return;
+                }
                 tracing::warn!("graph calendar session error, will reconnect: {e}");
                 let _ = events
                     .send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Error {
@@ -493,6 +508,45 @@ mod tests {
 
         cmd_tx.send(CalendarCommand::Shutdown).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn a_consent_error_stops_with_a_non_retryable_state() {
+        struct NoConsent;
+
+        #[async_trait]
+        impl TokenProvider for NoConsent {
+            async fn graph_token(&self) -> Result<String, GraphError> {
+                Err(GraphError::ConsentRequired("Calendars.ReadWrite".to_string()))
+            }
+            async fn ensure_scopes(&self, _scopes: &[&str]) -> Result<(), GraphError> {
+                Ok(())
+            }
+        }
+
+        // The token fetch fails before any request, so the bogus base URL is
+        // never reached.
+        let client = CalendarClient::new(GraphClient::with_base_url(Arc::new(NoConsent), "https://example.invalid/v1.0"));
+        let (_cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (evt_tx, evt_rx) = async_channel::unbounded();
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), client, cmd_rx, evt_tx));
+
+        let mut saw_non_retryable = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                Ok(Ok(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Error { retryable: false, .. }))) => {
+                    saw_non_retryable = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(saw_non_retryable, "a missing consent must surface as a non-retryable error");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), handle).await.is_ok(),
+            "the session should stop instead of retrying a consent error"
+        );
     }
 
     #[test]

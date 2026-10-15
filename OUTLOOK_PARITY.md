@@ -44,24 +44,24 @@ Counts are tallied from the §5 tables.
 |---|---|---|---|---|---|
 | Mail (5.1) | 27 | 6 | 11 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, and rules across client, Graph and Sieve backends). Missing Outlook's organising layer: Focused Inbox, Sweep, Quick Steps. No `.msg`. |
 | Compose (5.2) | 15 | 3 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
-| Calendar (5.3) | 23 | 8 | 4 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, or the organizer's own cache as a fallback) with Suggested times; Graph `getSchedule` and rooms wait on 5.1. |
+| Calendar (5.3) | 23 | 8 | 4 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, the organizer's own cache as a fallback, or Graph `getSchedule` for Microsoft 365, 5.1) with Suggested times; the editor's room suggestions from Graph `places` remain to be wired. |
 | People (5.4) | 9 | 1 | 2 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). No CSV or directory. |
 | Tasks (5.5) | 5 | 1 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
-| Accounts / Microsoft 365 (5.6) | 2 | 1 | 5 | 0 | Microsoft 365 is **mail only** (IMAP/SMTP). No Graph calendar, contacts, To Do, rules, auto-reply or categories. |
+| Accounts / Microsoft 365 (5.6) | 3 | 1 | 4 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar is now native via Graph** (5.1). No Graph contacts, To Do, auto-reply or Focused Inbox yet. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **91** | **24** | **37** | **5** | ~58% at parity, ~15% partial |
+| **Total** | **92** | **24** | **36** | **5** | ~59% at parity, ~15% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
-1. **Microsoft 365 calendar, contacts and To Do** (A-03…A-05). Accounts users "add from Outlook" show no calendar.
+1. **Microsoft 365 contacts and To Do** (A-04, A-05). The Microsoft 365 **calendar** is now native (5.1); contacts and To Do still wait on Graph.
 2. ✅ ~~**Sending meeting invitations as organizer** (CAL-14) - done: client iMIP REQUEST/update/CANCEL, or RFC 6638 server scheduling.~~
 3. ✅ ~~**Rules** (M-14) — done across client, Microsoft 365 (Graph) and Sieve backends (2.5).~~
 4. **Undo send and undo actions** (M-21, C-09).
 5. **Spell check** (C-02). WebKit can do this; it's switched off.
 6. **Flags with due dates / follow-up**, and **importance** (M-10, M-12, C-05).
 7. **Calendar preferences**: week start, working hours, time zones (CAL-08…CAL-11).
-8. **Scheduling Assistant / free/busy** (CAL-19) — CalDAV RFC 6638 and a local fallback landed with 3.8; Graph `getSchedule` and room finding remain.
+8. **Scheduling Assistant / free/busy** (CAL-19) — CalDAV RFC 6638 and a local fallback landed with 3.8, and Graph `getSchedule` with 5.1; room suggestions from Graph `places` remain to be wired into the editor.
 9. **Reopen drafts; forward with attachments** (C-12, C-13).
 10. **Automatic replies (Out of Office)** (M-24).
 
@@ -330,7 +330,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | CAL-16 | Response tracking | An opened REPLY merges its `PARTSTAT`s onto the stored organizer event and PUTs it (skipped when the server owns scheduling; deduped per message); the event editor has a Tracking view with per-attendee status, roles and counts (3.6) | ✅ | — |
 | CAL-17 | Propose new time | The invite card's **Propose new time…** dialog (date plus start/end times, valid span required) sends an iTIP `COUNTER` to the organizer, hidden when the invitation carries `X-MICROSOFT-DISALLOW-COUNTER:TRUE`; a counter message's card offers **Accept proposal** (applies the time, `SEQUENCE++`, PUTs, and re-sends the update to all attendees) and **Decline proposal** (`DECLINECOUNTER` with the original times) (3.7) | ✅ | — |
 | CAL-18 | Forward meeting | **Forward** on the invite card and in the event editor for a meeting someone else organizes: a recipient dialog whose REQUEST carries the new recipients on the attendee list, plus a plain "Your meeting was forwarded" notification to the organizer; the local copy is untouched (3.7) | ✅ | — |
-| CAL-19 | Scheduling Assistant / free/busy / room finder | Event editor **Scheduling** tab: attendee rows × a reusable horizontal time grid (also the shape CAL-03 wants), fed by an RFC 6638 `VFREEBUSY` POST to the account's schedule-outbox; the organizer's own row comes from the cached calendars, and **Suggested times** scans the fetched availability across working hours (the whole day is queried). Where the server doesn't schedule, the tab still shows the organizer and flags attendees as unknown | 🟡 | Graph `getSchedule` (5.1); rooms via Graph `places` |
+| CAL-19 | Scheduling Assistant / free/busy / room finder | Event editor **Scheduling** tab: attendee rows × a reusable horizontal time grid (also the shape CAL-03 wants), fed by an RFC 6638 `VFREEBUSY` POST to the account's schedule-outbox; the organizer's own row comes from the cached calendars, and **Suggested times** scans the fetched availability across working hours (the whole day is queried). Where the server doesn't schedule, the tab still shows the organizer and flags attendees as unknown | 🟡 | Graph `getSchedule` landed (5.1); the editor's room suggestions from Graph `places` remain |
 | CAL-20 | Teams / online meeting | `interop/onlinemeeting` classifies Teams/Zoom/Meet/Webex/Jitsi link hosts and detects the join URL from `CONFERENCE`, `URL`, the `X-MICROSOFT-SKYPE`/`-ONLINEMEETING` properties or the description; the invite card, reminder notification and Month-view peek each offer a provider-labelled **Join** button, and the editor's video-call row names the provider (3.17) | 🟡 | Teams-link creation / Graph `isOnlineMeeting` toggle (5.1) |
 | CAL-21 | Event attachments | — | ❌ | RFC 8607 / Graph |
 | CAL-22 | Event search | Calendar "Filter" button disabled | ❌ | Search over `dav` cache |
@@ -388,7 +388,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 |---|---|---|---|---|
 | A-01 | Accounts from GOA | `goa/src/discovery.rs` (skips accounts without IMAP/SMTP) | ✅ | — |
 | A-02 | Manual IMAP/SMTP | `app/src/other_accounts.rs` | ✅ | OAuth for manual Gmail/Microsoft 365 |
-| A-03 | Microsoft 365 calendar | — | ❌ | Graph backend |
+| A-03 | Microsoft 365 calendar | `lookout-graph`'s `calendar::session` actor (`calendarView` month sync, event CRUD, RRULE/Teams/RSVP/free-busy mapping) drives a Microsoft 365 account through the same contract as CalDAV; Graph access is opted into from Config (5.1) | ✅ | — |
 | A-04 | Microsoft 365 contacts | — | ❌ | Graph backend |
 | A-05 | Microsoft To Do | — | ❌ | Graph backend |
 | A-06 | Microsoft 365 mail | IMAP/SMTP with Lookout's own XOAUTH2 (`microsoft_oauth.rs`) | 🟡 | Graph-only mail features (categories, flags, Focused, rules, OOF) |
@@ -690,7 +690,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
-| 5.1 | Graph calendar backend | A-03, CAL-14…19 | `graph::CalendarSession` implementing the same command/event contract as `dav::CalendarSession`; delta sync of `calendarView`; invites/RSVP/proposals/free-busy/Teams natively (server sends iTIP) | L |
+| 5.1 | ✅ ~~Graph calendar backend~~ | A-03, CAL-14…19 | `lookout_graph::calendar::{client,session}` implements the same command/event contract as `lookout-dav`: `calendarView` month sync, event create/update/delete, and the RRULE/Teams/RSVP/free-busy/rooms mappings; Microsoft 365 accounts connect to it and Graph schedules iTIP itself. Follow-ups: the editor's room suggestions, the Graph COUNTER write, and the editor's Teams toggle | L |
 | 5.2 | Graph contacts backend | A-04, P-11 | `contactFolders` plus delta; GAL search; photos | M |
 | 5.3 | Microsoft To Do backend | A-05, T-12 | Lists/tasks/checklistItems/linkedResources; flagged-email list maps to M-10 | M |
 | 5.4 | Mail property sync | A-06, M-09, M-10, M-12, M-03 | Per-message Graph lookup by `internetMessageId` (cache the IMAP UID ↔ Graph ID map); sync categories, followupFlag, importance, inferenceClassification both ways; extends today's `graph_pin.rs` approach | L |
