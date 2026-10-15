@@ -752,14 +752,48 @@ pub fn show_create_contact_for(
     );
 }
 
-/// "Import…" for the People screen: pick a `.vcf` file, then route every
-/// card in it to a chosen address book. Deduplication is per the accepted
-/// policy: a card whose `UID` matches an existing contact in the target
-/// *account* updates that contact in place (its server href/etag are kept,
-/// so the write is guarded like an edit); a card without a matching UID but
-/// with an email the account already has is skipped and counted; anything
-/// else is created. One summary toast reports the three counts when every
-/// write has answered.
+/// The contact-file formats the People screen reads and writes (P-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactFileFormat {
+    /// A multi-card `.vcf` file.
+    VCard,
+    /// Outlook's "Comma Separated Values (Windows)" export
+    /// ([`lookout_core::interop::contacts_csv`]).
+    OutlookCsv,
+}
+
+/// The format implied by a chosen file's extension: `.csv` (any case) is
+/// Outlook CSV, everything else goes through the vCard path - the same split
+/// the import chooser's filter offers.
+fn contact_file_format_for_path(path: &std::path::Path) -> ContactFileFormat {
+    if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("csv")) {
+        ContactFileFormat::OutlookCsv
+    } else {
+        ContactFileFormat::VCard
+    }
+}
+
+/// The cards a chosen file holds, one `Result` per source entry so the
+/// import loop can count a malformed card as skipped. The CSV reader is
+/// all-or-nothing on the header; individual bad cells degrade inside a card
+/// instead (see `contacts_csv`).
+fn contact_cards(format: ContactFileFormat, text: &str) -> Vec<Result<VCard, ()>> {
+    match format {
+        ContactFileFormat::VCard => lookout_core::VCard::parse_all(text).into_iter().map(|card| card.map_err(|_| ())).collect(),
+        ContactFileFormat::OutlookCsv => lookout_core::interop::contacts_csv::parse(text)
+            .map(|cards| cards.into_iter().map(Ok).collect())
+            .unwrap_or_default(),
+    }
+}
+
+/// "Import…" for the People screen: pick a `.vcf` or Outlook CSV file, then
+/// route every contact in it to a chosen address book (the format follows
+/// the file's extension). Deduplication is per the accepted policy: a card
+/// whose `UID` matches an existing contact in the target *account* updates
+/// that contact in place (its server href/etag are kept, so the write is
+/// guarded like an edit); a card without a matching UID but with an email
+/// the account already has is skipped and counted; anything else is created.
+/// One summary toast reports the three counts when every write has answered.
 pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay) {
     // Target books: every writable address book across every connected
     // account, labelled "account · book" like the event editor's calendar
@@ -784,7 +818,7 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
 
     let choose_button = gtk::Button::with_label("Choose file…");
     let file_label = gtk::Label::builder().label("No file chosen").xalign(0.0).css_classes(["dim-label"]).build();
-    let chosen_vcf: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let chosen_file: Rc<RefCell<Option<(ContactFileFormat, String)>>> = Rc::new(RefCell::new(None));
 
     let file_group = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -818,31 +852,39 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
 
     {
         let window = window.clone();
-        let chosen_vcf = chosen_vcf.clone();
+        let chosen_file = chosen_file.clone();
         let file_label = file_label.clone();
         let import_button = import_button.clone();
         choose_button.connect_clicked(move |_| {
             let window = window.clone();
-            let chosen_vcf = chosen_vcf.clone();
+            let chosen_file = chosen_file.clone();
             let file_label = file_label.clone();
             let import_button = import_button.clone();
             glib::spawn_future_local(async move {
                 let filter = gtk::FileFilter::new();
                 filter.add_suffix("vcf");
                 filter.add_suffix("vcard");
-                filter.set_name(Some("vCard files (*.vcf, *.vcard)"));
+                filter.add_suffix("csv");
+                filter.set_name(Some("Contact files (*.vcf, *.vcard, *.csv)"));
                 let filters = gio::ListStore::new::<gtk::FileFilter>();
                 filters.append(&filter);
-                let picker = gtk::FileDialog::builder().title("Choose a vCard file").filters(&filters).build();
+                let picker = gtk::FileDialog::builder().title("Choose a contact file").filters(&filters).build();
                 let Ok(file) = picker.open_future(Some(&window)).await else { return };
                 let Some(path) = file.path() else { return };
                 let Ok(raw) = std::fs::read(&path) else { return };
                 let text = String::from_utf8_lossy(&raw).into_owned();
-                if lookout_core::VCard::parse_all(&text).is_empty() {
-                    file_label.set_label("No vCards found in this file.");
+                let format = contact_file_format_for_path(&path);
+                let card_count = match format {
+                    ContactFileFormat::VCard => lookout_core::VCard::parse_all(&text).len(),
+                    ContactFileFormat::OutlookCsv => lookout_core::interop::contacts_csv::parse(&text).map(|cards| cards.len()).unwrap_or(0),
+                };
+                if card_count == 0 {
+                    *chosen_file.borrow_mut() = None;
+                    file_label.set_label("No contacts found in this file.");
+                    import_button.set_sensitive(false);
                     return;
                 }
-                *chosen_vcf.borrow_mut() = Some(text);
+                *chosen_file.borrow_mut() = Some((format, text));
                 file_label.set_label(&path.display().to_string());
                 import_button.set_sensitive(true);
             });
@@ -858,11 +900,11 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
         let dialog = dialog.clone();
         let state = state.clone();
         let toast_overlay = toast_overlay.clone();
-        let chosen_vcf = chosen_vcf.clone();
+        let chosen_file = chosen_file.clone();
         let books = books.clone();
         let book_dropdown = book_dropdown.clone();
         import_button.connect_clicked(move |_| {
-            let Some(text) = chosen_vcf.borrow().clone() else { return };
+            let Some((format, text)) = chosen_file.borrow().clone() else { return };
             let Some((account_id, book_href, _)) = books.get(book_dropdown.selected() as usize).cloned() else {
                 return;
             };
@@ -895,7 +937,7 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
             let mut updated = 0usize;
             let mut skipped = 0usize;
             let mut replies = Vec::new();
-            for result in lookout_core::VCard::parse_all(&text) {
+            for result in contact_cards(format, &text) {
                 let Ok(mut card) = result else {
                     skipped += 1;
                     continue;
@@ -973,8 +1015,9 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
 
 /// "Export…" for the People screen: saves every contact in the currently
 /// selected bucket as one multi-card `.vcf` file (the same file shape
-/// `parse_all` imports).
-pub fn export_current_contacts(window: &adw::ApplicationWindow, entries: &Rc<RefCell<Vec<ContactsListEntry>>>, toast_overlay: &adw::ToastOverlay) {
+/// `parse_all` imports), or as an Outlook CSV file (P-08, §4.6), per
+/// `format`.
+pub fn export_current_contacts(window: &adw::ApplicationWindow, format: ContactFileFormat, entries: &Rc<RefCell<Vec<ContactsListEntry>>>, toast_overlay: &adw::ToastOverlay) {
     let cards: Vec<VCard> = entries.borrow().iter().map(|entry| entry.card.clone()).collect();
     if cards.is_empty() {
         toast_overlay.add_toast(adw::Toast::new("Nothing to export in this category."));
@@ -984,18 +1027,34 @@ pub fn export_current_contacts(window: &adw::ApplicationWindow, entries: &Rc<Ref
     let toast_overlay = toast_overlay.clone();
     glib::spawn_future_local(async move {
         let filter = gtk::FileFilter::new();
-        filter.add_suffix("vcf");
-        filter.set_name(Some("vCard files (*.vcf)"));
+        let (filter_name, initial_name) = match format {
+            ContactFileFormat::VCard => {
+                filter.add_suffix("vcf");
+                ("vCard files (*.vcf)", "contacts.vcf")
+            }
+            ContactFileFormat::OutlookCsv => {
+                filter.add_suffix("csv");
+                ("Outlook CSV files (*.csv)", "contacts.csv")
+            }
+        };
+        filter.set_name(Some(filter_name));
         let filters = gio::ListStore::new::<gtk::FileFilter>();
         filters.append(&filter);
-        let dialog = gtk::FileDialog::builder().title("Export contacts").filters(&filters).initial_name("contacts.vcf").build();
+        let dialog = gtk::FileDialog::builder().title("Export contacts").filters(&filters).initial_name(initial_name).build();
         let Ok(file) = dialog.save_future(Some(&window)).await else { return };
         let Some(path) = file.path() else { return };
-        let mut body = String::new();
-        for card in &cards {
-            body.push_str(&card.serialize());
-            body.push_str("\r\n");
-        }
+        let body = match format {
+            ContactFileFormat::VCard => {
+                let mut body = String::new();
+                for card in &cards {
+                    body.push_str(&card.serialize());
+                    body.push_str("\r\n");
+                }
+                body
+            }
+            // Excel trusts a UTF-8 BOM, and Outlook writes one.
+            ContactFileFormat::OutlookCsv => format!("\u{feff}{}", lookout_core::interop::contacts_csv::export(&cards)),
+        };
         match std::fs::write(&path, body) {
             Ok(()) => toast_overlay.add_toast(adw::Toast::new(&format!("Exported {} contact(s)", cards.len()))),
             Err(e) => toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't export contacts: {e}")))),
@@ -2289,5 +2348,32 @@ mod tests {
         assert!(contact_list_matches_prefix(&list, "brid"));
         assert!(contact_list_matches_prefix(&list, "Bridge"));
         assert!(!contact_list_matches_prefix(&list, "crew"));
+    }
+
+    #[test]
+    fn contact_file_format_follows_the_extension() {
+        use std::path::Path;
+        assert_eq!(contact_file_format_for_path(Path::new("/tmp/contacts.csv")), ContactFileFormat::OutlookCsv);
+        assert_eq!(contact_file_format_for_path(Path::new("/tmp/CONTACTS.CSV")), ContactFileFormat::OutlookCsv);
+        assert_eq!(contact_file_format_for_path(Path::new("/tmp/contacts.vcf")), ContactFileFormat::VCard);
+        assert_eq!(contact_file_format_for_path(Path::new("/tmp/contacts.vcard")), ContactFileFormat::VCard);
+        assert_eq!(contact_file_format_for_path(Path::new("/tmp/contacts")), ContactFileFormat::VCard);
+    }
+
+    #[test]
+    fn contact_cards_reads_both_formats() {
+        let vcf = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Grace Hopper\r\nEND:VCARD\r\n";
+        let vcards = contact_cards(ContactFileFormat::VCard, vcf);
+        assert_eq!(vcards.len(), 1);
+        assert_eq!(vcards[0].as_ref().unwrap().full_name.as_deref(), Some("Grace Hopper"));
+
+        let csv = "First Name,Last Name,E-mail Address\r\nGrace,Hopper,grace@example.com\r\n";
+        let csv_cards = contact_cards(ContactFileFormat::OutlookCsv, csv);
+        assert_eq!(csv_cards.len(), 1);
+        assert_eq!(csv_cards[0].as_ref().unwrap().emails[0].address, "grace@example.com");
+
+        // A file with no recognisable header yields no cards for either path.
+        assert!(contact_cards(ContactFileFormat::OutlookCsv, "Name,Phone\r\nGrace,1\r\n").is_empty());
+        assert!(contact_cards(ContactFileFormat::VCard, "not a card").is_empty());
     }
 }

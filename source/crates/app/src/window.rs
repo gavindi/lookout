@@ -26,8 +26,8 @@ use crate::calendar_view::{self, CalendarMain};
 use crate::contacts_view::{
     calendar_attendee_suggestions, contact_identity, delete_contact_entries, export_current_contacts, find_contact_by_address, merge_contact_suggestions, rebuild_contacts_list_ui,
     refresh_contacts_category_ui, show_contact_details_dialog, show_contact_editor_for, show_contacts_import_dialog, show_create_contact_for, show_manage_groups_dialog,
-    show_new_contact_editor, spawn_contacts_discovery, sync_contacts_account, ContactCommand, ContactsAccountSnapshot, ContactsCategoryChoice, ContactsListEntry,
-    SnapshotContactsProvider,
+    show_new_contact_editor, spawn_contacts_discovery, sync_contacts_account, ContactCommand, ContactFileFormat, ContactsAccountSnapshot, ContactsCategoryChoice,
+    ContactsListEntry, SnapshotContactsProvider,
 };
 use crate::folder_tree::{build_multi_account_tree_model, TreeItem};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
@@ -5797,7 +5797,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_command_toolbar.append(&contacts_delete_button);
     let import_contacts_button = gtk::Button::with_label("Import…");
     contacts_command_toolbar.append(&import_contacts_button);
-    let export_contacts_button = gtk::Button::with_label("Export…");
+    // Export is a split menu button (UX-16's split-button pattern): each
+    // entry opens the save dialog in its format - the multi-card vCard, or
+    // Outlook's CSV columns (P-08, §4.6).
+    let export_contacts_menu = gio::Menu::new();
+    export_contacts_menu.append(Some("vCard (.vcf)…"), Some("contacts-export.vcard"));
+    export_contacts_menu.append(Some("Outlook CSV (.csv)…"), Some("contacts-export.csv"));
+    let export_contacts_popover = gtk::PopoverMenu::from_model(Some(&export_contacts_menu));
+    let export_contacts_button = gtk::MenuButton::builder()
+        .label("Export")
+        .tooltip_text("Export contacts")
+        .popover(&export_contacts_popover)
+        .build();
     contacts_command_toolbar.append(&export_contacts_button);
     let manage_groups_button = gtk::Button::with_label("Manage groups…");
     contacts_command_toolbar.append(&manage_groups_button);
@@ -8225,12 +8236,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     {
-        let window = window.clone();
-        let contacts_entries = contacts_entries.clone();
-        let toast_overlay = toast_overlay.clone();
-        export_contacts_button.connect_clicked(move |_| {
-            export_current_contacts(&window, &contacts_entries, &toast_overlay);
-        });
+        // The Export menu's two actions. They live in a group inserted on
+        // the menu button so the popover items resolve `contacts-export.*`
+        // without touching the window's action namespace.
+        let actions = gio::SimpleActionGroup::new();
+        let export_vcard = gio::SimpleAction::new("vcard", None);
+        {
+            let window = window.clone();
+            let contacts_entries = contacts_entries.clone();
+            let toast_overlay = toast_overlay.clone();
+            export_vcard.connect_activate(move |_, _| {
+                export_current_contacts(&window, ContactFileFormat::VCard, &contacts_entries, &toast_overlay);
+            });
+        }
+        let export_csv = gio::SimpleAction::new("csv", None);
+        {
+            let window = window.clone();
+            let contacts_entries = contacts_entries.clone();
+            let toast_overlay = toast_overlay.clone();
+            export_csv.connect_activate(move |_, _| {
+                export_current_contacts(&window, ContactFileFormat::OutlookCsv, &contacts_entries, &toast_overlay);
+            });
+        }
+        actions.add_action(&export_vcard);
+        actions.add_action(&export_csv);
+        export_contacts_button.insert_action_group("contacts-export", Some(&actions));
     }
 
     // --- Config view: opened from the header bar's Settings button as a

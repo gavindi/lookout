@@ -7,6 +7,8 @@
 //! Graph enum values: it calls into these modules instead, so a mapping only
 //! ever lives in one place.
 //!
+//! - [`contacts_csv`] — Outlook's "Comma Separated Values" contact file
+//!   (§4.6, P-08).
 //! - [`headers`] — message importance and sensitivity (§4.1).
 //! - [`cdo`] — the `X-MICROSOFT-CDO-*` calendar properties (§4.3).
 //! - [`categories`] — Outlook's 25 category colour presets (§4.4, UX-85).
@@ -25,6 +27,7 @@
 /// Software released under the GPL3 license
 pub mod categories;
 pub mod cdo;
+pub mod contacts_csv;
 pub mod flags;
 pub mod headers;
 pub mod junk;
@@ -35,6 +38,7 @@ pub mod tnef;
 
 pub use categories::{graph_preset, nearest_preset_for_rgb, preset_by_graph, preset_by_index, preset_by_name, CategoryPreset, OUTLOOK_CATEGORY_PRESETS};
 pub use cdo::{disallow_counter, BusyStatus};
+pub use contacts_csv::{ContactsCsvError, OUTLOOK_CSV_COLUMNS};
 pub use flags::{
     flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers, follow_up_keywords,
     is_flag_keyword, FlagStatus, FollowUpFlag, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD,

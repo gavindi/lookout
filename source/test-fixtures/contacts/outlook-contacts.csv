@@ -1,0 +1,12 @@
+﻿First Name,Middle Name,Last Name,Title,Suffix,Initials,Web Page,Gender,Birthday,Anniversary,Location,Language,Internet Free Busy,Notes,Primary Phone,Home Phone,Home Phone 2,Mobile Phone,Pager,Home Fax,Home Street,Home Street 2,Home Street 3,Home City,Home State,Home Postal Code,Home Country/Region,Home Address,Business Phone,Business Phone 2,Business Fax,Assistant's Phone,Company Main Phone,Business Street,Business Street 2,Business Street 3,Business City,Business State,Business Postal Code,Business Country/Region,Business Address,Other Phone,Other Fax,Other Street,Other Street 2,Other Street 3,Other City,Other State,Other Postal Code,Other Country/Region,Other Address,Callback Phone,Car Phone,ISDN,Radio Phone,TTY/TDD Phone,Telex,Assistant's Name,Manager's Name,Company,Job Title,Office Location,Organizational ID Number,Profession,Account,Business Home Page,Spouse,Children,E-mail Address,E-mail Type,E-mail Display Name,E-mail 2 Address,E-mail 2 Type,E-mail 2 Display Name,E-mail 3 Address,E-mail 3 Type,E-mail 3 Display Name,User 1,User 1 Value,User 2,User 2 Value,User 3,User 3 Value,User 4,User 4 Value,Categories
+Ada,,Lovelace,Ms,,AL,https://ada.example.com,Female,12/10/1815,1835-07-08,London,,,"Mathematician, first programmer.
+Wrote the Notes.",+15550100,,,+15550101,,+15550102,12 Difference St,,,London,,EC1A 1BB,United Kingdom,"12 Difference St
+London
+EC1A 1BB
+United Kingdom",+442071234567,+442071234568,+442071234569,+442071234570,+442071234571,1 Engine Way,,,London,,SW1A 1AA,United Kingdom,"1 Engine Way
+London
+SW1A 1AA
+United Kingdom",,,,,,,,,,,+15550103,+15550104,+15550105,+15550106,+15550107,+15550108,Mary Somerville,Charles Babbage,Analytical Engines Ltd,Mathematician,Studio 1,AE-1,Mathematician,Analytical Engines,https://engines.example.com,William King,Byron King,ada@example.com,SMTP,Ada Lovelace,ada.lovelace@example.net,SMTP,,,,,,,,,,,,,"Colleagues,History"
+,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+Grace,,Hopper,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,grace@example.com,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,"Hardware, support",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,Acme Helpdesk,,,,,,,,,support@acme.example,,,,,,,,,,,,,,,,,
