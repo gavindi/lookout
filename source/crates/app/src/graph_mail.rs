@@ -22,8 +22,9 @@
 /// Software released under the GPL3 license
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use lookout_core::{AccountId, EmailAddress, FollowUpFlag, Importance, InferenceClassification};
-use lookout_graph::{GraphClient, GraphError, InferenceOverride, MailClient, MessageDelta};
+use lookout_graph::{GraphClient, GraphError, InferenceOverride, MailClient, MessageDelta, OutgoingAttachment, OutgoingMessage};
 
 use crate::microsoft_oauth::MicrosoftOAuth;
 
@@ -93,5 +94,60 @@ impl GraphMailClient {
     /// Deletes a sender override by id ("stop moving").
     pub async fn delete_override(&self, override_id: &str) -> Result<(), GraphError> {
         self.mail.delete_override(override_id).await
+    }
+
+    /// Sends `message` through Graph's `sendMail` with `PidTagDeferredSendTime`
+    /// set to `at` (item 5.5 / C-08), so Exchange holds it in Drafts and sends
+    /// it - even if Lookout has closed.
+    pub async fn send_scheduled(&self, message: &lookout_mail::ComposedMessage, at: DateTime<Utc>) -> Result<(), GraphError> {
+        self.mail.send_scheduled(&outgoing_message(message), Some(at)).await
+    }
+}
+
+/// Maps a composed message to Graph's `sendMail` shape (item 5.5). `From` is
+/// left to Graph (the signed-in mailbox), so a scheduled send goes out as the
+/// account's own address - a sending identity is not carried here.
+fn outgoing_message(message: &lookout_mail::ComposedMessage) -> OutgoingMessage {
+    let recipients = |list: &[String]| list.iter().map(|address| EmailAddress::new(address.clone())).collect::<Vec<_>>();
+    OutgoingMessage {
+        subject: message.subject.clone(),
+        text_body: message.text_body.clone(),
+        html_body: message.html_body.clone(),
+        importance: message.importance,
+        to: recipients(&message.to),
+        cc: recipients(&message.cc),
+        bcc: recipients(&message.bcc),
+        reply_to: message.reply_to.clone(),
+        attachments: message
+            .attachments
+            .iter()
+            .map(|attachment| OutgoingAttachment {
+                name: attachment.filename.clone(),
+                content_type: attachment.content_type.clone(),
+                content_id: None,
+                data: attachment.bytes.clone(),
+            })
+            .collect(),
+        inline_images: message
+            .inline_images
+            .iter()
+            .map(|image| OutgoingAttachment {
+                name: inline_name(&image.cid),
+                content_type: image.content_type.clone(),
+                content_id: Some(image.cid.clone()),
+                data: image.bytes.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// A display name for an inline image, from its `Content-ID` (Graph wants a
+/// `name` for every attachment).
+fn inline_name(cid: &str) -> String {
+    let trimmed = cid.trim().trim_start_matches('<').trim_end_matches('>');
+    if trimmed.is_empty() {
+        "inline-image".to_string()
+    } else {
+        trimmed.to_string()
     }
 }

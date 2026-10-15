@@ -35,7 +35,7 @@ pub mod client;
 
 pub use client::MailClient;
 
-use chrono::{DateTime, Duration, NaiveDateTime, Offset, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Offset, SecondsFormat, TimeZone, Utc};
 use lookout_core::{EmailAddress, FlagStatus, FollowUpFlag, Importance};
 use serde_json::{json, Value};
 
@@ -247,6 +247,97 @@ fn string_array(value: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One message to send through Graph's `sendMail` (item 5.5 / C-08). The app
+/// builds it from its composed message, so the Graph vocabulary stays here
+/// (§10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingMessage {
+    pub subject: String,
+    pub text_body: String,
+    pub html_body: Option<String>,
+    pub importance: Importance,
+    pub to: Vec<EmailAddress>,
+    pub cc: Vec<EmailAddress>,
+    pub bcc: Vec<EmailAddress>,
+    pub reply_to: Vec<String>,
+    pub attachments: Vec<OutgoingAttachment>,
+    /// Inline, `cid:`-referenced images (`content_id` set).
+    pub inline_images: Vec<OutgoingAttachment>,
+}
+
+/// One attachment or inline image on an [`OutgoingMessage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    pub name: String,
+    pub content_type: String,
+    /// The `Content-ID` an inline image's `cid:` reference resolves to.
+    pub content_id: Option<String>,
+    pub data: Vec<u8>,
+}
+
+/// A Graph `recipient` from an address (with its optional display name).
+fn recipient(address: &EmailAddress) -> Value {
+    let mut email = json!({ "address": address.address });
+    if let Some(name) = address.name.as_deref().filter(|name| !name.trim().is_empty()) {
+        email["name"] = json!(name.trim());
+    }
+    json!({ "emailAddress": email })
+}
+
+/// A Graph `fileAttachment` from an [`OutgoingAttachment`] (base64
+/// `contentBytes`; an inline image also carries `contentId`/`isInline`).
+fn attachment_body(attachment: &OutgoingAttachment) -> Value {
+    use base64::Engine as _;
+    let mut body = json!({
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": attachment.name,
+        "contentType": attachment.content_type,
+        "contentBytes": base64::engine::general_purpose::STANDARD.encode(&attachment.data),
+    });
+    if let Some(content_id) = &attachment.content_id {
+        body["contentId"] = json!(content_id);
+        body["isInline"] = json!(true);
+    }
+    body
+}
+
+/// The `message` JSON for Graph's `sendMail` (item 5.5). `deferred_send_at`
+/// adds the `PidTagDeferredSendTime` extended property (`SystemTime 0x3FEF`),
+/// so Exchange leaves the message in Drafts until then and sends it - even if
+/// Lookout has closed.
+pub fn outgoing_message_body(message: &OutgoingMessage, deferred_send_at: Option<DateTime<Utc>>) -> Value {
+    let body_content = match &message.html_body {
+        Some(html) => json!({ "contentType": "html", "content": html }),
+        None => json!({ "contentType": "text", "content": message.text_body }),
+    };
+    let mut body = json!({
+        "subject": message.subject,
+        "importance": message.importance.as_graph_str(),
+        "body": body_content,
+        "toRecipients": message.to.iter().map(recipient).collect::<Vec<_>>(),
+    });
+    if !message.cc.is_empty() {
+        body["ccRecipients"] = json!(message.cc.iter().map(recipient).collect::<Vec<_>>());
+    }
+    if !message.bcc.is_empty() {
+        body["bccRecipients"] = json!(message.bcc.iter().map(recipient).collect::<Vec<_>>());
+    }
+    if !message.reply_to.is_empty() {
+        body["replyTo"] = json!(message.reply_to.iter().map(|address| json!({ "emailAddress": { "address": address } })).collect::<Vec<_>>());
+    }
+    let mut attachments: Vec<Value> = message.attachments.iter().map(attachment_body).collect();
+    attachments.extend(message.inline_images.iter().map(attachment_body));
+    if !attachments.is_empty() {
+        body["attachments"] = json!(attachments);
+    }
+    if let Some(at) = deferred_send_at {
+        body["singleValueExtendedProperties"] = json!([
+            { "id": "SystemTime 0x3FEF", "value": at.to_rfc3339_opts(SecondsFormat::Secs, true) }
+        ]);
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +484,59 @@ mod tests {
         assert!(override_from_graph(&json!({ "id": "x", "classifyAs": "other", "senderEmailAddress": { "address": "a@b" } })).is_some());
         assert!(override_from_graph(&json!({ "id": "x", "classifyAs": "other" })).is_none());
         assert!(override_from_graph(&json!({ "classifyAs": "other", "senderEmailAddress": { "address": "a@b" } })).is_none());
+    }
+
+    #[test]
+    fn outgoing_message_body_carries_recipients_body_and_deferred_time() {
+        let message = OutgoingMessage {
+            subject: "Delayed".to_string(),
+            text_body: "hi".to_string(),
+            html_body: Some("<p>hi</p>".to_string()),
+            importance: Importance::High,
+            to: vec![EmailAddress {
+                name: Some("Ada".to_string()),
+                address: "ada@example.com".to_string(),
+            }],
+            cc: vec![EmailAddress::new("cc@example.com")],
+            bcc: Vec::new(),
+            reply_to: vec!["reply@example.com".to_string()],
+            attachments: vec![OutgoingAttachment {
+                name: "a.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                content_id: None,
+                data: b"hello".to_vec(),
+            }],
+            inline_images: vec![OutgoingAttachment {
+                name: "img".to_string(),
+                content_type: "image/png".to_string(),
+                content_id: Some("img1".to_string()),
+                data: vec![0x89, b'P', b'N', b'G'],
+            }],
+        };
+        let deferred = "2026-10-17T08:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let body = outgoing_message_body(&message, Some(deferred));
+        assert_eq!(body["subject"], "Delayed");
+        assert_eq!(body["importance"], "high");
+        assert_eq!(body["body"]["contentType"], "html");
+        assert_eq!(body["body"]["content"], "<p>hi</p>");
+        assert_eq!(body["toRecipients"][0]["emailAddress"]["address"], "ada@example.com");
+        assert_eq!(body["toRecipients"][0]["emailAddress"]["name"], "Ada");
+        assert_eq!(body["ccRecipients"][0]["emailAddress"]["address"], "cc@example.com");
+        assert!(body.get("bccRecipients").is_none());
+        assert_eq!(body["replyTo"][0]["emailAddress"]["address"], "reply@example.com");
+        assert_eq!(body["attachments"].as_array().unwrap().len(), 2);
+        assert_eq!(body["attachments"][0]["name"], "a.txt");
+        assert_eq!(body["attachments"][0]["contentBytes"], "aGVsbG8=");
+        assert_eq!(body["attachments"][1]["contentId"], "img1");
+        assert_eq!(body["attachments"][1]["isInline"], true);
+        assert_eq!(body["singleValueExtendedProperties"][0]["id"], "SystemTime 0x3FEF");
+        assert_eq!(body["singleValueExtendedProperties"][0]["value"], "2026-10-17T08:00:00Z");
+
+        // No deferred time -> no extended property; no HTML -> a text body.
+        let plain = OutgoingMessage { html_body: None, ..message };
+        let body = outgoing_message_body(&plain, None);
+        assert!(body.get("singleValueExtendedProperties").is_none());
+        assert_eq!(body["body"]["contentType"], "text");
+        assert_eq!(body["body"]["content"], "hi");
     }
 }

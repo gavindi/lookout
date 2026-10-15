@@ -665,6 +665,24 @@ pub(crate) fn show_composer_in_reading_pane_full(
         open_contact_picker,
         on_pop_out,
         on_send_started,
+        // Scheduling on a Microsoft 365 account with Graph access goes
+        // server-side through Exchange (item 5.5 / C-08) so it goes out even
+        // with Lookout closed; otherwise this returns false and the local
+        // outbox handles it.
+        {
+            let state = state.clone();
+            let account_id = account_id.clone();
+            Some(Rc::new(move |message: &lookout_mail::ComposedMessage, at: chrono::DateTime<chrono::Utc>| {
+                let resolved = {
+                    let st = state.borrow();
+                    account_id.clone().or_else(|| st.accounts.keys().next().cloned())
+                };
+                match resolved {
+                    Some(id) => schedule_send_via_graph(&state, &id, message, at),
+                    None => false,
+                }
+            }))
+        },
         pop_out_on_open,
     );
     // Replacing any previous composer's relay (dropped sender = its consumer

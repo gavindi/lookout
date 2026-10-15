@@ -19,10 +19,12 @@ use lookout_core::text::percent_encode;
 use lookout_core::{EmailAddress, FollowUpFlag, Importance};
 use serde_json::{json, Value};
 
+use chrono::{DateTime, Utc};
+
 use crate::client::{page_items, GraphClient};
 use crate::error::{GraphError, Result};
 
-use super::{override_body, override_from_graph, InferenceClassification, InferenceOverride, MessageDelta, MessageProperties};
+use super::{outgoing_message_body, override_body, override_from_graph, InferenceClassification, InferenceOverride, MessageDelta, MessageProperties, OutgoingMessage};
 
 /// `Prefer: IdType="ImmutableId"` - see the module notes.
 const IMMUTABLE_ID: [(&str, &str); 1] = [("Prefer", "IdType=\"ImmutableId\"")];
@@ -112,6 +114,15 @@ impl MailClient {
     /// Sets or clears a message's follow-up flag (M-10).
     pub async fn set_follow_up(&self, graph_id: &str, flag: &FollowUpFlag, zone: Option<chrono_tz::Tz>) -> Result<()> {
         self.patch_message(graph_id, &json!({ "flag": super::flag_body(flag, zone) })).await.map(|_| ())
+    }
+
+    /// Sends `message` through Graph's `sendMail` (item 5.5 / C-08). With
+    /// `deferred_send_at`, the request carries the `PidTagDeferredSendTime`
+    /// extended property (`SystemTime 0x3FEF`), so Exchange holds the message
+    /// in Drafts until then and sends it without Lookout's involvement.
+    pub async fn send_scheduled(&self, message: &OutgoingMessage, deferred_send_at: Option<DateTime<Utc>>) -> Result<()> {
+        let body = json!({ "message": outgoing_message_body(message, deferred_send_at) });
+        self.graph.post("me/sendMail", &body).await.map(|_| ())
     }
 
     /// The account's Focused / Other sender overrides (M-03).
@@ -333,6 +344,38 @@ mod tests {
         assert_eq!(created.id, "o2");
 
         client.delete_override("o1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_scheduled_posts_send_mail_with_the_deferred_property() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/sendMail"))
+            .and(body_partial_json(json!({
+                "message": {
+                    "subject": "Later",
+                    "importance": "normal",
+                    "singleValueExtendedProperties": [{ "id": "SystemTime 0x3FEF", "value": "2026-10-17T08:00:00Z" }]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let message = OutgoingMessage {
+            subject: "Later".to_string(),
+            text_body: "hi".to_string(),
+            html_body: None,
+            importance: Importance::Normal,
+            to: vec![EmailAddress::new("a@b.example")],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: Vec::new(),
+            attachments: Vec::new(),
+            inline_images: Vec::new(),
+        };
+        let at = "2026-10-17T08:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        client(&server).send_scheduled(&message, Some(at)).await.unwrap();
     }
 
     #[tokio::test]

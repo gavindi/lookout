@@ -164,6 +164,11 @@ pub struct ComposePrefill {
 /// `not_before` and `client_token`.
 pub type SendStarted = Rc<dyn Fn(&ComposedMessage, Option<chrono::DateTime<chrono::Utc>>) -> (Option<chrono::DateTime<chrono::Utc>>, Option<u64>)>;
 
+/// The server-side schedule-send hook (item 5.5 / C-08): given the message and
+/// its scheduled time, returns true when it was scheduled through Exchange (so
+/// nothing goes in the local outbox), false to fall back to it.
+pub type ScheduleSendHook = Rc<dyn Fn(&ComposedMessage, chrono::DateTime<chrono::Utc>) -> bool>;
+
 /// Whether Reply excludes the original's other recipients (`Reply`) or
 /// carries them all forward minus the replying account itself (`ReplyAll`).
 #[derive(Clone, Copy)]
@@ -1560,6 +1565,10 @@ pub fn build_compose_view(
     open_contact_picker: crate::contact_picker::ContactPickerOpener,
     on_pop_out: Option<Rc<dyn Fn(PopOutHandle)>>,
     on_send_started: SendStarted,
+    // Server-side schedule send (item 5.5 / C-08): returns true when the
+    // message was scheduled through Exchange (so nothing goes in the local
+    // outbox), false to fall back to it.
+    on_schedule_send: Option<ScheduleSendHook>,
     // Whether to move the composer into its own window straight away
     // (CAL-15's "Edit response before sending"): the same pop-out path the
     // header button runs, scheduled on the next main-loop turn so the
@@ -2466,6 +2475,7 @@ pub fn build_compose_view(
             let closed = closed.clone();
             let on_done = on_done.clone();
             let on_send_started = on_send_started.clone();
+            let on_schedule_send = on_schedule_send.clone();
             // The Send button anchors the attachment-reminder dialog (item
             // 1.19); cloned because the async block captures it by move.
             let send_button_for_dialog = send_button_for_reminder.clone();
@@ -2559,6 +2569,18 @@ pub fn build_compose_view(
                     references,
                     message_id: draft_message_id_used,
                 };
+                // On a Microsoft 365 account, schedule server-side through
+                // Exchange (item 5.5 / C-08) so the message goes out even with
+                // Lookout closed; otherwise fall through to the local outbox.
+                // An iMIP reply or read receipt is never guest-scheduled (its
+                // special MIME body has no Graph equivalent here).
+                if let Some(at) = schedule {
+                    if msg.calendar_part.is_none() && msg.read_receipt.is_none() && on_schedule_send.as_ref().is_some_and(|schedule_send| schedule_send(&msg, at)) {
+                        closed.set(true);
+                        on_done();
+                        return;
+                    }
+                }
                 let (not_before, client_token) = on_send_started(&msg, schedule);
                 let _ = cmd_tx.send_blocking(AccountCommand::SendMessage {
                     message: Box::new(msg),

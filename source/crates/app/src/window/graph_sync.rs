@@ -168,6 +168,42 @@ fn category_keys_for_names(set: &crate::categories::CategorySet, names: &[String
         .collect()
 }
 
+/// Schedules `message` to be sent by Exchange at `at` on a Microsoft 365
+/// account (item 5.5 / C-08): the message waits in Drafts and goes out even if
+/// Lookout is closed. Returns `false` - doing nothing - when the account isn't
+/// Microsoft 365 with Graph access, so the caller falls back to the local
+/// outbox.
+pub(crate) fn schedule_send_via_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId, message: &lookout_mail::ComposedMessage, at: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
+        return false;
+    };
+    let message = message.clone();
+    let state = state.clone();
+    let account_id = account_id.clone();
+    glib::spawn_future_local(async move {
+        match client.send_scheduled(&message, at).await {
+            Ok(()) => {
+                toast(
+                    &state,
+                    &format!(
+                        "Scheduled for {} (sends even if Lookout is closed)",
+                        crate::datetime_picker::format_short_time(&at.with_timezone(&chrono::Local), &chrono::Local::now())
+                    ),
+                );
+                // Replace the IMAP-autosaved draft with the server-side one, so
+                // Drafts doesn't end up holding two copies.
+                if let Some(message_id) = message.message_id.clone() {
+                    if let Some(cmd_tx) = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone()) {
+                        let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft { message_id });
+                    }
+                }
+            }
+            Err(e) => toast(&state, &format!("Couldn't schedule the message: {e}")),
+        }
+    });
+    true
+}
+
 /// Fetches one page of the Graph messages delta on a Microsoft 365 account and
 /// hands it to the session (item 5.4), so categories, flags, importance and
 /// Focused/Other set in Outlook show here. The cursor is read from (and the
