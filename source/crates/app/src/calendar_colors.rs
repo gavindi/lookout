@@ -186,6 +186,7 @@ mod tests {
             color: color.map(|c| c.to_string()),
             href: format!("/{id}"),
             supports_tasks: false,
+            owner: None,
         }
     }
 

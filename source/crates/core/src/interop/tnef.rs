@@ -913,10 +913,8 @@ pub fn rtf_deencapsulate_html(rtf: &[u8]) -> Option<String> {
                             out.push('\n');
                         }
                     }
-                    "tab" => {
-                        if emitting && !htmlrtf {
-                            out.push('\t');
-                        }
+                    "tab" if emitting && !htmlrtf => {
+                        out.push('\t');
                     }
                     _ => {}
                 }

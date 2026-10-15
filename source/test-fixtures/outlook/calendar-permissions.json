@@ -1,0 +1,32 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('user%40example.com')/calendars('AAAACAL')/calendarPermissions",
+  "value": [
+    {
+      "id": "AAAAPERMOWNER",
+      "emailAddress": { "name": "User Example", "address": "user@example.com" },
+      "isInsideOrganization": true,
+      "isRemovable": false,
+      "role": "read",
+      "allowedRoles": ["freeBusyRead", "limitedRead", "read", "write"],
+      "scope": "default"
+    },
+    {
+      "id": "AAAAPERMADA",
+      "emailAddress": { "name": "Ada King", "address": "ada@example.com" },
+      "isInsideOrganization": true,
+      "isRemovable": true,
+      "role": "write",
+      "allowedRoles": ["freeBusyRead", "limitedRead", "read", "write"],
+      "scope": "default"
+    },
+    {
+      "id": "AAAAPERMBOB",
+      "emailAddress": { "name": "Bob Ray", "address": "bob@contoso.com" },
+      "isInsideOrganization": false,
+      "isRemovable": true,
+      "role": "limitedRead",
+      "allowedRoles": ["freeBusyRead", "limitedRead", "read"],
+      "scope": "default"
+    }
+  ]
+}

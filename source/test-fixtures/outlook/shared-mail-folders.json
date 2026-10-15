@@ -1,0 +1,8 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('support%40example.com')/mailFolders",
+  "value": [
+    { "id": "AAAAMAILFOLDERINBOX", "displayName": "Inbox", "parentFolderId": "AAAAMAILFOLDERROOT", "childFolderCount": 0, "totalItemCount": 42, "unreadItemCount": 3 },
+    { "id": "AAAAMAILFOLDERDRAFTS", "displayName": "Drafts", "parentFolderId": "AAAAMAILFOLDERROOT", "childFolderCount": 0, "totalItemCount": 1, "unreadItemCount": 0 },
+    { "id": "AAAAMAILFOLDERSENT", "displayName": "Sent Items", "parentFolderId": "AAAAMAILFOLDERROOT", "childFolderCount": 0, "totalItemCount": 128, "unreadItemCount": 0 }
+  ]
+}

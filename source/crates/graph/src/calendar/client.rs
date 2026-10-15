@@ -19,7 +19,9 @@ use serde_json::{json, Value};
 use crate::client::{DeltaPage, GraphClient};
 use crate::error::{GraphError, Result};
 
-use super::{calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph, parse_graph_date_time};
+use super::{
+    calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph, parse_graph_date_time, CalendarPermission, CalendarRole,
+};
 
 /// One room from the tenant directory (`/places/microsoft.graph.room`,
 /// item 15 / CAL-19).
@@ -41,6 +43,9 @@ const MAX_EVENT_INSTANCES: usize = 5000;
 const MAX_CALENDARS: usize = 500;
 /// Most rooms read from the tenant directory.
 const MAX_ROOMS: usize = 1000;
+/// Most calendar-permission grants read for one calendar (`calendarPermissions`
+/// is small in practice). Item 5.6 / CAL-24.
+const MAX_PERMISSIONS: usize = 500;
 
 /// The `$select` fields the calendar-view read needs (exactly what the mapper
 /// consumes, so full bodies aren't fetched).
@@ -56,13 +61,14 @@ impl CalendarClient {
         CalendarClient { graph }
     }
 
-    /// The account's calendars (`/me/calendars`).
-    pub async fn list_calendars(&self, account_id: &AccountId) -> Result<Vec<CalendarInfo>> {
-        let items = self
-            .graph
-            .get_all("me/calendars?$top=100&$select=id,name,hexColor,isDefaultCalendar", MAX_CALENDARS)
-            .await?;
-        Ok(items.iter().filter_map(|value| calendar_from_graph(value, account_id)).collect())
+    /// The calendars under `owner`'s mailbox: `/me/calendars` for the user's
+    /// own, or `/users/{owner}/calendars` for a shared/delegated calendar
+    /// (item 5.6 / CAL-25). `owner` is a Graph user id or address, or `None`
+    /// for the signed-in user.
+    pub async fn list_calendars(&self, account_id: &AccountId, owner: Option<&str>) -> Result<Vec<CalendarInfo>> {
+        let path = format!("{}?$top=100&$select=id,name,hexColor,isDefaultCalendar", self.calendars_root(owner));
+        let items = self.graph.get_all(&path, MAX_CALENDARS).await?;
+        Ok(items.iter().filter_map(|value| calendar_from_graph(value, account_id, owner)).collect())
     }
 
     /// The expanded occurrences of `calendar` over `[start, end)`
@@ -83,7 +89,7 @@ impl CalendarClient {
     /// Creates `event` in `calendar` and returns the server's copy (with its
     /// Graph id/`changeKey`).
     pub async fn create_event(&self, calendar: &CalendarInfo, event: &CalendarEvent) -> Result<CalendarEvent> {
-        let path = format!("me/calendars/{}/events", encode_segment(&calendar.href));
+        let path = format!("{}/{}/events", self.calendars_root(calendar.owner.as_deref()), encode_segment(&calendar.href));
         let created = self.graph.post(&path, &event_create_body(event)).await?;
         event_from_graph(&created, &calendar.id).ok_or_else(malformed_event)
     }
@@ -93,9 +99,11 @@ impl CalendarClient {
     /// `Prefer: return=representation` asks Graph for the updated resource so
     /// its new `changeKey` is available; if the server omits the body, the
     /// input event is returned unchanged (the session resyncs after a write).
-    pub async fn update_event(&self, event: &CalendarEvent) -> Result<CalendarEvent> {
+    /// `owner` is the event's calendar owner for a shared/delegated calendar
+    /// (item 5.6 / CAL-25), or `None` for the user's own.
+    pub async fn update_event(&self, event: &CalendarEvent, owner: Option<&str>) -> Result<CalendarEvent> {
         let id = event.href.as_deref().ok_or_else(missing_event_id)?;
-        let path = format!("me/events/{}", encode_segment(id));
+        let path = format!("{}/{}", self.events_root(owner), encode_segment(id));
         let mut headers: Vec<(&str, &str)> = vec![("Prefer", "return=representation")];
         if let Some(etag) = event.etag.as_deref() {
             headers.push(("If-Match", etag));
@@ -105,9 +113,10 @@ impl CalendarClient {
     }
 
     /// Deletes the event with Graph `id`, guarded by `etag` (`If-Match`) when
-    /// known.
-    pub async fn delete_event(&self, id: &str, etag: Option<&str>) -> Result<()> {
-        let path = format!("me/events/{}", encode_segment(id));
+    /// known. `owner` selects a shared/delegated calendar's mailbox
+    /// (item 5.6 / CAL-25), or `None` for the user's own.
+    pub async fn delete_event(&self, id: &str, etag: Option<&str>, owner: Option<&str>) -> Result<()> {
+        let path = format!("{}/{}", self.events_root(owner), encode_segment(id));
         let headers: Vec<(&str, &str)> = etag.map(|etag| vec![("If-Match", etag)]).unwrap_or_default();
         self.graph.delete_with_headers(&path, &headers).await?;
         Ok(())
@@ -116,10 +125,12 @@ impl CalendarClient {
     /// Responds to a meeting invitation through Graph's own RSVP action
     /// (item 12 / CAL-15): `POST /me/events/{id}/{accept|tentativelyAccept|decline}`.
     /// `send_response` asks Graph to email the organizer; `proposed_new_time`
-    /// carries an iTIP COUNTER (item 3.7).
+    /// carries an iTIP COUNTER (item 3.7). `owner` selects a shared/delegated
+    /// calendar's mailbox (item 5.6 / CAL-25), or `None` for the user's own.
     pub async fn respond_invitation(
         &self,
         event_id: &str,
+        owner: Option<&str>,
         response: InvitationResponse,
         comment: Option<&str>,
         send_response: bool,
@@ -140,7 +151,9 @@ impl CalendarClient {
                 "end": graph_date_time(proposed.end, None),
             });
         }
-        self.graph.post(&format!("me/events/{}/{}", encode_segment(event_id), action), &body).await?;
+        self.graph
+            .post(&format!("{}/{}/{}", self.events_root(owner), encode_segment(event_id), action), &body)
+            .await?;
         Ok(())
     }
 
@@ -218,10 +231,11 @@ impl CalendarClient {
             .collect())
     }
 
-    /// `/me/calendars/{id}/calendarView?startDateTime=…`, encoded and windowed.
+    /// `/calendars/{id}/calendarView?startDateTime=…`, encoded and windowed.
     fn view_path(&self, calendar: &CalendarInfo, start: DateTime<Utc>, end: DateTime<Utc>) -> String {
         format!(
-            "me/calendars/{}/calendarView?startDateTime={}&endDateTime={}&{EVENT_SELECT}&$top=100",
+            "{}/{}/calendarView?startDateTime={}&endDateTime={}&{EVENT_SELECT}&$top=100",
+            self.calendars_root(calendar.owner.as_deref()),
             encode_segment(&calendar.href),
             iso8601(start),
             iso8601(end),
@@ -231,11 +245,79 @@ impl CalendarClient {
     /// The `/delta` form of [`Self::view_path`].
     fn view_path_delta(&self, calendar: &CalendarInfo, start: DateTime<Utc>, end: DateTime<Utc>) -> String {
         format!(
-            "me/calendars/{}/calendarView/delta?startDateTime={}&endDateTime={}&{EVENT_SELECT}&$top=100",
+            "{}/{}/calendarView/delta?startDateTime={}&endDateTime={}&{EVENT_SELECT}&$top=100",
+            self.calendars_root(calendar.owner.as_deref()),
             encode_segment(&calendar.href),
             iso8601(start),
             iso8601(end),
         )
+    }
+
+    /// The calendars collection root for `owner`: `me/calendars` for the
+    /// signed-in user, or `users/{owner}/calendars` for another user's mailbox
+    /// (item 5.6 / CAL-25).
+    fn calendars_root(&self, owner: Option<&str>) -> String {
+        match owner {
+            Some(owner) => format!("users/{}/calendars", encode_segment(owner)),
+            None => "me/calendars".to_string(),
+        }
+    }
+
+    /// The events collection root for `owner`: `me/events`, or
+    /// `users/{owner}/events` for another user's mailbox (item 5.6 / CAL-25).
+    fn events_root(&self, owner: Option<&str>) -> String {
+        match owner {
+            Some(owner) => format!("users/{}/events", encode_segment(owner)),
+            None => "me/events".to_string(),
+        }
+    }
+
+    /// The calendar's permission grants
+    /// (`/me/calendars/{id}/calendarPermissions`, item 5.6 / CAL-24) - who the
+    /// signed-in user has shared this calendar with, and at what role.
+    pub async fn list_permissions(&self, calendar: &CalendarInfo) -> Result<Vec<CalendarPermission>> {
+        let path = format!("{}/{}/calendarPermissions", self.calendars_root(None), encode_segment(&calendar.href));
+        let items = self.graph.get_all(&path, MAX_PERMISSIONS).await?;
+        Ok(items.iter().filter_map(super::permission_from_graph).collect())
+    }
+
+    /// Grants `email` the given `role` on `calendar`, optionally emailing them
+    /// an invitation (`send_notification`).
+    pub async fn create_permission(&self, calendar: &CalendarInfo, email: &str, role: CalendarRole, send_notification: bool) -> Result<CalendarPermission> {
+        let path = format!("{}/{}/calendarPermissions", self.calendars_root(None), encode_segment(&calendar.href));
+        let body = super::permission_create_body(email, role, send_notification);
+        let created = self.graph.post(&path, &body).await?;
+        super::permission_from_graph(&created).ok_or_else(malformed_permission)
+    }
+
+    /// Changes an existing grant's role, guarded by nothing (Graph has no
+    /// `changeKey` on a permission) - `permission_id` is the grant's own id.
+    pub async fn update_permission(&self, calendar: &CalendarInfo, permission_id: &str, role: CalendarRole) -> Result<CalendarPermission> {
+        let path = format!(
+            "{}/{}/calendarPermissions/{}",
+            self.calendars_root(None),
+            encode_segment(&calendar.href),
+            encode_segment(permission_id)
+        );
+        let updated = self.graph.patch(&path, &super::permission_role_body(role)).await?;
+        Ok(super::permission_from_graph(&updated).unwrap_or(CalendarPermission {
+            id: Some(permission_id.to_string()),
+            email: None,
+            name: None,
+            role,
+            allowed_roles: vec![role],
+        }))
+    }
+
+    /// Revokes a grant.
+    pub async fn delete_permission(&self, calendar: &CalendarInfo, permission_id: &str) -> Result<()> {
+        let path = format!(
+            "{}/{}/calendarPermissions/{}",
+            self.calendars_root(None),
+            encode_segment(&calendar.href),
+            encode_segment(permission_id)
+        );
+        self.graph.delete(&path).await.map(|_| ())
     }
 }
 
@@ -287,6 +369,15 @@ fn missing_event_id() -> GraphError {
     }
 }
 
+/// A malformed permission response (no id), mirroring `malformed_event`.
+fn malformed_permission() -> GraphError {
+    GraphError::Status {
+        status: 0,
+        message: "Graph returned a calendar permission without an id".to_string(),
+        request_id: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -324,6 +415,7 @@ mod tests {
             color: None,
             href: "cal1".to_string(),
             supports_tasks: false,
+            owner: None,
         }
     }
 
@@ -357,11 +449,27 @@ mod tests {
             .mount(&server)
             .await;
 
-        let calendars = client(&server).list_calendars(&AccountId("acct".to_string())).await.unwrap();
+        let calendars = client(&server).list_calendars(&AccountId("acct".to_string()), None).await.unwrap();
         assert_eq!(calendars.len(), 2);
         assert_eq!(calendars[0].display_name, "Work");
         assert_eq!(calendars[0].href, "cal1");
         assert_eq!(calendars[0].id, lookout_core::CalendarId("acct:cal1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_calendars_of_another_mailbox_uses_the_users_path_and_tags_the_owner() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/users/owner%40example.com/calendars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{ "id": "cal1", "name": "Ada's Calendar" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let calendars = client(&server).list_calendars(&AccountId("acct".to_string()), Some("owner@example.com")).await.unwrap();
+        assert_eq!(calendars.len(), 1);
+        assert_eq!(calendars[0].owner.as_deref(), Some("owner@example.com"));
     }
 
     #[tokio::test]
@@ -433,7 +541,7 @@ mod tests {
             .await;
 
         let event = event_from_graph(&event_json(), &calendar().id).unwrap();
-        let updated = client(&server).update_event(&event).await.unwrap();
+        let updated = client(&server).update_event(&event, None).await.unwrap();
         assert_eq!(updated.etag.as_deref(), Some("ck2"));
         assert_eq!(updated.summary.as_deref(), Some("Standup (moved)"));
     }
@@ -448,7 +556,7 @@ mod tests {
             .await;
 
         let event = event_from_graph(&event_json(), &calendar().id).unwrap();
-        let updated = client(&server).update_event(&event).await.unwrap();
+        let updated = client(&server).update_event(&event, None).await.unwrap();
         assert_eq!(updated.href, event.href);
         assert_eq!(updated.summary.as_deref(), Some("Standup"));
     }
@@ -459,7 +567,7 @@ mod tests {
         event.href = None;
         // No request is made; the client needs a server only to build the transport.
         let server = MockServer::start().await;
-        assert!(client(&server).update_event(&event).await.is_err());
+        assert!(client(&server).update_event(&event, None).await.is_err());
     }
 
     #[tokio::test]
@@ -472,7 +580,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        client(&server).delete_event("ev1", Some("ck1")).await.unwrap();
+        client(&server).delete_event("ev1", Some("ck1"), None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_delegated_event_writes_under_the_users_events_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1.0/users/owner%40example.com/events/ev1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        client(&server).delete_event("ev1", None, Some("owner@example.com")).await.unwrap();
     }
 
     #[tokio::test]
@@ -486,7 +606,7 @@ mod tests {
             .await;
 
         client(&server)
-            .respond_invitation("ev1", InvitationResponse::Tentative, Some("running late"), true, None)
+            .respond_invitation("ev1", None, InvitationResponse::Tentative, Some("running late"), true, None)
             .await
             .unwrap();
     }
@@ -509,7 +629,7 @@ mod tests {
             end: utc(2026, 10, 16),
         };
         client(&server)
-            .respond_invitation("ev1", InvitationResponse::Decline, None, false, Some(proposed))
+            .respond_invitation("ev1", None, InvitationResponse::Decline, None, false, Some(proposed))
             .await
             .unwrap();
     }
@@ -562,5 +682,80 @@ mod tests {
     fn encode_segment_escapes_path_specials() {
         assert_eq!(encode_segment("cal1"), "cal1");
         assert_eq!(encode_segment("a+b/c="), "a%2Bb%2Fc%3D");
+    }
+
+    #[tokio::test]
+    async fn list_permissions_maps_the_grants() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/calendars/cal1/calendarPermissions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{
+                    "id": "perm1",
+                    "emailAddress": { "name": "Ada", "address": "ada@example.com" },
+                    "role": "read",
+                    "allowedRoles": ["freeBusyRead", "limitedRead", "read"]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let permissions = client(&server).list_permissions(&calendar()).await.unwrap();
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(permissions[0].id.as_deref(), Some("perm1"));
+        assert_eq!(permissions[0].role, CalendarRole::Read);
+        assert_eq!(permissions[0].allowed_roles.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn create_permission_posts_the_recipient_and_role() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/calendars/cal1/calendarPermissions"))
+            .and(body_partial_json(json!({
+                "emailAddress": { "address": "ada@example.com" },
+                "role": "write",
+                "sendNotification": true
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "perm2",
+                "emailAddress": { "address": "ada@example.com" },
+                "role": "write"
+            })))
+            .mount(&server)
+            .await;
+
+        let permission = client(&server).create_permission(&calendar(), "ada@example.com", CalendarRole::Write, true).await.unwrap();
+        assert_eq!(permission.id.as_deref(), Some("perm2"));
+        assert_eq!(permission.role, CalendarRole::Write);
+    }
+
+    #[tokio::test]
+    async fn update_permission_patches_the_role() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1.0/me/calendars/cal1/calendarPermissions/perm2"))
+            .and(body_partial_json(json!({ "role": "limitedRead" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "perm2",
+                "role": "limitedRead"
+            })))
+            .mount(&server)
+            .await;
+
+        let permission = client(&server).update_permission(&calendar(), "perm2", CalendarRole::LimitedRead).await.unwrap();
+        assert_eq!(permission.role, CalendarRole::LimitedRead);
+    }
+
+    #[tokio::test]
+    async fn delete_permission_deletes_the_grant() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1.0/me/calendars/cal1/calendarPermissions/perm2"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        client(&server).delete_permission(&calendar(), "perm2").await.unwrap();
     }
 }

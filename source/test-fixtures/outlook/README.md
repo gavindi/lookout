@@ -25,6 +25,9 @@ behaviour rather than an interpretation of the specs.
 | `automatic-replies.json` | A Graph `GET /me/mailboxSettings` response with `automaticRepliesSetting`: a scheduled range in a Windows time zone, HTML internal/external messages, a `contactsOnly` audience — pins the automatic-replies mapping (M-24, item 2.11). |
 | `contacts.json` | A Graph `GET /me/contacts` response: two contacts exercising the name parts, company/department, job title, phones, the three address blocks, IM addresses, categories, a full and a yearless birthday, and the scalar fields with no vCard home — pins the Graph contacts mapping (A-04, item 5.2). |
 | `contact-folders.json` | A Graph `GET /me/contactFolders` response, the People screen's address-book rows (A-04, item 5.2). |
+| `calendar-permissions.json` | A Graph `GET /me/calendars/{id}/calendarPermissions` response: the owner's own grant plus two others at different roles — pins the sharing mapping (CAL-24, item 5.6). |
+| `delegated-calendars.json` | A Graph `GET /users/{id}/calendars` response, the calendars under another user's mailbox — pins the delegated-calendar mapping and its owner tag (CAL-25, item 5.6). |
+| `shared-mail-folders.json` | A Graph `GET /users/{id}/mailFolders` response, a shared mailbox's folders with their item counts — pins the shared-mailbox mapping (M-42, item 5.6). |
 
 These are authored to the documented wire formats (`[MS-OXCICAL]`, `[MS-OXOMSG]`,
 `[MS-OXTNEF]`, RFC 6047, the Microsoft Graph reference) and verified by

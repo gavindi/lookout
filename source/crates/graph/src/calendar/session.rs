@@ -125,7 +125,10 @@ async fn connect_and_run(
     commands: &async_channel::Receiver<CalendarCommand>,
     events: &async_channel::Sender<CalendarSessionEvent>,
 ) -> Result<ShutdownReason, GraphError> {
-    let calendars = client.list_calendars(account_id).await?;
+    let mut calendars = client.list_calendars(account_id, None).await?;
+    // The other users' mailboxes whose calendars this account also shows
+    // (item 5.6 / CAL-25), from `CalendarCommand::SetSharedCalendars`.
+    let mut shared_owners: Vec<String> = Vec::new();
     let _ = events.send(CalendarSessionEvent::CalendarsUpdated(calendars.clone())).await;
     // Graph schedules iTIP itself (item 11), so the client-side iMIP sender
     // stands down.
@@ -171,7 +174,10 @@ async fn connect_and_run(
         for command in woke_on_command.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
             match command {
                 CalendarCommand::Shutdown => return Ok(ShutdownReason::Requested),
-                CalendarCommand::Refresh => sync_month(client, &calendars, current_month, events).await?,
+                CalendarCommand::Refresh => {
+                    calendars = rebuild_calendars(client, account_id, &shared_owners, events).await?;
+                    sync_month(client, &calendars, current_month, events).await?;
+                }
                 CalendarCommand::SyncMonth(date) => {
                     current_month = first_of_month(date);
                     sync_month(client, &calendars, current_month, events).await?;
@@ -180,28 +186,42 @@ async fn connect_and_run(
                     sync_month(client, &calendars, first_of_month(date), events).await?;
                 }
                 CalendarCommand::Reconnect => {}
+                CalendarCommand::SetSharedCalendars { owners } => {
+                    shared_owners = owners;
+                    calendars = rebuild_calendars(client, account_id, &shared_owners, events).await?;
+                    sync_month(client, &calendars, current_month, events).await?;
+                }
                 CalendarCommand::CreateEvent { event } | CalendarCommand::UpdateEvent { event } => {
                     write_event(client, &calendars, &event, current_month, events).await;
                 }
-                CalendarCommand::DeleteEvent { calendar_id: _, href, etag } => match client.delete_event(&href, etag.as_deref()).await {
-                    Ok(()) => sync_month(client, &calendars, current_month, events).await?,
-                    Err(e) => {
-                        let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete event: {e}"))).await;
+                CalendarCommand::DeleteEvent { calendar_id, href, etag } => {
+                    let owner = owner_of(&calendars, &calendar_id);
+                    match client.delete_event(&href, etag.as_deref(), owner.as_deref()).await {
+                        Ok(()) => sync_month(client, &calendars, current_month, events).await?,
+                        Err(e) => {
+                            let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete event: {e}"))).await;
+                        }
                     }
-                },
+                }
                 CalendarCommand::RespondInvitation {
+                    calendar_id,
                     event_id,
                     response,
                     comment,
                     send_response,
                     proposed_new_time,
-                    ..
-                } => match client.respond_invitation(&event_id, response, comment.as_deref(), send_response, proposed_new_time).await {
-                    Ok(()) => sync_month(client, &calendars, current_month, events).await?,
-                    Err(e) => {
-                        let _ = events.send(CalendarSessionEvent::Error(format!("failed to respond to the invitation: {e}"))).await;
+                } => {
+                    let owner = owner_of(&calendars, &calendar_id);
+                    match client
+                        .respond_invitation(&event_id, owner.as_deref(), response, comment.as_deref(), send_response, proposed_new_time)
+                        .await
+                    {
+                        Ok(()) => sync_month(client, &calendars, current_month, events).await?,
+                        Err(e) => {
+                            let _ = events.send(CalendarSessionEvent::Error(format!("failed to respond to the invitation: {e}"))).await;
+                        }
                     }
-                },
+                }
                 CalendarCommand::SyncTasks => {
                     let _ = events.send(CalendarSessionEvent::TasksUpdated(Vec::new())).await;
                 }
@@ -250,6 +270,35 @@ async fn connect_and_run(
             }
         }
     }
+}
+
+/// Re-lists the account's own calendars plus every configured shared owner's
+/// (item 5.6 / CAL-25), emits the merged set and returns it. A shared owner
+/// that fails to resolve is logged and skipped, so one bad address can't blank
+/// the whole calendar list; a stale credential still forces a reconnect.
+async fn rebuild_calendars(
+    client: &CalendarClient,
+    account_id: &AccountId,
+    owners: &[String],
+    events: &async_channel::Sender<CalendarSessionEvent>,
+) -> Result<Vec<CalendarInfo>, GraphError> {
+    let mut calendars = client.list_calendars(account_id, None).await?;
+    for owner in owners {
+        match client.list_calendars(account_id, Some(owner)).await {
+            Ok(mut shared) => {
+                for calendar in &mut shared {
+                    // Label the row with the other user so the sidebar
+                    // distinguishes their calendar from the user's own.
+                    calendar.display_name = format!("{owner} · {}", calendar.display_name);
+                }
+                calendars.append(&mut shared);
+            }
+            Err(e @ GraphError::Unauthorized) => return Err(e),
+            Err(e) => tracing::warn!("failed to list shared calendars for {owner}: {e}"),
+        }
+    }
+    let _ = events.send(CalendarSessionEvent::CalendarsUpdated(calendars.clone())).await;
+    Ok(calendars)
 }
 
 /// Fetches every calendar's occurrences over a padded month window, clips to
@@ -313,7 +362,8 @@ async fn write_event(client: &CalendarClient, calendars: &[CalendarInfo], event:
             }
         }
     } else {
-        client.update_event(event).await.map(|_| ())
+        let owner = owner_of(calendars, &event.calendar_id);
+        client.update_event(event, owner.as_deref()).await.map(|_| ())
     };
 
     match result {
@@ -342,6 +392,12 @@ async fn write_event(client: &CalendarClient, calendars: &[CalendarInfo], event:
 /// Whether an occurrence overlaps the half-open `[start, end)` month window.
 fn overlaps(occ: &EventOccurrence, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
     occ.start < end && occ.end > start
+}
+
+/// The Graph owner (another user's id/address) of the calendar with `id`, for
+/// a shared/delegated calendar (item 5.6 / CAL-25); `None` for the user's own.
+fn owner_of(calendars: &[CalendarInfo], id: &lookout_core::CalendarId) -> Option<String> {
+    calendars.iter().find(|calendar| &calendar.id == id).and_then(|calendar| calendar.owner.clone())
 }
 
 fn first_of_month(date: NaiveDate) -> NaiveDate {
@@ -479,6 +535,7 @@ mod tests {
             color: None,
             href: "cal1".to_string(),
             supports_tasks: false,
+            owner: None,
         };
         let mut event = crate::calendar::event_from_graph(
             &json!({ "id": "x", "subject": "New", "start": { "dateTime": "2026-10-15T09:00:00", "timeZone": "UTC" }, "end": { "dateTime": "2026-10-15T09:30:00", "timeZone": "UTC" } }),
@@ -549,6 +606,76 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), handle).await.is_ok(),
             "the session should stop instead of retrying a consent error"
         );
+    }
+
+    #[tokio::test]
+    async fn set_shared_calendars_lists_the_owners_and_tags_them() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/calendars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "id": "own1", "name": "Calendar" }] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/users/ada%40example.com/calendars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "id": "shared1", "name": "Ada's Calendar" }] })))
+            .mount(&server)
+            .await;
+        // The month sync that follows the rebuild.
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/calendars/own1/calendarView"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/users/ada%40example.com/calendars/shared1/calendarView"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+            .mount(&server)
+            .await;
+
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (evt_tx, evt_rx) = async_channel::unbounded();
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx));
+
+        // Wait for the initial list, then ask for the shared owner.
+        let mut first = None;
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                Ok(Ok(CalendarSessionEvent::CalendarsUpdated(list))) => {
+                    first = Some(list);
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert_eq!(first.expect("initial CalendarsUpdated").len(), 1);
+
+        cmd_tx
+            .send(CalendarCommand::SetSharedCalendars {
+                owners: vec!["ada@example.com".to_string()],
+            })
+            .await
+            .unwrap();
+
+        let mut merged = None;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                Ok(Ok(CalendarSessionEvent::CalendarsUpdated(list))) if list.len() == 2 => {
+                    merged = Some(list);
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        let merged = merged.expect("merged CalendarsUpdated");
+        let shared = merged.iter().find(|c| c.owner.is_some()).expect("a shared calendar");
+        assert_eq!(shared.owner.as_deref(), Some("ada@example.com"));
+        assert_eq!(shared.display_name, "ada@example.com · Ada's Calendar");
+
+        cmd_tx.send(CalendarCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 
     #[test]

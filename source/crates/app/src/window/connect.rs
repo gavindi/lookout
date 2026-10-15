@@ -1709,6 +1709,7 @@ pub(crate) fn connect_goa_account(
             goa_client.clone(),
             calendar.clone(),
             tasks_view.clone(),
+            shared_owners_for(&state, &account_id),
         );
         current_calendar_page.set("calendar");
         if calendar_view_button.is_active() {
@@ -1857,6 +1858,7 @@ pub(crate) fn spawn_calendar_discovery(
                     show_tasks_page("tasks");
                     show_lookout_page("lookout");
                     for account in enabled_accounts {
+                        let shared_owners = shared_owners_for(&state, &account.account_id);
                         connect_calendar_account(
                             worker.clone(),
                             calendar_state.clone(),
@@ -1870,6 +1872,7 @@ pub(crate) fn spawn_calendar_discovery(
                             client.clone(),
                             account,
                             tasks_view.clone(),
+                            shared_owners,
                         );
                     }
                     refresh_config();
@@ -2055,6 +2058,7 @@ pub(crate) fn connect_google_tasks_account(
                                     color: None,
                                     href: String::new(),
                                     supports_tasks: true,
+                                    owner: None,
                                 })
                                 .collect();
                             calendar_colors::assign_missing(&mut st.calendar_colors, &infos);
@@ -2133,6 +2137,7 @@ pub(crate) fn connect_graph_todo_account(
                                 color: None,
                                 href: String::new(),
                                 supports_tasks: true,
+                                owner: None,
                             })
                             .collect();
                         {
@@ -2164,6 +2169,21 @@ pub(crate) fn connect_graph_todo_account(
     });
 }
 
+/// The Graph owner ids of the shared/delegated calendars configured for
+/// `account_id` (item 5.6 / CAL-25), from `settings.json`. Empty unless the
+/// account has shared calendars configured against it.
+pub(crate) fn shared_owners_for(state: &Rc<RefCell<UiState>>, account_id: &AccountId) -> Vec<String> {
+    state
+        .borrow()
+        .app_config
+        .borrow()
+        .shared_calendars
+        .iter()
+        .filter(|sc| &sc.parent_account == account_id)
+        .map(|sc| sc.owner_id.clone())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_calendar_account(
     worker: Rc<Worker>,
@@ -2178,6 +2198,10 @@ pub(crate) fn connect_calendar_account(
     goa_client: GoaClient,
     account: GoaCalendarAccount,
     tasks_view: Rc<crate::tasks_view::TasksView>,
+    // Other users' mailboxes whose calendars this Microsoft 365 account also
+    // shows (item 5.6 / CAL-25), from `settings.json`. Empty for every other
+    // account.
+    shared_owners: Vec<String>,
 ) {
     let account_id = account.account_id.clone();
     let display_name = account.display_name.clone();
@@ -2221,6 +2245,7 @@ pub(crate) fn connect_calendar_account(
     // under a flood instead of queueing unboundedly - see `EVENT_CHANNEL_CAPACITY`.
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
+    let shared_cmd_tx = cmd_tx.clone();
     calendar_state.borrow_mut().accounts.insert(
         account_id.clone(),
         CalendarAccountHandle {
@@ -2244,6 +2269,11 @@ pub(crate) fn connect_calendar_account(
         let oauth = std::sync::Arc::new(crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()));
         let client = lookout_graph::CalendarClient::new(lookout_graph::GraphClient::new(oauth));
         worker.spawn(lookout_graph::run_calendar_session(account_id.clone(), client, cmd_rx, evt_tx));
+        // Other users' calendars this account also shows (item 5.6 / CAL-25):
+        // the Graph actor merges them in alongside the account's own.
+        if !shared_owners.is_empty() {
+            let _ = shared_cmd_tx.send_blocking(CalendarCommand::SetSharedCalendars { owners: shared_owners.clone() });
+        }
         // Microsoft To Do is a separate Graph backend (item 5.3 / A-05): only
         // the calendar actor above owns calendars/events, this one owns the
         // task lists. Both are gated by the same Graph consent.

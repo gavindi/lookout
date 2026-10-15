@@ -27,6 +27,9 @@ use crate::categories::CategoryDef;
 /// keys on the `AccountId` string, so the prefix is just the marker the
 /// account management UI greps for.
 pub const OTHER_ACCOUNT_ID_PREFIX: &str = "other:";
+/// The id prefix for shared/delegated calendars opened from another user's
+/// mailbox (item 5.6 / CAL-25).
+pub const SHARED_CALENDAR_ID_PREFIX: &str = "sharedcal:";
 
 /// A user override of a mailbox's special-use role (e.g. "this folder is my
 /// Archive"), winning over the server's `LIST (SPECIAL-USE)` attributes and
@@ -62,6 +65,50 @@ pub struct OtherAccount {
     /// case) or distinct IMAP/SMTP passwords. The keyring always holds both
     /// slots either way - the flag only drives the edit dialog's prefill.
     pub use_same_password: bool,
+}
+
+/// One shared mailbox added by address (OUTLOOK_PARITY.md item 5.6 / M-42).
+/// A shared mailbox is a second mailbox a Microsoft 365 user has been granted
+/// access to; Lookout surfaces it as its own account-like group, reusing the
+/// parent account's OAuth token rather than the delegate's own credentials.
+/// Never holds a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMailbox {
+    /// Stable `shared:<uuid>` id. Filesystem-safe (the mail cache derives
+    /// filenames from it) and collision-free.
+    pub id: String,
+    /// The Microsoft 365 account whose OAuth token (and Graph consent) this
+    /// shared mailbox borrows.
+    pub parent_account: AccountId,
+    /// The shared mailbox's own address (e.g. `support@contoso.com`).
+    pub address: String,
+    /// The mailbox's display name, for the folder pane.
+    pub display_name: String,
+    /// The shared mailbox's Graph user id, resolved once from `address`
+    /// (`GET /users/{address}`) and cached here so `/users/{id}/...` requests
+    /// don't need a lookup each time. `None` until resolved.
+    #[serde(default)]
+    pub owner_id: Option<String>,
+}
+
+/// One shared or delegated calendar opened from another user's mailbox
+/// (OUTLOOK_PARITY.md item 5.6 / CAL-25). The other user's mailbox is read
+/// through Graph (`/users/{owner}/calendars`), gated by the
+/// `Calendars.ReadWrite.Shared` consent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedCalendar {
+    /// Stable `sharedcal:<uuid>` id.
+    pub id: String,
+    /// The Microsoft 365 account whose OAuth token borrows the access.
+    pub parent_account: AccountId,
+    /// The other user's address (e.g. `ada@contoso.com`).
+    pub address: String,
+    /// The other user's Graph user id, resolved from `address`.
+    pub owner_id: String,
+    /// The Graph calendar id (`href`) under that user's mailbox.
+    pub calendar_id: String,
+    /// The calendar's display name, for the sidebar.
+    pub display_name: String,
 }
 
 /// One account's default-signature selections - which signature its new
@@ -101,6 +148,15 @@ pub struct AppConfig {
     pub folder_role_overrides: Vec<FolderRoleOverride>,
     pub webcal_subscriptions: Vec<WebcalSubscription>,
     pub other_accounts: Vec<OtherAccount>,
+    /// Shared mailboxes added by address (item 5.6 / M-42), each borrowing a
+    /// parent Microsoft 365 account's OAuth token and Graph consent.
+    #[serde(default)]
+    pub shared_mailboxes: Vec<SharedMailbox>,
+    /// Shared or delegated calendars opened from another user's mailbox
+    /// (item 5.6 / CAL-25), read through Graph under the parent account's
+    /// token.
+    #[serde(default)]
+    pub shared_calendars: Vec<SharedCalendar>,
     /// The shared category master list (item 2.1 / M-09, CAL-07, T-08), used
     /// by mail, events and tasks. Replaces the pre-2.1 `tags.json`; a legacy
     /// file is migrated on first load (see `categories::migrate_legacy_tags`).
@@ -408,6 +464,21 @@ mod tests {
                 smtp_username: "work".into(),
                 use_same_password: true,
             }],
+            shared_mailboxes: vec![SharedMailbox {
+                id: "shared:abc".into(),
+                parent_account: AccountId("account_1".into()),
+                address: "support@example.com".into(),
+                display_name: "Support".into(),
+                owner_id: Some("u1".into()),
+            }],
+            shared_calendars: vec![SharedCalendar {
+                id: format!("{SHARED_CALENDAR_ID_PREFIX}abc"),
+                parent_account: AccountId("account_1".into()),
+                address: "ada@example.com".into(),
+                owner_id: "u2".into(),
+                calendar_id: "AAAACAL".into(),
+                display_name: "Ada's Calendar".into(),
+            }],
             categories: Vec::new(),
             rules: Vec::new(),
             templates: Vec::new(),
@@ -441,6 +512,8 @@ mod tests {
             folder_role_overrides: Vec::new(),
             webcal_subscriptions: Vec::new(),
             other_accounts: Vec::new(),
+            shared_mailboxes: Vec::new(),
+            shared_calendars: Vec::new(),
             categories: Vec::new(),
             rules: Vec::new(),
             templates: Vec::new(),

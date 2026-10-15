@@ -18,6 +18,7 @@ pub const BASE_GRAPH_SCOPES: &[&str] = &[MAIL_READ_WRITE];
 pub const MAIL_READ_WRITE: &str = "Mail.ReadWrite";
 pub const MAIL_READ_WRITE_SHARED: &str = "Mail.ReadWrite.Shared";
 pub const MAIL_SEND: &str = "Mail.Send";
+pub const MAIL_SEND_SHARED: &str = "Mail.Send.Shared";
 pub const MAILBOX_SETTINGS_READ_WRITE: &str = "MailboxSettings.ReadWrite";
 pub const CALENDARS_READ_WRITE: &str = "Calendars.ReadWrite";
 pub const CALENDARS_READ_SHARED: &str = "Calendars.Read.Shared";
@@ -56,7 +57,9 @@ pub enum GraphFeature {
     Directory,
     /// Microsoft To Do lists, tasks and checklist items.
     ToDo,
-    /// A shared mailbox's folders.
+    /// A shared mailbox's folders, messages and "send as" identity
+    /// (`/users/{id}/mailFolders`, `/users/{id}/sendMail`). Needs
+    /// [`MAIL_READ_WRITE_SHARED`] and [`MAIL_SEND_SHARED`].
     SharedMailboxes,
 }
 
@@ -75,7 +78,7 @@ impl GraphFeature {
             GraphFeature::Contacts => &[CONTACTS_READ_WRITE],
             GraphFeature::Directory => &[USER_READ_BASIC_ALL, PEOPLE_READ],
             GraphFeature::ToDo => &[TASKS_READ_WRITE],
-            GraphFeature::SharedMailboxes => &[MAIL_READ_WRITE_SHARED],
+            GraphFeature::SharedMailboxes => &[MAIL_READ_WRITE_SHARED, MAIL_SEND_SHARED],
         }
     }
 
@@ -109,6 +112,22 @@ mod tests {
 
         let categories = GraphFeature::Categories.consent_scopes();
         assert_eq!(categories, vec![MAIL_READ_WRITE, MAILBOX_SETTINGS_READ_WRITE]);
+    }
+
+    #[test]
+    fn shared_scopes_are_per_feature() {
+        // Delegated calendars and shared mailboxes are admin-sensitive, so
+        // their scopes are requested per-feature (like Rooms/Directory), never
+        // in the default base set.
+        assert!(!BASE_GRAPH_SCOPES.contains(&CALENDARS_READ_WRITE_SHARED));
+        assert!(!BASE_GRAPH_SCOPES.contains(&MAIL_READ_WRITE_SHARED));
+        assert!(!BASE_GRAPH_SCOPES.contains(&MAIL_SEND_SHARED));
+
+        assert_eq!(GraphFeature::SharedCalendars.consent_scopes(), vec![MAIL_READ_WRITE, CALENDARS_READ_WRITE_SHARED]);
+        assert_eq!(
+            GraphFeature::SharedMailboxes.consent_scopes(),
+            vec![MAIL_READ_WRITE, MAIL_READ_WRITE_SHARED, MAIL_SEND_SHARED]
+        );
     }
 
     #[test]

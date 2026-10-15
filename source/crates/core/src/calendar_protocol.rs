@@ -130,6 +130,15 @@ pub enum CalendarCommand {
         href: String,
         etag: Option<String>,
     },
+    /// Replaces the set of *other users'* mailboxes whose calendars this Graph
+    /// account also shows (item 5.6 / CAL-25) - the shared/delegated calendars
+    /// configured in `settings.json`, each an owner id or address. The Graph
+    /// actor re-lists those mailboxes' calendars and merges them into
+    /// `CalendarsUpdated`; a CalDAV account ignores it (CalDAV has no
+    /// equivalent of Graph's shared-calendar read).
+    SetSharedCalendars {
+        owners: Vec<String>,
+    },
     Shutdown,
 }
 

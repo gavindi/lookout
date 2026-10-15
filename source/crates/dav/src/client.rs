@@ -432,6 +432,7 @@ impl DavClient {
                     color: r.prop(NS_APPLE_ICAL, "calendar-color").map(str::to_string),
                     href: r.href.clone(),
                     supports_tasks,
+                    owner: None,
                 }
             })
             .collect())

@@ -40,10 +40,12 @@ use serde_json::{json, Value};
 /// Maps a Graph `calendar` object to a [`CalendarInfo`]. `href` carries the
 /// Graph calendar id (the path segment the session builds
 /// `/me/calendars/{href}/…` from); `id` is the account-scoped `<account>:<id>`
-/// the rest of the app keys calendars by. Graph calendars never carry VTODOs,
-/// so `supports_tasks` is always `false` - Microsoft To Do is the separate
-/// [`crate::todo`] backend (item 5.3 / A-05).
-pub fn calendar_from_graph(value: &Value, account_id: &AccountId) -> Option<CalendarInfo> {
+/// the rest of the app keys calendars by. `owner` is the other user's Graph id
+/// for a shared/delegated calendar (item 5.6 / CAL-25); `None` for the user's
+/// own. Graph calendars never carry VTODOs, so `supports_tasks` is always
+/// `false` - Microsoft To Do is the separate [`crate::todo`] backend (item 5.3
+/// / A-05).
+pub fn calendar_from_graph(value: &Value, account_id: &AccountId, owner: Option<&str>) -> Option<CalendarInfo> {
     let graph_id = value.get("id")?.as_str()?;
     let display_name = value.get("name").and_then(Value::as_str).unwrap_or("Calendar").to_string();
     let color = value.get("hexColor").and_then(Value::as_str).map(str::to_string).filter(|c| !c.is_empty());
@@ -54,6 +56,7 @@ pub fn calendar_from_graph(value: &Value, account_id: &AccountId) -> Option<Cale
         color,
         href: graph_id.to_string(),
         supports_tasks: false,
+        owner: owner.map(str::to_string),
     })
 }
 
@@ -452,6 +455,129 @@ fn conference_url(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The access level a calendar permission grants (Graph `calendarRole`),
+/// item 5.6 / CAL-24. The ordering is least-to-most access, matching Graph's
+/// own escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarRole {
+    /// "Can view when I'm busy" - only free/busy.
+    FreeBusyRead,
+    /// "Can view titles and locations".
+    LimitedRead,
+    /// "Can view all details".
+    Read,
+    /// "Can edit".
+    Write,
+    /// A delegate who can edit but not see private events.
+    DelegateWithoutPrivateEventAccess,
+    /// A delegate who can edit and see private events.
+    DelegateWithPrivateEventAccess,
+}
+
+impl CalendarRole {
+    /// The Graph `role`/`allowedRoles` string.
+    pub fn as_graph_str(self) -> &'static str {
+        match self {
+            CalendarRole::FreeBusyRead => "freeBusyRead",
+            CalendarRole::LimitedRead => "limitedRead",
+            CalendarRole::Read => "read",
+            CalendarRole::Write => "write",
+            CalendarRole::DelegateWithoutPrivateEventAccess => "delegateWithoutPrivateEventAccess",
+            CalendarRole::DelegateWithPrivateEventAccess => "delegateWithPrivateEventAccess",
+        }
+    }
+
+    /// Parses a Graph `role` string; an unknown role degrades to the least
+    /// access (`FreeBusyRead`) rather than silently granting more.
+    pub fn from_graph(value: &str) -> CalendarRole {
+        match value {
+            "limitedRead" => CalendarRole::LimitedRead,
+            "read" => CalendarRole::Read,
+            "write" => CalendarRole::Write,
+            "delegateWithoutPrivateEventAccess" => CalendarRole::DelegateWithoutPrivateEventAccess,
+            "delegateWithPrivateEventAccess" => CalendarRole::DelegateWithPrivateEventAccess,
+            _ => CalendarRole::FreeBusyRead,
+        }
+    }
+}
+
+/// One `calendarPermission` grant on the user's own calendar (item 5.6 /
+/// CAL-24): who the calendar is shared with, and at what role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarPermission {
+    /// The grant's Graph id, the target for an update or revoke.
+    pub id: Option<String>,
+    /// The grantee's address, if Graph returned one (the owner's own default
+    /// permission may have none).
+    pub email: Option<String>,
+    /// The grantee's display name.
+    pub name: Option<String>,
+    /// The role granted.
+    pub role: CalendarRole,
+    /// Every role this grant may be set to (`allowedRoles`), for the UI's
+    /// dropdown. Empty when Graph omits it.
+    pub allowed_roles: Vec<CalendarRole>,
+}
+
+/// Maps a Graph `calendarPermission` to a [`CalendarPermission`], or `None`
+/// when it has no id. Graph has carried the role as both `role` (singular,
+/// legacy) and `roles` (array); `role` wins, falling back to the first of
+/// `roles`.
+pub fn permission_from_graph(value: &Value) -> Option<CalendarPermission> {
+    let id = value.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?.to_string();
+    let email = value
+        .get("emailAddress")
+        .and_then(|address| address.get("address"))
+        .and_then(Value::as_str)
+        .filter(|address| !address.trim().is_empty())
+        .map(str::to_string);
+    let name = value
+        .get("emailAddress")
+        .and_then(|address| address.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string);
+    let role = value
+        .get("role")
+        .and_then(Value::as_str)
+        .map(CalendarRole::from_graph)
+        .or_else(|| {
+            value
+                .get("roles")
+                .and_then(Value::as_array)
+                .and_then(|roles| roles.first())
+                .and_then(Value::as_str)
+                .map(CalendarRole::from_graph)
+        })
+        .unwrap_or(CalendarRole::Read);
+    let allowed_roles = value
+        .get("allowedRoles")
+        .and_then(Value::as_array)
+        .map(|roles| roles.iter().filter_map(Value::as_str).map(CalendarRole::from_graph).collect())
+        .unwrap_or_default();
+    Some(CalendarPermission {
+        id: Some(id),
+        email,
+        name,
+        role,
+        allowed_roles,
+    })
+}
+
+/// The JSON body to `POST …/calendarPermissions` for a new grant.
+pub fn permission_create_body(email: &str, role: CalendarRole, send_notification: bool) -> Value {
+    json!({
+        "emailAddress": { "address": email },
+        "role": role.as_graph_str(),
+        "sendNotification": send_notification,
+    })
+}
+
+/// The JSON body to `PATCH …/calendarPermissions/{id}` for a role change.
+pub fn permission_role_body(role: CalendarRole) -> Value {
+    json!({ "role": role.as_graph_str() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,19 +619,69 @@ mod tests {
     #[test]
     fn calendar_maps_id_name_colour_and_href() {
         let value = json!({ "id": "graph-cal", "name": "Work", "hexColor": "#008000" });
-        let info = calendar_from_graph(&value, &account()).unwrap();
+        let info = calendar_from_graph(&value, &account(), None).unwrap();
         assert_eq!(info.id, CalendarId::new(&account(), "graph-cal"));
         assert_eq!(info.display_name, "Work");
         assert_eq!(info.color.as_deref(), Some("#008000"));
         assert_eq!(info.href, "graph-cal");
         assert!(!info.supports_tasks, "Graph calendars never carry VTODOs");
         assert_eq!(info.account_id, account());
+        assert_eq!(info.owner, None);
+    }
+
+    #[test]
+    fn a_delegated_calendar_carries_its_owner() {
+        let value = json!({ "id": "graph-cal", "name": "Ada's Calendar" });
+        let info = calendar_from_graph(&value, &account(), Some("owner-id")).unwrap();
+        assert_eq!(info.owner.as_deref(), Some("owner-id"));
+    }
+
+    #[test]
+    fn the_captured_delegated_calendars_fixture_maps_with_the_owner() {
+        let page: Value = serde_json::from_str(include_str!("../../../../test-fixtures/outlook/delegated-calendars.json")).unwrap();
+        let calendars: Vec<CalendarInfo> = page["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| calendar_from_graph(value, &account(), Some("ada@example.com")))
+            .collect();
+        assert_eq!(calendars.len(), 2);
+        assert_eq!(calendars[0].display_name, "Ada's Calendar");
+        assert_eq!(calendars[0].color.as_deref(), Some("#0F6CBD"));
+        assert!(calendars.iter().all(|c| c.owner.as_deref() == Some("ada@example.com")));
+    }
+
+    #[test]
+    fn the_captured_calendar_permissions_fixture_maps_roles() {
+        let page: Value = serde_json::from_str(include_str!("../../../../test-fixtures/outlook/calendar-permissions.json")).unwrap();
+        let grants: Vec<CalendarPermission> = page["value"].as_array().unwrap().iter().filter_map(permission_from_graph).collect();
+        assert_eq!(grants.len(), 3);
+        assert_eq!(grants[0].email.as_deref(), Some("user@example.com"));
+        assert_eq!(grants[0].role, CalendarRole::Read);
+        assert_eq!(grants[1].role, CalendarRole::Write);
+        assert_eq!(grants[2].role, CalendarRole::LimitedRead);
+        assert_eq!(grants[2].name.as_deref(), Some("Bob Ray"));
+        assert_eq!(grants[0].allowed_roles.len(), 4);
+    }
+
+    #[test]
+    fn an_unknown_permission_role_degrades_to_free_busy_read() {
+        let value = json!({ "id": "p", "role": "someFutureRole" });
+        assert_eq!(permission_from_graph(&value).unwrap().role, CalendarRole::FreeBusyRead);
+    }
+
+    #[test]
+    fn permission_bodies_carry_the_graph_role_strings() {
+        assert_eq!(permission_create_body("ada@example.com", CalendarRole::Write, true)["role"], "write");
+        assert_eq!(permission_create_body("ada@example.com", CalendarRole::LimitedRead, false)["sendNotification"], false);
+        assert_eq!(permission_role_body(CalendarRole::FreeBusyRead)["role"], "freeBusyRead");
+        assert_eq!(CalendarRole::DelegateWithPrivateEventAccess.as_graph_str(), "delegateWithPrivateEventAccess");
     }
 
     #[test]
     fn calendar_defaults_a_missing_name_and_ignores_an_empty_colour() {
         let value = json!({ "id": "graph-cal", "hexColor": "" });
-        let info = calendar_from_graph(&value, &account()).unwrap();
+        let info = calendar_from_graph(&value, &account(), None).unwrap();
         assert_eq!(info.display_name, "Calendar");
         assert_eq!(info.color, None);
     }

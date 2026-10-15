@@ -23,6 +23,7 @@ pub mod error;
 pub mod mail;
 pub mod scopes;
 pub mod todo;
+pub mod users;
 
 pub use auth::TokenProvider;
 pub use calendar::client::{CalendarClient, Room};
@@ -30,7 +31,7 @@ pub use calendar::recurrence::{recurrence_from_graph, rrule_to_graph};
 pub use calendar::session::run_calendar_session;
 pub use calendar::{
     attendee_from_graph, attendee_to_graph, calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph,
-    parse_graph_date_time, parse_graph_date_time_str,
+    parse_graph_date_time, parse_graph_date_time_str, permission_create_body, permission_from_graph, permission_role_body, CalendarPermission, CalendarRole,
 };
 pub use client::{delta_link_of, next_link, page_items, retry_after, DeltaPage, GraphClient, GRAPH_BASE_URL};
 pub use contacts::client::ContactsClient;
@@ -39,11 +40,12 @@ pub use error::{GraphError, Result};
 pub use mail::client::MailClient;
 pub use mail::{
     categories_body, classification_body, flag_body, flag_from_graph, importance_body, message_id_filter, message_properties_from_graph, outgoing_message_body, override_body,
-    override_from_graph, InferenceClassification, InferenceOverride, MessageDelta, MessageProperties, OutgoingAttachment, OutgoingMessage,
+    override_from_graph, shared_mail_folder_from_graph, InferenceClassification, InferenceOverride, MessageDelta, MessageProperties, OutgoingAttachment, OutgoingMessage,
+    SharedMailFolder,
 };
 pub use scopes::{
     GraphFeature, BASE_GRAPH_SCOPES, CALENDARS_READ_SHARED, CALENDARS_READ_WRITE, CALENDARS_READ_WRITE_SHARED, CONTACTS_READ_WRITE, MAILBOX_SETTINGS_READ_WRITE, MAIL_READ_WRITE,
-    MAIL_READ_WRITE_SHARED, MAIL_SEND, PEOPLE_READ, PLACE_READ_ALL, TASKS_READ_WRITE, USER_READ_BASIC_ALL,
+    MAIL_READ_WRITE_SHARED, MAIL_SEND, MAIL_SEND_SHARED, PEOPLE_READ, PLACE_READ_ALL, TASKS_READ_WRITE, USER_READ_BASIC_ALL,
 };
 pub use todo::client::TodoClient;
 pub use todo::session::{run_todo_session, TodoCommand, TodoEvent};
@@ -51,3 +53,4 @@ pub use todo::{
     checklist_item_from_graph, graph_todo_calendar_id, graph_todo_list_id, linked_resource_from_graph, task_to_todo_body, todo_list_from_graph, todo_task_from_graph,
     ChecklistStep, LinkedResource, TodoList, GRAPH_TODO_PREFIX, WELL_KNOWN_DEFAULT_LIST, WELL_KNOWN_FLAGGED_EMAIL,
 };
+pub use users::{resolve_user, GraphUser};

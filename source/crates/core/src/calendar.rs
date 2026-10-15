@@ -147,6 +147,14 @@ pub struct CalendarInfo {
     /// collection instead of silently hiding the calendar's tasks).
     #[serde(default)]
     pub supports_tasks: bool,
+    /// The mailbox that owns this calendar, when it isn't the signed-in user -
+    /// a shared or delegated calendar opened from another user's mailbox
+    /// (CAL-25). Graph builds the calendar's path as
+    /// `users/{owner}/calendars/{id}` (and its events as `users/{owner}/events/
+    /// {id}`) when this is set, instead of the account's own `/me/...`. `None`
+    /// for the account's own calendars and for every non-Graph (CalDAV) source.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// One VEVENT as it exists on the server: for a recurring event this is the

@@ -78,6 +78,35 @@ pub struct InferenceOverride {
     pub sender: EmailAddress,
 }
 
+/// One folder in a shared mailbox added by address (item 5.6 / M-42):
+/// `GET /users/{id}/mailFolders`, mapped to what the folder pane needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedMailFolder {
+    /// The folder's Graph id (`/users/{id}/mailFolders/{folder_id}/messages`).
+    pub id: String,
+    pub display_name: String,
+    /// The parent folder's Graph id, or `None` for a top-level folder.
+    pub parent_id: Option<String>,
+    /// Total and unread item counts, for the folder row's badge.
+    pub total: u32,
+    pub unread: u32,
+}
+
+/// Maps a Graph `mailFolder` to a [`SharedMailFolder`], or `None` when it has
+/// no id or name.
+pub fn shared_mail_folder_from_graph(value: &Value) -> Option<SharedMailFolder> {
+    let id = value.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
+    let display_name = value.get("displayName").and_then(Value::as_str).filter(|n| !n.trim().is_empty())?.to_string();
+    let parent_id = value.get("parentFolderId").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_string);
+    Some(SharedMailFolder {
+        id: id.to_string(),
+        display_name,
+        parent_id,
+        total: value.get("totalItemCount").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
+        unread: value.get("unreadItemCount").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
+    })
+}
+
 /// The Graph id of a `/delta` tombstone (`{"id": "…", "@removed": {…}}`), or
 /// `None` for a live record.
 pub fn removed_id(value: &Value) -> Option<String> {
@@ -359,6 +388,24 @@ mod tests {
         assert_eq!(InferenceClassification::from_graph("FOCUSED"), Some(InferenceClassification::Focused));
         assert_eq!(InferenceClassification::from_graph("nonsense"), None);
         assert_eq!(InferenceClassification::default(), InferenceClassification::Focused);
+    }
+
+    #[test]
+    fn the_captured_shared_mail_folders_fixture_maps() {
+        let page: Value = serde_json::from_str(include_str!("../../../../test-fixtures/outlook/shared-mail-folders.json")).unwrap();
+        let folders: Vec<SharedMailFolder> = page["value"].as_array().unwrap().iter().filter_map(shared_mail_folder_from_graph).collect();
+        assert_eq!(folders.len(), 3);
+        assert_eq!(folders[0].display_name, "Inbox");
+        assert_eq!(folders[0].total, 42);
+        assert_eq!(folders[0].unread, 3);
+        assert_eq!(folders[0].parent_id.as_deref(), Some("AAAAMAILFOLDERROOT"));
+        assert_eq!(folders[1].display_name, "Drafts");
+    }
+
+    #[test]
+    fn a_shared_mail_folder_without_an_id_or_name_is_skipped() {
+        assert!(shared_mail_folder_from_graph(&json!({ "displayName": "No id" })).is_none());
+        assert!(shared_mail_folder_from_graph(&json!({ "id": "f" })).is_none());
     }
 
     #[test]

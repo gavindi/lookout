@@ -308,6 +308,7 @@ pub(crate) fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiS
                         href: sub.url.clone(),
                         // Feeds are events-only - never a task target.
                         supports_tasks: false,
+                        owner: None,
                     })
                     .collect(),
                 status: None,
@@ -330,6 +331,7 @@ pub(crate) fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiS
                     href: String::new(),
                     // Events-only, like feeds - never a task target.
                     supports_tasks: false,
+                    owner: None,
                 }],
                 status: None,
             });
@@ -719,6 +721,17 @@ pub(crate) fn calendar_account_label(state: &Rc<RefCell<CalendarUiState>>, accou
         .get(account_id)
         .map(|h| h.display_name.clone())
         .unwrap_or_else(|| account_id.0.clone())
+}
+
+/// The first calendar the user can share - an own (non-delegated) calendar of
+/// a connected Microsoft 365 account (item 5.6 / CAL-24). `None` when the
+/// account has no Graph calendars (so the caller explains that sharing is a
+/// Microsoft 365 feature).
+pub(crate) fn first_shareable_calendar(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Option<CalendarInfo> {
+    let st = calendar_state.borrow();
+    let mut handles: Vec<&CalendarAccountHandle> = st.accounts.values().filter(|h| h.graph).collect();
+    handles.sort_by_key(|h| h.display_name.to_lowercase());
+    handles.into_iter().find_map(|h| h.calendars.iter().find(|c| c.owner.is_none()).cloned())
 }
 
 /// The `(label, id)` list the event editor's calendar picker shows: every
@@ -2348,8 +2361,208 @@ pub(crate) fn show_calendar_dialog(
         }
     });
 
+    // --- Open another user's calendar (item 5.6 / CAL-25): resolve the
+    // address through Graph, list that user's calendars, and add the chosen
+    // one to this account (the calendars sync in through
+    // `CalendarCommand::SetSharedCalendars`). Only offered once a Microsoft 365
+    // account with Graph access is connected.
+    let shared_address_entry = adw::EntryRow::builder().title("Name or email address").build();
+    let shared_continue_button = gtk::Button::with_label("Continue");
+    shared_continue_button.set_halign(gtk::Align::End);
+    let shared_status = gtk::Label::builder()
+        .label("Enter someone's address to see their calendars")
+        .xalign(0.0)
+        .css_classes(["dim-label", "caption"])
+        .wrap(true)
+        .build();
+    let shared_calendar_dropdown = gtk::DropDown::builder().build();
+    shared_calendar_dropdown.set_sensitive(false);
+    let shared_add_button = gtk::Button::with_label("Add");
+    shared_add_button.add_css_class("suggested-action");
+    shared_add_button.set_halign(gtk::Align::End);
+    shared_add_button.set_sensitive(false);
+    let shared_group = adw::PreferencesGroup::builder().title("Open another user's calendar").build();
+    shared_group.add(&shared_address_entry);
+    shared_group.add(&shared_continue_button);
+    shared_group.add(&shared_status);
+    shared_group.add(&shared_calendar_dropdown);
+    shared_group.add(&shared_add_button);
+    // (display name, owner id, calendar id) for each listed calendar.
+    let shared_candidates: Rc<RefCell<Vec<(String, String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    let shared_address: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+    shared_continue_button.connect_clicked({
+        let calendar_state = calendar_state.clone();
+        let shared_address_entry = shared_address_entry.clone();
+        let shared_status = shared_status.clone();
+        let shared_calendar_dropdown = shared_calendar_dropdown.clone();
+        let shared_add_button = shared_add_button.clone();
+        let shared_candidates = shared_candidates.clone();
+        let shared_address = shared_address.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            let address = shared_address_entry.text().trim().to_string();
+            if address.is_empty() {
+                return;
+            }
+            let Some(parent) = first_shareable_calendar(&calendar_state) else {
+                toast_overlay.add_toast(adw::Toast::new("Opening another user's calendar needs a Microsoft 365 account with Outlook access"));
+                return;
+            };
+            let account_id = parent.account_id.clone();
+            let client = crate::graph_calendar_share::GraphCalendarShareClient::new(account_id.clone());
+            let shared_status = shared_status.clone();
+            let shared_calendar_dropdown = shared_calendar_dropdown.clone();
+            let shared_add_button = shared_add_button.clone();
+            let shared_candidates = shared_candidates.clone();
+            let shared_address = shared_address.clone();
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                shared_status.set_label("Looking up…");
+                let user = match client.resolve_user(&address).await {
+                    Ok(Some(user)) => user,
+                    Ok(None) => {
+                        shared_status.set_label("No such person in your organization");
+                        return;
+                    }
+                    Err(e) => {
+                        shared_status.set_label("Couldn't look them up");
+                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't look them up: {e}"))));
+                        return;
+                    }
+                };
+                match client.list_calendars(&account_id, &user.id).await {
+                    Ok(calendars) if calendars.is_empty() => {
+                        shared_status.set_label("They have no calendars you can open");
+                    }
+                    Ok(calendars) => {
+                        let labels: Vec<String> = calendars.iter().map(|c| c.display_name.clone()).collect();
+                        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                        shared_calendar_dropdown.set_model(Some(&gtk::StringList::new(&label_refs)));
+                        shared_calendar_dropdown.set_selected(0);
+                        shared_calendar_dropdown.set_sensitive(true);
+                        shared_add_button.set_sensitive(true);
+                        *shared_candidates.borrow_mut() = calendars.iter().map(|c| (c.display_name.clone(), user.id.clone(), c.href.clone())).collect();
+                        *shared_address.borrow_mut() = address.clone();
+                        shared_status.set_label(&format!("{} calendar(s) found", calendars.len()));
+                    }
+                    Err(e) => {
+                        shared_status.set_label("Couldn't list their calendars");
+                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't list their calendars: {e}"))));
+                    }
+                }
+            });
+        }
+    });
+
+    shared_add_button.connect_clicked({
+        let calendar_state = calendar_state.clone();
+        let app_config = app_config.clone();
+        let shared_calendar_dropdown = shared_calendar_dropdown.clone();
+        let shared_candidates = shared_candidates.clone();
+        let shared_address = shared_address.clone();
+        let shared_status = shared_status.clone();
+        let toast_overlay = toast_overlay.clone();
+        move |_| {
+            let Some(parent) = first_shareable_calendar(&calendar_state) else {
+                return;
+            };
+            let index = shared_calendar_dropdown.selected() as usize;
+            let Some((name, owner_id, calendar_id)) = shared_candidates.borrow().get(index).cloned() else {
+                return;
+            };
+            let address = shared_address.borrow().clone();
+            let shared = crate::app_config::SharedCalendar {
+                id: format!("{}{}", crate::app_config::SHARED_CALENDAR_ID_PREFIX, uuid::Uuid::new_v4()),
+                parent_account: parent.account_id.clone(),
+                address,
+                owner_id,
+                calendar_id,
+                display_name: name.clone(),
+            };
+            {
+                let mut config = app_config.borrow_mut();
+                config.shared_calendars.push(shared);
+                crate::app_config::save(&config);
+            }
+            // Push the account's full owner set to the running Graph session.
+            let owners: Vec<String> = app_config
+                .borrow()
+                .shared_calendars
+                .iter()
+                .filter(|sc| sc.parent_account == parent.account_id)
+                .map(|sc| sc.owner_id.clone())
+                .collect();
+            if let Some(handle) = calendar_state.borrow().accounts.get(&parent.account_id) {
+                let _ = handle.cmd_tx.send_blocking(CalendarCommand::SetSharedCalendars { owners });
+            }
+            shared_status.set_label(&format!("Added {name} - syncing…"));
+            toast_overlay.add_toast(adw::Toast::new(&format!("Added {name} - syncing…")));
+        }
+    });
+
+    // --- Manage the shared/delegated calendars already added, each with a
+    // Remove that drops it from `settings.json` and re-pushes the account's
+    // owner set to the running session.
+    let shared_manage_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let shared_manage_group = adw::PreferencesGroup::builder().title("Shared calendars").build();
+    shared_manage_group.add(&shared_manage_box);
+    for shared in app_config.borrow().shared_calendars.clone() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let label = gtk::Label::builder()
+            .label(format!("{} ({})", shared.display_name, shared.address))
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove.add_css_class("flat");
+        remove.set_tooltip_text(Some("Remove shared calendar"));
+        remove.connect_clicked({
+            let app_config = app_config.clone();
+            let calendar_state = calendar_state.clone();
+            let toast_overlay = toast_overlay.clone();
+            let row = row.clone();
+            let parent_account = shared.parent_account.clone();
+            let id = shared.id.clone();
+            move |_| {
+                {
+                    let mut config = app_config.borrow_mut();
+                    config.shared_calendars.retain(|s| s.id != id);
+                    crate::app_config::save(&config);
+                }
+                let owners: Vec<String> = app_config
+                    .borrow()
+                    .shared_calendars
+                    .iter()
+                    .filter(|sc| sc.parent_account == parent_account)
+                    .map(|sc| sc.owner_id.clone())
+                    .collect();
+                if let Some(handle) = calendar_state.borrow().accounts.get(&parent_account) {
+                    let _ = handle.cmd_tx.send_blocking(CalendarCommand::SetSharedCalendars { owners });
+                }
+                row.set_visible(false);
+                toast_overlay.add_toast(adw::Toast::new("Shared calendar removed"));
+            }
+        });
+        row.append(&label);
+        row.append(&remove);
+        shared_manage_box.append(&row);
+    }
+    if shared_manage_box.first_child().is_none() {
+        shared_manage_box.append(
+            &gtk::Label::builder()
+                .label("No shared calendars yet")
+                .xalign(0.0)
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+    }
+
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     content.append(&subscribe_group);
+    content.append(&shared_group);
+    content.append(&shared_manage_group);
     content.append(&holiday_group);
     content.append(&import_group);
     content.append(&manage_group);

@@ -3499,7 +3499,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     filter_button.set_sensitive(false);
     let share_button = gtk::Button::from_icon_name("send-to-symbolic");
     share_button.set_tooltip_text(Some("Share"));
-    share_button.set_sensitive(false);
     let print_button = gtk::Button::from_icon_name("printer-symbolic");
     print_button.set_tooltip_text(Some("Print"));
     let calendar_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
@@ -7782,6 +7781,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                     )
                                 };
                                 if let (Some(goa_client), Some(goa_account)) = (goa_client.clone(), goa_calendar) {
+                                    let shared_owners = crate::window::connect::shared_owners_for(&state, &account_id);
                                     connect_calendar_account(
                                         worker.clone(),
                                         calendar_state.clone(),
@@ -7795,6 +7795,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                         goa_client,
                                         goa_account,
                                         tasks_view.clone(),
+                                        shared_owners,
                                     );
                                 }
                                 // ...and its Microsoft 365 contacts (item 5.2 /
@@ -9803,6 +9804,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &toast_overlay,
             );
         });
+    }
+
+    // --- Calendar Home ribbon "Share" -> the calendar-sharing dialog for the
+    // user's Microsoft 365 calendar (item 5.6 / CAL-24).
+    {
+        let window = window.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        share_button
+            .clone()
+            .connect_clicked(move |_| match calendar_glue::first_shareable_calendar(&calendar_state) {
+                Some(calendar) => crate::calendar_share::show_share_calendar_dialog(&window, calendar, &toast_overlay),
+                None => toast_overlay.add_toast(adw::Toast::new("Sharing is available for Microsoft 365 calendars")),
+            });
     }
 
     // --- Webcal feed session: one poller for every configured subscription,

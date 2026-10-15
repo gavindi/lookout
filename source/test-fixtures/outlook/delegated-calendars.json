@@ -1,0 +1,7 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('ada%40example.com')/calendars",
+  "value": [
+    { "id": "AAAACALADA1", "name": "Ada's Calendar", "hexColor": "#0F6CBD", "isDefaultCalendar": true },
+    { "id": "AAAACALADA2", "name": "Team Events", "hexColor": "#008000", "isDefaultCalendar": false }
+  ]
+}

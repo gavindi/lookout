@@ -229,6 +229,10 @@ async fn connect_and_run(
                 // (or applied server-side under RFC 6638), never a calendar
                 // command - nothing to do here.
                 CalendarCommand::RespondInvitation { .. } => {}
+                // Shared/delegated calendars are a Graph concept (item 5.6 /
+                // CAL-25); a CalDAV account has no equivalent read, so there's
+                // nothing to do.
+                CalendarCommand::SetSharedCalendars { .. } => {}
                 CalendarCommand::FetchFreeBusy {
                     organizer,
                     attendees,
@@ -628,6 +632,7 @@ mod tests {
             color: None,
             href: href.to_string(),
             supports_tasks: true,
+            owner: None,
         }
     }
 

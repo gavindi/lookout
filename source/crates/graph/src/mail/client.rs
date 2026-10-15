@@ -24,7 +24,10 @@ use chrono::{DateTime, Utc};
 use crate::client::{page_items, GraphClient};
 use crate::error::{GraphError, Result};
 
-use super::{outgoing_message_body, override_body, override_from_graph, InferenceClassification, InferenceOverride, MessageDelta, MessageProperties, OutgoingMessage};
+use super::{
+    outgoing_message_body, override_body, override_from_graph, shared_mail_folder_from_graph, InferenceClassification, InferenceOverride, MessageDelta, MessageProperties,
+    OutgoingMessage, SharedMailFolder,
+};
 
 /// `Prefer: IdType="ImmutableId"` - see the module notes.
 const IMMUTABLE_ID: [(&str, &str); 1] = [("Prefer", "IdType=\"ImmutableId\"")];
@@ -36,6 +39,8 @@ const PROPERTY_SELECT: &str = "$select=id,internetMessageId,categories,flag,impo
 /// Most sender overrides read for one account. Graph itself caps a mailbox at
 /// 1000 overrides.
 const MAX_OVERRIDES: usize = 1000;
+/// Most folders read for one shared mailbox (item 5.6 / M-42).
+const MAX_SHARED_FOLDERS: usize = 1000;
 
 /// The mail-property HTTP operations, over a shared [`GraphClient`].
 pub struct MailClient {
@@ -123,6 +128,26 @@ impl MailClient {
     pub async fn send_scheduled(&self, message: &OutgoingMessage, deferred_send_at: Option<DateTime<Utc>>) -> Result<()> {
         let body = json!({ "message": outgoing_message_body(message, deferred_send_at) });
         self.graph.post("me/sendMail", &body).await.map(|_| ())
+    }
+
+    /// Sends `message` **as** a shared mailbox (`owner`, a Graph user id or
+    /// address) through `POST /users/{owner}/sendMail` (item 5.6 / M-42).
+    /// Needs the `Mail.Send.Shared` scope (`GraphFeature::SharedMailboxes`).
+    pub async fn send_mail_as(&self, owner: &str, message: &OutgoingMessage, deferred_send_at: Option<DateTime<Utc>>) -> Result<()> {
+        let body = json!({ "message": outgoing_message_body(message, deferred_send_at) });
+        self.graph.post(&format!("users/{}/sendMail", encode_segment(owner)), &body).await.map(|_| ())
+    }
+
+    /// A shared mailbox's folders (`GET /users/{owner}/mailFolders`,
+    /// item 5.6 / M-42). Needs the `Mail.ReadWrite.Shared` scope
+    /// (`GraphFeature::SharedMailboxes`).
+    pub async fn list_mail_folders(&self, owner: &str) -> Result<Vec<SharedMailFolder>> {
+        let path = format!(
+            "users/{}/mailFolders?$top=100&$select=id,displayName,parentFolderId,totalItemCount,unreadItemCount",
+            encode_segment(owner)
+        );
+        let items = self.graph.get_all(&path, MAX_SHARED_FOLDERS).await?;
+        Ok(items.iter().filter_map(shared_mail_folder_from_graph).collect())
     }
 
     /// The account's Focused / Other sender overrides (M-03).
@@ -376,6 +401,48 @@ mod tests {
         };
         let at = "2026-10-17T08:00:00Z".parse::<DateTime<Utc>>().unwrap();
         client(&server).send_scheduled(&message, Some(at)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_mail_folders_reads_a_shared_mailbox() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/users/support%40example.com/mailFolders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{ "id": "inbox", "displayName": "Inbox", "totalItemCount": 5, "unreadItemCount": 2 }]
+            })))
+            .mount(&server)
+            .await;
+
+        let folders = client(&server).list_mail_folders("support@example.com").await.unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].display_name, "Inbox");
+        assert_eq!(folders[0].unread, 2);
+    }
+
+    #[tokio::test]
+    async fn send_mail_as_posts_under_the_shared_mailbox() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/users/support%40example.com/sendMail"))
+            .and(body_partial_json(json!({ "message": { "subject": "From support" } })))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let message = OutgoingMessage {
+            subject: "From support".to_string(),
+            text_body: "hi".to_string(),
+            html_body: None,
+            importance: Importance::Normal,
+            to: vec![EmailAddress::new("a@b.example")],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: Vec::new(),
+            attachments: Vec::new(),
+            inline_images: Vec::new(),
+        };
+        client(&server).send_mail_as("support@example.com", &message, None).await.unwrap();
     }
 
     #[tokio::test]
