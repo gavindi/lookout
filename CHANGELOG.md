@@ -13,6 +13,10 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.203] - 2026-10-15
+**Reference**: Microsoft 365 — Graph calendar transport (Phase 5, items 6–8 / A-03)
+**Summary**: The mapping module becomes `crates/graph/src/calendar/mod.rs` beside a new `crates/graph/src/calendar/client.rs`, and `crates/graph/src/{client,lib}.rs` are touched; no data-format change. A `CalendarClient` over the Graph transport implements the calendar HTTP operations: `list_calendars` (`/me/calendars`), `calendar_view` (`/me/calendars/{id}/calendarView`, Graph-expanded occurrences), `calendar_view_delta` (the `/delta` cursor form, whose returned link the session persists), and `create_event`/`update_event`/`delete_event` (POST, and PATCH/DELETE guarded by the event's `changeKey` via `If-Match`, with `Prefer: return=representation` for the updated copy). `GraphClient` gains `patch_with_headers`/`delete_with_headers` for those request headers. Every method returns `lookout-core` types through the item-5 mapping, and Graph ids are percent-encoded into the URL path. Covered by 9 new `calendar::client` wiremock tests.
+
 ## [v0.9.202] - 2026-10-15
 **Reference**: Microsoft 365 — detect Microsoft 365 calendar accounts (Phase 5, item 5.1 / A-03)
 **Summary**: Touches `crates/goa/src/discovery.rs`, `crates/goa/tests/fake_goa.rs` and `crates/app/src/window.rs`; no data-format change. GOA reports a Microsoft 365 account's `Calendar` interface with an empty `Uri` (its calendar is modelled as Graph/EWS), which the parser previously dropped. `parse_calendar_account` now keeps such accounts, and a new `GoaCalendarAccount::is_microsoft_365()` (sharing the provider-type predicate with the mail path) flags them so the app can route them to the Graph calendar backend. Until that backend lands the app's calendar discovery skips them, so no CalDAV session is attempted against an empty URL and today's behaviour (no Microsoft 365 calendar yet) is unchanged. The fake-GOA D-Bus test now asserts the account is listed and flagged.

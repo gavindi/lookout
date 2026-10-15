@@ -7,9 +7,10 @@
 //! one place the two are translated, so neither the session actor nor the
 //! feature code hard-codes Graph property names (§10 "Interop strings").
 //!
-//! Deliberately pure - no HTTP, no `GraphClient` - so every rule is
-//! unit-testable against inline JSON. The session (`calendar::session` in a
-//! later item) owns paging, delta and the command loop.
+//! This module is deliberately pure - no HTTP, no `GraphClient` - so every
+//! rule is unit-testable against inline JSON. The HTTP transport lives in
+//! [`client`] (`CalendarClient`), and the actor that drives it
+//! (`calendar::session`, a later item) owns the command loop.
 //!
 //! Deferred to their own items, and therefore mapped as `None`/ignored here:
 //! - **Recurrence** (`recurrence` ⇄ the model's raw `RRULE`): item 9. A
@@ -24,6 +25,8 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+pub mod client;
+
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use lookout_core::{
     AccountId, Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarInfo, EmailAddress, EventOccurrence, EventSensitivity, EventUid,

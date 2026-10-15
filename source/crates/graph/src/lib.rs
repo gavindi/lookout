@@ -22,6 +22,7 @@ pub mod error;
 pub mod scopes;
 
 pub use auth::TokenProvider;
+pub use calendar::client::CalendarClient;
 pub use calendar::{
     attendee_from_graph, attendee_to_graph, calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph,
     parse_graph_date_time, parse_graph_date_time_str,

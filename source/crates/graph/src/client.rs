@@ -73,25 +73,38 @@ impl GraphClient {
 
     /// A single `GET` returning the parsed JSON body.
     pub async fn get(&self, path: &str) -> Result<Value> {
-        self.send_json(Method::GET, path, None).await
+        self.send_json(Method::GET, path, None, &[]).await
     }
 
     /// A `PATCH` with a JSON body, returning the parsed response body (Graph
     /// returns the updated resource, or an empty body for some endpoints,
     /// which surfaces as `Value::Null`).
     pub async fn patch(&self, path: &str, body: &Value) -> Result<Value> {
-        self.send_json(Method::PATCH, path, Some(body)).await
+        self.send_json(Method::PATCH, path, Some(body), &[]).await
+    }
+
+    /// A `PATCH` carrying extra request headers (`If-Match` against a
+    /// `changeKey`, `Prefer: return=representation`, …), returning the parsed
+    /// response body. The calendar backend's event updates use it.
+    pub async fn patch_with_headers(&self, path: &str, body: &Value, headers: &[(&str, &str)]) -> Result<Value> {
+        self.send_json(Method::PATCH, path, Some(body), headers).await
     }
 
     /// A `POST` with a JSON body.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        self.send_json(Method::POST, path, Some(body)).await
+        self.send_json(Method::POST, path, Some(body), &[]).await
     }
 
     /// A `DELETE` (Graph returns `204 No Content`; the body surfaces as
     /// `Value::Null`). Used to remove a `masterCategory` (item 2.1).
     pub async fn delete(&self, path: &str) -> Result<Value> {
-        self.send_json(Method::DELETE, path, None).await
+        self.send_json(Method::DELETE, path, None, &[]).await
+    }
+
+    /// A `DELETE` carrying extra request headers (e.g. `If-Match` against a
+    /// `changeKey`).
+    pub async fn delete_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Result<Value> {
+        self.send_json(Method::DELETE, path, None, headers).await
     }
 
     /// Follows `@odata.nextLink` until the collection ends or `max_items` is
@@ -139,12 +152,15 @@ impl GraphClient {
 
     /// The token-authenticated request loop: sends the request, waits out
     /// throttling, and maps the response into [`GraphError`].
-    async fn send_json(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
+    async fn send_json(&self, method: Method, path: &str, body: Option<&Value>, headers: &[(&str, &str)]) -> Result<Value> {
         let url = self.absolute(path);
         let mut attempt = 0u32;
         loop {
             let token = self.tokens.graph_token().await?;
             let mut request = self.http.request(method.clone(), &url).bearer_auth(token);
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
             if let Some(body) = body {
                 request = request.json(body);
             }
