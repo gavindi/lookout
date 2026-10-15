@@ -17,8 +17,8 @@
 //!   is a separate backend, item 5.3), so task commands report empty/soft
 //!   failures rather than a hard error.
 //!
-//! Free/busy (`FetchFreeBusy`) is answered softly until the Graph
-//! `getSchedule` work (item 14) lands.
+//! Free/busy (`FetchFreeBusy`) is answered through Graph `getSchedule`
+//! (item 14).
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -211,16 +211,25 @@ async fn connect_and_run(
                         ))
                         .await;
                 }
-                CalendarCommand::FetchFreeBusy { request_id, .. } => {
-                    // Soft failure: the app falls back to the organizer's own
-                    // calendars until Graph `getSchedule` lands (item 14).
-                    let _ = events
-                        .send(CalendarSessionEvent::FreeBusyFailed {
-                            request_id,
-                            message: "Microsoft 365 free/busy isn't available yet".to_string(),
-                        })
-                        .await;
-                }
+                CalendarCommand::FetchFreeBusy {
+                    attendees,
+                    start,
+                    end,
+                    request_id,
+                    ..
+                } => match client.get_schedule(&attendees, start, end).await {
+                    Ok(availabilities) => {
+                        let _ = events.send(CalendarSessionEvent::FreeBusyUpdated { request_id, availabilities }).await;
+                    }
+                    Err(e) => {
+                        let _ = events
+                            .send(CalendarSessionEvent::FreeBusyFailed {
+                                request_id,
+                                message: e.to_string(),
+                            })
+                            .await;
+                    }
+                },
             }
         }
     }

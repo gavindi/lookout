@@ -13,6 +13,13 @@ New entries follow this style:
 **Summary**: scope/files; a plain, human-readable description of the change - keep it short.
 ```
 
+## [v0.9.210] - 2026-10-15
+**Reference**: Microsoft 365 — Graph free/busy (Phase 5, item 14 / CAL-19)
+**Summary**: Touches `crates/graph/src/calendar/{client,session}.rs`; no data-format change. `CalendarClient::get_schedule` calls `POST /me/calendar/getSchedule` and maps the answer onto `lookout_core`'s availability model: one `AttendeeAvailability` per requested attendee in order, each `scheduleItem` becoming a `FreeBusyInterval` with the five-state show-as, and an attendee Graph didn't resolve marked `unknown`, so the editor shows "no data" rather than "free". The Graph session now answers `FetchFreeBusy` with `FreeBusyUpdated` (previously a soft failure), so the event editor's Scheduling Assistant tab and Suggested times work for Microsoft 365 accounts as they already do for RFC 6638 CalDAV. Covered by a new `calendar::client` test.
+
+**Reference**: Microsoft 365 — Graph rooms (Phase 5, item 15 / CAL-19)
+**Summary**: Touches `crates/graph/src/calendar/client.rs` and `crates/graph/src/lib.rs`; no data-format change. `CalendarClient::list_rooms` reads the tenant's bookable rooms from `GET /places/microsoft.graph.room` (needs the `Place.Read.All` / `GraphFeature::Rooms` scope), returning each room's display name and SMTP address for the editor's room suggestions. The editor wiring that consumes them is a follow-up. Covered by a new `calendar::client` test.
+
 ## [v0.9.209] - 2026-10-15
 **Reference**: Microsoft 365 — Graph RSVP command (Phase 5, item 12 / CAL-15, CAL-17)
 **Summary**: Touches `crates/core/src/calendar_protocol.rs`, `crates/graph/src/calendar/{client,session}.rs` and `crates/dav/src/session.rs`; no data-format change. The shared calendar contract gains `CalendarCommand::RespondInvitation` (with `InvitationResponse` and `ProposedTime`), mapping to Graph's own RSVP actions (`/me/events/{id}/accept|tentativelyAccept|decline`, with `sendResponse`, `comment` and an iTIP `proposedNewTime` COUNTER). The Graph session dispatches it and resyncs; the CalDAV session treats it as a no-op, since CalDAV RSVP is an iMIP REPLY sent by the app. Covered by 2 new `calendar::client` tests.

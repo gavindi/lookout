@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.210" date="2026-10-15">
+      <description>
+        <p>The Scheduling Assistant can now check colleagues' availability for Microsoft 365 accounts, and Lookout can list your organisation's bookable rooms.</p>
+      </description>
+    </release>
     <release version="0.9.209" date="2026-10-15">
       <description>
         <p>Meeting invitations in a Microsoft 365 calendar can now be accepted, tentatively accepted or declined through Microsoft, with your reply sent to the organizer.</p>

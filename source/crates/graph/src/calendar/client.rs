@@ -13,19 +13,34 @@
 /// Software released under the GPL3 license
 use chrono::{DateTime, Utc};
 use lookout_core::calendar_protocol::{InvitationResponse, ProposedTime};
-use lookout_core::{AccountId, CalendarEvent, CalendarInfo, EventOccurrence};
-use serde_json::json;
+use lookout_core::{AccountId, AttendeeAvailability, BusyStatus, CalendarEvent, CalendarInfo, EmailAddress, EventOccurrence, FreeBusyInterval};
+use serde_json::{json, Value};
 
 use crate::client::{DeltaPage, GraphClient};
 use crate::error::{GraphError, Result};
 
-use super::{calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph};
+use super::{calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph, parse_graph_date_time};
+
+/// One room from the tenant directory (`/places/microsoft.graph.room`,
+/// item 15 / CAL-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Room {
+    pub display_name: String,
+    pub address: String,
+}
+
+/// The `availabilityViewInterval` (minutes) Graph quantises free/busy to. The
+/// app ignores the `availabilityView` string and uses the exact
+/// `scheduleItems`, so this only shapes Graph's response.
+const AVAILABILITY_INTERVAL_MINUTES: u32 = 30;
 
 /// Most event instances read for one calendar-view window - a guard against an
 /// unbounded recurring series.
 const MAX_EVENT_INSTANCES: usize = 5000;
 /// Most calendars read for one account.
 const MAX_CALENDARS: usize = 500;
+/// Most rooms read from the tenant directory.
+const MAX_ROOMS: usize = 1000;
 
 /// The `$select` fields the calendar-view read needs (exactly what the mapper
 /// consumes, so full bodies aren't fetched).
@@ -129,6 +144,80 @@ impl CalendarClient {
         Ok(())
     }
 
+    /// Attendees' availability over `[start, end)` via
+    /// `POST /me/calendar/getSchedule` (item 14 / CAL-19). Returns one
+    /// [`AttendeeAvailability`] per requested attendee, in request order; an
+    /// attendee Graph didn't resolve (no `scheduleId` in the answer) is
+    /// `unknown`, so the UI shows "no data" rather than "free".
+    pub async fn get_schedule(&self, attendees: &[EmailAddress], start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<AttendeeAvailability>> {
+        // Deduplicate the requested addresses (Graph rejects/duplicates dupes)
+        // while preserving per-attendee result order below.
+        let schedules: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            attendees
+                .iter()
+                .map(|a| a.address.as_str())
+                .filter(|address| seen.insert(address.to_ascii_lowercase()))
+                .collect()
+        };
+        if schedules.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = json!({
+            "schedules": schedules,
+            "startTime": graph_date_time(start, None),
+            "endTime": graph_date_time(end, None),
+            "availabilityViewInterval": AVAILABILITY_INTERVAL_MINUTES,
+        });
+        let response = self.graph.post("me/calendar/getSchedule", &body).await?;
+
+        // Map each returned schedule to its busy intervals, keyed
+        // case-insensitively by address.
+        let mut resolved: std::collections::HashMap<String, Vec<FreeBusyInterval>> = std::collections::HashMap::new();
+        for entry in response.get("value").and_then(Value::as_array).into_iter().flatten() {
+            let Some(schedule_id) = entry.get("scheduleId").and_then(Value::as_str) else {
+                continue;
+            };
+            let intervals = entry
+                .get("scheduleItems")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(free_busy_interval)
+                .collect();
+            resolved.insert(schedule_id.to_ascii_lowercase(), intervals);
+        }
+
+        Ok(attendees
+            .iter()
+            .map(|attendee| match resolved.get(&attendee.address.to_ascii_lowercase()) {
+                Some(intervals) => AttendeeAvailability::new(attendee.clone(), intervals.clone()),
+                None => AttendeeAvailability::unknown(attendee.clone()),
+            })
+            .collect())
+    }
+
+    /// The tenant's bookable rooms (`GET /places/microsoft.graph.room`,
+    /// item 15 / CAL-19), for the editor's room suggestions. Needs the
+    /// `Place.Read.All` scope (`GraphFeature::Rooms`).
+    pub async fn list_rooms(&self) -> Result<Vec<Room>> {
+        let items = self
+            .graph
+            .get_all("places/microsoft.graph.room?$top=100&$select=id,displayName,emailAddress", MAX_ROOMS)
+            .await?;
+        Ok(items
+            .iter()
+            .filter_map(|value| {
+                let address = value.get("emailAddress")?.as_str()?.to_string();
+                if address.trim().is_empty() {
+                    return None;
+                }
+                let display_name = value.get("displayName").and_then(Value::as_str).unwrap_or(&address).to_string();
+                Some(Room { display_name, address })
+            })
+            .collect())
+    }
+
     /// `/me/calendars/{id}/calendarView?startDateTime=…`, encoded and windowed.
     fn view_path(&self, calendar: &CalendarInfo, start: DateTime<Utc>, end: DateTime<Utc>) -> String {
         format!(
@@ -148,6 +237,15 @@ impl CalendarClient {
             iso8601(end),
         )
     }
+}
+
+/// One Graph `scheduleItem` as a [`FreeBusyInterval`], or `None` when it has no
+/// resolvable time span.
+fn free_busy_interval(value: &Value) -> Option<FreeBusyInterval> {
+    let start = parse_graph_date_time(value.get("start")?)?.0;
+    let end = parse_graph_date_time(value.get("end")?)?.0;
+    let status = value.get("status").and_then(Value::as_str).and_then(BusyStatus::from_graph).unwrap_or_default();
+    Some(FreeBusyInterval { start, end, status })
 }
 
 /// A Graph-required calendar-view bound: `2026-10-15T00:00:00Z`.
@@ -414,6 +512,50 @@ mod tests {
             .respond_invitation("ev1", InvitationResponse::Decline, None, false, Some(proposed))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_schedule_maps_resolved_attendees_and_marks_others_unknown() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/calendar/getSchedule"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{
+                    "scheduleId": "bob@example.com",
+                    "scheduleItems": [{
+                        "status": "busy",
+                        "start": { "dateTime": "2026-10-15T09:00:00", "timeZone": "UTC" },
+                        "end": { "dateTime": "2026-10-15T10:00:00", "timeZone": "UTC" }
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let attendees = vec![EmailAddress::new("bob@example.com"), EmailAddress::new("ghost@example.com")];
+        let availabilities = client(&server).get_schedule(&attendees, utc(2026, 10, 15), utc(2026, 10, 16)).await.unwrap();
+        assert_eq!(availabilities.len(), 2, "one per requested attendee, in order");
+        assert!(!availabilities[0].unknown);
+        assert_eq!(availabilities[0].intervals.len(), 1);
+        assert_eq!(availabilities[0].intervals[0].status, BusyStatus::Busy);
+        assert!(availabilities[1].unknown, "an unresolved attendee is unknown, not free");
+    }
+
+    #[tokio::test]
+    async fn list_rooms_maps_the_directory() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/places/microsoft.graph.room"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{ "id": "r1", "displayName": "Room 4", "emailAddress": "room4@example.com" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let rooms = client(&server).list_rooms().await.unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].display_name, "Room 4");
+        assert_eq!(rooms[0].address, "room4@example.com");
     }
 
     #[test]

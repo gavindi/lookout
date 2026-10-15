@@ -22,7 +22,7 @@ pub mod error;
 pub mod scopes;
 
 pub use auth::TokenProvider;
-pub use calendar::client::CalendarClient;
+pub use calendar::client::{CalendarClient, Room};
 pub use calendar::recurrence::{recurrence_from_graph, rrule_to_graph};
 pub use calendar::session::run_calendar_session;
 pub use calendar::{
