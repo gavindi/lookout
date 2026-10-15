@@ -1312,6 +1312,12 @@ pub(crate) fn spawn_account_event_loop(
                         refresh_flagged_mail(&state);
                         refresh_follow_up_banner(&state, &message_list, &reading_stack);
                     }
+                    // The session has already stored these in the cache and
+                    // repainted; carrying them to Outlook through Graph is the
+                    // item-5.4 app sprint.
+                    AccountEvent::CategoriesChanged { .. } => {}
+                    AccountEvent::ImportanceSet { .. } => {}
+                    AccountEvent::FocusedSet { .. } => {}
                     AccountEvent::MailboxCreated { mailbox } => {
                         // Open the new folder's parent, so it's visible once the
                         // re-list that follows lands in `FoldersUpdated`.

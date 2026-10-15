@@ -330,6 +330,17 @@ pub enum DraftReplace {
     ByUid { mailbox: MailboxId, uid: Uid },
 }
 
+/// How far a Focused/Other change (M-03) reaches: just the selected messages,
+/// or every message from their senders (a per-sender override, Outlook's
+/// "Always move…").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedScope {
+    /// Reclassify only the named messages.
+    Message,
+    /// Also record a per-sender override so future mail follows.
+    Sender,
+}
+
 #[derive(Debug)]
 pub enum AccountCommand {
     /// Select a mailbox and (re)fetch its envelopes.
@@ -639,6 +650,34 @@ pub enum AccountCommand {
         snapshot: Vec<(String, lookout_core::FollowUpFlag)>,
         taken_at: chrono::DateTime<chrono::Utc>,
     },
+    /// Sets `uids`' importance (M-12). There is no IMAP way to change a
+    /// message's importance header, so it is stored in the cache's local
+    /// overlay and answered by `ImportanceSet` plus a list repaint; the app
+    /// mirrors it to Graph on Microsoft 365.
+    SetImportance {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        importance: lookout_core::Importance,
+    },
+    /// Sets `uids`' Focused/Other classification (M-03). `scope` reclassifies
+    /// just the named messages, or also records a per-sender override so
+    /// future mail from their senders follows. Answered by `FocusedSet`.
+    SetFocused {
+        mailbox: MailboxId,
+        uids: Vec<Uid>,
+        classification: lookout_core::InferenceClassification,
+        scope: FocusedScope,
+    },
+    /// Applies one incremental page of the `/me/messages/delta` feed (item
+    /// 5.4): each named message's non-default Outlook properties, the graph
+    /// ids of the tombstones (`removed_graph_ids`), and the fresh cursor.
+    /// Answered by a repaint of the open mailbox and the flagged-mail list.
+    ApplyRemoteMailProperties {
+        properties: Vec<crate::cache::RemoteMailProperties>,
+        removed_graph_ids: Vec<String>,
+        delta_cursor: Option<String>,
+        taken_at: chrono::DateTime<chrono::Utc>,
+    },
     /// Kick off background body prefetch for all mailboxes. The prefetch
     /// runs cooperatively in batches between IDLE cycles, fetching full
     /// message bodies and caching them on disk so subsequent message views
@@ -912,6 +951,30 @@ pub enum AccountEvent {
         message_ids: Vec<String>,
         flag: lookout_core::FollowUpFlag,
     },
+    /// A category (tag) change was stored (item 5.4 / M-09), on the server or
+    /// in the local overlay: the affected messages' `Message-ID`s and the
+    /// added/removed Lookout category *keys*, so the UI can mirror it to
+    /// Outlook through Graph whatever sent it - a toggle, a drag-drop, or its
+    /// undo.
+    CategoriesChanged {
+        message_ids: Vec<String>,
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
+    /// A `SetImportance` was stored (M-12): the affected messages' `Message-ID`s
+    /// and the new importance, for the app to mirror to Graph.
+    ImportanceSet {
+        message_ids: Vec<String>,
+        importance: lookout_core::Importance,
+    },
+    /// A `SetFocused` was stored (M-03): the affected messages' `Message-ID`s,
+    /// the new classification, and - for a `FocusedScope::Sender` change - the
+    /// sender whose override the app should create ("Always move…").
+    FocusedSet {
+        message_ids: Vec<String>,
+        classification: lookout_core::InferenceClassification,
+        sender: Option<lookout_core::EmailAddress>,
+    },
     /// Every cached message on the account carrying a follow-up flag, open
     /// or complete (item 1.16) - the Tasks view's "Flagged email". Emitted
     /// at session start (before connecting) and after each sync or flag
@@ -1009,6 +1072,41 @@ fn mention_matcher(cache: &CacheHandle) -> lookout_core::MentionMatcher {
         Some(cache) => cache.mention_matcher(),
         None => lookout_core::MentionMatcher::default(),
     }
+}
+
+/// Loads the cached summaries for `uids` (empty when uncached or cacheless) -
+/// what the item-5.4 property writes key on and report by `Message-ID`.
+async fn load_summaries_for(cache: &CacheHandle, mailbox: &MailboxId, uids: &[Uid]) -> Vec<EmailSummary> {
+    cache_op(cache, {
+        let mailbox = mailbox.clone();
+        let uids = uids.to_vec();
+        move |c| c.load_summaries(&mailbox, &uids)
+    })
+    .await
+    .and_then(|result| result.ok())
+    .map(|found| found.into_values().collect())
+    .unwrap_or_default()
+}
+
+/// The Lookout category keys among a list of `$Lookout-tag-<key>` atoms.
+fn tag_keys(atoms: &[String]) -> Vec<String> {
+    atoms.iter().filter_map(|atom| lookout_core::tag_key_from_keyword(atom).map(str::to_string)).collect()
+}
+
+/// Reports a stored category change (item 5.4) so the app can mirror it to
+/// Graph on Microsoft 365.
+async fn emit_categories_changed(events: &async_channel::Sender<AccountEvent>, summaries: &[EmailSummary], add: &[String], remove: &[String]) {
+    let message_ids: Vec<String> = summaries.iter().filter_map(|summary| summary.message_id.clone()).collect();
+    if message_ids.is_empty() {
+        return;
+    }
+    let _ = events
+        .send(AccountEvent::CategoriesChanged {
+            message_ids,
+            add: tag_keys(add),
+            remove: tag_keys(remove),
+        })
+        .await;
 }
 
 /// One row of the local outbox as the UI lists it (item 1.14): the payload's
@@ -3910,58 +4008,108 @@ async fn connect_and_run(
                     // command races a folder switch (or the unified view),
                     // so SELECT the message's own folder when needed; the
                     // top of the loop re-selects the user's folder before
-                    // the next IDLE wait.
-                    if session_selected != mailbox {
-                        session.select(&path).await?;
+                    // the next IDLE wait. The SELECT also learns whether the
+                    // folder keeps custom keywords (item 5.4): Exchange IMAP
+                    // doesn't, so the category lives in the cache overlay.
+                    if session_selected != mailbox || !keywords_ok.contains_key(&mailbox) {
+                        let accepts = select_accepting_keywords(&mut session, &path).await?;
                         session_selected = mailbox.clone();
+                        keywords_ok.insert(mailbox.clone(), accepts);
                     }
                     // Keywords are client-supplied atoms; drop anything that
                     // isn't one so a malformed atom can't be sent (servers
                     // are entitled to reject the whole STORE).
                     let add: Vec<String> = add.into_iter().filter(|k| valid_keyword_atom(k)).collect();
                     let remove: Vec<String> = remove.into_iter().filter(|k| valid_keyword_atom(k)).collect();
-                    match store_raw_flags(&mut session, &[uid], &add, &remove).await {
-                        Ok(()) => {
-                            let patched = match cache_op(cache, {
-                                let mailbox = mailbox.clone();
-                                let add = add.clone();
-                                let remove = remove.clone();
-                                move |c| c.update_keywords(&mailbox, uid, &add, &remove)
-                            })
-                            .await
-                            {
-                                Some(Ok(patched)) => patched,
-                                Some(Err(e)) => {
-                                    tracing::warn!("failed to update cached keywords: {e}");
-                                    false
+                    let summaries = load_summaries_for(cache, &mailbox, &[uid]).await;
+                    if keywords_ok.get(&mailbox) == Some(&true) {
+                        match store_raw_flags(&mut session, &[uid], &add, &remove).await {
+                            Ok(()) => {
+                                let patched = match cache_op(cache, {
+                                    let mailbox = mailbox.clone();
+                                    let add = add.clone();
+                                    let remove = remove.clone();
+                                    move |c| c.update_keywords(&mailbox, uid, &add, &remove)
+                                })
+                                .await
+                                {
+                                    Some(Ok(patched)) => patched,
+                                    Some(Err(e)) => {
+                                        tracing::warn!("failed to update cached keywords: {e}");
+                                        false
+                                    }
+                                    None => false,
+                                };
+                                // The server keywords are authoritative now:
+                                // drop any local overlay row masking them.
+                                if let Some(Err(e)) = cache_op(cache, {
+                                    let summaries = summaries.clone();
+                                    move |c| c.clear_local_categories(&summaries)
+                                })
+                                .await
+                                {
+                                    tracing::warn!("failed to clear local categories: {e}");
                                 }
-                                None => false,
-                            };
-                            if patched {
-                                emit_cached_messages(cache, &mailbox, events).await;
-                            } else if mailbox == current_mailbox_id {
-                                // No cache (or the uid fell outside the
-                                // cached window): re-sync so the UI still
-                                // sees the new keywords.
-                                sync_mailbox(
-                                    &mut session,
-                                    &account_id,
-                                    &current_mailbox_name,
-                                    &current_mailbox_id,
-                                    events,
-                                    cache,
-                                    &mut folders,
-                                    interactive_commands,
-                                    Some(&session_selected),
-                                    condstore,
-                                    qresync,
-                                )
-                                .await?;
-                                session_selected = current_mailbox_id.clone();
+                                if patched {
+                                    emit_cached_messages(cache, &mailbox, events).await;
+                                } else if mailbox == current_mailbox_id {
+                                    // No cache (or the uid fell outside the
+                                    // cached window): re-sync so the UI still
+                                    // sees the new keywords.
+                                    sync_mailbox(
+                                        &mut session,
+                                        &account_id,
+                                        &current_mailbox_name,
+                                        &current_mailbox_id,
+                                        events,
+                                        cache,
+                                        &mut folders,
+                                        interactive_commands,
+                                        Some(&session_selected),
+                                        condstore,
+                                        qresync,
+                                    )
+                                    .await?;
+                                    session_selected = current_mailbox_id.clone();
+                                }
+                                emit_categories_changed(events, &summaries, &add, &remove).await;
+                            }
+                            Err(e) => {
+                                let _ = events.send(AccountEvent::Error(format!("Couldn't update message tags: {e}"))).await;
                             }
                         }
-                        Err(e) => {
-                            let _ = events.send(AccountEvent::Error(format!("Couldn't update message tags: {e}"))).await;
+                    } else {
+                        // The folder can't keep custom keywords (Exchange IMAP):
+                        // store the category in the cache overlay (item 5.4).
+                        let stored = matches!(
+                            cache_op(cache, {
+                                let summaries = summaries.clone();
+                                let add_keys = tag_keys(&add);
+                                let remove_keys = tag_keys(&remove);
+                                move |c| c.update_local_categories(&summaries, &add_keys, &remove_keys, chrono::Utc::now())
+                            })
+                            .await,
+                            Some(Ok(()))
+                        );
+                        if stored {
+                            emit_cached_messages(cache, &mailbox, events).await;
+                            emit_categories_changed(events, &summaries, &add, &remove).await;
+                        } else if mailbox == current_mailbox_id {
+                            sync_mailbox(
+                                &mut session,
+                                &account_id,
+                                &current_mailbox_name,
+                                &current_mailbox_id,
+                                events,
+                                cache,
+                                &mut folders,
+                                interactive_commands,
+                                Some(&session_selected),
+                                condstore,
+                                qresync,
+                            )
+                            .await?;
+                            session_selected = current_mailbox_id.clone();
                         }
                     }
                 }
@@ -3972,49 +4120,99 @@ async fn connect_and_run(
                     let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {
                         continue;
                     };
-                    if session_selected != mailbox {
-                        session.select(&path).await?;
+                    // As `StoreKeywords`: SELECT on demand and learn whether
+                    // the folder keeps custom keywords (item 5.4).
+                    if session_selected != mailbox || !keywords_ok.contains_key(&mailbox) {
+                        let accepts = select_accepting_keywords(&mut session, &path).await?;
                         session_selected = mailbox.clone();
+                        keywords_ok.insert(mailbox.clone(), accepts);
                     }
                     let add: Vec<String> = add.into_iter().filter(|k| valid_keyword_atom(k)).collect();
                     let remove: Vec<String> = remove.into_iter().filter(|k| valid_keyword_atom(k)).collect();
-                    match store_raw_flags(&mut session, &uids, &add, &remove).await {
-                        Ok(()) => {
-                            // Same all-or-resync contract as `StoreFlagsMany`:
-                            // patch the cache for every uid, or resync once.
-                            let all_patched = matches!(
-                                cache_op(cache, {
-                                    let mailbox = mailbox.clone();
-                                    let uids = uids.clone();
-                                    let add = add.clone();
-                                    let remove = remove.clone();
-                                    move |c| c.update_keywords_many(&mailbox, &uids, &add, &remove)
+                    let summaries = load_summaries_for(cache, &mailbox, &uids).await;
+                    if keywords_ok.get(&mailbox) == Some(&true) {
+                        match store_raw_flags(&mut session, &uids, &add, &remove).await {
+                            Ok(()) => {
+                                // Same all-or-resync contract as `StoreFlagsMany`:
+                                // patch the cache for every uid, or resync once.
+                                let all_patched = matches!(
+                                    cache_op(cache, {
+                                        let mailbox = mailbox.clone();
+                                        let uids = uids.clone();
+                                        let add = add.clone();
+                                        let remove = remove.clone();
+                                        move |c| c.update_keywords_many(&mailbox, &uids, &add, &remove)
+                                    })
+                                    .await,
+                                    Some(Ok(true))
+                                );
+                                // The server keywords are authoritative now:
+                                // drop any local overlay rows masking them.
+                                if let Some(Err(e)) = cache_op(cache, {
+                                    let summaries = summaries.clone();
+                                    move |c| c.clear_local_categories(&summaries)
                                 })
-                                .await,
-                                Some(Ok(true))
-                            );
-                            if all_patched {
-                                emit_cached_messages(cache, &mailbox, events).await;
-                            } else if mailbox == current_mailbox_id {
-                                sync_mailbox(
-                                    &mut session,
-                                    &account_id,
-                                    &current_mailbox_name,
-                                    &current_mailbox_id,
-                                    events,
-                                    cache,
-                                    &mut folders,
-                                    interactive_commands,
-                                    Some(&session_selected),
-                                    condstore,
-                                    qresync,
-                                )
-                                .await?;
-                                session_selected = current_mailbox_id.clone();
+                                .await
+                                {
+                                    tracing::warn!("failed to clear local categories: {e}");
+                                }
+                                if all_patched {
+                                    emit_cached_messages(cache, &mailbox, events).await;
+                                } else if mailbox == current_mailbox_id {
+                                    sync_mailbox(
+                                        &mut session,
+                                        &account_id,
+                                        &current_mailbox_name,
+                                        &current_mailbox_id,
+                                        events,
+                                        cache,
+                                        &mut folders,
+                                        interactive_commands,
+                                        Some(&session_selected),
+                                        condstore,
+                                        qresync,
+                                    )
+                                    .await?;
+                                    session_selected = current_mailbox_id.clone();
+                                }
+                                emit_categories_changed(events, &summaries, &add, &remove).await;
+                            }
+                            Err(e) => {
+                                let _ = events.send(AccountEvent::Error(format!("Couldn't update message tags: {e}"))).await;
                             }
                         }
-                        Err(e) => {
-                            let _ = events.send(AccountEvent::Error(format!("Couldn't update message tags: {e}"))).await;
+                    } else {
+                        // The folder can't keep custom keywords (Exchange IMAP):
+                        // store the categories in the cache overlay (item 5.4).
+                        let stored = matches!(
+                            cache_op(cache, {
+                                let summaries = summaries.clone();
+                                let add_keys = tag_keys(&add);
+                                let remove_keys = tag_keys(&remove);
+                                move |c| c.update_local_categories(&summaries, &add_keys, &remove_keys, chrono::Utc::now())
+                            })
+                            .await,
+                            Some(Ok(()))
+                        );
+                        if stored {
+                            emit_cached_messages(cache, &mailbox, events).await;
+                            emit_categories_changed(events, &summaries, &add, &remove).await;
+                        } else if mailbox == current_mailbox_id {
+                            sync_mailbox(
+                                &mut session,
+                                &account_id,
+                                &current_mailbox_name,
+                                &current_mailbox_id,
+                                events,
+                                cache,
+                                &mut folders,
+                                interactive_commands,
+                                Some(&session_selected),
+                                condstore,
+                                qresync,
+                            )
+                            .await?;
+                            session_selected = current_mailbox_id.clone();
                         }
                     }
                 }
@@ -4182,6 +4380,102 @@ async fn connect_and_run(
                     }
                     emit_cached_messages(cache, &current_mailbox_id, events).await;
                     emit_flagged_messages(cache, events).await;
+                }
+                AccountCommand::ApplyRemoteMailProperties {
+                    properties,
+                    removed_graph_ids,
+                    delta_cursor,
+                    taken_at,
+                } => {
+                    let applied = matches!(
+                        cache_op(cache, move |c| c.apply_remote_mail_properties(
+                            &properties,
+                            &removed_graph_ids,
+                            delta_cursor.as_deref(),
+                            taken_at
+                        ))
+                        .await,
+                        Some(Ok(()))
+                    );
+                    if applied {
+                        emit_cached_messages(cache, &current_mailbox_id, events).await;
+                        emit_flagged_messages(cache, events).await;
+                    }
+                }
+                AccountCommand::SetImportance { mailbox, uids, importance } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let summaries = load_summaries_for(cache, &mailbox, &uids).await;
+                    let stored = matches!(
+                        cache_op(cache, {
+                            let summaries = summaries.clone();
+                            move |c| c.set_local_importance(&summaries, importance, chrono::Utc::now())
+                        })
+                        .await,
+                        Some(Ok(()))
+                    );
+                    if stored {
+                        let message_ids: Vec<String> = summaries.iter().filter_map(|summary| summary.message_id.clone()).collect();
+                        let _ = events.send(AccountEvent::ImportanceSet { message_ids, importance }).await;
+                        emit_cached_messages(cache, &mailbox, events).await;
+                    } else {
+                        let _ = events.send(AccountEvent::Error("Couldn't set the message importance: no local cache".to_string())).await;
+                    }
+                }
+                AccountCommand::SetFocused {
+                    mailbox,
+                    uids,
+                    classification,
+                    scope,
+                } => {
+                    if uids.is_empty() {
+                        continue;
+                    }
+                    let summaries = load_summaries_for(cache, &mailbox, &uids).await;
+                    let mut stored = matches!(
+                        cache_op(cache, {
+                            let summaries = summaries.clone();
+                            move |c| c.set_local_inference(&summaries, classification, chrono::Utc::now())
+                        })
+                        .await,
+                        Some(Ok(()))
+                    );
+                    // A "Always move…" change also records a per-sender
+                    // override (M-03), so future mail from them follows.
+                    let mut sender: Option<lookout_core::EmailAddress> = None;
+                    if scope == FocusedScope::Sender {
+                        if let Some(from) = summaries.iter().find_map(|summary| summary.from.first()).cloned() {
+                            let address = from.address.clone();
+                            let override_stored = matches!(
+                                cache_op(cache, {
+                                    let address = address.clone();
+                                    move |c| c.set_inference_override(&address, classification, None, chrono::Utc::now())
+                                })
+                                .await,
+                                Some(Ok(()))
+                            );
+                            stored &= override_stored;
+                            if override_stored {
+                                sender = Some(from);
+                            }
+                        }
+                    }
+                    if stored {
+                        let message_ids: Vec<String> = summaries.iter().filter_map(|summary| summary.message_id.clone()).collect();
+                        let _ = events
+                            .send(AccountEvent::FocusedSet {
+                                message_ids,
+                                classification,
+                                sender,
+                            })
+                            .await;
+                        emit_cached_messages(cache, &mailbox, events).await;
+                    } else {
+                        let _ = events
+                            .send(AccountEvent::Error("Couldn't change the Focused/Other classification: no local cache".to_string()))
+                            .await;
+                    }
                 }
                 AccountCommand::PrefetchBodies => {
                     tracing::debug!("PrefetchBodies command received");
@@ -8003,6 +8297,46 @@ mod tests {
         assert_eq!(info.unread, 2, "only the unread cached messages count");
         assert_eq!(info.message_ids.get(&Uid(2)).map(String::as_str), Some("2@example.com"));
         assert_eq!(info.message_ids.len(), 3, "an uncached uid contributes nothing");
+
+        if let Ok(entries) = std::fs::read_dir(crate::cache::cache_info().0) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().contains(&tag) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    /// A stored category change reports the affected Message-IDs and the
+    /// added/removed keys - what the app mirrors to Graph (item 5.4).
+    #[tokio::test]
+    async fn emit_categories_changed_reports_keys_and_message_ids() {
+        let tag = uuid::Uuid::new_v4().to_string();
+        let account_id = AccountId(format!("/test/session_categories_{tag}"));
+        let cache: CacheHandle = std::sync::Arc::new(Some(crate::cache::Cache::open(&account_id).unwrap()));
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let mut message = unread_summary(&mailbox_id, 1, true);
+        message.message_id = Some("<one@example.com>".to_string());
+        let stored = cache_op(&cache, {
+            let mailbox_id = mailbox_id.clone();
+            move |c| c.replace_messages(&mailbox_id, UidValidity(1), &[message])
+        })
+        .await;
+        assert!(matches!(stored, Some(Ok(()))));
+
+        let summaries = load_summaries_for(&cache, &mailbox_id, &[Uid(1)]).await;
+        assert_eq!(summaries.len(), 1);
+
+        let (tx, rx) = async_channel::bounded(4);
+        emit_categories_changed(&tx, &summaries, &[lookout_core::tag_keyword("work")], &[lookout_core::tag_keyword("red")]).await;
+        match rx.recv().await.unwrap() {
+            AccountEvent::CategoriesChanged { message_ids, add, remove } => {
+                assert_eq!(message_ids, vec!["<one@example.com>".to_string()]);
+                assert_eq!(add, vec!["work".to_string()]);
+                assert_eq!(remove, vec!["red".to_string()]);
+            }
+            other => panic!("expected CategoriesChanged, got {other:?}"),
+        }
 
         if let Ok(entries) = std::fs::read_dir(crate::cache::cache_info().0) {
             for entry in entries.flatten() {

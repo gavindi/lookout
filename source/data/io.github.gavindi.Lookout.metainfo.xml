@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.221" date="2026-10-16">
+      <description>
+        <p>Internal groundwork: categories, importance and Focused/Other changes made in Lookout now land in the mail cache for Microsoft 365, ready to sync with Outlook. No user-visible changes yet.</p>
+      </description>
+    </release>
     <release version="0.9.220" date="2026-10-16">
       <description>
         <p>Internal groundwork: the mail cache now stores and reconciles Outlook's per-message categories, importance and Focused Inbox classification for Microsoft 365. No user-visible changes yet.</p>

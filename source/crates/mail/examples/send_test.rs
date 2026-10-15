@@ -167,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
                     AccountEvent::FollowUpFailed { .. } | AccountEvent::FollowUpSet { .. } => {}
                     AccountEvent::FlaggedMessages { .. } => {}
+                    AccountEvent::CategoriesChanged { .. } | AccountEvent::ImportanceSet { .. } | AccountEvent::FocusedSet { .. } => {}
                     AccountEvent::MailboxCreated { .. } | AccountEvent::MailboxRenamed { .. } | AccountEvent::MailboxDeleted { .. } => {}
                     AccountEvent::SearchResults { .. } => {}
                     AccountEvent::PartFetched { .. } => {}

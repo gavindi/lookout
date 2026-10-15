@@ -2370,6 +2370,38 @@ impl Cache {
         Ok(())
     }
 
+    /// Applies a tag-keyword change to each message's local category row
+    /// (item 5.4) - the Exchange-IMAP fallback for a keyword `STORE` that the
+    /// server can't keep. `add`/`remove` are Lookout category *keys*; each
+    /// summary's effective key set is its current tag keywords adjusted by
+    /// them, and an empty result clears the row.
+    pub fn update_local_categories(&self, summaries: &[EmailSummary], add: &[String], remove: &[String], now: DateTime<Utc>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut upsert = tx.prepare("INSERT OR REPLACE INTO local_categories (message_key, category_keys, updated_at) VALUES (?1, ?2, ?3)")?;
+            let mut clear = tx.prepare("DELETE FROM local_categories WHERE message_key = ?1")?;
+            for summary in summaries {
+                let mut keys: std::collections::BTreeSet<&str> = summary.keywords.iter().filter_map(|keyword| lookout_core::tag_key_from_keyword(keyword)).collect();
+                for key in add {
+                    keys.insert(key.as_str());
+                }
+                for key in remove {
+                    keys.remove(key.as_str());
+                }
+                let message_key = follow_up_key(summary);
+                if keys.is_empty() {
+                    clear.execute([message_key])?;
+                } else {
+                    let list: Vec<&str> = keys.into_iter().collect();
+                    upsert.execute(rusqlite::params![message_key, serde_json::to_string(&list)?, now.timestamp()])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drops the local category rows for `summaries` - their keywords on the
     /// server are authoritative again (a keyword STORE just succeeded).
     pub fn clear_local_categories(&self, summaries: &[EmailSummary]) -> Result<()> {
@@ -3761,6 +3793,42 @@ mod tests {
 
         cache.clear_inference_override("sam@contoso.com").unwrap();
         assert!(cache.inference_overrides().unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The delta form of a local category write adjusts each message's
+    /// effective tag set and clears the row when nothing remains.
+    #[test]
+    fn update_local_categories_applies_a_delta_and_clears() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let msg = with_message_id(sample_summary(&mailbox_id, 1, None), "one@x");
+        cache.replace_messages(&mailbox_id, UidValidity(1), std::slice::from_ref(&msg)).unwrap();
+
+        cache
+            .update_local_categories(std::slice::from_ref(&msg), &["work".to_string(), "red".to_string()], &[], Utc::now())
+            .unwrap();
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(loaded[0].keywords.contains(&lookout_core::tag_keyword("work")));
+        assert!(loaded[0].keywords.contains(&lookout_core::tag_keyword("red")));
+
+        // Removing one key keeps the other (adjusting the overlaid set).
+        cache
+            .update_local_categories(std::slice::from_ref(&loaded[0]), &[], &["red".to_string()], Utc::now())
+            .unwrap();
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(loaded[0].keywords.contains(&lookout_core::tag_keyword("work")));
+        assert!(!loaded[0].keywords.contains(&lookout_core::tag_keyword("red")));
+
+        // Removing the last key clears the row entirely.
+        cache
+            .update_local_categories(std::slice::from_ref(&loaded[0]), &[], &["work".to_string()], Utc::now())
+            .unwrap();
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(!loaded[0].keywords.iter().any(|k| k.starts_with(lookout_core::TAG_KEYWORD_PREFIX)));
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

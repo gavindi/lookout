@@ -157,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::DraftSaved { message_id } => println!("draft saved: {message_id}"),
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
                     AccountEvent::FollowUpFailed { .. } | AccountEvent::FollowUpSet { .. } => {}
+                    AccountEvent::CategoriesChanged { .. } | AccountEvent::ImportanceSet { .. } | AccountEvent::FocusedSet { .. } => {}
                     AccountEvent::FlaggedMessages { messages } => println!("flagged: {} message(s)", messages.len()),
                     AccountEvent::MailboxCreated { .. } | AccountEvent::MailboxRenamed { .. } | AccountEvent::MailboxDeleted { .. } => {}
                     AccountEvent::PreviewsFetched { .. } => {}
