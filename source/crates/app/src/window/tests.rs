@@ -2333,3 +2333,167 @@ fn copy_to_folder_records_recent_folder_and_undoes_by_revert_copy() {
         other => panic!("expected RevertCopy, got {other:?}"),
     }
 }
+
+#[test]
+fn search_history_keeps_entry_focus_and_dismisses_on_edit_escape_and_navigation() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let state = test_state(Vec::new());
+    state.borrow_mut().recent_searches = vec!["from:alice".into()];
+    let entry = gtk::SearchEntry::new();
+    let other = gtk::Button::with_label("Inbox");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.append(&entry);
+    content.append(&other);
+    let window = gtk::Window::builder().child(&content).build();
+    let popover = install_search_history(&state, &entry);
+    window.present();
+    entry.grab_focus();
+    let drain = || {
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+    };
+    drain();
+    assert!(!popover.is_autohide(), "history must never grab input from the window");
+    assert!(popover.is_visible());
+    let focus = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
+    assert!(focus == entry || focus.is_ancestor(&entry));
+
+    entry.set_text("test");
+    assert!(!popover.is_visible(), "typing dismisses suggestions");
+    entry.set_text("");
+    other.grab_focus();
+    entry.grab_focus();
+    drain();
+    assert!(popover.is_visible());
+    entry.emit_by_name::<()>("stop-search", &[]);
+    drain();
+    assert!(!popover.is_visible(), "Escape must leave history closed");
+
+    other.grab_focus();
+    entry.grab_focus();
+    drain();
+    assert!(popover.is_visible());
+    let history = popover.child().unwrap().downcast::<gtk::Box>().unwrap();
+    history.first_child().unwrap().downcast::<gtk::Button>().unwrap().emit_clicked();
+    assert_eq!(entry.text(), "from:alice");
+    assert!(!popover.is_visible());
+
+    entry.set_text("");
+    other.grab_focus();
+    entry.grab_focus();
+    drain();
+    assert!(popover.is_visible());
+    other.grab_focus();
+    drain();
+    assert!(!popover.is_visible(), "other controls must remain reachable");
+    assert!(other.has_focus());
+    window.destroy();
+    popover.unparent();
+}
+
+#[test]
+fn folder_sidebar_includes_accounts_awaiting_their_first_folder_sync() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let ids: Vec<AccountId> = (0..4).map(|n| AccountId(format!("account-{n}"))).collect();
+    let state = test_state(ids.iter().map(|id| (id.clone(), Vec::new())).collect());
+    let selection = gtk::SingleSelection::new(None::<gtk::gio::ListModel>);
+    let scroller = gtk::ScrolledWindow::new();
+    rebuild_folder_tree(&state, &selection, &scroller);
+    let model = selection.model().unwrap().downcast::<gtk::TreeListModel>().unwrap();
+    let mut visible = Vec::new();
+    for index in 0..model.n_items() {
+        let row = model.row(index).unwrap();
+        let item = row.item().unwrap().downcast::<glib::BoxedAnyObject>().unwrap();
+        if let crate::folder_tree::TreeItem::Account(account) = &*item.borrow::<crate::folder_tree::TreeItem>() {
+            visible.push(account.account_id.clone());
+        };
+    }
+    assert_eq!(visible.len(), 4);
+    assert!(ids.iter().all(|id| visible.contains(id)));
+}
+
+#[test]
+fn sender_hover_card_is_non_modal_and_closes_and_reopens() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let state = test_state(Vec::new());
+    let context = Rc::new(crate::profile_card::ProfileCardContext {
+        state,
+        worker: Rc::new(Worker::new()),
+        actions: crate::profile_card::ProfileCardActions {
+            send_email: Rc::new(|_, _| {}),
+            schedule_meeting: Rc::new(|_| {}),
+            add_contact: Rc::new(|_| {}),
+            edit_contact: Rc::new(|_| {}),
+            open_message: Rc::new(|_| {}),
+            open_event: Rc::new(|_| {}),
+            events_for_person: Rc::new(|_| Vec::new()),
+        },
+    });
+    let sender = gtk::Label::new(Some("Alice"));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.append(&sender);
+    let window = gtk::Window::builder().child(&row).build();
+    crate::profile_card::attach_person_hover(
+        Rc::new(move || Some(context.clone())),
+        &sender,
+        &row,
+        Rc::new(|| Some((EmailAddress::new("alice@example.com"), None))),
+    );
+    let motion_for = |widget: &gtk::Widget| {
+        let controllers = widget.observe_controllers();
+        (0..controllers.n_items())
+            .find_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerMotion>().ok())
+            .unwrap()
+    };
+    let wait = |ms| glib::MainContext::default().block_on(glib::timeout_future(std::time::Duration::from_millis(ms)));
+    window.present();
+    let motion = motion_for(sender.upcast_ref());
+    // A quick pass over the sender must not leave a delayed popup behind.
+    motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+    motion.emit_by_name::<()>("leave", &[]);
+    wait(400);
+    assert!(sender.first_child().is_none());
+
+    motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+    wait(400);
+    let card = sender.first_child().unwrap().downcast::<gtk::Popover>().unwrap();
+    assert!(card.is_visible());
+    assert!(!card.is_autohide(), "hover must not grab input from the message list");
+    assert!(
+        (0..sender.observe_controllers().n_items()).all(|i| { !sender.observe_controllers().item(i).unwrap().is::<gtk::GestureClick>() }),
+        "a sender click must not open a card"
+    );
+
+    // Returning to the sender cancels a pending dismissal as well.
+    motion.emit_by_name::<()>("leave", &[]);
+    motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+    wait(200);
+    assert!(card.is_visible());
+
+    // Crossing to the card keeps its actions accessible.
+    motion.emit_by_name::<()>("leave", &[]);
+    let card_motion = motion_for(card.upcast_ref());
+    card_motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+    wait(200);
+    assert!(card.is_visible());
+    card_motion.emit_by_name::<()>("leave", &[]);
+    wait(200);
+    assert!(!card.is_visible());
+
+    // The fired timer and closed popover must not prevent the next hover.
+    motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+    wait(400);
+    let reopened = sender.first_child().unwrap().downcast::<gtk::Popover>().unwrap();
+    assert!(reopened.is_visible());
+    window.destroy();
+    wait(200);
+    assert!(!reopened.is_visible());
+}

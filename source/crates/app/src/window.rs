@@ -681,10 +681,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let state_clone2 = state.clone();
     let reading_stack_clone = reading_stack.clone();
     // The profile card (Phase 4.2 / P-10, UX-67): a single context is built
-    // once the calendar state exists further down and stored here, so every
-    // person reference - including the message-list rows built before it (the
-    // row factory only ever consults the provider at hover/click time, never
-    // during setup).
+    // once the calendar state exists further down and stored here for
+    // person references in the message list, reading pane and calendar.
     let profile_card_ctx: Rc<RefCell<Option<Rc<crate::profile_card::ProfileCardContext>>>> = Rc::new(RefCell::new(None));
     let profile_card_provider: Rc<dyn Fn() -> Option<Rc<crate::profile_card::ProfileCardContext>>> = {
         let holder = profile_card_ctx.clone();
@@ -1028,9 +1026,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // The conversation this row heads, when it's a conversation header.
         let bound_thread: Rc<RefCell<Option<ThreadId>>> = Rc::new(RefCell::new(None));
 
-        // The profile card (Phase 4.2 / UX-67): hovering or clicking a row's
-        // sender name/avatar opens the person's card. Installed once per row
-        // (not per bind), resolving the row's message lazily from `bound`.
+        // Only hovering over the avatar reveals the person, so reading the
+        // sender and preview doesn't open a card. Row presses dismiss the
+        // card and keep propagating to the message selection handler.
         {
             let provider = profile_card_provider_for_rows.clone();
             let resolve: crate::profile_card::PersonResolver = {
@@ -1042,8 +1040,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         .and_then(|summary| summary.from.first().map(|sender| (sender.clone(), mailbox_account_id(&summary.mailbox))))
                 })
             };
-            crate::profile_card::attach_person_trigger(provider.clone(), &sender_label, false, resolve.clone());
-            crate::profile_card::attach_person_trigger(provider, &avatar, false, resolve);
+            crate::profile_card::attach_person_hover(provider, &avatar, &overlay, resolve);
         }
 
         let checkbox_suppress: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -4312,62 +4309,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             search_clear_button.connect_clicked(move |_| entry.set_text(""));
         }
 
-        // The history popover, anchored to the entry and shown on focus while
-        // the entry is empty (Outlook's recent-search list).
-        let history_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(6)
-            .margin_end(6)
-            .build();
-        let history_popover = gtk::Popover::new();
-        history_popover.set_child(Some(&history_box));
-        history_popover.set_parent(&search_entry);
-        let refresh_history: Rc<dyn Fn()> = {
-            let state = state.clone();
-            let entry = search_entry.clone();
-            let history_box = history_box.clone();
-            let popover = history_popover.clone();
-            Rc::new(move || {
-                while let Some(child) = history_box.first_child() {
-                    history_box.remove(&child);
-                }
-                let recent = state.borrow().recent_searches.clone();
-                if recent.is_empty() {
-                    history_box.append(&gtk::Label::builder().label("No recent searches").xalign(0.0).css_classes(["dim-label"]).build());
-                    return;
-                }
-                for query in recent {
-                    let button = gtk::Button::with_label(&query);
-                    button.add_css_class("flat");
-                    button.set_halign(gtk::Align::Start);
-                    {
-                        let entry = entry.clone();
-                        let popover = popover.clone();
-                        button.connect_clicked(move |_| {
-                            entry.set_text(&query);
-                            popover.popdown();
-                        });
-                    }
-                    history_box.append(&button);
-                }
-            })
-        };
-        let focus = gtk::EventControllerFocus::new();
-        {
-            let popover = history_popover.clone();
-            let entry = search_entry.clone();
-            let refresh_history = refresh_history.clone();
-            focus.connect_enter(move |_| {
-                if entry.text().is_empty() {
-                    refresh_history();
-                    popover.popup();
-                }
-            });
-        }
-        search_entry.add_controller(focus);
+        install_search_history(&state, &search_entry);
     }
 
     // The nav rail runs the full height *below the title bar* - it sits

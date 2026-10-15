@@ -1,7 +1,8 @@
 //! The profile card (Phase 4.2 / P-10, UX-67): a popover showing a person's
 //! contact details, their recent mail, upcoming shared events and a small set
-//! of actions, opened by hovering or clicking any person reference - the
-//! reading-pane sender, a message-list row's sender/avatar, a conversation
+//! of actions, opened by hovering over person references (and by clicking
+//! explicit person links outside the message list) - the
+//! reading-pane sender, a message-list row's avatar, a conversation
 //! card's sender, an event editor's attendee chip, an invitation card's
 //! organizer, or a People row.
 //!
@@ -117,30 +118,61 @@ pub fn shared_upcoming_events(occurrences: &[EventOccurrence], address: &str, no
 /// trigger can be installed before the window's [`ProfileCardContext`] is
 /// ready (the message-list rows are built before the calendar state exists).
 pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widget: &W, claim_press: bool, resolve: PersonResolver) {
+    attach_person_trigger_impl(context, widget, claim_press, resolve, None);
+}
+
+/// Shows a non-modal card on hover, leaving row clicks to message selection.
+pub fn attach_person_hover<W: IsA<gtk::Widget>, R: IsA<gtk::Widget>>(context: ContextProvider, widget: &W, row: &R, resolve: PersonResolver) {
+    attach_person_trigger_impl(context, widget, false, resolve, Some(row.clone().upcast()));
+}
+
+fn attach_person_trigger_impl<W: IsA<gtk::Widget>>(context: ContextProvider, widget: &W, claim_press: bool, resolve: PersonResolver, hover_row: Option<gtk::Widget>) {
     let widget = widget.clone().upcast::<gtk::Widget>();
+    let hover_only = hover_row.is_some();
     let active: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
     let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
-    // Click opens straight away. On the reading-pane header the press is
-    // claimed (there's nothing beneath to select); on list rows it is left
-    // unclaimed so the row still selects and drags as usual.
-    let click = gtk::GestureClick::new();
-    click.set_button(gtk::gdk::BUTTON_PRIMARY);
-    {
-        let context = context.clone();
-        let widget = widget.clone();
-        let resolve = resolve.clone();
+    if let Some(row) = hover_row {
+        // Observe presses before row selection, without claiming or consuming
+        // them. A hover card must never eat the click that selects a message.
+        let presses = gtk::EventControllerLegacy::new();
+        presses.set_propagation_phase(gtk::PropagationPhase::Capture);
         let active = active.clone();
         let timer = timer.clone();
-        click.connect_pressed(move |gesture, _n, _x, _y| {
-            if claim_press {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
+        presses.connect_event(move |_, event| {
+            if event.event_type() == gtk::gdk::EventType::ButtonPress {
+                // The card's actions live on a separate popup surface. Let
+                // their clicks reach the action instead of dismissing it.
+                let on_card = active.borrow().as_ref().is_some_and(|card| event.surface() == card.surface());
+                if !on_card {
+                    cancel_timer(&timer);
+                    close_card(&active);
+                }
             }
-            cancel_timer(&timer);
-            show_card(&context, &widget, &resolve, &active);
+            glib::Propagation::Proceed
         });
+        row.add_controller(presses);
+    } else {
+        // Explicit person references, such as the reading-pane sender,
+        // also open the card on click.
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_PRIMARY);
+        {
+            let context = context.clone();
+            let widget = widget.clone();
+            let resolve = resolve.clone();
+            let active = active.clone();
+            let timer = timer.clone();
+            click.connect_pressed(move |gesture, _n, _x, _y| {
+                if claim_press {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+                cancel_timer(&timer);
+                show_card(&context, &widget, &resolve, &active, true);
+            });
+        }
+        widget.add_controller(click);
     }
-    widget.add_controller(click);
 
     // Hover opens after a short rest; leaving cancels the pending open.
     let motion = gtk::EventControllerMotion::new();
@@ -151,25 +183,74 @@ pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widg
         let active = active.clone();
         let timer = timer.clone();
         motion.connect_enter(move |_, _x, _y| {
+            cancel_timer(&timer);
             if active.borrow().is_some() {
                 return;
             }
-            cancel_timer(&timer);
             let context = context.clone();
             let widget = widget.clone();
             let resolve = resolve.clone();
             let active = active.clone();
+            let pending = timer.clone();
             let src = glib::timeout_add_local_once(std::time::Duration::from_millis(HOVER_DELAY_MS), move || {
-                show_card(&context, &widget, &resolve, &active);
+                // The source has fired; don't try to remove its stale id later.
+                pending.borrow_mut().take();
+                show_card(&context, &widget, &resolve, &active, !hover_only);
+                if hover_only {
+                    let popover = active.borrow().clone();
+                    if let Some(popover) = popover {
+                        let motion = gtk::EventControllerMotion::new();
+                        motion.connect_enter({
+                            let pending = pending.clone();
+                            move |_, _, _| cancel_timer(&pending)
+                        });
+                        motion.connect_leave({
+                            let pending = pending.clone();
+                            let active = active.clone();
+                            move |_| schedule_card_close(&active, &pending)
+                        });
+                        popover.add_controller(motion);
+                    }
+                }
             });
             *timer.borrow_mut() = Some(src);
         });
     }
     {
         let timer = timer.clone();
-        motion.connect_leave(move |_| cancel_timer(&timer));
+        let active = active.clone();
+        motion.connect_leave(move |_| {
+            cancel_timer(&timer);
+            if hover_only {
+                schedule_card_close(&active, &timer);
+            }
+        });
     }
     widget.add_controller(motion);
+    if hover_only {
+        widget.connect_unmap(move |_| {
+            cancel_timer(&timer);
+            close_card(&active);
+        });
+    }
+}
+
+fn close_card(active: &Rc<RefCell<Option<gtk::Popover>>>) {
+    let previous = active.borrow_mut().take();
+    if let Some(previous) = previous {
+        previous.popdown();
+    }
+}
+
+fn schedule_card_close(active: &Rc<RefCell<Option<gtk::Popover>>>, timer: &Rc<RefCell<Option<glib::SourceId>>>) {
+    cancel_timer(timer);
+    let active = active.clone();
+    let pending = timer.clone();
+    // Allow the pointer to cross the gap between the sender and the card.
+    *timer.borrow_mut() = Some(glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+        pending.borrow_mut().take();
+        close_card(&active);
+    }));
 }
 
 /// Cancels a pending hover-open timer, if any.
@@ -180,18 +261,17 @@ fn cancel_timer(timer: &Rc<RefCell<Option<glib::SourceId>>>) {
 }
 
 /// Closes any open card and shows a fresh one anchored to `widget`.
-fn show_card(context: &ContextProvider, widget: &gtk::Widget, resolve: &PersonResolver, active: &Rc<RefCell<Option<gtk::Popover>>>) {
+fn show_card(context: &ContextProvider, widget: &gtk::Widget, resolve: &PersonResolver, active: &Rc<RefCell<Option<gtk::Popover>>>, autohide: bool) {
     // Drop the previous card first (popdown emits `closed`, which clears the
     // slot itself, so take before pulling it down to avoid a double borrow).
     let previous = active.borrow_mut().take();
     if let Some(previous) = previous {
         previous.popdown();
-        previous.unparent();
     }
     let Some(ctx) = context() else { return };
     let Some((address, account_id)) = resolve() else { return };
 
-    let popover = gtk::Popover::builder().autohide(true).has_arrow(true).build();
+    let popover = gtk::Popover::builder().autohide(autohide).has_arrow(true).build();
     let content = build_card(&ctx, &address, account_id.as_ref());
     let scroller = gtk::ScrolledWindow::builder()
         .child(&content)
@@ -207,7 +287,7 @@ fn show_card(context: &ContextProvider, widget: &gtk::Widget, resolve: &PersonRe
         popover.connect_closed(move |p| {
             p.unparent();
             let mut slot = active.borrow_mut();
-            if slot.as_ref().is_some_and(|current| std::ptr::eq(current, p)) {
+            if slot.as_ref().is_some_and(|current| current == p) {
                 *slot = None;
             }
         });

@@ -54,126 +54,137 @@ pub(crate) fn spawn_account_discovery(
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
-        let result = async {
-            let client = GoaClient::connect().await?;
-            let accounts = client.list_mail_accounts().await?;
-            Ok::<_, lookout_goa::Error>((client, accounts))
+        // Closing the window normally keeps Lookout running. Re-discover
+        // accounts added in GNOME Settings without requiring a real quit.
+        loop {
+            let result = async {
+                let client = GoaClient::connect().await?;
+                let accounts = client.list_mail_accounts().await?;
+                Ok::<_, lookout_goa::Error>((client, accounts))
+            }
+            .await;
+            let failed = result.is_err();
+            if goa_tx.send(result).await.is_err() || failed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
-        .await;
-        let _ = goa_tx.send(result).await;
     });
 
     glib::spawn_future_local(async move {
-        let Ok(result) = goa_rx.recv().await else { return };
-        let show_page = |name: &'static str| {
-            current_mail_page.set(name);
-            if mail_view_button.is_active() {
-                root_stack.set_visible_child_name(name);
-            }
-        };
-        // The Lookout tab flips between its status page (no accounts at all)
-        // and the live dashboard once *any* account set exists. Mail
-        // discovery owns the downgrade: only it knows whether nothing is
-        // connected; the calendar discovery only ever upgrades.
-        let show_lookout_page = |name: &'static str| {
-            current_lookout_page.set(name);
-            if lookout_view_button.is_active() {
-                root_stack.set_visible_child_name(name);
-            }
-        };
-        match result {
-            Ok((client, accounts)) => {
-                // Record every discovered account (disabled ones included -
-                // Config's account list and a later re-enable need them),
-                // then connect only the enabled ones. An account list of
-                // nothing-but-disabled accounts therefore falls through to
-                // the same empty/fallback handling as GOA reporting none at
-                // all - the disabled accounts stay visible in Config.
-                let mut enabled_accounts = Vec::new();
-                for account in accounts {
-                    let id = AccountId(account.account_id.0.clone());
-                    let enabled = {
-                        let mut st = state.borrow_mut();
-                        st.goa_client = Some(client.clone());
-                        let entry = st.goa_accounts.entry(id.clone()).or_insert(DiscoveredGoaAccount {
-                            display_name: String::new(),
-                            email: String::new(),
-                            provider_type: None,
-                            mail: None,
-                            calendar: None,
-                            contacts: None,
-                        });
-                        entry.display_name = account.display_name.clone();
-                        entry.email = account.email.clone();
-                        entry.provider_type = account.provider_type.clone();
-                        entry.mail = Some(account.clone());
-                        st.account_enabled(&id)
-                    };
-                    if enabled {
-                        enabled_accounts.push(account);
+        while let Ok(result) = goa_rx.recv().await {
+            let show_page = |name: &'static str| {
+                current_mail_page.set(name);
+                if mail_view_button.is_active() {
+                    root_stack.set_visible_child_name(name);
+                }
+            };
+            // The Lookout tab flips between its status page (no accounts at all)
+            // and the live dashboard once *any* account set exists. Mail
+            // discovery owns the downgrade: only it knows whether nothing is
+            // connected; the calendar discovery only ever upgrades.
+            let show_lookout_page = |name: &'static str| {
+                current_lookout_page.set(name);
+                if lookout_view_button.is_active() {
+                    root_stack.set_visible_child_name(name);
+                }
+            };
+            match result {
+                Ok((client, accounts)) => {
+                    // Record every discovered account (disabled ones included -
+                    // Config's account list and a later re-enable need them),
+                    // then connect only the enabled ones. An account list of
+                    // nothing-but-disabled accounts therefore falls through to
+                    // the same empty/fallback handling as GOA reporting none at
+                    // all - the disabled accounts stay visible in Config.
+                    let mut enabled_accounts = Vec::new();
+                    for account in accounts {
+                        let id = AccountId(account.account_id.0.clone());
+                        let enabled = {
+                            let mut st = state.borrow_mut();
+                            st.goa_client = Some(client.clone());
+                            let entry = st.goa_accounts.entry(id.clone()).or_insert(DiscoveredGoaAccount {
+                                display_name: String::new(),
+                                email: String::new(),
+                                provider_type: None,
+                                mail: None,
+                                calendar: None,
+                                contacts: None,
+                            });
+                            entry.display_name = account.display_name.clone();
+                            entry.email = account.email.clone();
+                            entry.provider_type = account.provider_type.clone();
+                            entry.mail = Some(account.clone());
+                            st.account_enabled(&id)
+                        };
+                        // Keep existing sessions and caches intact on subsequent
+                        // discovery passes, including sessions still connecting.
+                        if enabled && !state.borrow().accounts.contains_key(&id) {
+                            enabled_accounts.push(account);
+                        }
+                    }
+                    if !enabled_accounts.is_empty() {
+                        show_page("mail");
+                        show_lookout_page("lookout");
+                        // One AccountSession actor per connected account, all
+                        // running concurrently on the worker thread. `GoaClient` is
+                        // a cheap Arc-backed handle (see its doc comment), so
+                        // cloning it per account reuses the one D-Bus connection
+                        // rather than opening a redundant one each time.
+                        for account in enabled_accounts {
+                            connect_account(
+                                worker.clone(),
+                                state.clone(),
+                                folder_selection.clone(),
+                                folder_scroller.clone(),
+                                message_list.clone(),
+                                message_list_stack.clone(),
+                                message_header.clone(),
+                                reading_stack.clone(),
+                                toast_overlay.clone(),
+                                window.clone(),
+                                app.clone(),
+                                client.clone(),
+                                list_header.clone(),
+                                account,
+                                dashboard_refresh.clone(),
+                                mark_read_button.clone(),
+                                pin_button.clone(),
+                            );
+                        }
+                        refresh_config();
+                    }
+                    // GOA itself reported no (or zero usable) accounts - but manual
+                    // "other" accounts are connected synchronously, before this async
+                    // D-Bus round trip can land, so `state.accounts` may already be
+                    // non-empty by the time this branch runs. Only show the empty
+                    // state if nothing at all is connected.
+                    else if state.borrow().accounts.is_empty() {
+                        show_page("empty");
+                        show_lookout_page("lookout-empty");
+                    } else {
+                        show_page("mail");
+                        show_lookout_page("lookout");
                     }
                 }
-                if !enabled_accounts.is_empty() {
-                    show_page("mail");
-                    show_lookout_page("lookout");
-                    // One AccountSession actor per connected account, all
-                    // running concurrently on the worker thread. `GoaClient` is
-                    // a cheap Arc-backed handle (see its doc comment), so
-                    // cloning it per account reuses the one D-Bus connection
-                    // rather than opening a redundant one each time.
-                    for account in enabled_accounts {
-                        connect_account(
-                            worker.clone(),
-                            state.clone(),
-                            folder_selection.clone(),
-                            folder_scroller.clone(),
-                            message_list.clone(),
-                            message_list_stack.clone(),
-                            message_header.clone(),
-                            reading_stack.clone(),
-                            toast_overlay.clone(),
-                            window.clone(),
-                            app.clone(),
-                            client.clone(),
-                            list_header.clone(),
-                            account,
-                            dashboard_refresh.clone(),
-                            mark_read_button.clone(),
-                            pin_button.clone(),
-                        );
+                Err(e) => {
+                    if state.borrow().accounts.is_empty() {
+                        show_page("empty");
+                        show_lookout_page("lookout-empty");
+                    } else {
+                        show_page("mail");
+                        show_lookout_page("lookout");
                     }
-                    refresh_config();
-                }
-                // GOA itself reported no (or zero usable) accounts - but manual
-                // "other" accounts are connected synchronously, before this async
-                // D-Bus round trip can land, so `state.accounts` may already be
-                // non-empty by the time this branch runs. Only show the empty
-                // state if nothing at all is connected.
-                else if state.borrow().accounts.is_empty() {
-                    show_page("empty");
-                    show_lookout_page("lookout-empty");
-                } else {
-                    show_page("mail");
-                    show_lookout_page("lookout");
-                }
-            }
-            Err(e) => {
-                if state.borrow().accounts.is_empty() {
-                    show_page("empty");
-                    show_lookout_page("lookout-empty");
-                } else {
-                    show_page("mail");
-                    show_lookout_page("lookout");
-                }
-                if e.is_service_unavailable() {
-                    // Expected on a desktop with no GOA daemon (e.g. KDE) -
-                    // silently note it so Config can hide the GOA section
-                    // instead of nagging with a toast every launch.
-                    state.borrow_mut().goa_unavailable = true;
-                    refresh_config();
-                } else {
-                    let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
-                    toast_overlay.add_toast(adw::Toast::new(&title));
+                    if e.is_service_unavailable() {
+                        // Expected on a desktop with no GOA daemon (e.g. KDE) -
+                        // silently note it so Config can hide the GOA section
+                        // instead of nagging with a toast every launch.
+                        state.borrow_mut().goa_unavailable = true;
+                        refresh_config();
+                    } else {
+                        let title = glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts: {e}"));
+                        toast_overlay.add_toast(adw::Toast::new(&title));
+                    }
                 }
             }
         }
@@ -291,6 +302,7 @@ pub(crate) fn connect_account(
             sieve_advertised: false,
         },
     );
+    rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     if is_microsoft_365 {
         // Read Outlook's flags once the session has had a moment to open its
@@ -1476,6 +1488,7 @@ pub(crate) fn connect_other_account(
             sieve_advertised: false,
         },
     );
+    rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
