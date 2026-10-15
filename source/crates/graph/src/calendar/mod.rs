@@ -41,7 +41,8 @@ use serde_json::{json, Value};
 /// Graph calendar id (the path segment the session builds
 /// `/me/calendars/{href}/…` from); `id` is the account-scoped `<account>:<id>`
 /// the rest of the app keys calendars by. Graph calendars never carry VTODOs,
-/// so `supports_tasks` is always `false` (Microsoft To Do is item 5.3).
+/// so `supports_tasks` is always `false` - Microsoft To Do is the separate
+/// [`crate::todo`] backend (item 5.3 / A-05).
 pub fn calendar_from_graph(value: &Value, account_id: &AccountId) -> Option<CalendarInfo> {
     let graph_id = value.get("id")?.as_str()?;
     let display_name = value.get("name").and_then(Value::as_str).unwrap_or("Calendar").to_string();

@@ -2159,6 +2159,18 @@ fn collapse_google_tasks_events_keeps_one_list_and_task_snapshot() {
 }
 
 #[test]
+fn collapse_graph_todo_events_keeps_one_list_and_task_snapshot() {
+    let collapsed = collapse_graph_todo_events(vec![
+        lookout_graph::TodoEvent::ListsUpdated(Vec::new()),
+        lookout_graph::TodoEvent::TasksUpdated(Vec::new()),
+        lookout_graph::TodoEvent::ListsUpdated(Vec::new()),
+    ]);
+    assert_eq!(collapsed.len(), 2);
+    assert!(matches!(&collapsed[0], lookout_graph::TodoEvent::TasksUpdated(_)));
+    assert!(matches!(&collapsed[1], lookout_graph::TodoEvent::ListsUpdated(_)));
+}
+
+#[test]
 fn collapse_subscription_events_keeps_the_last_update_per_month() {
     let m1 = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
     let m2 = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();

@@ -46,15 +46,15 @@ Counts are tallied from the §5 tables.
 | Compose (5.2) | 15 | 3 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
 | Calendar (5.3) | 23 | 8 | 4 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, the organizer's own cache as a fallback, or Graph `getSchedule` for Microsoft 365, 5.1) with Suggested times; the editor's room suggestions from Graph `places` remain to be wired. |
 | People (5.4) | 10 | 1 | 1 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). CSV import/export matches Outlook's format (4.5). The Graph GAL reaches `/me/people` and `/users` (5.2); only LDAP and the autocomplete wiring remain (4.7). No merge UI. |
-| Tasks (5.5) | 5 | 1 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
-| Accounts / Microsoft 365 (5.6) | 4 | 1 | 3 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar** (5.1) and **contacts** (5.2) are now native via Graph. No Graph To Do or Focused Inbox yet. |
+| Tasks (5.5) | 6 | 1 | 4 | 1 | VTODO, Google Tasks and now Microsoft To Do (Graph) CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
+| Accounts / Microsoft 365 (5.6) | 5 | 1 | 2 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar** (5.1), **contacts** (5.2) and **To Do** (5.3) are now native via Graph. No Graph Focused Inbox yet. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **98** | **23** | **31** | **5** | ~62% at parity, ~15% partial |
+| **Total** | **100** | **23** | **29** | **5** | ~64% at parity, ~15% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
-1. **Microsoft 365 To Do** (A-05). The Microsoft 365 **calendar** (5.1) and **contacts** (5.2) are now native; To Do still waits on Graph.
+1. ✅ ~~**Microsoft 365 To Do** (A-05) - done: `/me/todo/lists` and per-list tasks sync through `lookout_graph::todo` into the Tasks view as synthetic `todo:<list id>` sources, sharing the account's "Sync with Outlook" Graph consent (5.3).~~
 2. ✅ ~~**Sending meeting invitations as organizer** (CAL-14) - done: client iMIP REQUEST/update/CANCEL, or RFC 6638 server scheduling.~~
 3. ✅ ~~**Rules** (M-14) — done across client, Microsoft 365 (Graph) and Sieve backends (2.5).~~
 4. **Undo send and undo actions** (M-21, C-09).
@@ -371,7 +371,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 |---|---|---|---|---|
 | T-01 | Task lists sidebar | Lists merged (`merged_tasks`); chosen only in editor | 🟡 | List navigation pane, create/rename lists |
 | T-02 | My Day | — | ❌ | Per-day pin set (local; Graph To Do has no My Day API; **verify**) |
-| T-03 | Flagged email as tasks | Tasks view "Flagged email" section listing open M-10 flags across accounts (check = mark complete, click = open), also on the dashboard and Mail overview; "Create task from message…" in More | ✅ | Lists cached messages only; Graph To Do `linkedResources` (5.3) |
+| T-03 | Flagged email as tasks | Tasks view "Flagged email" section listing open M-10 flags across accounts (check = mark complete, click = open), also on the dashboard and Mail overview; "Create task from message…" in More | ✅ | Lists cached messages only; Graph To Do's `linkedResources` list is not read separately, since M-10 already syncs the message flags directly (5.3) |
 | T-04 | Due, importance, % complete, notes | `app/src/task_editor.rs` | ✅ | — |
 | T-05 | Reminders | — | ❌ | `VALARM` in VTODO; Graph `reminderDateTime` |
 | T-06 | Recurrence | — | ❌ | `RRULE` in VTODO; Graph `recurrence` |
@@ -380,7 +380,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | T-09 | Sort / group options | The Tasks view's "Sort and group" menu: sort by due/importance/title/created, group by due bucket/list/category/none, plus "Show completed"; persisted in GSettings, with pure tested functions (4.12) | ✅ | — |
 | T-10 | Assign / task requests | — | ⛔ | Exchange-only (classic) |
 | T-11 | Google Tasks, CalDAV VTODO, local list | `app/src/google_tasks.rs`, `dav` VTODO, `ui_state_db` | ✅ | — |
-| T-12 | Microsoft To Do | — | ❌ | Graph (A-05) |
+| T-12 | Microsoft To Do | `lookout_graph::todo` (item 5.3 / A-05): `/me/todo/lists` and `/me/todo/lists/{id}/tasks` are a separate Graph backend, mapped into the same `CalendarTask` and synthetic `todo:<list id>` calendar ids as CalDAV VTODO and Google Tasks, so the Tasks view and the task editor's picker treat the lists like calendars; create/update/delete round-trip (guarded by `If-Match`), while `checklistItems`/`recurrence`/`reminderDateTime` map to their own gaps (T-07/T-06/T-05) | ✅ | — |
 
 ### 5.6 Accounts and Microsoft 365
 
@@ -390,7 +390,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | A-02 | Manual IMAP/SMTP | `app/src/other_accounts.rs` | ✅ | OAuth for manual Gmail/Microsoft 365 |
 | A-03 | Microsoft 365 calendar | `lookout-graph`'s `calendar::session` actor (`calendarView` month sync, event CRUD, RRULE/Teams/RSVP/free-busy mapping) drives a Microsoft 365 account through the same contract as CalDAV; Graph access is opted into from Config (5.1) | ✅ | — |
 | A-04 | Microsoft 365 contacts | `lookout-graph`'s `contacts` module drives the People screen through the same `ContactsCache`, snapshot and `ContactCommand` channel as CardDAV: contact folders are the address books, contacts delta-sync both ways (with a full-read fallback), photos are cached as the card's `PHOTO`, and Graph v1.0's lack of a contact-group endpoint leaves `KIND:group` lists local (5.2) | ✅ | — |
-| A-05 | Microsoft To Do | — | ❌ | Graph backend |
+| A-05 | Microsoft To Do | `lookout_graph`'s `todo` module (`TodoClient` + `run_todo_session`) drives the Tasks view through synthetic `todo:<list id>` sources: `/me/todo/lists` and per-list `/tasks` sync on connect and the poll cadence, create/update/delete round-trip, and the account connects with the same "Sync with Outlook" Graph consent as the calendar (item 5.3 / T-12) | ✅ | — |
 | A-06 | Microsoft 365 mail | IMAP/SMTP with Lookout's own XOAUTH2 (`microsoft_oauth.rs`) | 🟡 | Remaining Graph-only mail features (Focused Inbox, server-side property sync) |
 | A-07 | Exchange on-premises (EWS) | — | ❌ | Deferred (§9) |
 | A-08 | POP3 | — | ❌ | Low priority; IMAP covers modern hosts |
@@ -692,7 +692,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 |---|---|---|---|---|
 | 5.1 | ✅ ~~Graph calendar backend~~ | A-03, CAL-14…19 | `lookout_graph::calendar::{client,session}` implements the same command/event contract as `lookout-dav`: `calendarView` month sync, event create/update/delete, and the RRULE/Teams/RSVP/free-busy/rooms mappings; Microsoft 365 accounts connect to it and Graph schedules iTIP itself. Follow-ups: the editor's room suggestions, the Graph COUNTER write, and the editor's Teams toggle | L |
 | 5.2 | ✅ ~~Graph contacts backend~~ | A-04, P-11 | `lookout-graph::contacts`: contact folders, per-folder `/delta`, create/update/delete (`If-Match`), `/photo/$value`, and the GAL (`/me/people`, `/users?$search=`). The People screen's poll loop syncs M365 accounts through the Graph backend (consent-gated like the calendar), and a fallback synthesises the account when GOA reports no `Contacts` interface | M |
-| 5.3 | Microsoft To Do backend | A-05, T-12 | Lists/tasks/checklistItems/linkedResources; flagged-email list maps to M-10 | M |
+| 5.3 | ✅ ~~Microsoft To Do backend~~ | A-05, T-12 | `lookout_graph::todo` (`TodoClient` + pure mapper + `run_todo_session`): `/me/todo/lists` and per-list `/tasks` mapped into `CalendarTask` and synthetic `todo:<list id>` ids, CRUD guarded by `If-Match`; the app routes saves/deletes, offers the lists in the editor picker and merges them into the Tasks view; `Tasks.ReadWrite` joins the combined consent. Checklist items map to T-07 (4.11); the flagged-email list is already served by M-10's per-message `followupFlag` sync | M |
 | 5.4 | Mail property sync | A-06, M-09, M-10, M-12, M-03 | Per-message Graph lookup by `internetMessageId` (cache the IMAP UID ↔ Graph ID map); sync categories, followupFlag, importance, inferenceClassification both ways; extends today's `graph_pin.rs` approach | L |
 | 5.5 | Server-side schedule send | C-08 | `PidTagDeferredSendTime` on a Graph draft, so it sends while Lookout is closed | S |
 | 5.6 | Shared mailboxes and delegate calendars | M-42, CAL-24, CAL-25 | Add shared mailbox by address (IMAP `user@tenant/shared` login or Graph); open another user's calendar; share mine via `calendarPermissions` | L |

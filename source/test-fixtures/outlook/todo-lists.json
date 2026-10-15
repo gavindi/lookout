@@ -1,0 +1,18 @@
+{
+    "value": [
+        {
+            "id": "AAMkADAwATNiLTE0Y2YtNGVhMS05ZjA4LTYyNTdiNDk0NzY5ZgAuAAAAAA",
+            "displayName": "Tasks",
+            "wellknownListName": "defaultList",
+            "isOwner": true,
+            "isShared": false
+        },
+        {
+            "id": "AAMkADAwATNiLTE0Y2YtNGVhMS05ZjA4LTYyNTdiNDk0NzY5ZgAuAAAAAB",
+            "displayName": "Groceries",
+            "wellknownListName": "unknown",
+            "isOwner": true,
+            "isShared": false
+        }
+    ]
+}

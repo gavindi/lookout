@@ -5260,6 +5260,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         webcal_handles: HashMap::new(),
         birthdays: None,
         google_tasks: HashMap::new(),
+        graph_todo: HashMap::new(),
         google_account_emails: Vec::new(),
         local_tasks,
         local_tasks_db,
@@ -9492,6 +9493,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 for handle in calendar_state.borrow().google_tasks.values() {
                     let _ = handle.cmd_tx.send_blocking(GoogleTasksCommand::Refresh);
+                }
+                for handle in calendar_state.borrow().graph_todo.values() {
+                    let _ = handle.cmd_tx.send_blocking(lookout_graph::TodoCommand::Refresh);
                 }
             }
         });

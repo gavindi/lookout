@@ -424,6 +424,16 @@ pub(crate) fn collapse_google_tasks_events(events: Vec<GoogleTasksEvent>) -> Vec
     })
 }
 
+/// Collapses a batch of Graph To Do events, the `collapse_google_tasks_events`
+/// equivalent (item 5.3 / A-05, T-12).
+pub(crate) fn collapse_graph_todo_events(events: Vec<lookout_graph::TodoEvent>) -> Vec<lookout_graph::TodoEvent> {
+    collapse_last_wins(events, |event| match event {
+        lookout_graph::TodoEvent::ListsUpdated(_) => Some(SnapshotKey::TaskLists),
+        lookout_graph::TodoEvent::TasksUpdated(_) => Some(SnapshotKey::Tasks),
+        lookout_graph::TodoEvent::Error(_) => None,
+    })
+}
+
 pub(crate) fn collapse_subscription_events(events: Vec<SubscriptionSessionEvent>) -> Vec<SubscriptionSessionEvent> {
     collapse_last_wins(events, |event| match event {
         SubscriptionSessionEvent::SubscriptionsUpdated { month, .. } => Some(SnapshotKey::Subscriptions(*month)),
@@ -1581,6 +1591,7 @@ pub(crate) fn teardown_goa_account(
             st.google_tasks.remove(email);
             st.google_account_emails.retain(|e| e != email);
         }
+        st.graph_todo.remove(account_id);
     }
     reminders_engine.borrow_mut().remove_account(account_id);
     refresh_calendar_checklist(calendar_state, calendar_list_box, calendar_main);
@@ -2055,6 +2066,90 @@ pub(crate) fn connect_google_tasks_account(
     });
 }
 
+/// Starts one Microsoft 365 account's Graph To Do session (item 5.3 / A-05,
+/// T-12): inserts its handle into `calendar_state.graph_todo`, spawns the
+/// `run_todo_session` actor on the shared worker, and routes its snapshot
+/// events into the Tasks view. A no-op when the account is already connected.
+/// Graph consent is the caller's gate (the same `graph_consented` check the
+/// calendar backend uses).
+pub(crate) fn connect_graph_todo_account(
+    worker: Rc<Worker>,
+    calendar_state: Rc<RefCell<CalendarUiState>>,
+    tasks_view: Rc<crate::tasks_view::TasksView>,
+    toast_overlay: adw::ToastOverlay,
+    account_id: AccountId,
+    display_name: String,
+) {
+    if calendar_state.borrow().graph_todo.contains_key(&account_id) {
+        return;
+    }
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
+    calendar_state.borrow_mut().graph_todo.insert(
+        account_id.clone(),
+        GraphTodoHandle {
+            cmd_tx,
+            display_name,
+            task_lists: Vec::new(),
+            last_tasks: Vec::new(),
+            error: None,
+        },
+    );
+    let oauth = std::sync::Arc::new(crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()));
+    let client = lookout_graph::TodoClient::new(lookout_graph::GraphClient::new(oauth));
+    worker.spawn(lookout_graph::run_todo_session(account_id.clone(), client, cmd_rx, evt_tx));
+
+    glib::spawn_future_local(async move {
+        while let Ok(event) = evt_rx.recv().await {
+            // Drain the whole queued batch, collapsing whole-snapshot events
+            // (the fast-paint/lists, tasks) into the last copy of each.
+            let mut batch = vec![event];
+            while let Ok(next) = evt_rx.try_recv() {
+                batch.push(next);
+            }
+            for event in collapse_graph_todo_events(batch) {
+                match event {
+                    lookout_graph::TodoEvent::ListsUpdated(lists) => {
+                        let infos: Vec<CalendarInfo> = lists
+                            .iter()
+                            .map(|list| CalendarInfo {
+                                id: lookout_graph::graph_todo_calendar_id(&list.id),
+                                account_id: account_id.clone(),
+                                display_name: list.display_name.clone(),
+                                color: None,
+                                href: String::new(),
+                                supports_tasks: true,
+                            })
+                            .collect();
+                        {
+                            let mut st = calendar_state.borrow_mut();
+                            if let Some(handle) = st.graph_todo.get_mut(&account_id) {
+                                handle.task_lists = lists;
+                                handle.error = None;
+                            }
+                            calendar_colors::assign_missing(&mut st.calendar_colors, &infos);
+                        }
+                        refresh_tasks_view(&calendar_state, &tasks_view);
+                    }
+                    lookout_graph::TodoEvent::TasksUpdated(tasks) => {
+                        if let Some(handle) = calendar_state.borrow_mut().graph_todo.get_mut(&account_id) {
+                            handle.last_tasks = tasks;
+                            handle.error = None;
+                        }
+                        refresh_tasks_view(&calendar_state, &tasks_view);
+                    }
+                    lookout_graph::TodoEvent::Error(message) => {
+                        if let Some(handle) = calendar_state.borrow_mut().graph_todo.get_mut(&account_id) {
+                            handle.error = Some(message.clone());
+                        }
+                        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_calendar_account(
     worker: Rc<Worker>,
@@ -2116,7 +2211,7 @@ pub(crate) fn connect_calendar_account(
         account_id.clone(),
         CalendarAccountHandle {
             cmd_tx,
-            display_name,
+            display_name: display_name.clone(),
             uri: if microsoft_365 { "Microsoft 365".to_string() } else { config.base_url.clone() },
             graph: microsoft_365,
             calendars: Vec::new(),
@@ -2135,6 +2230,17 @@ pub(crate) fn connect_calendar_account(
         let oauth = std::sync::Arc::new(crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()));
         let client = lookout_graph::CalendarClient::new(lookout_graph::GraphClient::new(oauth));
         worker.spawn(lookout_graph::run_calendar_session(account_id.clone(), client, cmd_rx, evt_tx));
+        // Microsoft To Do is a separate Graph backend (item 5.3 / A-05): only
+        // the calendar actor above owns calendars/events, this one owns the
+        // task lists. Both are gated by the same Graph consent.
+        connect_graph_todo_account(
+            worker.clone(),
+            calendar_state.clone(),
+            tasks_view.clone(),
+            toast_overlay.clone(),
+            account_id.clone(),
+            display_name,
+        );
     } else {
         worker.spawn(lookout_dav::session::run_calendar_session(config, credentials, cmd_rx, evt_tx));
     }

@@ -759,6 +759,13 @@ pub(crate) fn pickable_task_calendars(calendar_state: &Rc<RefCell<CalendarUiStat
             out.push((format!("{} · {}", handle.email, list.title), google_tasks::google_task_calendar_id(&list.id)));
         }
     }
+    let mut graph_handles: Vec<&GraphTodoHandle> = st.graph_todo.values().collect();
+    graph_handles.sort_by_key(|h| h.display_name.to_lowercase());
+    for handle in graph_handles {
+        for list in &handle.task_lists {
+            out.push((format!("{} · {}", handle.display_name, list.display_name), lookout_graph::graph_todo_calendar_id(&list.id)));
+        }
+    }
     out
 }
 
@@ -778,9 +785,12 @@ pub(crate) fn default_pickable_task_calendar(calendar_state: &Rc<RefCell<Calenda
     if let Some(calendar) = st.accounts.values().find_map(|handle| handle.calendars.iter().find(|c| task_capable(c))) {
         return Some(calendar.id.clone());
     }
-    st.google_tasks
+    if let Some(list) = st.google_tasks.values().find_map(|handle| handle.task_lists.first()) {
+        return Some(google_tasks::google_task_calendar_id(&list.id));
+    }
+    st.graph_todo
         .values()
-        .find_map(|handle| handle.task_lists.first().map(|l| google_tasks::google_task_calendar_id(&l.id)))
+        .find_map(|handle| handle.task_lists.first().map(|l| lookout_graph::graph_todo_calendar_id(&l.id)))
 }
 
 /// The "Add as Task" mail toolbar button's default target: the preferred
@@ -797,6 +807,9 @@ pub(crate) fn default_task_calendar_preferring(calendar_state: &Rc<RefCell<Calen
     if let Some(preferred_account) = preferred_account {
         if let Some(calendar) = st.accounts.get(preferred_account).and_then(|h| h.calendars.iter().find(|c| c.supports_tasks)) {
             return calendar.id.clone();
+        }
+        if let Some(list) = st.graph_todo.get(preferred_account).and_then(|h| h.task_lists.first()) {
+            return lookout_graph::graph_todo_calendar_id(&list.id);
         }
     }
     if let Some(preferred_email) = preferred_email {
@@ -1667,6 +1680,13 @@ pub(crate) fn google_tasks_handle_for_calendar<'a>(state: &'a CalendarUiState, c
     state.google_tasks.values().find(|handle| handle.task_lists.iter().any(|l| l.id == list_id))
 }
 
+/// The Graph To Do session owning a `todo:<list id>` calendar, if any - the
+/// task-write routing lookup (item 5.3 / A-05, T-12).
+pub(crate) fn graph_todo_handle_for_calendar<'a>(state: &'a CalendarUiState, calendar_id: &CalendarId) -> Option<&'a GraphTodoHandle> {
+    let list_id = lookout_graph::graph_todo_list_id(calendar_id)?;
+    state.graph_todo.values().find(|handle| handle.task_lists.iter().any(|l| l.id == list_id))
+}
+
 /// Unions every connected task source's latest snapshot: CalDAV accounts'
 /// tasks, Google Tasks accounts' tasks, and the local on-device store.
 /// Tasks have no month window, so the full set is always the merge unit.
@@ -1676,6 +1696,7 @@ pub(crate) fn merged_tasks(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec
         .values()
         .flat_map(|handle| handle.last_tasks.iter().cloned())
         .chain(st.google_tasks.values().flat_map(|handle| handle.last_tasks.iter().cloned()))
+        .chain(st.graph_todo.values().flat_map(|handle| handle.last_tasks.iter().cloned()))
         .chain(st.local_tasks.iter().cloned())
         .collect()
 }
@@ -1691,17 +1712,27 @@ pub(crate) fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, 
     // local store) fall back to the id in `arrange_tasks`.
     let list_names: HashMap<CalendarId, String> = {
         let st = calendar_state.borrow();
-        st.accounts
+        let mut names: HashMap<CalendarId, String> = st
+            .accounts
             .values()
             .flat_map(|handle| handle.calendars.iter())
             .map(|cal| (cal.id.clone(), cal.display_name.clone()))
-            .collect()
+            .collect();
+        // To Do lists get their proper names for the "group by list" mode;
+        // Google lists keep falling back to their id, as before.
+        for handle in st.graph_todo.values() {
+            for list in &handle.task_lists {
+                names.insert(lookout_graph::graph_todo_calendar_id(&list.id), list.display_name.clone());
+            }
+        }
+        names
     };
     let st = calendar_state.borrow();
     let has_caldav_tasks = st.accounts.values().flat_map(|h| h.calendars.iter()).any(|c| c.supports_tasks);
     let has_google_tasks = !st.google_tasks.is_empty();
+    let has_graph_todo = !st.graph_todo.is_empty();
     drop(st);
-    let message = if has_caldav_tasks || has_google_tasks {
+    let message = if has_caldav_tasks || has_google_tasks || has_graph_todo {
         "No tasks yet - use New task to create one.".to_string()
     } else {
         "No connected calendar supports tasks, so new tasks are saved on this device only. To sync tasks, use Connect Google Tasks or connect a calendar that supports them (Nextcloud, iCloud).".to_string()

@@ -13,9 +13,10 @@
 //!   itself, so the session reports a non-`None` schedule-outbox marker and the
 //!   app's `calendar_invites::delivery_for` stands the client-side iMIP sender
 //!   down.
-//! - **No tasks** (item 17): Graph calendars carry no VTODOs (Microsoft To Do
-//!   is a separate backend, item 5.3), so task commands report empty/soft
-//!   failures rather than a hard error.
+//! - **No tasks**: Graph calendars carry no VTODOs - Microsoft To Do is the
+//!   separate [`crate::todo`] backend (item 5.3 / A-05), which owns the task
+//!   lists. This session's task commands therefore stay soft-fail placeholders;
+//!   the app routes task writes to the To Do session instead.
 //!
 //! Free/busy (`FetchFreeBusy`) is answered through Graph `getSchedule`
 //! (item 14).
@@ -137,8 +138,9 @@ async fn connect_and_run(
 
     let mut current_month = first_of_month(Utc::now().date_naive());
     sync_month(client, &calendars, current_month, events).await?;
-    // Graph calendars carry no tasks (item 17); still report an (empty) set so
-    // the Tasks view clears any stale rows for the account.
+    // Graph calendars carry no tasks - Microsoft To Do is the separate `todo`
+    // backend (item 5.3 / A-05); still report an (empty) set so the Tasks view
+    // clears any stale rows for the account's calendar source.
     let _ = events.send(CalendarSessionEvent::TasksUpdated(Vec::new())).await;
 
     loop {
@@ -206,7 +208,7 @@ async fn connect_and_run(
                 CalendarCommand::CreateTask { task } => {
                     let _ = events
                         .send(CalendarSessionEvent::Error(format!(
-                            "task \"{}\" was not saved - Microsoft 365 calendars don't support tasks",
+                            "task \"{}\" was not saved - tasks live in Microsoft To Do, not a Graph calendar",
                             task.uid
                         )))
                         .await;
@@ -214,7 +216,7 @@ async fn connect_and_run(
                 CalendarCommand::UpdateTask { task } => {
                     let _ = events
                         .send(CalendarSessionEvent::Error(format!(
-                            "task \"{}\" was not saved - Microsoft 365 calendars don't support tasks",
+                            "task \"{}\" was not saved - tasks live in Microsoft To Do, not a Graph calendar",
                             task.uid
                         )))
                         .await;
@@ -222,7 +224,7 @@ async fn connect_and_run(
                 CalendarCommand::DeleteTask { .. } => {
                     let _ = events
                         .send(CalendarSessionEvent::Error(
-                            "the task was not deleted - Microsoft 365 calendars don't support tasks".to_string(),
+                            "the task was not deleted - tasks live in Microsoft To Do, not a Graph calendar".to_string(),
                         ))
                         .await;
                 }

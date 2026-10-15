@@ -1,0 +1,31 @@
+{
+    "value": [
+        {
+            "id": "AAMkADAwATNiLTE0Y2YtNGVhMS05ZjA4LTYyNTdiNDk0NzY5ZgBGAAAAAA",
+            "@odata.etag": "W/\"hER0u4a2aUq0aLm0hQ9C7wAAr0wJkR\"",
+            "title": "Buy milk",
+            "body": { "content": "Two litres of semi-skimmed", "contentType": "text" },
+            "importance": "high",
+            "status": "inProgress",
+            "dueDateTime": { "dateTime": "2026-08-09T09:00:00.0000000", "timeZone": "UTC" },
+            "startDateTime": { "dateTime": "2026-08-08T09:00:00.0000000", "timeZone": "UTC" },
+            "createdDateTime": "2026-08-01T12:00:00Z",
+            "lastModifiedDateTime": "2026-08-02T08:30:00Z",
+            "categories": ["Errands", "Home"],
+            "checklistItems": [
+                { "id": "step-1", "displayName": "Check the fridge", "isChecked": true, "createdDateTime": "2026-08-01T12:00:00Z" },
+                { "id": "step-2", "displayName": "Walk to the shop", "isChecked": false, "createdDateTime": "2026-08-01T12:00:00Z" }
+            ]
+        },
+        {
+            "id": "AAMkADAwATNiLTE0Y2YtNGVhMS05ZjA4LTYyNTdiNDk0NzY5ZgBHAAAAAA",
+            "@odata.etag": "W/\"hER0u4a2aUq0aLm0hQ9C7wAAr0wJkS\"",
+            "title": "Post the letter",
+            "body": { "content": "", "contentType": "text" },
+            "importance": "normal",
+            "status": "completed",
+            "completedDateTime": { "dateTime": "2026-08-07T10:00:00.0000000", "timeZone": "UTC" },
+            "createdDateTime": "2026-08-03T09:00:00Z"
+        }
+    ]
+}

@@ -1858,6 +1858,25 @@ pub(crate) struct GoogleTasksHandle {
     pub(crate) error: Option<String>,
 }
 
+/// Per-Microsoft-365-account state for the Graph To Do integration (keyed by
+/// the GOA account id, like `accounts`). One
+/// `lookout_graph::run_todo_session` actor per connected account; its lists map
+/// to synthetic `todo:<list id>` calendar ids so the Tasks view's
+/// colour/merge machinery treats them like calendars (item 5.3 / A-05, T-12).
+pub(crate) struct GraphTodoHandle {
+    pub(crate) cmd_tx: async_channel::Sender<lookout_graph::TodoCommand>,
+    /// The account's display name, so the task editor's picker can label its
+    /// lists the same way CalDAV/Google sources are labelled.
+    pub(crate) display_name: String,
+    /// The account's To Do lists, from the last `ListsUpdated` - the task
+    /// editor's picker entries and the save-routing lookup.
+    pub(crate) task_lists: Vec<lookout_graph::TodoList>,
+    /// Latest full task snapshot from the account's last `TasksUpdated`.
+    pub(crate) last_tasks: Vec<CalendarTask>,
+    /// The latest reported error, if any (revoked consent, failed write, ...).
+    pub(crate) error: Option<String>,
+}
+
 pub(crate) struct CalendarUiState {
     pub(crate) accounts: HashMap<AccountId, CalendarAccountHandle>,
     pub(crate) displayed_month: chrono::NaiveDate,
@@ -1889,6 +1908,8 @@ pub(crate) struct CalendarUiState {
     pub(crate) birthdays: Option<BirthdaysHandle>,
     /// Connected Google Tasks accounts, keyed by email.
     pub(crate) google_tasks: HashMap<String, GoogleTasksHandle>,
+    /// Connected Microsoft 365 To Do accounts, keyed by GOA account id.
+    pub(crate) graph_todo: HashMap<AccountId, GraphTodoHandle>,
     /// Every Google GOA account's email, discovered at startup - the
     /// "Connect Google Tasks" toolbar button's targets.
     pub(crate) google_account_emails: Vec<String>,

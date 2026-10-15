@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.218" date="2026-10-16">
+      <description>
+        <p>Microsoft To Do is now native: your Microsoft 365 to-do lists and their tasks sync into the Tasks view, and can be created, edited or deleted from Lookout, using the same "Sync with Outlook" permission as the calendar and contacts.</p>
+      </description>
+    </release>
     <release version="0.9.217" date="2026-10-16">
       <description>
         <p>Microsoft 365 contacts are now native: your Outlook contacts sync into the People screen, photos included, and can be created, edited or deleted from Lookout.</p>

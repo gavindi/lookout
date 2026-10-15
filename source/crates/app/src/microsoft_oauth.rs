@@ -66,8 +66,9 @@ const EXCHANGE_SCOPES: &str = concat!(
 /// to Outlook (`graph_pin.rs`), the category master list
 /// (`/me/outlook/masterCategories`, item 2.1 - `MailboxSettings.ReadWrite`),
 /// the calendar backend (`Calendars.ReadWrite` for events, item 5.1 /
-/// A-03, plus `Calendars.Read.Shared` for free/busy, CAL-19), and the contacts
-/// backend (`Contacts.ReadWrite`, item 5.2 / A-04). `Place.Read.All` (room
+/// A-03, plus `Calendars.Read.Shared` for free/busy, CAL-19), the contacts
+/// backend (`Contacts.ReadWrite`, item 5.2 / A-04), and the To Do backend
+/// (`Tasks.ReadWrite`, item 5.3 / A-05). `Place.Read.All` (room
 /// finding) and the directory scopes `User.ReadBasic.All`/`People.Read` (GAL,
 /// item 5.2 / P-11) are deliberately *not* here: some tenants admin-block
 /// them, so they're requested only through `GraphFeature::Rooms` /
@@ -82,7 +83,8 @@ const GRAPH_SCOPES: &str = concat!(
     "https://graph.microsoft.com/MailboxSettings.ReadWrite ",
     "https://graph.microsoft.com/Calendars.ReadWrite ",
     "https://graph.microsoft.com/Calendars.Read.Shared ",
-    "https://graph.microsoft.com/Contacts.ReadWrite"
+    "https://graph.microsoft.com/Contacts.ReadWrite ",
+    "https://graph.microsoft.com/Tasks.ReadWrite"
 );
 
 /// Requested only by `ensure_graph_consent`: a single interactive consent
@@ -91,7 +93,7 @@ const GRAPH_SCOPES: &str = concat!(
 /// scope-bound, even though each individual access token it mints is
 /// single-resource). Mirrors [`GRAPH_SCOPES`]'s Graph set plus the Exchange
 /// ones, so one Config action opts the account into every Outlook-sync
-/// feature (mail properties, categories, calendar, contacts).
+/// feature (mail properties, categories, calendar, contacts, tasks).
 const COMBINED_SCOPES: &str = concat!(
     "offline_access ",
     "https://outlook.office.com/IMAP.AccessAsUser.All ",
@@ -100,7 +102,8 @@ const COMBINED_SCOPES: &str = concat!(
     "https://graph.microsoft.com/MailboxSettings.ReadWrite ",
     "https://graph.microsoft.com/Calendars.ReadWrite ",
     "https://graph.microsoft.com/Calendars.Read.Shared ",
-    "https://graph.microsoft.com/Contacts.ReadWrite"
+    "https://graph.microsoft.com/Contacts.ReadWrite ",
+    "https://graph.microsoft.com/Tasks.ReadWrite"
 );
 
 /// Which resource a token is being requested for - AAD v2 access tokens are
@@ -731,6 +734,7 @@ mod tests {
             lookout_graph::CALENDARS_READ_WRITE,
             lookout_graph::CALENDARS_READ_SHARED,
             lookout_graph::CONTACTS_READ_WRITE,
+            lookout_graph::TASKS_READ_WRITE,
         ] {
             let qualified = format!("https://graph.microsoft.com/{bare}");
             assert!(GRAPH_SCOPES.contains(qualified.as_str()), "{bare} missing from GRAPH_SCOPES");

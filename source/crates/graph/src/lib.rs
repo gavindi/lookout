@@ -21,6 +21,7 @@ pub mod client;
 pub mod contacts;
 pub mod error;
 pub mod scopes;
+pub mod todo;
 
 pub use auth::TokenProvider;
 pub use calendar::client::{CalendarClient, Room};
@@ -37,4 +38,10 @@ pub use error::{GraphError, Result};
 pub use scopes::{
     GraphFeature, BASE_GRAPH_SCOPES, CALENDARS_READ_SHARED, CALENDARS_READ_WRITE, CALENDARS_READ_WRITE_SHARED, CONTACTS_READ_WRITE, MAILBOX_SETTINGS_READ_WRITE, MAIL_READ_WRITE,
     MAIL_READ_WRITE_SHARED, MAIL_SEND, PEOPLE_READ, PLACE_READ_ALL, TASKS_READ_WRITE, USER_READ_BASIC_ALL,
+};
+pub use todo::client::TodoClient;
+pub use todo::session::{run_todo_session, TodoCommand, TodoEvent};
+pub use todo::{
+    checklist_item_from_graph, graph_todo_calendar_id, graph_todo_list_id, linked_resource_from_graph, task_to_todo_body, todo_list_from_graph, todo_task_from_graph,
+    ChecklistStep, LinkedResource, TodoList, GRAPH_TODO_PREFIX, WELL_KNOWN_DEFAULT_LIST, WELL_KNOWN_FLAGGED_EMAIL,
 };

@@ -140,6 +140,13 @@ pub(crate) fn open_task_editor_for(
                 .map(|l| (h, l))
         }) {
             calendars.push((format!("{} · {}", list.0.email, list.1.title), task.calendar_id.clone()));
+        } else if let Some(list) = calendar_state.borrow().graph_todo.values().find_map(|h| {
+            h.task_lists
+                .iter()
+                .find(|l| lookout_graph::graph_todo_calendar_id(&l.id) == task.calendar_id)
+                .map(|l| (h, l))
+        }) {
+            calendars.push((format!("{} · {}", list.0.display_name, list.1.display_name), task.calendar_id.clone()));
         }
     }
     let calendar_state = calendar_state.clone();
@@ -201,6 +208,24 @@ pub(crate) fn route_task_save(calendar_state: &Rc<RefCell<CalendarUiState>>, tas
         let _ = handle.send_blocking(cmd);
         return;
     }
+    if let Some(list_id) = lookout_graph::graph_todo_list_id(&calendar_id).map(str::to_string) {
+        let command = {
+            let st = calendar_state.borrow();
+            let Some(handle) = graph_todo_handle_for_calendar(&st, &calendar_id) else {
+                tracing::warn!("tried to save a task into an unknown Microsoft To Do list {calendar_id}");
+                return;
+            };
+            let is_new = !handle.last_tasks.iter().any(|t| t.uid == task.uid);
+            let command = if is_new {
+                lookout_graph::TodoCommand::CreateTask { list_id, task: Box::new(task) }
+            } else {
+                lookout_graph::TodoCommand::UpdateTask { list_id, task: Box::new(task) }
+            };
+            (handle.cmd_tx.clone(), command)
+        };
+        let _ = command.0.send_blocking(command.1);
+        return;
+    }
     let Some(handle) = task_handle_for_id(calendar_state, &calendar_id) else {
         tracing::warn!("tried to save a task into an unknown calendar {calendar_id}");
         return;
@@ -243,6 +268,15 @@ pub(crate) fn route_task_delete(
             list_id: list_id.to_string(),
             task_id: uid.0,
         });
+        return;
+    }
+    if let Some(list_id) = lookout_graph::graph_todo_list_id(&calendar_id).map(str::to_string) {
+        let st = calendar_state.borrow();
+        let Some(handle) = graph_todo_handle_for_calendar(&st, &calendar_id) else {
+            tracing::warn!("tried to delete a task from an unknown Microsoft To Do list {calendar_id}");
+            return;
+        };
+        let _ = handle.cmd_tx.send_blocking(lookout_graph::TodoCommand::DeleteTask { list_id, task_id: uid.0, etag });
         return;
     }
     let Some(handle) = task_handle_for_id(calendar_state, &calendar_id) else {
