@@ -18,6 +18,7 @@
 pub mod auth;
 pub mod calendar;
 pub mod client;
+pub mod contacts;
 pub mod error;
 pub mod scopes;
 
@@ -30,6 +31,8 @@ pub use calendar::{
     parse_graph_date_time, parse_graph_date_time_str,
 };
 pub use client::{delta_link_of, next_link, page_items, retry_after, DeltaPage, GraphClient, GRAPH_BASE_URL};
+pub use contacts::client::ContactsClient;
+pub use contacts::{contact_folder_from_graph, contact_from_graph, contact_to_graph, person_from_graph, removed_id, user_from_graph, ContactFolder, DirectoryPerson, GraphContact};
 pub use error::{GraphError, Result};
 pub use scopes::{
     GraphFeature, BASE_GRAPH_SCOPES, CALENDARS_READ_SHARED, CALENDARS_READ_WRITE, CALENDARS_READ_WRITE_SHARED, CONTACTS_READ_WRITE, MAILBOX_SETTINGS_READ_WRITE, MAIL_READ_WRITE,

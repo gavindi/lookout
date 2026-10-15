@@ -1,0 +1,70 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('work%40contoso.com')/contacts",
+  "value": [
+    {
+      "id": "AAMkAGVmMDEzMTM4LTExNmQtNDEwOS05ZjE1LTZlZjI0YjE4YzNiYwBGAAAAAAD",
+      "changeKey": "EQAAABYAAABkZmUxYzE=",
+      "parentFolderId": "AAMkAGVmMDEzMTM4LTExNmQ=",
+      "displayName": "Alex Wilber",
+      "givenName": "Alex",
+      "middleName": "D",
+      "surname": "Wilber",
+      "title": "Mr.",
+      "generation": "Jr.",
+      "jobTitle": "Marketing Assistant",
+      "initials": "AW",
+      "nickName": "Al",
+      "fileAs": "Wilber, Alex",
+      "companyName": "Contoso Ltd.",
+      "department": "Marketing",
+      "officeLocation": "Room 4-2112",
+      "profession": "Marketing",
+      "manager": "Miriam Graham",
+      "assistantName": "Katie Jordan",
+      "spouseName": "Robin Wilber",
+      "children": ["Rene Wilber"],
+      "emailAddresses": [
+        { "name": "Alex Wilber", "address": "alex.wilber@contoso.com" },
+        { "name": "Alex Wilber (home)", "address": "alex@example.org" }
+      ],
+      "businessPhones": ["+1 425 555 0100"],
+      "homePhones": ["+1 425 555 0101"],
+      "mobilePhone": "+1 425 555 0102",
+      "homeAddress": {
+        "street": "1 Example Way",
+        "city": "Redmond",
+        "state": "WA",
+        "postalCode": "98052",
+        "countryOrRegion": "United States"
+      },
+      "businessAddress": {
+        "street": "One Microsoft Way",
+        "city": "Redmond",
+        "state": "WA",
+        "postalCode": "98052",
+        "countryOrRegion": "United States"
+      },
+      "otherAddress": {
+        "postOfficeBox": "PO Box 1000"
+      },
+      "imAddresses": ["sip:alex.wilber@contoso.com"],
+      "personalNotes": "Met at the Contoso partner event.",
+      "categories": ["Customers", "Marketing"],
+      "birthday": "1985-04-23T00:00:00Z",
+      "businessHomePage": "https://www.contoso.com"
+    },
+    {
+      "id": "AAMkAGVmMDEzMTM4LTExNmQtNDEwOS05ZjE1LTZlZjI0YjE4YzNiYwBGAAAAAAD",
+      "changeKey": "EQAAABYAAABkZmUxYzI=",
+      "parentFolderId": "AAMkAGVmMDEzMTM4LTExNmQ=",
+      "displayName": "Megan Bowen",
+      "givenName": "Megan",
+      "surname": "Bowen",
+      "jobTitle": "Coordinator",
+      "emailAddresses": [
+        { "name": "Megan Bowen", "address": "megan.bowen@contoso.com" }
+      ],
+      "birthday": "--06-11"
+    }
+  ]
+}

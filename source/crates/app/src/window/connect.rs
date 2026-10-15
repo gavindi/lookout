@@ -18,7 +18,7 @@ use lookout_mail::{AccountConfig, EndpointConfig};
 
 use crate::calendar_colors;
 use crate::calendar_view::{self, CalendarMain};
-use crate::contacts_view::sync_contacts_account;
+use crate::contacts_view::{contacts_account_usable, microsoft_graph_contacts_account, sync_contacts_account};
 use crate::goa_calendar_credentials::GoaCalendarCredentialProvider;
 use crate::goa_credentials::GoaCredentialProvider;
 use crate::google_tasks::{self, GoogleTasksEvent};
@@ -1694,18 +1694,24 @@ pub(crate) fn connect_goa_account(
             root_stack.set_visible_child_name("tasks");
         }
     }
-    if let Some(contacts) = &account.contacts {
-        let (cmd_tx, cmd_rx) = async_channel::unbounded();
-        state.borrow_mut().contact_cmd_tx.insert(account_id.clone(), cmd_tx);
-        sync_contacts_account(
-            worker.clone(),
-            state.clone(),
-            toast_overlay.clone(),
-            goa_client.clone(),
-            contacts.clone(),
-            cmd_rx,
-            refresh_contacts_ui.clone(),
-        );
+    // Prefer the Contacts interface GOA reported; fall back to the Graph
+    // contacts backend for a Microsoft 365 mailbox that didn't get one (item
+    // 5.2 / A-04), so a re-enabled account comes back online the same way. A
+    // Microsoft 365 account still needs Graph consent.
+    if let Some(contacts) = account.contacts.clone().or_else(|| microsoft_graph_contacts_account(account, &account_id)) {
+        if contacts_account_usable(&contacts) {
+            let (cmd_tx, cmd_rx) = async_channel::unbounded();
+            state.borrow_mut().contact_cmd_tx.insert(account_id.clone(), cmd_tx);
+            sync_contacts_account(
+                worker.clone(),
+                state.clone(),
+                toast_overlay.clone(),
+                goa_client.clone(),
+                contacts,
+                cmd_rx,
+                refresh_contacts_ui.clone(),
+            );
+        }
     }
     // Google Tasks needs a stored OAuth token to connect silently; without
     // one it just reappears as a "Connect Google Tasks" button target.

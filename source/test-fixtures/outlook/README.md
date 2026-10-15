@@ -23,6 +23,8 @@ behaviour rather than an interpretation of the specs.
 | `freebusy-request.ics` | The RFC 6638 §B.5 `VFREEBUSY` `METHOD:REQUEST` body a client POSTs to a CalDAV schedule-outbox (CAL-19). |
 | `freebusy-response.xml` | The RFC 6638 §B.5 `CALDAV:schedule-response` answer: three recipients (two busy, one an invalid calendar user with no `calendar-data`). |
 | `automatic-replies.json` | A Graph `GET /me/mailboxSettings` response with `automaticRepliesSetting`: a scheduled range in a Windows time zone, HTML internal/external messages, a `contactsOnly` audience — pins the automatic-replies mapping (M-24, item 2.11). |
+| `contacts.json` | A Graph `GET /me/contacts` response: two contacts exercising the name parts, company/department, job title, phones, the three address blocks, IM addresses, categories, a full and a yearless birthday, and the scalar fields with no vCard home — pins the Graph contacts mapping (A-04, item 5.2). |
+| `contact-folders.json` | A Graph `GET /me/contactFolders` response, the People screen's address-book rows (A-04, item 5.2). |
 
 These are authored to the documented wire formats (`[MS-OXCICAL]`, `[MS-OXOMSG]`,
 `[MS-OXTNEF]`, RFC 6047, the Microsoft Graph reference) and verified by

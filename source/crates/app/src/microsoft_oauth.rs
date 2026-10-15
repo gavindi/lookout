@@ -65,12 +65,15 @@ const EXCHANGE_SCOPES: &str = concat!(
 /// MAPI extended properties (`PR_RENEW_TIME`) on a message so pinning mirrors
 /// to Outlook (`graph_pin.rs`), the category master list
 /// (`/me/outlook/masterCategories`, item 2.1 - `MailboxSettings.ReadWrite`),
-/// and the calendar backend (`Calendars.ReadWrite` for events, item 5.1 /
-/// A-03, plus `Calendars.Read.Shared` for free/busy, CAL-19). `Place.Read.All`
-/// (room finding) is deliberately *not* here: some tenants admin-block it, so
-/// it's requested only through `GraphFeature::Rooms` when the room finder is
-/// first used, keeping the default consent from breaking. Only ever requested
-/// as part of `COMBINED_SCOPES` below, via the explicit, Config-triggered
+/// the calendar backend (`Calendars.ReadWrite` for events, item 5.1 /
+/// A-03, plus `Calendars.Read.Shared` for free/busy, CAL-19), and the contacts
+/// backend (`Contacts.ReadWrite`, item 5.2 / A-04). `Place.Read.All` (room
+/// finding) and the directory scopes `User.ReadBasic.All`/`People.Read` (GAL,
+/// item 5.2 / P-11) are deliberately *not* here: some tenants admin-block
+/// them, so they're requested only through `GraphFeature::Rooms` /
+/// `GraphFeature::Directory` when the feature is first used, keeping the
+/// default consent from breaking. Only ever requested as part of
+/// `COMBINED_SCOPES` below, via the explicit, Config-triggered
 /// `ensure_graph_consent`. An existing grant made before a scope was added
 /// must be re-run from Config to cover it.
 const GRAPH_SCOPES: &str = concat!(
@@ -78,7 +81,8 @@ const GRAPH_SCOPES: &str = concat!(
     "https://graph.microsoft.com/Mail.ReadWrite ",
     "https://graph.microsoft.com/MailboxSettings.ReadWrite ",
     "https://graph.microsoft.com/Calendars.ReadWrite ",
-    "https://graph.microsoft.com/Calendars.Read.Shared"
+    "https://graph.microsoft.com/Calendars.Read.Shared ",
+    "https://graph.microsoft.com/Contacts.ReadWrite"
 );
 
 /// Requested only by `ensure_graph_consent`: a single interactive consent
@@ -87,7 +91,7 @@ const GRAPH_SCOPES: &str = concat!(
 /// scope-bound, even though each individual access token it mints is
 /// single-resource). Mirrors [`GRAPH_SCOPES`]'s Graph set plus the Exchange
 /// ones, so one Config action opts the account into every Outlook-sync
-/// feature (mail properties, categories, calendar).
+/// feature (mail properties, categories, calendar, contacts).
 const COMBINED_SCOPES: &str = concat!(
     "offline_access ",
     "https://outlook.office.com/IMAP.AccessAsUser.All ",
@@ -95,7 +99,8 @@ const COMBINED_SCOPES: &str = concat!(
     "https://graph.microsoft.com/Mail.ReadWrite ",
     "https://graph.microsoft.com/MailboxSettings.ReadWrite ",
     "https://graph.microsoft.com/Calendars.ReadWrite ",
-    "https://graph.microsoft.com/Calendars.Read.Shared"
+    "https://graph.microsoft.com/Calendars.Read.Shared ",
+    "https://graph.microsoft.com/Contacts.ReadWrite"
 );
 
 /// Which resource a token is being requested for - AAD v2 access tokens are
@@ -718,19 +723,28 @@ mod tests {
     }
 
     #[test]
-    fn combined_consent_covers_calendar_but_omits_the_room_scope() {
+    fn combined_consent_covers_calendar_and_contacts_but_omits_the_optional_scopes() {
         // The Config "Sync with Outlook" consent must grant the calendar
-        // backend its event and free/busy scopes (item 5.1 / A-03, CAL-19)...
-        for bare in [lookout_graph::CALENDARS_READ_WRITE, lookout_graph::CALENDARS_READ_SHARED] {
+        // backend its event and free/busy scopes (item 5.1 / A-03, CAL-19)
+        // and the contacts backend its contact scope (item 5.2 / A-04)...
+        for bare in [
+            lookout_graph::CALENDARS_READ_WRITE,
+            lookout_graph::CALENDARS_READ_SHARED,
+            lookout_graph::CONTACTS_READ_WRITE,
+        ] {
             let qualified = format!("https://graph.microsoft.com/{bare}");
             assert!(GRAPH_SCOPES.contains(qualified.as_str()), "{bare} missing from GRAPH_SCOPES");
             assert!(COMBINED_SCOPES.contains(qualified.as_str()), "{bare} missing from COMBINED_SCOPES");
         }
-        // ...but not `Place.Read.All`, which some tenants admin-block; it stays
-        // a per-feature (`GraphFeature::Rooms`) request so the default consent
-        // never breaks.
-        assert!(!GRAPH_SCOPES.contains(lookout_graph::PLACE_READ_ALL));
-        assert!(!COMBINED_SCOPES.contains(lookout_graph::PLACE_READ_ALL));
+        // ...but not `Place.Read.All` (room finding) or the directory scopes
+        // `User.ReadBasic.All`/`People.Read` (GAL), which some tenants
+        // admin-block; they stay per-feature (`GraphFeature::Rooms` /
+        // `GraphFeature::Directory`) requests so the default consent never
+        // breaks.
+        for optional in [lookout_graph::PLACE_READ_ALL, lookout_graph::USER_READ_BASIC_ALL, lookout_graph::PEOPLE_READ] {
+            assert!(!GRAPH_SCOPES.contains(optional), "{optional} must not be in GRAPH_SCOPES");
+            assert!(!COMBINED_SCOPES.contains(optional), "{optional} must not be in COMBINED_SCOPES");
+        }
     }
 
     #[test]

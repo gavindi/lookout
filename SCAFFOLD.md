@@ -784,12 +784,16 @@ leads the row, doubling as the field's label, and opens **`contact_picker::show_
 button inserts every checked address. Cc/Bcc keep their own smaller reveal-link buttons, trailing
 on the right of the To line.
 
-**`contacts_view.rs`** / **`contacts_editor.rs`** — CardDAV account discovery + per-account
-`sync_contacts_account` poll loop (RFC 6578 deltas), a left category tree (`ContactsBucketKind`:
+**`contacts_view.rs`** / **`contacts_editor.rs`** — contact account discovery + per-account
+`sync_contacts_account` poll loop, a left category tree (`ContactsBucketKind`:
 `AllContacts|Favourites|ContactLists|Deleted|Category(String)`) + right contact list, `.vcf`
-import/export. The editor dialog starts from a clone of the existing card and only rewrites
-exposed fields, so unedited custom properties (`X-` extensions, `KIND:group`, etc.) ride along
-untouched.
+import/export. The loop branches on the account's backend: CardDAV (RFC 6578 deltas via
+`lookout-dav`) or, for a Microsoft 365 account, Microsoft Graph
+(`lookout_graph::contacts::ContactsClient` — contact folders, per-folder `/delta`, CRUD, photos),
+both writing the same `ContactsCache` and snapshot so the UI is unchanged. The editor dialog
+starts from a clone of the existing card and only rewrites exposed fields, so unedited custom
+properties (`X-` extensions, `KIND:group`, etc.) ride along untouched. Graph v1.0 has no
+contact-group endpoint, so `KIND:group` lists remain a CardDAV-only feature.
 
 **`event_editor.rs`** — the calendar's counterpart to `compose.rs` (a modal form, since Calendar
 has no reading-pane slot). Recurrence UI lives in a separate `recurrence.rs` module

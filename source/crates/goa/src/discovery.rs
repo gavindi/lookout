@@ -147,6 +147,18 @@ pub struct GoaContactsAccount {
     pub provider_type: Option<String>,
 }
 
+impl GoaContactsAccount {
+    /// Microsoft 365 accounts (GOA provider types `ms_graph`, the legacy
+    /// `microsoft365`, and the older personal `microsoft`) are served by the
+    /// Microsoft Graph contacts backend, not CardDAV - GOA models their
+    /// contacts as Graph and may report the Contacts interface with an empty
+    /// `Uri` (see [`parse_contacts_account`](GoaClient), which keeps such
+    /// accounts so the app can route them - OUTLOOK_PARITY.md item 5.2).
+    pub fn is_microsoft_365(&self) -> bool {
+        is_microsoft365_provider_type(self.provider_type.as_deref())
+    }
+}
+
 /// Thin wrapper over a session-bus [`Connection`] providing GOA account
 /// discovery and on-demand credential fetches. Holds no secrets itself.
 /// `Clone` is cheap - `zbus::Connection` is itself an `Arc`-backed handle -
@@ -311,7 +323,9 @@ impl GoaClient {
         Ok(accounts)
     }
 
-    /// Lists every GOA account with a usable `Contacts` interface.
+    /// Lists every GOA account with a usable `Contacts` interface, including
+    /// Microsoft 365 accounts (whose interface may carry an empty `Uri` and is
+    /// served by the Graph contacts backend instead of CardDAV).
     pub async fn list_contacts_accounts(&self) -> Result<Vec<GoaContactsAccount>> {
         let manager = ObjectManagerProxy::new(&self.connection).await?;
         let objects: ManagedObjects = manager.get_managed_objects().await?;
@@ -401,8 +415,15 @@ impl GoaClient {
 
         let display_name = get_string(account_props, "PresentationIdentity").unwrap_or_default();
         let identity = get_string(account_props, "Identity").unwrap_or_default();
-        let uri = normalize_dav_base_url(get_string(contacts_props, "Uri").unwrap_or_default(), get_string(account_props, "ProviderType").as_deref());
-        if uri.is_empty() {
+        let provider_type = get_string(account_props, "ProviderType");
+        let microsoft_365 = is_microsoft365_provider_type(provider_type.as_deref());
+        let uri = normalize_dav_base_url(get_string(contacts_props, "Uri").unwrap_or_default(), provider_type.as_deref());
+        // A Microsoft 365 account's Contacts interface carries an empty `Uri`
+        // (GOA models its contacts as Graph), but the account is still valid -
+        // the Graph contacts backend needs no CardDAV base URL - so it is kept
+        // for the app to route (`GoaContactsAccount::is_microsoft_365`). Every
+        // other provider must have a usable URI.
+        if uri.is_empty() && !microsoft_365 {
             return Ok(None);
         }
         let accept_ssl_errors = get_bool(contacts_props, "AcceptSslErrors").unwrap_or(false);
@@ -425,7 +446,7 @@ impl GoaClient {
             uri,
             accept_ssl_errors,
             auth,
-            provider_type: get_string(account_props, "ProviderType"),
+            provider_type,
         }))
     }
 
@@ -639,6 +660,31 @@ mod tests {
             assert!(!calendar_account(Some(t)).is_microsoft_365(), "expected {t:?} not to be treated as Microsoft 365");
         }
         assert!(!calendar_account(None).is_microsoft_365(), "an account without a ProviderType must not be special-cased");
+    }
+
+    #[test]
+    fn microsoft_365_contacts_accounts_are_flagged_by_provider_type() {
+        fn contacts_account(provider_type: Option<&str>) -> GoaContactsAccount {
+            GoaContactsAccount {
+                account_id: AccountId("acct".to_string()),
+                object_path: OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/a").unwrap(),
+                display_name: "Work".to_string(),
+                identity: "work@contoso.com".to_string(),
+                // A Microsoft 365 account's Contacts interface carries an empty
+                // Uri (Graph is the backend); the routing flag must still say so.
+                uri: String::new(),
+                accept_ssl_errors: false,
+                auth: ContactsAuthMethod::OAuth2,
+                provider_type: provider_type.map(str::to_string),
+            }
+        }
+        for t in ["ms_graph", "microsoft365", "microsoft"] {
+            assert!(contacts_account(Some(t)).is_microsoft_365(), "expected {t:?} to be treated as Microsoft 365");
+        }
+        for t in ["google", "nextcloud", "owncloud"] {
+            assert!(!contacts_account(Some(t)).is_microsoft_365(), "expected {t:?} not to be treated as Microsoft 365");
+        }
+        assert!(!contacts_account(None).is_microsoft_365(), "an account without a ProviderType must not be special-cased");
     }
 
     #[test]

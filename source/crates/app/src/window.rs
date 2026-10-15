@@ -18,9 +18,9 @@ use webkit::prelude::*;
 use crate::calendar_colors;
 use crate::calendar_view::{self};
 use crate::contacts_view::{
-    contact_identity, delete_contact_entries, export_current_contacts, find_contact_by_address, rebuild_contacts_list_ui, refresh_contacts_category_ui,
-    show_contact_details_dialog, show_contact_editor_for, show_contacts_import_dialog, show_create_contact_for, show_manage_groups_dialog, show_new_contact_editor,
-    spawn_contacts_discovery, ContactCommand, ContactFileFormat, ContactsCategoryChoice, ContactsListEntry,
+    contact_identity, delete_contact_entries, export_current_contacts, find_contact_by_address, microsoft_graph_contacts_account, rebuild_contacts_list_ui,
+    refresh_contacts_category_ui, show_contact_details_dialog, show_contact_editor_for, show_contacts_import_dialog, show_create_contact_for, show_manage_groups_dialog,
+    show_new_contact_editor, spawn_contacts_discovery, sync_contacts_account, ContactCommand, ContactFileFormat, ContactsCategoryChoice, ContactsListEntry,
 };
 use crate::folder_tree::TreeItem;
 use crate::google_tasks::GoogleTasksCommand;
@@ -7698,6 +7698,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let mail_overview_day_list = mail_overview_day_list.clone();
                 let reminders_engine = reminders_engine.clone();
                 let tasks_view = tasks_view.clone();
+                let refresh_contacts_ui = refresh_contacts_ui.clone();
                 Rc::new(move |_anchor, account_id: &str| {
                     let Some(client) = state.borrow().accounts.get(&AccountId(account_id.to_string())).and_then(|h| h.graph_pin.clone()) else {
                         return;
@@ -7715,6 +7716,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let mail_overview_day_list = mail_overview_day_list.clone();
                     let reminders_engine = reminders_engine.clone();
                     let tasks_view = tasks_view.clone();
+                    let refresh_contacts_ui = refresh_contacts_ui.clone();
                     let account_id = AccountId(account_id.to_string());
                     glib::spawn_future_local(async move {
                         match client.ensure_consent().await {
@@ -7729,11 +7731,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 sync_and_push_rules_from_graph(&state, &account_id);
                                 // Bring the account's Microsoft 365 calendar
                                 // online now that Graph is consented (item 19).
-                                let (goa_client, goa_account) = {
+                                let (goa_client, goa_calendar, contacts_account) = {
                                     let st = state.borrow();
-                                    (st.goa_client.clone(), st.goa_accounts.get(&account_id).and_then(|a| a.calendar.clone()))
+                                    let entry = st.goa_accounts.get(&account_id);
+                                    (
+                                        st.goa_client.clone(),
+                                        entry.and_then(|a| a.calendar.clone()),
+                                        entry.and_then(|a| a.contacts.clone().or_else(|| microsoft_graph_contacts_account(a, &account_id))),
+                                    )
                                 };
-                                if let (Some(goa_client), Some(goa_account)) = (goa_client, goa_account) {
+                                if let (Some(goa_client), Some(goa_account)) = (goa_client.clone(), goa_calendar) {
                                     connect_calendar_account(
                                         worker.clone(),
                                         calendar_state.clone(),
@@ -7748,6 +7755,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                         goa_account,
                                         tasks_view.clone(),
                                     );
+                                }
+                                // ...and its Microsoft 365 contacts (item 5.2 /
+                                // A-04), which had no session before consent.
+                                if let (Some(goa_client), Some(contacts_account)) = (goa_client, contacts_account) {
+                                    if !state.borrow().contact_cmd_tx.contains_key(&account_id) {
+                                        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+                                        state.borrow_mut().contact_cmd_tx.insert(account_id.clone(), cmd_tx);
+                                        sync_contacts_account(
+                                            worker.clone(),
+                                            state.clone(),
+                                            toast_overlay.clone(),
+                                            goa_client,
+                                            contacts_account,
+                                            cmd_rx,
+                                            refresh_contacts_ui.clone(),
+                                        );
+                                        refresh_contacts_ui(None);
+                                    }
                                 }
                                 let refresh = refresh_hook.borrow().clone();
                                 refresh();

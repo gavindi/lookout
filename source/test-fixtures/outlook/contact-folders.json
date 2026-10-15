@@ -1,0 +1,15 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('work%40contoso.com')/contactFolders",
+  "value": [
+    {
+      "id": "AAMkAGVmMDEzMTM4LTExNmQ=",
+      "displayName": "Contacts",
+      "parentFolderId": "AAMkAGVmMDEzMTM4LTExNmQ="
+    },
+    {
+      "id": "AAMkAGVmMDEzMTM4LTExNmY=",
+      "displayName": "Contoso Partners",
+      "parentFolderId": "AAMkAGVmMDEzMTM4LTExNmQ="
+    }
+  ]
+}

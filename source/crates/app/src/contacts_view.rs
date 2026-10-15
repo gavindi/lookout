@@ -1,6 +1,7 @@
-//! The People screen: CardDAV account discovery, per-account sync sessions
-//! (RFC 6578 `sync-collection` deltas into each account's `ContactsCache`),
-//! the left category tree and right contact list, and every contact dialog
+//! The People screen: contact account discovery, per-account sync sessions
+//! (CardDAV RFC 6578 `sync-collection` deltas, or Microsoft Graph for
+//! Microsoft 365 accounts, both into the account's `ContactsCache`), the left
+//! category tree and right contact list, and every contact dialog
 //! (details/editor/import/export/groups). Extracted out of `window.rs` so
 //! the contacts view has a real module home like `calendar_view` and
 //! `config_view`. The mutable state it drives still lives on `UiState`
@@ -17,27 +18,31 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use lookout_core::{AccountId, ContactList, ContactListMember, ContactsProvider, EmailAddress, EmailField, VCard};
-use lookout_dav::{CardDavAccountConfig, ContactsCache, Credential, DavClient};
-use lookout_goa::{ContactsAuthMethod, GoaClient, GoaContactsAccount};
+use lookout_core::{AccountId, ContactList, ContactListMember, ContactsProvider, EmailAddress, EmailField, Photo, VCard};
+use lookout_dav::{CardDavAccountConfig, ContactRecord, ContactsCache, Credential, DavClient};
+use lookout_goa::{ContactsAuthMethod, GoaClient, GoaContactsAccount, GoaMailAccount};
+use lookout_graph::{ContactsClient, GraphClient, GraphContact};
 
-use crate::window::UiState;
+use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::window::{DiscoveredGoaAccount, UiState};
 use crate::worker::Worker;
 
 #[derive(Clone)]
 pub struct ContactsAccountSnapshot {
     display_name: String,
     /// The address books discovered for this account - the write path's
-    /// targets: creating a contact PUTs it under a book's href, and the
-    /// contact editor's create mode offers the books as a picker.
+    /// targets: creating a contact PUTs/POSTs it under a book's href/Graph
+    /// folder id, and the contact editor's create mode offers the books as a
+    /// picker.
     books: Vec<lookout_dav::AddressBookInfo>,
-    /// Every vCard from every CardDAV address book discovered for this
-    /// account, flattened - the People screen buckets these by fixed
-    /// criteria (all/favourites/lists/deleted) and by vCard `CATEGORIES`
-    /// rather than by which address book they came from (see
-    /// `refresh_contacts_category_ui`), so which book a card came from
-    /// doesn't need tracking here. Each record carries the server-side
-    /// `href`/`getetag` the write path needs to PUT/DELETE it back.
+    /// Every vCard from every address book discovered for this account,
+    /// flattened - the People screen buckets these by fixed criteria
+    /// (all/favourites/lists/deleted) and by vCard `CATEGORIES` rather than by
+    /// which address book they came from (see `refresh_contacts_category_ui`),
+    /// so which book a card came from doesn't need tracking here. Each record
+    /// carries the server-side `href`/`getetag` (the CardDAV href, or the
+    /// Graph contact id/`changeKey`) the write path needs to PUT/DELETE it
+    /// back.
     /// `pub(crate)` so the birthdays calendar can read the same contact
     /// set the People screen shows.
     pub(crate) contacts: Vec<lookout_dav::ContactRecord>,
@@ -148,28 +153,28 @@ pub struct ContactsListEntry {
     pub etag: Option<String>,
 }
 
-/// A write command for one account's CardDAV session, sent by the People
-/// screen's editor/import/manage-groups flows and executed by the account's
-/// poll loop in `sync_contacts_account`. Each command carries a one-shot
-/// `reply` channel the UI awaits for the result (a toast or a dialog close),
-/// so success/failure can't be conflated with the sync polling's `tx`.
+/// A write command for one account's contact session (CardDAV or Graph), sent
+/// by the People screen's editor/import/manage-groups flows and executed by the
+/// account's poll loop in `sync_contacts_account`. Each command carries a
+/// one-shot `reply` channel the UI awaits for the result (a toast or a dialog
+/// close), so success/failure can't be conflated with the sync polling's `tx`.
 pub enum ContactCommand {
-    /// PUT a brand-new card under `book_href` as `<uid>.vcf` with
-    /// `If-None-Match: *`.
+    /// Create a brand-new card: CardDAV PUTs `<uid>.vcf` under `book_href`
+    /// with `If-None-Match: *`; Graph POSTs to the folder named by the href.
     Create {
         book_href: String,
         card: VCard,
         reply: async_channel::Sender<Result<(), String>>,
     },
-    /// PUT an edited card to its own `href` with `etag` as `If-Match`
-    /// (a stale etag fails with HTTP 412 instead of clobbering).
+    /// Update an edited card at its own `href`, with `etag` as the `If-Match`
+    /// precondition (a stale etag fails with HTTP 412 instead of clobbering).
     Update {
         href: String,
         etag: Option<String>,
         card: VCard,
         reply: async_channel::Sender<Result<(), String>>,
     },
-    /// DELETE the card at `href` with `etag` as `If-Match`.
+    /// Delete the card at `href`, with `etag` as `If-Match`.
     Delete {
         href: String,
         etag: Option<String>,
@@ -184,6 +189,13 @@ pub enum ContactCommand {
 /// CardDAV has no push equivalent in this app yet, so contacts are refreshed
 /// on a fixed polling interval.
 const CONTACTS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The most Graph contact photos fetched in one sync pass. Graph returns the
+/// photo from a separate `/photo/$value` request (not inline in the contact
+/// JSON), so a large fresh address book would otherwise issue one request per
+/// contact at once; the cap spreads them across polls (photos are cached as
+/// the card's `PHOTO`, so a fetched one is never re-requested).
+const MAX_GRAPH_PHOTO_FETCHES_PER_SYNC: usize = 50;
 fn contacts_match_prefix(contact: &EmailAddress, prefix: &str) -> bool {
     if prefix.is_empty() {
         return true;
@@ -1636,7 +1648,12 @@ pub fn spawn_contacts_discovery(
         let result = async {
             let client = GoaClient::connect().await?;
             let accounts = client.list_contacts_accounts().await?;
-            Ok::<_, lookout_goa::Error>((client, accounts))
+            // Microsoft 365 mailboxes, listed independently of the contacts
+            // interfaces: GOA's ms_graph provider may not expose a `Contacts`
+            // interface at all, and this discovery can't rely on the mail
+            // discovery having populated `goa_accounts` first (they race).
+            let m365_mail: Vec<GoaMailAccount> = client.list_mail_accounts().await?.into_iter().filter(GoaMailAccount::is_microsoft_365).collect();
+            Ok::<_, lookout_goa::Error>((client, accounts, m365_mail))
         }
         .await;
         let _ = goa_tx.send(result).await;
@@ -1651,8 +1668,11 @@ pub fn spawn_contacts_discovery(
             }
         };
         match result {
-            Ok((client, accounts)) if !accounts.is_empty() => {
-                show_page("contacts");
+            Ok((client, accounts, m365_mail)) => {
+                // The accounts a session was started for, so the Microsoft 365
+                // fallback below doesn't double-connect one GOA already
+                // reported a `Contacts` interface for.
+                let mut started: HashSet<AccountId> = HashSet::new();
                 for account in accounts {
                     let id = account.account_id.clone();
                     // Record the account in the GOA union (disabled ones
@@ -1679,11 +1699,46 @@ pub fn spawn_contacts_discovery(
                     if !enabled {
                         continue;
                     }
+                    // A Microsoft 365 account has no contacts until Graph is
+                    // consented (item 5.2 / A-04); an unconsented one is
+                    // recorded above but not synced, ready for a re-enable.
+                    if !contacts_account_usable(&account) {
+                        tracing::debug!("Microsoft 365 contacts {id} has no Outlook-sync consent yet; skipping until enabled in Config");
+                        continue;
+                    }
                     // Each account's session gets its own command channel,
                     // stored so the People screen's editor/import/group flows
                     // can route writes to the right account.
                     let (cmd_tx, cmd_rx) = async_channel::unbounded();
-                    state.borrow_mut().contact_cmd_tx.insert(id, cmd_tx);
+                    state.borrow_mut().contact_cmd_tx.insert(id.clone(), cmd_tx);
+                    sync_contacts_account(
+                        worker.clone(),
+                        state.clone(),
+                        toast_overlay.clone(),
+                        client.clone(),
+                        account,
+                        cmd_rx,
+                        refresh_contacts_ui.clone(),
+                    );
+                    started.insert(id);
+                }
+                // A Microsoft 365 mailbox whose `Contacts` interface GOA didn't
+                // report is still served by the Graph contacts backend (item
+                // 5.2 / A-04); synthesise its contacts account so the People
+                // screen gains it as soon as Graph is consented.
+                let fallback: Vec<GoaContactsAccount> = m365_mail
+                    .into_iter()
+                    .filter(|mail| !started.contains(&mail.account_id))
+                    .filter(|mail| state.borrow().account_enabled(&mail.account_id))
+                    .filter_map(|mail| {
+                        let consented = crate::microsoft_oauth::MicrosoftOAuth::new(mail.account_id.clone()).graph_consented();
+                        graph_contacts_account_from_mail(&mail, &mail.account_id, &mail.display_name, consented)
+                    })
+                    .collect();
+                for account in fallback {
+                    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+                    started.insert(account.account_id.clone());
+                    state.borrow_mut().contact_cmd_tx.insert(account.account_id.clone(), cmd_tx);
                     sync_contacts_account(
                         worker.clone(),
                         state.clone(),
@@ -1694,8 +1749,12 @@ pub fn spawn_contacts_discovery(
                         refresh_contacts_ui.clone(),
                     );
                 }
+                if started.is_empty() {
+                    show_page("contacts-empty");
+                } else {
+                    show_page("contacts");
+                }
             }
-            Ok(_) => show_page("contacts-empty"),
             Err(e) => {
                 show_page("contacts-empty");
                 if e.is_service_unavailable() {
@@ -1720,14 +1779,23 @@ pub fn sync_contacts_account(
 ) {
     let account_id = account.account_id.clone();
     let label = account.display_name.clone();
+    // A Microsoft 365 account is served by the Graph contacts backend (item
+    // 5.2 / A-04), not CardDAV; access is opt-in (Config's "Sync with Outlook"
+    // runs the consent flow), and discovery skips an unconsented account.
+    let graph_backend = account.is_microsoft_365();
     let (tx, rx) = async_channel::unbounded();
     let cache_account_id = account_id.clone();
     worker.spawn(async move {
-        // The per-account CardDAV cache: fast-paint source at startup, the
-        // full contact set deltas are applied to, and the RFC 6578 sync-token
-        // store. Best-effort - a failed open just means no cache (full
-        // refetches every poll, no fast paint), never an error.
+        // The per-account contacts cache: fast-paint source at startup, the
+        // full contact set deltas are applied to, and the RFC 6578 sync-token /
+        // Graph delta-link store. Best-effort - a failed open just means no
+        // cache (full refetches every poll, no fast paint), never an error.
         let cache = ContactsCache::open(&cache_account_id).ok();
+        // The Graph transport, built once per session; `None` for CardDAV.
+        let graph = graph_backend.then(|| {
+            let oauth = std::sync::Arc::new(MicrosoftOAuth::new(account.account_id.clone()));
+            ContactsClient::new(GraphClient::new(oauth))
+        });
         let mut first = true;
         // Render whatever the previous session cached immediately, so the
         // People screen shows data before the first live poll completes.
@@ -1763,21 +1831,30 @@ pub fn sync_contacts_account(
             for command in wake.into_iter().chain(std::iter::from_fn(|| cmd_rx.try_recv().ok())) {
                 match command {
                     ContactCommand::Create { book_href, card, reply } => {
-                        let result = put_contact(goa_client.clone(), account.clone(), new_contact_href(&book_href, &card), &card, None).await;
+                        let result = match &graph {
+                            Some(client) => graph_create_contact(client, &book_href, &card).await,
+                            None => put_contact(goa_client.clone(), account.clone(), new_contact_href(&book_href, &card), &card, None).await,
+                        };
                         let _ = reply.send(result.clone()).await;
                         if result.is_ok() {
                             resync = true;
                         }
                     }
                     ContactCommand::Update { href, etag, card, reply } => {
-                        let result = put_contact(goa_client.clone(), account.clone(), href, &card, etag).await;
+                        let result = match &graph {
+                            Some(client) => graph_update_contact(client, &href, etag.as_deref(), &card).await,
+                            None => put_contact(goa_client.clone(), account.clone(), href, &card, etag).await,
+                        };
                         let _ = reply.send(result.clone()).await;
                         if result.is_ok() {
                             resync = true;
                         }
                     }
                     ContactCommand::Delete { href, etag, reply } => {
-                        let result = delete_contact(goa_client.clone(), account.clone(), href, etag).await;
+                        let result = match &graph {
+                            Some(client) => graph_delete_contact(client, &href, etag.as_deref()).await,
+                            None => delete_contact(goa_client.clone(), account.clone(), href, etag).await,
+                        };
                         let _ = reply.send(result.clone()).await;
                         if result.is_ok() {
                             resync = true;
@@ -1792,7 +1869,10 @@ pub fn sync_contacts_account(
             if !resync {
                 continue;
             }
-            let result = fetch_carddav_contacts(goa_client.clone(), account.clone(), cache.as_ref()).await;
+            let result = match &graph {
+                Some(client) => fetch_graph_contacts(client, &account, cache.as_ref()).await,
+                None => fetch_carddav_contacts(goa_client.clone(), account.clone(), cache.as_ref()).await,
+            };
             if tx.send((first, result)).await.is_err() {
                 break;
             }
@@ -2093,6 +2173,245 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
     })
 }
 
+/// Syncs one Microsoft 365 account's contacts from Graph (item 5.2 / A-04) into
+/// the account cache, then rebuilds the snapshot from it - the same full-set
+/// semantics as the CardDAV path, so the People screen's Deleted bucket sees a
+/// vanished contact. Each Graph contact folder is one address book; contacts
+/// are delta-synced per folder, falling back to a full read when the delta
+/// cursor can't be used (a cold start on a server that refuses one, or any
+/// per-folder delta error).
+async fn fetch_graph_contacts(client: &ContactsClient, account: &GoaContactsAccount, cache: Option<&ContactsCache>) -> Result<ContactsAccountSnapshot, String> {
+    let folders = client.list_folders().await.map_err(|e| e.to_string())?;
+    let books: Vec<lookout_dav::AddressBookInfo> = folders
+        .iter()
+        .map(|folder| lookout_dav::AddressBookInfo {
+            account_id: account.account_id.clone(),
+            display_name: folder.display_name.clone(),
+            href: folder.id.clone(),
+        })
+        .collect();
+
+    if let Some(cache) = cache {
+        let _ = cache.store_address_books(&books);
+        // Drop cached folders that vanished server-side so their members read
+        // as deletions (the UI receiver diffs the previous snapshot against
+        // this one) instead of lingering in the People screen forever.
+        let live_hrefs: HashSet<&str> = books.iter().map(|book| book.href.as_str()).collect();
+        if let Ok(cached_books) = cache.load_address_books() {
+            for stale in cached_books.iter().filter(|book| !live_hrefs.contains(book.href.as_str())) {
+                let gone: Vec<String> = cache
+                    .load_contacts()
+                    .ok()
+                    .map(|contacts| {
+                        contacts
+                            .iter()
+                            .filter(|contact| contact.book_href == stale.href)
+                            .map(|contact| contact.href.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let _ = cache.apply_delta(&stale.href, None, &[], &gone);
+            }
+        }
+    }
+
+    for folder in &folders {
+        let result = match cache {
+            Some(cache) => sync_graph_folder_into(client, folder, cache).await,
+            None => client.list_contacts(Some(&folder.id)).await.map(|_| ()).map_err(|e| e.to_string()),
+        };
+        if let Err(e) = result {
+            tracing::warn!("Graph contacts sync failed for folder {:?}: {e}", folder.display_name);
+        }
+    }
+    tracing::debug!("Graph contacts sync for {} complete ({} folder(s))", account.display_name, folders.len());
+
+    // Full-set semantics: the per-folder syncs above applied to the cache, so
+    // the snapshot is rebuilt from it (a contact missing from it was genuinely
+    // deleted). Without a cache, the folders are re-read into the snapshot.
+    if let Some(cache) = cache {
+        if let Some(snapshot) = snapshot_from_cache(account, cache) {
+            return Ok(snapshot);
+        }
+    }
+    let mut contacts = Vec::new();
+    let mut addresses = Vec::new();
+    for folder in &folders {
+        match client.list_contacts(Some(&folder.id)).await {
+            Ok(records) => {
+                for contact in &records {
+                    addresses.extend(contact.card.email_addresses());
+                }
+                contacts.extend(records.into_iter().map(graph_contact_record));
+            }
+            Err(e) => tracing::warn!("Graph contacts fetch failed for folder {:?}: {e}", folder.display_name),
+        }
+    }
+    let contact_lists = resolve_contact_lists(&contacts);
+    Ok(ContactsAccountSnapshot {
+        display_name: account.display_name.clone(),
+        books,
+        contacts,
+        suggestions: dedupe_addresses(addresses, usize::MAX),
+        contact_lists,
+    })
+}
+
+/// One full folder sync: an incremental delta where a cursor is available,
+/// else a full read. Either way the cache ends with the folder's complete set
+/// (a full read diffs against what was cached to produce the deletions a delta
+/// reports as tombstones), and any missing contact photos are fetched
+/// best-effort.
+async fn sync_graph_folder_into(client: &ContactsClient, folder: &lookout_graph::ContactFolder, cache: &ContactsCache) -> Result<(), String> {
+    let token = cache.sync_token(&folder.id).map_err(|e| e.to_string())?;
+    let (changed, removed, delta_link): (Vec<GraphContact>, Vec<String>, Option<String>) = match client.contacts_delta(Some(&folder.id), token.as_deref()).await {
+        Ok(page) => (
+            page.items.iter().filter_map(lookout_graph::contact_from_graph).collect(),
+            page.items.iter().filter_map(lookout_graph::removed_id).collect(),
+            page.delta_link,
+        ),
+        Err(e) => {
+            tracing::warn!("Graph contacts delta failed for {:?}, falling back to a full read: {e}", folder.display_name);
+            let previous: HashSet<String> = cache
+                .load_contacts()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|contact| contact.book_href == folder.id)
+                .map(|contact| contact.href)
+                .collect();
+            let records = client.list_contacts(Some(&folder.id)).await.map_err(|e| e.to_string())?;
+            let current: HashSet<String> = records.iter().map(|contact| contact.id.clone()).collect();
+            let removed: Vec<String> = previous.difference(&current).cloned().collect();
+            (records, removed, None)
+        }
+    };
+
+    let records: Vec<ContactRecord> = changed.iter().map(|contact| graph_contact_record(contact.clone())).collect();
+    cache.apply_delta(&folder.id, delta_link, &records, &removed).map_err(|e| e.to_string())?;
+    fetch_graph_photos(client, &folder.id, cache, &changed).await;
+    Ok(())
+}
+
+/// Fetches the photo of each just-changed contact that has none cached,
+/// bounded per sync pass, and stores it on the card (`PHOTO`). A contact with
+/// no photo is left alone; the sync passes the cap eventually cover a large
+/// fresh address book, and a fetched photo is never re-requested (the cached
+/// card carries it).
+async fn fetch_graph_photos(client: &ContactsClient, folder_id: &str, cache: &ContactsCache, changed: &[GraphContact]) {
+    if changed.is_empty() {
+        return;
+    }
+    let with_photo: HashSet<String> = cache
+        .load_contacts()
+        .map(|contacts| contacts.into_iter().filter(|contact| contact.card.photo.is_some()).map(|contact| contact.href).collect())
+        .unwrap_or_default();
+    let mut updated = Vec::new();
+    for contact in changed.iter().filter(|contact| !with_photo.contains(&contact.id)).take(MAX_GRAPH_PHOTO_FETCHES_PER_SYNC) {
+        match client.contact_photo(&contact.id).await {
+            Ok(Some(bytes)) => {
+                let mut card = contact.card.clone();
+                card.photo = Some(Photo {
+                    media_type: None,
+                    data: Some(bytes),
+                    uri: None,
+                });
+                updated.push(ContactRecord {
+                    href: contact.id.clone(),
+                    etag: contact.etag.clone(),
+                    card,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!("couldn't fetch the photo for contact {}: {e}", contact.id),
+        }
+    }
+    if !updated.is_empty() {
+        if let Err(e) = cache.upsert_contacts(folder_id, &updated) {
+            tracing::warn!("couldn't store {} contact photo(s): {e}", updated.len());
+        }
+    }
+}
+
+/// A [`GraphContact`] as the shared [`ContactRecord`] (the Graph id is the
+/// `href`, the `changeKey` the `etag`).
+fn graph_contact_record(contact: GraphContact) -> ContactRecord {
+    ContactRecord {
+        href: contact.id,
+        etag: contact.etag,
+        card: contact.card,
+    }
+}
+
+/// A Graph create: POST the card to its folder (`book_href` is the Graph
+/// folder id from the editor's address-book picker; empty means the default
+/// contacts folder).
+async fn graph_create_contact(client: &ContactsClient, book_href: &str, card: &VCard) -> Result<(), String> {
+    let folder = (!book_href.trim().is_empty()).then_some(book_href);
+    client.create_contact(folder, card).await.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// A Graph update: PATCH the card to its contact id, guarded by its
+/// `changeKey`.
+async fn graph_update_contact(client: &ContactsClient, href: &str, etag: Option<&str>, card: &VCard) -> Result<(), String> {
+    client.update_contact(href, etag, card).await.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// A Graph delete, guarded by the contact's `changeKey`.
+async fn graph_delete_contact(client: &ContactsClient, href: &str, etag: Option<&str>) -> Result<(), String> {
+    client.delete_contact(href, etag).await.map_err(|e| e.to_string())
+}
+
+/// Whether an account's contacts can be synced right now: a CardDAV account is
+/// always usable, a Microsoft 365 account needs Graph consent (Config's "Sync
+/// with Outlook"), which discovery waits for exactly as the calendar backend
+/// does. Without consent the Graph client would only produce
+/// `ConsentRequired` errors, so the account is left out until enabled.
+pub fn contacts_account_usable(account: &GoaContactsAccount) -> bool {
+    !account.is_microsoft_365() || crate::microsoft_oauth::MicrosoftOAuth::new(account.account_id.clone()).graph_consented()
+}
+
+/// The Graph contacts account for a discovered Microsoft 365 mailbox that GOA
+/// reported no `Contacts` interface for (its `ms_graph` provider may omit it
+/// entirely). The synthesised account reuses the mailbox's object path, so its
+/// `AccountId` - and therefore its snapshot key, cache file and command
+/// channel - matches every other module. `None` when GOA already reported
+/// contacts, the account isn't Microsoft 365, or Graph access isn't granted.
+pub fn microsoft_graph_contacts_account(account: &DiscoveredGoaAccount, account_id: &AccountId) -> Option<GoaContactsAccount> {
+    let consented = crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()).graph_consented();
+    microsoft_graph_contacts_account_if_consented(account, account_id, consented)
+}
+
+/// The consent-free half of [`microsoft_graph_contacts_account`], split out so
+/// the routing rule (M365 mailbox, no GOA contacts, Graph granted) is testable
+/// without a consent token on disk.
+fn microsoft_graph_contacts_account_if_consented(account: &DiscoveredGoaAccount, account_id: &AccountId, consented: bool) -> Option<GoaContactsAccount> {
+    if account.contacts.is_some() || !consented {
+        return None;
+    }
+    let mail = account.mail.as_ref()?;
+    graph_contacts_account_from_mail(mail, account_id, &account.display_name, consented)
+}
+
+/// Synthesises the Graph contacts account for a Microsoft 365 mailbox, using
+/// the mailbox's object path so its `AccountId` - and therefore its snapshot
+/// key, cache file and command channel - matches every other module. `None`
+/// for a non-Microsoft account or while Graph access isn't granted.
+fn graph_contacts_account_from_mail(mail: &GoaMailAccount, account_id: &AccountId, display_name: &str, consented: bool) -> Option<GoaContactsAccount> {
+    if !consented || !mail.is_microsoft_365() {
+        return None;
+    }
+    Some(GoaContactsAccount {
+        account_id: account_id.clone(),
+        object_path: mail.object_path.clone(),
+        display_name: display_name.to_string(),
+        identity: mail.email.clone(),
+        uri: String::new(),
+        accept_ssl_errors: false,
+        auth: ContactsAuthMethod::OAuth2,
+        provider_type: mail.provider_type.clone(),
+    })
+}
+
 /// "Manage groups…" for the People screen. A group is a vCard `CATEGORIES`
 /// tag shared by several contacts, so a group only exists on the server as
 /// the tags its member cards carry - the dialog therefore edits *members*:
@@ -2375,5 +2694,99 @@ mod tests {
         // A file with no recognisable header yields no cards for either path.
         assert!(contact_cards(ContactFileFormat::OutlookCsv, "Name,Phone\r\nGrace,1\r\n").is_empty());
         assert!(contact_cards(ContactFileFormat::VCard, "not a card").is_empty());
+    }
+
+    /// A discovered GOA account for the routing tests, with an optional Mail
+    /// and Contacts interface.
+    fn discovered(provider_type: Option<&str>, mail: bool, contacts: bool) -> DiscoveredGoaAccount {
+        let mail_account = mail.then(|| lookout_goa::GoaMailAccount {
+            account_id: AccountId("acct".to_string()),
+            object_path: zbus::zvariant::OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/a").unwrap(),
+            display_name: "Work".to_string(),
+            email: "work@contoso.com".to_string(),
+            imap: lookout_goa::EndpointConfig {
+                host: "outlook.office365.com".to_string(),
+                port: None,
+                use_tls: true,
+                accept_ssl_errors: false,
+                username: "work@contoso.com".to_string(),
+            },
+            smtp: lookout_goa::EndpointConfig {
+                host: "smtp.office365.com".to_string(),
+                port: None,
+                use_tls: true,
+                accept_ssl_errors: false,
+                username: "work@contoso.com".to_string(),
+            },
+            auth: lookout_goa::AuthMethod::OAuth2,
+            provider_type: provider_type.map(str::to_string),
+        });
+        DiscoveredGoaAccount {
+            display_name: "Work".to_string(),
+            email: "work@contoso.com".to_string(),
+            provider_type: provider_type.map(str::to_string),
+            mail: mail_account,
+            calendar: None,
+            contacts: contacts.then(|| GoaContactsAccount {
+                account_id: AccountId("acct".to_string()),
+                object_path: zbus::zvariant::OwnedObjectPath::try_from("/org/gnome/OnlineAccounts/Accounts/a").unwrap(),
+                display_name: "Work".to_string(),
+                identity: "work@contoso.com".to_string(),
+                uri: String::new(),
+                accept_ssl_errors: false,
+                auth: ContactsAuthMethod::OAuth2,
+                provider_type: provider_type.map(str::to_string),
+            }),
+        }
+    }
+
+    #[test]
+    fn microsoft_contacts_fallback_requires_an_m365_mailbox_without_goa_contacts() {
+        let id = AccountId("acct".to_string());
+        // The normal case: a consented M365 mailbox with no GOA Contacts
+        // interface is synthesised against the mailbox's object path.
+        let account = microsoft_graph_contacts_account_if_consented(&discovered(Some("ms_graph"), true, false), &id, true).expect("synthesised");
+        assert!(account.is_microsoft_365());
+        assert!(account.uri.is_empty());
+        assert_eq!(account.account_id, id);
+        assert_eq!(account.object_path, discovered(Some("ms_graph"), true, false).mail.unwrap().object_path);
+
+        // Every disqualifier yields nothing.
+        assert!(
+            microsoft_graph_contacts_account_if_consented(&discovered(Some("ms_graph"), true, true), &id, true).is_none(),
+            "GOA already reported contacts"
+        );
+        assert!(
+            microsoft_graph_contacts_account_if_consented(&discovered(Some("ms_graph"), true, false), &id, false).is_none(),
+            "Graph access is not granted"
+        );
+        assert!(
+            microsoft_graph_contacts_account_if_consented(&discovered(Some("google"), true, false), &id, true).is_none(),
+            "not Microsoft 365"
+        );
+        assert!(
+            microsoft_graph_contacts_account_if_consented(&discovered(Some("ms_graph"), false, false), &id, true).is_none(),
+            "no mailbox to hang the account off"
+        );
+    }
+
+    #[test]
+    fn a_non_microsoft_account_is_always_usable_without_graph_consent() {
+        // A CardDAV account needs no Graph grant; only Microsoft 365 does.
+        let google = discovered(Some("google"), true, true).contacts.unwrap();
+        assert!(contacts_account_usable(&google));
+    }
+
+    #[test]
+    fn graph_contact_record_uses_the_graph_id_and_change_key() {
+        let contact = lookout_graph::GraphContact {
+            id: "c1".to_string(),
+            etag: Some("ck1".to_string()),
+            card: person_card("c1", "ada@example.com"),
+        };
+        let record = graph_contact_record(contact);
+        assert_eq!(record.href, "c1");
+        assert_eq!(record.etag.as_deref(), Some("ck1"));
+        assert_eq!(record.card.emails[0].address, "ada@example.com");
     }
 }

@@ -45,16 +45,16 @@ Counts are tallied from the §5 tables.
 | Mail (5.1) | 31 | 5 | 8 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, `@mentions` detection with a filter, rules across client, Graph and Sieve backends, automatic replies across Graph and Sieve, and Quick Steps in the ribbon and the `Ctrl+Shift+1`…`9` slots). Missing Outlook's organising layer: Focused Inbox, Sweep. No `.msg`. |
 | Compose (5.2) | 15 | 3 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
 | Calendar (5.3) | 23 | 8 | 4 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, the organizer's own cache as a fallback, or Graph `getSchedule` for Microsoft 365, 5.1) with Suggested times; the editor's room suggestions from Graph `places` remain to be wired. |
-| People (5.4) | 10 | 0 | 2 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). CSV import/export matches Outlook's format (4.5). No directory. |
+| People (5.4) | 10 | 1 | 1 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). CSV import/export matches Outlook's format (4.5). The Graph GAL reaches `/me/people` and `/users` (5.2); only LDAP and the autocomplete wiring remain (4.7). No merge UI. |
 | Tasks (5.5) | 5 | 1 | 5 | 1 | VTODO and Google Tasks CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
-| Accounts / Microsoft 365 (5.6) | 3 | 1 | 4 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar is now native via Graph** (5.1). No Graph contacts, To Do or Focused Inbox yet. |
+| Accounts / Microsoft 365 (5.6) | 4 | 1 | 3 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar** (5.1) and **contacts** (5.2) are now native via Graph. No Graph To Do or Focused Inbox yet. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **97** | **22** | **33** | **5** | ~60% at parity, ~15% partial |
+| **Total** | **98** | **23** | **31** | **5** | ~62% at parity, ~15% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
-1. **Microsoft 365 contacts and To Do** (A-04, A-05). The Microsoft 365 **calendar** is now native (5.1); contacts and To Do still wait on Graph.
+1. **Microsoft 365 To Do** (A-05). The Microsoft 365 **calendar** (5.1) and **contacts** (5.2) are now native; To Do still waits on Graph.
 2. ✅ ~~**Sending meeting invitations as organizer** (CAL-14) - done: client iMIP REQUEST/update/CANCEL, or RFC 6638 server scheduling.~~
 3. ✅ ~~**Rules** (M-14) — done across client, Microsoft 365 (Graph) and Sieve backends (2.5).~~
 4. **Undo send and undo actions** (M-21, C-09).
@@ -354,7 +354,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 |---|---|---|---|---|
 | P-01 | Contact CRUD, multi email/phone/address | `core/src/vcard.rs`, `app/src/contacts_editor.rs` | ✅ | — |
 | P-02 | Anniversary, IM, website, custom fields | Editor rows for anniversary (`ANNIVERSARY`), IM (`IMPP`), website (`URL`) and custom properties, each property's original parameters preserved (4.1) | ✅ | — |
-| P-03 | Photo | Shown in the People list avatar (over the initials) and previewed/set/removed in the editor; Mail sender avatars already use it (4.1) | ✅ | Graph photo via 5.2 |
+| P-03 | Photo | Shown in the People list avatar (over the initials) and previewed/set/removed in the editor; Mail sender avatars already use it (4.1); Graph contact photos are fetched and cached as the card's `PHOTO` (5.2) | ✅ | — |
 | P-04 | Groups / favourites | Groups, starred contacts | ✅ | — |
 | P-05 | Contact lists in compose | `KIND:group` cards (with `X-ADDRESSBOOKSERVER-MEMBER`) appear in autocomplete and the address-book picker; picking one inserts a list chip with a `+` expander (4.3) | ✅ | — |
 | P-06 | Search in People | `contacts_view.rs` search box (name/email/org) plus a module-aware title-bar search: searching while People is active filters the contacts list in place (UX-12) | ✅ | — |
@@ -362,7 +362,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | P-08 | Import/export CSV | `.vcf` plus Outlook CSV import and export (§4.6), format auto-detected on import and chosen from the Export split button | ✅ | — |
 | P-09 | Link / merge duplicates | Exact-dupe skip on import | ❌ | Merge UI |
 | P-10 | Profile card | `app/src/profile_card.rs` (4.2): a popover on hover/click of a person reference (reading-pane header, message-list row, conversation card, attendee chip) showing photo/initials, name, title·org, phones, address, recent mail (FTS by address), upcoming shared events, and Send email / Schedule meeting / Add-or-Edit contact | ✅ | Invitation-card organizer and People-row triggers not yet wired; the UX-67 "Files" tab waits on attachment preview (M-32) |
-| P-11 | Directory (GAL / LDAP) | — | ❌ | Graph `/users`; LDAP |
+| P-11 | Directory (GAL / LDAP) | The Graph half landed with 5.2: `ContactsClient::search_people` (`/me/people`) and `search_directory` (`/users?$search=`, `ConsistencyLevel: eventual`) return directory entries and user photos (`/users/{id}/photo/$value`) | 🟡 | LDAP (`ldap3`) and wiring the Graph provider into `merge_contact_suggestions` (4.7) |
 | P-12 | Recently deleted | Local Deleted bucket | ✅ | — |
 
 ### 5.5 Tasks (To Do)
@@ -389,7 +389,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | A-01 | Accounts from GOA | `goa/src/discovery.rs` (skips accounts without IMAP/SMTP) | ✅ | — |
 | A-02 | Manual IMAP/SMTP | `app/src/other_accounts.rs` | ✅ | OAuth for manual Gmail/Microsoft 365 |
 | A-03 | Microsoft 365 calendar | `lookout-graph`'s `calendar::session` actor (`calendarView` month sync, event CRUD, RRULE/Teams/RSVP/free-busy mapping) drives a Microsoft 365 account through the same contract as CalDAV; Graph access is opted into from Config (5.1) | ✅ | — |
-| A-04 | Microsoft 365 contacts | — | ❌ | Graph backend |
+| A-04 | Microsoft 365 contacts | `lookout-graph`'s `contacts` module drives the People screen through the same `ContactsCache`, snapshot and `ContactCommand` channel as CardDAV: contact folders are the address books, contacts delta-sync both ways (with a full-read fallback), photos are cached as the card's `PHOTO`, and Graph v1.0's lack of a contact-group endpoint leaves `KIND:group` lists local (5.2) | ✅ | — |
 | A-05 | Microsoft To Do | — | ❌ | Graph backend |
 | A-06 | Microsoft 365 mail | IMAP/SMTP with Lookout's own XOAUTH2 (`microsoft_oauth.rs`) | 🟡 | Remaining Graph-only mail features (Focused Inbox, server-side property sync) |
 | A-07 | Exchange on-premises (EWS) | — | ❌ | Deferred (§9) |
@@ -691,7 +691,7 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | # | Item | IDs | Approach | Effort |
 |---|---|---|---|---|
 | 5.1 | ✅ ~~Graph calendar backend~~ | A-03, CAL-14…19 | `lookout_graph::calendar::{client,session}` implements the same command/event contract as `lookout-dav`: `calendarView` month sync, event create/update/delete, and the RRULE/Teams/RSVP/free-busy/rooms mappings; Microsoft 365 accounts connect to it and Graph schedules iTIP itself. Follow-ups: the editor's room suggestions, the Graph COUNTER write, and the editor's Teams toggle | L |
-| 5.2 | Graph contacts backend | A-04, P-11 | `contactFolders` plus delta; GAL search; photos | M |
+| 5.2 | ✅ ~~Graph contacts backend~~ | A-04, P-11 | `lookout-graph::contacts`: contact folders, per-folder `/delta`, create/update/delete (`If-Match`), `/photo/$value`, and the GAL (`/me/people`, `/users?$search=`). The People screen's poll loop syncs M365 accounts through the Graph backend (consent-gated like the calendar), and a fallback synthesises the account when GOA reports no `Contacts` interface | M |
 | 5.3 | Microsoft To Do backend | A-05, T-12 | Lists/tasks/checklistItems/linkedResources; flagged-email list maps to M-10 | M |
 | 5.4 | Mail property sync | A-06, M-09, M-10, M-12, M-03 | Per-message Graph lookup by `internetMessageId` (cache the IMAP UID ↔ Graph ID map); sync categories, followupFlag, importance, inferenceClassification both ways; extends today's `graph_pin.rs` approach | L |
 | 5.5 | Server-side schedule send | C-08 | `PidTagDeferredSendTime` on a Graph draft, so it sends while Lookout is closed | S |

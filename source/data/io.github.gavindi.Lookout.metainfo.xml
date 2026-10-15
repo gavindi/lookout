@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.217" date="2026-10-16">
+      <description>
+        <p>Microsoft 365 contacts are now native: your Outlook contacts sync into the People screen, photos included, and can be created, edited or deleted from Lookout.</p>
+      </description>
+    </release>
     <release version="0.9.216" date="2026-10-16">
       <description>
         <p>Quick Steps run a chain of actions - archive, categorise, flag, move or forward - on the selected messages in one click, from the Mail ribbon or the Ctrl+Shift+1 to Ctrl+Shift+9 slots.</p>

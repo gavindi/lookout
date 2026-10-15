@@ -356,6 +356,22 @@ impl ContactsCache {
         }
     }
 
+    /// Upserts contact records under `book_href` without touching the book's
+    /// stored sync token - unlike [`Self::apply_delta`], which stores whatever
+    /// cursor a `sync-collection`/Graph-delta poll produced. Used for a
+    /// follow-up enrichment of an already-synced contact (a Graph contact
+    /// photo), where the incremental cursor must survive.
+    pub fn upsert_contacts(&self, book_href: &str, records: &[ContactRecord]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for record in records {
+            conn.execute(
+                "INSERT OR REPLACE INTO contacts (href, book_href, etag, card) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![record.href, book_href, record.etag, record.card.serialize()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Applies the result of one `sync-collection` poll for `book_href`:
     /// upserts the changed records, deletes the gone hrefs, and stores the
     /// server's next `sync_token` (or clears it when the caller fell back to
@@ -454,6 +470,60 @@ mod contacts_tests {
         let reopened = ContactsCache::open(&account_id).unwrap();
         assert_eq!(reopened.load_contacts().unwrap().len(), 1);
         assert_eq!(reopened.load_address_books().unwrap()[0].sync_token.as_deref(), Some("token-2"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upsert_contacts_replaces_a_card_without_touching_the_token() {
+        let account_id = temp_account_id();
+        let path = temp_path(&account_id);
+        let cache = ContactsCache::open(&account_id).unwrap();
+        let book_href = "folder-1";
+        cache
+            .store_address_books(&[crate::AddressBookInfo {
+                account_id: account_id.clone(),
+                display_name: "Contacts".to_string(),
+                href: book_href.to_string(),
+            }])
+            .unwrap();
+        let card = sample_card("alice", "alice@example.com");
+        cache
+            .apply_delta(
+                book_href,
+                Some("delta-1".to_string()),
+                &[crate::ContactRecord {
+                    href: "c1".to_string(),
+                    etag: Some("ck1".to_string()),
+                    card: card.clone(),
+                }],
+                &[],
+            )
+            .unwrap();
+
+        // A photo enrichment upserts the same contact with a new card, and the
+        // Graph delta cursor must survive it.
+        let mut with_photo = card;
+        with_photo.photo = Some(lookout_core::Photo {
+            media_type: None,
+            data: Some(vec![1, 2, 3]),
+            uri: None,
+        });
+        cache
+            .upsert_contacts(
+                book_href,
+                &[crate::ContactRecord {
+                    href: "c1".to_string(),
+                    etag: Some("ck1".to_string()),
+                    card: with_photo,
+                }],
+            )
+            .unwrap();
+
+        let contacts = cache.load_contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].card.photo.as_ref().and_then(|p| p.data.as_deref()), Some([1u8, 2, 3].as_slice()));
+        assert_eq!(cache.load_address_books().unwrap()[0].sync_token.as_deref(), Some("delta-1"));
 
         let _ = std::fs::remove_file(&path);
     }

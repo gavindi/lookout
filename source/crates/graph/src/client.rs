@@ -76,6 +76,24 @@ impl GraphClient {
         self.send_json(Method::GET, path, None, &[]).await
     }
 
+    /// A `GET` carrying extra request headers (e.g. `ConsistencyLevel:
+    /// eventual` for a `/users?$search=` directory query, which Graph rejects
+    /// without it), returning the parsed JSON body.
+    pub async fn get_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Result<Value> {
+        self.send_json(Method::GET, path, None, headers).await
+    }
+
+    /// A `GET` whose body is binary rather than JSON (`/photo/$value`),
+    /// returning the raw bytes, or `None` when the resource carries no binary
+    /// content (Graph answers HTTP 404 for a contact/user with no photo).
+    pub async fn get_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        match self.send_response(Method::GET, path, None, &[]).await {
+            Ok(response) => Ok(Some(response.bytes().await?.to_vec())),
+            Err(GraphError::Status { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// A `PATCH` with a JSON body, returning the parsed response body (Graph
     /// returns the updated resource, or an empty body for some endpoints,
     /// which surfaces as `Value::Null`).
@@ -150,9 +168,21 @@ impl GraphClient {
         })
     }
 
-    /// The token-authenticated request loop: sends the request, waits out
-    /// throttling, and maps the response into [`GraphError`].
+    /// Decodes a successful response into a JSON body (or `Value::Null` for an
+    /// empty one, e.g. a `204 No Content`).
     async fn send_json(&self, method: Method, path: &str, body: Option<&Value>, headers: &[(&str, &str)]) -> Result<Value> {
+        let response = self.send_response(method, path, body, headers).await?;
+        let bytes = response.bytes().await?;
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// The token-authenticated request loop: sends the request, waits out
+    /// throttling, and returns the successful response for the caller to decode
+    /// (JSON for [`Self::send_json`], raw bytes for [`Self::get_bytes`]).
+    async fn send_response(&self, method: Method, path: &str, body: Option<&Value>, headers: &[(&str, &str)]) -> Result<reqwest::Response> {
         let url = self.absolute(path);
         let mut attempt = 0u32;
         loop {
@@ -168,11 +198,7 @@ impl GraphClient {
             let status = response.status();
 
             if status.is_success() {
-                let bytes = response.bytes().await?;
-                if bytes.is_empty() {
-                    return Ok(Value::Null);
-                }
-                return Ok(serde_json::from_slice(&bytes)?);
+                return Ok(response);
             }
 
             if is_throttled(status) {
@@ -270,7 +296,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::{json, Value};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -440,6 +466,41 @@ mod tests {
             .await;
         let response = client(&server).patch("me/messages/abc", &json!({ "importance": "high" })).await.unwrap();
         assert_eq!(response["importance"], Value::String("high".into()));
+    }
+
+    #[tokio::test]
+    async fn get_with_headers_sends_the_extra_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/users"))
+            .and(header("ConsistencyLevel", "eventual"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "id": "u1" }] })))
+            .mount(&server)
+            .await;
+
+        let page = client(&server).get_with_headers("users", &[("ConsistencyLevel", "eventual")]).await.unwrap();
+        assert_eq!(page_items(&page).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_bytes_returns_the_body_or_none_on_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/contacts/c1/photo/$value"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8, 2, 3]))
+            .mount(&server)
+            .await;
+
+        let bytes = client(&server).get_bytes("me/contacts/c1/photo/$value").await.unwrap();
+        assert_eq!(bytes.as_deref(), Some([1u8, 2, 3].as_slice()));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/contacts/c2/photo/$value"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        assert!(client(&server).get_bytes("me/contacts/c2/photo/$value").await.unwrap().is_none());
     }
 
     #[tokio::test]
