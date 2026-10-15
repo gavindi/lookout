@@ -13688,12 +13688,11 @@ fn spawn_calendar_discovery(
                         entry.calendar = Some(account.clone());
                         st.account_enabled(&id)
                     };
-                    // Microsoft 365 calendar accounts are detected (recorded
-                    // above) but not counted as enabled CalDAV calendars -
-                    // `connect_calendar_account` skips them pending the Graph
-                    // backend (item 5.1), so they must not flip the page to a
-                    // non-empty calendar view.
-                    if enabled && !account.is_microsoft_365() {
+                    // A Microsoft 365 account is only a usable calendar once
+                    // the user has opted into Outlook sync (Graph); until then
+                    // it isn't counted as enabled, so the page stays empty.
+                    let usable = !account.is_microsoft_365() || crate::microsoft_oauth::MicrosoftOAuth::new(account.account_id.clone()).graph_consented();
+                    if enabled && usable {
                         enabled_accounts.push(account);
                     }
                 }
@@ -14526,17 +14525,17 @@ fn connect_calendar_account(
     account: GoaCalendarAccount,
     tasks_view: Rc<crate::tasks_view::TasksView>,
 ) {
-    // Microsoft 365 calendars are served by the Graph backend (OUTLOOK_PARITY
-    // item 5.1), not CalDAV - GOA reports their Calendar interface with an
-    // empty `Uri`, which `GoaCalendarAccount::is_microsoft_365` now flags.
-    // Until the Graph session lands, skip them so no CalDAV discovery is
-    // attempted against an empty base URL.
-    if account.is_microsoft_365() {
-        tracing::debug!("skipping CalDAV for Microsoft 365 calendar account {}; the Graph backend is pending", account.account_id);
-        return;
-    }
     let account_id = account.account_id.clone();
     let display_name = account.display_name.clone();
+    // Microsoft 365 calendars are served by the Graph backend (OUTLOOK_PARITY
+    // item 5.1), not CalDAV - GOA reports their Calendar interface with an
+    // empty `Uri`. Graph access is opt-in (Config's "Sync with Outlook" runs
+    // the consent flow), so an unconsented account has no calendar until then.
+    let microsoft_365 = account.is_microsoft_365();
+    if microsoft_365 && !crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()).graph_consented() {
+        tracing::debug!("Microsoft 365 calendar {account_id} has no Outlook-sync consent yet; skipping until enabled in Config");
+        return;
+    }
     let config = CalendarAccountConfig {
         account_id: account_id.clone(),
         display_name: display_name.clone(),
@@ -14573,7 +14572,7 @@ fn connect_calendar_account(
         CalendarAccountHandle {
             cmd_tx,
             display_name,
-            uri: config.base_url.clone(),
+            uri: if microsoft_365 { "Microsoft 365".to_string() } else { config.base_url.clone() },
             calendars: Vec::new(),
             connection_state: CalConnectionState::Connecting,
             last_occurrences: Vec::new(),
@@ -14584,7 +14583,15 @@ fn connect_calendar_account(
         },
     );
 
-    worker.spawn(lookout_dav::session::run_calendar_session(config, credentials, cmd_rx, evt_tx));
+    if microsoft_365 {
+        // The Graph session needs only the account's own OAuth token provider,
+        // which `MicrosoftOAuth` supplies (`lookout_graph::TokenProvider`).
+        let oauth = std::sync::Arc::new(crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()));
+        let client = lookout_graph::CalendarClient::new(lookout_graph::GraphClient::new(oauth));
+        worker.spawn(lookout_graph::run_calendar_session(account_id.clone(), client, cmd_rx, evt_tx));
+    } else {
+        worker.spawn(lookout_dav::session::run_calendar_session(config, credentials, cmd_rx, evt_tx));
+    }
 
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {

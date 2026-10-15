@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.207" date="2026-10-15">
+      <description>
+        <p>Microsoft 365 calendars now appear in Lookout once you enable Outlook sync for the account: browse a month, create, edit and delete events, all through Microsoft Graph.</p>
+      </description>
+    </release>
     <release version="0.9.206" date="2026-10-15">
       <description>
         <p>The Microsoft 365 calendar backend can now connect, sync a month of events and create, edit and delete them - the foundation for showing Outlook calendars natively.</p>
