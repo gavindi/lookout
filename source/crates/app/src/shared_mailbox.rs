@@ -97,6 +97,8 @@ pub fn show_manage_shared_mailboxes(anchor: &gtk::Widget, app_config: Rc<RefCell
                     .hexpand(true)
                     .ellipsize(gtk::pango::EllipsizeMode::End)
                     .build();
+                // A shared mailbox address: blurred by privacy mode.
+                crate::privacy::mark(&text);
                 let remove = gtk::Button::from_icon_name("user-trash-symbolic");
                 remove.add_css_class("flat");
                 remove.set_tooltip_text(Some("Remove shared mailbox"));

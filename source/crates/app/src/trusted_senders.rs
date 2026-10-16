@@ -125,6 +125,8 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                 account_entries.sort_by(|a, b| a.0.cmp(&b.0));
                 for (entry, level) in &account_entries {
                     let row = adw::ActionRow::builder().title(glib::markup_escape_text(entry)).build();
+                    // A trusted sender's address: blurred by privacy mode.
+                    crate::privacy::mark_row(&row);
                     let remove = gtk::Button::from_icon_name("user-trash-symbolic");
                     remove.set_tooltip_text(Some("Remove this sender"));
                     remove.add_css_class("flat");

@@ -207,6 +207,10 @@ pub const PREFETCH_BATCH_SIZE: &str = "prefetch-batch-size";
 /// Config → Advanced → "Aggressive prefetch" → "Re-scan every": minutes
 /// between full prefetch re-scans of every folder.
 pub const PREFETCH_REFRESH_INTERVAL_MINUTES: &str = "prefetch-refresh-interval-minutes";
+/// Config → Advanced → "Blur sensitive information": whether email addresses,
+/// account names and people's names are blurred throughout the UI. Intended
+/// for taking screenshots for demos and marketing (see `crate::privacy`).
+pub const BLUR_SENSITIVE_CONTENT: &str = "blur-sensitive-content";
 
 /// One stored value, mirroring the GSettings key types the app uses: booleans,
 /// strings, doubles (pane-width percentages), integers (prefetch counts),
@@ -347,6 +351,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(PREFETCH_FOLDER_LIMIT, Value::Int(200));
     map.insert(PREFETCH_BATCH_SIZE, Value::Int(1));
     map.insert(PREFETCH_REFRESH_INTERVAL_MINUTES, Value::Int(60));
+    map.insert(BLUR_SENSITIVE_CONTENT, Value::Bool(false));
     map
 }
 
@@ -1023,6 +1028,16 @@ mod tests {
         assert_eq!(tuned.refresh_interval, std::time::Duration::from_secs(45 * 60));
         store.set_bool(PREFETCH_AGGRESSIVE, false);
         assert!(!store.prefetch_policy().aggressive);
+    }
+
+    #[test]
+    fn blur_sensitive_content_defaults_off_and_round_trips() {
+        let store = resolve();
+        assert!(!store.get_bool(BLUR_SENSITIVE_CONTENT), "privacy blur is off by default");
+        store.set_bool(BLUR_SENSITIVE_CONTENT, true);
+        assert!(store.get_bool(BLUR_SENSITIVE_CONTENT));
+        store.set_bool(BLUR_SENSITIVE_CONTENT, false);
+        assert!(!store.get_bool(BLUR_SENSITIVE_CONTENT));
     }
 
     #[test]

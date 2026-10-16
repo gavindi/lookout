@@ -393,6 +393,8 @@ pub fn show_contact_details_dialog(window: &adw::ApplicationWindow, entry: &Cont
         .selectable(true)
         .wrap(true)
         .build();
+    // The details block is exactly the contact's personal data.
+    crate::privacy::mark(&details);
     details.set_margin_start(12);
     details.set_margin_end(12);
     details.set_margin_top(12);
@@ -1356,7 +1358,11 @@ pub fn refresh_contacts_category_ui(
                 })
                 .collect();
 
-            row_widgets.push((append_contacts_header_row(category_list, &account.display_name), None));
+            // The header row shows the account's display name/address, so it
+            // blurs under privacy mode ("Categories" below stays sharp).
+            let account_header = append_contacts_header_row(category_list, &account.display_name);
+            crate::privacy::mark(&account_header);
+            row_widgets.push((account_header, None));
 
             // Favourites keeps the full, unfiltered contact list - which
             // contacts belong depends on `starred_contacts` (persisted in
@@ -1581,6 +1587,9 @@ pub fn rebuild_contacts_list_ui(
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
             .build();
+        // Contact names and addresses: blurred by privacy mode.
+        crate::privacy::mark(&name);
+        crate::privacy::mark(&email);
         let text_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
@@ -1673,6 +1682,8 @@ pub fn rebuild_contacts_list_ui(
             .child(&avatar_label)
             .build();
         avatar.add_overlay(&avatar_photo);
+        // The avatar (initials and any photo) is identity-revealing.
+        crate::privacy::mark(&avatar);
 
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
         row_box.set_margin_start(10);

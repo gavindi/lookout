@@ -337,7 +337,12 @@ pub(crate) fn refresh_search_refiners(state: &Rc<RefCell<UiState>>, header: &Lis
                 .spacing(2)
                 .css_classes(["search-refiner-chip"])
                 .build();
-            chip.append(&gtk::Label::new(Some(&refiner_label(&refiner))));
+            let refiner_chip_label = gtk::Label::new(Some(&refiner_label(&refiner)));
+            // From/To/Cc refiners carry an address: blurred by privacy mode.
+            if matches!(refiner, Refiner::From(_) | Refiner::To(_) | Refiner::Cc(_)) {
+                crate::privacy::mark(&refiner_chip_label);
+            }
+            chip.append(&refiner_chip_label);
             let remove = gtk::Button::from_icon_name("window-close-symbolic");
             remove.add_css_class("flat");
             remove.set_tooltip_text(Some("Remove"));

@@ -963,7 +963,10 @@ pub fn build_event_peek(occ: &EventOccurrence, colors: &HashMap<CalendarId, Stri
         content.append(&peek_detail(&format!("Where: {location}")));
     }
     if let Some(organizer) = &occ.organizer {
-        content.append(&peek_detail(&format!("Organizer: {}", organizer.display_label())));
+        // The organizer's name/address is the sensitive part of this line.
+        let organizer_row = peek_detail(&format!("Organizer: {}", organizer.display_label()));
+        crate::privacy::mark(&organizer_row);
+        content.append(&organizer_row);
     }
     let attendee_count = occ.attendees.len();
     if attendee_count > 0 {
@@ -3855,6 +3858,8 @@ pub fn rebuild_calendar_checklist(
             .css_classes(["dim-label", "caption", "calendar-account-header"])
             .xalign(0.0)
             .build();
+        // A group header is the calendar account's name/address.
+        crate::privacy::mark(&header);
         container.append(&header);
         if group.calendars.is_empty() {
             if let Some(status) = &group.status {

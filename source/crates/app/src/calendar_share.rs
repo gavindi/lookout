@@ -201,6 +201,8 @@ fn permission_row(
         .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
+    // The person a calendar is shared with: blurred by privacy mode.
+    crate::privacy::mark(&text);
     let role = gtk::Label::builder()
         .label(role_label(permission.role))
         .xalign(0.0)

@@ -712,6 +712,8 @@ pub(crate) fn flagged_mail_row(message: &EmailSummary, today: NaiveDate, complet
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
+    // Flagged-mail rows show the sender's name: blurred by privacy mode.
+    crate::privacy::mark(&sender);
     let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).build();
     text.append(&subject);
     text.append(&sender);

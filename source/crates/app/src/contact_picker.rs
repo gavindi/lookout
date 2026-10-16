@@ -349,6 +349,8 @@ fn append_picker_row(list: &gtk::ListBox, candidate: &Item, selected: &Rc<RefCel
     }
 
     let name = gtk::Label::builder().label(candidate.label()).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+    // Picker rows name people/addresses: blurred by privacy mode.
+    crate::privacy::mark(&name);
     let text_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -363,6 +365,7 @@ fn append_picker_row(list: &gtk::ListBox, candidate: &Item, selected: &Rc<RefCel
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
             .build();
+        crate::privacy::mark(&subtitle);
         text_box.append(&subtitle);
     }
 

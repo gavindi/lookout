@@ -90,6 +90,8 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                 account_entries.sort();
                 for entry in &account_entries {
                     let row = adw::ActionRow::builder().title(glib::markup_escape_text(entry)).build();
+                    // A blocked sender's address: blurred by privacy mode.
+                    crate::privacy::mark_row(&row);
                     let remove = gtk::Button::from_icon_name("user-trash-symbolic");
                     remove.set_tooltip_text(Some("Remove this sender"));
                     remove.add_css_class("flat");

@@ -1196,6 +1196,10 @@ pub(crate) fn invite_detail_row(row_name: &str, value_name: &str, caption: &str)
     value.set_xalign(0.0);
     value.set_wrap(true);
     value.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    // The Organizer line is a name/address: blurred by privacy mode.
+    if value_name == "imip-organizer" {
+        crate::privacy::mark(&value);
+    }
     row.append(&caption_label);
     row.append(&value);
     row

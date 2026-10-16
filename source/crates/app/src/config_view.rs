@@ -455,6 +455,9 @@ pub struct ConfigView {
     /// "Re-scan every" spin row (Config → Advanced), exposed so the caller
     /// can wire its value into the policy's `refresh_interval`.
     pub prefetch_refresh_row: adw::SpinRow,
+    /// "Blur sensitive information" switch (Config → Advanced), exposed so the
+    /// caller can toggle `crate::privacy::PrivacyMode`.
+    pub blur_sensitive_row: adw::SwitchRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     webcal_group: adw::PreferencesGroup,
@@ -1041,6 +1044,18 @@ pub fn build() -> ConfigView {
     }
     advanced_group.add(&prefetch_group);
 
+    // Privacy: blur email addresses, account names and people's names across
+    // the app, so screenshots for demos and marketing don't leak personal
+    // details. Purely visual - nothing is hidden from the user's own eyes any
+    // more than a blur makes it.
+    let privacy_advanced_group = adw::PreferencesGroup::builder().title("Privacy").build();
+    let blur_sensitive_row = adw::SwitchRow::builder()
+        .title("Blur sensitive information")
+        .subtitle("Blur email addresses, account names and people's names across the app - useful when taking screenshots for demos or marketing")
+        .build();
+    privacy_advanced_group.add(&blur_sensitive_row);
+    advanced_group.add(&privacy_advanced_group);
+
     let mail_cache_group = adw::PreferencesGroup::builder().title("Mail cache").build();
     advanced_group.add(&mail_cache_group);
 
@@ -1217,6 +1232,7 @@ pub fn build() -> ConfigView {
         prefetch_limit_row,
         prefetch_batch_row,
         prefetch_refresh_row,
+        blur_sensitive_row,
         mail_group,
         calendar_group,
         webcal_group,
@@ -1290,6 +1306,8 @@ pub fn refresh(
                 .subtitle(glib::markup_escape_text(&info.email))
                 .active(info.enabled)
                 .build();
+            // Account name + address: blurred by privacy mode.
+            crate::privacy::mark_row(&row);
             // Wired per refresh rather than once at build: `active` is set
             // above before the callback attaches, so a rebuild can't fire
             // the handler for the rows it just created.
@@ -1323,6 +1341,8 @@ pub fn refresh(
         for info in mail {
             let subtitle = format!("{} · IMAP {} · SMTP {}", info.email, info.imap, info.smtp);
             let row = account_row(&info.display_name, &subtitle);
+            // Account name + address: blurred by privacy mode.
+            crate::privacy::mark_row(&row);
             if info.is_other {
                 let edit_button = gtk::Button::from_icon_name("document-edit-symbolic");
                 edit_button.set_tooltip_text(Some("Edit account"));
@@ -1366,6 +1386,8 @@ pub fn refresh(
                 .subtitle(&identities_subtitle)
                 .activatable(true)
                 .build();
+            // The subtitle is this account's sending addresses.
+            crate::privacy::mark_row(&identity_row);
             let account_id = info.account_id.clone();
             let manage = manage_identities.clone();
             identity_row.connect_activated(move |row| manage(row.upcast_ref::<gtk::Widget>(), &account_id));
@@ -1405,7 +1427,9 @@ pub fn refresh(
         push_row(&view.calendar_group, &view.calendar_rows, empty_row("No calendar accounts connected"));
     } else {
         for info in calendar {
-            push_row(&view.calendar_group, &view.calendar_rows, account_row(&info.display_name, &info.uri));
+            let row = account_row(&info.display_name, &info.uri);
+            crate::privacy::mark_row(&row);
+            push_row(&view.calendar_group, &view.calendar_rows, row);
         }
     }
 
@@ -1416,7 +1440,9 @@ pub fn refresh(
         push_row(&view.webcal_group, &view.webcal_rows, empty_row("No webcal subscriptions"));
     } else {
         for info in webcal {
-            push_row(&view.webcal_group, &view.webcal_rows, account_row(&info.display_name, &info.url));
+            let row = account_row(&info.display_name, &info.url);
+            crate::privacy::mark_row(&row);
+            push_row(&view.webcal_group, &view.webcal_rows, row);
         }
     }
 

@@ -272,6 +272,8 @@ fn build_header(address: &EmailAddress, contact: Option<&VCard>) -> gtk::Widget 
         picture.set_paintable(Some(&texture));
     }
     row.append(&avatar);
+    // The avatar (initials/photo) identifies the person: blurred by privacy mode.
+    crate::privacy::mark(&avatar);
 
     let text = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -313,6 +315,8 @@ fn build_header(address: &EmailAddress, contact: Option<&VCard>) -> gtk::Widget 
         }
     }
     text.append(&gtk::Label::builder().label(&address.address).xalign(0.0).wrap(true).css_classes(["caption"]).build());
+    // Name, title/organization, phones and address all live in this column.
+    crate::privacy::mark(&text);
     row.append(&text);
 
     row.upcast()

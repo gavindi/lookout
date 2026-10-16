@@ -1460,6 +1460,8 @@ fn build_tracking_page(occurrence: &EventOccurrence, owner_email: Option<&str>) 
             .title(gtk::glib::markup_escape_text(title))
             .subtitle(gtk::glib::markup_escape_text(&organizer.address))
             .build();
+        // Organizer name/address: blurred by privacy mode.
+        crate::privacy::mark_row(&row);
         row.add_suffix(&gtk::Label::builder().label("Organizer").css_classes(["dim-label"]).build());
         group.add(&row);
     }
@@ -1481,6 +1483,8 @@ fn build_tracking_page(occurrence: &EventOccurrence, owner_email: Option<&str>) 
             subtitle_parts.push("You".to_string());
         }
         let row = adw::ActionRow::builder().title(gtk::glib::markup_escape_text(title)).build();
+        // Attendee name/address: blurred by privacy mode.
+        crate::privacy::mark_row(&row);
         if !subtitle_parts.is_empty() {
             row.set_subtitle(&gtk::glib::markup_escape_text(&subtitle_parts.join(" · ")));
         }

@@ -59,6 +59,7 @@ mod microsoft_oauth;
 mod my_day;
 mod online_accounts;
 mod other_accounts;
+mod privacy;
 mod profile_card;
 mod quick_steps;
 mod quick_steps_view;

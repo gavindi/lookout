@@ -691,6 +691,8 @@ impl RecipientEntry {
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .max_width_chars(28)
             .build();
+        // Recipient name/address: blurred by privacy mode.
+        crate::privacy::mark(&label);
         let remove = gtk::Button::builder()
             .icon_name("window-close-symbolic")
             .css_classes(["flat", "circular", "recipient-chip-remove"])
@@ -748,6 +750,8 @@ impl RecipientEntry {
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .max_width_chars(32)
             .build();
+        // A contact list's name: blurred by privacy mode.
+        crate::privacy::mark(&label);
         let toggle = gtk::Button::builder()
             .icon_name(if expanded { "pan-down-symbolic" } else { "pan-end-symbolic" })
             .css_classes(["flat", "circular", "recipient-chip-toggle"])
@@ -800,6 +804,8 @@ impl RecipientEntry {
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .max_width_chars(28)
             .build();
+        // A contact-list member's name/address: blurred by privacy mode.
+        crate::privacy::mark(&label);
         let remove = gtk::Button::builder()
             .icon_name("window-close-symbolic")
             .css_classes(["flat", "circular", "recipient-chip-remove"])
@@ -898,6 +904,9 @@ impl RecipientEntry {
                 .margin_start(8)
                 .margin_end(8)
                 .build();
+            // Autocomplete suggestions name people/addresses: blurred by
+            // privacy mode.
+            crate::privacy::mark(&row);
             self.suggestion_list.append(&row);
         }
         *self.suggestions.borrow_mut() = matches;

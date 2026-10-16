@@ -426,6 +426,11 @@
       <summary>Minutes between prefetch re-scans</summary>
       <description>How often the aggressive prefetch re-scans every folder, so mail that arrived in unopened folders gets its bodies cached too.</description>
     </key>
+    <key name="blur-sensitive-content" type="b">
+      <default>false</default>
+      <summary>Blur sensitive information</summary>
+      <description>When on, email addresses, account names and people's names are blurred throughout the interface. Intended for taking screenshots for demos and marketing, so personal details are not readable.</description>
+    </key>
 
     <!-- Session memory -->
     <key name="last-view-unified" type="b">

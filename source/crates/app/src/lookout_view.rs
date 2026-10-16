@@ -342,6 +342,8 @@ fn contact_row(address: &EmailAddress, count: i64) -> gtk::Box {
         .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
+    // Most-contacted people: name/address blurred by privacy mode.
+    crate::privacy::mark(&name);
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .margin_start(4)
@@ -358,6 +360,7 @@ fn contact_row(address: &EmailAddress, count: i64) -> gtk::Box {
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
+        crate::privacy::mark(&address_label);
         row_box.append(&address_label);
     }
     let count_label = gtk::Label::builder().label(count.to_string()).css_classes(["lookout-count"]).build();

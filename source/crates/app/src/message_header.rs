@@ -91,6 +91,9 @@ pub fn build() -> MessageHeader {
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .build();
+    // Sender initials are derived from the sender's name/address: privacy mode
+    // blurs them.
+    crate::privacy::mark(&avatar_label);
 
     let sender_name_label = gtk::Label::builder().xalign(0.0).css_classes(["heading"]).ellipsize(gtk::pango::EllipsizeMode::End).build();
     let sender_email_label = gtk::Label::builder()
@@ -98,6 +101,9 @@ pub fn build() -> MessageHeader {
         .css_classes(["message-header-meta"])
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
+    // The reading pane's From name and address.
+    crate::privacy::mark(&sender_name_label);
+    crate::privacy::mark(&sender_email_label);
     let sender_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(4)
@@ -161,6 +167,8 @@ pub fn build() -> MessageHeader {
         .css_classes(["message-header-meta"])
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
+    // The "To:" recipient list.
+    crate::privacy::mark(&to_label);
     let date_label = gtk::Label::builder().css_classes(["message-header-meta"]).valign(gtk::Align::Center).build();
     let meta_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
     meta_row.append(&to_label);

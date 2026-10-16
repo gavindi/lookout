@@ -77,6 +77,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // rows are wired further down.
     let theme_manager = crate::theme::ThemeManager::install();
     install_paned_css();
+    // Privacy mode's blur provider (Config → Advanced → "Blur sensitive
+    // information"). Installed disabled; seeded from GSettings when the
+    // Advanced rows are wired further down.
+    let privacy_mode = crate::privacy::PrivacyMode::install();
 
     let quit_action = gio::SimpleAction::new("quit", None);
     quit_action.connect_activate({
@@ -385,7 +389,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 TreeItem::Account(account) => {
                     icon.set_visible(false);
                     label.set_label(&account.label);
-                    label.set_css_classes(&["heading", "folder-row-label"]);
+                    // An account row's label is the account name/address, so it
+                    // blurs under privacy mode. Every other arm resets the
+                    // classes (dropping this one), so folder names stay sharp.
+                    label.set_css_classes(&["heading", "folder-row-label", crate::privacy::SENSITIVE_CLASS]);
                     set_count(account.unread);
                 }
                 TreeItem::SearchFolders => {
@@ -808,11 +815,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .child(&avatar_label)
             .build();
         avatar.add_overlay(&avatar_photo);
+        // The avatar (initials and, when present, the contact's photo) is
+        // derived from the sender's name/address, so privacy mode blurs it.
+        crate::privacy::mark(&avatar);
 
         // Fixed-width sender, expanding subject: that's what lines every
         // row's subject up in one column, rather than letting it start
         // wherever the sender happens to end.
         let sender_label = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        // Sender name, address and (in the unified view) account name all land
+        // in this one label; privacy mode blurs the lot.
+        crate::privacy::mark(&sender_label);
         // The attachment and meeting-invite indicators, drawn after the
         // sender column on rows that carry either. Same footprint as the flag
         // icon; hidden (not just blank) when absent so a plain row takes no
@@ -945,6 +958,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // the message row's (`width_request(180)` sender, hexpand subject) so
         // threads and messages line up in the same columns.
         let thread_sender = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        // Thread header sender (a name, or the participant list) - privacy
+        // mode blurs it like the message rows' sender column.
+        crate::privacy::mark(&thread_sender);
         let thread_attachment_icon = gtk::Image::builder()
             .icon_name("mail-attachment-symbolic")
             .pixel_size(12)
@@ -1806,6 +1822,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["caption", "dim-label"])
         .build();
+    // The list header's subtitle is the account's display name or address.
+    crate::privacy::mark(&account_title_label);
     let title_column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .halign(gtk::Align::Start)
@@ -6829,6 +6847,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
     }
 
+    // Config → Advanced → "Blur sensitive information": toggles the
+    // display-level blur provider and remembers the choice. Seeding below
+    // re-applies the stored value at startup.
+    {
+        let state = state.clone();
+        let privacy_mode = privacy_mode.clone();
+        config_view.blur_sensitive_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::BLUR_SENSITIVE_CONTENT, enabled);
+            privacy_mode.set_enabled(enabled);
+        });
+    }
+
     // The tray's menu/click actions all target widgets this window owns, so
     {
         let app = app.clone();
@@ -6971,6 +7002,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .prefetch_refresh_row
             .set_value(persisted.get_int(crate::settings::PREFETCH_REFRESH_INTERVAL_MINUTES) as f64);
+        // Advanced → "Blur sensitive information": seeding fires the notify
+        // handler above, applying the stored value to the blur provider.
+        config_view.blur_sensitive_row.set_active(persisted.get_bool(crate::settings::BLUR_SENSITIVE_CONTENT));
     }
 
     {

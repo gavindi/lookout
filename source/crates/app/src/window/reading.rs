@@ -649,6 +649,11 @@ pub(crate) fn message_detail_row(caption: &str, value: &str) -> gtk::Box {
         .valign(gtk::Align::Start)
         .build();
     let value_label = gtk::Label::builder().label(value).xalign(0.0).wrap(true).selectable(true).hexpand(true).build();
+    // The From/To/Cc values are addresses: blurred by privacy mode. Subject,
+    // date and Message ID are left readable.
+    if matches!(caption, "From" | "To" | "Cc") {
+        crate::privacy::mark(&value_label);
+    }
     row.append(&caption_label);
     row.append(&value_label);
     row
