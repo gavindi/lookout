@@ -3280,23 +3280,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window_header.pack_start(&lookout_view_button);
     // The search cluster is the header's centred title widget (built above);
     // nothing to pack here.
-    // A second home for the View tab's Calendar overview toggle, docked at
-    // the header's right end. Wired to `overview_pane_toggle` below, so
-    // either button flips both - they can never disagree about the pane's
-    // visibility, and the toggle state survives a round-trip through the
-    // Calendar view. Like Home/View, it goes honest-disabled while another
-    // module is active (see the nav-rail handlers). The Settings button
-    // sits to its right, directly left of the window controls, and opens
-    // the Settings window as a modal dialog (see its click handler below).
-    // `pack_end` stacks right-to-left, so the calls are ordered rightmost
-    // first: on screen this reads open-.eml, Calendar overview, Settings.
-    let header_calendar_overview_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").css_classes(["flat"]).build();
-    header_calendar_overview_toggle.set_tooltip_text(Some("Calendar overview"));
+    // The privacy toggle: flips Config → Advanced → "Blur sensitive
+    // information" from anywhere in the app, docked at the header's right
+    // end so a screenshot run is one click away. It is a global control, not
+    // Mail-only, so unlike the ribbon toggles it stays enabled in every
+    // module. The Settings button sits to its right, directly left of the
+    // window controls, and opens the Settings window as a modal dialog (see
+    // its click handler below). `pack_end` stacks right-to-left, so the calls
+    // are ordered rightmost first: on screen this reads open-.eml, privacy,
+    // Settings.
+    let header_privacy_toggle = gtk::ToggleButton::builder()
+        .icon_name(themed_icon_name(&["view-conceal-symbolic", "channel-secure-symbolic", "security-high-symbolic"]))
+        .css_classes(["flat"])
+        .build();
+    header_privacy_toggle.set_tooltip_text(Some("Blur sensitive information"));
     let settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
     settings_button.set_css_classes(&["flat"]);
     settings_button.set_tooltip_text(Some("Settings"));
     window_header.pack_end(&settings_button);
-    window_header.pack_end(&header_calendar_overview_toggle);
+    window_header.pack_end(&header_privacy_toggle);
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
 
@@ -3926,25 +3928,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         let overview_forced_hidden = overview_forced_hidden.clone();
         let state = state.clone();
-        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         overview_pane_toggle.connect_toggled(move |btn| {
             state.borrow().settings.set_bool(crate::settings::LAYOUT_CALENDAR_OVERVIEW, btn.is_active());
             // The window-width check may have auto-hidden the pane while the
             // window is too narrow; don't override that here.
             mail_calendar_overview_card.set_visible(btn.is_active() && !overview_forced_hidden.get());
-            // Keep the header's copy in lockstep. `set_active` with the
-            // button's current value is a no-op, so the mirror handler below
-            // can't loop back into this one.
-            header_calendar_overview_toggle.set_active(btn.is_active());
-        });
-    }
-    {
-        // The header's own copy is a mirror: flipping it just drives
-        // `overview_pane_toggle`, whose handler owns the setting, the pane's
-        // visibility, and this button's state.
-        let overview_pane_toggle = overview_pane_toggle.clone();
-        header_calendar_overview_toggle.connect_toggled(move |btn| {
-            overview_pane_toggle.set_active(btn.is_active());
         });
     }
     {
@@ -4092,7 +4080,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let overview_forced_hidden = overview_forced_hidden.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
-        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         let state = state.clone();
         let search_entry = search_entry.clone();
         mail_view_button.connect_toggled(move |btn| {
@@ -4115,7 +4102,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active() && !overview_forced_hidden.get());
                 home_button.set_sensitive(true);
                 view_button.set_sensitive(true);
-                header_calendar_overview_toggle.set_sensitive(true);
             }
         });
     }
@@ -4127,7 +4113,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_module = current_module.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
-        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         let search_entry = search_entry.clone();
         calendar_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
@@ -4138,7 +4123,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
-                header_calendar_overview_toggle.set_sensitive(false);
             }
         });
     }
@@ -4151,7 +4135,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let contacts_window = contacts_window.clone();
-        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         let search_entry = search_entry.clone();
         contacts_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
@@ -4162,7 +4145,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
-                header_calendar_overview_toggle.set_sensitive(false);
                 // People may have been popped out into their own window -
                 // bring that to the front instead of the in-stack placeholder.
                 if let Some(win) = contacts_window.borrow().as_ref() {
@@ -4179,7 +4161,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_module = current_module.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
-        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         let search_entry = search_entry.clone();
         tasks_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
@@ -4190,7 +4171,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
-                header_calendar_overview_toggle.set_sensitive(false);
             }
         });
     }
@@ -4202,7 +4182,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_module = current_module.clone();
         let home_button = home_button.clone();
         let view_button = view_button.clone();
-        let header_calendar_overview_toggle = header_calendar_overview_toggle.clone();
         let search_entry = search_entry.clone();
         lookout_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
@@ -4213,7 +4192,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 mail_calendar_overview_card.set_visible(false);
                 home_button.set_sensitive(false);
                 view_button.set_sensitive(false);
-                header_calendar_overview_toggle.set_sensitive(false);
             }
         });
     }
@@ -6848,15 +6826,36 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // Config → Advanced → "Blur sensitive information": toggles the
-    // display-level blur provider and remembers the choice. Seeding below
-    // re-applies the stored value at startup.
+    // display-level blur provider and remembers the choice; the header's
+    // privacy toggle is a second control for the same state, kept in lockstep
+    // below. Seeding further down re-applies the stored value at startup.
     {
         let state = state.clone();
         let privacy_mode = privacy_mode.clone();
+        let header_privacy_toggle = header_privacy_toggle.clone();
         config_view.blur_sensitive_row.connect_active_notify(move |row| {
             let enabled = row.is_active();
             state.borrow().settings.set_bool(crate::settings::BLUR_SENSITIVE_CONTENT, enabled);
             privacy_mode.set_enabled(enabled);
+            // Mirror the header's copy; a no-op when already in sync, so the
+            // two handlers can't loop.
+            header_privacy_toggle.set_active(enabled);
+        });
+    }
+    // The title bar's privacy toggle: flips the same setting and blur
+    // provider, keeps the Config switch in lockstep, and reflects the current
+    // state in its tooltip. `set_active` with the button's current value is a
+    // no-op, so this can't loop back into the switch handler above.
+    {
+        let state = state.clone();
+        let privacy_mode = privacy_mode.clone();
+        let blur_row = config_view.blur_sensitive_row.clone();
+        header_privacy_toggle.connect_toggled(move |btn| {
+            let enabled = btn.is_active();
+            state.borrow().settings.set_bool(crate::settings::BLUR_SENSITIVE_CONTENT, enabled);
+            privacy_mode.set_enabled(enabled);
+            blur_row.set_active(enabled);
+            btn.set_tooltip_text(Some(if enabled { "Show sensitive information" } else { "Blur sensitive information" }));
         });
     }
 
@@ -7003,8 +7002,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .prefetch_refresh_row
             .set_value(persisted.get_int(crate::settings::PREFETCH_REFRESH_INTERVAL_MINUTES) as f64);
         // Advanced → "Blur sensitive information": seeding fires the notify
-        // handler above, applying the stored value to the blur provider.
-        config_view.blur_sensitive_row.set_active(persisted.get_bool(crate::settings::BLUR_SENSITIVE_CONTENT));
+        // handler above, applying the stored value to the blur provider and
+        // mirroring it into the header's privacy toggle. The toggle is set
+        // explicitly too, so its tooltip reads correctly even when the stored
+        // value matches the switch's default (no `toggled` fires then).
+        let blur_sensitive = persisted.get_bool(crate::settings::BLUR_SENSITIVE_CONTENT);
+        config_view.blur_sensitive_row.set_active(blur_sensitive);
+        header_privacy_toggle.set_active(blur_sensitive);
     }
 
     {
