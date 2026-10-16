@@ -362,7 +362,7 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 | P-08 | Import/export CSV | `.vcf` plus Outlook CSV import and export (§4.6), format auto-detected on import and chosen from the Export split button | ✅ | — |
 | P-09 | Link / merge duplicates | Exact-dupe skip on import | ❌ | Merge UI |
 | P-10 | Profile card | `app/src/profile_card.rs` (4.2): a popover on hover/click of a person reference (reading-pane header, message-list row, conversation card, attendee chip) showing photo/initials, name, title·org, phones, address, recent mail (FTS by address), upcoming shared events, and Send email / Schedule meeting / Add-or-Edit contact | ✅ | Invitation-card organizer and People-row triggers not yet wired; the UX-67 "Files" tab waits on attachment preview (M-32) |
-| P-11 | Directory (GAL / LDAP) | The Graph half landed with 5.2: `ContactsClient::search_people` (`/me/people`) and `search_directory` (`/users?$search=`, `ConsistencyLevel: eventual`) return directory entries and user photos (`/users/{id}/photo/$value`) | 🟡 | LDAP (`ldap3`) and wiring the Graph provider into `merge_contact_suggestions` (4.7) |
+| P-11 | Directory (GAL / LDAP) | The Graph half landed with 5.2: `ContactsClient::search_people` (`/me/people`) and `search_directory` (`/users?$search=`, `ConsistencyLevel: eventual`) return directory entries and user photos (`/users/{id}/photo/$value`) | 🟡 | LDAP (`ldap3`, rustls, server configured per account) and wiring the Graph provider into `merge_contact_suggestions` plus the recipient picker and People search, behind a per-account directory-consent opt-in (4.7) |
 | P-12 | Recently deleted | Local Deleted bucket | ✅ | — |
 
 ### 5.5 Tasks (To Do)
@@ -679,12 +679,31 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 4.4 | ✅ ~~People search and sort~~ | P-06, P-07 | Search box in the People pane (name/email/org) plus a module-aware title-bar search; a global "File contacts as" preference and a per-contact `file_as` override (`X-MS-FILEAS`/`SORT-AS`) | S |
 | 4.5 | ✅ ~~Outlook CSV import/export~~ | P-08 | Column map per §4.6; tolerant header matching | M |
 | 4.6 | Merge duplicates | P-09 | Match by email/phone/name; merge UI with field-level choice | M |
-| 4.7 | Directory lookup | P-11 | Graph `/users` (Microsoft 365) and LDAP (`ldap3`, server configured per account) as an extra provider in `merge_contact_suggestions` | M |
+| 4.7 | Directory lookup | P-11 | Graph `/users` (Microsoft 365) and LDAP (`ldap3`, rustls, configured per account) as extra directory providers in autocomplete, the recipient picker and People search. Ten substeps in **4.7 Directory lookup — substeps** below | M–L |
 | 4.8 | ✅ ~~Task lists sidebar~~ | T-01 | Navigation pane in `tasks_view.rs`: smart lists (My Day, Flagged email, Tasks) then one row per source, with the row filtering the list. Create/rename/delete lists route to the owning backend — CalDAV MKCALENDAR (VTODO-only) / PROPPATCH / DELETE (`dav`), Google Tasks `tasklists` CRUD, Graph `/me/todo/lists` CRUD (well-known lists guarded), local lists in `settings.json` (`app_config`, `task_lists.rs`) — degrading to a toast where unsupported | M |
 | 4.9 | ✅ ~~My Day~~ | T-02 | Local per-day pin set (`ui_state_db`'s `my_day_tasks`); the **My Day** smart list shows the pins plus due-today/overdue **Suggestions**; a task row's right-click toggles membership (`my_day.rs`, pure selection logic) | S |
 | 4.10 | Task reminders and recurrence | T-05, T-06 | `VALARM`/`RRULE` in `build_vtodo`; roll forward on complete; reminders via 3.9 | M |
 | 4.11 | Steps / subtasks | T-07 | `RELATED-TO;RELTYPE=PARENT` children (CalDAV); Google Tasks `parent`; Graph `checklistItems` | M |
 | 4.12 | ✅ ~~Task sort/group and categories~~ | T-08, T-09 | "Sort and group" toolbar menu (due/importance/title/created; group by due/list/category/none; show completed) persisted in GSettings; `CalendarTask.created` (RFC 5545 `CREATED`); category chips from the 2.1 master list | S |
+
+#### 4.7 Directory lookup — substeps
+
+Graph `/users` (Microsoft 365) and LDAP (`ldap3`, rustls, configured per account) join autocomplete, the recipient picker and People search as directory providers feeding `merge_contact_suggestions`. An unreachable or unauthorised directory degrades to no hits, never an error (§10).
+
+| # | Substep | Effort |
+|---|---|---|
+| 4.7.1 | Add a `directory: &[DirectoryPerson]` argument to `merge_contact_suggestions`, merged after CardDAV contacts, deduped and `limit`-bounded (pure, unit-tested). | S |
+| 4.7.2 | New `app/src/directory.rs`: one shared async `DirectorySource` dispatching per account over the Graph and LDAP backends, with keystroke debounce (~250 ms), a 2–3 character minimum and a small prefix→results cache (autocomplete fires on every keystroke). | M |
+| 4.7.3 | **Graph provider.** Build `ContactsClient` from the account's `MicrosoftOAuth`, run `ensure_directory_consent` on first use, search `search_directory` (`/users?$search=`) with `search_people` (`/me/people`) as fallback. Gated on `graph_consented()` plus a new per-account opt-in toggle, since `User.ReadBasic.All`/`People.Read` sit outside the default "Sync with Outlook" consent. | M |
+| 4.7.4 | **LDAP config model.** `LdapDirectory { id, account_id, display_name, host, port, tls, bind_dn, base_dn, filter, mail_attr, name_attr, enabled }` in `settings.json` (`AppConfig`, `#[serde(default)]`), with the bind password in the keyring under a new `PROTOCOL_LDAP` slot. | S |
+| 4.7.5 | **LDAP backend.** `ldap3` (`default-features = false, features = ["tls-rustls-aws-lc-rs"]`, matching Lookout's existing rustls/aws-lc-rs stack; async `LdapConnAsync`) behind a `DirectorySearch` trait, with a pure filter builder/escaping and an entry→`EmailAddress` mapping so tests use a fake (no live server). | M |
+| 4.7.6 | Wire both sources into the composer (`compose_host.rs`) and the calendar attendee field (`contacts_view.rs`) — account-scoped for compose, unioned across accounts for attendees. | S |
+| 4.7.7 | Add a **Directory** section to the recipient picker (`contact_picker.rs`), queried once the search box has text, with read-only rows. | S |
+| 4.7.8 | Add a transient **Directory** group to the People list while the filter is active, with Send email / Add to contacts row actions. | M |
+| 4.7.9 | **Settings → People UI.** A per-Microsoft-365 "Search the company directory (GAL)" consent switch, plus add/edit/remove LDAP directory entries (dialog modelled on `show_add_account_dialog`). | M |
+| 4.7.10 | **Close-out.** CHANGELOG entry (P-11), flip P-11 to ✅ with the §2.1/§7 rows, `cargo test`/`clippy` clean. | S |
+
+**Order:** 4.7.1 → 4.7.2 → (4.7.3 ∥ 4.7.4 → 4.7.5) → 4.7.6 → 4.7.7 → 4.7.8 → 4.7.9 → 4.7.10.
 
 ### Phase 5: Microsoft 365 native (Graph)
 
