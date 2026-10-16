@@ -455,9 +455,6 @@ pub struct ConfigView {
     /// "Re-scan every" spin row (Config → Advanced), exposed so the caller
     /// can wire its value into the policy's `refresh_interval`.
     pub prefetch_refresh_row: adw::SpinRow,
-    /// "Blur sensitive information" switch (Config → Advanced), exposed so the
-    /// caller can toggle `crate::privacy::PrivacyMode`.
-    pub blur_sensitive_row: adw::SwitchRow,
     mail_group: adw::PreferencesGroup,
     calendar_group: adw::PreferencesGroup,
     webcal_group: adw::PreferencesGroup,
@@ -1044,17 +1041,9 @@ pub fn build() -> ConfigView {
     }
     advanced_group.add(&prefetch_group);
 
-    // Privacy: blur email addresses, account names and people's names across
-    // the app, so screenshots for demos and marketing don't leak personal
-    // details. Purely visual - nothing is hidden from the user's own eyes any
-    // more than a blur makes it.
-    let privacy_advanced_group = adw::PreferencesGroup::builder().title("Privacy").build();
-    let blur_sensitive_row = adw::SwitchRow::builder()
-        .title("Blur sensitive information")
-        .subtitle("Blur email addresses, account names and people's names across the app - useful when taking screenshots for demos or marketing")
-        .build();
-    privacy_advanced_group.add(&blur_sensitive_row);
-    advanced_group.add(&privacy_advanced_group);
+    // The privacy blur has no Settings row: it is driven entirely by the
+    // title bar's cycling toggle (see `window.rs`), which is one click away
+    // and mirrors the state as an icon.
 
     let mail_cache_group = adw::PreferencesGroup::builder().title("Mail cache").build();
     advanced_group.add(&mail_cache_group);
@@ -1232,7 +1221,6 @@ pub fn build() -> ConfigView {
         prefetch_limit_row,
         prefetch_batch_row,
         prefetch_refresh_row,
-        blur_sensitive_row,
         mail_group,
         calendar_group,
         webcal_group,

@@ -167,6 +167,8 @@ pub fn build_lookout_view() -> LookoutView {
         .height_request(220)
         .vexpand(true)
         .build();
+    // The assistant's reply cards are HTML; "All text" mode blurs the view.
+    crate::privacy::mark_blur_all(&chat_output);
     // The card sits on the dashboard's dark scrim; a transparent view
     // background (plus the document's own `background: transparent` rule,
     // see `chat_document`) keeps WebKit from painting its default white.

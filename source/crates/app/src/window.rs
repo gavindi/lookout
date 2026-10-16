@@ -2241,6 +2241,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .hexpand(true)
         .vexpand(true)
         .build();
+    // The message body is text the GTK text selectors can't reach inside a
+    // `WebView`, so privacy blur's "All text" mode blurs the whole view.
+    crate::privacy::mark_blur_all(&web_view);
     install_web_view_zoom(&web_view);
     // Inline `cid:` image resolution: register a custom URI scheme so WebKit
     // asks us for the bytes behind `<img src="cid:...">` references instead
@@ -3280,17 +3283,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window_header.pack_start(&lookout_view_button);
     // The search cluster is the header's centred title widget (built above);
     // nothing to pack here.
-    // The privacy toggle: flips Config → Advanced → "Blur sensitive
-    // information" from anywhere in the app, docked at the header's right
-    // end so a screenshot run is one click away. It is a global control, not
-    // Mail-only, so unlike the ribbon toggles it stays enabled in every
-    // module. The Settings button sits to its right, directly left of the
+    // The privacy toggle: cycles the tri-state privacy blur (Config →
+    // Advanced → "Privacy blur") from anywhere in the app, docked at the
+    // header's right end so a screenshot run is one click away. It is a global
+    // control, not Mail-only, so unlike the ribbon toggles it stays enabled in
+    // every module. A `ToggleButton` (not a plain button) so the checked
+    // highlight shows while any blur is on; the icon and tooltip then say
+    // which level is active and what the next click does (see `apply_blur_mode`
+    // below). The Settings button sits to its right, directly left of the
     // window controls, and opens the Settings window as a modal dialog (see
     // its click handler below). `pack_end` stacks right-to-left, so the calls
     // are ordered rightmost first: on screen this reads open-.eml, privacy,
     // Settings.
     let header_privacy_toggle = gtk::ToggleButton::builder()
-        .icon_name(themed_icon_name(&["view-conceal-symbolic", "channel-secure-symbolic", "security-high-symbolic"]))
+        .icon_name(themed_icon_name(&["view-reveal-symbolic", "view-conceal-symbolic"]))
         .css_classes(["flat"])
         .build();
     header_privacy_toggle.set_tooltip_text(Some("Blur sensitive information"));
@@ -6825,37 +6831,48 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
     }
 
-    // Config → Advanced → "Blur sensitive information": toggles the
-    // display-level blur provider and remembers the choice; the header's
-    // privacy toggle is a second control for the same state, kept in lockstep
-    // below. Seeding further down re-applies the stored value at startup.
-    {
+    // The title bar's privacy toggle drives the tri-state (`privacy::BlurMode`)
+    // and is the only control for it. `apply_blur_mode` stores the mode,
+    // reloads the display-level blur provider, and refreshes the toggle's
+    // checked state, icon and tooltip. The `suppress` flag stops the
+    // programmatic `set_active` below from being mistaken for a user click
+    // (which would otherwise advance the cycle again). Seeding further down
+    // runs it once at startup.
+    let suppress_blur_toggle = Rc::new(Cell::new(false));
+    let apply_blur_mode: Rc<dyn Fn(crate::privacy::BlurMode)> = {
         let state = state.clone();
         let privacy_mode = privacy_mode.clone();
         let header_privacy_toggle = header_privacy_toggle.clone();
-        config_view.blur_sensitive_row.connect_active_notify(move |row| {
-            let enabled = row.is_active();
-            state.borrow().settings.set_bool(crate::settings::BLUR_SENSITIVE_CONTENT, enabled);
-            privacy_mode.set_enabled(enabled);
-            // Mirror the header's copy; a no-op when already in sync, so the
-            // two handlers can't loop.
-            header_privacy_toggle.set_active(enabled);
-        });
-    }
-    // The title bar's privacy toggle: flips the same setting and blur
-    // provider, keeps the Config switch in lockstep, and reflects the current
-    // state in its tooltip. `set_active` with the button's current value is a
-    // no-op, so this can't loop back into the switch handler above.
+        let suppress_blur_toggle = suppress_blur_toggle.clone();
+        Rc::new(move |mode| {
+            state.borrow().settings.set_string(crate::settings::PRIVACY_BLUR_MODE, mode.as_setting());
+            privacy_mode.set_mode(mode);
+            suppress_blur_toggle.set(true);
+            header_privacy_toggle.set_active(mode != crate::privacy::BlurMode::Off);
+            suppress_blur_toggle.set(false);
+            // The icon says which level is active; the tooltip names what the
+            // next click does (the same convention the theme button uses).
+            let (icon, fallback, tooltip) = match mode {
+                crate::privacy::BlurMode::Off => ("view-reveal-symbolic", "view-conceal-symbolic", "Blur sensitive information"),
+                crate::privacy::BlurMode::Sensitive => ("view-conceal-symbolic", "security-high-symbolic", "Blur all text"),
+                crate::privacy::BlurMode::All => ("channel-secure-symbolic", "security-high-symbolic", "Show text"),
+            };
+            header_privacy_toggle.set_icon_name(themed_icon_name(&[icon, fallback]));
+            header_privacy_toggle.set_tooltip_text(Some(tooltip));
+        })
+    };
     {
+        // The header toggle: each click advances the cycle, read from the
+        // stored mode (the single source of truth) so a programmatic
+        // `set_active` can't shift it.
         let state = state.clone();
-        let privacy_mode = privacy_mode.clone();
-        let blur_row = config_view.blur_sensitive_row.clone();
-        header_privacy_toggle.connect_toggled(move |btn| {
-            let enabled = btn.is_active();
-            state.borrow().settings.set_bool(crate::settings::BLUR_SENSITIVE_CONTENT, enabled);
-            privacy_mode.set_enabled(enabled);
-            blur_row.set_active(enabled);
-            btn.set_tooltip_text(Some(if enabled { "Show sensitive information" } else { "Blur sensitive information" }));
+        let apply_blur_mode = apply_blur_mode.clone();
+        header_privacy_toggle.connect_toggled(move |_btn| {
+            if suppress_blur_toggle.get() {
+                return;
+            }
+            let current = crate::privacy::BlurMode::from_setting(&state.borrow().settings.get_string(crate::settings::PRIVACY_BLUR_MODE));
+            apply_blur_mode(current.next());
         });
     }
 
@@ -7001,14 +7018,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .prefetch_refresh_row
             .set_value(persisted.get_int(crate::settings::PREFETCH_REFRESH_INTERVAL_MINUTES) as f64);
-        // Advanced → "Blur sensitive information": seeding fires the notify
-        // handler above, applying the stored value to the blur provider and
-        // mirroring it into the header's privacy toggle. The toggle is set
-        // explicitly too, so its tooltip reads correctly even when the stored
-        // value matches the switch's default (no `toggled` fires then).
-        let blur_sensitive = persisted.get_bool(crate::settings::BLUR_SENSITIVE_CONTENT);
-        config_view.blur_sensitive_row.set_active(blur_sensitive);
-        header_privacy_toggle.set_active(blur_sensitive);
+        // Advanced → "Privacy blur": apply the stored mode once, which loads
+        // the blur provider and syncs the ComboRow and the header toggle.
+        apply_blur_mode(crate::privacy::BlurMode::from_setting(&persisted.get_string(crate::settings::PRIVACY_BLUR_MODE)));
     }
 
     {

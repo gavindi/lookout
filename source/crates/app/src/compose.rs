@@ -1105,6 +1105,8 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
         .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
         .build();
     let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).web_context(&compose_web_context()).build());
+    // The draft body is editable HTML; "All text" mode blurs the whole view.
+    crate::privacy::mark_blur_all(web_view.as_ref());
     // Ctrl+scroll / Ctrl+± zoom on the composer (item 1.20 / M-37).
     crate::window::install_web_view_zoom(&web_view);
 

@@ -207,10 +207,11 @@ pub const PREFETCH_BATCH_SIZE: &str = "prefetch-batch-size";
 /// Config → Advanced → "Aggressive prefetch" → "Re-scan every": minutes
 /// between full prefetch re-scans of every folder.
 pub const PREFETCH_REFRESH_INTERVAL_MINUTES: &str = "prefetch-refresh-interval-minutes";
-/// Config → Advanced → "Blur sensitive information": whether email addresses,
-/// account names and people's names are blurred throughout the UI. Intended
-/// for taking screenshots for demos and marketing (see `crate::privacy`).
-pub const BLUR_SENSITIVE_CONTENT: &str = "blur-sensitive-content";
+/// The title bar's privacy toggle: how much text is blurred throughout the
+/// UI, as one of `crate::privacy::BlurMode`'s stored strings ("off",
+/// "sensitive", "all"). Intended for taking screenshots for demos and
+/// marketing (see `crate::privacy`).
+pub const PRIVACY_BLUR_MODE: &str = "privacy-blur-mode";
 
 /// One stored value, mirroring the GSettings key types the app uses: booleans,
 /// strings, doubles (pane-width percentages), integers (prefetch counts),
@@ -351,7 +352,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(PREFETCH_FOLDER_LIMIT, Value::Int(200));
     map.insert(PREFETCH_BATCH_SIZE, Value::Int(1));
     map.insert(PREFETCH_REFRESH_INTERVAL_MINUTES, Value::Int(60));
-    map.insert(BLUR_SENSITIVE_CONTENT, Value::Bool(false));
+    map.insert(PRIVACY_BLUR_MODE, Value::String("off".into()));
     map
 }
 
@@ -1031,13 +1032,13 @@ mod tests {
     }
 
     #[test]
-    fn blur_sensitive_content_defaults_off_and_round_trips() {
+    fn privacy_blur_mode_defaults_off_and_round_trips() {
         let store = resolve();
-        assert!(!store.get_bool(BLUR_SENSITIVE_CONTENT), "privacy blur is off by default");
-        store.set_bool(BLUR_SENSITIVE_CONTENT, true);
-        assert!(store.get_bool(BLUR_SENSITIVE_CONTENT));
-        store.set_bool(BLUR_SENSITIVE_CONTENT, false);
-        assert!(!store.get_bool(BLUR_SENSITIVE_CONTENT));
+        assert_eq!(store.get_string(PRIVACY_BLUR_MODE), "off", "privacy blur is off by default");
+        store.set_string(PRIVACY_BLUR_MODE, "sensitive");
+        assert_eq!(store.get_string(PRIVACY_BLUR_MODE), "sensitive");
+        store.set_string(PRIVACY_BLUR_MODE, "all");
+        assert_eq!(store.get_string(PRIVACY_BLUR_MODE), "all");
     }
 
     #[test]

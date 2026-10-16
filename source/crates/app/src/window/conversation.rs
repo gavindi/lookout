@@ -844,6 +844,9 @@ pub(crate) fn build_conversation_ui(ctx: &ConversationContext, reading_stack: &g
         .hexpand(true)
         .vexpand(true)
         .build();
+    // The conversation's message cards are HTML; "All text" blur covers the
+    // whole view.
+    crate::privacy::mark_blur_all(&web_view);
     web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
     install_web_view_zoom(&web_view);
 
