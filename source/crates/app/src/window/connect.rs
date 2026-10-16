@@ -790,6 +790,9 @@ pub(crate) fn spawn_account_event_loop(
                         // Blocked senders (item 2.9 / M-17) always apply, even
                         // when the rules master switch is off.
                         crate::rules::enforce_blocked_senders(&state, &account_id, &mailbox, &messages);
+                        // Ignored conversations (item 2.8 / M-20) always apply
+                        // too, and silently.
+                        crate::rules::enforce_ignored_threads(&state, &account_id, &mailbox, &messages);
                     }
                     AccountEvent::SieveAdvertised(advertised) => {
                         // Remember whether this account's server offers

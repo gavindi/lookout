@@ -10,10 +10,10 @@
 //! the same wherever it's invoked.
 //!
 //! Entries whose features haven't landed yet are left out rather than shown
-//! greyed: Ignore (2.8). Report ▸ Report phishing (6.7) is included only when a
-//! reporting address is set; Block ▸ (2.9) offers Block sender / Block domain,
-//! or Unblock sender when the sender is already blocked. Each adds itself here
-//! when it lands.
+//! greyed. Ignore / Clean up conversation (2.8) are included. Report ▸ Report
+//! phishing (6.7) is included only when a reporting address is set; Block ▸
+//! (2.9) offers Block sender / Block domain, or Unblock sender when the sender
+//! is already blocked. Each adds itself here when it lands.
 //!
 //! Copyright (C) <2026>  <Gavin Graham & Contributors>
 //! Software released under the GPL3 license
@@ -76,6 +76,15 @@ pub enum MessageMenuAction {
     BlockDomain,
     /// Remove the target's sender from the account's blocked list.
     UnblockSender,
+    /// Ignore the target conversation (item 2.8 / M-20): remember its thread
+    /// key so future arrivals move to Deleted, and move the conversation's
+    /// messages there now.
+    Ignore,
+    /// Stop ignoring the target conversation (remove the thread key).
+    StopIgnoring,
+    /// Delete the conversation's redundant, wholly-quoted messages (item 2.8 /
+    /// M-20).
+    CleanUpConversation,
     /// Reclassify the targets' Focused/Other bucket (M-03): `true` = Focused.
     MoveFocused(bool),
     /// Also record a sender override so future mail follows: `true` = Focused
@@ -198,6 +207,9 @@ pub struct MenuChoices {
     /// otherwise, per the module docs' "features not available are left out"
     /// rule.
     pub focused_inbox: bool,
+    /// Whether the target conversation is already ignored (item 2.8 / M-20):
+    /// when true the menu offers "Stop ignoring" instead of "Ignore".
+    pub thread_ignored: bool,
 }
 
 /// Every action the menu's group carries.
@@ -227,6 +239,9 @@ pub fn action_specs() -> Vec<ActionSpec> {
         "block-sender",
         "block-domain",
         "unblock-sender",
+        "ignore",
+        "stop-ignoring",
+        "clean-up-conversation",
         "importance-high",
         "importance-normal",
         "importance-low",
@@ -370,6 +385,14 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
         );
     }
     menu = menu.section();
+    // Ignore / Clean up (item 2.8 / M-20) precede Report ▸ in Outlook's order
+    // (UX-36). "Stop ignoring" replaces "Ignore" for an already-ignored thread.
+    menu = if choices.thread_ignored {
+        menu.icon_action("Stop ignoring", ns("stop-ignoring"), "edit-clear-symbolic")
+    } else {
+        menu.icon_action("Ignore", ns("ignore"), "action-unavailable-symbolic")
+    };
+    menu = menu.icon_action("Clean up conversation", ns("clean-up-conversation"), "edit-clear-all-symbolic");
     let mut report = MenuDescription::new().section().icon_action("Report junk", ns("report-junk"), "mail-mark-junk-symbolic");
     if choices.report_phishing {
         report = report.icon_action("Report phishing", ns("report-phishing"), "dialog-warning-symbolic");
@@ -448,6 +471,9 @@ pub fn message_action_for(name: &str, param: Option<&glib::Variant>) -> Option<M
         "block-sender" => MessageMenuAction::BlockSender,
         "block-domain" => MessageMenuAction::BlockDomain,
         "unblock-sender" => MessageMenuAction::UnblockSender,
+        "ignore" => MessageMenuAction::Ignore,
+        "stop-ignoring" => MessageMenuAction::StopIgnoring,
+        "clean-up-conversation" => MessageMenuAction::CleanUpConversation,
         "importance-high" => MessageMenuAction::SetImportance(Importance::High),
         "importance-normal" => MessageMenuAction::SetImportance(Importance::Normal),
         "importance-low" => MessageMenuAction::SetImportance(Importance::Low),
@@ -528,7 +554,7 @@ mod tests {
                 vec!["Reply", "Reply all", "Forward", "Reply with meeting"],
                 vec!["Delete", "Archive", "Move ▸", "Copy ▸"],
                 vec!["Mark as unread", "Flag ▸", "Pin", "Snooze ▸", "Categorize ▸", "Importance ▸"],
-                vec!["Report ▸"],
+                vec!["Ignore", "Clean up conversation", "Report ▸"],
                 vec!["Block ▸"],
                 vec!["Rules ▸"],
                 vec!["View ▸"],
@@ -660,6 +686,7 @@ mod tests {
             report_phishing: false,
             sender_blocked: false,
             focused_inbox: false,
+            thread_ignored: false,
         };
         let menu = message_menu_description(&message_menu_state(&[facts(None)], true, true), &choices);
         assert_eq!(labels(submenu(&menu, "Move")), vec![vec!["Projects"], vec!["Other folder…"]]);
@@ -712,6 +739,9 @@ mod tests {
             ("block-sender", MessageMenuAction::BlockSender),
             ("block-domain", MessageMenuAction::BlockDomain),
             ("unblock-sender", MessageMenuAction::UnblockSender),
+            ("ignore", MessageMenuAction::Ignore),
+            ("stop-ignoring", MessageMenuAction::StopIgnoring),
+            ("clean-up-conversation", MessageMenuAction::CleanUpConversation),
             ("importance-high", MessageMenuAction::SetImportance(Importance::High)),
             ("importance-normal", MessageMenuAction::SetImportance(Importance::Normal)),
             ("importance-low", MessageMenuAction::SetImportance(Importance::Low)),
@@ -736,7 +766,7 @@ mod tests {
         assert_eq!(message_action_for("move", None), None);
         assert_eq!(message_action_for("flag", Some(&"16/10/2026".to_variant())), None);
         assert_eq!(message_action_for("snooze", Some(&"soon".to_variant())), None);
-        assert_eq!(message_action_for("ignore", None), None);
+        assert_eq!(message_action_for("ignore", Some(&"x".to_variant())), Some(MessageMenuAction::Ignore));
     }
 
     /// The description builds into a real popover whose Categorize submenu

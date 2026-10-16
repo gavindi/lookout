@@ -113,6 +113,65 @@ pub(crate) fn enforce_blocked_senders(state: &Rc<RefCell<UiState>>, account_id: 
     });
 }
 
+/// Moves genuinely-new arriving mail in an ignored conversation (item 2.8 /
+/// M-20) to Deleted Items. Like [`enforce_blocked_senders`] this is
+/// independent of the rules master switch (Outlook's Ignore always applies)
+/// and silent - arrival-time filtering shows no toast and records no undo.
+pub(crate) fn enforce_ignored_threads(state: &Rc<RefCell<UiState>>, account_id: &AccountId, mailbox: &MailboxId, messages: &[EmailSummary]) {
+    if messages.is_empty() {
+        return;
+    }
+    let (ignored, cmd_tx) = {
+        let st = state.borrow();
+        if st.ignored_threads.is_empty() {
+            return;
+        }
+        let Some(handle) = st.accounts.get(account_id) else {
+            return;
+        };
+        let ignored: std::collections::HashSet<String> = st
+            .ignored_threads
+            .iter()
+            .filter(|(account, _)| account == account_id)
+            .map(|(_, thread)| thread.clone())
+            .collect();
+        (ignored, handle.cmd_tx.clone())
+    };
+    let uids: Vec<Uid> = messages
+        .iter()
+        .filter(|message| ignored.contains(&message.thread_key.0))
+        .map(|message| message.uid)
+        .collect();
+    if uids.is_empty() {
+        return;
+    }
+    let _ = cmd_tx.send_blocking(AccountCommand::MoveMessages {
+        mailbox: mailbox.clone(),
+        uids,
+        role: MailboxRole::Trash,
+    });
+}
+
+/// Remembers `thread` as ignored for `account` (item 2.8 / M-20), persisting it
+/// so arrival enforcement and the management dialog both see it. `label` is the
+/// conversation's subject, shown in the dialog.
+pub(crate) fn ignore_thread(state: &Rc<RefCell<UiState>>, account: &AccountId, thread: &str, label: &str) {
+    let mut st = state.borrow_mut();
+    st.ignored_threads.insert((account.clone(), thread.to_string()));
+    if let Some(db) = &st.ui_db {
+        let _ = db.set_ignored_thread(account, thread, label);
+    }
+}
+
+/// Stops ignoring `thread` for `account` (item 2.8 / M-20).
+pub(crate) fn unignore_thread(state: &Rc<RefCell<UiState>>, account: &AccountId, thread: &str) {
+    let mut st = state.borrow_mut();
+    st.ignored_threads.remove(&(account.clone(), thread.to_string()));
+    if let Some(db) = &st.ui_db {
+        let _ = db.remove_ignored_thread(account, thread);
+    }
+}
+
 /// Applies the account's client rules to every cached message in `mailbox`,
 /// the folder menu's "Run rules now". Unlike automatic arrival, this runs on
 /// whatever folder the user chose, Inbox or not.

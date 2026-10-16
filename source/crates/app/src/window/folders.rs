@@ -168,7 +168,20 @@ pub(crate) fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection
     // it rebuilds every row, collapses whatever subfolders the user had
     // expanded, and drops the selection (see the restore below), so skipping
     // it outright is what keeps the pane still while counts fill in.
-    let signature = folder_tree_signature(&accounts, &favorites, &state.borrow().folder_prefs);
+    let search_folders = state.borrow().app_config.borrow().search_folders.clone();
+    let mut signature = folder_tree_signature(&accounts, &favorites, &state.borrow().folder_prefs);
+    // Saved searches (item 2.4 / M-19) are part of the rendered tree, so they
+    // belong in the signature too - a group appearing/disappearing or a name
+    // changing must re-render the pane. Carried under a reserved pseudo-account
+    // id, like the Favorites section.
+    signature.push((
+        AccountId(SEARCH_FOLDERS_GROUP_KEY.into()),
+        String::new(),
+        search_folders
+            .iter()
+            .map(|folder| (MailboxId(folder.id.clone()), folder.name.clone(), MailboxRole::Custom, '/', 0, 0, Default::default()))
+            .collect(),
+    ));
     {
         let st = state.borrow();
         if st.folder_tree.as_ref() == Some(&signature) && !auto_select_inbox && !st.restore_pending {
@@ -209,7 +222,7 @@ pub(crate) fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection
         }
     };
 
-    let model = build_multi_account_tree_model(accounts, favorites);
+    let model = build_multi_account_tree_model(accounts, favorites, search_folders);
     // Everything from here to the flag being cleared is the rebuild putting
     // the pane back the way the user left it, not the user navigating - so
     // the `selected-item` handler has to stay out of it. `set_model` alone
@@ -663,6 +676,10 @@ pub(crate) fn expand_mailboxes(model: &gtk::TreeListModel, expanded: &HashSet<Ma
 /// `folder_tree_signature` uses to fold the favorites section into its
 /// comparison.
 pub(crate) const FAVORITES_GROUP_KEY: &str = "\u{0}favorites";
+
+/// The reserved pseudo-account key under which the Search Folders group's
+/// membership is carried in the folder-tree signature (item 2.4 / M-19).
+pub(crate) const SEARCH_FOLDERS_GROUP_KEY: &str = "\u{0}search-folders";
 
 /// The account groups (and the Favorites section) the user has collapsed in
 /// the current tree. Test-only sugar over [`capture_folder_expansion`]; the

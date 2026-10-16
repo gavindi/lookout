@@ -304,6 +304,13 @@ pub struct ConfigView {
     /// caller can wire its `activated` signal to the blocked-senders manage
     /// dialog (item 2.9 / M-17).
     pub blocked_senders_row: adw::ActionRow,
+    /// "Ignored conversations…" row (Config → Mail → Junk email), exposed so
+    /// the caller can open the ignored-conversations manage dialog (item 2.8 /
+    /// M-20).
+    pub ignored_conversations_row: adw::ActionRow,
+    /// "Search Folders…" row (Config → Mail), exposed so the caller can open
+    /// the saved-search manager (item 2.4 / M-19).
+    pub search_folders_row: adw::ActionRow,
     /// "Categories…" row (Config → Mail), exposed so the caller can open the
     /// shared category master-list editor (item 2.1 / M-09).
     pub categories_row: adw::ActionRow,
@@ -663,12 +670,24 @@ pub fn build() -> ConfigView {
         .activatable(true)
         .build();
     junk_email_group.add(&blocked_senders_row);
+    let ignored_conversations_row = adw::ActionRow::builder()
+        .title("Ignored conversations…")
+        .subtitle("Conversations whose new mail goes straight to Deleted Items")
+        .activatable(true)
+        .build();
+    junk_email_group.add(&ignored_conversations_row);
     let categories_row = adw::ActionRow::builder()
         .title("Categories…")
         .subtitle("Manage the categories shared by mail, events and tasks")
         .activatable(true)
         .build();
     mail_settings_group.add(&categories_row);
+    let search_folders_row = adw::ActionRow::builder()
+        .title("Search Folders…")
+        .subtitle("Saved searches shown as virtual folders in the folder pane")
+        .activatable(true)
+        .build();
+    mail_settings_group.add(&search_folders_row);
     let rules_row = adw::ActionRow::builder()
         .title("Rules…")
         .subtitle("Organise incoming mail automatically")
@@ -1153,7 +1172,9 @@ pub fn build() -> ConfigView {
         remote_images_row,
         trusted_senders_row,
         blocked_senders_row,
+        ignored_conversations_row,
         categories_row,
+        search_folders_row,
         rules_row,
         quick_steps_row,
         automatic_replies_row,

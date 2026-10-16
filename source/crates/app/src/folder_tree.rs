@@ -7,6 +7,8 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::{AccountId, Mailbox, MailboxRole};
 
+use crate::app_config::SearchFolder;
+
 /// A folder-tree node, built once per `FoldersUpdated` event and wrapped in
 /// `glib::BoxedAnyObject` for use in a `Gtk.TreeListModel`. Kept separate
 /// from `lookout_core::Mailbox` because parent/child linking is inherently a
@@ -50,6 +52,11 @@ pub enum TreeItem {
     /// will land on the favorite copy instead of the folder's real row (see
     /// `find_mailbox_index`).
     Favorite(Rc<FolderNode>),
+    /// The "Search Folders" grouping row (item 2.4 / M-19), pinned below the
+    /// account groups. Present only while at least one saved search exists.
+    SearchFolders,
+    /// One saved search, a leaf row that runs its query when selected.
+    SearchFolder(Rc<SearchFolder>),
 }
 
 /// Reconstructs a folder hierarchy from the flat mailbox list IMAP's `LIST`
@@ -127,7 +134,7 @@ fn sort_paths(paths: &mut [String], by_path: &HashMap<String, Mailbox>) {
 ///
 /// `favorites` are rendered as flat leaves - a favorite is one folder, not a
 /// subtree - and are duplicates of rows that also live under their account.
-pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mailbox>)>, favorites: Vec<Mailbox>) -> gtk::TreeListModel {
+pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mailbox>)>, favorites: Vec<Mailbox>, search_folders: Vec<SearchFolder>) -> gtk::TreeListModel {
     let mut folder_roots_by_account: HashMap<AccountId, Vec<Rc<FolderNode>>> = HashMap::new();
     let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
     // The unified row merges exactly the inboxes the account rows count, so
@@ -148,6 +155,12 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
         })));
         folder_roots_by_account.insert(account_id, roots);
     }
+    // Search Folders (item 2.4 / M-19) sit below the account groups, present
+    // only while at least one saved search exists.
+    let search_folder_nodes: Vec<Rc<SearchFolder>> = search_folders.into_iter().map(Rc::new).collect();
+    if !search_folder_nodes.is_empty() {
+        root_store.append(&glib::BoxedAnyObject::new(TreeItem::SearchFolders));
+    }
 
     let model = gtk::TreeListModel::new(root_store, false, false, move |item| {
         let boxed = item.downcast_ref::<glib::BoxedAnyObject>()?;
@@ -162,8 +175,15 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
             }
             return Some(store.upcast::<gio::ListModel>());
         }
+        if matches!(&*tree_item, TreeItem::SearchFolders) {
+            let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+            for folder in &search_folder_nodes {
+                store.append(&glib::BoxedAnyObject::new(TreeItem::SearchFolder(folder.clone())));
+            }
+            return Some(store.upcast::<gio::ListModel>());
+        }
         let children = match &*tree_item {
-            TreeItem::Unified(_) | TreeItem::Favorites | TreeItem::Favorite(_) => return None,
+            TreeItem::Unified(_) | TreeItem::Favorites | TreeItem::Favorite(_) | TreeItem::SearchFolders | TreeItem::SearchFolder(_) => return None,
             TreeItem::Account(acc) => folder_roots_by_account.get(&acc.account_id)?.clone(),
             TreeItem::Folder(node) => node.children.clone(),
         };

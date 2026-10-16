@@ -451,7 +451,7 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
     }
     let state = &context.state;
     let account = mailbox_account_id(&targets[0].mailbox);
-    let (menu_state, recent_folders, sender_blocked, focused_inbox) = {
+    let (menu_state, recent_folders, sender_blocked, focused_inbox, thread_ignored) = {
         let st = state.borrow();
         let facts: Vec<TargetFacts> = targets
             .iter()
@@ -499,7 +499,14 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
             .and_then(|id| st.accounts.get(id))
             .and_then(|handle| handle.graph_mail.clone())
             .is_some_and(|client| client.consented());
-        (menu_state, recent, sender_blocked, focused_inbox)
+        // Whether the target conversation is already ignored (item 2.8 /
+        // M-20), so the menu reads "Stop ignoring".
+        let thread_ignored = primary.as_ref().is_some_and(|summary| {
+            account
+                .as_ref()
+                .is_some_and(|account_id| st.ignored_threads.contains(&(account_id.clone(), summary.thread_key.0.clone())))
+        });
+        (menu_state, recent, sender_blocked, focused_inbox, thread_ignored)
     };
     let today = crate::calendar_tz::display_zone().today();
     let prefs = state.borrow().settings.calendar_preferences();
@@ -523,6 +530,7 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
         report_phishing: targets.len() == 1 && !state.borrow().settings.get_string(crate::settings::MAIL_REPORT_PHISHING_ADDRESS).trim().is_empty(),
         sender_blocked,
         focused_inbox,
+        thread_ignored,
     };
 
     let description = crate::message_menu::message_menu_description(&menu_state, &choices);
@@ -619,6 +627,18 @@ pub(crate) fn run_message_menu_action(
         A::UnblockSender => {
             let Some(summary) = primary.cloned() else { return };
             unblock_sender_selection(state, &summary);
+        }
+        A::Ignore => {
+            let Some(summary) = primary.cloned() else { return };
+            ignore_conversation(state, message_list, targets, &summary);
+        }
+        A::StopIgnoring => {
+            let Some(summary) = primary.cloned() else { return };
+            stop_ignoring_conversation(state, &summary);
+        }
+        A::CleanUpConversation => {
+            let Some(summary) = primary.cloned() else { return };
+            clean_up_conversation(state, message_list, targets, &summary);
         }
         A::MoveTo(folder) => move_messages_to_folder(state, message_list, targets, &folder),
         A::CopyTo(folder) => copy_messages_to_folder(state, targets, &folder),
@@ -2121,6 +2141,78 @@ pub(crate) fn unblock_sender_selection(state: &Rc<RefCell<UiState>>, summary: &E
     }
 }
 
+/// Whether `text` is entirely quoted/attribution - no unquoted content of its
+/// own (item 2.8 / M-20). Used by Clean up conversation to spot a message that
+/// only repeats a later one; deliberately conservative, recognising `>`
+/// quote lines, "On … wrote:" attributions and Outlook's
+/// `-----Original Message-----` marker.
+pub(crate) fn wholly_quoted(text: &str) -> bool {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let quoted = trimmed.starts_with('>') || trimmed.starts_with("-----Original Message-----") || (trimmed.starts_with("On ") && trimmed.ends_with("wrote:"));
+        if !quoted {
+            return false;
+        }
+    }
+    true
+}
+
+/// Ignores the conversation of `primary` (item 2.8 / M-20 / M-16): remembers
+/// its thread key so future arrivals move to Deleted, and moves the thread's
+/// currently-visible messages (`targets` that share the key) there now.
+pub(crate) fn ignore_conversation(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, targets: &[EmailSummary], primary: &EmailSummary) {
+    let Some(account) = mailbox_account_id(&primary.mailbox) else { return };
+    let thread = primary.thread_key.0.clone();
+    let label = primary.subject.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "(No subject)".to_string());
+    crate::rules::ignore_thread(state, &account, &thread, &label);
+    let to_move: Vec<EmailSummary> = targets.iter().filter(|summary| summary.thread_key == primary.thread_key).cloned().collect();
+    if !to_move.is_empty() {
+        move_messages_to_role(state, message_list, &to_move, MailboxRole::Trash);
+    }
+    if let Some(overlay) = &state.borrow().toast_overlay {
+        overlay.add_toast(adw::Toast::new("Conversation ignored"));
+    }
+}
+
+/// Stops ignoring the conversation of `primary` (item 2.8 / M-20).
+pub(crate) fn stop_ignoring_conversation(state: &Rc<RefCell<UiState>>, primary: &EmailSummary) {
+    let Some(account) = mailbox_account_id(&primary.mailbox) else { return };
+    crate::rules::unignore_thread(state, &account, &primary.thread_key.0);
+    if let Some(overlay) = &state.borrow().toast_overlay {
+        overlay.add_toast(adw::Toast::new("Conversation no longer ignored"));
+    }
+}
+
+/// Cleans up a conversation (item 2.8 / M-20): moves its older messages whose
+/// cached preview is entirely quoted (so they add nothing a later message
+/// doesn't already carry) to Deleted. Conservative and undoable - only
+/// messages with a known, wholly-quoted preview are touched, and the move is a
+/// normal Undo-able delete.
+pub(crate) fn clean_up_conversation(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, targets: &[EmailSummary], primary: &EmailSummary) {
+    let thread_id = (primary.mailbox.clone(), primary.thread_key.clone());
+    let mut messages = message_list.thread_messages(&thread_id);
+    if messages.is_empty() {
+        messages = targets.to_vec();
+    }
+    let newest = messages.iter().map(|message| message.date).max();
+    let redundant: Vec<EmailSummary> = messages
+        .into_iter()
+        .filter(|message| Some(message.date) != newest)
+        .filter(|message| message.preview.as_deref().is_some_and(wholly_quoted))
+        .collect();
+    let Some(overlay) = state.borrow().toast_overlay.clone() else { return };
+    if redundant.is_empty() {
+        overlay.add_toast(adw::Toast::new("Nothing to clean up in this conversation"));
+        return;
+    }
+    let count = redundant.len();
+    move_messages_to_role(state, message_list, &redundant, MailboxRole::Trash);
+    overlay.add_toast(adw::Toast::new(&format!("Cleaned up {count} message(s)")));
+}
+
 /// Starts a Report phishing run (item 6.7 / S-09) for the single target: the
 /// message's raw bytes are fetched, then (in the `RawMessageFetched` handler)
 /// forwarded as a `.eml` attachment to the configured address and the message
@@ -2664,4 +2756,259 @@ pub(crate) fn compose_new_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Work
         account_id,
         Some(crate::config_view::SignatureDefault::New),
     );
+}
+
+/// How a Sweep selects which of the sender's messages to act on (item 2.7 /
+/// M-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepMode {
+    /// Every message from the sender.
+    All,
+    /// Every message except the most recent.
+    KeepLatest,
+    /// Messages older than this many days.
+    Older(i64),
+}
+
+/// The messages a [`SweepMode`] acts on, from `messages` (item 2.7 / M-16).
+/// Pure, so the selection rule is unit-tested.
+pub(crate) fn sweep_selection(mut messages: Vec<EmailSummary>, mode: SweepMode) -> Vec<EmailSummary> {
+    match mode {
+        SweepMode::All => messages,
+        SweepMode::KeepLatest => {
+            if let Some(newest) = messages.iter().enumerate().max_by_key(|(_, message)| message.date).map(|(index, _)| index) {
+                messages.remove(newest);
+            }
+            messages
+        }
+        SweepMode::Older(days) => {
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(days.max(0));
+            messages.retain(|message| message.date < cutoff);
+            messages
+        }
+    }
+}
+
+/// The maximum messages one sweep gathers from the local cache (a guard against
+/// an unbounded sender).
+const SWEEP_LIMIT: usize = 5000;
+
+/// Opens the Sweep dialog for `primary` (item 2.7 / M-16): bulk delete or move
+/// of every message from the same sender in the open folder, optionally keeping
+/// the latest, optionally older than N days, and optionally a standing rule for
+/// future mail.
+pub(crate) fn show_sweep_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, worker: Rc<Worker>, message_list: MessageListModel, primary: EmailSummary) {
+    let Some(sender) = primary.from.first().cloned() else {
+        if let Some(overlay) = &state.borrow().toast_overlay {
+            overlay.add_toast(adw::Toast::new("This message has no sender to sweep"));
+        }
+        return;
+    };
+    let sender_label = sender.display_label().to_string();
+    let dialog = {
+        let mut builder = gtk::Window::builder().modal(true).title("Sweep").default_width(460);
+        if let Some(win) = anchor.root().and_downcast::<gtk::Window>() {
+            builder = builder.transient_for(&win);
+        }
+        builder.build()
+    };
+
+    let all = gtk::CheckButton::with_label(&format!("All messages from {sender_label}"));
+    all.set_active(true);
+    let keep_latest = gtk::CheckButton::with_label("All except the latest");
+    keep_latest.set_group(Some(&all));
+    let older = gtk::CheckButton::with_label("Older than");
+    older.set_group(Some(&all));
+    let older_spin = gtk::SpinButton::with_range(1.0, 3650.0, 1.0);
+    older_spin.set_value(10.0);
+    let older_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    older_row.append(&older);
+    older_row.append(&older_spin);
+    older_row.append(&gtk::Label::new(Some("days")));
+
+    let target_dropdown = gtk::DropDown::builder().build();
+    target_dropdown.set_model(Some(&gtk::StringList::new(&["Deleted Items", "Archive"])));
+    target_dropdown.set_selected(0);
+    let target_row = adw::ActionRow::builder().title("Move to").subtitle("Where the swept messages go").build();
+    target_row.add_suffix(&target_dropdown);
+
+    let standing = adw::SwitchRow::builder()
+        .title("Also apply to future messages")
+        .subtitle("Creates a rule for this sender")
+        .build();
+
+    let options = adw::PreferencesGroup::builder().title("Sweep").build();
+    options.add(&all);
+    options.add(&keep_latest);
+    options.add(&older_row);
+    options.add(&target_row);
+    options.add(&standing);
+
+    let cancel = gtk::Button::with_label("Cancel");
+    let sweep = gtk::Button::with_label("Sweep");
+    sweep.add_css_class("destructive-action");
+    let buttons = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).halign(gtk::Align::End).build();
+    buttons.append(&cancel);
+    buttons.append(&sweep);
+
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    root.append(&options);
+    root.append(&buttons);
+    dialog.set_child(Some(&root));
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| dialog.close());
+    }
+
+    {
+        let state = state.clone();
+        let worker = worker.clone();
+        let message_list = message_list.clone();
+        let dialog = dialog.clone();
+        let account = mailbox_account_id(&primary.mailbox);
+        let mailbox = primary.mailbox.clone();
+        let address = sender.address.clone();
+        let older = older.clone();
+        let older_spin = older_spin.clone();
+        let keep_latest = keep_latest.clone();
+        let target_dropdown = target_dropdown.clone();
+        let standing = standing.clone();
+        sweep.connect_clicked(move |_| {
+            let mode = if older.is_active() {
+                SweepMode::Older(older_spin.value() as i64)
+            } else if keep_latest.is_active() {
+                SweepMode::KeepLatest
+            } else {
+                SweepMode::All
+            };
+            let role = if target_dropdown.selected() == 1 { MailboxRole::Archive } else { MailboxRole::Trash };
+            let standing = standing.is_active();
+            dialog.close();
+            run_sweep(&state, &worker, &message_list, account.clone(), mailbox.clone(), address.clone(), mode, role, standing);
+        });
+    }
+    dialog.present();
+}
+
+/// Runs one sweep (item 2.7 / M-16): gathers the sender's messages from the
+/// account's local cache scoped to the open folder, applies the mode, moves the
+/// survivors to `role`, and (optionally) records a standing rule.
+#[allow(clippy::too_many_arguments)]
+fn run_sweep(
+    state: &Rc<RefCell<UiState>>,
+    worker: &Rc<Worker>,
+    message_list: &MessageListModel,
+    account: Option<AccountId>,
+    mailbox: MailboxId,
+    address: String,
+    mode: SweepMode,
+    role: MailboxRole,
+    standing: bool,
+) {
+    if standing {
+        add_sweep_rule(state, &address, role);
+    }
+    let Some(account) = account else { return };
+    let cache = state.borrow().accounts.get(&account).and_then(|handle| handle.address_cache.clone());
+    let Some(cache) = cache else {
+        if let Some(overlay) = &state.borrow().toast_overlay {
+            overlay.add_toast(adw::Toast::new("Sweep needs the local message cache - try again in a moment"));
+        }
+        return;
+    };
+    let query = lookout_mail::parse_search_query(&format!("from:{address}"));
+    let scope = [mailbox];
+    let reply = crate::window::spawn_cache_read(worker, cache, move |cache| cache.search_query(&query, Some(&scope), SWEEP_LIMIT).unwrap_or_default());
+    let state = state.clone();
+    let message_list = message_list.clone();
+    glib::spawn_future_local(async move {
+        let Ok(messages) = reply.recv().await else { return };
+        let selected = sweep_selection(messages, mode);
+        let Some(overlay) = state.borrow().toast_overlay.clone() else { return };
+        if selected.is_empty() {
+            overlay.add_toast(adw::Toast::new("Nothing to sweep"));
+            return;
+        }
+        let count = selected.len();
+        move_messages_to_role(&state, &message_list, &selected, role);
+        overlay.add_toast(adw::Toast::new(&format!("Swept {count} message(s)")));
+    });
+}
+
+/// Adds a standing client rule for a sweep (item 2.7 / M-16): mail from
+/// `address` moves to `role` on arrival.
+fn add_sweep_rule(state: &Rc<RefCell<UiState>>, address: &str, role: MailboxRole) {
+    let mut rule = lookout_core::Rule::new("", format!("Sweep {address}"));
+    rule.backend = lookout_core::RuleBackend::Client;
+    rule.conditions = vec![lookout_core::RuleCondition::From(address.to_string())];
+    rule.actions = vec![lookout_core::RuleAction::Move(lookout_core::RuleTarget::Role(role))];
+    let mut rules = state.borrow().app_config.borrow().rules.clone();
+    rules.push(rule);
+    crate::rules_view::save_rules(state, rules);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sweep_selection, wholly_quoted, SweepMode};
+    use chrono::Utc;
+    use lookout_core::EmailSummary;
+
+    fn msg(uid: u32, days_ago: i64) -> EmailSummary {
+        EmailSummary {
+            inference_classification: Default::default(),
+            uid: lookout_core::Uid(uid),
+            mailbox: lookout_core::MailboxId("acct:INBOX".into()),
+            message_id: None,
+            in_reply_to: None,
+            references: Vec::new(),
+            thread_key: lookout_core::ThreadKey(String::new()),
+            subject: None,
+            from: Vec::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: Utc::now() - chrono::Duration::days(days_ago),
+            flags: Default::default(),
+            keywords: Default::default(),
+            size: 0,
+            has_attachment: false,
+            has_calendar: false,
+            preview: None,
+            mentions: false,
+            importance: Default::default(),
+            sensitivity: Default::default(),
+            list_id: None,
+            structure: None,
+        }
+    }
+
+    #[test]
+    fn sweep_modes_select_the_right_messages() {
+        let messages = vec![msg(1, 30), msg(2, 10), msg(3, 0)];
+        assert_eq!(sweep_selection(messages.clone(), SweepMode::All).len(), 3);
+        let kept = sweep_selection(messages.clone(), SweepMode::KeepLatest);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|m| m.uid.0 != 3), "the newest is kept");
+        let older = sweep_selection(messages, SweepMode::Older(15));
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].uid.0, 1);
+    }
+
+    #[test]
+    fn wholly_quoted_recognises_fully_quoted_and_rejects_real_content() {
+        assert!(wholly_quoted(""));
+        assert!(wholly_quoted("> quoted line\n> another\n"));
+        assert!(wholly_quoted("On Tue, Ada wrote:\n> hello\n"));
+        assert!(wholly_quoted("-----Original Message-----\n> old\n"));
+        // Any unquoted line means the message carries its own content.
+        assert!(!wholly_quoted("Here is my reply\n> quoted\n"));
+        assert!(!wholly_quoted("plain text with no quote marker"));
+        assert!(!wholly_quoted("On the whole, agreed"));
+    }
 }

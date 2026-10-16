@@ -184,6 +184,12 @@ impl UiStateDb {
                 entry TEXT NOT NULL,
                 PRIMARY KEY (account, entry)
             );
+            CREATE TABLE IF NOT EXISTS ignored_threads (
+                account TEXT NOT NULL,
+                thread TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (account, thread)
+            );
             CREATE TABLE IF NOT EXISTS folder_expansion_state (
                 kind TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -299,6 +305,34 @@ impl UiStateDb {
     pub fn remove_blocked_sender(&self, account: &AccountId, entry: &str) -> rusqlite::Result<()> {
         self.conn
             .execute("DELETE FROM blocked_senders WHERE account = ?1 AND entry = ?2", rusqlite::params![account.0, entry])?;
+        Ok(())
+    }
+
+    /// Every ignored conversation for every account (item 2.8 / M-20): the
+    /// `(account, thread key, display label)` triples whose arriving mail is
+    /// moved to Deleted Items. Thread keys are `lookout_core::ThreadKey`
+    /// strings (a root Message-ID, or a `subject:` fallback); the label is the
+    /// conversation's subject, kept for the management dialog.
+    pub fn load_ignored_threads(&self) -> rusqlite::Result<Vec<(AccountId, String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT account, thread, label FROM ignored_threads ORDER BY account, thread")?;
+        let rows = stmt.query_map([], |row| Ok((AccountId(row.get::<_, String>(0)?), row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+        rows.collect()
+    }
+
+    /// Remembers an ignored conversation for `account`, with `label` shown in
+    /// the management dialog. Idempotent.
+    pub fn set_ignored_thread(&self, account: &AccountId, thread: &str, label: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ignored_threads (account, thread, label) VALUES (?1, ?2, ?3)",
+            rusqlite::params![account.0, thread, label],
+        )?;
+        Ok(())
+    }
+
+    /// Stops ignoring one conversation. A missing row is not an error.
+    pub fn remove_ignored_thread(&self, account: &AccountId, thread: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM ignored_threads WHERE account = ?1 AND thread = ?2", rusqlite::params![account.0, thread])?;
         Ok(())
     }
 
@@ -581,6 +615,29 @@ mod tests {
         assert_eq!(loaded[&total].count_mode, FolderCountMode::Total);
         db.set_folder_prefs(&HashMap::new()).unwrap();
         assert!(db.load_folder_prefs().unwrap().is_empty(), "replace semantics");
+    }
+
+    #[test]
+    fn ignored_threads_round_trip() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("ignored-threads");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_ignored_threads().unwrap().is_empty());
+        let account = AccountId("acc".into());
+        db.set_ignored_thread(&account, "root@x", "Project kickoff").unwrap();
+        // Re-ignoring the same thread replaces its label (idempotent).
+        db.set_ignored_thread(&account, "root@x", "Project kickoff v2").unwrap();
+        db.set_ignored_thread(&account, "other@y", "Other thread").unwrap();
+
+        let loaded = UiStateDb::open().unwrap().load_ignored_threads().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains(&(account.clone(), "root@x".into(), "Project kickoff v2".into())));
+
+        db.remove_ignored_thread(&account, "root@x").unwrap();
+        assert_eq!(UiStateDb::open().unwrap().load_ignored_threads().unwrap().len(), 1);
     }
 
     #[test]

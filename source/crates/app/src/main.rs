@@ -41,6 +41,7 @@ mod graph_rules;
 #[cfg(test)]
 mod gtk_test;
 mod identities;
+mod ignored_conversations;
 mod invite_conflicts;
 mod last_view;
 mod launcher_entry;
@@ -65,6 +66,7 @@ mod resources;
 mod rules;
 mod rules_view;
 mod schedule_grid;
+mod search_folders;
 mod settings;
 mod shared_mailbox;
 mod shortcuts;

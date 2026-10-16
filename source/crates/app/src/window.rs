@@ -388,6 +388,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     label.set_css_classes(&["heading", "folder-row-label"]);
                     set_count(account.unread);
                 }
+                TreeItem::SearchFolders => {
+                    icon.set_visible(true);
+                    icon.set_icon_name(Some(themed_icon_name(&["edit-find-symbolic", "system-search-symbolic"])));
+                    label.set_label("Search Folders");
+                    label.set_css_classes(&["heading", "folder-row-label"]);
+                    set_count(0);
+                }
+                TreeItem::SearchFolder(folder) => {
+                    icon.set_visible(true);
+                    icon.set_icon_name(Some(themed_icon_name(&["edit-find-symbolic", "system-search-symbolic"])));
+                    label.set_label(&folder.name);
+                    label.set_css_classes(&["folder-row-label"]);
+                    set_count(0);
+                }
                 // A favorite renders exactly like the folder it duplicates.
                 TreeItem::Folder(node) | TreeItem::Favorite(node) => {
                     icon.set_visible(true);
@@ -523,6 +537,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // message menu's Block sender / Block domain. Enforced by the client rule
     // path on arrival; the load-policy's safe list reuses `trusted_senders`.
     let blocked_senders: HashSet<(AccountId, String)> = ui_db.as_ref().and_then(|db| db.load_blocked_senders().ok()).into_iter().flatten().collect();
+    // Ignored conversations (item 2.8 / M-20): thread keys entered from the
+    // message menu's Ignore; new mail in one is moved to Deleted on arrival.
+    let ignored_threads: HashSet<(AccountId, String)> = ui_db
+        .as_ref()
+        .and_then(|db| db.load_ignored_threads().ok())
+        .into_iter()
+        .flatten()
+        .map(|(account, thread, _label)| (account, thread))
+        .collect();
     // The folder pane's expansion memory: which subfolders the user left
     // expanded and which account groups collapsed. Loaded from the same
     // UI-state database so the first `rebuild_folder_tree` of a fresh session
@@ -633,6 +656,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rich_text_default: settings.get_bool(crate::settings::MAIL_RICH_TEXT_DEFAULT),
         trusted_senders,
         blocked_senders,
+        ignored_threads,
+        folder_tree_refresh: None,
         rendered_trust_sender: None,
         rendered_from_mismatch: None,
         rendered_link_warnings: Vec::new(),
@@ -676,6 +701,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let _ = std::fs::remove_file(&path);
         }
     });
+    // A repaint hook for the folder pane, so a config change that alters it (a
+    // saved search, item 2.4 / M-19) can rebuild the tree at once rather than
+    // waiting for the next `FoldersUpdated`.
+    state.borrow_mut().folder_tree_refresh = Some(Rc::new({
+        let state = state.clone();
+        let folder_selection = folder_selection.clone();
+        let folder_scroller = folder_scroller.clone();
+        move || rebuild_folder_tree(&state, &folder_selection, &folder_scroller)
+    }));
     let reading_stack = gtk::Stack::new();
     let state_clone = state.clone();
     let state_clone2 = state.clone();
@@ -3353,6 +3387,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         report_menu.append(Some("Not junk"), Some("report.not-junk"));
         report_button.set_menu_model(Some(&report_menu));
     }
+    let sweep_button = gtk::Button::from_icon_name("edit-clear-all-symbolic");
+    sweep_button.set_tooltip_text(Some("Sweep"));
+    {
+        let state = state.clone();
+        let worker = worker.clone();
+        let message_list = message_list.clone();
+        sweep_button.connect_clicked(move |button| {
+            let selected = message_list.selected_summaries();
+            let Some(primary) = selected.first().cloned() else {
+                if let Some(overlay) = &state.borrow().toast_overlay {
+                    overlay.add_toast(adw::Toast::new("Select a message to sweep"));
+                }
+                return;
+            };
+            show_sweep_dialog(button.upcast_ref::<gtk::Widget>(), state.clone(), worker.clone(), message_list.clone(), primary);
+        });
+    }
     let pin_button = gtk::Button::from_icon_name(pin_icon_name(false));
     pin_button.set_tooltip_text(Some("Pin/Unpin"));
     refresh_pin_button(&pin_button, &message_list);
@@ -3436,6 +3487,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_toolbar.append(&delete_button);
     command_toolbar.append(&archive_button);
     command_toolbar.append(&report_button);
+    command_toolbar.append(&sweep_button);
     command_toolbar.append(&pin_button);
     command_toolbar.append(&flag_button);
     command_toolbar.append(&mark_read_button);
@@ -6338,6 +6390,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → Junk email → "Ignored conversations…": opens the manage
+    // dialog for ignored conversations (item 2.8 / M-20). New mail in an
+    // ignored conversation is moved to Deleted on arrival by
+    // `rules::enforce_ignored_threads`.
+    {
+        let state = state.clone();
+        let row = config_view.ignored_conversations_row.clone();
+        row.clone().connect_activated(move |_| {
+            crate::ignored_conversations::show_manage_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
+        });
+    }
+
+    // Config → Mail → "Search Folders…": manages the saved searches shown as
+    // virtual folders in the folder pane (item 2.4 / M-19).
+    {
+        let state = state.clone();
+        let row = config_view.search_folders_row.clone();
+        row.clone().connect_activated(move |_| {
+            crate::search_folders::show_manage_dialog(row.upcast_ref::<gtk::Widget>(), state.clone());
+        });
+    }
+
     // Config → Mail → "Categories…": opens the shared category master-list
     // editor (item 2.1 / M-09, CAL-07, T-08). The same editor is reachable
     // from the Categorize menu's "Manage categories…" row.
@@ -8982,7 +9056,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     select_mailbox(&state, &worker, &message_list, &message_list_stack, account_id, mailbox_id);
                     refresh_list_header(&state, &list_header);
                 }
-                TreeItem::Account(_) | TreeItem::Favorites => {}
+                TreeItem::Account(_) | TreeItem::Favorites | TreeItem::SearchFolders => {}
+                TreeItem::SearchFolder(folder) => {
+                    let query = folder.query.clone();
+                    drop(tree_item);
+                    // A saved search runs across every mailbox (item 2.4 /
+                    // M-19), the way Outlook's search folders do.
+                    state.borrow_mut().search_scope = lookout_mail::SearchScope::All;
+                    start_search(&state, &worker, &message_list, &list_header, &query);
+                }
             }
         });
     }

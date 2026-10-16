@@ -75,6 +75,21 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.227" date="2026-10-16">
+      <description>
+        <p>Outlook's mail-organising layer lands: <em>Sweep</em> (bulk delete or move everything from a sender, keeping the latest or older-than-N-days, with an optional rule), <em>Search Folders</em> (saved searches shown as virtual folders), and <em>Ignore</em> / <em>Clean up conversation</em>.</p>
+      </description>
+    </release>
+    <release version="0.9.226" date="2026-10-16">
+      <description>
+        <p>Shared mailboxes on Microsoft 365: add one by address from Config and it connects alongside the parent account, borrowing its Outlook access.</p>
+      </description>
+    </release>
+    <release version="0.9.225" date="2026-10-16">
+      <description>
+        <p>Microsoft 365 calendars can be shared: open another user's calendar from Add calendar, and manage who can see yours with the new Share dialog.</p>
+      </description>
+    </release>
     <release version="0.9.224" date="2026-10-16">
       <description>
         <p>Scheduled sends on Microsoft 365 are now handled by Exchange: a message scheduled to send later is delivered even when Lookout is closed.</p>

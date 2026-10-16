@@ -33,6 +33,37 @@ pub const SHARED_MAILBOX_ID_PREFIX: &str = "shared:";
 /// mailbox (item 5.6 / CAL-25).
 pub const SHARED_CALENDAR_ID_PREFIX: &str = "sharedcal:";
 
+/// A saved search shown as a virtual folder in the folder pane (item 2.4 /
+/// M-19): a display name and a query in the search language
+/// (`mail/src/search_query.rs`: `from:`, `is:unread`, `category:`, …).
+/// Stored in `settings.json` beside the rules and Quick Steps; the shipped
+/// defaults are seeded once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFolder {
+    pub id: String,
+    pub name: String,
+    pub query: String,
+}
+
+/// The shipped saved searches (item 2.4 / M-19), seeded once like the Quick
+/// Steps. "From VIPs" is intentionally not a default: it needs the starred
+/// contacts, so it stays a query the user can write.
+pub fn default_search_folders() -> Vec<SearchFolder> {
+    [
+        ("search:unread", "Unread mail", "is:unread"),
+        ("search:flagged", "Flagged", "is:flagged"),
+        ("search:large", "Large mail", "size:>5MB"),
+        ("search:attachments", "Has attachments", "has:attachment"),
+    ]
+    .into_iter()
+    .map(|(id, name, query)| SearchFolder {
+        id: id.to_string(),
+        name: name.to_string(),
+        query: query.to_string(),
+    })
+    .collect()
+}
+
 /// A user override of a mailbox's special-use role (e.g. "this folder is my
 /// Archive"), winning over the server's `LIST (SPECIAL-USE)` attributes and
 /// the name-heuristic fallback.
@@ -194,6 +225,15 @@ pub struct AppConfig {
     /// "empty means seed" guard would resurrect them on the next launch).
     #[serde(default)]
     pub quick_steps_seeded: bool,
+    /// The user's saved searches (item 2.4 / M-19), shown as virtual folders
+    /// in the folder pane. Structured config, so they live in `settings.json`
+    /// beside the rules and Quick Steps; the shipped defaults are seeded once.
+    #[serde(default)]
+    pub search_folders: Vec<SearchFolder>,
+    /// Whether the shipped saved searches have been seeded once (same guard as
+    /// `quick_steps_seeded`, so deleting them all stays deleted).
+    #[serde(default)]
+    pub search_folders_seeded: bool,
 }
 
 impl AppConfig {
@@ -387,6 +427,13 @@ pub fn load() -> AppConfig {
         config.quick_steps_seeded = true;
         save(&config);
     }
+    // One-time seed of the shipped saved searches (item 2.4 / M-19), same
+    // guard so an intentionally emptied list stays empty.
+    if !config.search_folders_seeded {
+        config.search_folders = default_search_folders();
+        config.search_folders_seeded = true;
+        save(&config);
+    }
     config
 }
 
@@ -493,6 +540,8 @@ mod tests {
             automatic_replies: Vec::new(),
             quick_steps: Vec::new(),
             quick_steps_seeded: false,
+            search_folders: Vec::new(),
+            search_folders_seeded: false,
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -528,6 +577,8 @@ mod tests {
             automatic_replies: Vec::new(),
             quick_steps: Vec::new(),
             quick_steps_seeded: false,
+            search_folders: Vec::new(),
+            search_folders_seeded: false,
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -539,6 +590,25 @@ mod tests {
 
         // Other accounts' identities are never mixed in.
         assert!(config.identities_for(&other).iter().all(|i| i.email == "other@example.com"));
+    }
+
+    #[test]
+    fn default_search_folders_are_unique_and_parse() {
+        let folders = default_search_folders();
+        assert!(!folders.is_empty());
+        let mut ids: Vec<&str> = folders.iter().map(|f| f.id.as_str()).collect();
+        ids.sort_unstable();
+        let unique = {
+            let mut seen = ids.clone();
+            seen.dedup();
+            seen
+        };
+        assert_eq!(unique.len(), folders.len(), "ids are unique");
+        for folder in &folders {
+            // Every shipped query parses in the search language.
+            let _ = lookout_mail::parse_search_query(&folder.query);
+            assert!(!folder.name.trim().is_empty() && !folder.query.trim().is_empty());
+        }
     }
 
     #[test]

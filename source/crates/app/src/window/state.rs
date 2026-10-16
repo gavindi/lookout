@@ -1480,6 +1480,17 @@ pub(crate) struct UiState {
     /// Block ▸. Persisted in the UI-state database (`ui_state_db`), like
     /// `trusted_senders`. The safe list is `trusted_senders` (S-01).
     pub(crate) blocked_senders: HashSet<(AccountId, String)>,
+    /// Ignored conversations (item 2.8 / M-20), keyed by the receiving account
+    /// and the message's `ThreadKey` string. New mail in an ignored thread is
+    /// moved to Deleted Items on arrival; entered from the message menu's
+    /// Ignore. Persisted in the UI-state database (`ui_state_db`), like
+    /// `blocked_senders`.
+    pub(crate) ignored_threads: HashSet<(AccountId, String)>,
+    /// Rebuilds the folder pane from current state; registered by the window
+    /// once the tree exists, so a config change that alters it (adding or
+    /// removing a saved search, item 2.4 / M-19) can repaint the pane at once
+    /// rather than waiting for the next `FoldersUpdated`. `None` until then.
+    pub(crate) folder_tree_refresh: Option<Rc<dyn Fn()>>,
     /// The `(account, normalized sender address)` of the message currently on
     /// the reading pane, re-stashed by `render_body` from the rendered
     /// summary's From address. The load-policy handler resolves this against

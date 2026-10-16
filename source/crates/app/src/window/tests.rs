@@ -817,6 +817,8 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         rich_text_default: true,
         trusted_senders: HashMap::new(),
         blocked_senders: HashSet::new(),
+        ignored_threads: HashSet::new(),
+        folder_tree_refresh: None,
         rendered_trust_sender: None,
         rendered_from_mismatch: None,
         rendered_link_warnings: Vec::new(),
@@ -1354,6 +1356,7 @@ fn folder_tree_rebuild_preserves_collapse_state_and_scroll() {
                 (acc_b.clone(), "B".into(), vec![test_mailbox(&acc_b, "INBOX", 0)]),
             ],
             vec![test_mailbox(&acc_a, "INBOX", 3)],
+            Vec::new(),
         )
     };
     let model = build();
@@ -1384,6 +1387,7 @@ fn folder_tree_rebuild_preserves_collapse_state_and_scroll() {
     let waiting = build_multi_account_tree_model(
         vec![(acc_a.clone(), "A".into(), vec![test_mailbox(&acc_a, "INBOX", 3)]), (acc_b.clone(), "B".into(), Vec::new())],
         vec![],
+        Vec::new(),
     );
     apply_account_group_expansion(&waiting, &HashSet::new());
     let b_row = account_row(&waiting, &acc_b);
@@ -1401,6 +1405,7 @@ fn folder_tree_rebuild_preserves_collapse_state_and_scroll() {
             (acc_b.clone(), "B".into(), vec![test_mailbox(&acc_b, "INBOX", 1)]),
         ],
         vec![],
+        Vec::new(),
     );
     apply_account_group_expansion(&connected, &collapsed);
     let b_row = account_row(&connected, &acc_b);
@@ -1629,7 +1634,7 @@ fn shutdown_signal_fires_with_tree_still_alive() {
     }
     let app = adw::Application::builder().application_id("org.example.lookout-shutdown-order-test").build();
     let win = gtk::ApplicationWindow::new(&app);
-    let model = build_multi_account_tree_model(Vec::new(), Vec::new());
+    let model = build_multi_account_tree_model(Vec::new(), Vec::new(), Vec::new());
     let selection = gtk::SingleSelection::new(Some(model));
     let seen: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
     let seen2 = seen.clone();
