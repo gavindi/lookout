@@ -55,6 +55,11 @@ secret-service = { version = "5.1", default-features = false, features = ["rt-to
 # on the same zbus 5 stack the rest of the app's D-Bus code uses.
 ksni = "0.3"
 
+[dev-dependencies]
+# HTTP-level tests for the Graph directory provider (item 4.7.3), the same
+# fake-Graph-server approach `lookout-graph`'s own transport tests use.
+wiremock = "0.6"
+
 [package.metadata.deb]
 name = "lookout"
 maintainer = "Gavin Graham <gavindi@users.noreply.github.com>"

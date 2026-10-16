@@ -36,6 +36,7 @@ mod google_tasks;
 mod graph_automatic_replies;
 mod graph_calendar_share;
 mod graph_categories;
+mod graph_directory;
 mod graph_mail;
 mod graph_pin;
 mod graph_rules;

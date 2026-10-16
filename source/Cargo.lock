@@ -2165,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-app"
-version = "0.9.229"
+version = "0.9.230"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
@@ -2194,13 +2194,14 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webkit6",
+ "wiremock",
  "zbus",
  "zip",
 ]
 
 [[package]]
 name = "lookout-core"
-version = "0.9.229"
+version = "0.9.230"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2212,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-dav"
-version = "0.9.229"
+version = "0.9.230"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -2236,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-goa"
-version = "0.9.229"
+version = "0.9.230"
 dependencies = [
  "anyhow",
  "lookout-core",
@@ -2248,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-graph"
-version = "0.9.229"
+version = "0.9.230"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
@@ -2266,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "lookout-mail"
-version = "0.9.229"
+version = "0.9.230"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",

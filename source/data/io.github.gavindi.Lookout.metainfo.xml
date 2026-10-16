@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.230" date="2026-10-16">
+      <description>
+        <p>Directory lookup continues: Microsoft 365 company-directory search is wired to the shared source (opt-in per account, gated on Outlook consent), and LDAP directories can now be configured in settings.</p>
+      </description>
+    </release>
     <release version="0.9.229" date="2026-10-16">
       <description>
         <p>The first half of directory lookup: contact suggestions can now merge entries from a company directory, and a new debounced, cached source is ready to search Microsoft 365 and LDAP without slowing typing down.</p>

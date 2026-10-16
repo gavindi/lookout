@@ -34,6 +34,14 @@ use crate::worker::Worker;
 
 const PROTOCOL_IMAP: &str = "imap";
 const PROTOCOL_SMTP: &str = "smtp";
+/// The keyring slot for an LDAP directory's bind password (items 4.7.4-4.7.5 /
+/// P-11). Unlike the mail slots, its item is keyed by the `LdapDirectory.id`
+/// (e.g. `ldap:<uuid>`) through the same `KeyringStore` API - the "account"
+/// attribute is just the id string - and `delete_account` drops it when the
+/// directory is removed. Unused until the LDAP backend (4.7.5) and its
+/// Settings UI (4.7.9) consume it.
+#[allow(dead_code)]
+pub(crate) const PROTOCOL_LDAP: &str = "ldap";
 
 /// The keyring item attribute identifying Lookout's own items, so the
 /// passwords show up under a recognizable application name in Seahorse and
@@ -653,5 +661,25 @@ mod tests {
         assert!(keyring_error(secret_service::Error::Unavailable).contains("keyring"));
         assert!(keyring_error(secret_service::Error::NoResult).contains("collection"));
         assert!(!keyring_error(secret_service::Error::Locked).is_empty());
+    }
+
+    #[test]
+    fn ldap_bind_password_uses_its_own_slot_keyed_by_the_directory_id() {
+        use crate::app_config::LDAP_DIRECTORY_ID_PREFIX;
+
+        let keyring = Arc::new(FakeKeyring::default());
+        let directory_id = AccountId(format!("{LDAP_DIRECTORY_ID_PREFIX}1234"));
+        block_on(keyring.store_password(&directory_id, PROTOCOL_LDAP, "bind-secret")).unwrap();
+
+        block_on(async {
+            assert_eq!(keyring.load_password(&directory_id, PROTOCOL_LDAP).await.unwrap(), "bind-secret");
+            // The slot is independent of the mail protocols a same-named
+            // account would use.
+            assert!(keyring.load_password(&directory_id, PROTOCOL_IMAP).await.is_err());
+            // Removing the directory drops the bind password with the same
+            // call the other-account removal uses.
+            keyring.delete_account(&directory_id).await.unwrap();
+            assert!(keyring.load_password(&directory_id, PROTOCOL_LDAP).await.is_err());
+        });
     }
 }

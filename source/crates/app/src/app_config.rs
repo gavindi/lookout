@@ -32,6 +32,12 @@ pub const SHARED_MAILBOX_ID_PREFIX: &str = "shared:";
 /// The id prefix for shared/delegated calendars opened from another user's
 /// mailbox (item 5.6 / CAL-25).
 pub const SHARED_CALENDAR_ID_PREFIX: &str = "sharedcal:";
+/// The id prefix for configured LDAP directories (items 4.7.4-4.7.5 / P-11).
+/// The id doubles as the keyring slot's account attribute
+/// (`other_accounts::PROTOCOL_LDAP`). Unused until the add/edit dialog lands
+/// in 4.7.9.
+#[allow(dead_code)]
+pub const LDAP_DIRECTORY_ID_PREFIX: &str = "ldap:";
 
 /// A saved search shown as a virtual folder in the folder pane (item 2.4 /
 /// M-19): a display name and a query in the search language
@@ -185,6 +191,47 @@ pub struct AccountAutomaticReplies {
     pub settings: lookout_core::AutomaticReplies,
 }
 
+/// One LDAP directory a mail account can search for recipients (OUTLOOK_PARITY.md
+/// items 4.7.4-4.7.5 / P-11). Structured config, so it lives in `settings.json`
+/// (cross-cutting rule §10); the bind password lives in the GNOME keyring under
+/// `other_accounts::PROTOCOL_LDAP`, keyed by this entry's `id`, never here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LdapDirectory {
+    /// Stable `ldap:<uuid>` id ([`LDAP_DIRECTORY_ID_PREFIX`]). Also the keyring
+    /// slot's account attribute.
+    pub id: String,
+    /// The mail account whose composer and attendee searches this directory
+    /// serves.
+    pub account_id: AccountId,
+    /// Name shown in the directory-management UI (Settings → People).
+    pub display_name: String,
+    pub host: String,
+    pub port: u16,
+    /// Whether to encrypt the connection (implicit TLS on an LDAPS port,
+    /// StartTLS otherwise - the 4.7.5 backend settles the exact form).
+    pub tls: bool,
+    /// The DN the search binds as; empty means an anonymous bind (where the
+    /// server allows it).
+    pub bind_dn: String,
+    /// The search base DN (`dc=example,dc=com`).
+    pub base_dn: String,
+    /// An extra filter ANDed with the name/address match; empty means the
+    /// backend's built-in person filter.
+    #[serde(default)]
+    pub filter: String,
+    /// The attribute holding an entry's address; empty means `mail`.
+    #[serde(default)]
+    pub mail_attr: String,
+    /// The attribute holding an entry's display name; empty means
+    /// `displayName`.
+    #[serde(default)]
+    pub name_attr: String,
+    /// Whether the directory is searched. A hand-written entry without the key
+    /// stays off until explicitly enabled.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// The whole file's contents. All fields are additive: an older build's file
 /// (or a `{}` hand-edited file) deserializes into defaults for the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -259,6 +306,19 @@ pub struct AppConfig {
     /// absent, so an empty list is a valid, fully-working state.
     #[serde(default)]
     pub local_task_lists: Vec<LocalTaskList>,
+    /// The Microsoft 365 accounts whose company directory (GAL) may be searched
+    /// from recipient autocomplete, the address-book picker and People
+    /// (item 4.7.3 / P-11). A per-account opt-in separate from the "Sync with
+    /// Outlook" Graph consent, because the directory scopes
+    /// (`User.ReadBasic.All`, `People.Read`) sit outside it; the Settings →
+    /// People switch is item 4.7.9.
+    #[serde(default)]
+    pub directory_accounts: Vec<AccountId>,
+    /// The configured LDAP directories (items 4.7.4-4.7.5 / P-11). Bind
+    /// passwords live in the keyring under `other_accounts::PROTOCOL_LDAP`,
+    /// never here.
+    #[serde(default)]
+    pub ldap_directories: Vec<LdapDirectory>,
 }
 
 impl AppConfig {
@@ -453,6 +513,44 @@ impl AppConfig {
         }
         self.local_task_lists.retain(|l| l.id != id);
     }
+
+    /// Whether `account_id` has opted in to company-directory (GAL) search in
+    /// recipient/attendee autocomplete and People (item 4.7.3). This is just the
+    /// stored opt-in - callers also check the account's Graph consent
+    /// (`MicrosoftOAuth::graph_consented`).
+    pub fn directory_enabled_for(&self, account_id: &AccountId) -> bool {
+        self.directory_accounts.contains(account_id)
+    }
+
+    /// Records (or clears) `account_id`'s company-directory opt-in. The
+    /// Settings → People switch that calls this is item 4.7.9.
+    #[allow(dead_code)]
+    pub fn set_directory_enabled(&mut self, account_id: &AccountId, enabled: bool) {
+        self.directory_accounts.retain(|id| id != account_id);
+        if enabled {
+            self.directory_accounts.push(account_id.clone());
+        }
+    }
+
+    /// Inserts `directory`, replacing any existing entry with the same id (the
+    /// edit path) or appending it (the add path). The dialog that calls this is
+    /// item 4.7.9.
+    #[allow(dead_code)]
+    pub fn upsert_ldap_directory(&mut self, directory: LdapDirectory) {
+        if let Some(existing) = self.ldap_directories.iter_mut().find(|d| d.id == directory.id) {
+            *existing = directory;
+        } else {
+            self.ldap_directories.push(directory);
+        }
+    }
+
+    /// Removes the LDAP directory with `id`, if any. The caller drops its
+    /// keyring password separately (`KeyringStore::delete_account`); the
+    /// dialog that calls this is item 4.7.9.
+    #[allow(dead_code)]
+    pub fn remove_ldap_directory(&mut self, id: &str) {
+        self.ldap_directories.retain(|d| d.id != id);
+    }
 }
 
 pub(crate) fn config_dir() -> PathBuf {
@@ -608,6 +706,21 @@ mod tests {
                 id: "work".into(),
                 name: "Work".into(),
             }],
+            directory_accounts: vec![AccountId("account_1".into())],
+            ldap_directories: vec![LdapDirectory {
+                id: format!("{LDAP_DIRECTORY_ID_PREFIX}abc"),
+                account_id: AccountId("account_1".into()),
+                display_name: "Company directory".into(),
+                host: "ldap.example.com".into(),
+                port: 636,
+                tls: true,
+                bind_dn: "uid=lookout,ou=services,dc=example,dc=com".into(),
+                base_dn: "dc=example,dc=com".into(),
+                filter: "(objectClass=person)".into(),
+                mail_attr: "mail".into(),
+                name_attr: "displayName".into(),
+                enabled: true,
+            }],
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -646,6 +759,8 @@ mod tests {
             search_folders: Vec::new(),
             search_folders_seeded: false,
             local_task_lists: Vec::new(),
+            directory_accounts: Vec::new(),
+            ldap_directories: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -1035,6 +1150,106 @@ mod tests {
 
         save_at(&path, &config);
         assert_eq!(load_at(&path).local_task_lists, config.local_task_lists);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_accounts_opt_in_toggles_and_tolerates_old_files() {
+        let dir = std::env::temp_dir().join(format!("lookout-directory-accounts-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `directory_accounts` (no such key) loads as an
+        // empty list rather than failing.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        let mut config = load_at(&path);
+        let account = AccountId("account_1".into());
+        assert!(!config.directory_enabled_for(&account));
+
+        config.set_directory_enabled(&account, true);
+        assert!(config.directory_enabled_for(&account));
+        // Enabling twice replaces rather than duplicating.
+        config.set_directory_enabled(&account, true);
+        assert_eq!(config.directory_accounts, vec![account.clone()]);
+
+        config.set_directory_enabled(&account, false);
+        assert!(!config.directory_enabled_for(&account));
+        assert!(config.directory_accounts.is_empty());
+
+        // An enabled opt-in round-trips.
+        config.set_directory_enabled(&account, true);
+        save_at(&path, &config);
+        assert!(load_at(&path).directory_enabled_for(&account));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ldap_directories_round_trip_upsert_remove_and_tolerance() {
+        let dir = std::env::temp_dir().join(format!("lookout-ldap-directories-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `ldap_directories` (no such key) loads as an empty
+        // list rather than failing.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        assert!(load_at(&path).ldap_directories.is_empty());
+
+        let mut directory = LdapDirectory {
+            id: format!("{LDAP_DIRECTORY_ID_PREFIX}1234"),
+            account_id: AccountId("account_1".into()),
+            display_name: "Company directory".into(),
+            host: "ldap.example.com".into(),
+            port: 636,
+            tls: true,
+            bind_dn: "uid=lookout,ou=services,dc=example,dc=com".into(),
+            base_dn: "dc=example,dc=com".into(),
+            filter: "(objectClass=person)".into(),
+            mail_attr: "mail".into(),
+            name_attr: "displayName".into(),
+            enabled: true,
+        };
+        let mut config = AppConfig::default();
+        config.upsert_ldap_directory(directory.clone());
+        assert_eq!(config.ldap_directories, vec![directory.clone()]);
+
+        // Upsert replaces in place rather than appending a duplicate.
+        directory.display_name = "Company LDAP".into();
+        config.upsert_ldap_directory(directory.clone());
+        assert_eq!(config.ldap_directories.len(), 1);
+        assert_eq!(config.ldap_directories[0].display_name, "Company LDAP");
+
+        save_at(&path, &config);
+        assert_eq!(load_at(&path).ldap_directories, vec![directory.clone()]);
+
+        // A file written before the key existed parses (every other field
+        // present) and yields an empty list.
+        std::fs::write(
+            &path,
+            r#"{"identities": [], "signatures": [], "signature_defaults": {}, "folder_role_overrides": [], "webcal_subscriptions": [], "other_accounts": []}"#,
+        )
+        .unwrap();
+        let loaded = load_at(&path);
+        assert!(loaded.ldap_directories.is_empty());
+        assert!(loaded.directory_accounts.is_empty());
+
+        // A hand-written entry may omit the optional keys: the directory then
+        // deserializes with empty attributes and off until explicitly enabled.
+        let hand_written: LdapDirectory = serde_json::from_str(
+            r#"{"id": "ldap:x", "account_id": "account_1", "display_name": "Hand-written", "host": "ldap.example.com", "port": 389, "tls": false, "bind_dn": "", "base_dn": "dc=example,dc=com"}"#,
+        )
+        .unwrap();
+        assert!(!hand_written.enabled);
+        assert!(hand_written.filter.is_empty());
+        assert!(hand_written.mail_attr.is_empty());
+        assert!(hand_written.name_attr.is_empty());
+
+        // Removal drops only the named entry; an unknown id is a no-op.
+        config.remove_ldap_directory(&directory.id);
+        assert!(config.ldap_directories.is_empty());
+        config.remove_ldap_directory("ldap:nope");
+        assert!(config.ldap_directories.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
