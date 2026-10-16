@@ -288,6 +288,19 @@ async fn connect_and_run(
                         let _ = events.send(CalendarSessionEvent::Error("couldn't rename the list: it no longer exists".to_string())).await;
                     }
                 },
+                // Colour write-back (item 3.13 / CAL-32). The extension
+                // property is optional, so a non-2xx is expected on servers
+                // that don't implement it: the app has already applied the
+                // colour locally, so this stays silent rather than toasting
+                // every rejected pick (§10), and the calendar's own colour
+                // (when a server advertises one) is unchanged.
+                CalendarCommand::SetCalendarColor { calendar_id, color } => {
+                    if let Some(href) = calendar_href_for(&calendars, &calendar_id) {
+                        if let Err(e) = client.set_calendar_color(&href, &color, &credential).await {
+                            tracing::debug!("calendar colour for {calendar_id:?} kept on this device: {e}");
+                        }
+                    }
+                }
                 CalendarCommand::DeleteCalendar { calendar_id } => match calendar_href_for(&calendars, &calendar_id) {
                     Some(href) => match client.delete_calendar(&href, &credential).await {
                         Ok(()) => calendars = relist_calendars(&client, &home_set_href, config, &credential, events).await?,

@@ -5371,6 +5371,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         scheduling_next_id: 0,
         pending_open_editor: None,
         open_event_editor: None,
+        calendar_groups: state.borrow().app_config.borrow().calendar_groups.clone(),
+        hidden_calendars: state.borrow().app_config.borrow().hidden_calendars.clone(),
+        calendar_sidebar_action: None,
     }));
     // The calendar handle `render_body` reaches for when an incoming iMIP
     // REPLY arrives (item 3.6): stored on `UiState` so the reply can be
@@ -10103,6 +10106,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             );
         });
     }
+
+    // --- Calendar sidebar row/group actions (item 3.13 / CAL-32, CAL-33):
+    // the per-calendar ⋯ menu (Change colour, Rename, Share, Remove, Move to
+    // group) and the group header/footer actions (New/Rename/Delete group,
+    // Show all). Registered on `calendar_state` (the late-binding hook
+    // pattern) so every checklist rebuild can reach it.
+    calendar_glue::install_calendar_sidebar_actions(
+        &window,
+        &state,
+        &calendar_state,
+        &calendar_main,
+        &calendar_sidebar.calendar_list_box,
+        &calendar_sidebar.mini_calendar,
+        &mail_overview_day,
+        &mail_overview_day_list,
+        &tasks_view,
+        &toast_overlay,
+    );
 
     // --- Calendar Home ribbon "Share" -> the calendar-sharing dialog for the
     // user's Microsoft 365 calendar (item 5.6 / CAL-24).

@@ -71,6 +71,18 @@ impl CalendarClient {
         Ok(items.iter().filter_map(|value| calendar_from_graph(value, account_id, owner)).collect())
     }
 
+    /// Renames `calendar` (the row menu's Rename action, item 3.13): a `PATCH`
+    /// of the calendar's `name` at `/me/calendars/{id}` (or
+    /// `/users/{owner}/calendars/{id}` for a shared/delegated calendar, taken
+    /// from `CalendarInfo::owner`). Graph's calendar `hexColor` is read-only,
+    /// so a colour pick on Microsoft 365 stays on the device - see
+    /// [`lookout_core::calendar_protocol::CalendarCommand::SetCalendarColor`].
+    pub async fn rename_calendar(&self, calendar: &CalendarInfo, name: &str) -> Result<()> {
+        let path = format!("{}/{}", self.calendars_root(calendar.owner.as_deref()), encode_segment(&calendar.href));
+        self.graph.patch(&path, &serde_json::json!({ "name": name })).await?;
+        Ok(())
+    }
+
     /// The expanded occurrences of `calendar` over `[start, end)`
     /// (`/me/calendars/{id}/calendarView`). Graph already expands recurrences
     /// for this endpoint, so the result is render-ready.
@@ -728,6 +740,21 @@ mod tests {
         let permission = client(&server).create_permission(&calendar(), "ada@example.com", CalendarRole::Write, true).await.unwrap();
         assert_eq!(permission.id.as_deref(), Some("perm2"));
         assert_eq!(permission.role, CalendarRole::Write);
+    }
+
+    /// Item 3.13: the row menu's Rename PATCHes the calendar's `name` at
+    /// `/me/calendars/{id}`.
+    #[tokio::test]
+    async fn rename_calendar_patches_the_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1.0/me/calendars/cal1"))
+            .and(body_partial_json(json!({ "name": "Renamed" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "cal1", "name": "Renamed" })))
+            .mount(&server)
+            .await;
+
+        client(&server).rename_calendar(&calendar(), "Renamed").await.unwrap();
     }
 
     #[tokio::test]

@@ -494,6 +494,26 @@ pub fn build_proppatch_displayname_body(display_name: &str) -> String {
     )
 }
 
+/// Builds an RFC 4918 PROPPATCH body setting a calendar collection's colour
+/// (item 3.13 / CAL-32): the CalDAV `calendar-color` extension property
+/// (RFC 7986 §5.9), which lives in the Apple namespace. `color` is expected to
+/// be a `#rrggbb` hex string (the caller normalises it); servers that don't
+/// implement the extension answer non-2xx, which the caller treats as a
+/// soft failure and keeps the colour locally (§10).
+pub fn build_proppatch_calendar_color_body(color: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n\
+         <D:propertyupdate xmlns:D=\"DAV:\" xmlns:IC=\"http://apple.com/ns/ical/\">\n\
+         \x20 <D:set>\n\
+         \x20   <D:prop>\n\
+         \x20     <IC:calendar-color>{}</IC:calendar-color>\n\
+         \x20   </D:prop>\n\
+         \x20 </D:set>\n\
+         </D:propertyupdate>",
+        escape_text(color),
+    )
+}
+
 /// Minimal XML text-content escaping for values interpolated into a request
 /// body (hrefs, sync tokens) - CardDAV hrefs are normally already
 /// percent-encoded and safe, but this is cheap insurance against a server
@@ -923,5 +943,14 @@ END:VCARD
         let body = build_proppatch_displayname_body("Renamed <list>");
         assert!(body.contains("<D:propertyupdate"));
         assert!(body.contains("<D:displayname>Renamed &lt;list&gt;</D:displayname>"));
+    }
+
+    #[test]
+    fn proppatch_body_sets_the_calendar_color() {
+        let body = build_proppatch_calendar_color_body("#3584e4");
+        assert!(body.contains("<D:propertyupdate"));
+        assert!(body.contains("xmlns:IC=\"http://apple.com/ns/ical/\""));
+        assert!(body.contains("<IC:calendar-color>#3584e4</IC:calendar-color>"));
+        assert!(!body.contains("displayname"), "only the colour property is set");
     }
 }

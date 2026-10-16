@@ -10,6 +10,7 @@ mod background;
 mod background_image;
 mod blocked_senders;
 mod calendar_colors;
+mod calendar_groups;
 mod calendar_invites;
 mod calendar_share;
 mod calendar_tz;

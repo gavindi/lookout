@@ -11,6 +11,7 @@ use lookout_core::calendar_protocol::ConnectionState as CalendarConnectionState;
 use lookout_core::{BusyStatus, CalendarId, CalendarInfo, EventOccurrence};
 
 use crate::calendar_colors;
+use crate::context_menu::{ActionSpec, ContextMenu, Dispatch, MenuDescription};
 
 /// The short label for each weekday, indexed by `num_days_from_sunday`. The
 /// displayed week order is driven by the `calendar-week-start` preference (see
@@ -300,6 +301,20 @@ fn install_calendar_css() {
         }
         .calendar-toggle-label {
             font-weight: normal;
+        }
+        /* The colour picker's swatches (the calendar row menu's Change
+           colour submenu). The background comes from a per-colour
+           `.calendar-swatch-<hex>` rule the checklist writes into
+           `check_colors`; this is the shared chrome. */
+        .calendar-color-swatch {
+            min-width: 18px;
+            min-height: 18px;
+            padding: 0;
+            border-radius: 4px;
+            border: 1px solid alpha(currentColor, 0.25);
+        }
+        .calendar-color-swatch:hover {
+            border-color: @accent_bg_color;
         }
         /* Month-grid event chips are `Gtk.Button`s so they can open an editor;
            strip the button chrome so they render as the plain colored chips the
@@ -3789,18 +3804,67 @@ pub fn connect_day_selected(mc: &MiniCalendar, f: impl Fn(NaiveDate) + 'static) 
     mc.on_day_selected.borrow_mut().push(Rc::new(f));
 }
 
-/// One calendar account in the sidebar's "My calendars" checklist: a header
-/// row showing the account's display name, its discovered calendars as the
-/// checkable rows below it, and an optional status line rendered while the
-/// account hasn't delivered any calendars yet (so a connected-but-silent
+/// One section of the sidebar's "My calendars" checklist: a header row (the
+/// account's display name, or a user-defined group's name), its calendars as
+/// the checkable rows below it, and an optional status line rendered while an
+/// account section hasn't delivered any calendars yet (so a connected-but-silent
 /// account is never just blank).
-pub struct CalendarAccountGroup {
-    pub display_name: String,
+pub struct CalendarSection {
+    /// `Some(group id)` for a user-defined group (item 3.13 / CAL-33): its
+    /// header carries a ⋯ menu with Rename/Delete. `None` for an account
+    /// fallback section, whose header has no menu.
+    pub id: Option<String>,
+    pub title: String,
     pub calendars: Vec<CalendarInfo>,
-    /// Short status line for the sidebar, or `None` once the account has
+    /// Short status line for the sidebar, or `None` once the section has
     /// calendars to list (see [`calendar_account_status_text`]).
     pub status: Option<String>,
 }
+
+/// A calendar section before user grouping has been applied: what an account
+/// (or a synthetic source) contributes to the checklist.
+pub struct CalendarFallbackSection {
+    pub title: String,
+    pub calendars: Vec<CalendarInfo>,
+    pub status: Option<String>,
+}
+
+/// A user-defined calendar group as the sidebar needs it (item 3.13 /
+/// CAL-33): its id, display name, and member calendar ids in order. The row
+/// menu's "Move to group" only reads `id`/`name`; the section builder also
+/// reads `calendar_ids`.
+pub struct CalendarGroupChoice {
+    pub id: String,
+    pub name: String,
+    pub calendar_ids: Vec<CalendarId>,
+}
+
+/// What a checklist row or group header asked for (item 3.13 / CAL-32,
+/// CAL-33). The widget layer only names the intent; the window owns the effect
+/// (persisting a colour, opening a dialog, routing a rename to the session).
+pub enum CalendarSidebarAction {
+    /// A palette swatch was picked (`#rrggbb`).
+    SetColor(CalendarId, String),
+    /// "Custom colour…" - the caller opens a `gtk::ColorDialog`.
+    CustomColor(CalendarId),
+    /// "Automatic colour" - the caller re-derives the palette/server colour.
+    AutomaticColor(CalendarId),
+    Rename(CalendarId),
+    Share(CalendarId),
+    /// Remove from the sidebar (webcal unsubscribes; everything else hides).
+    Remove(CalendarId),
+    /// Move the calendar into a group (`None` takes it out of every group).
+    MoveToGroup(CalendarId, Option<String>),
+    NewGroup,
+    RenameGroup(String),
+    DeleteGroup(String),
+    /// Reveal every hidden calendar.
+    ShowAll,
+}
+
+/// The checklist's action callback, stored by the caller (the window) and
+/// handed to every rebuild through `CalendarUiState`.
+pub type CalendarSidebarActionHandler = Rc<dyn Fn(CalendarSidebarAction) + 'static>;
 
 /// Renders a calendar account's latest session state as a short sidebar
 /// status line, shown under the account header until it has calendars to
@@ -3818,33 +3882,86 @@ pub fn calendar_account_status_text(connection_state: &CalendarConnectionState, 
     Some(text)
 }
 
+/// Splits the per-account (and synthetic) fallback sections into the checklist
+/// the sidebar renders (item 3.13 / CAL-33): the user-defined groups first, in
+/// their own order, then whatever calendars those groups didn't claim, still
+/// under their account's header. Pure so the ordering and "an account section
+/// disappears once all its calendars are grouped" rules are unit-tested
+/// without GTK.
+///
+/// A user group is rendered even when empty (a group the user is about to fill,
+/// or has emptied); an account section whose calendars all moved into groups is
+/// dropped, while a still-calendarless account section is kept for its status
+/// line.
+pub fn build_calendar_sections(fallbacks: &[CalendarFallbackSection], groups: &[CalendarGroupChoice]) -> Vec<CalendarSection> {
+    let by_id: HashMap<&CalendarId, &CalendarInfo> = fallbacks.iter().flat_map(|f| f.calendars.iter()).map(|c| (&c.id, c)).collect();
+    let mut claimed: HashSet<CalendarId> = HashSet::new();
+    let mut sections = Vec::new();
+    for group in groups {
+        let calendars: Vec<CalendarInfo> = group.calendar_ids.iter().filter_map(|id| by_id.get(id).map(|c| (*c).clone())).collect();
+        for calendar in &calendars {
+            claimed.insert(calendar.id.clone());
+        }
+        sections.push(CalendarSection {
+            id: Some(group.id.clone()),
+            title: group.name.clone(),
+            calendars,
+            status: None,
+        });
+    }
+    for fallback in fallbacks {
+        let remaining: Vec<CalendarInfo> = fallback.calendars.iter().filter(|c| !claimed.contains(&c.id)).cloned().collect();
+        if remaining.is_empty() && !fallback.calendars.is_empty() {
+            // Every calendar here moved into a user group, so the account
+            // header would be an empty stub.
+            continue;
+        }
+        sections.push(CalendarSection {
+            id: None,
+            title: fallback.title.clone(),
+            calendars: remaining,
+            status: fallback.status.clone(),
+        });
+    }
+    sections
+}
+
 /// Clears `container` and re-renders the "My calendars" checklist from the
-/// given per-account groups: one account header (dim caption, deliberately not
-/// the bold `caption-heading`) per
-/// group, its calendars as custom coloured toggle rows (name + hand-drawn
-/// radio indicator in the calendar's colour, active = currently checked), or
-/// a dim status line when the account has none yet. Each row's `toggled`
-/// handler fires `on_toggle`. A plain rebuildable-list function rather than a
-/// stateful struct, matching this file's existing data-in/widget-state-out
-/// convention - callers own the actual checked/unchecked state and just ask
-/// for a fresh render of it.
+/// given sections: one header per section (dim caption, deliberately not the
+/// bold `caption-heading`), its calendars as custom coloured toggle rows
+/// (name + hand-drawn radio indicator in the calendar's colour, active =
+/// currently checked), or a dim status line when an account has none yet. A
+/// user-defined group's header also carries a ⋯ menu (Rename/Delete group),
+/// and every calendar row a ⋯ menu offering Outlook's per-calendar actions -
+/// Change colour, Rename, Share, Remove and Move to group (item 3.13 /
+/// CAL-32, CAL-33). The trailing "＋ New group" row creates a group, and a
+/// "Show all" row appears while calendars are hidden. Each row's `toggled`
+/// handler fires `on_toggle`; every menu item fires `on_action`. A plain
+/// rebuildable-list function rather than a stateful struct, matching this
+/// file's existing data-in/widget-state-out convention - callers own the
+/// actual checked/colour/group state and just ask for a fresh render of it.
 ///
 /// Every calendar's row is tinted with its assigned colour from `colors` (the
 /// colour normally lives in `calendar_colors::load`, but this function only
 /// needs the map - the caller resolves/persists assignments). The same pass
-/// writes the matching `.calendar-event-<hex>` chip rules into `check_colors`,
-/// a display-level provider owned by the caller.
+/// writes the matching `.calendar-event-<hex>` chip rules and the colour
+/// picker's swatch rules into `check_colors`, a display-level provider owned
+/// by the caller.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_calendar_checklist(
     container: &gtk::Box,
-    groups: &[CalendarAccountGroup],
+    sections: &[CalendarSection],
     checked: &HashSet<CalendarId>,
     colors: &HashMap<CalendarId, String>,
     check_colors: &gtk::CssProvider,
     on_toggle: impl Fn(CalendarId, bool) + 'static + Clone,
+    on_action: CalendarSidebarActionHandler,
+    groups: &[CalendarGroupChoice],
+    hidden_count: usize,
 ) {
     clear_children(container);
     let mut css = String::new();
-    if groups.is_empty() {
+    if sections.is_empty() {
         let placeholder = gtk::Label::builder()
             .label("No calendars connected")
             .css_classes(["dim-label", "caption"])
@@ -3852,23 +3969,32 @@ pub fn rebuild_calendar_checklist(
             .build();
         container.append(&placeholder);
     }
-    for group in groups {
+    for section in sections {
+        let header_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).build();
         let header = gtk::Label::builder()
-            .label(&group.display_name)
+            .label(&section.title)
             .css_classes(["dim-label", "caption", "calendar-account-header"])
             .xalign(0.0)
+            .hexpand(true)
             .build();
-        // A group header is the calendar account's name/address.
-        crate::privacy::mark(&header);
-        container.append(&header);
-        if group.calendars.is_empty() {
-            if let Some(status) = &group.status {
+        // A group header names a group, not an account, so it isn't private
+        // data; an account header is the account's name/address.
+        if section.id.is_none() {
+            crate::privacy::mark(&header);
+        }
+        header_row.append(&header);
+        if let Some(group_id) = &section.id {
+            header_row.append(&build_group_menu(group_id, &on_action));
+        }
+        container.append(&header_row);
+        if section.calendars.is_empty() {
+            if let Some(status) = &section.status {
                 let label = gtk::Label::builder().label(status).css_classes(["dim-label", "caption"]).xalign(0.0).wrap(true).build();
                 container.append(&label);
             }
             continue;
         }
-        for calendar in &group.calendars {
+        for calendar in &section.calendars {
             let color = colors.get(&calendar.id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
             css.push_str(&calendar_color_css(color));
             let id = calendar.id.clone();
@@ -3876,10 +4002,50 @@ pub fn rebuild_calendar_checklist(
             let toggle = calendar_toggle_row(&calendar.display_name, color, checked.contains(&calendar.id), move |is_checked| {
                 on_toggle(id.clone(), is_checked)
             });
-            container.append(&toggle);
+            let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).build();
+            toggle.set_hexpand(true);
+            row.append(&toggle);
+            row.append(&build_calendar_row_menu(calendar, groups, &on_action));
+            container.append(&row);
         }
     }
+    // The colour picker's swatch grid: one background rule per palette colour.
+    // Written into the same provider the chip rules use, so it is (re)parsed
+    // once per checklist rebuild.
+    for hex in calendar_colors::CALENDAR_PALETTE {
+        css.push_str(&format!(".calendar-swatch-{} {{ background-color: {hex}; }}\n", hex.trim_start_matches('#')));
+    }
+    append_checklist_footer(container, &on_action, hidden_count);
     check_colors.load_from_string(&css);
+}
+
+/// The checklist's trailing controls: "＋ New group" always, and a "Show all"
+/// row while any calendar is hidden (item 3.13 / CAL-33, CAL-32).
+fn append_checklist_footer(container: &gtk::Box, on_action: &CalendarSidebarActionHandler, hidden_count: usize) {
+    let new_group = gtk::Button::builder()
+        .label("+ New group")
+        .css_classes(["flat", "dim-label"])
+        .halign(gtk::Align::Start)
+        .tooltip_text("Create a calendar group")
+        .build();
+    {
+        let on_action = on_action.clone();
+        new_group.connect_clicked(move |_| on_action(CalendarSidebarAction::NewGroup));
+    }
+    container.append(&new_group);
+    if hidden_count > 0 {
+        let show_all = gtk::Button::builder()
+            .label("Show all")
+            .css_classes(["flat", "dim-label"])
+            .halign(gtk::Align::Start)
+            .tooltip_text("Show calendars removed from the list")
+            .build();
+        {
+            let on_action = on_action.clone();
+            show_all.connect_clicked(move |_| on_action(CalendarSidebarAction::ShowAll));
+        }
+        container.append(&show_all);
+    }
 }
 
 /// One row in the "My calendars" checklist: a flat `ToggleButton` carrying the
@@ -3919,6 +4085,140 @@ fn calendar_toggle_row(name: &str, color: &str, active: bool, on_toggle: impl Fn
         });
     }
 
+    button
+}
+
+/// One calendar row's ⋯ menu (UX-52, item 3.13 / CAL-32, CAL-33): Outlook's
+/// per-calendar actions - Change colour (palette swatches + Automatic + Custom),
+/// Rename, Share, Remove, and Move to group. Built through the shared
+/// [`ContextMenu`] builder (item 0.5), like the folder row menu, so the
+/// swatches and action wiring match the rest of the app. The menu is rebuilt
+/// with its row on every checklist refresh, so it captures its calendar
+/// directly rather than sharing a mutable cursor slot.
+fn build_calendar_row_menu(calendar: &CalendarInfo, groups: &[CalendarGroupChoice], on_action: &CalendarSidebarActionHandler) -> gtk::MenuButton {
+    let button = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More options")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .build();
+    let dispatch: Dispatch = {
+        let on_action = on_action.clone();
+        let id = calendar.id.clone();
+        Rc::new(move |name, param| {
+            let text = param.and_then(|p| p.get::<String>());
+            let action = match name {
+                "color" => CalendarSidebarAction::SetColor(id.clone(), text.unwrap_or_default()),
+                "color-auto" => CalendarSidebarAction::AutomaticColor(id.clone()),
+                "color-custom" => CalendarSidebarAction::CustomColor(id.clone()),
+                "rename" => CalendarSidebarAction::Rename(id.clone()),
+                "share" => CalendarSidebarAction::Share(id.clone()),
+                "remove" => CalendarSidebarAction::Remove(id.clone()),
+                "move-group" => CalendarSidebarAction::MoveToGroup(id.clone(), text.filter(|group| !group.is_empty())),
+                "new-group" => CalendarSidebarAction::NewGroup,
+                _ => return,
+            };
+            on_action(action);
+        })
+    };
+
+    let mut move_menu = MenuDescription::new().section().action_with_target("No group", "calendar.move-group", String::new());
+    for group in groups {
+        move_menu = move_menu.action_with_target(group.name.clone(), "calendar.move-group", group.id.clone());
+    }
+    move_menu = move_menu.section().action("New group…", "calendar.new-group");
+
+    let description = MenuDescription::new()
+        .section()
+        .submenu(
+            "Change colour",
+            MenuDescription::new()
+                .section()
+                .custom("colors")
+                .section()
+                .action("Automatic colour", "calendar.color-auto")
+                .action("Custom colour…", "calendar.color-custom"),
+        )
+        .section()
+        .action("Rename…", "calendar.rename")
+        .action("Share…", "calendar.share")
+        .action("Remove", "calendar.remove")
+        .section()
+        .submenu("Move to group", move_menu);
+
+    let specs = [
+        ActionSpec::parameterised("color", gtk::glib::VariantTy::STRING),
+        ActionSpec::simple("color-auto"),
+        ActionSpec::simple("color-custom"),
+        ActionSpec::simple("rename"),
+        ActionSpec::simple("share"),
+        ActionSpec::simple("remove"),
+        ActionSpec::parameterised("move-group", gtk::glib::VariantTy::STRING),
+        ActionSpec::simple("new-group"),
+    ];
+    let menu = ContextMenu::new(&description, &specs, dispatch);
+    menu.attach_button(&button, "calendar");
+
+    // The palette swatches are the "Change colour" submenu's custom child (the
+    // folder menu's pattern); clicking one applies the colour and closes the
+    // menu. Their background rules are written into `check_colors` by
+    // [`rebuild_calendar_checklist`].
+    let swatch_grid = gtk::Grid::builder()
+        .column_spacing(6)
+        .row_spacing(6)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    for (index, hex) in calendar_colors::CALENDAR_PALETTE.iter().enumerate() {
+        let swatch = gtk::Button::builder()
+            .css_classes(["calendar-color-swatch", &format!("calendar-swatch-{}", hex.trim_start_matches('#'))])
+            .tooltip_text(*hex)
+            .build();
+        {
+            let menu = menu.clone();
+            let on_action = on_action.clone();
+            let id = calendar.id.clone();
+            let hex = hex.to_string();
+            swatch.connect_clicked(move |_| {
+                menu.popdown();
+                on_action(CalendarSidebarAction::SetColor(id.clone(), hex.clone()));
+            });
+        }
+        swatch_grid.attach(&swatch, (index % 5) as i32, (index / 5) as i32, 1, 1);
+    }
+    menu.add_child(&swatch_grid, "colors");
+    button
+}
+
+/// A user-defined group header's ⋯ menu (item 3.13 / CAL-33): Rename and
+/// Delete. Deleting a group never deletes its calendars - they return to their
+/// account's fallback section - so it is safe without a confirmation dialog
+/// (the caller offers an Undo).
+fn build_group_menu(group_id: &str, on_action: &CalendarSidebarActionHandler) -> gtk::MenuButton {
+    let button = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More options")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .build();
+    let dispatch: Dispatch = {
+        let on_action = on_action.clone();
+        let group_id = group_id.to_string();
+        Rc::new(move |name, _| match name {
+            "group-rename" => on_action(CalendarSidebarAction::RenameGroup(group_id.clone())),
+            "group-delete" => on_action(CalendarSidebarAction::DeleteGroup(group_id.clone())),
+            _ => {}
+        })
+    };
+    let description = MenuDescription::new()
+        .section()
+        .action("Rename group…", "calendar.group-rename")
+        .action("Delete group", "calendar.group-delete");
+    let specs = [ActionSpec::simple("group-rename"), ActionSpec::simple("group-delete")];
+    let menu = ContextMenu::new(&description, &specs, dispatch);
+    menu.attach_button(&button, "calendar");
     button
 }
 
@@ -5072,5 +5372,183 @@ mod tests {
         assert_eq!(active_view(&main), "schedule");
         set_view(&main, "month");
         assert_eq!(active_view(&main), "month");
+    }
+
+    fn calendar(id: &str) -> CalendarInfo {
+        CalendarInfo {
+            id: CalendarId(id.to_string()),
+            account_id: lookout_core::AccountId("account".to_string()),
+            display_name: id.to_string(),
+            color: None,
+            href: format!("/{id}"),
+            supports_tasks: false,
+            owner: None,
+        }
+    }
+
+    fn fallback(title: &str, ids: &[&str]) -> CalendarFallbackSection {
+        CalendarFallbackSection {
+            title: title.to_string(),
+            calendars: ids.iter().map(|id| calendar(id)).collect(),
+            status: None,
+        }
+    }
+
+    fn group(id: &str, name: &str, members: &[&str]) -> CalendarGroupChoice {
+        CalendarGroupChoice {
+            id: id.to_string(),
+            name: name.to_string(),
+            calendar_ids: members.iter().map(|m| CalendarId(m.to_string())).collect(),
+        }
+    }
+
+    /// CAL-33: user groups render first, their members in the group's own
+    /// order; an account keeps whatever calendars a group didn't claim, and an
+    /// account whose calendars all moved drops out.
+    #[test]
+    fn sections_place_user_groups_before_unclaimed_account_calendars() {
+        let fallbacks = vec![fallback("Work account", &["a", "b"]), fallback("Home account", &["c"])];
+        let groups = vec![group("group:1", "Favourites", &["c", "a"])];
+        let sections = build_calendar_sections(&fallbacks, &groups);
+
+        assert_eq!(sections.len(), 2, "Home account has no calendars left, so it drops out");
+        assert_eq!(sections[0].id.as_deref(), Some("group:1"));
+        assert_eq!(sections[0].title, "Favourites");
+        // Membership follows the group's order (c then a), not the account's.
+        assert_eq!(sections[0].calendars.iter().map(|c| c.id.0.as_str()).collect::<Vec<_>>(), vec!["c", "a"]);
+        // The work account keeps only its unclaimed calendar.
+        assert_eq!(sections[1].id, None);
+        assert_eq!(sections[1].title, "Work account");
+        assert_eq!(sections[1].calendars.iter().map(|c| c.id.0.as_str()).collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    /// A group renders even while empty (a new or emptied group), and an
+    /// account with no calendars at all is kept for its status line.
+    #[test]
+    fn sections_keep_empty_groups_and_status_only_accounts() {
+        let fallbacks = vec![CalendarFallbackSection {
+            title: "Connecting…".to_string(),
+            calendars: vec![],
+            status: Some("Connecting…".to_string()),
+        }];
+        let groups = vec![group("group:1", "New group", &[])];
+        let sections = build_calendar_sections(&fallbacks, &groups);
+
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].id.as_deref(), Some("group:1"));
+        assert!(sections[0].calendars.is_empty());
+        assert_eq!(sections[1].title, "Connecting…");
+        assert_eq!(sections[1].status.as_deref(), Some("Connecting…"));
+    }
+
+    /// With no groups, every fallback section survives unchanged and a stale
+    /// member id is simply skipped.
+    #[test]
+    fn sections_without_groups_keep_every_account_and_skip_stale_members() {
+        let fallbacks = vec![fallback("Work account", &["a"]), fallback("Home account", &["c"])];
+        let sections = build_calendar_sections(&fallbacks, &[]);
+        assert_eq!(sections.len(), 2);
+        assert!(sections.iter().all(|s| s.id.is_none()));
+
+        // A group naming a calendar that no longer exists renders empty rather
+        // than failing.
+        let groups = vec![group("group:1", "Stale", &["gone"])];
+        let sections = build_calendar_sections(&fallbacks, &groups);
+        assert_eq!(sections.len(), 3, "the empty stale group still renders");
+        assert!(sections[0].calendars.is_empty());
+        assert_eq!(sections[1].title, "Work account");
+        assert_eq!(sections[2].title, "Home account");
+    }
+
+    /// Every widget under `root`, so a test can find the labels and buttons a
+    /// rebuild produced without depending on the exact tree shape.
+    fn collect_widgets(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        out.push(root.clone());
+        let mut child = root.first_child();
+        while let Some(current) = child {
+            collect_widgets(&current, out);
+            child = current.next_sibling();
+        }
+    }
+
+    /// CAL-32/CAL-33: a rebuild renders every section's header, each calendar
+    /// row's ⋯ menu, and the footer controls (whose clicks reach the handler) -
+    /// and the colour rules land in the shared provider.
+    #[test]
+    fn checklist_renders_sections_menus_and_footer_actions() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let sections = vec![
+            CalendarSection {
+                id: Some("group:1".to_string()),
+                title: "Favourites".to_string(),
+                calendars: vec![calendar("a")],
+                status: None,
+            },
+            CalendarSection {
+                id: None,
+                title: "Work account".to_string(),
+                calendars: vec![calendar("b")],
+                status: None,
+            },
+            CalendarSection {
+                id: Some("group:2".to_string()),
+                title: "Empty".to_string(),
+                calendars: vec![],
+                status: None,
+            },
+        ];
+        let checked: HashSet<CalendarId> = sections.iter().flat_map(|s| s.calendars.iter().map(|c| c.id.clone())).collect();
+        let colors: HashMap<CalendarId, String> = checked.iter().map(|id| (id.clone(), "#3584e4".to_string())).collect();
+        let groups = vec![group("group:1", "Favourites", &["a"]), group("group:2", "Empty", &[])];
+        let provider = gtk::CssProvider::new();
+        let fired: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let on_action: CalendarSidebarActionHandler = {
+            let fired = fired.clone();
+            Rc::new(move |action| {
+                let label = match action {
+                    CalendarSidebarAction::NewGroup => "new-group".to_string(),
+                    CalendarSidebarAction::ShowAll => "show-all".to_string(),
+                    CalendarSidebarAction::SetColor(id, hex) => format!("color:{hex}:{}", id.0),
+                    CalendarSidebarAction::DeleteGroup(id) => format!("delete-group:{id}"),
+                    _ => "other".to_string(),
+                };
+                fired.borrow_mut().push(label);
+            })
+        };
+
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rebuild_calendar_checklist(&container, &sections, &checked, &colors, &provider, |_, _| {}, on_action, &groups, 2);
+
+        let mut widgets = Vec::new();
+        collect_widgets(container.upcast_ref::<gtk::Widget>(), &mut widgets);
+        let labels: Vec<String> = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .map(|label| label.text().to_string())
+            .collect();
+        let buttons: Vec<gtk::Button> = widgets.iter().filter_map(|w| w.downcast_ref::<gtk::Button>().cloned()).collect();
+        let menus = widgets.iter().filter(|w| w.is::<gtk::MenuButton>()).count();
+
+        assert!(labels.iter().any(|l| l == "Favourites"), "the group header renders: {labels:?}");
+        assert!(labels.iter().any(|l| l == "a"), "the group's calendar row renders: {labels:?}");
+        assert!(labels.iter().any(|l| l == "Work account"), "the account fallback renders");
+        assert!(labels.iter().any(|l| l == "Empty"), "an empty group still renders its header");
+        assert_eq!(menus, 4, "one ⋯ menu per calendar row (2) and per group header (2)");
+
+        // The shared provider carries the chip rules and the swatch backdrops.
+        let css = provider.to_str();
+        assert!(css.contains("calendar-event-3584e4"), "chip rules written: {css}");
+        assert!(css.contains("calendar-swatch-3584e4"), "swatch rules written: {css}");
+
+        // The footer's New group / Show all buttons dispatch through the handler.
+        let click = |name: &str| {
+            let button = buttons.iter().find(|b| b.label().as_deref() == Some(name)).unwrap_or_else(|| panic!("no {name} button"));
+            button.emit_clicked();
+        };
+        click("+ New group");
+        click("Show all");
+        assert_eq!(fired.borrow().as_slice(), &["new-group".to_string(), "show-all".to_string()]);
     }
 }

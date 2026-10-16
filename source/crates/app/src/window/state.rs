@@ -1998,4 +1998,19 @@ pub(crate) struct CalendarUiState {
     /// `dashboard_refresh`), so the calendar event loop can open the editor
     /// for a just-created occurrence without holding the window's closures.
     pub(crate) open_event_editor: Option<Rc<dyn Fn(EventOccurrence)>>,
+    /// The user-defined calendar groups (item 3.13 / CAL-33), mirrored from
+    /// `AppConfig::calendar_groups` so the sidebar checklist can order its
+    /// sections without reaching into the config store on every rebuild. The
+    /// row/group action handler persists changes back to `settings.json`.
+    pub(crate) calendar_groups: Vec<crate::app_config::CalendarGroup>,
+    /// Calendars removed from the sidebar (item 3.13), mirrored from
+    /// `AppConfig::hidden_calendars`; hidden calendars are filtered out of the
+    /// checklist and every view until "Show all".
+    pub(crate) hidden_calendars: Vec<CalendarId>,
+    /// The sidebar checklist's row/group action handler (item 3.13),
+    /// registered by the window once `calendar_state` exists - the same
+    /// late-binding pattern as `open_event_editor`, so
+    /// `refresh_calendar_checklist` can hand it to every rebuild from the many
+    /// call sites that have no window reference.
+    pub(crate) calendar_sidebar_action: Option<calendar_view::CalendarSidebarActionHandler>,
 }

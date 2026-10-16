@@ -16,7 +16,7 @@
 /// Software released under the GPL3 license
 use std::path::PathBuf;
 
-use lookout_core::{AccountId, Identity, MailboxRole, QuickStep, Rule, Signature, WebcalSubscription};
+use lookout_core::{AccountId, CalendarId, Identity, MailboxRole, QuickStep, Rule, Signature, WebcalSubscription};
 use serde::{Deserialize, Serialize};
 
 use crate::categories::CategoryDef;
@@ -150,8 +150,28 @@ pub struct SharedCalendar {
     pub display_name: String,
 }
 
-/// One local, on-device task list (OUTLOOK_PARITY.md item 4.8 / T-01). The
-/// fallback task store when no connected server carries `VTODO`s is a single
+/// One user-defined group of calendars in the Calendar sidebar
+/// (OUTLOOK_PARITY.md item 3.13 / CAL-33): a named, ordered set of member
+/// calendars rendered as a section above the per-account fallback sections.
+/// Structured config, so it lives in `settings.json` beside the rules and Quick
+/// Steps (cross-cutting rule §10). Membership is advisory: an id that no longer
+/// exists (a calendar removed, or one whose account is temporarily
+/// disconnected) is skipped at render time rather than pruned here, so a
+/// disconnect can never destroy the grouping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarGroup {
+    /// Stable `group:<uuid>` id ([`CALENDAR_GROUP_ID_PREFIX`]).
+    pub id: String,
+    pub name: String,
+    /// Member calendar ids, in the order the sidebar lists them.
+    #[serde(default)]
+    pub calendar_ids: Vec<CalendarId>,
+}
+
+/// The id prefix of a [`CalendarGroup`].
+pub const CALENDAR_GROUP_ID_PREFIX: &str = "group:";
+
+/// One local, on-device task list (OUTLOOK_PARITY.md item 4.8 / T-01). The/// fallback task store when no connected server carries `VTODO`s is a single
 /// `CalendarId("local")`; this gives it user-created sibling lists as well, so
 /// the Tasks navigation pane behaves the same whether a list is server-backed
 /// or local. Structured config, so it lives in `settings.json` beside the rules
@@ -319,6 +339,17 @@ pub struct AppConfig {
     /// never here.
     #[serde(default)]
     pub ldap_directories: Vec<LdapDirectory>,
+    /// The user-defined calendar groups shown in the Calendar sidebar
+    /// (item 3.13 / CAL-33), in the order they're listed. A calendar in no
+    /// group falls back to its account's section.
+    #[serde(default)]
+    pub calendar_groups: Vec<CalendarGroup>,
+    /// Calendars the user removed from the Calendar sidebar (the row menu's
+    /// Remove, item 3.13 / CAL-32). They stay out of the checklist and every
+    /// view until "Show all" clears this list - so Remove is reversible and
+    /// never deletes a server-side collection.
+    #[serde(default)]
+    pub hidden_calendars: Vec<CalendarId>,
 }
 
 impl AppConfig {
@@ -551,6 +582,79 @@ impl AppConfig {
     pub fn remove_ldap_directory(&mut self, id: &str) {
         self.ldap_directories.retain(|d| d.id != id);
     }
+
+    /// A fresh, empty calendar group id (`group:<uuid>`, item 3.13 / CAL-33).
+    pub fn new_calendar_group_id() -> String {
+        format!("{CALENDAR_GROUP_ID_PREFIX}{}", uuid::Uuid::new_v4())
+    }
+
+    /// Inserts `group`, replacing any existing entry with the same id (the
+    /// edit path) or appending it (the create path), so group order is list
+    /// order.
+    pub fn upsert_calendar_group(&mut self, group: CalendarGroup) {
+        if let Some(existing) = self.calendar_groups.iter_mut().find(|g| g.id == group.id) {
+            *existing = group;
+        } else {
+            self.calendar_groups.push(group);
+        }
+    }
+
+    /// Renames the group with `id`, if any, leaving its members untouched.
+    pub fn rename_calendar_group(&mut self, id: &str, name: &str) {
+        if let Some(group) = self.calendar_groups.iter_mut().find(|g| g.id == id) {
+            group.name = name.to_string();
+        }
+    }
+
+    /// Removes the group with `id` (item 3.13 / CAL-33). Its member calendars
+    /// are not touched - they simply return to their account's fallback
+    /// section. The caller offers an Undo that re-adds the group.
+    pub fn remove_calendar_group(&mut self, id: &str) {
+        self.calendar_groups.retain(|g| g.id != id);
+    }
+
+    /// The group `calendar_id` currently belongs to, if any.
+    pub fn calendar_group_of(&self, calendar_id: &CalendarId) -> Option<&CalendarGroup> {
+        self.calendar_groups.iter().find(|g| g.calendar_ids.contains(calendar_id))
+    }
+
+    /// Moves `calendar_id` into `group` (`None` takes it out of every group),
+    /// removing it from any other group first. A `group` id that doesn't exist
+    /// is a no-op beyond the removal - the caller works from the live list.
+    pub fn move_calendar_to_group(&mut self, calendar_id: &CalendarId, group: Option<&str>) {
+        for existing in &mut self.calendar_groups {
+            existing.calendar_ids.retain(|id| id != calendar_id);
+        }
+        if let Some(group_id) = group {
+            if let Some(target) = self.calendar_groups.iter_mut().find(|g| g.id == group_id) {
+                target.calendar_ids.push(calendar_id.clone());
+            }
+        }
+    }
+
+    /// Whether `calendar_id` is hidden from the sidebar and views.
+    #[allow(dead_code)]
+    pub fn is_calendar_hidden(&self, calendar_id: &CalendarId) -> bool {
+        self.hidden_calendars.contains(calendar_id)
+    }
+
+    /// Hides `calendar_id` from the sidebar and views (the row menu's Remove,
+    /// item 3.13). Idempotent.
+    pub fn hide_calendar(&mut self, calendar_id: &CalendarId) {
+        if !self.hidden_calendars.contains(calendar_id) {
+            self.hidden_calendars.push(calendar_id.clone());
+        }
+    }
+
+    /// Un-hides `calendar_id`, if it was hidden.
+    pub fn show_calendar(&mut self, calendar_id: &CalendarId) {
+        self.hidden_calendars.retain(|id| id != calendar_id);
+    }
+
+    /// Reveals every hidden calendar ("Show all", item 3.13).
+    pub fn show_all_calendars(&mut self) {
+        self.hidden_calendars.clear();
+    }
 }
 
 pub(crate) fn config_dir() -> PathBuf {
@@ -721,6 +825,8 @@ mod tests {
                 name_attr: "displayName".into(),
                 enabled: true,
             }],
+            calendar_groups: Vec::new(),
+            hidden_calendars: Vec::new(),
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -761,6 +867,8 @@ mod tests {
             local_task_lists: Vec::new(),
             directory_accounts: Vec::new(),
             ldap_directories: Vec::new(),
+            calendar_groups: Vec::new(),
+            hidden_calendars: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -1250,6 +1358,93 @@ mod tests {
         assert!(config.ldap_directories.is_empty());
         config.remove_ldap_directory("ldap:nope");
         assert!(config.ldap_directories.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_groups_round_trip_membership_and_hiding() {
+        let dir = std::env::temp_dir().join(format!("lookout-calendar-groups-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating both keys loads them as empty lists rather than
+        // failing, so an older settings.json keeps working.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        let mut config = load_at(&path);
+        assert!(config.calendar_groups.is_empty());
+        assert!(config.hidden_calendars.is_empty());
+
+        let work = CalendarId("account:work".into());
+        let home = CalendarId("account:home".into());
+        let g1 = CalendarGroup {
+            id: AppConfig::new_calendar_group_id(),
+            name: "Work".into(),
+            calendar_ids: vec![work.clone()],
+        };
+        let g2 = CalendarGroup {
+            id: AppConfig::new_calendar_group_id(),
+            name: "Home".into(),
+            calendar_ids: vec![],
+        };
+        assert_ne!(g1.id, g2.id, "each group gets a fresh id");
+        config.upsert_calendar_group(g1.clone());
+        config.upsert_calendar_group(g2.clone());
+        assert_eq!(config.calendar_groups.len(), 2);
+        assert_eq!(config.calendar_group_of(&work).map(|g| g.name.as_str()), Some("Work"));
+
+        // Rename leaves membership alone; upsert with an existing id replaces
+        // in place (so order is stable).
+        config.rename_calendar_group(&g2.id, "Personal");
+        assert_eq!(config.calendar_groups[1].name, "Personal");
+        assert_eq!(config.calendar_groups.len(), 2);
+
+        // Moving a calendar between groups removes it from the old one first.
+        config.move_calendar_to_group(&work, Some(&g2.id));
+        assert!(config.calendar_groups[0].calendar_ids.is_empty());
+        assert_eq!(config.calendar_groups[1].calendar_ids, vec![work.clone()]);
+        assert_eq!(config.calendar_group_of(&work).map(|g| g.id.as_str()), Some(g2.id.as_str()));
+
+        // Moving it again re-orders within the target rather than duplicating.
+        config.move_calendar_to_group(&work, Some(&g2.id));
+        assert_eq!(config.calendar_groups[1].calendar_ids, vec![work.clone()]);
+
+        // Ungrouping leaves it in no group (the account fallback renders it).
+        config.move_calendar_to_group(&work, None);
+        assert!(config.calendar_group_of(&work).is_none());
+        assert!(config.calendar_groups.iter().all(|g| g.calendar_ids.is_empty()));
+
+        // Hiding is idempotent and reversible; Show all clears everything.
+        assert!(!config.is_calendar_hidden(&home));
+        config.hide_calendar(&home);
+        config.hide_calendar(&home);
+        assert!(config.is_calendar_hidden(&home));
+        assert_eq!(config.hidden_calendars.len(), 1);
+        config.show_calendar(&home);
+        assert!(!config.is_calendar_hidden(&home));
+
+        config.hide_calendar(&home);
+        config.hide_calendar(&work);
+        config.show_all_calendars();
+        assert!(config.hidden_calendars.is_empty());
+
+        // Removing a group never touches its member calendars.
+        config.move_calendar_to_group(&work, Some(&g2.id));
+        config.remove_calendar_group(&g2.id);
+        assert_eq!(config.calendar_groups.len(), 1);
+        assert!(config.calendar_group_of(&work).is_none());
+        config.remove_calendar_group("group:nope");
+        assert_eq!(config.calendar_groups.len(), 1);
+
+        // Everything survives a round-trip.
+        config.upsert_calendar_group(g2.clone());
+        config.move_calendar_to_group(&work, Some(&g1.id));
+        config.hide_calendar(&home);
+        save_at(&path, &config);
+        let loaded = load_at(&path);
+        assert_eq!(loaded.calendar_groups.len(), 2);
+        assert_eq!(loaded.calendar_group_of(&work).map(|g| g.name.as_str()), Some("Work"));
+        assert_eq!(loaded.hidden_calendars, vec![home.clone()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

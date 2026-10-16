@@ -250,12 +250,33 @@ async fn connect_and_run(
                 }
                 // Task lists on Microsoft 365 live in To Do, which has its own
                 // actor (`lookout_graph::todo`); the Graph calendar actor never
-                // creates task lists (item 4.8 / T-01).
-                CalendarCommand::CreateCalendar { .. } | CalendarCommand::UpdateCalendar { .. } | CalendarCommand::DeleteCalendar { .. } => {
+                // creates or deletes task lists (item 4.8 / T-01). A rename,
+                // though, comes from the Calendar sidebar's row menu (item
+                // 3.13) - To Do list renames route to the To Do actor - so it
+                // renames the calendar itself.
+                CalendarCommand::CreateCalendar { .. } | CalendarCommand::DeleteCalendar { .. } => {
                     let _ = events
                         .send(CalendarSessionEvent::Error("task lists live in Microsoft To Do, not a Graph calendar".to_string()))
                         .await;
                 }
+                CalendarCommand::UpdateCalendar { calendar_id, display_name } => match calendars.iter().find(|c| c.id == calendar_id) {
+                    Some(calendar) => match client.rename_calendar(calendar, &display_name).await {
+                        Ok(()) => calendars = rebuild_calendars(client, account_id, &shared_owners, events).await?,
+                        Err(e) => {
+                            let _ = events.send(CalendarSessionEvent::Error(format!("couldn't rename the calendar: {e}"))).await;
+                        }
+                    },
+                    None => {
+                        let _ = events
+                            .send(CalendarSessionEvent::Error("couldn't rename the calendar: it no longer exists".to_string()))
+                            .await;
+                    }
+                },
+                // Colours stay on the device for Microsoft 365 calendars
+                // (item 3.13 / CAL-32): Graph's calendar `hexColor` is
+                // read-only, so there is nothing to write. The app has already
+                // applied the picked colour locally.
+                CalendarCommand::SetCalendarColor { .. } => {}
                 CalendarCommand::FetchFreeBusy {
                     attendees,
                     start,

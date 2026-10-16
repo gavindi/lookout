@@ -140,10 +140,25 @@ pub enum CalendarCommand {
         display_name: String,
     },
     /// Rename an existing collection (`PROPPATCH` `displayname`), then
-    /// re-list. `calendar_id` identifies the collection to rename.
+    /// re-list. `calendar_id` identifies the collection to rename. A Microsoft
+    /// 365 calendar renames through Graph (`PATCH /me/calendars/{id}`); To Do
+    /// lists go to the separate `lookout_graph::todo` actor, so this command
+    /// only ever names a calendar there.
     UpdateCalendar {
         calendar_id: CalendarId,
         display_name: String,
+    },
+    /// Set a calendar collection's colour (item 3.13 / CAL-32) - the CalDAV
+    /// `calendar-color` extension property (`IC:calendar-color`, RFC 7986
+    /// §5.9), written with `PROPPATCH` when the server accepts it. `color` is a
+    /// `#rrggbb` hex string chosen from the palette or a `gtk::ColorDialog`.
+    /// Servers that don't implement the extension answer non-2xx; the app keeps
+    /// the colour locally either way (§10), so this degrades softly rather than
+    /// surfacing an error. Microsoft 365 calendars keep their colour on this
+    /// device only: Graph's calendar `hexColor` is read-only.
+    SetCalendarColor {
+        calendar_id: CalendarId,
+        color: String,
     },
     /// Delete an existing collection (`DELETE`), then re-list. Destructive
     /// and not undoable - the UI confirms before sending (§6.1).

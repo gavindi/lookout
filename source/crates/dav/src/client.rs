@@ -536,6 +536,23 @@ impl DavClient {
         Ok(())
     }
 
+    /// Sets the collection's colour via `PROPPATCH` of the CalDAV
+    /// `calendar-color` extension property (RFC 7986 §5.9; item 3.13 /
+    /// CAL-32). A server that doesn't implement the extension answers non-2xx,
+    /// which surfaces as an error - the caller keeps the colour on the device
+    /// and treats it as a soft failure (§10).
+    pub async fn set_calendar_color(&self, href: &str, color: &str, credential: &Credential) -> Result<()> {
+        let url = self.resolve(href)?;
+        let request_url = url.clone();
+        let body = xml::build_proppatch_calendar_color_body(color);
+        let response = self
+            .send_request("PROPPATCH", url, credential, Some(body), &[("Content-Type", "application/xml; charset=utf-8".to_string())])
+            .await?;
+        tracing::debug!("DAV PROPPATCH colour {request_url} -> {}", response.status());
+        drop(response.text().await?);
+        Ok(())
+    }
+
     /// Deletes the whole collection at `href` via `DELETE` - the list and
     /// every task in it (RFC 4791 §5.3.4). Distinct from
     /// [`Self::delete_calendar_object`], which removes one resource.
@@ -936,6 +953,44 @@ END:VCALENDAR
         let credential = Credential::Password("secret".to_string());
 
         client.rename_calendar("/dav/calendars/user/abc/", "Renamed", &credential).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_calendar_color_proppatches_the_extension_property() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("PROPPATCH"))
+            .and(path("/dav/calendars/user/abc/"))
+            .and(body_string_contains("<IC:calendar-color>#3584e4</IC:calendar-color>"))
+            .and(body_string_contains("http://apple.com/ns/ical/"))
+            .respond_with(ResponseTemplate::new(207))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        client.set_calendar_color("/dav/calendars/user/abc/", "#3584e4", &credential).await.unwrap();
+    }
+
+    /// A server that doesn't implement the `calendar-color` extension answers
+    /// non-2xx, which the caller treats as a soft failure (item 3.13 / §10).
+    #[tokio::test]
+    async fn set_calendar_color_surfaces_a_rejecting_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("PROPPATCH"))
+            .and(path("/dav/calendars/user/abc/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        assert!(client.set_calendar_color("/dav/calendars/user/abc/", "#3584e4", &credential).await.is_err());
     }
 
     #[tokio::test]

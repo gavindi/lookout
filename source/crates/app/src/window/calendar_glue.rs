@@ -278,25 +278,34 @@ pub(crate) fn refresh_birthdays_from_contacts(
 /// defaults any newly-seen id to checked (shown), and re-renders the
 /// sidebar's "My calendars" checklist against that - the checklist's own
 /// `on_toggle` closure flips membership in `checked_calendar_ids` and calls
-/// `refresh_displayed_calendar_view` to redraw the grid accordingly.
+/// `refresh_displayed_calendar_view` to redraw the grid accordingly. Calendars
+/// the user removed from the list (item 3.13) are filtered out of both the
+/// checklist and the views until "Show all" reveals them; the sections come
+/// from the user's groups first, then the per-account fallback.
 pub(crate) fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_list_box: &gtk::Box, calendar_main: &Rc<CalendarMain>) {
-    let mut groups: Vec<calendar_view::CalendarAccountGroup> = calendar_state
+    let (groups, hidden, on_action) = {
+        let st = calendar_state.borrow();
+        (st.calendar_groups.clone(), st.hidden_calendars.clone(), st.calendar_sidebar_action.clone())
+    };
+    let hidden_set: HashSet<CalendarId> = hidden.iter().cloned().collect();
+
+    let mut fallbacks: Vec<calendar_view::CalendarFallbackSection> = calendar_state
         .borrow()
         .accounts
         .values()
-        .map(|h| calendar_view::CalendarAccountGroup {
-            display_name: h.display_name.clone(),
+        .map(|h| calendar_view::CalendarFallbackSection {
+            title: h.display_name.clone(),
             calendars: h.calendars.clone(),
             status: calendar_view::calendar_account_status_text(&h.connection_state, !h.calendars.is_empty()),
         })
         .collect();
-    // Subscriptions render as one synthetic "Webcal subscriptions" group so
+    // Subscriptions render as one synthetic "Webcal subscriptions" section so
     // they inherit the checklist's toggle/color machinery unchanged.
     {
         let st = calendar_state.borrow();
         if !st.webcal_subscriptions.is_empty() {
-            groups.push(calendar_view::CalendarAccountGroup {
-                display_name: "Webcal subscriptions".to_string(),
+            fallbacks.push(calendar_view::CalendarFallbackSection {
+                title: "Webcal subscriptions".to_string(),
                 calendars: st
                     .webcal_subscriptions
                     .iter()
@@ -316,13 +325,13 @@ pub(crate) fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiS
         }
     }
     // The synthesized birthdays calendar renders as one row in its own
-    // group, present only while any contacts exist (the handle is `None`
+    // section, present only while any contacts exist (the handle is `None`
     // otherwise) - same inheritance of the toggle/color machinery.
     {
         let st = calendar_state.borrow();
         if let Some(birthdays) = &st.birthdays {
-            groups.push(calendar_view::CalendarAccountGroup {
-                display_name: "Birthdays".to_string(),
+            fallbacks.push(calendar_view::CalendarFallbackSection {
+                title: "Birthdays".to_string(),
                 calendars: vec![CalendarInfo {
                     id: birthdays.calendar_id.clone(),
                     account_id: AccountId("birthdays".to_string()),
@@ -337,8 +346,28 @@ pub(crate) fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiS
             });
         }
     }
-    groups.sort_by_key(|g| g.display_name.to_lowercase());
-    let all_calendars: Vec<CalendarInfo> = groups.iter().flat_map(|g| g.calendars.iter().cloned()).collect();
+    fallbacks.sort_by_key(|g| g.title.to_lowercase());
+
+    // Count the removed calendars that still exist somewhere (a stale hidden id
+    // for a calendar the server no longer offers shouldn't keep a "Show all"
+    // row alive), then drop them from every section - so a removed calendar is
+    // out of both the checklist and the views.
+    let hidden_count = fallbacks.iter().flat_map(|f| f.calendars.iter()).filter(|c| hidden_set.contains(&c.id)).count();
+    for fallback in &mut fallbacks {
+        fallback.calendars.retain(|c| !hidden_set.contains(&c.id));
+    }
+
+    let choices: Vec<calendar_view::CalendarGroupChoice> = groups
+        .iter()
+        .map(|g| calendar_view::CalendarGroupChoice {
+            id: g.id.clone(),
+            name: g.name.clone(),
+            calendar_ids: g.calendar_ids.clone(),
+        })
+        .collect();
+    let sections = calendar_view::build_calendar_sections(&fallbacks, &choices);
+
+    let all_calendars: Vec<CalendarInfo> = fallbacks.iter().flat_map(|g| g.calendars.iter().cloned()).collect();
     {
         let mut st = calendar_state.borrow_mut();
         ensure_checked_calendars(&mut st.checked_calendar_ids, &all_calendars);
@@ -366,7 +395,18 @@ pub(crate) fn refresh_calendar_checklist(calendar_state: &Rc<RefCell<CalendarUiS
             refresh_displayed_calendar_view(&calendar_state, &calendar_main);
         }
     };
-    calendar_view::rebuild_calendar_checklist(calendar_list_box, &groups, &checked, &colors, &calendar_main.check_colors, on_toggle);
+    let on_action = on_action.unwrap_or_else(|| Rc::new(|_| {}));
+    calendar_view::rebuild_calendar_checklist(
+        calendar_list_box,
+        &sections,
+        &checked,
+        &colors,
+        &calendar_main.check_colors,
+        on_toggle,
+        on_action,
+        &choices,
+        hidden_count,
+    );
     calendar_view::set_calendar_colors(calendar_main, &colors);
     calendar_view::set_schedule_calendars(calendar_main, &schedule_calendars_from(&all_calendars, &checked));
     refresh_displayed_calendar_view(calendar_state, calendar_main);
@@ -380,6 +420,466 @@ pub(crate) fn schedule_calendars_from(all_calendars: &[CalendarInfo], checked: &
         .filter(|c| checked.contains(&c.id))
         .map(|c| (c.id.clone(), c.display_name.clone()))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Calendar sidebar actions (item 3.13 / CAL-32, CAL-33)
+// ---------------------------------------------------------------------------
+
+/// Every calendar a connected source currently offers, with hidden ones
+/// optionally included - the lookup the sidebar action handler resolves ids
+/// against, and (sorted by id) the position `Automatic colour` scores from.
+fn calendars_in_state(calendar_state: &Rc<RefCell<CalendarUiState>>, include_hidden: bool) -> Vec<CalendarInfo> {
+    let st = calendar_state.borrow();
+    let mut out: Vec<CalendarInfo> = st.accounts.values().flat_map(|h| h.calendars.iter().cloned()).collect();
+    for sub in &st.webcal_subscriptions {
+        out.push(CalendarInfo {
+            id: webcal_calendar_id(&sub.id),
+            account_id: AccountId(format!("webcal:{}", sub.id)),
+            display_name: sub.display_name.clone(),
+            color: None,
+            href: sub.url.clone(),
+            supports_tasks: false,
+            owner: None,
+        });
+    }
+    if let Some(birthdays) = &st.birthdays {
+        out.push(CalendarInfo {
+            id: birthdays.calendar_id.clone(),
+            account_id: AccountId("birthdays".to_string()),
+            display_name: birthdays.display_name.clone(),
+            color: None,
+            href: String::new(),
+            supports_tasks: false,
+            owner: None,
+        });
+    }
+    if !include_hidden {
+        let hidden: HashSet<CalendarId> = st.hidden_calendars.iter().cloned().collect();
+        out.retain(|c| !hidden.contains(&c.id));
+    }
+    out
+}
+
+/// The account whose session owns `calendar_id`, as `(account id, command
+/// channel, is_graph)`. `None` for a Webcal subscription or the synthesized
+/// Birthdays calendar - they have no session to talk to.
+fn calendar_session_for(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> Option<(AccountId, async_channel::Sender<CalendarCommand>, bool)> {
+    let st = calendar_state.borrow();
+    st.accounts
+        .iter()
+        .find(|(_, handle)| handle.calendars.iter().any(|c| &c.id == calendar_id))
+        .map(|(id, handle)| (id.clone(), handle.cmd_tx.clone(), handle.graph))
+}
+
+/// The `webcal:<id>` subscription id behind a synthetic calendar id, if any.
+fn webcal_subscription_id(calendar_id: &CalendarId) -> Option<&str> {
+    calendar_id.0.strip_prefix("webcal:")
+}
+
+/// The colour currently shown for `calendar_id` (what a colour's Undo
+/// restores).
+fn current_calendar_color(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> String {
+    calendar_state
+        .borrow()
+        .calendar_colors
+        .get(calendar_id)
+        .cloned()
+        .unwrap_or_else(|| calendar_colors::DEFAULT_CHECK_COLOR.to_string())
+}
+
+/// Applies a colour locally and persists the map - the optimistic half of a
+/// pick, before any server write-back.
+fn set_calendar_color_local(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId, color: &str) {
+    calendar_state.borrow_mut().calendar_colors.insert(calendar_id.clone(), color.to_string());
+    calendar_colors::save(&calendar_state.borrow().calendar_colors);
+}
+
+/// Sends the colour to the owning CalDAV session so the server learns it
+/// (`PROPPATCH calendar-color`, item 3.13 / CAL-32). A Microsoft 365 calendar
+/// keeps it on the device (Graph's `hexColor` is read-only), and a Webcal or
+/// Birthdays calendar has no session at all.
+fn write_calendar_color_back(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId, color: &str) {
+    if let Some((_, tx, graph)) = calendar_session_for(calendar_state, calendar_id) {
+        if !graph {
+            let _ = tx.send_blocking(CalendarCommand::SetCalendarColor {
+                calendar_id: calendar_id.clone(),
+                color: color.to_string(),
+            });
+        }
+    }
+}
+
+/// Applies a picked colour end to end: locally, to the server (CalDAV), to
+/// every surface, and with an Undo that restores the previous colour.
+fn apply_calendar_color(calendar_state: &Rc<RefCell<CalendarUiState>>, toast_overlay: &adw::ToastOverlay, refresh: &Rc<dyn Fn()>, calendar_id: &CalendarId, color: &str) {
+    let previous = current_calendar_color(calendar_state, calendar_id);
+    set_calendar_color_local(calendar_state, calendar_id, color);
+    write_calendar_color_back(calendar_state, calendar_id, color);
+    refresh();
+    let toast = adw::Toast::new("Colour updated");
+    toast.set_button_label(Some("Undo"));
+    {
+        let calendar_state = calendar_state.clone();
+        let refresh = refresh.clone();
+        let calendar_id = calendar_id.clone();
+        let previous = previous.clone();
+        toast.connect_button_clicked(move |_| {
+            set_calendar_color_local(&calendar_state, &calendar_id, &previous);
+            write_calendar_color_back(&calendar_state, &calendar_id, &previous);
+            refresh();
+        });
+    }
+    toast_overlay.add_toast(toast);
+}
+
+/// Repaints every calendar surface after a sidebar change (item 3.13): the
+/// checklist and main panel (via `refresh_calendar_checklist`), the Mail
+/// overview pane and the sidebar mini-calendar. The Add-calendar dialog's own
+/// refresh and the row/group actions share it, so one change looks the same
+/// wherever it was made.
+pub(crate) fn refresh_calendar_surfaces(
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    calendar_main: &Rc<CalendarMain>,
+    calendar_list_box: &gtk::Box,
+    mini_calendar: &calendar_view::MiniCalendar,
+    mail_overview_day: &Rc<Cell<chrono::NaiveDate>>,
+    mail_overview_day_list: &gtk::Box,
+) {
+    refresh_calendar_checklist(calendar_state, calendar_list_box, calendar_main);
+    refresh_mail_overview_day_list(calendar_state, mail_overview_day.get(), mail_overview_day_list);
+    let month = calendar_state.borrow().displayed_month;
+    let event_days = calendar_event_days(calendar_state, month);
+    calendar_view::set_mini_event_days(mini_calendar, &event_days);
+}
+
+/// Removes a Webcal subscription (item 3.13's row-menu Remove for a feed, and
+/// the Add-calendar dialog's own manage list): drops it from `settings.json`
+/// and the in-memory mirrors, deletes its cache, and reloads the feed session.
+/// The caller repaints. Unlike hiding a calendar this is destructive (the
+/// cached events go), so callers confirm first.
+pub(crate) fn remove_webcal_subscription(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>, toast_overlay: &adw::ToastOverlay, id: &str) {
+    let subscriptions = {
+        let app_config = state.borrow().app_config.clone();
+        let mut config = app_config.borrow_mut();
+        config.webcal_subscriptions.retain(|s| s.id != id);
+        crate::app_config::save(&config);
+        config.webcal_subscriptions.clone()
+    };
+    {
+        let mut st = calendar_state.borrow_mut();
+        st.webcal_subscriptions.retain(|s| s.id != id);
+        st.webcal_handles.remove(id);
+        st.checked_calendar_ids.remove(&webcal_calendar_id(id));
+        st.calendar_colors.remove(&webcal_calendar_id(id));
+    }
+    calendar_colors::save(&calendar_state.borrow().calendar_colors);
+    let _ = lookout_dav::remove_subscription_cache(id);
+    if let Some(cmd) = calendar_state.borrow().webcal_cmd_tx.clone() {
+        let _ = cmd.send_blocking(SubscriptionCommand::Reload { subscriptions });
+    }
+    toast_overlay.add_toast(adw::Toast::new("Subscription removed"));
+}
+
+/// Registers the sidebar checklist's row/group action handler (item 3.13 /
+/// CAL-32, CAL-33) on `calendar_state`, the late-binding pattern the other
+/// window hooks use - so `refresh_calendar_checklist` can hand it to every
+/// rebuild from the many call sites that have no window reference.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_calendar_sidebar_actions(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    calendar_main: &Rc<CalendarMain>,
+    calendar_list_box: &gtk::Box,
+    mini_calendar: &calendar_view::MiniCalendar,
+    mail_overview_day: &Rc<Cell<chrono::NaiveDate>>,
+    mail_overview_day_list: &gtk::Box,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    // One repaint closure for every action: the checklist/main panel, the Mail
+    // overview pane, the sidebar mini-calendar, the Tasks list (its rows are
+    // colour-dotted) and the dashboard's upcoming-events card.
+    let refresh: Rc<dyn Fn()> = Rc::new({
+        let calendar_state = calendar_state.clone();
+        let calendar_main = calendar_main.clone();
+        let calendar_list_box = calendar_list_box.clone();
+        let mini_calendar = mini_calendar.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        let tasks_view = tasks_view.clone();
+        move || {
+            refresh_calendar_surfaces(
+                &calendar_state,
+                &calendar_main,
+                &calendar_list_box,
+                &mini_calendar,
+                &mail_overview_day,
+                &mail_overview_day_list,
+            );
+            refresh_tasks_view(&calendar_state, &tasks_view);
+            if let Some(hook) = calendar_state.borrow().dashboard_refresh.clone() {
+                hook();
+            }
+        }
+    });
+
+    /// Persists `AppConfig` and refreshes `CalendarUiState`'s group/hidden
+    /// mirrors from it - the shared tail of every group/hide action.
+    fn persist(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<CalendarUiState>>) {
+        let app_config = state.borrow().app_config.clone();
+        let config = app_config.borrow();
+        crate::app_config::save(&config);
+        let mut st = calendar_state.borrow_mut();
+        st.calendar_groups = config.calendar_groups.clone();
+        st.hidden_calendars = config.hidden_calendars.clone();
+    }
+
+    let handler: calendar_view::CalendarSidebarActionHandler = Rc::new({
+        let window = window.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let toast_overlay = toast_overlay.clone();
+        let refresh = refresh.clone();
+        move |action| {
+            match action {
+                calendar_view::CalendarSidebarAction::SetColor(calendar_id, color) => {
+                    apply_calendar_color(&calendar_state, &toast_overlay, &refresh, &calendar_id, &color);
+                }
+                calendar_view::CalendarSidebarAction::CustomColor(calendar_id) => {
+                    let dialog = gtk::ColorDialog::new();
+                    let initial = gtk::gdk::RGBA::parse(current_calendar_color(&calendar_state, &calendar_id)).ok();
+                    let calendar_state = calendar_state.clone();
+                    let toast_overlay = toast_overlay.clone();
+                    let refresh = refresh.clone();
+                    let window = window.clone();
+                    dialog.choose_rgba(Some(&window), initial.as_ref(), gtk::gio::Cancellable::NONE, move |result| {
+                        if let Ok(rgba) = result {
+                            let color = calendar_colors::rgba_to_hex(rgba.red(), rgba.green(), rgba.blue());
+                            apply_calendar_color(&calendar_state, &toast_overlay, &refresh, &calendar_id, &color);
+                        }
+                    });
+                }
+                calendar_view::CalendarSidebarAction::AutomaticColor(calendar_id) => {
+                    // The palette position is the calendar's place in the
+                    // id-sorted list, exactly as `assign_missing` scores a
+                    // first sighting.
+                    let mut calendars = calendars_in_state(&calendar_state, true);
+                    calendars.sort_by_key(|c| c.id.0.clone());
+                    let (server, index) = calendars
+                        .iter()
+                        .enumerate()
+                        .find(|(_, c)| c.id == calendar_id)
+                        .map(|(index, c)| (c.color.clone(), index))
+                        .unwrap_or((None, 0));
+                    let color = calendar_colors::automatic_color(server.as_deref(), index);
+                    apply_calendar_color(&calendar_state, &toast_overlay, &refresh, &calendar_id, &color);
+                }
+                calendar_view::CalendarSidebarAction::Rename(calendar_id) => {
+                    if let Some(subscription_id) = webcal_subscription_id(&calendar_id).map(str::to_string) {
+                        let initial = calendar_state
+                            .borrow()
+                            .webcal_subscriptions
+                            .iter()
+                            .find(|s| s.id == subscription_id)
+                            .map(|s| s.display_name.clone())
+                            .unwrap_or_default();
+                        let state = state.clone();
+                        let calendar_state = calendar_state.clone();
+                        let refresh = refresh.clone();
+                        crate::calendar_groups::show_name_dialog(&window, "Rename calendar", "Name", "Rename", &initial, move |name| {
+                            let subscriptions = {
+                                let app_config = state.borrow().app_config.clone();
+                                let mut config = app_config.borrow_mut();
+                                if let Some(sub) = config.webcal_subscriptions.iter_mut().find(|s| s.id == subscription_id) {
+                                    sub.display_name = name.clone();
+                                }
+                                crate::app_config::save(&config);
+                                config.webcal_subscriptions.clone()
+                            };
+                            calendar_state.borrow_mut().webcal_subscriptions = subscriptions.clone();
+                            if let Some(cmd) = calendar_state.borrow().webcal_cmd_tx.clone() {
+                                let _ = cmd.send_blocking(SubscriptionCommand::Reload { subscriptions });
+                            }
+                            refresh();
+                        });
+                    } else if let Some((_, tx, _)) = calendar_session_for(&calendar_state, &calendar_id) {
+                        let initial = calendars_in_state(&calendar_state, true)
+                            .into_iter()
+                            .find(|c| c.id == calendar_id)
+                            .map(|c| c.display_name)
+                            .unwrap_or_default();
+                        crate::calendar_groups::show_name_dialog(&window, "Rename calendar", "Name", "Rename", &initial, move |name| {
+                            let _ = tx.send_blocking(CalendarCommand::UpdateCalendar {
+                                calendar_id: calendar_id.clone(),
+                                display_name: name,
+                            });
+                        });
+                    } else {
+                        toast_overlay.add_toast(adw::Toast::new("This calendar can't be renamed"));
+                    }
+                }
+                calendar_view::CalendarSidebarAction::Share(calendar_id) => {
+                    let shareable = calendar_session_for(&calendar_state, &calendar_id).map(|(_, _, graph)| graph).unwrap_or(false);
+                    let calendar = calendars_in_state(&calendar_state, true).into_iter().find(|c| c.id == calendar_id);
+                    match (shareable, calendar) {
+                        // Only a calendar the user owns can be shared; a
+                        // delegated one stays read-through.
+                        (true, Some(calendar)) if calendar.owner.is_none() => crate::calendar_share::show_share_calendar_dialog(&window, calendar, &toast_overlay),
+                        _ => toast_overlay.add_toast(adw::Toast::new("Sharing is available for Microsoft 365 calendars")),
+                    }
+                }
+                calendar_view::CalendarSidebarAction::Remove(calendar_id) => {
+                    if let Some(subscription_id) = webcal_subscription_id(&calendar_id).map(str::to_string) {
+                        let name = calendars_in_state(&calendar_state, true)
+                            .into_iter()
+                            .find(|c| c.id == calendar_id)
+                            .map(|c| c.display_name)
+                            .unwrap_or_else(|| "this calendar".to_string());
+                        let dialog = adw::MessageDialog::builder()
+                            .transient_for(&window)
+                            .modal(true)
+                            .heading(format!("Unsubscribe from \"{name}\"?"))
+                            .body("Its cached events will be removed. You can subscribe again later.")
+                            .build();
+                        dialog.add_response("cancel", "Cancel");
+                        dialog.add_response("remove", "Unsubscribe");
+                        dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+                        dialog.set_default_response(Some("cancel"));
+                        dialog.set_close_response("cancel");
+                        {
+                            let state = state.clone();
+                            let calendar_state = calendar_state.clone();
+                            let toast_overlay = toast_overlay.clone();
+                            let refresh = refresh.clone();
+                            dialog.connect_response(None, move |_dialog, response| {
+                                if response == "remove" {
+                                    remove_webcal_subscription(&state, &calendar_state, &toast_overlay, &subscription_id);
+                                    refresh();
+                                }
+                            });
+                        }
+                        dialog.present();
+                    } else {
+                        {
+                            let app_config = state.borrow().app_config.clone();
+                            let mut config = app_config.borrow_mut();
+                            config.hide_calendar(&calendar_id);
+                        }
+                        persist(&state, &calendar_state);
+                        // A hidden calendar must stop feeding the views: drop
+                        // it from the checked set so its events vanish too.
+                        calendar_state.borrow_mut().checked_calendar_ids.remove(&calendar_id);
+                        refresh();
+                        let name = calendars_in_state(&calendar_state, true)
+                            .into_iter()
+                            .find(|c| c.id == calendar_id)
+                            .map(|c| c.display_name)
+                            .unwrap_or_else(|| "Calendar".to_string());
+                        let toast = adw::Toast::new(&format!("{name} removed from the list"));
+                        toast.set_button_label(Some("Undo"));
+                        {
+                            let state = state.clone();
+                            let calendar_state = calendar_state.clone();
+                            let refresh = refresh.clone();
+                            toast.connect_button_clicked(move |_| {
+                                state.borrow().app_config.borrow_mut().show_calendar(&calendar_id);
+                                persist(&state, &calendar_state);
+                                refresh();
+                            });
+                        }
+                        toast_overlay.add_toast(toast);
+                    }
+                }
+                calendar_view::CalendarSidebarAction::MoveToGroup(calendar_id, group) => {
+                    let previous = state.borrow().app_config.borrow().calendar_group_of(&calendar_id).map(|g| g.id.clone());
+                    state.borrow().app_config.borrow_mut().move_calendar_to_group(&calendar_id, group.as_deref());
+                    persist(&state, &calendar_state);
+                    refresh();
+                    let toast = adw::Toast::new("Calendar moved");
+                    toast.set_button_label(Some("Undo"));
+                    {
+                        let state = state.clone();
+                        let calendar_state = calendar_state.clone();
+                        let refresh = refresh.clone();
+                        toast.connect_button_clicked(move |_| {
+                            state.borrow().app_config.borrow_mut().move_calendar_to_group(&calendar_id, previous.as_deref());
+                            persist(&state, &calendar_state);
+                            refresh();
+                        });
+                    }
+                    toast_overlay.add_toast(toast);
+                }
+                calendar_view::CalendarSidebarAction::NewGroup => {
+                    let state = state.clone();
+                    let calendar_state = calendar_state.clone();
+                    let refresh = refresh.clone();
+                    crate::calendar_groups::show_name_dialog(&window, "New group", "Group name", "Create", "", move |name| {
+                        let group = crate::app_config::CalendarGroup {
+                            id: crate::app_config::AppConfig::new_calendar_group_id(),
+                            name,
+                            calendar_ids: Vec::new(),
+                        };
+                        state.borrow().app_config.borrow_mut().upsert_calendar_group(group);
+                        persist(&state, &calendar_state);
+                        refresh();
+                    });
+                }
+                calendar_view::CalendarSidebarAction::RenameGroup(group_id) => {
+                    let initial = state
+                        .borrow()
+                        .app_config
+                        .borrow()
+                        .calendar_groups
+                        .iter()
+                        .find(|g| g.id == group_id)
+                        .map(|g| g.name.clone())
+                        .unwrap_or_default();
+                    let state = state.clone();
+                    let calendar_state = calendar_state.clone();
+                    let refresh = refresh.clone();
+                    crate::calendar_groups::show_name_dialog(&window, "Rename group", "Group name", "Rename", &initial, move |name| {
+                        state.borrow().app_config.borrow_mut().rename_calendar_group(&group_id, &name);
+                        persist(&state, &calendar_state);
+                        refresh();
+                    });
+                }
+                calendar_view::CalendarSidebarAction::DeleteGroup(group_id) => {
+                    let removed = {
+                        let app_config = state.borrow().app_config.clone();
+                        let mut config = app_config.borrow_mut();
+                        let removed = config.calendar_groups.iter().find(|g| g.id == group_id).cloned();
+                        config.remove_calendar_group(&group_id);
+                        removed
+                    };
+                    persist(&state, &calendar_state);
+                    refresh();
+                    if let Some(group) = removed {
+                        let toast = adw::Toast::new(&format!("Group \"{}\" deleted", group.name));
+                        toast.set_button_label(Some("Undo"));
+                        {
+                            let state = state.clone();
+                            let calendar_state = calendar_state.clone();
+                            let refresh = refresh.clone();
+                            toast.connect_button_clicked(move |_| {
+                                state.borrow().app_config.borrow_mut().upsert_calendar_group(group.clone());
+                                persist(&state, &calendar_state);
+                                refresh();
+                            });
+                        }
+                        toast_overlay.add_toast(toast);
+                    }
+                }
+                calendar_view::CalendarSidebarAction::ShowAll => {
+                    state.borrow().app_config.borrow_mut().show_all_calendars();
+                    persist(&state, &calendar_state);
+                    refresh();
+                }
+            }
+        }
+    });
+    calendar_state.borrow_mut().calendar_sidebar_action = Some(handler);
 }
 
 /// Unions every connected calendar account's latest occurrences for

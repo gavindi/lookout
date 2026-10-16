@@ -126,6 +126,24 @@ fn parse_expanded_hex(body: &str) -> Option<(u8, u8, u8)> {
     Some((byte(chars.next()?)?, byte(chars.next()?)?, byte(chars.next()?)?))
 }
 
+/// Formats a picked colour's 0.0-1.0 RGB components (as a `gtk::gdk::RGBA`
+/// carries them, `f32`) as the `#rrggbb` string the map stores. Components are
+/// clamped, so a slightly out-of-range value from a colour dialog can't
+/// produce a malformed colour.
+pub fn rgba_to_hex(r: f32, g: f32, b: f32) -> String {
+    let byte = |c: f32| (f64::from(c).clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b))
+}
+
+/// The colour a calendar falls back to when the user asks for "Automatic
+/// colour" (item 3.13 / CAL-32): its server-advertised colour when there is
+/// one, else the palette colour at its position in `index` (wrapping), the
+/// same rule [`assign_missing`] applies on first sight. Kept pure so the
+/// window's action handler and its tests agree on the result.
+pub fn automatic_color(server_color: Option<&str>, index: usize) -> String {
+    resolve_color(server_color, CALENDAR_PALETTE[index % CALENDAR_PALETTE.len()])
+}
+
 /// A foreground colour that stays readable against `background` as an event
 /// chip: `"white"` for dark backgrounds, `"black"` for light ones. Uses the
 /// standard sRGB-relative luminance, so bright calendar colours (yellows,
@@ -241,5 +259,26 @@ mod tests {
         assert_eq!(readable_foreground("#e5a50a"), "black");
         assert_eq!(readable_foreground("#abc"), "black");
         assert_eq!(readable_foreground("not-a-color"), "white");
+    }
+
+    #[test]
+    fn rgba_to_hex_round_trips_through_parse_hex_rgb() {
+        // The colour dialog hands components back as 0.0-1.0 floats; the map
+        // stores hex, so the conversion must agree with the parser the rest of
+        // this module (and the CSS class names) work from.
+        assert_eq!(rgba_to_hex(1.0, 1.0, 1.0), "#ffffff");
+        assert_eq!(rgba_to_hex(0.0, 0.0, 0.0), "#000000");
+        assert_eq!(rgba_to_hex(0.2, 0.5, 0.25), "#338040");
+        assert_eq!(parse_hex_rgb(&rgba_to_hex(0.2, 0.5, 0.25)), Some((0x33, 0x80, 0x40)));
+        // Out-of-range components clamp rather than producing a malformed hex.
+        assert_eq!(rgba_to_hex(-0.5, 1.5, 0.0), "#00ff00");
+    }
+
+    #[test]
+    fn automatic_color_prefers_the_server_then_the_palette_position() {
+        assert_eq!(automatic_color(Some("#00ff00"), 3), "#00ff00");
+        assert_eq!(automatic_color(None, 1), CALENDAR_PALETTE[1]);
+        // The palette wraps for an index past its end (a long calendar list).
+        assert_eq!(automatic_color(None, CALENDAR_PALETTE.len()), CALENDAR_PALETTE[0]);
     }
 }
